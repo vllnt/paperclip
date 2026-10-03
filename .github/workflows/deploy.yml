@@ -48,8 +48,8 @@ jobs:
             PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
             PAPERCLIP_BUILD_VERSION=2026.1001.0-vllnt
             INSTALL_LOCAL_CLIS=false
-          cache-from: type=gha,scope=paperclip-production
-          cache-to: type=gha,scope=paperclip-production,mode=max
+          cache-from: type=gha,scope=paperclip-production,timeout=1m
+          cache-to: type=gha,scope=paperclip-production,mode=max,ignore-error=true,timeout=2m
       - name: Record signed image commit on main for Coolify
         env:
           BUILT_SOURCE_COMMIT: ${{ github.sha }}

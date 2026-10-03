@@ -72,3 +72,6 @@ CLI installations and their download cache are omitted from the control-plane
 image. Workers provide their own harnesses. The upstream Dockerfile default still
 includes the CLIs for installations that execute agents locally. All application,
 adapter and server source continues to be built; this is not a UI-only image.
+
+CI cache transfer is bounded and best-effort; cache unavailability cannot hold a
+completed image build indefinitely or block publication of its deployment record.
