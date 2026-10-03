@@ -11,7 +11,12 @@ concurrency:
   group: publish-main
   cancel-in-progress: false
 jobs:
+  security:
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
   publish:
+    needs: security
     if: github.repository == 'vllnt/paperclip' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -44,20 +49,11 @@ jobs:
             PAPERCLIP_BUILD_VERSION=2026.1001.0-vllnt
           cache-from: type=gha,scope=paperclip-production
           cache-to: type=gha,scope=paperclip-production,mode=max
-      - name: Record image on main for Coolify
+      - name: Record signed image commit on main for Coolify
         env:
           BUILT_SOURCE_COMMIT: ${{ github.sha }}
           BUILT_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          git fetch origin main
-          if [ "$(git rev-parse origin/main)" != "$BUILT_SOURCE_COMMIT" ]; then
-            echo 'A newer source revision exists; leave deployment to its build.'
-            exit 0
-          fi
           python3 scripts/record-deployment.py
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add deploy/compose.yaml deploy/release.json
-          git commit -m 'Deploy completed source build'
-          git push origin HEAD:main
+          python3 scripts/publish-deployment.py

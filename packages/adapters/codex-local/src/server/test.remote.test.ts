@@ -139,6 +139,30 @@ describe("codex remote environment diagnostics", () => {
     }
   });
 
+  it("routes an API-key probe through the configured custom provider", async () => {
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "codex_local",
+      config: {
+        engine: "cli",
+        env: {
+          OPENAI_API_KEY: "synthetic-probe-key",
+          PAPERCLIP_CODEX_PROVIDERS: JSON.stringify({
+            model_provider: "gateway",
+            providers: { gateway: { name: "Test gateway", base_url: "https://example.invalid/v1", env_key: "OPENAI_API_KEY", wire_api: "responses" } },
+          }),
+        },
+      },
+      executionTarget: sandboxTarget(),
+    });
+    expect(result.status).toBe("pass");
+    const call = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as [string, unknown, string, string[], { env: Record<string, string> }];
+    expect(call[4].env._PAPERCLIP_CODEX_CONFIG_TOML).toContain('model_provider = "gateway"');
+    expect(call[4].env._PAPERCLIP_CODEX_CONFIG_TOML).toContain('base_url = "https://example.invalid/v1"');
+    expect(call[4].env._PAPERCLIP_CODEX_CONFIG_TOML).not.toContain("synthetic-probe-key");
+    expect(call[3][1]).toContain('"$CODEX_HOME/config.toml"');
+  });
+
   it("stages managed CODEX_HOME in an isolated runtime dir and keeps the probe cwd on the original remote workspace", async () => {
     const remoteTarget: AdapterExecutionTarget = {
       kind: "remote",

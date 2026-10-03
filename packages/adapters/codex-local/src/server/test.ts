@@ -24,6 +24,7 @@ import { parseCodexJsonl } from "./parse.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { codexHomeDir, readCodexAuthInfo } from "./quota.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import {
   isManagedCodexHomePath,
   prepareManagedCodexHome,
@@ -216,13 +217,23 @@ async function prepareCodexHelloProbe(input: {
     const probeHome = input.targetIsRemote
       ? path.posix.join(input.cwd, ".paperclip-runtime", "codex", `probe-home-${input.runId}`)
       : path.join(os.tmpdir(), `paperclip-codex-probe-${input.runId}`);
-    // The local finally path retries cleanup independently of the model result.
-    if (!input.targetIsRemote) probeHomeLocalDir = probeHome;
+    // Build provider routing with the same serializer as real executions. The
+    // API-key probe has its own disposable home, so host settings are untouched.
+    probeHomeLocalDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-probe-config-"));
+    let configToml = "";
+    try {
+      const providerConfig = await prepareCodexRuntimeConfig({ env: input.env, codexHome: probeHomeLocalDir });
+      configToml = await fs.readFile(path.join(probeHomeLocalDir, "config.toml"), "utf8").catch(() => "");
+      await providerConfig.cleanup();
+    } finally {
+      await fs.rm(probeHomeLocalDir, { recursive: true, force: true });
+    }
+    probeHomeLocalDir = input.targetIsRemote ? null : probeHome;
     return {
       command: "sh",
       args: [
         "-c",
-        `set -e; umask 077; mkdir -p "$CODEX_HOME"; printf "%s" "$_PAPERCLIP_CODEX_AUTH_JSON" > "$CODEX_HOME/auth.json"; unset _PAPERCLIP_CODEX_AUTH_JSON; cleanup() { result=$?; trap - EXIT; rm -f "$CODEX_HOME/auth.json" || true; rm -rf "$CODEX_HOME" || printf '%s\\n' '${PROBE_CLEANUP_WARNING}' >&2; exit "$result"; }; trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; "$0" "$@"`,
+        `set -e; umask 077; mkdir -p "$CODEX_HOME"; printf "%s" "$_PAPERCLIP_CODEX_AUTH_JSON" > "$CODEX_HOME/auth.json"; printf "%s" "$_PAPERCLIP_CODEX_CONFIG_TOML" > "$CODEX_HOME/config.toml"; unset _PAPERCLIP_CODEX_AUTH_JSON _PAPERCLIP_CODEX_CONFIG_TOML; cleanup() { result=$?; trap - EXIT; rm -f "$CODEX_HOME/auth.json" || true; rm -rf "$CODEX_HOME" || printf '%s\\n' '${PROBE_CLEANUP_WARNING}' >&2; exit "$result"; }; trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; "$0" "$@"`,
         input.command,
         ...input.args,
       ],
@@ -230,6 +241,7 @@ async function prepareCodexHelloProbe(input: {
         ...input.env,
         CODEX_HOME: probeHome,
         _PAPERCLIP_CODEX_AUTH_JSON: JSON.stringify({ OPENAI_API_KEY: input.probeApiKey }),
+        _PAPERCLIP_CODEX_CONFIG_TOML: configToml,
       },
       cleanup,
     };

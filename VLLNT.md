@@ -45,3 +45,22 @@ The SSH wizard regression was reproduced without the fix (two failures), then th
 three focused setup suites passed (11 tests). UI typecheck, production build and
 token gates passed. The full monorepo suite has not yet been run for this fork.
 Live deployment and fresh-agent execution acceptance are tracked privately.
+
+## Publication safeguards
+
+GitHub secret scanning and push protection are enabled. `main` requires verified
+cryptographic commit signatures and rejects force pushes and deletion. CI signs
+its generated deployment commit through GitHub's commit API without a persistent
+signing key. Deployment waits for the reusable security check, focused regression
+tests, UI typechecking and the complete production image build.
+
+The security check runs Gitleaks with full redaction against all commits added
+since the upstream base and rejects private network literals and runtime env files.
+It runs on main pushes and pull requests. CI runs after publication; it cannot erase
+a secret already pushed. GitHub push protection catches supported secret formats,
+not every possible confidential value. Before your first push from each checkout,
+install Gitleaks and run `git config core.hooksPath .githooks` for the local guard.
+Do not bypass these checks or put runtime configuration in this repository.
+
+The Codex API-key connection test now uses the same custom-provider configuration
+serializer as real executions. Previously its disposable home omitted that routing.

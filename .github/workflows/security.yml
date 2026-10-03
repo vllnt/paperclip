@@ -1,0 +1,31 @@
+name: Public fork security
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  secrets:
+    name: Secret and private configuration scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-pinned scanner
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz' | sha256sum -c -
+          mkdir /tmp/gitleaks-bin
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp/gitleaks-bin gitleaks
+      - name: Verify guard and scan new fork history
+        run: |
+          python3 scripts/test-public-config.py
+          python3 scripts/check-public-config.py
+          /tmp/gitleaks-bin/gitleaks git . --redact --no-banner --log-opts='8f8a0ab7effbd6a0584107d8038736c134ee5047..HEAD'
