@@ -87,3 +87,6 @@ Custom Codex providers also apply to Paperclip-managed per-agent and connection
 homes during execution. An explicitly user-managed external home remains untouched.
 Remote-execution regressions verify the staged routing and cleanup for all three
 cases without invoking an external provider.
+
+The dependency layer comes from the install-only stage. Test caches are excluded
+from that layer so source-only builds do not invalidate its content.

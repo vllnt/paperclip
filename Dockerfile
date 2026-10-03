@@ -178,7 +178,8 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-COPY --chown=node:node --from=build /app/node_modules /app/node_modules
+# Use the install-only tree: test caches in the build tree change every run.
+COPY --chown=node:node --from=deps /app/node_modules /app/node_modules
 COPY --chown=node:node --from=runtime-app /app /app
 
 # Declare per-build metadata after the stable RUN layers. Docker includes
