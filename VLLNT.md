@@ -27,10 +27,13 @@ It has no production, Tailnet, proxy, database or Coolify access credentials.
 The public image package must allow anonymous pulls. Coolify must have automatic
 deployments enabled, previews disabled, `/deploy/compose.yaml` as its Compose path,
 and `/deploy/compose.yaml` as its watch path. The operator configures runtime values
-privately, including `PAPERCLIP_DATA_ROOT`, `PAPERCLIP_PUBLIC_URL`, database and auth
+privately, including `PAPERCLIP_PUBLIC_URL`, database and auth
 secrets. Existing private ingress and certificates remain operator-managed.
 
-The Compose manifest expects an existing operator-managed persistent directory,
+The Compose manifest uses `/var/lib/paperclip` as its generic persistent root.
+The operator can map existing data there with a host-side symlink. Coolify validates
+bind sources before environment substitution and rejects variable-based paths.
+The manifest expects an existing operator-managed persistent directory,
 TLS gateway configuration, secret key file and private loopback ingress. It creates
 no public route and requests no certificate. Do not put private endpoints, hostnames,
 server identities, SSH material or credentials in this public repository.
@@ -75,3 +78,7 @@ adapter and server source continues to be built; this is not a UI-only image.
 
 CI cache transfer is bounded and best-effort; cache unavailability cannot hold a
 completed image build indefinitely or block publication of its deployment record.
+
+Runtime dependencies and application files use separate image layers. Normal
+source updates can reuse the dependency layer; dependency updates still require
+capacity for both the previous and replacement dependency trees.

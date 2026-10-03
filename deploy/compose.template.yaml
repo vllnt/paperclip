@@ -22,8 +22,8 @@ services:
       PAPERCLIP_DB_BACKUP_ENABLED: "false"
       NODE_OPTIONS: --max-old-space-size=1536
     volumes:
-      - ${PAPERCLIP_DATA_ROOT:?required}/home:/paperclip
-      - ${PAPERCLIP_DATA_ROOT:?required}/secrets/master-key:/run/secrets/master-key:ro
+      - /var/lib/paperclip/home:/paperclip
+      - /var/lib/paperclip/secrets/master-key:/run/secrets/master-key:ro
     tmpfs:
       - /tmp:size=256m,mode=1777
     cap_drop: [ALL]
@@ -57,7 +57,7 @@ services:
       POSTGRES_USER: paperclip
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
     volumes:
-      - ${PAPERCLIP_DATA_ROOT:?required}/postgres:/var/lib/postgresql/data
+      - /var/lib/paperclip/postgres:/var/lib/postgresql/data
     shm_size: 128m
     security_opt: [no-new-privileges:true]
     mem_limit: 1g
@@ -80,10 +80,10 @@ services:
     ports:
       - "127.0.0.1:18543:8443"
     volumes:
-      - ${PAPERCLIP_DATA_ROOT:?required}/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ${PAPERCLIP_DATA_ROOT:?required}/tls:/etc/paperclip-tls:ro
-      - ${PAPERCLIP_DATA_ROOT:?required}/ops:/var/lib/paperclip-ops:ro
-      - ${PAPERCLIP_DATA_ROOT:?required}/backups:/var/lib/paperclip-backups:ro
+      - /var/lib/paperclip/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /var/lib/paperclip/tls:/etc/paperclip-tls:ro
+      - /var/lib/paperclip/ops:/var/lib/paperclip-ops:ro
+      - /var/lib/paperclip/backups:/var/lib/paperclip-backups:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
     cap_drop: [ALL]

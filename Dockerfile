@@ -147,6 +147,11 @@ RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 RUN rm -rf packages/paperclip-runner/runner/target
 
+# Keep the dependency tree in its own runtime layer. Source-only updates then
+# replace application files without storing another complete dependency tree.
+FROM build AS runtime-app
+RUN rm -rf /app/node_modules
+
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -173,7 +178,8 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-COPY --chown=node:node --from=build /app /app
+COPY --chown=node:node --from=build /app/node_modules /app/node_modules
+COPY --chown=node:node --from=runtime-app /app /app
 
 # Declare per-build metadata after the stable RUN layers. Docker includes
 # in-scope ARG values in a RUN's environment even when its command does not
