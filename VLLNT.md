@@ -82,3 +82,8 @@ completed image build indefinitely or block publication of its deployment record
 Runtime dependencies and application files use separate image layers. Normal
 source updates can reuse the dependency layer; dependency updates still require
 capacity for both the previous and replacement dependency trees.
+
+Custom Codex providers also apply to Paperclip-managed per-agent and connection
+homes during execution. An explicitly user-managed external home remains untouched.
+Remote-execution regressions verify the staged routing and cleanup for all three
+cases without invoking an external provider.

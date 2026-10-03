@@ -87,6 +87,69 @@ describe("codex remote execution", () => {
     }
   });
 
+  it.each(["managed-agent", "managed-connection", "external"])(
+    "ships provider routing only for a %s Codex home and restores the original",
+    async (kind) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-provider-home-"));
+      cleanupDirs.push(root);
+      const workspace = path.join(root, "workspace");
+      const home = kind === "managed-agent"
+        ? path.join(root, "instances/default/companies/company-1/agents/agent-1/codex-home")
+        : path.join(root, "provider");
+      await mkdir(workspace, { recursive: true });
+      await mkdir(home, { recursive: true });
+      const original = 'model = "fixture-model"\n';
+      await writeFile(path.join(home, "config.toml"), original);
+      await writeFile(path.join(home, "auth.json"), '{"OPENAI_API_KEY":"fixture-key"}');
+      let shippedConfig = "";
+      syncDirectoryToSsh.mockImplementationOnce(async (...args: unknown[]) => {
+        const input = args[0] as { localDir: string };
+        shippedConfig = await readFile(path.join(input.localDir, "config.toml"), "utf8");
+      });
+      vi.stubEnv("PAPERCLIP_HOME", root);
+      vi.stubEnv("PAPERCLIP_INSTANCE_ID", "default");
+      vi.stubEnv("CODEX_HOME", home);
+      try {
+        await execute({
+          runId: "provider-route",
+          agent: { id: "agent-1", companyId: "company-1", name: "Fixture",
+            adapterType: "codex_local", adapterConfig: {} },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: {
+            engine: "cli", command: "codex",
+            ...(kind === "managed-connection" ? { managedAiConnection: { connectionId: "fixture" } } : {}),
+            env: {
+              CODEX_HOME: home,
+              OPENAI_API_KEY: "fixture-key",
+              PAPERCLIP_CODEX_PROVIDERS: JSON.stringify({
+                model_provider: "gateway",
+                providers: { gateway: { base_url: "https://example.invalid/v1",
+                  env_key: "OPENAI_API_KEY", wire_api: "responses" } },
+              }),
+            },
+          },
+          context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+          executionTransport: { remoteExecution: {
+            host: "127.0.0.1", port: 2222, username: "fixture",
+            remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          } },
+          onLog: async () => {},
+        });
+        if (kind === "external") expect(shippedConfig).toBe(original);
+        else {
+          expect(shippedConfig).toContain('model_provider = "gateway"');
+          expect(shippedConfig).toContain('base_url = "https://example.invalid/v1"');
+          expect(shippedConfig).toContain('env_key = "OPENAI_API_KEY"');
+        }
+        expect(await readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
   it("prepares the workspace, syncs CODEX_HOME, and restores workspace changes for remote SSH execution", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-"));
     cleanupDirs.push(rootDir);

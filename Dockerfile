@@ -131,7 +131,7 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 # Both the browser bundle and server stamp need the source commit. Declare it
 # after the stable dependency layers, before either application build.
 ARG PAPERCLIP_BUILD_COMMIT=""
-RUN pnpm exec vitest run ui/src/lib/agent-setup-fields.test.ts ui/src/lib/test-agent-setup.test.ts ui/src/lib/saved-provider-credentials.test.ts packages/adapters/codex-local/src/server/test.remote.test.ts packages/adapters/codex-local/src/server/runtime-config.test.ts
+RUN pnpm exec vitest run ui/src/lib/agent-setup-fields.test.ts ui/src/lib/test-agent-setup.test.ts ui/src/lib/saved-provider-credentials.test.ts packages/adapters/codex-local/src/server/test.remote.test.ts packages/adapters/codex-local/src/server/runtime-config.test.ts packages/adapters/codex-local/src/server/execute.remote.test.ts
 RUN pnpm check:token-gates
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
