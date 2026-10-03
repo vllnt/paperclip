@@ -53,3 +53,10 @@ export const SETUP_LOGIN_HINTS: Record<string, string> = {
   hermes_local:
     "Use a provider API key, or the existing Hermes provider configuration on the selected environment's host.",
 };
+
+/** SSH workers support the native CLI lanes, not ACP. */
+export function setupEngineValues(driver: string | undefined) {
+  return driver === "ssh"
+    ? { claudeEngine: "cli" as const, codexEngine: "cli" as const }
+    : {};
+}

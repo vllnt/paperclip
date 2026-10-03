@@ -1,3 +1,4 @@
+import { setupEngineValues } from "@/lib/agent-setup-fields";
 import { AgentCharacter } from "../AgentCharacter";
 import { useAgentAppearanceDraft } from "../../hooks/useAgentAppearanceDraft";
 import { AiConnectionField, aiProviderForAdapter } from "../ai-connections/AiConnectionField";
@@ -331,6 +332,7 @@ function Setup({
   ): Record<string, unknown> {
     const values = {
       ...defaultCreateValues,
+      ...setupEngineValues(environment?.driver),
       adapterType,
       model:
         model || (brandType === "codex_local" ? DEFAULT_CODEX_LOCAL_MODEL : ""),

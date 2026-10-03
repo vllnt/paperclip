@@ -1,0 +1,63 @@
+name: Build and publish for Coolify
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - deploy/compose.yaml
+      - deploy/release.json
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'vllnt/paperclip' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Free disposable hosted runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/share/swift /opt/ghc
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Authenticate to image registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build all application source and publish
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/vllnt/paperclip:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/vllnt/paperclip
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            PAPERCLIP_BUILD_VERSION=2026.1001.0-vllnt
+          cache-from: type=gha,scope=paperclip-production
+          cache-to: type=gha,scope=paperclip-production,mode=max
+      - name: Record image on main for Coolify
+        env:
+          BUILT_SOURCE_COMMIT: ${{ github.sha }}
+          BUILT_IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$BUILT_SOURCE_COMMIT" ]; then
+            echo 'A newer source revision exists; leave deployment to its build.'
+            exit 0
+          fi
+          python3 scripts/record-deployment.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add deploy/compose.yaml deploy/release.json
+          git commit -m 'Deploy completed source build'
+          git push origin HEAD:main
