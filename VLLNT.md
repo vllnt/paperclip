@@ -64,3 +64,11 @@ Do not bypass these checks or put runtime configuration in this repository.
 
 The Codex API-key connection test now uses the same custom-provider configuration
 serializer as real executions. Previously its disposable home omitted that routing.
+
+## Remote-worker image
+
+The deployment workflow builds with `INSTALL_LOCAL_CLIS=false`: global inference
+CLI installations and their download cache are omitted from the control-plane
+image. Workers provide their own harnesses. The upstream Dockerfile default still
+includes the CLIs for installations that execute agents locally. All application,
+adapter and server source continues to be built; this is not a UI-only image.
