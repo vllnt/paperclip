@@ -20,6 +20,7 @@ async function writeFailingClaudeCommand(
   const payload = JSON.stringify(options.resultEvent);
   const exit = options.exitCode ?? 1;
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 console.log(${JSON.stringify(payload)});
 process.exit(${exit});
 `;
@@ -33,6 +34,7 @@ async function writeTextFailingClaudeCommand(
 ): Promise<void> {
   const exit = options.exitCode ?? 1;
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 if (${JSON.stringify(options.stdout ?? "")}) {
   process.stdout.write(${JSON.stringify(options.stdout ?? "")});
 }
@@ -51,6 +53,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
+if (argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 const addDirIndex = argv.indexOf("--add-dir");
 const addDir = addDirIndex >= 0 ? argv[addDirIndex + 1] : null;
 const instructionsIndex = argv.indexOf("--append-system-prompt-file");
@@ -96,6 +99,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
+if (argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 if (argv.includes("--help")) {
   process.stdout.write("Usage: claude [options]\\n  --print\\n  --model <id>\\n");
   process.exit(0);
@@ -134,6 +138,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
+if (argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 if (argv.includes("--help")) {
   const helpCountPath = process.env.PAPERCLIP_TEST_HELP_COUNT_PATH;
   if (helpCountPath) {
@@ -190,6 +195,7 @@ afterEach(() => {
 async function writePoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;
@@ -226,6 +232,7 @@ console.log(JSON.stringify({ type: "result", session_id: "bbbbbbbb-bbbb-4bbb-8bb
 async function writeAlwaysPoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
@@ -256,6 +263,7 @@ process.exit(1);
 async function writeRetryThenSucceedClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;

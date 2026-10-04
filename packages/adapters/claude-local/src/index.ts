@@ -21,6 +21,16 @@ export function resolveClaudeModel(
   return DEFAULT_CLAUDE_LOCAL_MODEL;
 }
 
+export function claudeLocalReasoningEffortsForModel(model: string): readonly string[] {
+  const id = model.trim().replace(/\[1m\]$/, "").replace(/^(?:(?:us|eu|apac|global)\.)?anthropic\./, "");
+  if (/^claude-haiku-/.test(id)) return [];
+  if (/^claude-(?:opus-5(?:-5)?|opus-4-[78]|sonnet-5|fable-5(?:-1)?)$/.test(id)) {
+    return ["low", "medium", "high", "xhigh", "max"];
+  }
+  if (/^claude-(?:opus|sonnet)-4-6(?:-v1)?$/.test(id)) return ["low", "medium", "high", "max"];
+  return ["low", "medium", "high"];
+}
+
 export const type = "claude_local";
 export const label = "Claude Code";
 

@@ -1,5 +1,5 @@
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray, or } from "drizzle-orm";
 import {
   type Db,
@@ -23,9 +23,11 @@ import {
   aiGatewayConfigSchema,
   aiSubscriptionNeedsIsolatedLogin,
   isAiConnectionCompatible,
+  supportsAiConnectionUsage,
   type AiConnectionBinding,
   type AiConnectionAttribution,
   type AiConnectionMetadata,
+  type AiConnectionUsage,
   type AiManagedConnectionSummary,
   type CreateAiConnection,
   type AiConnectionLoginIntent,
@@ -33,6 +35,7 @@ import {
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
+import { probeAiConnectionUsage } from "./ai-connection-usage.js";
 
 /** Same human audience displayed by the existing Connections identity controls. */
 function canUseCredential(
@@ -209,6 +212,29 @@ export function aiConnectionService(db: Db) {
           set: { grantId, updatedAt: new Date() },
         });
     });
+  }
+  /** On-demand account observation for either runner; never probes ambient CLI auth. */
+  async function probeUsage(companyId: string, userId: string, connectionId: string, grantId?: string): Promise<AiConnectionUsage> {
+    if (!(await membership(companyId, userId))) throw forbidden("An active company member is required");
+    const candidates = (await rows(companyId)).filter((row) => row.connection.id === connectionId && (!grantId || row.grant.id === grantId));
+    const audience = await db.select().from(connectionGrantMembers).where(eq(connectionGrantMembers.companyId, companyId));
+    const visible = candidates.filter(({ grant }) => canUseCredential(grant, userId, audience.filter((member) => member.grantId === grant.id)));
+    if (!visible.length) throw notFound("AI connection not found");
+    if (visible.length > 1) throw unprocessable("Choose a credential grant for this usage check");
+    const row = visible[0]!;
+    const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
+    if (!metadata.success) throw notFound("AI connection not found");
+    const identity = { connectionId: row.connection.id, grantId: row.grant.id, ...metadata.data };
+    const empty = { ...identity, checkedAt: new Date().toISOString(), source: null, planType: null, limits: [], overage: null };
+    if (row.grant.status !== "active" || !row.connection.enabled || row.connection.status !== "active" ||
+      row.connection.healthStatus !== "ok" || aiSubscriptionNeedsIsolatedLogin(row.connection.config)) {
+      return { ...empty, status: "unavailable", errorCode: "connection_unavailable", message: "Reconnect or enable this AI connection before checking usage." };
+    }
+    if (!supportsAiConnectionUsage(metadata.data.provider, metadata.data.method)) {
+      return { ...identity, ...await probeAiConnectionUsage(metadata.data, "") };
+    }
+    const value = await credential(row);
+    return { ...identity, ...await probeAiConnectionUsage(metadata.data, value) };
   }
   async function select(input: {
     companyId: string;
@@ -801,5 +827,49 @@ export function aiConnectionService(db: Db) {
       return { connectionId: id, grantId };
     });
   }
-  return { list, select, credential, save, setDefault, membership, gatewayForTest };
+  /** A late failure must never invalidate credentials that were refreshed or reconnected meanwhile. */
+  async function markAuthenticationFailed(input: {
+    companyId: string;
+    runId?: string;
+    agentId?: string;
+    runStartedAt: Date;
+    attribution: AiConnectionAttribution & { identity: string };
+  }) {
+    return db.transaction(async (tx) => {
+      const { attribution } = input;
+      const [grant] = await tx.select().from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, input.companyId),
+        eq(connectionGrants.id, attribution.grantId),
+        eq(connectionGrants.connectionId, attribution.connectionId),
+      )).for("update");
+      if (!grant || grant.status !== "active" || grant.updatedAt > input.runStartedAt) return;
+      const [connection] = await tx.select().from(toolConnections).where(and(
+        eq(toolConnections.companyId, input.companyId),
+        eq(toolConnections.id, attribution.connectionId),
+        eq(toolConnections.connectionPurpose, "ai"),
+      ));
+      if (!connection) return;
+      const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
+      if (!metadata.success || metadata.data.provider !== attribution.provider || metadata.data.method !== attribution.method) return;
+      const ref = grant.credentialSecretRefs.find((candidate) => candidate.configPath === "ai.credential");
+      if (!ref) return;
+      await tx.select({ id: companySecrets.id }).from(companySecrets).where(and(
+        eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, ref.secretId),
+      )).for("update");
+      const value = await aiConnectionService(tx as unknown as Db).credential({ connection, grant });
+      const generation = createHash("sha256").update(value).digest("hex").slice(0, 16);
+      if (attribution.identity !== `${grant.id}:${attribution.responsibleUserId ?? "shared"}:${generation}`) return;
+      await tx.update(connectionGrants).set({ status: "needs_reauthorization", updatedAt: new Date() })
+        .where(eq(connectionGrants.id, grant.id));
+      await tx.update(toolConnections).set({ healthStatus: "error", healthMessage: "Sign in again to restore this AI connection.", updatedAt: new Date() })
+        .where(eq(toolConnections.id, connection.id));
+      await logActivity(tx as unknown as Db, {
+        companyId: input.companyId, actorType: "system", actorId: input.runId ? "heartbeat" : "adapter_test",
+        agentId: input.agentId, runId: input.runId, action: "ai_connection.authentication_failed",
+        entityType: "tool_connection", entityId: connection.id,
+        details: { provider: attribution.provider, grantId: grant.id },
+      });
+    });
+  }
+  return { list, select, credential, save, setDefault, membership, gatewayForTest, probeUsage, markAuthenticationFailed };
 }

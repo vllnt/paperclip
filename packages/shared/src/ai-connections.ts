@@ -120,6 +120,8 @@ export function isAiConnectionCompatible(
       runnerProvider === "claude" ||
       (runnerProvider === "acpx" && acpxAgent === "claude")
         ? "claude_local"
+        : runnerProvider === "acpx" && acpxAgent === "grok"
+          ? "grok_local"
         : runnerProvider === "codex"
           ? "codex_local"
           : runnerProvider === "opencode"
@@ -171,6 +173,12 @@ export interface AiManagedConnectionSummary {
   isDefault: boolean;
   status: "connected" | "needs_attention" | "expired" | "revoked";
   unavailableReason?: string;
+  usageProbeSupported?: boolean;
+}
+export interface AiConnectionList {
+  currentUserId: string;
+  canManageConnections: boolean;
+  connections: AiManagedConnectionSummary[];
 }
 /** A trusted, operator-approved server exposing the selected client API. */
 export const aiGatewayConfigSchema = z.object({

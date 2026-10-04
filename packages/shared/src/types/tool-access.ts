@@ -182,6 +182,8 @@ export interface ToolConnection {
   transportConfig: Record<string, unknown>;
   config?: Record<string, unknown>;
   credentialSecretRefs: ToolCredentialSecretRef[];
+  /** Saved client secret for the requesting user, or the shared connection. Never includes secret material. */
+  hasSavedOAuthClientSecret?: boolean;
   credentialRefs?: McpConnectionCredentialRef[];
   healthStatus: ToolConnectionHealthStatus;
   /** Managed GitHub grant state; transient health failures do not require sign-in. */
@@ -224,6 +226,7 @@ export interface ConnectionGrant {
         expiresAt?: string;
       };
     };
+    slackSearch?: { endpointId: string; workspaceId: string; slackUserId: string; clientRevision: string };
     github?: {
       userId: string;
       login: string;
