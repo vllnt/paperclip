@@ -656,6 +656,26 @@ If a file intentionally remains workspace-only, create a work product with
 path in the final comment. Use browse/search only as the fallback for recovering
 that file, not as the main completion path for deliverables.
 
+## Company execution defaults
+
+Instance administrators can set `companyEnvironmentDefaults` through
+`PATCH /api/instance/settings/general`. The object maps company UUIDs to active
+environment UUIDs; an empty object removes all company overrides. The environment
+settings page edits the selected company's entry while preserving other entries.
+
+An explicit agent environment wins. Otherwise the company's configured default
+wins, then the instance default, then the local default. Managed execution policies
+still apply. The wizard, login/probe flow, agent list and dispatch use the same
+company resolution. Environment credentials remain company-scoped: choosing an
+execution target does not authorize another company's secrets. These defaults
+are stored in the existing general-settings JSON; no database migration is needed.
+Environments used by any configured default cannot be deleted until reassigned.
+
+To roll back this feature before returning to an older application image, give
+agents that need company-specific routing an explicit environment, or stop them,
+then remove the company override map. Older versions only understand the instance
+default and cannot safely infer the correct company worker.
+
 ## Default Agent Workspaces
 
 When a local agent run has no resolved project/session workspace, Paperclip falls back to an agent home workspace under the instance root:

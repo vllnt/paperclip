@@ -2,11 +2,20 @@ import { describe, expect, it, vi } from "vitest";
 import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import {
   applyExperimentalSettingsPatch,
+  instanceSettingsService,
   normalizeExperimentalSettings,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 
 describe("instance settings service", () => {
+  it("retains company defaults when loading persisted general settings", async () => {
+    const defaults = { "11111111-1111-4111-8111-111111111111": "22222222-2222-4222-8222-222222222222" };
+    const row = { id: "settings", defaultEnvironmentId: null, general: { companyEnvironmentDefaults: defaults }, experimental: {}, createdAt: new Date(), updatedAt: new Date() };
+    const db = { select: () => ({ from: () => ({ where: () => Promise.resolve([row]) }) }) };
+    const settings = await instanceSettingsService(db as never).get();
+    expect(settings.general.companyEnvironmentDefaults).toEqual(defaults);
+  });
+
   it("keeps chat connectors opt-in across legacy storage and patches without disabling Apps", () => {
     for (const stored of [undefined, {}, { enableApps: true }, { enableConferenceRoomChat: true }]) {
       expect(normalizeExperimentalSettings(stored).enableChatConnectors).toBe(false);

@@ -7,9 +7,7 @@ export const label = "Codex";
 
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @openai/codex";
 
-// Use the concrete `gpt-5.6-sol` slug (Codex's own default for the 5.6 family) rather than the
-// bare `gpt-5.6` alias: OpenAI ships no model metadata for the bare slug, so passing it makes the
-// Codex CLI warn ("Model metadata for `gpt-5.6` not found") and fall back to generic context limits.
+// Use the concrete supported model ID; explicit older model selections remain valid.
 export const DEFAULT_CODEX_LOCAL_MODEL = PAPERCLIP_RUNNER_DEFAULT_MODELS.codex;
 export const DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX = true;
 export const CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS = [
@@ -62,7 +60,7 @@ export function normalizeCodexModel(model: string | null | undefined): string {
 export function codexLocalReasoningEffortsForModel(
   model: string | null | undefined,
 ): readonly CodexLocalReasoningEffort[] {
-  return normalizeCodexModel(model) === "gpt-6-astra"
+  return ["gpt-6-astra", "gpt-6.1-sol"].includes(normalizeCodexModel(model))
     ? CODEX_LOCAL_ASTRA_REASONING_EFFORTS
     : CODEX_LOCAL_DEFAULT_REASONING_EFFORTS;
 }
@@ -91,8 +89,9 @@ export function isCodexLocalFastModeSupported(model: string | null | undefined):
 }
 
 export const models = [
-  // DEFAULT_CODEX_LOCAL_MODEL is gpt-5.6-sol, so it doubles as the first (default) 5.6 entry.
+  // Keep the previous model selectable while defaulting new configurations to GPT-6.1 Sol.
   { id: DEFAULT_CODEX_LOCAL_MODEL, label: DEFAULT_CODEX_LOCAL_MODEL },
+  { id: "gpt-5.6-sol", label: "gpt-5.6-sol" },
   { id: "gpt-6-astra", label: "gpt-6-astra" },
   { id: "gpt-5.6-terra", label: "gpt-5.6-terra" },
   { id: "gpt-5.6-luna", label: "gpt-5.6-luna" },
@@ -116,7 +115,7 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to stdin prompt at runtime
 - model (string, optional): Codex model id
-- modelReasoningEffort (string, optional): reasoning effort override passed via -c model_reasoning_effort=...; GPT-6 Astra supports low|medium|high|xhigh|max|ultra
+- modelReasoningEffort (string, optional): reasoning effort override passed via -c model_reasoning_effort=...; GPT-6 Astra and GPT-6.1 Sol support low|medium|high|xhigh|max|ultra
 - promptTemplate (string, optional): run prompt template
 - search (boolean, optional): run codex with --search
 - fastMode (boolean, optional): enable Codex Fast mode; supported on GPT-6 Astra, GPT-5.6 (sol/terra/luna), GPT-5.5, GPT-5.4 and passed through for manual model IDs

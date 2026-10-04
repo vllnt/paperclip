@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type AiProvider, type AiAuthMethod, type AiConnectionLoginIntent } from "@paperclipai/shared";
@@ -49,7 +50,7 @@ function SubscriptionConnectionStep({ companyId, provider, initialMethod, fixedM
   try {
     environmentId = forced.forced ? forced.kubernetesEnvironment?.id ?? null : resolveAdapterTestEnvironmentId({
       agentDefaultEnvironmentId: suppliedEnvironmentId ?? chosenEnvironment,
-      instanceDefaultEnvironmentId: settings.data?.defaultEnvironmentId,
+      instanceDefaultEnvironmentId: resolveCompanyEnvironmentDefault(settings.data, companyId),
       localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(envs.data),
       managedSandboxOnly: experimental.data?.enableManagedSandboxOnly,
       managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(envs.data),

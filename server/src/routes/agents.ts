@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
@@ -1162,7 +1163,8 @@ export function agentRoutes(
   async function resolveAdapterTestEnvironmentId(companyId: string, environmentId: string | null | undefined) {
     if (environmentId) return environmentId;
     const settings = await instanceSettings.get();
-    if (settings.defaultEnvironmentId) return settings.defaultEnvironmentId;
+    const defaultId = resolveCompanyEnvironmentDefault(settings, companyId);
+    if (defaultId) return defaultId;
     if ((await instanceSettings.getExperimental()).enableManagedSandboxOnly === true) {
       const managed = await environmentsSvc.findManagedSandboxEnvironment(companyId);
       if (!managed) {

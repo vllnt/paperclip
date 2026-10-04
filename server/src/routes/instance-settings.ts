@@ -6,7 +6,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { validate } from "../middleware/validate.js";
@@ -216,6 +216,13 @@ export function instanceSettingsRoutes(db: Db) {
         () => svc.getGeneral(),
         (field) => hidden.has(`instance.general.${field}`),
       );
+      if (req.body.companyEnvironmentDefaults !== undefined) {
+        const companyIds = new Set(await svc.listCompanyIds());
+        for (const [companyId, environmentId] of Object.entries(req.body.companyEnvironmentDefaults)) {
+          if (!companyIds.has(companyId)) throw unprocessable("Company not found for environment default.");
+          await assertEnvironmentSelectionForCompany(environments, companyId, environmentId as string);
+        }
+      }
       const updated = await svc.updateGeneral(req.body);
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();

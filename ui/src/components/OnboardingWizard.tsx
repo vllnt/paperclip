@@ -1,3 +1,5 @@
+import { setupEngineValues } from "@/lib/agent-setup-fields";
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { healthApi } from "@/api/health";
 import { LocalProviderLoginInstructions } from "./AdapterLoginChrome";
 import { useLocalAiLogin } from "./ai-connections/useLocalAiLogin";
@@ -966,7 +968,7 @@ function OnboardingWizardInner({
     try {
       return resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: null,
-        instanceDefaultEnvironmentId: instanceSettingsForLogin?.defaultEnvironmentId ?? null,
+        instanceDefaultEnvironmentId: resolveCompanyEnvironmentDefault(instanceSettingsForLogin, createdCompanyId),
         localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(loginEnvironmentList),
         managedSandboxOnly: experimentalSettingsForLogin?.enableManagedSandboxOnly === true,
         managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(loginEnvironmentList),
@@ -976,7 +978,8 @@ function OnboardingWizardInner({
       return null;
     }
   }, [
-    instanceSettingsForLogin?.defaultEnvironmentId,
+    instanceSettingsForLogin,
+    createdCompanyId,
     loginEnvironmentList,
     experimentalSettingsForLogin?.enableManagedSandboxOnly,
   ]);
@@ -1819,6 +1822,7 @@ function OnboardingWizardInner({
     const adapter = getUIAdapter(adapterType);
     const config = adapter.buildAdapterConfig({
       ...defaultCreateValues,
+      ...setupEngineValues(resolvedLoginEnvironment?.driver),
       adapterType,
       model:
         adapterType === "gemini_local"
@@ -1935,7 +1939,7 @@ function OnboardingWizardInner({
       // catch surfaces as a fail-closed error rather than a local host probe.
       const environmentId = resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: null,
-        instanceDefaultEnvironmentId: settings?.defaultEnvironmentId ?? null,
+        instanceDefaultEnvironmentId: resolveCompanyEnvironmentDefault(settings, createdCompanyId),
         localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(environmentList),
         managedSandboxOnly,
         managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(environmentList),

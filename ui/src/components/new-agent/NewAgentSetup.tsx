@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { setupEngineValues } from "@/lib/agent-setup-fields";
 import { AgentCharacter } from "../AgentCharacter";
 import { useAgentAppearanceDraft } from "../../hooks/useAgentAppearanceDraft";
@@ -243,7 +244,7 @@ function Setup({
       : resolveAdapterTestEnvironmentId({
           agentDefaultEnvironmentId: environmentOverride || null,
           instanceDefaultEnvironmentId:
-            settings.data?.defaultEnvironmentId ?? null,
+            resolveCompanyEnvironmentDefault(settings.data, companyId),
           localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(
             envs.data ?? [],
           ),

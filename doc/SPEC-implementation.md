@@ -1173,6 +1173,15 @@ Queue and triage mutations accept board non-viewers and active standard-scope ag
 
 The attention feed returns server-computed `shelf`, `retentionDays`, `keep`, `archivedAt`, and `retentionVersion` fields. Archived rows are excluded by default and selected with `archived=true`. Bulk archive proposals bind the exact source identities, per-item reasons, activity timestamps, and expected retention versions into the signed decisions-v1 target snapshots; acceptance re-authorizes both proposer and decider and commits all rows or none.
 
+### Company execution-default overrides
+
+Self-hosted instance administrators may select a default execution environment
+for each company in `instance_settings.general.companyEnvironmentDefaults`.
+Explicit agent selections retain precedence; absent company overrides preserve
+instance and local defaults. Probes and runtime dispatch resolve identically,
+managed execution restrictions remain enforced, and company-scoped secrets
+remain the credential boundary. This config does not grant worker access.
+
 ## 11. Heartbeat and Adapter Contract
 
 ## 11.1 Adapter Interface

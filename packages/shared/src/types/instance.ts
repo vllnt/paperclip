@@ -38,6 +38,8 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /** Instance-admin selected execution defaults, keyed by company ID. */
+  companyEnvironmentDefaults?: Record<string, string>;
 }
 
 export interface InstanceExperimentalSettings {

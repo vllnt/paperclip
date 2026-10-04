@@ -1289,4 +1289,37 @@ describe("instance settings routes", () => {
       expect(mockHeartbeatService.applyTaskDrain).not.toHaveBeenCalled();
     });
   });
+  it("stores an admin-selected company environment default", async () => {
+    const companyId = "11111111-1111-4111-8111-111111111111";
+    const environmentId = "22222222-2222-4222-8222-222222222222";
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue([companyId]);
+    mockEnvironmentService.getById.mockResolvedValue({ id: environmentId, driver: "ssh", status: "active", config: {} });
+    mockInstanceSettingsService.updateGeneral.mockImplementation(async (patch) => patch);
+    const app = createApp({ type: "board", source: "session", isInstanceAdmin: true, userId: "owner" });
+    const response = await request(app).patch("/api/instance/settings/general")
+      .send({ companyEnvironmentDefaults: { [companyId]: environmentId } });
+    expect(response.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ companyEnvironmentDefaults: { [companyId]: environmentId } });
+  });
+
+  it("rejects a company default for an unknown company before writing", async () => {
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue([]);
+    const app = createApp({ type: "board", source: "session", isInstanceAdmin: true, userId: "owner" });
+    const response = await request(app).patch("/api/instance/settings/general")
+      .send({ companyEnvironmentDefaults: { "11111111-1111-4111-8111-111111111111": "22222222-2222-4222-8222-222222222222" } });
+    expect(response.status).toBe(422);
+    expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  it("rejects an archived company default before writing", async () => {
+    const companyId = "11111111-1111-4111-8111-111111111111";
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue([companyId]);
+    mockEnvironmentService.getById.mockResolvedValue({ id: "22222222-2222-4222-8222-222222222222", driver: "ssh", status: "archived", config: {} });
+    const app = createApp({ type: "board", source: "session", isInstanceAdmin: true, userId: "owner" });
+    const response = await request(app).patch("/api/instance/settings/general")
+      .send({ companyEnvironmentDefaults: { [companyId]: "22222222-2222-4222-8222-222222222222" } });
+    expect(response.status).toBe(422);
+    expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
 });

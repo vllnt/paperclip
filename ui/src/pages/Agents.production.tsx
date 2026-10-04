@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { useState, useEffect, useMemo, lazy, Suspense } from "react";
 import { Link, useNavigate, useLocation } from "@/lib/router";
@@ -309,13 +310,13 @@ export function Agents() {
         resolveAgentEnvironment(
           agent,
           environmentsById,
-          instanceSettings?.defaultEnvironmentId ?? null,
+          resolveCompanyEnvironmentDefault(instanceSettings, selectedCompanyId),
           environmentCapabilities,
         ),
       );
     }
     return map;
-  }, [agents, environmentsById, environmentCapabilities, instanceSettings?.defaultEnvironmentId]);
+  }, [agents, environmentsById, environmentCapabilities, instanceSettings, selectedCompanyId]);
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Agents" }]);

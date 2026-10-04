@@ -145,6 +145,7 @@ const mockEnvironmentsApi = vi.hoisted(() => ({
 }));
 const mockInstanceSettingsApi = vi.hoisted(() => ({
   get: vi.fn(),
+  updateGeneral: vi.fn(),
   getExperimental: vi.fn(),
 }));
 const mockSecretsApi = vi.hoisted(() => ({
@@ -1661,7 +1662,25 @@ describe("CompanyEnvironments — test provider button", () => {
     }
   });
 
-  it("offers the implicit Local option in the default picker by default", async () => {
+  it("shows this company's default and preserves another company's mapping when edited", async () => {
+    mockInstanceSettingsApi.get.mockResolvedValue({ defaultEnvironmentId: "env-2", general: { companyEnvironmentDefaults: { "company-1": "env-1", "company-2": "env-2" } } });
+    mockInstanceSettingsApi.updateGeneral.mockResolvedValue({});
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => { root!.render(renderCompanyEnvironments(queryClient)); });
+    await flushReact();
+    const select = container.querySelector<HTMLSelectElement>('select[aria-label="Company default environment"]')!;
+    expect(select.value).toBe("env-1");
+    await act(async () => {
+      select.value = "env-2";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await waitForAssertion(() => {
+      expect(mockInstanceSettingsApi.updateGeneral).toHaveBeenCalledWith({ companyEnvironmentDefaults: { "company-1": "env-2", "company-2": "env-2" } });
+    });
+  });
+
+  it("offers inheritance from the instance default for a company without an override", async () => {
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
@@ -1671,7 +1690,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await flushReact();
 
     const options = Array.from(container.querySelectorAll("option"));
-    expect(options.some((option) => option.textContent?.trim() === "Local")).toBe(true);
+    expect(options.some((option) => option.textContent?.trim() === "Inherit instance default")).toBe(true);
   });
 
   it("hides the implicit Local option in the default picker under managed-sandbox-only", async () => {
@@ -1688,7 +1707,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await flushReact();
 
     const options = Array.from(container.querySelectorAll("option"));
-    expect(options.some((option) => option.textContent?.trim() === "Local")).toBe(false);
+    expect(options.some((option) => option.textContent?.trim() === "Inherit instance default")).toBe(false);
     // Saved non-local environments remain selectable defaults.
     expect(options.some((option) => option.textContent?.includes("Alpha"))).toBe(true);
   });
@@ -1818,7 +1837,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await waitForAssertion(() => {
       expect(
         document.body.querySelector("[data-testid='environment-delete-dialog']")?.textContent,
-      ).toContain("Cannot delete the current instance default environment");
+      ).toContain("Cannot delete an environment used as an instance or company default");
     });
 
     const confirm = document.body.querySelector<HTMLButtonElement>(

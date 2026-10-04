@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { AiConnectionField } from "./ai-connections/AiConnectionField";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { testAgentSetup } from "@/lib/test-agent-setup";
@@ -778,11 +779,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     [currentDefaultEnvironmentId, environments],
   );
   const instanceDefaultEnvironmentId = useMemo(() => {
-    const environmentId = instanceSettings?.defaultEnvironmentId ?? null;
+    const environmentId = resolveCompanyEnvironmentDefault(instanceSettings, selectedCompanyId);
     if (!environmentId) return "";
     const selected = environments.find((environment) => environment.id === environmentId) ?? null;
     return selected?.driver === "local" ? "" : environmentId;
-  }, [environments, instanceSettings?.defaultEnvironmentId]);
+  }, [environments, instanceSettings, selectedCompanyId]);
   const instanceDefaultEnvironment = useMemo(
     () => environments.find((environment) => environment.id === instanceDefaultEnvironmentId) ?? null,
     [environments, instanceDefaultEnvironmentId],
@@ -807,7 +808,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     try {
       return resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: rawCurrentDefaultEnvironmentId || null,
-        instanceDefaultEnvironmentId: instanceSettings?.defaultEnvironmentId ?? null,
+        instanceDefaultEnvironmentId: resolveCompanyEnvironmentDefault(instanceSettings, selectedCompanyId),
         localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(environments),
         managedSandboxOnly: experimentalSettings?.enableManagedSandboxOnly === true,
         managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(environments),
@@ -822,7 +823,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     }
   }, [
     rawCurrentDefaultEnvironmentId,
-    instanceSettings?.defaultEnvironmentId,
+    instanceSettings,
+    selectedCompanyId,
     environments,
     experimentalSettings?.enableManagedSandboxOnly,
   ]);
@@ -1048,7 +1050,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       // surfaces as a fail-closed error rather than a local host probe.
       const environmentId = resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: rawCurrentDefaultEnvironmentId || null,
-        instanceDefaultEnvironmentId: settings?.defaultEnvironmentId ?? null,
+        instanceDefaultEnvironmentId: resolveCompanyEnvironmentDefault(settings, selectedCompanyId),
         localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(environmentList),
         managedSandboxOnly,
         managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(environmentList),

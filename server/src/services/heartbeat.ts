@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
@@ -20905,7 +20906,7 @@ export function heartbeatService(
       const environmentResolution = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
         instanceDefaultEnvironmentId:
-          resolvedInstanceSettings.defaultEnvironmentId ?? null,
+          resolveCompanyEnvironmentDefault(resolvedInstanceSettings, agent.companyId),
         localDefaultEnvironmentId: localEnvironment.id,
         managedSandboxOnly,
         managedSandboxEnvironmentId: managedSandboxEnvironment?.id ?? null,

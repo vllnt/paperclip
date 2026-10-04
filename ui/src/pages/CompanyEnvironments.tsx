@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import {
   useCallback,
   useEffect,
@@ -101,7 +102,7 @@ function environmentDeleteBlockMessage(impact: EnvironmentDeleteBlastRadius): st
     return "Cannot delete the managed local environment.";
   }
   if (impact.staticReferences.isInstanceDefault) {
-    return "Cannot delete the current instance default environment. Set a new default environment before deleting this one.";
+    return "Cannot delete an environment used as an instance or company default. Change its defaults before deleting it.";
   }
   if (impact.pendingCleanupLeaseCount > 0) {
     return "Cannot delete this environment while a sandbox cleanup is pending. Wait for the cleanup sweep to destroy the orphan sandbox, then retry.";
@@ -1511,13 +1512,21 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
   });
 
   const defaultEnvironmentMutation = useMutation({
-    mutationFn: async (defaultEnvironmentId: string | null) =>
-      await instanceSettingsApi.update({ defaultEnvironmentId }),
+    mutationFn: async (defaultEnvironmentId: string | null) => {
+      if (!selectedCompanyId) throw new Error("Select a company first.");
+      const defaults = { ...instanceSettings?.general?.companyEnvironmentDefaults };
+      if (defaultEnvironmentId) defaults[selectedCompanyId] = defaultEnvironmentId;
+      else delete defaults[selectedCompanyId];
+      return instanceSettingsApi.updateGeneral({ companyEnvironmentDefaults: defaults });
+    },
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.instance.settings });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.instance.settings }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.instance.generalSettings }),
+      ]);
       pushToast({
         title: "Default environment updated",
-        body: "Agent inheritance now follows the updated instance default.",
+        body: "Agents in this company now inherit the selected environment.",
         tone: "success",
       });
     },
@@ -1855,7 +1864,7 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
   const editingSandboxDisplayName = editingSandboxCapability?.displayName ?? editingSandboxProvider ?? "sandbox";
   const nonLocalEnvironments = savedEnvironments.filter((environment) => !isLocalEnvironment(environment));
   const instanceDefaultEnvironmentId = normalizeNonLocalEnvironmentId(
-    instanceSettings?.defaultEnvironmentId ?? null,
+    resolveCompanyEnvironmentDefault(instanceSettings, selectedCompanyId),
     savedEnvironments,
   );
   const instanceDefaultEnvironment =
@@ -1959,10 +1968,10 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
       <div className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <label className="flex flex-wrap items-center gap-3 text-sm font-medium">
-            <span>Default</span>
+            <span>Company default</span>
             <span>
               <select
-                aria-label="Default environment"
+                aria-label="Company default environment"
                 className="min-w-(--sz-12rem) max-w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm font-normal outline-none"
                 value={instanceDefaultEnvironmentId}
                 onChange={(event) =>
@@ -1979,7 +1988,7 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
                     </option>
                   ) : null
                 ) : (
-                  <option value="">Local</option>
+                  <option value="">Inherit instance default</option>
                 )}
                 {nonLocalEnvironments.map((environment) => (
                   <option key={environment.id} value={environment.id}>

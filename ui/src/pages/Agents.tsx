@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { useAgentChatEnabled } from "../hooks/useAgentChatEnabled";
 import { useState, useEffect, useMemo, lazy, Suspense } from "react";
@@ -314,13 +315,13 @@ export function Agents({ initialView = "list" }: { initialView?: AgentsView } = 
         resolveAgentEnvironment(
           agent,
           environmentsById,
-          instanceSettings?.defaultEnvironmentId ?? null,
+          resolveCompanyEnvironmentDefault(instanceSettings, selectedCompanyId),
           environmentCapabilities,
         ),
       );
     }
     return map;
-  }, [agents, environmentsById, environmentCapabilities, instanceSettings?.defaultEnvironmentId]);
+  }, [agents, environmentsById, environmentCapabilities, instanceSettings, selectedCompanyId]);
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Agents" }]);

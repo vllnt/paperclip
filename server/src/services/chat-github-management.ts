@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { githubBotCredentials } from "./chat-github-client.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { agents, toolCatalogEntries } from "@paperclipai/db";
@@ -500,7 +501,7 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
         const selected = resolveExecutionWorkspaceEnvironmentId({
           agentDefaultEnvironmentId: agent.defaultEnvironmentId,
           instanceDefaultEnvironmentId:
-            (await settings.get()).defaultEnvironmentId ?? null,
+            resolveCompanyEnvironmentDefault(await settings.get(), bot.companyId),
           localDefaultEnvironmentId: local.id,
           managedSandboxOnly: experimental.enableManagedSandboxOnly,
           managedSandboxEnvironmentId: managed?.id,

@@ -32,6 +32,7 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  companyEnvironmentDefaults: z.record(z.string().guid(), z.string().guid()).optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

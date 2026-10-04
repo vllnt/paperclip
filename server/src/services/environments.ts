@@ -1166,6 +1166,8 @@ export function environmentService(db: Db) {
             sql`not exists (
               select 1 from ${instanceSettings}
               where ${instanceSettings.defaultEnvironmentId} = ${environments.id}
+                 or exists (select 1 from jsonb_each_text(coalesce(${instanceSettings.general} -> 'companyEnvironmentDefaults', '{}'::jsonb)) as company_default
+                            where company_default.value = ${environments.id}::text)
             )`,
             // A `pending_cleanup` lease is the durable teardown reference for an
             // orphan sandbox. The environment foreign key uses
@@ -1243,7 +1245,9 @@ export function environmentService(db: Db) {
         db
           .select({ count: sql<number>`count(*)::int` })
           .from(instanceSettings)
-          .where(eq(instanceSettings.defaultEnvironmentId, id)),
+          .where(sql`${instanceSettings.defaultEnvironmentId} = ${id}
+            or exists (select 1 from jsonb_each_text(coalesce(${instanceSettings.general} -> 'companyEnvironmentDefaults', '{}'::jsonb)) as company_default
+                       where company_default.value = ${id})`),
         db
           .select({ count: sql<number>`count(*)::int` })
           .from(agents)

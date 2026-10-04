@@ -1,4 +1,4 @@
-export const DEFAULT_CLAUDE_LOCAL_MODEL = "claude-opus-5";
+export const DEFAULT_CLAUDE_LOCAL_MODEL = "claude-opus-5-5";
 
 /** Resolve Paperclip's default without replacing an explicit provider model. */
 export function resolveClaudeModel(
@@ -27,6 +27,7 @@ export const label = "Claude Code";
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
 
 export const models = [
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-fable-5-1", label: "Claude Fable 5.1" },

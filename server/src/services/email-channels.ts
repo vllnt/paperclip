@@ -1,3 +1,4 @@
+import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { createHash, randomUUID } from "node:crypto";
 import WebSocket from "ws";
@@ -648,7 +649,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       const selected = resolveExecutionWorkspaceEnvironmentId({
         agentDefaultEnvironmentId: agent.defaultEnvironmentId,
         instanceDefaultEnvironmentId:
-          (await settings.get()).defaultEnvironmentId ?? null,
+          resolveCompanyEnvironmentDefault(await settings.get(), companyId),
         localDefaultEnvironmentId: local.id,
         managedSandboxOnly: experimental.enableManagedSandboxOnly,
         managedSandboxEnvironmentId: managed?.id,
