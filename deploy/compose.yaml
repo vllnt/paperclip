@@ -1,6 +1,6 @@
 services:
   paperclip:
-    image: ghcr.io/vllnt/paperclip@sha256:c7742dcc305f5b58a712246f35e4a4904e2323effefeb780c80e390cbe1a6042
+    image: ghcr.io/vllnt/paperclip@sha256:535787a171cd123147d157305d7f7eecddee715b2010b225e815b2d10b73871f
     restart: unless-stopped
     user: "1000:1000"
     read_only: true
@@ -15,6 +15,7 @@ services:
       PAPERCLIP_DEPLOYMENT_MODE: authenticated
       PAPERCLIP_DEPLOYMENT_EXPOSURE: private
       PAPERCLIP_PUBLIC_URL: ${PAPERCLIP_PUBLIC_URL:?required}
+      PAPERCLIP_AI_GATEWAY_ALLOWED_ORIGINS: ${PAPERCLIP_AI_GATEWAY_ALLOWED_ORIGINS:-}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?required}
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: ${PAPERCLIP_TOOL_ACTION_SIGNING_SECRET:?required}
       PAPERCLIP_SECRETS_MASTER_KEY_FILE: /run/secrets/master-key
