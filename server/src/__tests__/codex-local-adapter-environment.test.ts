@@ -7,13 +7,22 @@ import { testEnvironment } from "@paperclipai/adapter-codex-local/server";
 const itWindows = process.platform === "win32" ? it : it.skip;
 const itPosix = process.platform === "win32" ? it.skip : it;
 
-async function runProbeFixture(options: { failCleanup?: boolean; error?: string } = {}) {
+async function runProbeFixture(options: { failCleanup?: boolean; error?: string; managedConfig?: string; missingManagedConfig?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-probe-result-"));
   const capture = path.join(root, "capture.json");
   const command = path.join(root, "codex");
+  const managedHome = path.join(root, "managed-home");
+  if (options.managedConfig && !options.missingManagedConfig) {
+    await fs.mkdir(managedHome);
+    await fs.writeFile(path.join(managedHome, "config.toml"), options.managedConfig);
+  }
   await fs.writeFile(command, `#!${process.execPath}
 const fs = require('node:fs');
-fs.writeFileSync(process.env.PROBE_CAPTURE, JSON.stringify({ args: process.argv.slice(2), home: process.env.CODEX_HOME }));
+const config = fs.readFileSync(require('node:path').join(process.env.CODEX_HOME, 'config.toml'), 'utf8');
+fs.writeFileSync(process.env.PROBE_CAPTURE, JSON.stringify({ args: process.argv.slice(2), home: process.env.CODEX_HOME, config }));
+if (process.env.PROBE_REQUIRE_GATEWAY && !config.includes('model_provider = "paperclip_gateway"')) {
+  console.error('Probe discarded the selected gateway routing'); process.exit(1);
+}
 console.error('WARN codex_core_plugins::manager: remote installed plugin bundle sync failed error=chatgpt authentication required for remote plugin catalog');
 const error = process.env.PROBE_ERROR;
 if (error) { console.error(error); process.exit(1); }
@@ -27,12 +36,15 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_t
   try {
     const result = await testEnvironment({
       companyId: "company-1", adapterType: "codex_local",
-      config: { engine: "cli", command, cwd: root, env: {
+      config: { engine: "cli", command, cwd: root,
+        ...(options.managedConfig ? { managedAiConnection: { method: "api_key" } } : {}),
+        env: {
+        ...(options.managedConfig ? { CODEX_HOME: managedHome, PAPERCLIP_CODEX_PROVIDERS: "", PROBE_REQUIRE_GATEWAY: "1" } : {}),
         OPENAI_API_KEY: "fixture-key", PROBE_CAPTURE: capture,
         PROBE_ERROR: options.error ?? "", PATH: `${root}${path.delimiter}${process.env.PATH ?? ""}`,
       } },
     });
-    return { result, capture: JSON.parse(await fs.readFile(capture, "utf8")) as { args: string[]; home: string } };
+    return { result, capture: JSON.parse(await fs.readFile(capture, "utf8")) as { args: string[]; home: string; config: string } };
   } finally {
     const recorded = await fs.readFile(capture, "utf8").then(JSON.parse).catch(() => null);
     if (recorded?.home) await fs.rm(recorded.home, { recursive: true, force: true });
@@ -46,6 +58,16 @@ describe("codex_local environment diagnostics", () => {
   });
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+  const managedConfig = 'cli_auth_credentials_store = "file"\nmodel_provider = "paperclip_gateway"\n[model_providers.paperclip_gateway]\nbase_url = "https://gateway.example/v1"\nenv_key = "OPENAI_API_KEY"\nwire_api = "responses"\nrequires_openai_auth = false\n';
+  itPosix("retains managed gateway routing in the disposable Codex hello probe", async () => {
+    const { result, capture } = await runProbeFixture({ managedConfig });
+    expect(result.status).toBe("pass");
+    expect(capture.config).toBe(managedConfig);
+    expect(result.checks).toContainEqual(expect.objectContaining({ code: "codex_hello_probe_passed" }));
+  });
+  itPosix("does not launch with default routing when a managed config is missing", async () => {
+    await expect(runProbeFixture({ managedConfig, missingManagedConfig: true })).rejects.toThrow();
   });
   itPosix("preserves a successful hello when probe cleanup races a background writer", async () => {
     const { result } = await runProbeFixture({ failCleanup: true });

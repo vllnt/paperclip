@@ -20,6 +20,7 @@ import {
 import {
   AI_CONNECTION_CAPABILITIES,
   aiConnectionMetadataSchema,
+  aiGatewayConfigSchema,
   aiSubscriptionNeedsIsolatedLogin,
   isAiConnectionCompatible,
   type AiConnectionBinding,
@@ -133,6 +134,7 @@ export function aiConnectionService(db: Db) {
           companyId,
           ...metadata.data,
           name: connection.name,
+          ...(connection.config.aiGateway ? { gateway: aiGatewayConfigSchema.parse(connection.config.aiGateway) } : {}),
           accountLabel: grant.providerTenant?.name,
           ...(needsReconnect ? { unavailableReason: "Reconnect with a separate sign-in to protect your existing terminal login." } : {}),
           ownership:
@@ -373,7 +375,26 @@ export function aiConnectionService(db: Db) {
       } satisfies AiConnectionAttribution,
     };
   }
-  async function credential(row: Awaited<ReturnType<typeof select>>) {
+  /** A board-side gateway test uses the human audience, without impersonating an agent. */
+  async function gatewayForTest(companyId: string, userId: string, connectionId: string, grantId: string) {
+    if (!(await membership(companyId, userId))) throw forbidden("An active company member must test this connection");
+    const row = (await rows(companyId)).find(r => r.connection.id === connectionId && r.grant.id === grantId);
+    if (!row) throw notFound("AI connection not found");
+    const audience = await db.select().from(connectionGrantMembers).where(and(
+      eq(connectionGrantMembers.companyId, companyId), eq(connectionGrantMembers.grantId, grantId),
+    ));
+    if (!canUseCredential(row.grant, userId, audience)) throw forbidden("You cannot use this connection's credentials");
+    if (row.grant.status !== "active" || !row.connection.enabled || row.connection.status !== "active") {
+      throw unprocessable("Reconnect this connection before testing it");
+    }
+    const metadata = aiConnectionMetadataSchema.parse(row.connection.config.ai);
+    const gateway = aiGatewayConfigSchema.safeParse(row.connection.config.aiGateway);
+    if (!gateway.success || metadata.method !== "api_key" || (metadata.provider !== "openai" && metadata.provider !== "anthropic")) {
+      throw unprocessable("This connection is not a supported API gateway");
+    }
+    return { ...row, gateway: gateway.data, provider: metadata.provider };
+  }
+  async function credential(row: Pick<Awaited<ReturnType<typeof select>>, "connection" | "grant">) {
     const ref = row.grant.credentialSecretRefs.find(
       (r) => r.configPath === "ai.credential",
     );
@@ -435,6 +456,7 @@ export function aiConnectionService(db: Db) {
     sessionId?: string,
     attemptStartedAt = new Date(),
   ) {
+    const gateway = "gateway" in input ? input.gateway : undefined;
     if (!(await membership(companyId, userId)))
       throw forbidden("An active company member must own this connection");
     const reconnect = input.connectionId
@@ -466,6 +488,9 @@ export function aiConnectionService(db: Db) {
       throw unprocessable(
         "Reconnect cannot change the sign-in method or ownership",
       );
+    if (reconnect && JSON.stringify(reconnect.connection.config.aiGateway ?? null) !== JSON.stringify(gateway ?? null)) {
+      throw unprocessable("Reconnect cannot change the gateway address. Create a new connection to use a different server.");
+    }
     const id = reconnect?.connection.id ?? randomUUID();
     const grantId = reconnect?.grant.id ?? randomUUID();
     return db.transaction(async (tx) => {
@@ -649,6 +674,7 @@ export function aiConnectionService(db: Db) {
             config: {
               sourceTemplateKey: input.provider,
               ai: { provider: input.provider, method: input.method },
+              ...(gateway ? { aiGateway: gateway } : {}),
               aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
             },
             createdByUserId: userId,
@@ -775,5 +801,5 @@ export function aiConnectionService(db: Db) {
       return { connectionId: id, grantId };
     });
   }
-  return { list, select, credential, save, setDefault, membership };
+  return { list, select, credential, save, setDefault, membership, gatewayForTest };
 }

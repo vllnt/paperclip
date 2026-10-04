@@ -1,3 +1,5 @@
+import { useCompany } from "@/context/CompanyContext";
+import { PluginSlotOutlet } from "@/plugins/slots";
 import { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -9,7 +11,6 @@ import {
 } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { AiConnectionPicker } from "./AiConnectionPicker";
-import { AiConnectionLegacyNotice } from "./AiConnectionManagement";
 import { AiConnectionCredentialStep } from "./AiConnectionCredentialStep";
 import { Button } from "@/components/ui/button";
 import {
@@ -56,10 +57,11 @@ export function AiConnectionField({
   legacy?: boolean;
   readOnly?: boolean;
 }) {
+  const { companies } = useCompany();
+  const companyPrefix = companies.find(company => company.id === companyId)?.issuePrefix ?? null;
   const provider = aiProviderForAdapter(adapterType);
   const returnFocus = useRef<HTMLElement | null>(null);
   const restoreFocus = (event: Event) => { event.preventDefault(); returnFocus.current?.focus(); };
-  const [adopting, setAdopting] = useState(false);
   const [pendingAdoption, setPendingAdoption] = useState<AiConnectionBinding>();
   const [connecting, setConnecting] = useState(false);
   const changeBinding = (next: AiConnectionBinding) => {
@@ -76,13 +78,14 @@ export function AiConnectionField({
     ?? accounts.data?.connections.find((account) => account.provider === provider && account.isDefault)?.method
     ?? (provider === "openrouter" ? "api_key" : "subscription");
   if (!provider) return null;
-  if (legacy && !value && !adopting)
-    return (
-      <AiConnectionLegacyNotice
-        readOnly={readOnly}
-        onAdopt={() => setAdopting(true)}
-      />
-    );
+  const providerActions = agentId && !readOnly && (provider === "openai" || provider === "anthropic") ? (
+    <PluginSlotOutlet
+      slotTypes={["toolbarButton"]}
+      entityType="agent"
+      context={{ companyId, companyPrefix, entityId: agentId, entityType: "agent" }}
+      className="flex items-center justify-end gap-2"
+    />
+  ) : null;
   return (
     <div className="space-y-4">
       {value && (adapterType !== "opencode_local" || Boolean(model)) && !isAiConnectionCompatible(value, adapterType, model) && (
@@ -99,6 +102,7 @@ export function AiConnectionField({
         agentId={agentId ?? ""}
         agentName={agentName}
         readOnly={readOnly}
+        unmanaged={legacy && !value}
         loading={accounts.isPending}
         error={accounts.error?.message}
         onChange={(binding) =>
@@ -107,6 +111,7 @@ export function AiConnectionField({
         onConnect={() => { returnFocus.current = document.activeElement as HTMLElement; setConnecting(true); }}
         onRetry={() => void accounts.refetch()}
       />
+      {providerActions}
       <Dialog
         open={Boolean(pendingAdoption)}
         onOpenChange={(open) => {

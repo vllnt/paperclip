@@ -111,6 +111,11 @@ vi.mock("../services/ai-connection-runtime.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/ai-connection-runtime.js")>()),
   prepareManagedAiRuntime: mockPrepareManagedAiRuntime,
 }));
+const mockValidateAiGatewayKey = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("../services/ai-gateway.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/ai-gateway.js")>()),
+  validateAiGatewayKey: mockValidateAiGatewayKey,
+}));
 const mockValidateAiApiKey = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock("../routes/ai-connections.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../routes/ai-connections.js")>()),
@@ -447,6 +452,26 @@ describe("agent test-environment route", () => {
       unregisterServerAdapter("claude_local");
       if (previous) registerServerAdapter(previous);
     }
+  });
+
+  it.each(["anthropic", "openai"] as const)("reverifies managed %s gateway adoption only at its selected endpoint", async provider => {
+    const gateway = { baseUrl: "https://proxy.example" };
+    mockPrepareManagedAiRuntime.mockImplementation(async (_db: unknown, input: { config: Record<string, unknown> }) => ({
+      config: { ...input.config, managedAiConnection: { method: "api_key", gateway },
+        env: { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "fixture-proxy", OPENAI_API_KEY: "fixture-proxy" } },
+      cleanup: async () => {},
+    }));
+    const app = await createApp();
+    const send = () => request(app).post("/api/companies/company-1/adapters/external_test/test-environment").send({
+      adapterConfig: { cwd: "/", model: "proxy-model" }, aiConnection: { provider, method: "api_key", mode: "responsible_user" },
+    });
+    const accepted = await send();
+    expect(accepted.body.status).toBe("pass");
+    expect(mockValidateAiGatewayKey).toHaveBeenCalledWith(provider, gateway, "fixture-proxy", "proxy-model");
+    expect(mockValidateAiApiKey).not.toHaveBeenCalled();
+    mockValidateAiGatewayKey.mockRejectedValueOnce(new Error("gateway rejected"));
+    expect((await send()).body.status).toBe("fail");
+    expect(mockValidateAiApiKey).not.toHaveBeenCalled();
   });
 
   it("fails adoption of an api_key connection the provider no longer accepts", async () => {

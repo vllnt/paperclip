@@ -185,6 +185,14 @@ describe("plugin managed skill validators", () => {
 });
 
 describe("plugin UI slot validators", () => {
+  it("retains an optional sidebar section and preserves existing declarations", () => {
+    const slot = { type: "sidebar", id: "providers", displayName: "Providers", exportName: "ProvidersSidebar" };
+    expect(pluginUiSlotDeclarationSchema.parse({ ...slot, sidebarSection: "org" }).sidebarSection).toBe("org");
+    expect(pluginUiSlotDeclarationSchema.parse({ ...slot, sidebarSection: "work" }).sidebarSection).toBe("work");
+    expect(pluginUiSlotDeclarationSchema.parse(slot).sidebarSection).toBeUndefined();
+    expect(pluginUiSlotDeclarationSchema.safeParse({ ...slot, sidebarSection: "invalid" }).success).toBe(false);
+    expect(pluginUiSlotDeclarationSchema.safeParse({ ...slot, type: "page", sidebarSection: "org" }).success).toBe(false);
+  });
   it("accepts route-scoped sidebar slots with a routePath", () => {
     const parsed = pluginUiSlotDeclarationSchema.parse({
       type: "routeSidebar",

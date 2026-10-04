@@ -27,9 +27,11 @@ beforeAll(async () => {
   vi.stubEnv("PAPERCLIP_INSTANCE_ID", "hire-ai");
   database = await startEmbeddedPostgresTestDatabase("paperclip-hire-ai-db-");
   db = createDb(database.connectionString);
+  vi.spyOn(process, "cwd").mockReturnValue(home);
 }, 90_000);
 
 afterAll(async () => {
+  vi.restoreAllMocks();
   await database?.cleanup();
   vi.unstubAllEnvs();
   if (home) await rm(home, { recursive: true, force: true });

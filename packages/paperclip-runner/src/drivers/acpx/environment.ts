@@ -28,9 +28,10 @@ export function createSanitizedAcpxSpawnInput(
     agent === "pi"
       ? ["OPENROUTER_API_KEY"]
       : agent === "claude"
-        ? ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
+        ? ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
         : [
             "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
             "CODEX_API_KEY",
           ];
   const allowed = new Set([

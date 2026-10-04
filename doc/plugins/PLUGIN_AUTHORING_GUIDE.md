@@ -617,3 +617,13 @@ pnpm build
 
 For image-supplied plugins and the persistent shell lifecycle, see
 [Distribution plugins](DISTRIBUTION-PLUGINS.md).
+
+## VLLNT fork: bundled Providers
+
+`packages/plugins/plugin-providers` is the fork-owned Providers setup plugin,
+auto-installed on self-hosted startup once built. It contributes **Org → Providers**
+and uses the owning AI Connections API, credential vault, and access controls.
+It does not manage a proxy server or store its own copy of credentials.
+See [AI Connections](../connections/AI-CONNECTIONS.md#existing-cliproxyapi-and-compatible-gateways)
+for origin approval and supported client protocols. Other plugins continue to use
+the external package workflow.

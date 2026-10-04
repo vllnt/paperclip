@@ -210,6 +210,7 @@ export function Sidebar() {
           ) : null}
           <PluginSlotOutlet
             slotTypes={["sidebar"]}
+            sidebarSection="work"
             context={pluginContext}
             className="flex flex-col gap-0.5"
             itemClassName="text-(length:--text-compact) font-medium"
@@ -230,6 +231,14 @@ export function Sidebar() {
 
         <SidebarSection label="Company" collapsible={{ open: companyOpen, onOpenChange: setCompanyOpen }}>
           <SidebarNavItem to="/org" label="Org" icon={Network} />
+          <PluginSlotOutlet
+            slotTypes={["sidebar"]}
+            sidebarSection="org"
+            context={pluginContext}
+            className="flex flex-col gap-0.5"
+            itemClassName="text-(length:--text-compact) font-medium"
+            missingBehavior="placeholder"
+          />
           {showApps ? <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} /> : null}
           <SidebarNavItem to="/timeline" label="Timeline" icon={GanttChartSquare} />
           <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />

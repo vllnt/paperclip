@@ -1,3 +1,4 @@
+import { DEFAULT_CLAUDE_LOCAL_MODEL } from "../index.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -251,6 +252,24 @@ function buildContext(root: string, overrides: Partial<AdapterExecutionContext> 
 }
 
 describe("claude_local ACP lane", () => {
+  it("passes managed gateway credentials and the proxy model to ACP startup", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-gateway-");
+    const meta: AdapterInvocationMeta[] = [];
+    let launchEnv: unknown;
+    const execute = createClaudeAcpExecutor({ createRuntime: (options: FakeRuntimeOptions) => Object.assign(new FakeRuntime(options), { ensureSession: async function (input: Parameters<FakeRuntime["ensureSession"]>[0] & { sessionOptions?: { env?: unknown } }) { launchEnv = input.sessionOptions?.env; return FakeRuntime.prototype.ensureSession.call(this, input); } }) as never });
+    const result = await execute(buildContext(root, {
+      config: { engine: "acp", cwd: root, stateDir: path.join(root, "state"), model: "proxy-custom-model",
+        managedAiConnection: { method: "api_key" }, env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:18317",
+          ANTHROPIC_AUTH_TOKEN: "fixture-proxy", ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "" } },
+      onMeta: async payload => { meta.push(payload); },
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(JSON.stringify(meta)).not.toContain("fixture-proxy");
+    expect(result.billingType).toBe("api");
+    expect(launchEnv).toMatchObject({ ANTHROPIC_BASE_URL: "http://127.0.0.1:18317", ANTHROPIC_AUTH_TOKEN: "fixture-proxy",
+      ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "", ANTHROPIC_MODEL: "proxy-custom-model" });
+  });
+
   it("uses the same default model in ACP startup and session identity", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-default-");
     const meta: AdapterInvocationMeta[] = [];
@@ -261,7 +280,20 @@ describe("claude_local ACP lane", () => {
       onMeta: async (payload) => { meta.push(payload); },
     }));
     expect(result.exitCode).toBe(0);
-    expect(meta[0]?.env?.ANTHROPIC_MODEL).toBe("claude-opus-5");
+    expect(meta[0]?.env?.ANTHROPIC_MODEL).toBe(DEFAULT_CLAUDE_LOCAL_MODEL);
+  });
+
+  it("recognizes a managed gateway bearer key during ACP environment validation without a subscription probe", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-gateway-test-");
+    const command = path.join(root, "claude-agent-acp");
+    await fs.writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const result = await testClaudeAcpEnvironment({ adapterType: "claude_local", companyId: "company-1", config: {
+      engine: "acp", cwd: root, agentCommand: command, managedAiConnection: { method: "api_key" },
+      env: { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "fixture-proxy", ANTHROPIC_BASE_URL: "http://127.0.0.1:18317" },
+    } });
+    expect(result.checks).toContainEqual(expect.objectContaining({ code: "claude_acp_anthropic_api_key_detected", level: "info" }));
+    expect(result.checks.some(check => check.code.includes("hello_probe"))).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("fixture-proxy");
   });
 
   it("keeps ACP model precedence consistent with CLI and provider overrides", () => {
@@ -1338,6 +1370,13 @@ describe("resolveClaudeAcpBillingIdentity", () => {
     expect(
       resolveClaudeAcpBillingIdentity({ config: { env: { ANTHROPIC_API_KEY: "sk-ant-test" } } }),
     ).toEqual({ provider: "anthropic", biller: "anthropic", billingType: "api" });
+  });
+
+  it("classifies a managed proxy bearer credential as API billing", () => {
+    expect(resolveClaudeAcpBillingIdentity({ config: {
+      managedAiConnection: { method: "api_key" },
+      env: { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "fixture-proxy", CLAUDE_CODE_USE_BEDROCK: "", ANTHROPIC_BEDROCK_BASE_URL: "" },
+    } })).toEqual({ provider: "anthropic", biller: "anthropic", billingType: "api" });
   });
 
   it("classifies Bedrock auth as metered_api billed to aws_bedrock", () => {

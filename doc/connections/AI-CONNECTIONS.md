@@ -30,8 +30,9 @@ by agent setup. Supported sandbox environments use onboarding's existing browser
 sign-in controllers. Self-hosted installations use the shared terminal sign-in
 instructions described below and require no sandbox. Environment selection does
 not change agent execution settings.
-API keys are validated against fixed provider endpoints; redirects
-and caller-supplied validation URLs are rejected.
+Direct-provider API keys are validated against fixed provider endpoints.
+Explicit gateway connections use the approved destination described below.
+Validation never follows redirects.
 
 `runtimeConfig.aiConnection` contains `provider`, `mode`, and `method`. For responsible-user selections, `method` is a legacy wire hint retained for rolling upgrades; the resolver uses the selected account’s actual method:
 
@@ -48,7 +49,8 @@ selected company members or every company member. The separate agent-access
 setting determines which agents can use it. There is no additional AI agent
 authorization, and old delegation records do not override the human audience.
 
-A connection choice never changes the harness, model, or provider routing.
+A connection choice never changes the harness or model. Direct accounts retain
+the provider routing; a gateway account explicitly selects its approved endpoint.
 Changing those separately may make a binding incompatible; saving then requires
 a compatible choice. Agent configuration cannot grant access to another account.
 
@@ -58,6 +60,113 @@ The additive `ai_provider_defaults` table preserves the legacy per-method prefer
 
 Revocation retains the unavailable default; connecting another account does not
 silently replace it. Change it explicitly on the account detail page.
+
+## Existing CLIProxyAPI and compatible gateways
+
+In the VLLNT fork, Providers is installed by default on self-hosted startup when
+its built bundle is present. Build it with
+`pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build` (also included in
+`pnpm build` and the Docker image). No account or endpoint is configured at boot.
+Disabling or uninstalling it in Plugin Manager is respected across restarts.
+Managed instances retain their explicit `plugins.autoInstall` list; include
+`providers` to provision it there.
+
+The fork-bundled Providers plugin (`packages/plugins/plugin-providers`) adds an **Org → Providers** page for configuring
+existing compatible API servers, including CLIProxyAPI, through the same
+company-scoped AI Connections API. It lists all AI connections visible to the
+current user, including personal/shared subscriptions, direct API keys and gateways.
+Harness settings stay in the agent view, where a compact **Provider** dropdown
+selects a compatible shared connection or the responsible user’s personal default.
+The **Manage providers** action opens setup with that agent selected. Harness,
+workspace and permission settings stay on the agent. The plugin does not install
+or operate a proxy.
+Create a separate connection for each client: `openai` for Codex and `anthropic`
+for Claude Code, both with `method: api_key`. The provider identifies the client
+protocol, not the proxy's upstream billing account.
+
+The instance operator must approve exact origins before any gateway request:
+
+```sh
+PAPERCLIP_AI_GATEWAY_ALLOWED_ORIGINS=https://proxy.example.com,http://127.0.0.1:8317
+```
+
+Set this on the Paperclip server and restart it. Enter the root URL in the plugin
+(`https://proxy.example.com`); a trailing `/v1` is normalized away. HTTPS is
+recommended for remote servers. Only approved origins can receive credentials;
+private addresses require this same explicit approval. Link-local/metadata
+addresses remain denied. Validation pins DNS, rejects redirects, uses a 30-second
+timeout, caps responses at 1 MiB, and returns sanitized errors. Native clients
+make their own requests after launch, so the operator must trust the approved
+server, its DNS, TLS configuration, and network route. A remote agent must be able
+to reach the URL too: `127.0.0.1` refers to the agent's own machine or sandbox.
+
+The Providers page shows saved connections first, with green/red status,
+**Test connection**, **Reconnect**, **Access**, and a permission-gated
+**Disconnect** action. Disconnect uses the existing grant-revocation endpoint;
+it preserves the record and does not revoke credentials already materialized
+for running tasks. Tests show the full searchable advertised model list and an
+optional client-specific model probe. Test results are page-local, timestamped
+observations, not persisted health monitoring.
+
+`POST /api/companies/:companyId/ai-connections/gateway/test` supports two strict
+request shapes: a draft `{gateway: {baseUrl}, apiKey, provider, testModel?}` or a
+saved selection `{connectionId, grantId, testModel?}`. Draft testing requires
+connection-manager access; saved testing requires a non-viewer board member with
+access to that exact grant's human audience. Both check company membership and
+origin approval. Saved tests cannot override the destination, provider or key.
+The server decrypts the saved credential only after these checks. The response
+contains `{models, provider, testedModel?, checkedAt}` and is never cached. Tests
+neither save drafts nor alter credentials, grants, agent settings or saved status.
+
+Omit `testModel` from the test request to discover models without inference.
+Creation/reconnect uses the existing connections POST with gateway credentials
+and a required `testModel`. Discovery stores nothing. Creation
+sends a short test prompt before storing a credential: Codex requires the
+Responses API (`/v1/responses`); Claude requires the Messages API (`/v1/messages`).
+A server supporting only Chat Completions is insufficient. These probes may incur
+upstream usage; model discovery alone does not prove either protocol works. Discovery and
+Responses requests omit Anthropic-specific headers so CLIProxyAPI returns its
+canonical model IDs. Only Messages requests send `anthropic-version`. Codex CLI
+hello tests stage the selected managed home’s provider configuration along with
+its key; a missing managed configuration stops the probe before launching.
+
+The plugin supports all or selected company agents. Each compatible agent can
+choose its usual account or a named gateway in the Provider dropdown. Personal
+subscriptions appear as the responsible user’s default, preserving per-person
+credential resolution; selecting a provider never changes someone’s default.
+The Model dropdown follows the unsaved provider selection: gateways supply their
+advertised model IDs through the stored-key test endpoint, while direct and
+subscription connections use the client’s normal catalog. The latter is not a
+per-account entitlement check. Gateway failures show an error and no local catalog
+fallback. Local model detection is hidden for managed connections. Switching
+providers preserves the current model and warns when a gateway does not list it;
+it does not silently choose another model. Model catalog queries are keyed by
+company, connection and grant so delayed responses cannot replace a newer choice.
+The saved `config.aiGateway` contains only the destination; the proxy key uses
+the existing encrypted vault and grants. The plugin worker has no credentials
+or parallel configuration store. The plugin UI is trusted same-origin code,
+subject to the normal board API authorization.
+
+Managed Codex homes use a `paperclip_gateway` provider with `wire_api: responses`
+and `OPENAI_API_KEY`. The native runner rebuilds this configuration from the
+selected `OPENAI_BASE_URL`. Claude receives `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_AUTH_TOKEN`; competing API keys and subscription tokens are cleared.
+CLI, ACP, and the corresponding native runner profiles retain these settings.
+Connection selection, revocation, and key rotation retain the existing human
+and agent access checks. Missing/revoked credentials or removed origin approval
+stop preparation; they never fall back to a personal login. Session identity
+includes the destination and credential generation.
+
+Reconnect rotates the key while preserving the destination, identity and grants.
+Changing the destination requires a new connection. Reconnect is available in the
+plugin and on the normal connection permissions page. Disabling the setup plugin
+does not revoke a saved connection; use the normal revoke control for that.
+
+Protocol references: [CLIProxyAPI Codex setup](https://help.router-for-me/agent-client/codex.html)
+and [Claude Code setup](https://help.router-for-me/agent-client/claude-code.html).
+Mock-server validation is not live proof of upstream model availability, quota,
+streaming, or tools. Verify a small real agent task after entering the real key
+through the private UI.
 
 ## Storage and API
 

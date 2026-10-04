@@ -14,6 +14,8 @@ import {
 } from "@paperclipai/db";
 import {
   createAiConnectionSchema,
+  testAiGatewaySchema,
+  type AiGatewayConfig,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -28,6 +30,7 @@ import { accessService } from "../services/access.js";
 import { logActivity } from "../services/activity-log.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { validate } from "../middleware/validate.js";
+import { assertAiGatewayEndpoint, discoverAiGatewayModels, validateAiGatewayKey } from "../services/ai-gateway.js";
 
 /** Agent API calls inherit authenticated run identity, never the agent's own ID. */
 export function responsibleUserForAiRequest(req: Request): string | null {
@@ -43,7 +46,7 @@ export async function assertAiConnectionCreateAccess(
   input: Pick<
     AiConnectionLoginIntent,
     "ownership" | "allAgents" | "agentIds" | "connectionId"
-  >,
+  > & { gateway?: AiGatewayConfig },
 ) {
   assertBoard(req);
   assertCompanyAccess(req, companyId);
@@ -54,6 +57,7 @@ export async function assertAiConnectionCreateAccess(
       .select({
         owner: connectionGrants.subjectUserId,
         creator: toolConnections.createdByUserId,
+        config: toolConnections.config,
       })
       .from(connectionGrants)
       .innerJoin(
@@ -72,6 +76,9 @@ export async function assertAiConnectionCreateAccess(
       throw forbidden(
         "Only the account owner can reconnect this AI connection",
       );
+    if (JSON.stringify(grant.config.aiGateway ?? null) !== JSON.stringify(input.gateway ?? null)) {
+      throw unprocessable("Reconnect cannot change the gateway address. Use the gateway plugin to reconnect, or create a new connection.");
+    }
   }
   const membership = req.actor.memberships?.find(
     (m) => m.companyId === companyId && m.status === "active",
@@ -264,6 +271,31 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
       );
     },
   );
+  router.post("/companies/:companyId/ai-connections/gateway/test", validate(testAiGatewaySchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const input = testAiGatewaySchema.parse(req.body);
+    const saved = "connectionId" in input;
+    const userId = await assertAiConnectionCreateAccess(db, req, companyId, {
+      ownership: saved ? "personal" : "shared", allAgents: !saved, agentIds: [],
+    });
+    let gateway: AiGatewayConfig;
+    let provider: "openai" | "anthropic";
+    let key: string;
+    if ("connectionId" in input) {
+      const selection = await service.gatewayForTest(companyId, userId, input.connectionId, input.grantId);
+      gateway = await assertAiGatewayEndpoint(selection.gateway);
+      provider = selection.provider;
+      key = await service.credential(selection);
+    } else {
+      gateway = await assertAiGatewayEndpoint(input.gateway);
+      provider = input.provider;
+      key = input.apiKey;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    const { models } = await discoverAiGatewayModels(gateway, key);
+    if (input.testModel) await validateAiGatewayKey(provider, gateway, key, input.testModel);
+    res.json({ models, provider, ...(input.testModel ? { testedModel: input.testModel } : {}), checkedAt: new Date().toISOString() });
+  });
   router.post(
     "/companies/:companyId/ai-connections",
     validate(createAiConnectionSchema),
@@ -281,7 +313,8 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
           "Use the existing provider sign-in flow to connect a subscription",
         );
       const attemptStartedAt = new Date();
-      await validateAiApiKey(input.provider, input.apiKey!);
+      if (input.gateway) await validateAiGatewayKey(input.provider, input.gateway, input.apiKey!, input.testModel!);
+      else await validateAiApiKey(input.provider, input.apiKey!);
       const result = await service.save(
         companyId,
         userId,

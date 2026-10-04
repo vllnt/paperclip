@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { useState } from "react";
+import { DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
 import { createRoot, type Root } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -13,6 +14,13 @@ import { AgentConfigForm, AdapterLoginPanel, subtractPersistedOverlay, type Adap
 import { defaultCreateValues } from "./agent-config-defaults";
 import { buildNewAgentHirePayload } from "../lib/new-agent-hire-payload";
 import { ApiError } from "../api/client";
+
+const mockAiConnectionsApi = vi.hoisted(() => ({ list: vi.fn(), testGateway: vi.fn() }));
+vi.mock("@/api/ai-connections", () => ({ aiConnectionsApi: mockAiConnectionsApi }));
+vi.mock("@/api/plugins", () => ({ pluginsApi: { listUiContributions: vi.fn(async () => []) } }));
+vi.mock("@/plugins/slots", () => ({
+  PluginSlotOutlet: ({ context }: { context: { companyPrefix?: string; entityId?: string } }) => <div data-agent-plugin-prefix={context.companyPrefix} data-agent-plugin-id={context.entityId} />,
+}));
 
 const mockAgentsApi = vi.hoisted(() => ({
   adapterModels: vi.fn(),
@@ -84,7 +92,7 @@ vi.mock("../lib/clipboard", () => ({
 
 vi.mock("../context/CompanyContext", () => ({
   useCompany: () => ({
-    companies: [{ id: "company-1", name: "Paperclip" }],
+    companies: [{ id: "company-1", name: "Paperclip", issuePrefix: "PAP" }],
     selectedCompanyId: "company-1",
     selectedCompany: { id: "company-1", name: "Paperclip" },
     selectionSource: "bootstrap",
@@ -650,6 +658,8 @@ describe("AgentConfigForm environment selector", () => {
   let roots: Root[] = [];
 
   beforeEach(() => {
+    mockAiConnectionsApi.list.mockResolvedValue({ currentUserId: "board", connections: [] });
+    mockAiConnectionsApi.testGateway.mockReset();
     mockAgentsApi.adapterModels.mockResolvedValue([]);
     mockAgentsApi.detectModel.mockResolvedValue(null);
     mockAgentsApi.list.mockResolvedValue([]);
@@ -737,6 +747,99 @@ describe("AgentConfigForm environment selector", () => {
     roots = [];
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  it.each(["claude", "codex"])("shows a separate provider choice for the native %s harness", async (provider) => {
+    const result = await renderForm([], {
+      adapterType: "paperclip_runner", adapterConfig: { provider, model: "custom-model" },
+      runtimeConfig: { aiConnection: { mode: "responsible_user", provider: provider === "claude" ? "anthropic" : "openai", method: "api_key" } },
+    });
+    roots.push(result.root);
+    expect(result.container.querySelector('[aria-label="Provider connection"]')).not.toBeNull();
+    expect(result.container.querySelector('[data-agent-plugin-prefix="PAP"]')).not.toBeNull();
+    expect(result.onSave).not.toHaveBeenCalled();
+  });
+
+  it("loads selected provider models without using the local catalog or changing the saved model", async () => {
+    const connectionId = "11111111-1111-4111-8111-111111111111";
+    const grantId = "22222222-2222-4222-8222-222222222222";
+    mockAiConnectionsApi.list.mockResolvedValue({ currentUserId: "board", connections: [{
+      id: connectionId, grantId, companyId: "company-1", provider: "openai", method: "api_key",
+      ownership: "shared", name: "Fixture proxy", status: "connected", gateway: { baseUrl: "https://proxy.example" },
+    }] });
+    mockAiConnectionsApi.testGateway.mockResolvedValue({ models: ["proxy-only-model"], provider: "openai", checkedAt: new Date(0).toISOString() });
+    mockAgentsApi.adapterModels.mockResolvedValue([{ id: "local-only-model", label: "Local only" }]);
+    const result = await renderForm([], { adapterType: "codex_local", adapterConfig: { model: "saved-model" }, runtimeConfig: {
+      aiConnection: { provider: "openai", method: "api_key", mode: "shared", connectionId, grantId },
+    } });
+    roots.push(result.root);
+    await flushReact();
+    expect(result.container.querySelector('button[aria-label="Provider"]')).not.toBeNull();
+    expect(mockAiConnectionsApi.testGateway).toHaveBeenCalledWith("company-1", { connectionId, grantId });
+    expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+    expect(mockAgentsApi.detectModel).not.toHaveBeenCalled();
+    const modelButton = [...result.container.querySelectorAll("button")].find(button => button.textContent?.trim() === "saved-model")!;
+    await act(async () => modelButton.click());
+    expect(document.body.textContent).toContain("proxy-only-model");
+    expect(document.body.textContent).not.toContain("Local only");
+    expect(document.body.textContent).not.toContain("Detect model");
+    expect(result.onSave).not.toHaveBeenCalled();
+  });
+
+  it("switches the model catalog for unsaved provider choices and ignores an older provider's response", async () => {
+    const first = { id: "11111111-1111-4111-8111-111111111111", grantId: "22222222-2222-4222-8222-222222222222", companyId: "company-1", provider: "openai", method: "api_key", ownership: "shared", name: "First proxy", status: "connected", gateway: { baseUrl: "https://one.example" } };
+    const second = { ...first, id: "33333333-3333-4333-8333-333333333333", grantId: "44444444-4444-4444-8444-444444444444", name: "Second proxy", gateway: { baseUrl: "https://two.example" } };
+    const subscription = { ...first, id: "55555555-5555-4555-8555-555555555555", grantId: "66666666-6666-4666-8666-666666666666", ownership: "personal", ownerUserId: "board", isDefault: true, method: "subscription", gateway: undefined, name: "My ChatGPT" };
+    let resolveOlder!: (result: unknown) => void;
+    mockAiConnectionsApi.list.mockResolvedValue({ currentUserId: "board", connections: [first, second, subscription] });
+    mockAiConnectionsApi.testGateway.mockImplementation((_company, input) => input.connectionId === first.id
+      ? new Promise(resolve => { resolveOlder = resolve; })
+      : Promise.resolve({ models: ["second-only"], provider: "openai", checkedAt: new Date(0).toISOString() }));
+    mockAgentsApi.adapterModels.mockResolvedValue([{ id: "subscription-model", label: "Subscription model" }]);
+    const result = await renderForm([], { adapterType: "codex_local", adapterConfig: { model: "saved-model" }, runtimeConfig: { aiConnection: { provider: "openai", method: "api_key", mode: "shared", connectionId: first.id, grantId: first.grantId } } });
+    roots.push(result.root);
+    async function selectProvider(name: string) {
+      await act(async () => { result.container.querySelector('button[aria-label="Provider"]')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); });
+      const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(item => item.textContent?.includes(name))!;
+      expect(option).toBeDefined();
+      await act(async () => option.click());
+      await flushReact();
+    }
+    await selectProvider("Second proxy");
+    expect(mockAiConnectionsApi.testGateway).toHaveBeenCalledWith("company-1", { connectionId: second.id, grantId: second.grantId });
+    await act(async () => result.container.querySelector<HTMLButtonElement>('button[aria-label="Model"]')!.click());
+    expect(document.body.textContent).toContain("second-only");
+    await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    await selectProvider("My ChatGPT");
+    await act(async () => resolveOlder({ models: ["stale-first-model"] }));
+    await flushReact();
+    await act(async () => result.container.querySelector<HTMLButtonElement>('button[aria-label="Model"]')!.click());
+    expect(document.body.textContent).toContain("Subscription model");
+    expect(document.body.textContent).not.toContain("second-only");
+    expect(document.body.textContent).not.toContain("stale-first-model");
+    expect(result.onSave).not.toHaveBeenCalled();
+    expect(result.container.querySelector('button[aria-label="Model"]')?.textContent).toContain("saved-model");
+  });
+
+  it("shows model discovery failures without falling back to the local catalog", async () => {
+    const connectionId = "11111111-1111-4111-8111-111111111111", grantId = "22222222-2222-4222-8222-222222222222";
+    mockAiConnectionsApi.list.mockResolvedValue({ currentUserId: "board", connections: [{ id: connectionId, grantId, companyId: "company-1", provider: "openai", method: "api_key", ownership: "shared", name: "Proxy", status: "connected", gateway: { baseUrl: "https://proxy.example" } }] });
+    mockAiConnectionsApi.testGateway.mockRejectedValue(new Error("Proxy unavailable"));
+    mockAgentsApi.adapterModels.mockResolvedValue([{ id: "local-only-model", label: "Local only" }]);
+    const result = await renderForm([], { adapterType: "codex_local", runtimeConfig: { aiConnection: { provider: "openai", method: "api_key", mode: "shared", connectionId, grantId } } });
+    roots.push(result.root);
+    await flushReact();
+    expect(result.container.textContent).toContain("Proxy unavailable");
+    expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+    expect(mockAiConnectionsApi.testGateway).toHaveBeenCalledOnce();
+    mockAiConnectionsApi.testGateway.mockResolvedValue({ models: ["recovered-model"] });
+    await act(async () => result.container.querySelector<HTMLButtonElement>('button[aria-label="Model"]')!.click());
+    const refresh = [...document.querySelectorAll("button")].find(button => button.textContent?.trim() === "Refresh models")!;
+    await act(async () => refresh.click());
+    await flushReact();
+    expect(document.body.textContent).toContain("recovered-model");
+    expect(result.container.textContent).not.toContain("Proxy unavailable");
+    expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
   });
 
   it("promotes environment drafts through the page Save action and discards them through the page Discard action", async () => {
@@ -878,8 +981,8 @@ describe("AgentConfigForm environment selector", () => {
     roots.push(existing.root);
     const created = await renderCreateForm(environments, { adapterType: "claude_local", model: "" });
     roots.push(created.root);
-    expect(existing.container.textContent).toContain("Default (claude-opus-5)");
-    expect(created.container.textContent).toContain("Default (claude-opus-5)");
+    expect(existing.container.textContent).toContain(`Default (${DEFAULT_CLAUDE_LOCAL_MODEL})`);
+    expect(created.container.textContent).toContain(`Default (${DEFAULT_CLAUDE_LOCAL_MODEL})`);
     expect(existing.onSave).not.toHaveBeenCalled();
   });
 

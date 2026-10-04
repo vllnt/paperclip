@@ -289,6 +289,28 @@ function buildContext(root: string, overrides: Partial<AdapterExecutionContext> 
 }
 
 describe("codex_local ACP lane", () => {
+  it("preserves a managed gateway's home, provider config, key and model at ACP startup", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-gateway-");
+    const home = path.join(root, "gateway-home");
+    await fs.mkdir(home);
+    const config = 'model_provider = "paperclip_gateway"\n[model_providers.paperclip_gateway]\nname = "AI gateway"\nbase_url = "http://127.0.0.1:18317/v1"\nwire_api = "responses"\nenv_key = "OPENAI_API_KEY"\n';
+    await fs.writeFile(path.join(home, "config.toml"), config);
+    await fs.writeFile(path.join(home, "auth.json"), '{"OPENAI_API_KEY":"fixture-proxy"}');
+    const meta: AdapterInvocationMeta[] = [];
+    let launchEnv: unknown;
+    const execute = createCodexAcpExecutor({ createRuntime: (options: FakeRuntimeOptions) => Object.assign(new FakeRuntime(options), { ensureSession: async function (input: Parameters<FakeRuntime["ensureSession"]>[0] & { sessionOptions?: { env?: unknown } }) { launchEnv = input.sessionOptions?.env; return FakeRuntime.prototype.ensureSession.call(this, input); } }) as never });
+    const result = await execute(buildContext(root, {
+      config: { engine: "acp", cwd: root, stateDir: path.join(root, "state"), model: "proxy-custom-model",
+        managedAiConnection: { method: "api_key" }, env: { CODEX_HOME: home, OPENAI_API_KEY: "fixture-proxy" } },
+      onMeta: async payload => { meta.push(payload); },
+    }));
+    expect(result.exitCode).toBe(0);
+    expect(JSON.stringify(meta)).not.toContain("fixture-proxy");
+    expect(launchEnv).toMatchObject({ CODEX_HOME: home, OPENAI_API_KEY: "fixture-proxy" });
+    expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(config);
+    expect(await fs.readFile(path.join(home, "auth.json"), "utf8")).toContain("fixture-proxy");
+  });
+
   it("keeps ACP selected and reports unavailable prerequisites for default and explicit engines", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-default-");
     const commandPath = path.join(root, "bin", "codex-acp");

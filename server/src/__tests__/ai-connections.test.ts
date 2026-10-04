@@ -1,6 +1,7 @@
 import { connectionIntentService } from "../services/connection-intents.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import * as aiGateway from "../services/ai-gateway.js";
 import * as localCredentials from "../services/local-ai-credentials.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -17,6 +18,8 @@ import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
 import express from "express";
+import { errorHandler } from "../middleware/error-handler.js";
+import { unprocessable } from "../errors.js";
 import request from "supertest";
 import { aiConnectionRoutes, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest } from "../routes/ai-connections.js";
 import { validateAiApiKey } from "../routes/ai-connections.js";
@@ -39,11 +42,13 @@ beforeAll(async () => {
   database = await startEmbeddedPostgresTestDatabase("paperclip-ai-db-");
   db = createDb(database.connectionString);
   service = aiConnectionService(db);
+  // Project-auth checks must not inspect the developer's parent CLI configuration.
+  vi.spyOn(process, "cwd").mockReturnValue(home);
   await db.insert(companies).values([{ id: companyId, name: "AI connection tests", issuePrefix: "AIT" }, { id: otherCompanyId, name: "Other", issuePrefix: "AIO" }]);
   await db.insert(agents).values({ id: agentId, companyId, name: "Nova", adapterType: "claude_local" });
   await db.insert(companyMemberships).values(["alice", "bob"].map(principalId => ({ companyId, principalId, principalType: "user", status: "active", membershipRole: "member" })));
 }, 90000);
-afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
+afterAll(async () => { vi.restoreAllMocks(); await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
   it.each([
@@ -813,4 +818,183 @@ describe("AI connection recovery delivery", () => {
       }
     }, 30000,
   );
+});
+
+describe("managed gateway connections", () => {
+  const gateway = { baseUrl: "http://127.0.0.1:8317" };
+  const gatewayUser = "gateway-owner";
+  beforeAll(async () => {
+    vi.stubEnv("PAPERCLIP_AI_GATEWAY_ALLOWED_ORIGINS", gateway.baseUrl);
+    await db.insert(companyMemberships).values({ companyId, principalId: gatewayUser, principalType: "user", status: "active", membershipRole: "admin" });
+  });
+  it.each([
+    ["openai", "codex_local", {}], ["openai", "codex_local", { engine: "acp" }],
+    ["openai", "paperclip_runner", { provider: "codex" }],
+    ["anthropic", "claude_local", {}], ["anthropic", "claude_local", { engine: "acp" }],
+    ["anthropic", "paperclip_runner", { provider: "acpx", acpxAgent: "claude" }],
+  ] as const)("prepares isolated %s credentials and routing for %s (%j)", async (provider, adapterType, config) => {
+    const saved = await service.save(companyId, gatewayUser, {
+      provider, method: "api_key", ownership: "shared", name: `CLIProxyAPI ${provider}`, apiKey: "gateway-fixture",
+      gateway, testModel: "test-model", allAgents: true, agentIds: [],
+    }, "gateway-fixture");
+    const selected = { provider, method: "api_key", mode: "shared", ...saved } as const;
+    const prepared = await prepareManagedAiRuntime(db, {
+      companyId, agentId, adapterType, responsibleUserId: gatewayUser, binding: selected,
+      config: { ...config, model: "my-proxy-model", env: { OPENAI_API_KEY: "ambient", CLAUDE_CODE_OAUTH_TOKEN: "ambient" } },
+    });
+    try {
+      const env = prepared.config.env as Record<string, string>;
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("");
+      expect(env.PAPERCLIP_CODEX_PROVIDERS).toBe("");
+      expect(prepared.config.model).toBe("my-proxy-model");
+      expect(prepared.attribution.grantId).toBe(saved.grantId);
+      if (provider === "openai") {
+        const toml = await readFile(path.join(env.CODEX_HOME, "config.toml"), "utf8");
+        expect(env.OPENAI_BASE_URL).toBe(`${gateway.baseUrl}/v1`);
+        expect(toml).toContain('model_provider = "paperclip_gateway"');
+        expect(toml).toContain('base_url = "http://127.0.0.1:8317/v1"');
+        expect(toml).toContain('wire_api = "responses"');
+        expect(toml).not.toContain("gateway-fixture");
+        expect(JSON.parse(await readFile(path.join(env.CODEX_HOME, "auth.json"), "utf8"))).toEqual({ OPENAI_API_KEY: "gateway-fixture" });
+      } else {
+        expect(env.ANTHROPIC_BASE_URL).toBe(gateway.baseUrl);
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBe("gateway-fixture");
+        expect(env.ANTHROPIC_API_KEY).toBe("");
+      }
+      const listed = (await service.list(companyId, gatewayUser)).find(c => c.id === saved.connectionId);
+      expect(listed?.gateway).toEqual(gateway);
+      expect(JSON.stringify(listed)).not.toContain("gateway-fixture");
+      await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, saved.grantId));
+      await expect(prepareManagedAiRuntime(db, { companyId, agentId, adapterType, responsibleUserId: gatewayUser, binding: selected, config })).rejects.toThrow("Reconnect");
+    } finally { await prepared.cleanup(); await expect(access(prepared.home!)).rejects.toThrow(); }
+  });
+  it("rejects a custom Codex provider override for managed accounts before preparing credentials", async () => {
+    await expect(prepareManagedAiRuntime(db, { ...input, responsibleUserId: gatewayUser, config: { env: { PAPERCLIP_CODEX_PROVIDERS: '{"model_provider":"untrusted"}' } } })).rejects.toThrow("provider routing");
+  });
+  it("keeps a gateway's destination immutable on reconnect and retains grants on key rotation", async () => {
+    const details = { provider: "openai", method: "api_key", ownership: "shared", name: "Rotating gateway", apiKey: "old-key", gateway, testModel: "model", allAgents: true, agentIds: [] } as const;
+    const saved = await service.save(companyId, gatewayUser, { ...details, agentIds: [] }, "old-key");
+    await expect(service.save(companyId, gatewayUser, { ...details, agentIds: [], connectionId: saved.connectionId, gateway: { baseUrl: "https://different.example" } }, "new-key")).rejects.toThrow("gateway address");
+    const runInput = { companyId, agentId, adapterType: "codex_local", responsibleUserId: gatewayUser, binding: { provider: "openai", method: "api_key", mode: "shared", ...saved } as const, config: {} };
+    const before = await prepareManagedAiRuntime(db, runInput);
+    try {
+      expect(await service.save(companyId, gatewayUser, { ...details, agentIds: [], connectionId: saved.connectionId }, "new-key")).toEqual(saved);
+      const after = await prepareManagedAiRuntime(db, runInput);
+      try { expect(after.identity).not.toBe(before.identity); } finally { await after.cleanup(); }
+    } finally { await before.cleanup(); }
+    await expect(prepareManagedAiRuntime(db, { ...runInput, companyId: otherCompanyId })).rejects.toThrow();
+  });
+});
+
+
+describe("gateway HTTP authorization and persistence", () => {
+  it("checks company and manager access before discovery or verification, and saves only after a successful probe", async () => {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = req.headers["x-agent"] ? { type: "agent", agentId, companyId } : {
+        type: "board", source: "session", userId: "gateway-owner", companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: req.headers["x-role"] === "admin" ? "admin" : "viewer", status: "active" }],
+      };
+      next();
+    });
+    app.use("/api", aiConnectionRoutes(db));
+    app.use((error: { status?: number; message: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      res.status(error.status ?? 500).json({ error: error.message });
+    });
+    const probe = vi.spyOn(aiGateway, "validateAiGatewayKey").mockResolvedValue();
+    const base = `/api/companies/${companyId}/ai-connections`;
+    const discovery = { gateway: { baseUrl: "http://127.0.0.1:8317" }, apiKey: "fixture-route-key" };
+    const payload = { ...discovery, name: "HTTP gateway", provider: "openai", method: "api_key", ownership: "shared", testModel: "proxy-model", allAgents: true };
+    try {
+      expect((await request(app).post(base).send(payload)).status).toBe(403);
+      expect(probe).not.toHaveBeenCalled();
+      probe.mockRejectedValueOnce(Object.assign(new Error("The gateway rejected this API key."), { status: 422 }));
+      expect((await request(app).post(base).set("x-role", "admin").send(payload)).status).toBe(422);
+      expect((await service.list(companyId, "gateway-owner")).some(c => c.name === payload.name)).toBe(false);
+      const created = await request(app).post(base).set("x-role", "admin").send(payload);
+      expect(created.status).toBe(201);
+      expect(probe).toHaveBeenLastCalledWith("openai", discovery.gateway, discovery.apiKey, payload.testModel);
+      expect(JSON.stringify(created.body)).not.toContain(discovery.apiKey);
+      const saved = (await service.list(companyId, "gateway-owner")).find(c => c.id === created.body.connectionId);
+      expect(saved?.gateway).toEqual(discovery.gateway);
+      probe.mockClear();
+      expect((await request(app).post(base).set("x-role", "admin").send({ ...payload, connectionId: created.body.connectionId, gateway: { baseUrl: "https://changed.example" } })).status).toBe(422);
+      expect(probe).not.toHaveBeenCalled();
+    } finally { probe.mockRestore(); }
+  });
+});
+
+
+describe("standalone gateway tests", () => {
+  beforeAll(async () => {
+    await db.insert(companyMemberships).values({ companyId, principalId: "gateway-owner", principalType: "user", status: "active", membershipRole: "admin" }).onConflictDoNothing();
+  });
+  it("tests drafts without saving, uses only authorized stored credentials, and never redirects a saved key", async () => {
+    const gateway = { baseUrl: "http://127.0.0.1:8317" };
+    vi.stubEnv("PAPERCLIP_AI_GATEWAY_ALLOWED_ORIGINS", gateway.baseUrl);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = req.headers["x-agent"] ? { type: "agent", agentId, companyId } : {
+        type: "board", source: "session", userId: String(req.headers["x-user"] ?? "gateway-owner"), companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: req.headers["x-viewer"] ? "viewer" : "admin", status: "active" }],
+      };
+      next();
+    });
+    app.use("/api", aiConnectionRoutes(db));
+    app.use(errorHandler);
+    const models = vi.spyOn(aiGateway, "discoverAiGatewayModels").mockResolvedValue({ models: ["one", "two"] });
+    const probe = vi.spyOn(aiGateway, "validateAiGatewayKey").mockResolvedValue();
+    const url = `/api/companies/${companyId}/ai-connections/gateway/test`;
+    const draft = { gateway, provider: "openai" as const, apiKey: "private-draft-key" };
+    try {
+      for (const headers of [{ "x-agent": "1" }, { "x-viewer": "1" }]) {
+        expect((await request(app).post(url).set(headers).send(draft)).status).toBe(403);
+      }
+      expect((await request(app).post(`/api/companies/${otherCompanyId}/ai-connections/gateway/test`).send(draft)).status).toBe(403);
+      expect(models).not.toHaveBeenCalled();
+      const before = await service.list(companyId, "gateway-owner");
+      const discovery = await request(app).post(url).send(draft);
+      expect(discovery.status).toBe(200);
+      expect(discovery.headers["cache-control"]).toBe("no-store");
+      expect(discovery.body).toMatchObject({ models: ["one", "two"], provider: "openai", checkedAt: expect.any(String) });
+      expect(probe).not.toHaveBeenCalled();
+      expect((await request(app).post(url).send({ ...draft, testModel: "two" })).body.testedModel).toBe("two");
+      expect(probe).toHaveBeenLastCalledWith("openai", gateway, "private-draft-key", "two");
+      expect(await service.list(companyId, "gateway-owner")).toEqual(before);
+      expect(JSON.stringify(discovery.body)).not.toContain(draft.apiKey);
+
+      const saved = await service.save(companyId, "gateway-owner", {
+        ...draft, name: "Standalone saved test", method: "api_key", ownership: "personal", allAgents: false, agentIds: [],
+      }, "stored-private-key");
+      models.mockClear(); probe.mockClear();
+      expect((await request(app).post(url).set("x-user", "alice").send(saved)).status).toBe(403);
+      expect((await request(app).post(url).send({ ...saved, grantId: randomUUID() })).status).toBe(404);
+      expect((await request(app).post(url).send({ ...saved, gateway: { baseUrl: "https://elsewhere.example" } })).status).toBe(400);
+      expect((await request(app).post(url).send({ ...saved, apiKey: "replacement" })).status).toBe(400);
+      expect(models).not.toHaveBeenCalled();
+      const verified = await request(app).post(url).send({ ...saved, testModel: "two" });
+      expect(verified.status).toBe(200);
+      expect(models).toHaveBeenLastCalledWith(gateway, "stored-private-key");
+      expect(probe).toHaveBeenLastCalledWith("openai", gateway, "stored-private-key", "two");
+      expect(JSON.stringify(verified.body)).not.toContain("stored-private-key");
+      probe.mockRejectedValueOnce(unprocessable("The gateway rejected this API key."));
+      expect((await request(app).post(url).send({ ...saved, testModel: "two" })).status).toBe(422);
+      // A test neither rotates a credential nor changes its saved availability.
+      expect((await service.list(companyId, "gateway-owner")).find(c => c.id === saved.connectionId)?.status).toBe("connected");
+      await toolAccessService(db).revokeConnectionGrant(saved.connectionId, saved.grantId, { actorType: "user", actorId: "gateway-owner" });
+      models.mockClear();
+      expect((await request(app).post(url).send(saved)).status).toBe(422);
+      expect(models).not.toHaveBeenCalled();
+
+      const shared = await service.save(companyId, "gateway-owner", {
+        ...draft, name: "Restricted shared probe", method: "api_key", ownership: "shared", allAgents: false, agentIds: [],
+      }, "restricted-key");
+      await db.insert(connectionGrantMembers).values({ companyId, grantId: shared.grantId, subjectType: "user", subjectId: "gateway-owner" });
+      expect((await request(app).post(url).set("x-user", "bob").send(shared)).status).toBe(403);
+      expect(models).not.toHaveBeenCalled();
+      expect((await request(app).post(url).send(shared)).status).toBe(200);
+    } finally { models.mockRestore(); probe.mockRestore(); }
+  });
 });

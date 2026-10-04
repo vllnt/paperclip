@@ -1,3 +1,5 @@
+import { stringify as stringifyToml } from "smol-toml";
+import { assertAiGatewayEndpoint } from "./ai-gateway.js";
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
@@ -38,6 +40,7 @@ export const AI_AUTH_ENV_KEYS = [
   "OPENCODE_CONFIG_CONTENT",
   "OPENCODE_CONFIG",
   "OPENCODE_CONFIG_DIR",
+  "PAPERCLIP_CODEX_PROVIDERS",
   "PAPERCLIP_OPENCODE_PROVIDERS",
   "ANTHROPIC_BASE_URL",
   "OPENAI_BASE_URL",
@@ -217,6 +220,7 @@ export async function prepareManagedAiRuntime(
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
+    "PAPERCLIP_CODEX_PROVIDERS",
     "PAPERCLIP_OPENCODE_PROVIDERS",
   ]) {
     if (configuredEnv[key])
@@ -251,6 +255,12 @@ export async function prepareManagedAiRuntime(
       throw unprocessable(
         "The selected default changed. Retry this execution.",
       );
+    const gateway = selection.connection.config.aiGateway
+      ? await assertAiGatewayEndpoint(selection.connection.config.aiGateway as { baseUrl: string })
+      : null;
+    if (gateway && (selection.attribution.method !== "api_key" || !["anthropic", "openai"].includes(input.binding.provider))) {
+      throw unprocessable("This AI gateway is incompatible with the selected sign-in method.");
+    }
     const value = await service.credential(selection);
     home = await mkdtemp(
       path.join(
@@ -273,7 +283,16 @@ export async function prepareManagedAiRuntime(
     if (input.binding.provider === "openai")
       await writeFile(
         path.join(providerHome, "config.toml"),
-        'cli_auth_credentials_store = "file"\n',
+        stringifyToml({
+          cli_auth_credentials_store: "file",
+          ...(gateway ? {
+            model_provider: "paperclip_gateway",
+            model_providers: { paperclip_gateway: {
+              name: "AI gateway", base_url: `${gateway.baseUrl}/v1`,
+              wire_api: "responses", env_key: "OPENAI_API_KEY", requires_openai_auth: false,
+            } },
+          } : {}),
+        }),
         { mode: 0o600 },
       );
     if (subscriptionFile) await writeFile(authFile, value, { mode: 0o600 });
@@ -283,9 +302,15 @@ export async function prepareManagedAiRuntime(
       selection.attribution.method === "api_key"
     ) {
       env.CODEX_API_KEY = value;
+      if (gateway) env.OPENAI_BASE_URL = `${gateway.baseUrl}/v1`;
       await writeFile(authFile, JSON.stringify({ OPENAI_API_KEY: value }), {
         mode: 0o600,
       });
+    }
+    if (gateway && input.binding.provider === "anthropic") {
+      env.ANTHROPIC_BASE_URL = gateway.baseUrl;
+      env.ANTHROPIC_API_KEY = "";
+      env.ANTHROPIC_AUTH_TOKEN = value;
     }
     if (input.binding.provider === "openrouter") {
       env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
@@ -295,6 +320,7 @@ export async function prepareManagedAiRuntime(
     }
     const generation = createHash("sha256")
       .update(value)
+      .update(gateway ? `\0${gateway.baseUrl}` : "")
       .digest("hex")
       .slice(0, 16);
     const identity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${generation}`;
@@ -302,7 +328,7 @@ export async function prepareManagedAiRuntime(
       config: {
         ...input.config,
         env,
-        managedAiConnection: { ...selection.attribution, identity },
+        managedAiConnection: { ...selection.attribution, identity, ...(gateway ? { gateway } : {}) },
       },
       attribution: selection.attribution,
       accountName: selection.connection.name,

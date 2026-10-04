@@ -34,6 +34,25 @@ afterEach(async () => {
 });
 
 describe("ACPX runtime sandbox", () => {
+  it.each(["claude", "codex"] as const)("preserves the managed %s gateway through native sandbox isolation", async agent => {
+    const fixture = await sandboxFixture(agent);
+    const environment = { ANTHROPIC_BASE_URL: "http://127.0.0.1:18317", ANTHROPIC_AUTH_TOKEN: "fixture-proxy",
+      ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "", OPENAI_BASE_URL: "http://127.0.0.1:18317/v1", OPENAI_API_KEY: "fixture-codex" };
+    const sandbox = await prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent, environment });
+    if (agent === "claude") {
+      expect(sandbox.launchEnvironment).toMatchObject({ ANTHROPIC_BASE_URL: environment.ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN: "fixture-proxy", ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "" });
+      expect(sandbox.launchEnvironment).not.toHaveProperty("OPENAI_API_KEY");
+    } else {
+      expect(sandbox.launchEnvironment.OPENAI_API_KEY).toBe("fixture-codex");
+      const config = await readFile(join(sandbox.agentHomeDirectory, "config.toml"), "utf8");
+      expect(config).toContain('model_provider = "paperclip_gateway"');
+      expect(config).toContain('base_url = "http://127.0.0.1:18317/v1"');
+      expect(config).toContain("shell_snapshot = false");
+    }
+    expect(JSON.stringify(sandbox.persistedEnvironment)).not.toContain("fixture-proxy");
+    expect(JSON.stringify(sandbox.persistedEnvironment)).not.toContain("fixture-codex");
+  });
+
   it.each(["claude-sonnet-5", "sonnet", "custom-deployment-id"])(
     "preserves the requested Claude model %s in its isolated settings",
     async (model) => {

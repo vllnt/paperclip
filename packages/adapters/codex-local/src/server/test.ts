@@ -222,6 +222,18 @@ async function prepareCodexHelloProbe(input: {
     probeHomeLocalDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-probe-config-"));
     let configToml = "";
     try {
+      if (input.managedAiConnection) {
+        // Managed connections keep gateway routing in their private home, not
+        // PAPERCLIP_CODEX_PROVIDERS. Preserve it when staging the probe home;
+        // an empty replacement would send the gateway key to default OpenAI.
+        if (!isNonEmpty(input.env.CODEX_HOME)) {
+          throw new Error("The managed Codex probe requires its prepared home.");
+        }
+        await fs.copyFile(
+          path.join(input.env.CODEX_HOME, "config.toml"),
+          path.join(probeHomeLocalDir, "config.toml"),
+        );
+      }
       const providerConfig = await prepareCodexRuntimeConfig({ env: input.env, codexHome: probeHomeLocalDir });
       configToml = await fs.readFile(path.join(probeHomeLocalDir, "config.toml"), "utf8").catch(() => "");
       await providerConfig.cleanup();

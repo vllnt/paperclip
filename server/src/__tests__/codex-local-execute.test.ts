@@ -15,6 +15,7 @@ const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
   argv: process.argv.slice(2),
   prompt: fs.readFileSync(0, "utf8"),
+  codexApiKey: process.env.OPENAI_API_KEY,
   codexHome: process.env.CODEX_HOME || null,
   codexConfigContents: process.env.CODEX_HOME && fs.existsSync(process.env.CODEX_HOME + "/config.toml")
     ? fs.readFileSync(process.env.CODEX_HOME + "/config.toml", "utf8")
@@ -119,6 +120,36 @@ function createLocalSandboxRunner() {
 }
 
 describe("codex execute", () => {
+  it("preserves the selected gateway config and key in the CLI process", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-gateway-"));
+    const home = path.join(root, "auth-home");
+    const workspace = path.join(root, "workspace");
+    const command = path.join(root, "codex");
+    const capture = path.join(root, "capture.json");
+    await fs.mkdir(home); await fs.mkdir(workspace);
+    const config = 'model_provider = "paperclip_gateway"\n[model_providers.paperclip_gateway]\nname = "AI gateway"\nbase_url = "http://127.0.0.1:18317/v1"\nwire_api = "responses"\nenv_key = "OPENAI_API_KEY"\nrequires_openai_auth = false\n';
+    await fs.writeFile(path.join(home, "config.toml"), config);
+    await fs.writeFile(path.join(home, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "fixture-proxy" }));
+    await writeFakeCodexCommand(command);
+    try {
+      const result = await execute({
+        runId: "run-gateway", agent: { id: "a", companyId: "co", name: "Test", adapterType: "codex_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command, cwd: workspace, model: "proxy-custom-model", managedAiConnection: { method: "api_key" },
+          env: { CODEX_HOME: home, OPENAI_API_KEY: "fixture-proxy", PAPERCLIP_CODEX_PROVIDERS: "", PAPERCLIP_TEST_CAPTURE_PATH: capture } },
+        context: {}, onLog: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      const captured = JSON.parse(await fs.readFile(capture, "utf8"));
+      expect(captured.codexHome).toBe(home);
+      expect(captured.codexApiKey).toBe("fixture-proxy");
+      expect(captured.codexConfigContents).toContain('model_provider = "paperclip_gateway"');
+      expect(captured.codexConfigContents).toContain('base_url = "http://127.0.0.1:18317/v1"');
+      expect(captured.argv).toContain("proxy-custom-model");
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(config);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("uses a Paperclip-managed CODEX_HOME outside worktree mode while preserving shared auth and config", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-default-"));
     const workspace = path.join(root, "workspace");

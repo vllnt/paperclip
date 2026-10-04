@@ -107,6 +107,7 @@ export type RegisteredPluginComponent =
   };
 
 type SlotFilters = {
+  sidebarSection?: "work" | "org";
   slotTypes: PluginUiSlotType[];
   entityType?: PluginUiSlotEntityType | null;
   companyId?: string | null;
@@ -664,6 +665,7 @@ export function usePluginSlots(filters: SlotFilters): UsePluginSlotsResult {
     for (const contribution of data ?? []) {
       for (const slot of contribution.slots) {
         if (!allowedTypes.has(slot.type)) continue;
+        if (slot.type === "sidebar" && filters.sidebarSection && (slot.sidebarSection ?? "work") !== filters.sidebarSection) continue;
         if (requiresEntityType(slot.type)) {
           if (!filters.entityType) continue;
           if (!slot.entityTypes?.includes(filters.entityType)) continue;
@@ -686,7 +688,7 @@ export function usePluginSlots(filters: SlotFilters): UsePluginSlotsResult {
       return a.displayName.localeCompare(b.displayName);
     });
     return rows;
-  }, [data, filters.entityType, slotTypesKey]);
+  }, [data, filters.entityType, filters.sidebarSection, slotTypesKey]);
 
   // Consider loading until both query and module imports are done.
   const modulesLoaded = data ? aggregateLoadState(data) === "loaded" : true;
@@ -884,6 +886,7 @@ export function PluginSlotMount({
 }
 
 type PluginSlotOutletProps = {
+  sidebarSection?: "work" | "org";
   slotTypes: PluginUiSlotType[];
   context: PluginSlotContext;
   entityType?: PluginUiSlotEntityType | null;
@@ -894,6 +897,7 @@ type PluginSlotOutletProps = {
 };
 
 export function PluginSlotOutlet({
+  sidebarSection,
   slotTypes,
   context,
   entityType,
@@ -903,6 +907,7 @@ export function PluginSlotOutlet({
   missingBehavior = "hidden",
 }: PluginSlotOutletProps) {
   const { slots, errorMessage } = usePluginSlots({
+    sidebarSection,
     slotTypes,
     entityType,
     companyId: context.companyId,

@@ -1,6 +1,8 @@
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
-import { AiConnectionField } from "./ai-connections/AiConnectionField";
+import { AiConnectionField, aiProviderForAdapter } from "./ai-connections/AiConnectionField";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import { aiConnectionsApi } from "@/api/ai-connections";
+import { bindingProblem, personalAiDefault } from "./ai-connections/model";
 import { testAgentSetup } from "@/lib/test-agent-setup";
 import { RuntimeTestCard } from "./RuntimeTestCard";
 import { useState, useEffect, useRef, useMemo, useCallback, Children, isValidElement, type ReactNode } from "react";
@@ -892,27 +894,59 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     ? String(isCreate ? props.values.adapterSchemaValues?.provider ?? "codex"
       : eff("adapterConfig", "provider", config.provider === "acpx" && config.acpxAgent === "codex" ? "codex" : config.provider ?? "codex"))
     : undefined;
-  const modelProvider = adapterType === "opencode_local" && aiConnectionBindingSchema.safeParse(
+  const effectiveAiAdapter = adapterType === "paperclip_runner"
+    ? runnerProvider === "codex" ? "codex_local" : runnerProvider === "opencode" ? "opencode_local"
+      : runnerProvider === "claude" || (runnerProvider === "acpx" && eff("adapterConfig", "acpxAgent", config.acpxAgent) === "claude") ? "claude_local" : adapterType
+    : adapterType;
+  const aiProvider = aiProviderForAdapter(effectiveAiAdapter);
+  const effectiveAiBinding = aiConnectionBindingSchema.safeParse(
     (overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection,
-  ).data?.provider === "openrouter" ? "openrouter" : runnerProvider;
-  // Fetch adapter models for the effective provider, including unsaved changes.
+  ).data;
+  const accounts = useQuery({
+    queryKey: ["ai-connections", selectedCompanyId, isCreate ? undefined : props.agent.id],
+    queryFn: () => aiConnectionsApi.list(selectedCompanyId!, isCreate ? undefined : props.agent.id),
+    enabled: Boolean(selectedCompanyId && effectiveAiBinding),
+  });
+  const requirement = { companyId: selectedCompanyId ?? "", provider: aiProvider ?? effectiveAiBinding?.provider ?? "openai" } as const;
+  const selectedAccount = effectiveAiBinding?.mode === "responsible_user"
+    ? personalAiDefault(accounts.data?.connections ?? [], requirement, accounts.data?.currentUserId ?? "")
+    : effectiveAiBinding && accounts.data?.connections.find(connection => connection.id === effectiveAiBinding.connectionId && connection.grantId === effectiveAiBinding.grantId);
+  const connectionProblem = effectiveAiBinding && accounts.data
+    ? bindingProblem(effectiveAiBinding, requirement, accounts.data.connections, accounts.data.currentUserId, isCreate ? "" : props.agent.id)
+    : undefined;
+  const gateway = selectedAccount?.gateway;
+  const gatewayModels = useQuery({
+    queryKey: ["ai-connections", selectedCompanyId, "models", selectedAccount?.id, selectedAccount?.grantId, gateway?.baseUrl],
+    queryFn: () => aiConnectionsApi.testGateway(selectedCompanyId!, { connectionId: selectedAccount!.id, grantId: selectedAccount!.grantId }),
+    enabled: Boolean(effectiveAiBinding && gateway && accounts.isSuccess && !connectionProblem),
+    retry: false,
+    refetchOnWindowFocus: false,
+    staleTime: 60_000,
+  });
+  const useAdapterModels = !effectiveAiBinding || Boolean(selectedAccount && !gateway && accounts.isSuccess && !connectionProblem);
+  const modelProvider = adapterType === "opencode_local" && effectiveAiBinding?.provider === "openrouter" ? "openrouter" : runnerProvider;
   const modelQueryKey = selectedCompanyId
     ? queryKeys.agents.adapterModels(selectedCompanyId, adapterType, currentDefaultEnvironmentId || null, modelProvider)
     : ["agents", "none", "adapter-models", adapterType];
-  const {
-    data: fetchedModels,
-    error: fetchedModelsError,
-  } = useQuery({
+  const { data: fetchedModels, error: fetchedModelsError, isPending: adapterModelsPending } = useQuery({
     queryKey: modelQueryKey,
     queryFn: () => agentsApi.adapterModels(selectedCompanyId!, adapterType, {
       environmentId: currentDefaultEnvironmentId || null,
       provider: modelProvider,
     }),
-    enabled: Boolean(selectedCompanyId),
+    enabled: Boolean(selectedCompanyId && useAdapterModels),
   });
   const [refreshModelsError, setRefreshModelsError] = useState<string | null>(null);
   const [refreshingModels, setRefreshingModels] = useState(false);
-  const models = fetchedModels ?? externalModels ?? [];
+  useEffect(() => setRefreshModelsError(null), [selectedAccount?.grantId]);
+  const models: AdapterModel[] = useAdapterModels
+    ? fetchedModels ?? externalModels ?? []
+    : gateway && accounts.isSuccess && !connectionProblem && !gatewayModels.isError ? (gatewayModels.data?.models ?? []).map(id => ({ id, label: id })) : [];
+  const modelLoadError = connectionProblem ?? (effectiveAiBinding ? accounts.error?.message : undefined)
+    ?? (gateway ? gatewayModels.error?.message : fetchedModelsError?.message);
+  const modelsPending = Boolean(effectiveAiBinding && accounts.isPending)
+    || Boolean(gateway && !connectionProblem && gatewayModels.isPending)
+    || (useAdapterModels && adapterModelsPending);
   const adapterCommandField = "command";
   const {
     data: detectedModelData,
@@ -927,9 +961,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       }
       return agentsApi.detectModel(selectedCompanyId, adapterType);
     },
-    enabled: Boolean(selectedCompanyId && isLocal && adapterType !== "opencode_local" && adapterType !== "paperclip_runner"),
+    enabled: Boolean(!effectiveAiBinding && selectedCompanyId && isLocal && adapterType !== "opencode_local" && adapterType !== "paperclip_runner"),
   });
-  const detectedModel = detectedModelData?.model ?? null;
+  const detectedModel = effectiveAiBinding ? null : detectedModelData?.model ?? null;
   const detectedModelCandidates = detectedModelData?.candidates ?? [];
 
   const { data: companyAgents = [] } = useQuery({
@@ -1251,6 +1285,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   async function handleRefreshModels() {
     if (!selectedCompanyId) return;
+    if (gateway) {
+      await gatewayModels.refetch();
+      return;
+    }
     setRefreshingModels(true);
     setRefreshModelsError(null);
     try {
@@ -1569,8 +1607,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       <div data-config-section="adapter" className={cn(!cards && (isCreate ? "border-t border-border" : "border-b border-border"))}>
         <div className={cn(cards ? "flex items-center justify-between mb-3" : "px-4 py-2 flex items-center justify-between gap-2")}>
           {cards
-            ? <h3 className="text-sm font-medium">{props.sectionTitles?.["adapter"] ?? "Adapter"}</h3>
-            : <span className="text-xs font-medium text-muted-foreground">Adapter</span>
+            ? <h3 className="text-sm font-medium">{props.sectionTitles?.["adapter"] ?? "Harness and provider"}</h3>
+            : <span className="text-xs font-medium text-muted-foreground">Harness and provider</span>
           }
           {showInlineAdapterTestEnvironmentButton && (
             <Button
@@ -1587,7 +1625,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         </div>
         <div className={cn(cards ? "border border-border rounded-lg p-4 space-y-3" : "px-4 pb-3 space-y-3")}>
           {showAdapterTypeField && (
-            <Field label="Adapter type" hint={help.adapterType}>
+            <Field label="Harness" hint={help.adapterType}>
               <AdapterTypeDropdown
                 value={adapterType}
                 disabledTypes={adapterPickerDisabledTypes}
@@ -1652,8 +1690,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             </Field>
           )}
 
-          {!isCreate && selectedCompanyId && <AiConnectionField companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={adapterType === "paperclip_runner" ? eff("adapterConfig", "provider", config.provider) === "codex" ? "codex_local" : eff("adapterConfig", "provider", config.provider) === "opencode" ? "opencode_local" : eff("adapterConfig", "provider", config.provider) === "acpx" && eff("adapterConfig", "acpxAgent", config.acpxAgent) === "claude" ? "claude_local" : adapterType : adapterType}
-            value={aiConnectionBindingSchema.safeParse((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection).data}
+          {!isCreate && selectedCompanyId && <AiConnectionField
+            companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={effectiveAiAdapter}
+            value={effectiveAiBinding}
             model={String(eff("adapterConfig", "model", config.model) ?? "")} environmentId={currentDefaultEnvironmentId || undefined} legacy
             onChange={binding => mark("runtime", "runtimeConfig", { ...runtimeConfig, aiConnection: binding })} />}
 
@@ -1712,6 +1751,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           {renderAdapterFields("adapter")}
           {isLocal && (<>
               <ModelDropdown
+                key={selectedAccount?.grantId ?? "adapter"}
                 models={models}
                 value={currentModelId}
                 onChange={(v) => {
@@ -1735,34 +1775,31 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 open={modelOpen}
                 onOpenChange={setModelOpen}
                 defaultLabel={adapterType === "claude_local" ? `Default (${DEFAULT_CLAUDE_LOCAL_MODEL})` : undefined}
-                allowDefault={adapterType !== "opencode_local" && adapterType !== "pi_local" && adapterType !== "paperclip_runner"}
+                allowDefault={!gateway && adapterType !== "opencode_local" && adapterType !== "pi_local" && adapterType !== "paperclip_runner"}
                 required={adapterType === "opencode_local" || adapterType === "pi_local"}
                 groupByProvider={adapterType === "opencode_local" || adapterType === "pi_local"}
                 creatable
                 detectedModel={detectedModel}
                 detectedModelCandidates={[]}
-                onDetectModel={adapterType === "opencode_local" || adapterType === "paperclip_runner"
+                onDetectModel={effectiveAiBinding || adapterType === "opencode_local" || adapterType === "paperclip_runner"
                   ? undefined
                   : async () => {
                       const result = await refetchDetectedModel();
                       return result.data?.model ?? null;
                     }}
                 onRefreshModels={
-                  supportsAdapterModelRefresh(adapterType)
+                  (gateway && !connectionProblem) || (useAdapterModels && supportsAdapterModelRefresh(adapterType))
                     ? handleRefreshModels
                     : undefined
                 }
-                refreshingModels={refreshingModels}
+                refreshingModels={gateway ? gatewayModels.isFetching : refreshingModels}
                 detectModelLabel="Detect model"
                 emptyDetectHint="No model detected. Select or enter one manually."
               />
-              {(refreshModelsError || fetchedModelsError) && (
-                <p className="text-xs text-destructive">
-                  {refreshModelsError
-                    ?? (fetchedModelsError instanceof Error
-                      ? fetchedModelsError.message
-                      : "Failed to load adapter models.")}
-                </p>
+              {modelsPending && <p role="status" className="text-xs text-muted-foreground">Loading provider models…</p>}
+              {((!gateway && refreshModelsError) || modelLoadError) && <p role="alert" className="text-xs text-destructive">{(!gateway && refreshModelsError) || modelLoadError}</p>}
+              {gateway && gatewayModels.isSuccess && currentModelId && !models.some(model => model.id === currentModelId) && (
+                <p className="text-xs text-muted-foreground">The current model is not listed by this provider. Choose an available model or enter a supported ID.</p>
               )}
               {adapterType === "opencode_local"
                 && currentDefaultEnvironment
@@ -3802,7 +3839,7 @@ export function ModelDropdown({
         }}
       >
         <PopoverTrigger asChild>
-          <button type="button" className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-sm hover:bg-accent/50 transition-colors w-full justify-between">
+          <button type="button" aria-label="Model" className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-sm hover:bg-accent/50 transition-colors w-full justify-between">
             <span className={cn(!value && "text-muted-foreground")}>
               {selected
                 ? selected.label

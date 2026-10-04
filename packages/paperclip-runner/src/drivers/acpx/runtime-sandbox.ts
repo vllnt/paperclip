@@ -1,3 +1,4 @@
+import { codexGatewayConfig } from "../codex/gateway-config.js";
 import { randomBytes } from "node:crypto";
 import {
   constants,
@@ -394,10 +395,17 @@ export async function prepareAcpxRuntimeSandbox(input: {
       })}\n`,
     );
   }
+  const sanitizedSpawnInput = createSanitizedAcpxSpawnInput(
+    input.environment,
+    input.agent,
+  );
   if (input.agent === "codex") {
     await writePrivateFile(
       join(agentHomeDirectory, "config.toml"),
       [
+        ...(sanitizedSpawnInput.env.OPENAI_BASE_URL?.trim()
+          ? [codexGatewayConfig(sanitizedSpawnInput.env.OPENAI_BASE_URL)]
+          : []),
         // Codex shell snapshots serialize the provider process environment.
         // The ACPX sidecar receives a short-lived managed credential only so
         // it can authenticate the provider; that value must never become
@@ -411,10 +419,6 @@ export async function prepareAcpxRuntimeSandbox(input: {
     );
   }
 
-  const sanitizedSpawnInput = createSanitizedAcpxSpawnInput(
-    input.environment,
-    input.agent,
-  );
   // The sanitizer deliberately returns an opaque, frozen launch boundary.
   // Build the sandbox-owned mutable copy only from that projected environment
   // before adding paths that were created and validated above.

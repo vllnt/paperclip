@@ -7,6 +7,7 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   createAiConnectionSchema,
+  testAiGatewaySchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -1310,6 +1311,7 @@ const BOARD_ONLY_PREFIXES = [
 const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
+  "POST /api/companies/{companyId}/ai-connections/gateway/test",
   "POST /api/companies/{companyId}/ai-connections/local",
   "POST /api/companies/{companyId}/ai-connections/local/attempts",
   "POST /api/companies/{companyId}/ai-connections/local/check",
@@ -10167,6 +10169,15 @@ registerCurrentRoute({
 });
 
 // --- AI runtime connections -------------------------------------------------
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/gateway/test",
+  tags: ["ai-connections"],
+  summary: "Test an API gateway and list its models without saving or changing credentials",
+  body: testAiGatewaySchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
 
 registerCurrentRoute({
   method: "get",

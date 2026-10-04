@@ -1,3 +1,4 @@
+import { codexGatewayConfig } from "./codex/gateway-config.js";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
@@ -312,6 +313,7 @@ export async function prepareIsolatedCodexHome(input: {
   sourceCodexHome?: string | null;
   nativeMcp?: NativeMcpLaunchBinding | null;
   apiKey?: string | null;
+  baseUrl?: string;
 }): Promise<void> {
   await materializeNativeRuntimeSkills(
     input.context,
@@ -321,6 +323,7 @@ export async function prepareIsolatedCodexHome(input: {
   const configPath = join(input.codexHome, "config.toml");
   await rm(configPath, { force: true });
   await writeFile(configPath, [
+    ...(input.baseUrl?.trim() ? [codexGatewayConfig(input.baseUrl)] : []),
     // Codex shell snapshots serialize the provider process environment. The
     // native runner injects short-lived provider and MCP bindings, so a
     // snapshot would turn ephemeral credentials into durable session state.

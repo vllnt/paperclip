@@ -1,8 +1,9 @@
+import { validateAiGatewayKey } from "../services/ai-gateway.js";
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
+import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiGatewayConfigSchema, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
@@ -3315,11 +3316,21 @@ export function agentRoutes(
     // only a provider CLI reads, so proving the runtime lane can consume it
     // takes a real hello turn.
     if (resolvedMethod === "api_key") {
-      const envKey = AI_CONNECTION_CAPABILITIES[binding.provider].methods.api_key?.envKey;
+      const gatewayConfig = parseObject(context.config.managedAiConnection).gateway;
+      const envKey = gatewayConfig && binding.provider === "anthropic"
+        ? "ANTHROPIC_AUTH_TOKEN"
+        : AI_CONNECTION_CAPABILITIES[binding.provider].methods.api_key?.envKey;
       const key = envKey ? parseObject(context.config.env)[envKey] : undefined;
       try {
         if (typeof key !== "string" || !key) throw unprocessable("The selected account's API key was not available to verify.");
-        await validateAiApiKey(binding.provider, key);
+        if (gatewayConfig) {
+          const gateway = aiGatewayConfigSchema.parse(gatewayConfig);
+          const model = typeof context.config.model === "string" ? context.config.model.trim() : "";
+          if (!model) throw unprocessable("Choose a gateway model before testing this agent.");
+          await validateAiGatewayKey(binding.provider, gateway, key, model);
+        } else {
+          await validateAiApiKey(binding.provider, key);
+        }
         result.checks.push({ code: "ai_connection_api_key_reverified", level: "info", message: "The provider verified this API key for adoption." });
       } catch (error) {
         result.status = "fail";

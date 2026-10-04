@@ -1,6 +1,7 @@
-import type { AiManagedConnectionSummary, CreateAiConnection, AiConnectionLoginIntent, LocalAiLoginAttempt, LocalAiLoginStatus } from "@paperclipai/shared";
+import type { TestAiGateway, AiGatewayTestResult, AiManagedConnectionSummary, CreateAiConnection, AiConnectionLoginIntent, LocalAiLoginAttempt, LocalAiLoginStatus } from "@paperclipai/shared";
 import { api } from "./client";
 export const aiConnectionsApi = {
+  testGateway: (companyId: string, input: TestAiGateway) => api.post<AiGatewayTestResult>(`/companies/${companyId}/ai-connections/gateway/test`, input),
   startLocalLogin: (companyId: string, input: AiConnectionLoginIntent & { restart?: boolean }) => api.post<LocalAiLoginAttempt>(`/companies/${companyId}/ai-connections/local/attempts`, input),
   checkLocalLogin: (companyId: string, input: AiConnectionLoginIntent & { localSessionId?: string }) => api.post<LocalAiLoginStatus>(`/companies/${companyId}/ai-connections/local/check`, input),
   cancelLocalLogin: (companyId: string, sessionId: string) => api.delete(`/companies/${companyId}/ai-connections/local/attempts/${sessionId}`),

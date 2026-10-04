@@ -237,6 +237,10 @@ A full-page extension mounted at `/plugins/:pluginId` (global) or `/:company/plu
 
 Adds a navigation-style entry to the main company sidebar navigation area, rendered alongside the core nav items (Dashboard, Issues, Goals, etc.). Use this for lightweight, always-visible links or status indicators that feel native to the sidebar. Receives `PluginSidebarProps` with `context.companyId` set to the active company. Requires the `ui.sidebar.register` capability.
 
+Set `sidebarSection: "org"` on a `sidebar` slot to place company configuration
+under **Org** (Company/Organization in legacy navigation). Omitting the field
+keeps the entry under **Work**.
+
 #### `routeSidebar`
 
 A contextual sidebar shown while the current route is a plugin page route with the same `routePath`. Use this for full-page plugin workspaces that need their own local navigation. It does **not** replace the app sidebar: the host collapses the main `<Sidebar/>` to its 64px icon rail (still hover/peek-able) and renders your `routeSidebar` in a secondary pane beside it, producing `[ app rail ][ your sidebar ][ content ]`. Receives `PluginRouteSidebarProps` with `context.companyId` and `context.companyPrefix` set to the active company. Requires the `ui.sidebar.register` capability.
@@ -273,7 +277,7 @@ A button rendered in the global top bar (breadcrumb bar) that appears on every p
 
 #### `toolbarButton`
 
-A button rendered in the toolbar of an entity page (e.g. project detail, issue detail). Use this for short-lived, contextual actions scoped to the current entity — like triggering a project sync, opening a picker, or running a quick command on that entity. The component can open a plugin-owned modal internally for confirmations or compact forms. Receives `context.companyId`, `context.entityId`, and `context.entityType`; declare `entityTypes` in the manifest to control which entity pages the button appears on. Requires the `ui.action.register` capability.
+A button rendered in the toolbar of an entity page (e.g. project detail, issue detail). Use this for short-lived, contextual actions scoped to the current entity — like triggering a project sync, opening a picker, or running a quick command on that entity. The component can open a plugin-owned modal internally for confirmations or compact forms. Receives `context.companyId`, `context.entityId`, and `context.entityType`; declare `entityTypes` in the manifest to control which entity pages the button appears on. Requires the `ui.action.register` capability. Agent toolbar slots are mounted beside the managed provider selector on compatible agent configuration pages.
 
 #### `contextMenuItem`
 

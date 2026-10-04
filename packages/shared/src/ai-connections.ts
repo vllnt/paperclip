@@ -164,6 +164,7 @@ export interface AiManagedConnectionSummary {
   method: AiAuthMethod;
   name: string;
   accountLabel?: string;
+  gateway?: AiGatewayConfig;
   ownership: "personal" | "shared";
   ownerUserId?: string;
   ownerName?: string;
@@ -171,6 +172,46 @@ export interface AiManagedConnectionSummary {
   status: "connected" | "needs_attention" | "expired" | "revoked";
   unavailableReason?: string;
 }
+/** A trusted, operator-approved server exposing the selected client API. */
+export const aiGatewayConfigSchema = z.object({
+  baseUrl: z.string().trim().min(1).max(2048).superRefine((value, ctx) => {
+    try {
+      const url = new URL(value);
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || /[\\\s]/.test(value)) {
+        throw new Error("invalid endpoint");
+      }
+    } catch {
+      ctx.addIssue({ code: "custom", message: "Use an HTTP(S) gateway URL without credentials, query, or fragment" });
+    }
+  }).transform(value => value.replace(/\/+$/, "").replace(/\/v1$/, "")),
+}).strict();
+export type AiGatewayConfig = z.infer<typeof aiGatewayConfigSchema>;
+const gatewayTestCredentialSchema = z.object({
+  gateway: aiGatewayConfigSchema,
+  apiKey: z.string().trim().min(1).max(32768).regex(/^[^\r\n]+$/),
+}).strict();
+
+/** Tests never save a draft or change a saved connection's credential or grants. */
+const gatewayTestModelSchema = z.string().trim().min(1).max(256).regex(/^[^\r\n]+$/);
+export const testAiGatewaySchema = z.union([
+  gatewayTestCredentialSchema.extend({
+    provider: z.enum(["openai", "anthropic"]),
+    testModel: gatewayTestModelSchema.optional(),
+  }).strict(),
+  z.object({
+    connectionId: z.string().uuid(),
+    grantId: z.string().uuid(),
+    testModel: gatewayTestModelSchema.optional(),
+  }).strict(),
+]);
+export type TestAiGateway = z.infer<typeof testAiGatewaySchema>;
+export interface AiGatewayTestResult {
+  models: string[];
+  provider: "openai" | "anthropic";
+  testedModel?: string;
+  checkedAt: string;
+}
+
 export const createAiConnectionSchema = z
   .object({
     ...requirement,
@@ -178,12 +219,18 @@ export const createAiConnectionSchema = z
     ownership: z.enum(["personal", "shared"]),
     apiKey: z.string().trim().min(1).max(32768).optional(),
     loginSessionId: z.string().max(128).optional(),
+    gateway: aiGatewayConfigSchema.optional(),
+    testModel: gatewayTestModelSchema.optional(),
     connectionId: z.string().uuid().optional(),
     agentIds: z.array(z.string().uuid()).max(1000).default([]),
     allAgents: z.boolean().default(false),
   })
   .strict()
   .superRefine((v, ctx) => {
+    if (v.gateway && (v.method !== "api_key" || !["openai", "anthropic"].includes(v.provider) || !v.testModel || /[\r\n]/.test(v.apiKey ?? ""))) {
+      ctx.addIssue({ code: "custom", message: "Gateway connections require a Claude or Codex API key and a model to test" });
+    }
+    if (v.testModel && !v.gateway) ctx.addIssue({ code: "custom", message: "A test model requires a gateway" });
     if (!AI_CONNECTION_CAPABILITIES[v.provider].methods[v.method])
       ctx.addIssue({ code: "custom", message: "Unsupported sign-in method" });
     if (

@@ -472,6 +472,8 @@ export interface PluginManagedSkillResolution {
 export interface PluginUiSlotDeclaration {
   /** The type of UI mount point (page, detailTab, taskDetailView, toolbarButton, etc.). */
   type: PluginUiSlotType;
+  /** Main sidebar group; defaults to Work for existing sidebar contributions. */
+  sidebarSection?: "work" | "org";
   /** Unique slot identifier within the plugin. */
   id: string;
   /** Human-readable name shown in navigation or tab labels. */

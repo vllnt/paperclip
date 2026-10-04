@@ -39,7 +39,7 @@ export function AiConnectionDesignExamples() {
         Storybook under AI Connections / Review. Example controls below do not
         connect accounts.
       </p>
-      <p className="text-sm text-muted-foreground">Provider lists and account management use Browse and AppDetail from the Connectors interface. The picker below uses ConnectionChoiceList, also used by ConnectionSetupFlow.</p>
+      <p className="text-sm text-muted-foreground">Provider lists and account management use Browse and AppDetail from the Connectors interface. The picker below uses the standard Provider dropdown, also shown in agent settings.</p>
       <AiConnectionPicker
         requirement={requirement}
         connections={[account]}

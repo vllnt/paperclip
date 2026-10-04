@@ -187,7 +187,9 @@ export async function testEnvironment(
     isNonEmpty(env.ANTHROPIC_BEDROCK_BASE_URL) ||
     (considerHostEnv && isNonEmpty(process.env.ANTHROPIC_BEDROCK_BASE_URL));
 
-  const configApiKey = env.ANTHROPIC_API_KEY;
+  const configApiKey = parseObject(config.managedAiConnection).method === "api_key" && env.ANTHROPIC_AUTH_TOKEN
+    ? env.ANTHROPIC_AUTH_TOKEN
+    : env.ANTHROPIC_API_KEY;
   const hostApiKey = considerHostEnv ? process.env.ANTHROPIC_API_KEY : undefined;
   if (hasBedrock) {
     const source =

@@ -2333,6 +2333,7 @@ async function settleRetainedRunnerdSessionOwned(
       codexHome,
       sourceCodexHome:
         input.sourceCodexHome ?? resolveSourceCodexHome(input.environment),
+      baseUrl: input.environment?.OPENAI_BASE_URL,
       apiKey:
         input.environment?.CODEX_API_KEY ?? input.environment?.OPENAI_API_KEY,
     }),
@@ -4350,6 +4351,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         apiKey:
           this.options.environment?.CODEX_API_KEY ??
           this.options.environment?.OPENAI_API_KEY,
+        baseUrl: this.options.environment?.OPENAI_BASE_URL,
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }
@@ -5247,6 +5249,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         apiKey:
           this.options.environment?.CODEX_API_KEY ??
           this.options.environment?.OPENAI_API_KEY,
+        baseUrl: this.options.environment?.OPENAI_BASE_URL,
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }

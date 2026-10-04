@@ -1257,8 +1257,8 @@ export async function createApp(
   // worker (see activateReadyPlugin in services/plugin-lifecycle.ts).
   //
   // Managed instances (`plugins.autoInstall` from PAPERCLIP_MANAGED_CONFIG)
-  // drive the key list from the control plane; self-hosted instances keep
-  // the pre-existing behavior of ensuring only the kubernetes bundle.
+  // drive the key list from the control plane; self-hosted instances ensure
+  // this fork's Providers plugin and the kubernetes bundle when present.
   //
   // Resolution is deliberately synchronous and NOT fail-safe: an
   // unknown key or a path escaping the bundled catalog root throws out of

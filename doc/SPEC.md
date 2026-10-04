@@ -601,3 +601,11 @@ company search share lexical matching and ranking. Known identifiers and direct
 title matches lead; current conversation and document content supplies supporting
 evidence. See [Task search relevance](SEARCH.md) for the evaluation rubric,
 matching contract and reproducible quality tests.
+
+### Explicit AI gateway connections
+
+An AI connection can select an operator-approved existing model gateway while
+preserving the agent's harness and model. Gateway credentials follow the same
+company, human-audience, agent-access, and revocation rules as direct provider
+accounts. Current Claude/Codex implementation and protocol boundaries are in
+[AI Connections](connections/AI-CONNECTIONS.md#existing-cliproxyapi-and-compatible-gateways).

@@ -494,7 +494,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const modelEnv = executionTargetIsRemote ? env : effectiveEnv;
   const model = resolveClaudeModel(config.model, modelEnv);
-  const billingType = resolveClaudeBillingType(effectiveEnv);
+  const billingType = parseObject(config.managedAiConnection).method === "api_key" ? "api" : resolveClaudeBillingType(effectiveEnv);
   const claudeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = new Set(resolveClaudeDesiredSkillNames(config, claudeSkillEntries));
   // When instructionsFilePath is configured, build a stable content-addressed

@@ -380,6 +380,7 @@ export type PluginManagedSkillDeclarationInput = z.infer<typeof pluginManagedSki
  */
 export const pluginUiSlotDeclarationSchema = z.object({
   type: z.enum(PLUGIN_UI_SLOT_TYPES),
+  sidebarSection: z.enum(["work", "org"]).optional(),
   id: z.string().min(1),
   displayName: z.string().min(1),
   exportName: z.string().min(1),
@@ -389,6 +390,9 @@ export const pluginUiSlotDeclarationSchema = z.object({
   }).optional(),
   order: z.number().int().optional(),
 }).superRefine((value, ctx) => {
+  if (value.sidebarSection && value.type !== "sidebar") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "sidebarSection is only supported for sidebar slots", path: ["sidebarSection"] });
+  }
   // context-sensitive slots require explicit entity targeting.
   const entityScopedTypes = ["detailTab", "taskDetailView", "contextMenuItem", "commentAnnotation", "commentContextMenuItem", "projectSidebarItem"];
   if (

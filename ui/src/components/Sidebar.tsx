@@ -222,6 +222,7 @@ export function Sidebar({ children }: { children?: ReactNode }) {
           ) : null}
           <PluginSlotOutlet
             slotTypes={["sidebar"]}
+            sidebarSection="work"
             context={pluginContext}
             className="flex flex-col gap-0.5"
             itemClassName="text-(length:--text-compact) font-medium"
@@ -242,6 +243,14 @@ export function Sidebar({ children }: { children?: ReactNode }) {
           >
             <SidebarNavItem to="/agents" label="Agents" icon={Users} />
             <SidebarNavItem to="/skills" label="Skills" icon={Boxes} />
+            <PluginSlotOutlet
+              slotTypes={["sidebar"]}
+              sidebarSection="org"
+              context={pluginContext}
+              className="flex flex-col gap-0.5"
+              itemClassName="text-(length:--text-compact) font-medium"
+              missingBehavior="placeholder"
+            />
             <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} />
             <SidebarNavItem to="/activity" label="Audit" icon={History} />
           </SidebarSection>
@@ -261,6 +270,14 @@ export function Sidebar({ children }: { children?: ReactNode }) {
               collapsible={{ open: organizationOpen, onOpenChange: setOrganizationOpen }}
             >
               <SidebarNavItem to="/org" label="Org" icon={Network} />
+              <PluginSlotOutlet
+                slotTypes={["sidebar"]}
+                sidebarSection="org"
+                context={pluginContext}
+                className="flex flex-col gap-0.5"
+                itemClassName="text-(length:--text-compact) font-medium"
+                missingBehavior="placeholder"
+              />
               <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} />
               <SidebarNavItem to="/timeline" label="Timeline" icon={GanttChartSquare} />
               <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />

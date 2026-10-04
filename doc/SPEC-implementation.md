@@ -1693,3 +1693,12 @@ instance-level registry retains validated publication IDs, allowing offline
 dismissal retries after withdrawal while rejecting caller-invented IDs. It
 stores no announcement content, account data or interaction events.
 See [Announcements](ANNOUNCEMENTS.md) for API and publishing details.
+
+### Explicit AI gateway connections
+
+Claude and Codex AI connections may use an operator-approved existing gateway
+(such as CLIProxyAPI) with encrypted API-key credentials. The fork-bundled Providers
+plugin uses the existing company, grant, and agent-selection interfaces. The
+selected gateway controls the endpoint; the agent keeps its harness and model.
+See [AI Connections](connections/AI-CONNECTIONS.md#existing-cliproxyapi-and-compatible-gateways)
+for protocols, destination approval, tests, revocation, and runtime isolation.

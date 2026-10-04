@@ -1,9 +1,14 @@
-import { AppLogo } from "@/pages/apps/AppLogo";
-import { ConnectionChoiceList } from "@/features/connections/ConnectionChoiceList";
-import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Field } from "@/components/agent-config-primitives";
 import {
-  AI_PROVIDERS,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectSeparator,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
+import {
   aiConnectionProblem,
   aiMethodLabel,
   bindingProblem,
@@ -24,6 +29,7 @@ export interface AiConnectionPickerProps {
   loading?: boolean;
   error?: string;
   readOnly?: boolean;
+  unmanaged?: boolean;
   onChange: (binding: AiConnectionBinding) => void;
   onConnect: () => void;
   onRetry?: () => void;
@@ -38,6 +44,7 @@ export function AiConnectionPicker({
   loading,
   error,
   readOnly,
+  unmanaged,
   onChange,
   onConnect,
   onRetry,
@@ -50,94 +57,121 @@ export function AiConnectionPicker({
     requirement,
     currentUserId,
   );
-  const problem = value ? bindingProblem(
-    value,
-    requirement,
-    connections,
-    currentUserId,
-    agentId,
-  ) : undefined;
-  const select = (
-    mode: "shared",
-    connection: AiConnectionSummary,
-  ) =>
-    onChange({
-      provider: requirement.provider,
-      method: connection.method,
-      mode,
-      connectionId: connection.id,
-      grantId: connection.grantId,
-    });
+  const shared = compatible.filter(
+    (connection) => connection.ownership === "shared",
+  );
+  const problem = value
+    ? bindingProblem(value, requirement, connections, currentUserId, agentId)
+    : undefined;
+  const selectedId =
+    value?.mode === "responsible_user" ? "responsible_user" : value?.grantId;
+  const selected = compatible.find(
+    (connection) => connection.grantId === selectedId,
+  );
   return (
-    <section className="flex flex-col gap-4" aria-label="AI connection">
-      <div className="flex items-center gap-3">
-        <AppLogo
-          name={AI_PROVIDERS[requirement.provider].name}
-          brandKey={requirement.provider}
-          logoUrl={AI_PROVIDERS[requirement.provider].logo}
-          darkLogoUrl={requirement.provider === "xai" ? "/brands/adapters/grok-dark.svg" : undefined}
-          size={32}
-        />
-        <div className="flex min-w-0 flex-col gap-1">
-        <h3 className="text-sm font-semibold">AI connection</h3>
+    <section className="space-y-2" aria-label="Provider connection">
+      <Field label="Provider">
+        <Select
+          value={selectedId ?? ""}
+          disabled={readOnly || loading || Boolean(error)}
+          onValueChange={(id) => {
+            if (id === "connect") {
+              onConnect();
+              return;
+            }
+            if (id === "responsible_user") {
+              onChange({
+                provider: requirement.provider,
+                method:
+                  personalDefault?.method ??
+                  requirement.method ??
+                  (requirement.provider === "openrouter"
+                    ? "api_key"
+                    : "subscription"),
+                mode: "responsible_user",
+              });
+              return;
+            }
+            const connection = shared.find((item) => item.grantId === id);
+            if (connection)
+              onChange({
+                provider: requirement.provider,
+                method: connection.method,
+                mode: "shared",
+                connectionId: connection.id,
+                grantId: connection.grantId,
+              });
+          }}
+        >
+          <SelectTrigger aria-label="Provider" className="w-full" size="sm">
+            <SelectValue
+              placeholder={
+                loading
+                  ? "Loading providers…"
+                  : unmanaged
+                    ? "Existing authentication"
+                    : "Select provider"
+              }
+            />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="responsible_user">
+              {personalDefault
+                ? `${personalDefault.name} · ${aiMethodLabel(personalDefault.provider, personalDefault.method)} (personal default)`
+                : "Responsible user’s default · Not connected"}
+            </SelectItem>
+            {shared.map((connection) => (
+              <SelectItem
+                key={connection.grantId}
+                value={connection.grantId}
+                disabled={Boolean(aiConnectionProblem(connection))}
+              >
+                {connection.name} ·{" "}
+                {aiMethodLabel(connection.provider, connection.method)}
+                {aiConnectionProblem(connection) ? " · Unavailable" : ""}
+              </SelectItem>
+            ))}
+            {selectedId &&
+              selectedId !== "responsible_user" &&
+              !shared.some(
+                (connection) => connection.grantId === selectedId,
+              ) && (
+                <SelectItem value={selectedId} disabled>
+                  {selected?.name ?? "Unavailable provider"}
+                </SelectItem>
+              )}
+            {!readOnly && (
+              <>
+                <SelectSeparator />
+                <SelectItem value="connect">
+                  Connect another account…
+                </SelectItem>
+              </>
+            )}
+          </SelectContent>
+        </Select>
+      </Field>
+      {value?.mode === "responsible_user" && !problem && (
         <p className="text-xs text-muted-foreground">
-          {AI_PROVIDERS[requirement.provider].name}
-          {value && value.mode !== "responsible_user" && ` · ${aiMethodLabel(value.provider, value.method)}`}
+          Each person’s tasks use their own default account.
         </p>
-        </div>
-      </div>
-      {loading ? (
-        <div role="status" aria-label="Loading AI connections">
-          <Skeleton className="h-24 w-full" />
-        </div>
-      ) : error ? (
-        <div className="flex flex-col gap-2">
-          <p role="alert" className="text-sm text-destructive">
+      )}
+      {problem && (
+        <p role="status" className="text-xs text-destructive">
+          {problem}
+        </p>
+      )}
+      {error && (
+        <div className="flex items-center gap-2">
+          <p role="alert" className="text-xs text-destructive">
             {error}
           </p>
           {onRetry && (
-            <Button type="button" variant="outline" onClick={onRetry}>
-              Retry connections
+            <Button type="button" variant="ghost" size="sm" onClick={onRetry}>
+              Retry
             </Button>
           )}
         </div>
-      ) : (
-        <>
-          <ConnectionChoiceList
-            disabled={readOnly}
-            selectedId={value?.mode === "responsible_user" ? "responsible_user" : value?.connectionId}
-            choices={[
-              { id: "responsible_user", name: "Responsible user’s connection", description: <>
-                <span className="block">For you: {personalDefault?.name ?? "Not connected"}</span>
-                <span className="block">Other users’ tasks use their own {AI_PROVIDERS[requirement.provider].name} connection.</span>
-              </> },
-              ...compatible.filter((connection) => connection.ownership === "shared").map((connection) => ({
-                id: connection.id, name: connection.name,
-                disabled: Boolean(aiConnectionProblem(connection)),
-                description: <>Company shared · {aiMethodLabel(connection.provider, connection.method)}{connection.accountLabel ? ` · ${connection.accountLabel}` : ""}{aiConnectionProblem(connection) ? ` · ${aiConnectionProblem(connection)}` : ""}</>,
-              })),
-            ]}
-            onSelect={(id) => {
-              if (id === "responsible_user") onChange({provider: requirement.provider, method: personalDefault?.method ?? requirement.method ?? (requirement.provider === "openrouter" ? "api_key" : "subscription"), mode: "responsible_user"});
-              else { const connection = compatible.find((item) => item.id === id)!; select("shared", connection); }
-            }}
-          />
-          {problem && (
-            <p role="status" className="text-sm text-destructive">
-              {problem}
-            </p>
-          )}
-          {!readOnly && (
-            <Button
-              type="button"
-              variant="outline"
-              className="self-end"
-              onClick={onConnect}
-            >
-              Connect another account
-            </Button>
-          )}
-        </>
       )}
     </section>
   );

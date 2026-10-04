@@ -182,7 +182,7 @@ export function resolveClaudeAcpBillingIdentity(
   const bedrock = bedrockFlag === "1" || bedrockFlag === "true" || Boolean(readEnvValue("ANTHROPIC_BEDROCK_BASE_URL"));
   const billingType: AdapterBillingType = bedrock
     ? "metered_api"
-    : readEnvValue("ANTHROPIC_API_KEY")
+    : (parseObject(ctx.config.managedAiConnection).method === "api_key" || readEnvValue("ANTHROPIC_API_KEY"))
     ? "api"
     : "subscription";
   return {
@@ -799,7 +799,9 @@ export async function testClaudeAcpEnvironment(
     (considerHostEnv && process.env.CLAUDE_CODE_USE_BEDROCK === "true") ||
     isNonEmpty(envConfig.ANTHROPIC_BEDROCK_BASE_URL) ||
     (considerHostEnv && isNonEmpty(process.env.ANTHROPIC_BEDROCK_BASE_URL));
-  const configApiKey = envConfig.ANTHROPIC_API_KEY;
+  const configApiKey = parseObject(config.managedAiConnection).method === "api_key" && envConfig.ANTHROPIC_AUTH_TOKEN
+    ? envConfig.ANTHROPIC_AUTH_TOKEN
+    : envConfig.ANTHROPIC_API_KEY;
   const hostApiKey = considerHostEnv ? process.env.ANTHROPIC_API_KEY : undefined;
   const hostOauthToken = considerHostEnv ? process.env.CLAUDE_CODE_OAUTH_TOKEN : undefined;
   const hostAuthToken = considerHostEnv ? process.env.ANTHROPIC_AUTH_TOKEN : undefined;

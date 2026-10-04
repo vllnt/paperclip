@@ -1,4 +1,5 @@
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
@@ -55,6 +56,8 @@ export interface BundledPluginCatalogEntry {
    * containment when enforcement is on.
    */
   pathOverrideEnvVar?: string;
+  /** Source-checkout location for a fork-owned default plugin. */
+  selfHostedPath?: string;
 }
 
 /**
@@ -63,6 +66,12 @@ export interface BundledPluginCatalogEntry {
  * regardless of what the managed config document says.
  */
 export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
+  {
+    key: "providers",
+    pluginKey: "vllnt.paperclip-plugin-cliproxyapi",
+    relativePath: "plugin-providers",
+    selfHostedPath: fileURLToPath(new URL("../../../packages/plugins/plugin-providers", import.meta.url)),
+  },
   {
     key: "createos",
     pluginKey: "paperclip.createos-sandbox-provider",
@@ -108,10 +117,10 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
 
 /**
  * Keys ensured on a self-hosted instance (no managed config present).
- * Exactly the pre-refactor behavior: the kubernetes sandbox provider is
- * auto-installed when its bundle is present, nothing else.
+ * The fork includes Providers alongside the kubernetes sandbox provider.
+ * Both are installed only when their built bundle is present.
  */
-export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes"];
+export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes", "providers"];
 
 export function resolveBundledCatalogRoot(
   env: Record<string, string | undefined>,
@@ -192,7 +201,9 @@ export function resolveBundledPluginInstalls(
       : undefined;
     const localPath = override
       ? path.resolve(override)
-      : path.resolve(opts.catalogRoot, entry.relativePath);
+      : !opts.enforceCatalogRoot && opts.catalogRoot === DEFAULT_BUNDLED_CATALOG_ROOT && entry.selfHostedPath
+        ? entry.selfHostedPath
+        : path.resolve(opts.catalogRoot, entry.relativePath);
     if (opts.enforceCatalogRoot && !isInsideRoot(canonicalize(localPath), canonicalRoot)) {
       throw new Error(
         `bundled plugin "${key}" resolves to "${localPath}", outside the bundled catalog root "${opts.catalogRoot}"; refusing to start`,

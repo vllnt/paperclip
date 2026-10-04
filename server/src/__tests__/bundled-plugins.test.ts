@@ -166,14 +166,16 @@ describe("resolveBundledPluginInstalls", () => {
     expect(resolved).toHaveLength(1);
   });
 
-  it("keeps the self-hosted default list to exactly the kubernetes bundle", () => {
-    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes"]);
-    const [entry] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
+  it("includes Providers by default and preserves the kubernetes bundle location", () => {
+    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes", "providers"]);
+    const [entry, providers] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
       catalogRoot: resolveBundledCatalogRoot({}),
       env: {},
       enforceCatalogRoot: false,
     });
-    // Exactly the pre-refactor default path.
+    expect(providers).toMatchObject({ key: "providers", pluginKey: "vllnt.paperclip-plugin-cliproxyapi" });
+    expect(providers.localPath).toMatch(/packages\/plugins\/plugin-providers$/);
+    // Preserve the existing sandbox-provider location.
     expect(entry).toEqual({
       key: "kubernetes",
       pluginKey: "paperclip.kubernetes-sandbox-provider",

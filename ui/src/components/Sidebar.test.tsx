@@ -83,8 +83,8 @@ vi.mock("../hooks/useInboxBadge", () => ({
 }));
 
 vi.mock("@/plugins/slots", () => ({
-  PluginSlotOutlet: ({ slotTypes }: { slotTypes: string[] }) => (
-    <div data-plugin-slot-types={slotTypes.join(",")}>Plugin slot outlet</div>
+  PluginSlotOutlet: ({ slotTypes, sidebarSection }: { slotTypes: string[]; sidebarSection?: string }) => (
+    <div data-plugin-slot-types={slotTypes.join(",")} data-sidebar-section={sidebarSection}>Plugin slot outlet</div>
   ),
 }));
 
@@ -321,6 +321,19 @@ describe("Sidebar", () => {
     flushSync(() => {
       root.unmount();
     });
+  });
+
+  it.each([true, false])("places organization plugin entries in the company section (streamlined: %s)", async (streamlined) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    const root = await renderSidebar();
+    const org = container.querySelector('[data-sidebar-section="org"]');
+    const section = org?.parentElement?.parentElement?.parentElement;
+    expect(section?.textContent).toContain(streamlined ? "Org" : "Organization");
+    expect(section?.textContent).toContain("Connectors");
+    expect(section?.textContent).not.toContain("Workspaces");
+    const work = container.querySelector('[data-sidebar-section="work"]');
+    expect(work?.parentElement?.parentElement?.parentElement).not.toBe(section);
+    flushSync(() => root.unmount());
   });
 
   it("renders plugin sidebar slots in Work below Workspaces", async () => {

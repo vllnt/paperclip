@@ -462,3 +462,24 @@ describe("runtime context materialization", () => {
     await expect(stat(join(symlinkCodexHome, "auth.json"))).rejects.toThrow();
   });
 });
+
+
+describe("managed gateway native Codex home", () => {
+  it("keeps gateway routing when rebuilding an isolated home and removes it when returning to direct auth", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-native-gateway-"));
+    roots.push(root);
+    const codexHome = join(root, "codex-home");
+    await mkdir(codexHome);
+    await prepareIsolatedCodexHome({ context: null, codexHome, apiKey: "fixture-proxy", baseUrl: "http://127.0.0.1:18317/v1" });
+    const config = await readFile(join(codexHome, "config.toml"), "utf8");
+    expect(config).toContain('model_provider = "paperclip_gateway"');
+    expect(config).toContain('base_url = "http://127.0.0.1:18317/v1"');
+    expect(config).toContain('wire_api = "responses"');
+    expect(config).toContain("shell_snapshot = false");
+    expect(config).not.toContain("fixture-proxy");
+    expect(JSON.parse(await readFile(join(codexHome, "auth.json"), "utf8"))).toEqual({ OPENAI_API_KEY: "fixture-proxy" });
+    await rm(join(codexHome, "skills"), { recursive: true });
+    await prepareIsolatedCodexHome({ context: null, codexHome, apiKey: "direct-key" });
+    expect(await readFile(join(codexHome, "config.toml"), "utf8")).not.toContain("paperclip_gateway");
+  });
+});

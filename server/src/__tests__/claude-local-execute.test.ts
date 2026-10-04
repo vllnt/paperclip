@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -66,6 +67,10 @@ const payload = {
   mcpConfigPath,
   mcpConfigContents: mcpConfigPath ? fs.readFileSync(mcpConfigPath, "utf8") : null,
   skillEntries: addDir ? fs.readdirSync(path.join(addDir, ".claude", "skills")).sort() : [],
+  claudeBaseUrl: process.env.ANTHROPIC_BASE_URL,
+  claudeAuthToken: process.env.ANTHROPIC_AUTH_TOKEN,
+  claudeApiKey: process.env.ANTHROPIC_API_KEY,
+  claudeOauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
   claudeConfigDir: process.env.CLAUDE_CONFIG_DIR || null,
   claudeConfigEntries: process.env.CLAUDE_CONFIG_DIR && fs.existsSync(process.env.CLAUDE_CONFIG_DIR)
     ? fs.readdirSync(process.env.CLAUDE_CONFIG_DIR).sort()
@@ -351,10 +356,34 @@ function createLocalSandboxRunner() {
 }
 
 describe("claude execute", () => {
+  it("passes managed gateway bearer auth and custom model to the CLI with API billing", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-gateway-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    try {
+      const result = await execute({
+        runId: "run-gateway",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli", model: "proxy-custom-model", command: commandPath, cwd: workspace,
+          managedAiConnection: { method: "api_key" },
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath, ANTHROPIC_BASE_URL: "http://127.0.0.1:18317",
+            ANTHROPIC_AUTH_TOKEN: "fixture-proxy", ANTHROPIC_API_KEY: "", CLAUDE_CODE_OAUTH_TOKEN: "" },
+        },
+        context: {}, onLog: async () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.billingType).toBe("api");
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf8"));
+      expect(captured).toMatchObject({ claudeBaseUrl: "http://127.0.0.1:18317", claudeAuthToken: "fixture-proxy", claudeApiKey: "", claudeOauthToken: "" });
+      expect(captured.argv[captured.argv.indexOf("--model") + 1]).toBe("proxy-custom-model");
+    } finally { restore(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it.each([
-    [undefined, "claude-opus-5"],
-    ["", "claude-opus-5"],
-    ["  ", "claude-opus-5"],
+    [undefined, DEFAULT_CLAUDE_LOCAL_MODEL],
+    ["", DEFAULT_CLAUDE_LOCAL_MODEL],
+    ["  ", DEFAULT_CLAUDE_LOCAL_MODEL],
     ["claude-sonnet-4-5", "claude-sonnet-4-5"],
   ])("passes the resolved model to the CLI for %j", async (model, expected) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-default-"));
