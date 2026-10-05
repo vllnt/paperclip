@@ -404,12 +404,14 @@ describe("IssuesList", () => {
         viewStateKey="paperclip:test-issues"
         rowPresentation="task"
         toolbarPresentation="collection"
+        toolbarActions={<button>External sync</button>}
         onUpdateIssue={() => undefined}
       />,
       container,
     );
 
     await waitForAssertion(() => {
+      expect(container.querySelector(".paperclip-task-list-toolbar")?.textContent).toContain("External sync");
       const row = container.querySelector("[data-testid='issue-row']");
       expect(row).not.toBeNull();
       expect(row?.getAttribute("data-presentation")).toBeNull();

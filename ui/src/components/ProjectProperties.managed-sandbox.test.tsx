@@ -20,6 +20,7 @@ function act(callback: () => void) {
 
 const noop = vi.hoisted(() => () => undefined);
 
+vi.mock("@/lib/router", () => ({ useNavigate: () => vi.fn(), useActiveCompanyPrefix: () => "CMP" }));
 vi.mock("../api/projects", () => ({ projectsApi: { createWorkspace: vi.fn(), removeWorkspace: vi.fn(), updateWorkspace: vi.fn() } }));
 vi.mock("../api/goals", () => ({ goalsApi: { list: vi.fn().mockResolvedValue([]) } }));
 vi.mock("../api/secrets", () => ({ secretsApi: { list: vi.fn().mockResolvedValue([]), listUserSecretDefinitions: vi.fn().mockResolvedValue([]), create: vi.fn() } }));

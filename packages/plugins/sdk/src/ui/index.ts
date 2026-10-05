@@ -158,4 +158,5 @@ export type {
   PluginCommentAnnotationProps,
   PluginCommentContextMenuItemProps,
   PluginSettingsPageProps,
+  PluginAgentSettingsProps,
 } from "./types.js";

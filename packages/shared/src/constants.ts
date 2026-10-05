@@ -1322,6 +1322,7 @@ export type PluginCategory = (typeof PLUGIN_CATEGORIES)[number];
 export const PLUGIN_CAPABILITIES = [
   // Data Read
   "companies.read",
+  "chat.endpoints.read",
   "projects.read",
   "project.workspaces.read",
   "execution.workspaces.read",
@@ -1474,6 +1475,8 @@ export type PluginApiRouteCheckoutPolicy = (typeof PLUGIN_API_ROUTE_CHECKOUT_POL
  */
 export const PLUGIN_UI_SLOT_TYPES = [
   "page",
+  "taskListSection",
+  "taskListToolbar",
   "detailTab",
   "taskDetailView",
   "dashboardWidget",
@@ -1490,6 +1493,7 @@ export const PLUGIN_UI_SLOT_TYPES = [
   "commentContextMenuItem",
   "settingsPage",
   "companySettingsPage",
+  "agentSettings",
 ] as const;
 export type PluginUiSlotType = (typeof PLUGIN_UI_SLOT_TYPES)[number];
 
@@ -1610,6 +1614,7 @@ export type PluginLauncherRenderEnvironment =
  * @see PLUGIN_SPEC.md §19.3 — Detail Tabs
  */
 export const PLUGIN_UI_SLOT_ENTITY_TYPES = [
+  "company",
   "project",
   "issue",
   "agent",

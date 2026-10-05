@@ -1,4 +1,5 @@
 import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
+import { createTaskWithDestination, TaskDestinationPicker, useTaskDestination, type TaskDestination } from "@/plugins/task-creation";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { memo, useState, useEffect, useRef, useCallback, useMemo, type ChangeEvent, type CSSProperties, type DragEvent, type RefObject } from "react";
@@ -632,13 +633,17 @@ export function NewIssueDialog() {
     enabled: Boolean(effectiveCompanyId) && newIssueOpen && supportsAssigneeOverrides,
   });
 
+  const taskDestination = useTaskDestination(effectiveCompanyId, projectId, newIssueOpen);
+  const creationKey = useRef(crypto.randomUUID());
+
   const createIssue = useMutation({
     mutationFn: async ({
       companyId,
       stagedFiles: pendingStagedFiles,
+      destination,
       ...data
-    }: { companyId: string; stagedFiles: StagedIssueFile[] } & Record<string, unknown>) => {
-      const issue = await issuesApi.create(companyId, data);
+    }: { companyId: string; stagedFiles: StagedIssueFile[]; destination: TaskDestination | null } & Record<string, unknown>) => {
+      const { issue, warning } = await createTaskWithDestination(companyId, data, destination);
       const failures: string[] = [];
 
       for (const stagedFile of pendingStagedFiles) {
@@ -659,9 +664,10 @@ export function NewIssueDialog() {
         }
       }
 
-      return { issue, companyId, failures };
+      return { issue, companyId, failures, warning, destinationProvider: destination?.provider };
     },
-    onSuccess: ({ issue, companyId, failures }) => {
+    onSuccess: ({ issue, companyId, failures, warning, destinationProvider }) => {
+      if (warning) pushToast({ title: `Task saved · ${destinationProvider ?? "external sync"} pending`, body: warning, tone: "warn" });
       if (streamlinedUiEnabled) recordRecentTask(issue, currentUserId);
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe(companyId) });
@@ -976,6 +982,7 @@ export function NewIssueDialog() {
   }, []);
 
   function reset() {
+    creationKey.current = crypto.randomUUID();
     setIssueText("", "");
     setStatus("todo");
     setPriority("");
@@ -1038,7 +1045,7 @@ export function NewIssueDialog() {
   function handleSubmit() {
     const currentTitle = titleRef.current.trim();
     const currentDescription = descriptionRef.current.trim();
-    if (!effectiveCompanyId || (!currentTitle && !currentDescription) || createIssue.isPending) return;
+    if (!effectiveCompanyId || (!currentTitle && !currentDescription) || createIssue.isPending || taskDestination.blocked) return;
     const assigneeAdapterOverrides = buildAssigneeAdapterOverrides({
       adapterType: assigneeAdapterType,
       lane: assigneeModelLane,
@@ -1075,6 +1082,8 @@ export function NewIssueDialog() {
     createIssue.mutate({
       companyId: effectiveCompanyId,
       stagedFiles,
+      destination: taskDestination.selected,
+      idempotencyKey: `new-task:${creationKey.current}`,
       ...(currentTitle ? { title: currentTitle } : {}),
       description: currentDescription || undefined,
       status,
@@ -1875,6 +1884,8 @@ export function NewIssueDialog() {
             </div>
           ) : null}
 
+          <TaskDestinationPicker value={taskDestination} />
+
           {workspaceIsolationControlsVisible && currentProject && currentProjectSupportsExecutionWorkspace && (
             <div className="px-4 py-3 space-y-2">
             <div className="space-y-1.5">
@@ -2359,13 +2370,19 @@ export function NewIssueDialog() {
             <Button
               size="sm"
               className="min-w-(--sz-8_5rem) disabled:opacity-100"
-              disabled={!draftHasText || createIssue.isPending}
+              disabled={!draftHasText || createIssue.isPending || taskDestination.blocked}
               onClick={handleSubmit}
               aria-busy={createIssue.isPending}
             >
               <span className="inline-flex items-center justify-center gap-1.5">
                 {createIssue.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-                <span>{createIssue.isPending ? "Creating..." : isSubIssueMode ? "Create Sub-Task" : "Create Task"}</span>
+                <span>{createIssue.isPending
+                  ? "Creating..."
+                  : isSubIssueMode
+                    ? "Create Sub-Task"
+                    : taskDestination.selected
+                      ? `Create ${taskDestination.selected.provider} issue`
+                      : "Create Task"}</span>
               </span>
             </Button>
           </div>

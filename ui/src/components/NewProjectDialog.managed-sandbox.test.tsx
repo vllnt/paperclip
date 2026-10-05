@@ -16,6 +16,8 @@ function act(callback: () => void) {
   });
 }
 
+vi.mock("@/lib/router", () => ({ useNavigate: () => vi.fn(), useActiveCompanyPrefix: () => "GIT" }));
+
 vi.mock("../api/projects", () => ({ projectsApi: {
   create: vi.fn(),
   repositoryOptions: vi.fn().mockResolvedValue({ repositories: [], connectionCount: 0, failedConnectionCount: 0 }),

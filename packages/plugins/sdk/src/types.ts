@@ -11,6 +11,8 @@
 
 import type {
   PaperclipPluginManifestV1,
+  PluginTaskLink,
+  PluginTaskLinks,
   PluginStateScopeKind,
   PluginEventType,
   PluginToolDeclaration,
@@ -65,6 +67,8 @@ import type { PluginPerformActionContext } from "./protocol.js";
 
 export type {
   PaperclipPluginManifestV1,
+  PluginTaskLink,
+  PluginTaskLinks,
   PluginJobDeclaration,
   PluginWebhookDeclaration,
   PluginToolDeclaration,
@@ -1148,6 +1152,29 @@ export interface PluginCompaniesClient {
   get(companyId: string): Promise<Company | null>;
 }
 
+/** `ctx.chat` — inspect native chat connector readiness without credentials. Requires `chat.endpoints.read`. */
+export interface PluginChatClient {
+  listEndpoints(input: { companyId: string; agentId?: string; provider?: "github" }): Promise<{
+    chatConnectorsEnabled: boolean;
+    endpoints: Array<{
+      id: string;
+      companyId: string;
+      connectionId: string;
+      provider: "github";
+      status: string;
+      assignedAgentId: string;
+      assignedAgentName?: string | null;
+      botExternalId?: string | null;
+      botUsername?: string | null;
+      botLabel?: string | null;
+      capabilities: Record<string, boolean>;
+      lastError?: string | null;
+      activatedAt?: string | null;
+    }>;
+  }>;
+}
+
+
 /**
  * `ctx.issues.documents` — read and write issue documents.
  *
@@ -1438,6 +1465,8 @@ export interface PluginIssuesClient {
   create(input: {
     companyId: string;
     projectId?: string;
+    idempotencyKey?: string;
+    allowDuplicate?: boolean;
     goalId?: string;
     parentId?: string;
     inheritExecutionWorkspaceFromIssueId?: string;
@@ -1471,6 +1500,7 @@ export interface PluginIssuesClient {
       | "priority"
       | "assigneeAgentId"
       | "assigneeUserId"
+      | "projectId"
       | "billingCode"
       | "originKind"
       | "originId"
@@ -2175,6 +2205,9 @@ export interface PluginContext {
 
   /** Read company metadata. Requires `companies.read`. */
   companies: PluginCompaniesClient;
+
+  /** Inspect native chat connector readiness. Requires `chat.endpoints.read`. */
+  chat: PluginChatClient;
 
   /** Read and write issues, comments, and documents. Requires issue capabilities. */
   issues: PluginIssuesClient;

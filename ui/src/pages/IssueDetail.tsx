@@ -2,6 +2,7 @@ import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
+import { readTaskRecordSelection } from "@/plugins/task-record-panels";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { mergeComposerRunSettings, type ComposerRunSettings } from "@/components/task-chat/composer-run-settings";
 import { AgentIdentity } from "@/components/AgentIdentity";
@@ -3738,6 +3739,14 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     openTaskSidePanel();
     if (isMobile) setMobilePropsOpen(true);
   }, [openBrowserId, openTaskSidePanel, isMobile]);
+  const taskRecordRequest = readTaskRecordSelection(location.search);
+  const taskRecordRequestKey = taskRecordRequest ? `${issue?.id}:${taskRecordRequest.pluginId}:${taskRecordRequest.recordId}` : null;
+  useEffect(() => {
+    if (!taskRecordRequestKey || !issue?.id) return;
+    setPanelBeforePlanOverrideIssueId(issue.id);
+    setPanelVisible(true);
+    if (isMobile) setMobilePropsOpen(true);
+  }, [taskRecordRequestKey, issue?.id, isMobile, setPanelVisible]);
   const handleOpenSkill = useCallback((skillId: string, name: string) => {
     const next = openSkillPanelState(
       { panelBeforePlanOverrideIssueId },
@@ -5766,7 +5775,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   );
 
   useLayoutEffect(() => {
-    if (!panelIssue || suppressPanelUntilPlan || (conversation && !conversation.issue)) {
+    if (isMobile || !panelIssue || suppressPanelUntilPlan || (conversation && !conversation.issue)) {
       closePanel();
       return;
     }
@@ -5801,7 +5810,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       openSkillName: openSkill?.name ?? null,
       onSkillOpened: handleSkillOpened,
     };
-    if (taskChatShellEnabled) {
+    if (taskChatShellEnabled || panelIssue.originKind?.startsWith("plugin:")) {
       openPanel(
         <IssueGalleryContext.Provider value={openIssueGallery}>
           <TaskSidePanel
@@ -8250,7 +8259,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           />
 
           {/* Mobile properties drawer */}
-          <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
+          <Sheet open={isMobile && mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
             <SheetContent
               side={
                 taskChatShellEnabled
@@ -8275,7 +8284,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     : undefined
               }
             >
-              {taskChatShellEnabled ? (
+              {taskChatShellEnabled || issue.originKind?.startsWith("plugin:") ? (
                 <>
                   <SheetHeader className="sr-only">
                     <SheetTitle>Task side panel</SheetTitle>

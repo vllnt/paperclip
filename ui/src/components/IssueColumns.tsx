@@ -1,3 +1,4 @@
+import { TaskLinkColumnOptions, useTaskLinkColumns } from "@/plugins/task-links";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import type { AvatarAgent } from "./AgentAvatar";
 import type { ReactNode } from "react";
@@ -105,6 +106,7 @@ export function IssueColumnPicker({
   iconOnly?: boolean;
   rowPresentation?: "legacy" | "task";
 }) {
+  const taskLinkColumns = useTaskLinkColumns();
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -149,6 +151,7 @@ export function IssueColumnPicker({
             </span>
           </DropdownMenuCheckboxItem>
         ))}
+        <TaskLinkColumnOptions />
         {showDateGroupSeparators !== undefined && onToggleDateGroupSeparators ? (
           <DropdownMenuCheckboxItem
             checked={showDateGroupSeparators}
@@ -168,7 +171,7 @@ export function IssueColumnPicker({
         ) : null}
         <DropdownMenuSeparator />
         <DropdownMenuItem
-          onSelect={onResetColumns}
+          onSelect={() => { onResetColumns(); taskLinkColumns?.reset(); }}
           className="rounded-lg px-3 py-2 text-sm"
         >
           Reset defaults

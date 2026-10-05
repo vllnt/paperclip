@@ -786,6 +786,16 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
+      chat: {
+        async listEndpoints(input) {
+          return callHost("chat.endpoints.list", {
+            companyId: input.companyId,
+            agentId: input.agentId,
+            provider: input.provider,
+          });
+        },
+      },
+
       companies: {
         async list(input) {
           return callHost("companies.list", {
@@ -822,6 +832,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async create(input) {
           return callHost("issues.create", {
             companyId: input.companyId,
+            idempotencyKey: input.idempotencyKey,
+            allowDuplicate: input.allowDuplicate,
             projectId: input.projectId,
             goalId: input.goalId,
             parentId: input.parentId,

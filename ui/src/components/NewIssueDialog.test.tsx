@@ -76,6 +76,12 @@ const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
 }));
 const mockMissingUserSecretsBannerRender = vi.hoisted(() => vi.fn());
+const mockPluginsApi = vi.hoisted(() => ({
+  listUiContributions: vi.fn(),
+  bridgePerformAction: vi.fn(),
+}));
+
+vi.mock("@/api/plugins", () => ({ pluginsApi: mockPluginsApi }));
 
 vi.mock("../context/DialogContext", () => ({
   useDialog: () => dialogState,
@@ -362,6 +368,9 @@ describe("NewIssueDialog", () => {
     mockAssetsApi.uploadImage.mockResolvedValue({ contentPath: "/uploads/asset.png" });
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
     mockMissingUserSecretsBannerRender.mockReset();
+    mockPluginsApi.listUiContributions.mockReset();
+    mockPluginsApi.bridgePerformAction.mockReset();
+    mockPluginsApi.listUiContributions.mockResolvedValue([]);
     localStorage.clear();
     mockIssuesApi.create.mockResolvedValue({
       id: "issue-2",
@@ -413,6 +422,47 @@ describe("NewIssueDialog", () => {
     expect(container.textContent).toContain("Create Task");
     expect(container.textContent).not.toContain("Sub-task of");
 
+    act(() => rerendered.root.unmount());
+  });
+
+  it("publishes directly to the selected GitHub repository from New Task", async () => {
+    dialogState.newIssueDefaults = { title: "Fix GitHub issue", projectId: "project-1" };
+    mockPluginsApi.listUiContributions.mockResolvedValue([
+      { pluginId: "github", taskCreation: { label: "GitHub", listAction: "task-destinations", publishAction: "publish-task" } },
+    ]);
+    mockPluginsApi.bridgePerformAction.mockImplementation(async (_pluginId: string, action: string) => {
+      if (action === "task-destinations") return { data: { destinations: [{ id: "repo-1", label: "org/repo" }] } };
+      return { data: { url: "https://github.com/org/repo/issues/1" } };
+    });
+
+    const { root } = renderDialog(container);
+    await waitForAssertion(() => {
+      expect(container.querySelector('select[aria-label="Create in"]')).not.toBeNull();
+    });
+    localStorage.setItem("paperclip.task-destination:company-1:project-1", "github:repo-1");
+    await act(async () => root.unmount());
+    const rerendered = renderDialog(container);
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Create GitHub issue");
+    });
+    const submit = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Create GitHub issue"));
+    expect(submit).not.toBeUndefined();
+    await act(async () => {
+      submit!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    expect(mockIssuesApi.create).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      title: "Fix GitHub issue",
+      idempotencyKey: expect.stringMatching(/^new-task:/),
+      allowDuplicate: true,
+    }));
+    expect(mockPluginsApi.bridgePerformAction).toHaveBeenLastCalledWith(
+      "github",
+      "publish-task",
+      { issueId: "issue-2", destinationId: "repo-1" },
+      "company-1",
+    );
     act(() => rerendered.root.unmount());
   });
 

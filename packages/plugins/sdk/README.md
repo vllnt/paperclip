@@ -217,6 +217,8 @@ Slot types describe where a component mounts. Most values also exist as launcher
 | `appShellOverlay` (slot only) | Signed-in application shell | — |
 | `detailTab` | Entity | `project`, `issue`, `agent`, `goal`, `run` |
 | `taskDetailView` | Entity | (task/issue context) |
+| `taskListToolbar` | Company / project | Compact controls inside Tasks toolbars; `PluginWidgetProps`, `ui.detailTab.register` |
+| `taskListSection` | Company / project | Automatically shown on Tasks pages; `PluginWidgetProps`, `ui.detailTab.register` |
 | `commentAnnotation` | Entity | `comment` |
 | `commentContextMenuItem` | Entity | `comment` |
 | `projectSidebarItem` | Entity | `project` |
@@ -1309,3 +1311,42 @@ An `appShellOverlay` slot uses `ui.action.register` and the standard
 `PluginWidgetProps` context. It survives navigation and unmounts on account or
 company changes, sign-out and onboarding. Plugins own panel accessibility and
 request cleanup. See [the distribution and lifecycle contract](../../../doc/plugins/DISTRIBUTION-PLUGINS.md).
+
+
+Connector plugins can populate the host's native Projects repository picker with
+`manifest.projectRepositories = { listAction, setupPath? }`. The company-scoped,
+board-only action returns `ProjectRepositoryOptions`; see
+[the authoring guide](../../../doc/plugins/PLUGIN_AUTHORING_GUIDE.md#supply-repositories-to-the-native-projects-picker)
+for the current GitHub repository contract and credential boundary.
+
+Native task integration supports `manifest.taskCreation` (a label, destination
+list action and publish action). The normal New Task form creates the native task
+first and invokes the company's plugin action with its ID. Plugins own durable
+publication intent, external identity mapping and retry recovery. Native imports
+can use `ctx.issues.create({ ..., idempotencyKey, allowDuplicate: true })`; creation
+keys are company-scoped and namespaced by plugin by the host. Title-based duplicate
+detection remains unchanged for callers that omit `allowDuplicate`.
+
+Native task links can be supplied with `taskCreation.linksAction`. The action
+receives up to 100 `issueIds` plus optional `detail`/`refresh`, and returns
+`{ tasks: PluginTaskLinks[] }`. `PluginTaskLink` and `PluginTaskLinks` are exported
+by the SDK. Validate company ownership; batch and cache provider reads. The host
+renders source/PR columns and a properties sidebar, with optional internal views
+under `projectRepositories.setupPath`. See the authoring guide for the contract.
+
+For a full native task side-panel view, return `panel: { slotId, recordId }` on a
+source or PR link. The slot must be a declared `detailTab` supporting `issue`.
+Its component receives `PluginDetailTabProps.context.taskRecordId` plus the
+native task/company context. The host validates current task links before
+mounting and owns tab persistence and navigation. Keep credentials and provider
+access checks in worker actions. See "Native task record panels" in the plugin
+authoring guide for deep-link parameters and unavailable-record behavior.
+
+### Inspecting native chat connectors
+
+Connector plugins that route work to Paperclip agents may declare
+`chat.endpoints.read` and call `ctx.chat.listEndpoints({ companyId, agentId?, provider: "github" })`.
+The response contains only company-scoped endpoint status and bot metadata; it
+never contains provider credentials. Use it as a readiness check for agent
+assignment, wakeups or delegated review work. Native channel setup, identity,
+chat delivery and governed formal reviews remain host-owned.

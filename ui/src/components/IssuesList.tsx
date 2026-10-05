@@ -1,3 +1,4 @@
+import { TaskLinksProvider } from "@/plugins/task-links";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { startTransition, useDeferredValue, useEffect, useMemo, useState, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
@@ -508,12 +509,14 @@ interface IssuesListProps {
    * the merged Tasks surface uses to put its Views control there (PAP-670).
    */
   toolbarContext?: ReactNode;
+  toolbarActions?: ReactNode;
+
   onUpdateIssue: (id: string, data: Record<string, unknown>) => void;
 }
 
-function LegacyIssuesToolbar({ context, search, controls }: CollectionToolbarProps) {
+function LegacyIssuesToolbar({ context, search, controls, className }: CollectionToolbarProps) {
   return (
-    <div className="flex items-center justify-between gap-2 sm:gap-3">
+    <div className={cn("flex items-center justify-between gap-2 sm:gap-3", className)}>
       <div className="flex min-w-0 items-center gap-2 sm:gap-3">
         {context}
         {search}
@@ -708,7 +711,8 @@ const MOBILE_TREE_INDENT = ["", "pl-4 sm:pl-0", "pl-8 sm:pl-0", "pl-12 sm:pl-0",
 
 export function IssuesList(props: IssuesListProps) {
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
-  return streamlinedUiEnabled ? <StreamlinedIssuesList {...props} /> : <LegacyIssuesList {...props} />;
+  const { selectedCompanyId } = useCompany();
+  return <TaskLinksProvider companyId={selectedCompanyId} tasks={props.issues} collectionKey={props.viewStateKey ?? props.projectId ?? "tasks"}>{streamlinedUiEnabled ? <StreamlinedIssuesList {...props} /> : <LegacyIssuesList {...props} />}</TaskLinksProvider>;
 }
 
 function StreamlinedIssuesList({
@@ -742,6 +746,7 @@ function StreamlinedIssuesList({
   rowPresentation = "legacy",
   toolbarContext,
   toolbarPresentation = "legacy",
+  toolbarActions,
   onUpdateIssue,
 }: IssuesListProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -1783,6 +1788,7 @@ function StreamlinedIssuesList({
         )}
         controls={(
           <>
+          {toolbarActions}
           {/* View mode toggle */}
           <div className="flex items-center border border-border rounded-md overflow-hidden mr-1" role="group" aria-label="View mode">
             <button

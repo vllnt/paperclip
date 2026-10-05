@@ -31,6 +31,7 @@ export function openSkillPanelState(
 
 export type TaskSidePanelTabPayload =
   | { kind: "browser"; browserId: string }
+  | { kind: "plugin-record"; pluginId: string; recordId: string; recordKind: "issue" | "pull" }
   | { kind: "properties" }
   | { kind: "subtasks" }
   | { kind: "artifacts" }
@@ -92,6 +93,12 @@ function parsePayload(value: unknown): TaskSidePanelTabPayload | null {
   if (!input) return null;
   const kind = input.kind;
   if (kind === "browser") return typeof input.browserId === "string" && /^[0-9a-f-]{36}$/i.test(input.browserId) ? { kind, browserId: input.browserId } : null;
+  if (kind === "plugin-record") {
+    if (typeof input.pluginId !== "string" || !input.pluginId || input.pluginId.length > 200
+      || typeof input.recordId !== "string" || !input.recordId || input.recordId.length > 512
+      || (input.recordKind !== "issue" && input.recordKind !== "pull")) return null;
+    return { kind, pluginId: input.pluginId, recordId: input.recordId, recordKind: input.recordKind };
+  }
   if (kind === "properties") return { kind };
   if (kind === "subtasks") return { kind };
   if (kind === "artifacts") return { kind };
@@ -298,4 +305,15 @@ export function taskPanelAttachmentTab(attachmentId: string, title: string): Sid
 
 export function taskPanelBrowserTab(browserId: string): SidePanelTabRecord<TaskSidePanelTabPayload> {
   return { id: `browser:${browserId}`, type: "browser", label: "Browser", closable: true, contentMode: "full-bleed", payload: { kind: "browser", browserId } };
+}
+
+export function taskPanelPluginRecordTab(input: { pluginId: string; recordId: string; recordKind: "issue" | "pull"; label: string }): SidePanelTabRecord<TaskSidePanelTabPayload> {
+  return {
+    id: `plugin-record:${input.pluginId}:${input.recordId}`,
+    type: "plugin-record",
+    label: input.label,
+    closable: true,
+    contentMode: "padded",
+    payload: { kind: "plugin-record", pluginId: input.pluginId, recordId: input.recordId, recordKind: input.recordKind },
+  };
 }

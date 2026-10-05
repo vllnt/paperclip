@@ -682,6 +682,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     return { blockedBy, blocks };
   }
 
+  const issueCreationKeys = new Map<string, string>();
   const defaultPluginOriginKind: PluginIssueOriginKind = `plugin:${manifest.id}`;
 
   function managedAgentDeclaration(agentKey: string) {
@@ -1545,6 +1546,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         },
       },
     },
+    chat: {
+      async listEndpoints(input) {
+        requireCapability(manifest, capabilitySet, "chat.endpoints.read");
+        requireCompanyId(input.companyId);
+        return { chatConnectorsEnabled: false, endpoints: [] };
+      },
+    },
     companies: {
       async list(input) {
         requireCapability(manifest, capabilitySet, "companies.read");
@@ -1589,6 +1597,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
       async create(input) {
         requireCapability(manifest, capabilitySet, "issues.create");
+        const retryKey = input.idempotencyKey ? `${input.companyId}:${input.idempotencyKey}` : null;
+        const previous = retryKey ? issues.get(issueCreationKeys.get(retryKey) ?? "") : null;
+        if (previous) return previous;
         const now = new Date();
         const originKind = normalizePluginOriginKind(
           input.surfaceVisibility === "plugin_operation" && !input.originKind
@@ -1636,6 +1647,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           updatedAt: now,
         };
         issues.set(record.id, record);
+        if (retryKey) issueCreationKeys.set(retryKey, record.id);
         if (input.blockedByIssueIds) blockedByIssueIds.set(record.id, [...new Set(input.blockedByIssueIds)]);
         return record;
       },

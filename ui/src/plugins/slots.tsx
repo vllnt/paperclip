@@ -55,6 +55,8 @@ export type PluginSlotContext = {
   /** Parent entity ID for nested slots (e.g. comment annotations within an issue). */
   parentEntityId?: string | null;
   projectRef?: string | null;
+  /** Validated record from the owning plugin task-links action. */
+  taskRecordId?: string;
 };
 
 export type ResolvedPluginSlot = PluginUiSlotDeclaration & {
@@ -150,7 +152,7 @@ function usePluginRegistrySubscription(): void {
 }
 
 function requiresEntityType(slotType: PluginUiSlotType): boolean {
-  return slotType === "detailTab" || slotType === "taskDetailView" || slotType === "contextMenuItem" || slotType === "commentAnnotation" || slotType === "commentContextMenuItem" || slotType === "projectSidebarItem" || slotType === "toolbarButton";
+  return slotType === "taskListToolbar" || slotType === "taskListSection" || slotType === "detailTab" || slotType === "taskDetailView" || slotType === "contextMenuItem" || slotType === "commentAnnotation" || slotType === "commentContextMenuItem" || slotType === "projectSidebarItem" || slotType === "agentSettings" || slotType === "toolbarButton";
 }
 
 function getErrorMessage(error: unknown): string {

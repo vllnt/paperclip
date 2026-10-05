@@ -2279,6 +2279,48 @@ describe("IssueDetail", () => {
     await waitForAssertion(() => expect(panelProps().artifactsOpenRequestId).toBe(2));
   });
 
+  it.each([false, true])("opens GitHub record deep links in the native mobile task panel (streamlined: %s)", async streamlined => {
+    mockSidebarState.isMobile = true;
+    mockPanelState.panelVisible = false;
+    mockLocation.search = "?taskPlugin=vllnt.paperclip-github&taskRecord=1153792656%3Apull%3A6";
+    const linked = createIssue({ originKind: "plugin:vllnt.paperclip-github:issue" });
+    mockIssuesApi.get.mockResolvedValue(linked);
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIssuePlanDecompositions: false,
+      enableExperimentalFileViewer: false,
+      enableExternalObjects: false,
+      enableStreamlinedUi: streamlined,
+    });
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>));
+    await waitForAssertion(() => {
+      expect(mockTaskSidePanelRender).toHaveBeenCalledWith(expect.objectContaining({ inline: true, issue: expect.objectContaining({ id: linked.id }) }));
+    });
+    expect(mockOpenPanel).not.toHaveBeenCalled();
+    expect(mockSetPanelVisible).toHaveBeenCalledWith(true);
+    expect(document.querySelector('[data-slot="sheet-content"]')?.textContent).toContain("Task side panel");
+    expect(mockLocation.search).toContain("taskRecord=1153792656%3Apull%3A6");
+  });
+
+  it("mounts the desktop task panel after resizing from mobile", async () => {
+    mockSidebarState.isMobile = true;
+    mockLocation.search = "?taskPlugin=vllnt.paperclip-github&taskRecord=repo%3Aissue%3A1";
+    mockIssuesApi.get.mockResolvedValue(createIssue({ originKind: "plugin:vllnt.paperclip-github:issue" }));
+    const renderDetail = () => root.render(<QueryClientProvider client={queryClient}><IssueDetail /></QueryClientProvider>);
+    await act(async () => renderDetail());
+    await waitForAssertion(() => expect(mockTaskSidePanelRender).toHaveBeenCalledWith(expect.objectContaining({ inline: true })));
+    expect(mockOpenPanel).not.toHaveBeenCalled();
+    mockSidebarState.isMobile = false;
+    await act(async () => renderDetail());
+    await waitForAssertion(() => expect(mockOpenPanel).toHaveBeenCalled());
+    expect(document.querySelector('[data-slot="sheet-content"]')).toBeNull();
+    mockOpenPanel.mockClear();
+    mockSidebarState.isMobile = true;
+    await act(async () => renderDetail());
+    expect(mockOpenPanel).not.toHaveBeenCalled();
+    expect(mockClosePanel).toHaveBeenCalled();
+    expect(document.querySelector('[data-slot="sheet-content"]')).not.toBeNull();
+  });
+
   it("opens the mobile properties sheet for a document deep link", async () => {
     mockSidebarState.isMobile = true;
     mockLocation.hash = "#document-qa-evidence";

@@ -1740,6 +1740,29 @@ export interface WorkerToHostMethods {
     result: Company | null,
   ];
 
+  // Native chat connectors (read-only, credential-free)
+  "chat.endpoints.list": [
+    params: { companyId: string; agentId?: string; provider?: "github" },
+    result: {
+      chatConnectorsEnabled: boolean;
+      endpoints: Array<{
+        id: string;
+        companyId: string;
+        connectionId: string;
+        provider: "github";
+        status: string;
+        assignedAgentId: string;
+        assignedAgentName?: string | null;
+        botExternalId?: string | null;
+        botUsername?: string | null;
+        botLabel?: string | null;
+        capabilities: Record<string, boolean>;
+        lastError?: string | null;
+        activatedAt?: string | null;
+      }>;
+    },
+  ];
+
   // Projects (read)
   "projects.list": [
     params: { companyId: string; limit?: number; offset?: number },
@@ -1855,6 +1878,8 @@ export interface WorkerToHostMethods {
   "issues.create": [
     params: {
       companyId: string;
+      idempotencyKey?: string;
+      allowDuplicate?: boolean;
       projectId?: string;
       goalId?: string;
       parentId?: string;

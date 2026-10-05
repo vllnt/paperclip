@@ -489,7 +489,8 @@ export interface PluginUiSlotDeclaration {
   exportName: string;
   /**
    * Entity targets for context-sensitive slots.
-   * Required for `detailTab`, `taskDetailView`, and `contextMenuItem`.
+   * Required for `detailTab`, `taskDetailView`, `taskListSection`, `taskListToolbar`, and `contextMenuItem`.
+   * `taskListSection` and `taskListToolbar` accept company and project targets.
    */
   entityTypes?: PluginUiSlotEntityType[];
   /**
@@ -704,6 +705,21 @@ export interface PaperclipPluginManifestV1 {
   webhooks?: PluginWebhookDeclaration[];
   /** Agent tools this plugin contributes. Requires `agent.tools.register` capability. */
   tools?: PluginToolDeclaration[];
+  /** Supply the native Projects repository picker through a company-scoped board action.
+   * The action returns ProjectRepositoryOptions. Currently GitHub repositories only.
+   * Requires ui.action.register. Credentials stay inside the plugin.
+   */
+  projectRepositories?: {
+    listAction: string;
+    /** Company-relative path to a declared plugin page, e.g. /github-projects. */
+    setupPath?: string;
+  };
+  /** Native New Task destinations. Board actions validate company/project scope.
+   * listAction returns { destinations: { id, label, disabledReason? }[] }.
+   * publishAction receives { issueId, destinationId } after native creation and
+   * returns { warning? }. It must durably record intent and be retry-safe.
+   */
+  taskCreation?: { label: string; listAction: string; publishAction: string; linksAction?: string };
   /** Restricted plugin-owned database namespace declaration. */
   database?: PluginDatabaseDeclaration;
   /** Scoped JSON API routes mounted under `/api/plugins/:pluginId/api/*`. */
@@ -1011,4 +1027,25 @@ export interface PluginWebhookDeliveryRecord {
   finishedAt: Date | null;
   /** ISO 8601 creation timestamp. */
   createdAt: Date;
+}
+
+/** Batched task links supplied by taskCreation.linksAction; no provider credentials. */
+export interface PluginTaskLink {
+  label: string;
+  url: string;
+  title?: string;
+  state?: string;
+  /** Company-relative plugin page, for viewing/managing the record in Paperclip. */
+  viewPath?: string;
+  /** Declared issue detailTab to render inside the native task side panel. */
+  panel?: { slotId: string; recordId: string };
+}
+export interface PluginTaskLinks {
+  issueId: string;
+  issue?: PluginTaskLink;
+  pullRequests?: PluginTaskLink[];
+  pullRequestsStatus?: "ready" | "access_required" | "error";
+  morePullRequests?: boolean;
+  message?: string;
+  details?: { label: string; value: string }[];
 }

@@ -395,7 +395,7 @@ export const pluginUiSlotDeclarationSchema = z.object({
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "sidebarSection is only supported for sidebar slots", path: ["sidebarSection"] });
   }
   // context-sensitive slots require explicit entity targeting.
-  const entityScopedTypes = ["detailTab", "taskDetailView", "contextMenuItem", "commentAnnotation", "commentContextMenuItem", "projectSidebarItem"];
+  const entityScopedTypes = ["taskListToolbar", "taskListSection", "detailTab", "taskDetailView", "contextMenuItem", "commentAnnotation", "commentContextMenuItem", "projectSidebarItem", "agentSettings"];
   if (
     entityScopedTypes.includes(value.type)
     && (!value.entityTypes || value.entityTypes.length === 0)
@@ -403,6 +403,17 @@ export const pluginUiSlotDeclarationSchema = z.object({
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: `${value.type} slots require at least one entityType`,
+      path: ["entityTypes"],
+    });
+  }
+  if (["taskListSection", "taskListToolbar"].includes(value.type) && value.entityTypes?.some(type => type !== "company" && type !== "project")) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${value.type} supports company and project task lists`, path: ["entityTypes"] });
+  }
+  // agentSettings only makes sense for entityType "agent".
+  if (value.type === "agentSettings" && value.entityTypes && !value.entityTypes.includes("agent")) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "agentSettings slots require entityTypes to include \"agent\"",
       path: ["entityTypes"],
     });
   }
@@ -794,6 +805,16 @@ export const pluginManifestV1Schema = z.object({
   jobs: z.array(pluginJobDeclarationSchema).optional(),
   webhooks: z.array(pluginWebhookDeclarationSchema).optional(),
   tools: z.array(pluginToolDeclarationSchema).optional(),
+  projectRepositories: z.object({
+    listAction: z.string().min(1).max(100),
+    setupPath: z.string().regex(/^\/[a-z0-9][a-z0-9-]*$/).optional(),
+  }).optional(),
+  taskCreation: z.object({
+    label: z.string().trim().min(1).max(50),
+    listAction: z.string().min(1).max(100),
+    publishAction: z.string().min(1).max(100),
+    linksAction: z.string().min(1).max(100).optional(),
+  }).optional(),
   database: pluginDatabaseDeclarationSchema.optional(),
   apiRoutes: z.array(pluginApiRouteDeclarationSchema).optional(),
   environmentDrivers: z.array(pluginEnvironmentDriverDeclarationSchema).optional(),
@@ -838,6 +859,19 @@ export const pluginManifestV1Schema = z.object({
   // The host enforces capabilities at install and runtime. A plugin must
   // declare every capability it needs up-front; silently having more features
   // than capabilities would cause runtime rejections.
+
+  if (manifest.taskCreation && (!manifest.capabilities.includes("ui.action.register") || !manifest.entrypoints.ui)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "taskCreation requires ui.action.register and a UI entrypoint", path: ["taskCreation"] });
+  }
+  if (manifest.projectRepositories) {
+    if (!manifest.capabilities.includes("ui.action.register")) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Capability 'ui.action.register' is required for projectRepositories", path: ["capabilities"] });
+    }
+    const setupPath = manifest.projectRepositories.setupPath;
+    if (setupPath && !manifest.ui?.slots?.some(slot => slot.type === "page" && `/${slot.routePath}` === setupPath)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "projectRepositories.setupPath must point to a declared page route", path: ["projectRepositories", "setupPath"] });
+    }
+  }
 
   // tools require agent.tools.register (PLUGIN_SPEC.md §11)
   if (manifest.tools && manifest.tools.length > 0) {

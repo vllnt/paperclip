@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useCallback, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { useLocation, useNavigate, useSearchParams } from "@/lib/router";
+import { useActiveCompanyPrefix, useLocation, useNavigate, useSearchParams } from "@/lib/router";
 import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { PluginSlotOutlet } from "@/plugins/slots";
 import { issuesApi } from "../api/issues";
 import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
@@ -165,6 +166,7 @@ function OrganizationIssues({
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const issuesPresentation = resolveIssuesPresentation(streamlinedUiEnabled);
   const { selectedCompanyId } = useCompany();
+  const companyPrefix = useActiveCompanyPrefix();
   const { setBreadcrumbs } = useBreadcrumbs();
   const location = useLocation();
   const [searchParams] = useSearchParams();
@@ -305,6 +307,7 @@ function OrganizationIssues({
   }
 
   return (
+    <div className="space-y-6">
     <IssuesList
       issues={issues ?? []}
       isLoading={isLoading}
@@ -316,6 +319,9 @@ function OrganizationIssues({
       viewStateKey="paperclip:issues-view"
       rowPresentation={issuesPresentation.rowPresentation}
       toolbarPresentation={issuesPresentation.toolbarPresentation}
+      toolbarActions={<PluginSlotOutlet slotTypes={["taskListToolbar"]} entityType="company"
+        context={{ companyId: selectedCompanyId, companyPrefix, entityId: selectedCompanyId, entityType: "company" }}
+        className="flex items-center gap-2" itemClassName="inline-flex" missingBehavior="placeholder" />}
       issueLinkState={issueLinkState}
       initialAssignees={searchParams.get("assignee") ? [searchParams.get("assignee")!] : undefined}
       initialWorkspaces={initialWorkspaces.length > 0 ? initialWorkspaces : undefined}
@@ -329,5 +335,9 @@ function OrganizationIssues({
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
       searchFilters={participantAgentId || workspaceIdFilter ? { participantAgentId, workspaceId: workspaceIdFilter } : undefined}
     />
+    <PluginSlotOutlet slotTypes={["taskListSection"]} entityType="company"
+      context={{ companyId: selectedCompanyId, companyPrefix, entityId: selectedCompanyId, entityType: "company" }}
+      className="space-y-6" missingBehavior="placeholder" />
+    </div>
   );
 }

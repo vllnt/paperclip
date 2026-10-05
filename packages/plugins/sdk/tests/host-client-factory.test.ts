@@ -418,3 +418,27 @@ describe("createHostClientHandlers capability gating for LOOA-641 methods", () =
     expect(list).not.toHaveBeenCalled();
   });
 });
+
+describe("native chat endpoint bridge", () => {
+  const context = { invocationScope: { companyId: "company-a" } };
+
+  it("requires chat.endpoints.read and forwards the company-scoped request", async () => {
+    const listEndpoints = vi.fn(async () => ({ chatConnectorsEnabled: true, endpoints: [] }));
+    const services = { chat: { listEndpoints } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.github",
+      capabilities: ["chat.endpoints.read"],
+      services,
+    });
+    await expect(handlers["chat.endpoints.list"]({ companyId: "company-a", agentId: "agent-a", provider: "github" }, context)).resolves.toEqual({ chatConnectorsEnabled: true, endpoints: [] });
+    expect(listEndpoints).toHaveBeenCalledWith({ companyId: "company-a", agentId: "agent-a", provider: "github" });
+  });
+
+  it("does not expose the bridge without its dedicated capability", async () => {
+    const listEndpoints = vi.fn(async () => ({ chatConnectorsEnabled: true, endpoints: [] }));
+    const services = { chat: { listEndpoints } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({ pluginId: "paperclip.github", capabilities: [], services });
+    await expect(handlers["chat.endpoints.list"]({ companyId: "company-a" }, context)).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(listEndpoints).not.toHaveBeenCalled();
+  });
+});

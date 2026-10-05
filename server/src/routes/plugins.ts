@@ -130,6 +130,8 @@ type PluginUiContribution = {
   uiEntryFile: string;
   slots: PluginUiSlotDeclaration[];
   launchers: PluginLauncherDeclaration[];
+  projectRepositories?: { listAction: string; setupPath?: string };
+  taskCreation?: { label: string; listAction: string; publishAction: string; linksAction?: string };
 };
 
 /** Request body for POST /api/plugins/install */
@@ -941,6 +943,8 @@ export function pluginRoutes(
           uiEntryFile: uiMetadata.uiEntryFile,
           slots: uiMetadata.slots,
           launchers: uiMetadata.launchers,
+          ...(manifest.projectRepositories ? { projectRepositories: manifest.projectRepositories } : {}),
+          ...(manifest.taskCreation ? { taskCreation: manifest.taskCreation } : {}),
         };
       })
       .filter((item): item is PluginUiContribution => item !== null);
