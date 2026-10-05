@@ -1075,7 +1075,7 @@ export function getPluginUiContributionMetadata(
     ...(manifest.ui?.launchers ?? []),
   ];
 
-  if (slots.length === 0 && launchers.length === 0) {
+  if (slots.length === 0 && launchers.length === 0 && !manifest.taskCreation) {
     return null;
   }
 
@@ -1851,11 +1851,9 @@ export function pluginLoader(
           { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
           "plugin-loader: upgrade introduces new capabilities — requires admin approval",
         );
-        throw new Error(
-          `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
-            `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-            `Please review and approve the capability escalation before upgrading.`,
-        );
+        // Persist the staged manifest without making it runnable. The lifecycle
+        // returns upgrade_pending and an explicit admin enable approves it.
+        // Previously throwing here made that documented approval path unreachable.
       }
 
       // 4. Update the existing record
@@ -1863,6 +1861,7 @@ export function pluginLoader(
         packageName: discovered.packageName,
         version: discovered.version,
         manifest: newManifest,
+        ...(escalated.length ? { status: "upgrade_pending" as const } : {}),
       });
 
       return {

@@ -250,6 +250,7 @@ export type {
   PluginExecutionWorkspacesClient,
   PluginSkillsClient,
   PluginCompaniesClient,
+  PluginChatClient,
   PluginIssuesClient,
   PluginIssueMutationActor,
   PluginIssueRelationsClient,
@@ -333,6 +334,8 @@ export type {
 // dependency (@paperclipai/plugin-sdk) for all plugin authoring needs.
 export type {
   PaperclipPluginManifestV1,
+  PluginTaskLink,
+  PluginTaskLinks,
   PluginJobDeclaration,
   PluginWebhookDeclaration,
   PluginToolDeclaration,

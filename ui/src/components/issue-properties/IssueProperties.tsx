@@ -1,4 +1,5 @@
 import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
+import { TaskLinksSidebar } from "@/plugins/task-links";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
@@ -2590,6 +2591,8 @@ export function IssueProperties({
           onRetryExternalObjects={onRetryExternalObjects}
         />
       </PropertySection>
+
+      <TaskLinksSidebar issue={issue} />
 
       <PropertySection title="Execution" streamlined={streamlinedPropertiesEnabled}>
         {/* Read-only: agents set the policy, the board does not. */}

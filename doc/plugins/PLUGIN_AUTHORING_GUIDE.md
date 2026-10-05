@@ -366,6 +366,8 @@ Mount surfaces currently wired in the host include:
 - `sidebarPanel`
 - `detailTab`
 - `taskDetailView`
+- `taskListToolbar` (compact controls inside company/project Tasks toolbars; requires `ui.detailTab.register`)
+- `taskListSection` (company/project Tasks pages; requires `ui.detailTab.register`)
 - `projectSidebarItem`
 - `globalToolbarButton`
 - `appShellOverlay` (persistent, signed-in application shell)
@@ -646,3 +648,113 @@ It does not manage a proxy server or store its own copy of credentials.
 See [AI Connections](../connections/AI-CONNECTIONS.md#existing-cliproxyapi-and-compatible-gateways)
 for origin approval and supported client protocols. Other plugins continue to use
 the external package workflow.
+
+
+### Supply repositories to the native Projects picker
+
+A connector plugin can declare a repository source without adding its own project-creation UI:
+
+```ts
+projectRepositories: {
+  listAction: "project-repositories",
+  setupPath: "/github-projects", // optional; must match a declared page route
+}
+```
+
+Declare `ui.action.register` and register the named worker action. It receives the authenticated board user and authorized company in the ordinary immutable action context, plus `params.companyId`. Return `ProjectRepositoryOptions`: `repositories` (numeric GitHub `id` as a string, `fullName`, canonical HTTPS GitHub `url`, optional `private`, `connections`), `connectionCount`, `failedConnectionCount`, and optional `warnings`. A company without a connection returns zero counts and an empty array. Keep credentials and installation tokens inside the plugin. Counts and warnings should distinguish missing setup, empty access and partial provider failure.
+
+The host calls ready providers from `GET /api/companies/:companyId/project-repositories` and revalidates selections during native project creation and repository updates. It merges them with usable built-in GitHub connections, deduplicates by GitHub repository ID, and uses the manifest display name as the source label. Provider errors are sanitized; successful sources remain available. Optional `setupPath` routes the native picker’s connection action to the plugin settings page. Plugin repositories are currently board-only and GitHub-only; agent repository access keeps its existing responsible-user grant checks. Linking a repository does not grant clone credentials to an agent.
+
+
+### Automatic sections on Tasks pages
+
+Use `taskListToolbar` for compact status and refresh controls in the native Tasks toolbar. It takes the same company/project context and capability as `taskListSection`. Keep details in a popover or dialog.
+
+Declare a `taskListSection` UI slot to render an external issue list automatically below the native task list. Set `entityTypes` to `company`, `project`, or both. The host supplies the current `companyId` and, on a project's Tasks page, `projectId` and `entityId`. The existing `ui.detailTab.register` capability gates this slot. Use the SDK's `PluginWidgetProps` context for the component.
+
+The plugin owns loading, pagination, provider errors and company isolation. External rows are display-only unless the plugin explicitly implements an import or write operation; they are not Paperclip tasks and should link to their provider. Include partial-result warnings instead of treating failed sources as empty lists.
+
+### Native task creation destinations
+
+A plugin can add destinations to the native New Task form with:
+
+```ts
+taskCreation: {
+  label: "GitHub",
+  listAction: "task-destinations",
+  publishAction: "publish-task",
+}
+```
+
+This requires `ui.action.register` and a UI entrypoint. `listAction` receives the
+selected `projectId` in authenticated company context and returns
+`{ destinations: [{ id, label, disabledReason? }] }`. The form defaults to
+Paperclip and remembers an explicit destination per company/project. A disabled
+or unavailable saved destination blocks submission until the user chooses a
+valid option; it never silently publishes elsewhere.
+
+The host creates the native task first through its normal API, preserving all
+native form fields and using a durable creation retry key. Then `publishAction`
+receives `{ issueId, destinationId }` and must validate company/project ownership,
+persist publication intent, and handle repeated calls without creating duplicate
+external objects. Return `{ warning?: string }` only when intent is durably saved
+and the plugin owns recovery; throw when publication intent was not confirmed so
+the form retains its retry key. Credentials and provider implementation stay in
+the plugin. Tasks with `plugin:<pluginKey>` origins show the provider label in
+native rows while the plugin is ready.
+
+`ctx.issues.create` supports `idempotencyKey` and `allowDuplicate`. The host
+namespaces creation keys by plugin, and its normal company-scoped transaction
+handles concurrent retries. Importers should use stable source IDs and
+`allowDuplicate: true` to preserve distinct external tasks with identical titles.
+Keep a durable source mapping as well: the host's retry-key retention is bounded.
+
+Upgrades with additional capabilities are staged in `upgrade_pending` and cannot
+start until an instance administrator enables the reviewed version. The loader
+persists the staged manifest before returning to the lifecycle manager; it does
+not throw before the approval step. Existing configuration and plugin state stay
+attached to the same plugin record.
+
+### Source issue and pull request columns
+
+`taskCreation.linksAction` optionally supplies native Tasks columns and the task
+properties sidebar. It receives `{ issueIds: string[], detail?: boolean,
+refresh?: boolean }` with at most 100 native task IDs per call and the selected
+company in the board action context. Return `{ tasks: PluginTaskLinks[] }`.
+
+Each row includes `issueId`, an optional `issue` link, `pullRequests`,
+`pullRequestsStatus` (`ready`, `access_required`, or `error`), optional
+`morePullRequests`, `message`, and `details: { label, value }[]`. Each
+`PluginTaskLink` contains `label`, HTTPS `url`, optional `title`, `state`, and
+`viewPath`. The latter must point to the plugin's declared
+`projectRepositories.setupPath`, optionally with a query, and opens within the
+active company. Secrets and raw provider responses must stay in the worker.
+
+The host batches only tasks whose `originKind` belongs to that plugin. Validate
+every requested task against the actor's company before reading credentials.
+Batch/cache provider reads; return issue links even when PR lookup fails and
+never represent missing permission as an empty successful result. `detail`
+requests metadata for the right sidebar; `refresh` must bypass the provider
+cache. Only return PR relationships confirmed by the provider.
+
+The two columns default on when matching tasks exist. Users can hide them in
+Columns; preferences are independent of existing columns and scoped by company
+and task collection. Desktop links also appear below the title on mobile.
+
+### Native task record panels
+
+A task link may return `panel: { slotId, recordId }`. `slotId` must name this
+plugin's declared `detailTab` for `issue` entities. `recordId` is an opaque,
+non-secret identifier (up to 512 characters). The host passes it as
+`props.context.taskRecordId`, along with the native task `entityId`, company,
+and project. The plugin renders its full record view using its normal worker
+actions; provider authorization remains in those actions.
+
+Source/PR columns then open the native task with a right-panel tab. The primary
+source record opens on a linked task's first visit; additional records are in
+the panel's tab launcher. Tabs can coexist with Properties, documents and files,
+and their state is scoped to account, company and task. A task URL can select a
+record with `taskPlugin=<plugin key or ID>&taskRecord=<recordId>`. Both URL and
+persisted references are resolved against the current task-links response before
+mounting plugin UI; unavailable or revoked references show a retry state.
+`viewPath` remains the fallback for plugins without panel support.

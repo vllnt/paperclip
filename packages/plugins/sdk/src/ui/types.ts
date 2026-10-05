@@ -268,6 +268,8 @@ export interface PluginDetailTabProps {
   context: PluginHostContext & {
     entityId: string;
     entityType: string;
+    /** Opaque record ID from taskCreation.linksAction when mounted in a task side panel. */
+    taskRecordId?: string;
   };
 }
 
@@ -399,6 +401,21 @@ export interface PluginCommentContextMenuItemProps {
 export interface PluginSettingsPageProps {
   /** The current host context. */
   context: PluginHostContext;
+}
+
+/**
+ * Props passed to a plugin agent settings component.
+ *
+ * The host mounts this component on an agent's Tools/settings surface with
+ * the company and agent identifiers already resolved. Plugins should keep
+ * credentials in their normal company configuration and store only
+ * agent-scoped references or grants in their own state.
+ */
+export interface PluginAgentSettingsProps {
+  context: PluginHostContext & {
+    entityId: string;
+    entityType: "agent";
+  };
 }
 
 // ---------------------------------------------------------------------------

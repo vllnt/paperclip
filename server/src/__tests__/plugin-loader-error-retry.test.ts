@@ -182,6 +182,27 @@ describe("pluginLoader.loadAll error retry", () => {
     }
   });
 
+  it("stages added capabilities without activation until an administrator enables the upgrade", async () => {
+    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "plugin-upgrade-approval-")));
+    try {
+      mkdirSync(path.join(root, "dist"), { recursive: true });
+      const plugin = createPluginRecord({ status: "ready", packagePath: root });
+      const replacement = { ...plugin.manifestJson, version: "1.1.0", categories: ["connector"], capabilities: ["issues.read", "issues.create"] };
+      writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: plugin.packageName, version: "1.1.0", type: "module", paperclipPlugin: { manifest: "dist/manifest.js", worker: "dist/worker.js" } }));
+      writeFileSync(path.join(root, "dist/manifest.js"), `export default ${JSON.stringify(replacement)};`);
+      writeFileSync(path.join(root, "dist/worker.js"), "throw new Error('unapproved worker must not start');");
+      mockRegistry.getById.mockResolvedValue(plugin);
+      const runtime = createRuntimeServices();
+      const startWorker = vi.fn(); runtime.workerManager.startWorker = startWorker;
+      const loader = pluginLoader({} as Db, { localPluginDir: root }, runtime);
+      await expect(loader.upgradePlugin(plugin.id, {})).resolves.toMatchObject({ newManifest: replacement });
+      expect(mockRegistry.update).toHaveBeenCalledWith(plugin.id, expect.objectContaining({ status: "upgrade_pending", manifest: replacement }));
+      mockRegistry.getById.mockResolvedValue({ ...plugin, status: "upgrade_pending", manifestJson: replacement });
+      await expect(loader.loadSingle(plugin.id)).rejects.toThrow("upgrade_pending");
+      expect(startWorker).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("does not import an npm fallback for a removed distribution install", async () => {
     const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "distribution-removal-")));
     try {

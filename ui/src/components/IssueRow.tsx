@@ -1,3 +1,5 @@
+import { TaskLinkCells, useTaskLinkColumns } from "@/plugins/task-links";
+import { TaskSourceBadge } from "@/plugins/task-creation";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import type { ReactNode } from "react";
 import type { ExternalObjectSummary, Issue, IssueRecoveryAction } from "@paperclipai/shared";
@@ -151,6 +153,7 @@ export function IssueRow({
   chevronInGuide = false,
   showDivider = false,
 }: IssueRowProps) {
+  const taskLinks = useTaskLinkColumns();
   const issuePathId = issue.identifier ?? issue.id;
   const identifier = issue.identifier ?? issue.id.slice(0, 8);
   // A row participates in the unread system whenever `unreadState` is supplied.
@@ -306,6 +309,7 @@ export function IssueRow({
             >
               {issue.title}{titleSuffix}
             </span>
+            <TaskSourceBadge originKind={issue.originKind} />
             {recoveryIndicator}
             {mobileTitleMeta ? (
               <span className="ml-auto shrink-0 whitespace-nowrap text-right text-xs text-muted-foreground sm:hidden">
@@ -316,6 +320,7 @@ export function IssueRow({
           {checklistDependencyChips ? (
             <span className="flex flex-wrap gap-1">{checklistDependencyChips}</span>
           ) : null}
+          <TaskLinkCells issueId={issue.id} mobile />
           {mobileMeta ? (
             <span className="text-xs text-muted-foreground sm:hidden">{mobileMeta}</span>
           ) : null}
@@ -329,6 +334,7 @@ export function IssueRow({
             <ExternalObjectStatusSummary summary={externalObjectSummary} compact />
           ) : null}
           {metadata ? <span data-slot="task-row-metadata" className="min-w-0">{metadata}</span> : null}
+          <TaskLinkCells issueId={issue.id} />
           {desktopTrailing}
           {actions ? <span data-slot="task-row-actions" className="flex shrink-0 items-center gap-1">{actions}</span> : null}
           {onArchive ? <InboxArchiveButton onArchive={onArchive} disabled={archiveDisabled} compact /> : null}
@@ -396,6 +402,7 @@ export function IssueRow({
           >
             {issue.title}{titleSuffix}
           </span>
+          <TaskSourceBadge originKind={issue.originKind} />
           {recoveryIndicator}
         </span>
         {checklistDependencyChips ? (
@@ -403,6 +410,7 @@ export function IssueRow({
             {checklistDependencyChips}
           </span>
         ) : null}
+        <TaskLinkCells issueId={issue.id} mobile />
         <span className="flex items-center gap-2 self-stretch sm:order-1 sm:shrink-0">
           {showUnreadSlot ? (
             // Reserved leftmost dot gutter (desktop). Present on read and unread
@@ -477,7 +485,7 @@ export function IssueRow({
           ) : null}
         </span>
       </span>
-      {(onArchive || desktopTrailing || trailingMeta || externalObjectSummary) ? (
+      {(onArchive || desktopTrailing || trailingMeta || externalObjectSummary || taskLinks?.columns.length) ? (
         <span className="ml-auto hidden shrink-0 items-center gap-2 sm:order-3 sm:flex sm:gap-3">
           {onArchive ? (
             <InboxArchiveButton onArchive={onArchive} disabled={archiveDisabled} />
@@ -485,6 +493,7 @@ export function IssueRow({
           {externalObjectSummary ? (
             <ExternalObjectStatusSummary summary={externalObjectSummary} compact />
           ) : null}
+          <TaskLinkCells issueId={issue.id} />
           {desktopTrailing}
           {trailingMeta ? (
             <span className="text-xs text-muted-foreground">{trailingMeta}</span>

@@ -43,6 +43,8 @@ export type PluginUiContribution = {
   uiEntryFile: string;
   slots: PluginUiSlotDeclaration[];
   launchers: PluginLauncherDeclaration[];
+  projectRepositories?: { listAction: string; setupPath?: string };
+  taskCreation?: { label: string; listAction: string; publishAction: string; linksAction?: string };
 };
 
 /**

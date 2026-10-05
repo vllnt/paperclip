@@ -1,4 +1,5 @@
 import { LegacyProjectRepository } from "./LegacyProjectRepository";
+import { useNavigate } from "@/lib/router";
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { Project, ProjectRepository } from "@paperclipai/shared";
@@ -11,6 +12,7 @@ import { Button } from "./ui/button";
 
 export function ProjectRepositories({ project }: { project: Project }) {
   const client = useQueryClient();
+  const navigate = useNavigate();
   const saved: ProjectRepository[] = project.workspaces.flatMap((workspace) => {
     const id = workspace.metadata?.githubRepositoryId;
     return typeof id === "string" && workspace.repoUrl ? [{ id, fullName: workspace.name, url: workspace.repoUrl, connections: [] }] : [];
@@ -30,7 +32,7 @@ export function ProjectRepositories({ project }: { project: Project }) {
     },
   });
   return <section aria-label="Repositories" className="flex min-w-0 flex-col gap-4 py-4">
-    <ProjectRepositoryInput companyId={project.companyId} selected={draft ?? saved} onChange={(repos) => { setDraft(repos); save.reset(); }} onConnect={() => setConnecting(true)} disabled={save.isPending} />
+    <ProjectRepositoryInput companyId={project.companyId} selected={draft ?? saved} onChange={(repos) => { setDraft(repos); save.reset(); }} onConnect={(path) => { if (path) navigate(path); else setConnecting(true); }} disabled={save.isPending} />
     {project.workspaces.filter((workspace) => workspace.repoUrl && !workspace.metadata?.githubRepositoryId).map((workspace) => <LegacyProjectRepository key={workspace.id} workspace={workspace} projectRef={project.urlKey} />)}
     <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-4">
       {save.isError && <p role="alert" className="mr-auto text-sm text-destructive">{save.error.message}</p>}

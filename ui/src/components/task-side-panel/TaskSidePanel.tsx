@@ -20,6 +20,8 @@ import {
 import {
   Globe,
   Box,
+  CircleDot,
+  GitPullRequest,
   FileCode2,
   FileText,
   FolderOpen,
@@ -76,6 +78,7 @@ import {
   taskPanelDocumentTab,
   taskPanelFilesTab,
   taskPanelPropertiesTab,
+  taskPanelPluginRecordTab,
   taskPanelSkillTab,
   taskPanelSubtasksTab,
   taskPanelWorkspaceFileTab,
@@ -83,6 +86,7 @@ import {
   type TaskSidePanelTabPayload,
 } from "@/lib/task-side-panel-state";
 import { cn } from "@/lib/utils";
+import { readTaskRecordSelection, writeTaskRecordSelection, useTaskRecordPanels, recordPanelTab, TaskRecordPanelContent } from "@/plugins/task-record-panels";
 import { TaskDocumentPanel } from "./TaskDocumentPanel";
 import { TaskWorkspaceFilePanel } from "./TaskWorkspaceFilePanel";
 import { TaskSkillPanel } from "./TaskSkillPanel";
@@ -126,6 +130,7 @@ const EMPTY_ISSUE_DOCUMENTS: IssueDocument[] = [];
 function tabIcon(tab: SidePanelTabRecord<TaskSidePanelTabPayload>): ReactNode {
   switch (tab.payload.kind) {
     case "browser": return <Globe />;
+    case "plugin-record": return tab.payload.recordKind === "pull" ? <GitPullRequest /> : <CircleDot />;
     case "properties": return <SlidersHorizontal />;
     case "subtasks": return <ListTree />;
     case "artifacts": return <Box />;
@@ -161,6 +166,8 @@ function useTaskSidePanelFileRouting() {
   const state = useMemo(() => readFileViewerStateFromSearch(location.search), [location.search]);
   const browseState = useMemo(() => readBrowseStateFromSearch(location.search), [location.search]);
   const navigateSearch = useCallback((nextSearch: string, replace = false) => {
+    const params = new URLSearchParams(nextSearch);
+    if (params.get("file") || params.get("browse") === "1") nextSearch = writeTaskRecordSelection(nextSearch, null);
     if (!shouldNavigateFileViewerSearch(nextSearch, location.search)) return;
     navigate(
       { pathname: location.pathname, hash: location.hash, search: nextSearch },
@@ -270,6 +277,17 @@ export function TaskSidePanel({
   const conversationAgentId = agentChatEnabled ? issue.conversationAgentId ?? null : null;
   const showRelatedTasks = showSubtasksTab && !conversationAgentId;
   const viewer = useTaskSidePanelFileRouting();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const recordPanels = useTaskRecordPanels(issue);
+  const recordSelection = readTaskRecordSelection(location.search);
+  const recordRequestKey = recordSelection ? `${recordSelection.pluginId}:${recordSelection.recordId}` : null;
+  const handledRecordRequest = useRef<string | null>(null);
+  const autoRecordHandled = useRef(false);
+  function navigateRecord(selection: { pluginId: string; recordId: string } | null) {
+    const search = writeTaskRecordSelection(location.search, selection);
+    if (search !== location.search) navigate({ pathname: location.pathname, hash: location.hash, search }, { replace: true, state: location.state });
+  }
   const { data: documentsData } = useIssueDocuments(issue.id);
   const documents = documentsData ?? EMPTY_ISSUE_DOCUMENTS;
   const { data: planDocument } = useIssuePlanDocument(issue.id);
@@ -351,6 +369,24 @@ export function TaskSidePanel({
   const activeTab = controller.tabs.find((tab) => tab.id === controller.activeTabId) ?? null;
   const subtasksAvailable = showRelatedTasks && (taskCount > 0 || tasksTab?.hasError === true);
   const hasSubtasksTab = controller.tabs.some((tab) => tab.id === "subtasks");
+
+  useEffect(() => {
+    if (!recordRequestKey) { handledRecordRequest.current = null; return; }
+    if (handledRecordRequest.current === recordRequestKey || !recordSelection) return;
+    const record = recordPanels.records.find(r => (r.pluginId === recordSelection.pluginId || r.pluginKey === recordSelection.pluginId) && r.recordId === recordSelection.recordId);
+    if (!record && recordPanels.loading) return;
+    handledRecordRequest.current = recordRequestKey;
+    autoRecordHandled.current = true;
+    userInteractedRef.current = true;
+    setLauncherOpen(false);
+    controller.openTab(record ? recordPanelTab(record) : taskPanelPluginRecordTab({ ...recordSelection, recordKind: "issue", label: "Source record" }));
+  }, [recordRequestKey, recordPanels.records, recordPanels.loading, controller.openTab]);
+
+  useEffect(() => {
+    if (autoRecordHandled.current || restoredRef.current || recordRequestKey || userInteractedRef.current || planDocument || !recordPanels.records.length) return;
+    autoRecordHandled.current = true;
+    controller.openTab(recordPanelTab(recordPanels.records[0]));
+  }, [recordPanels.records, recordRequestKey, planDocument, controller.openTab]);
 
   useEffect(() => {
     if (!openSkillId) return;
@@ -495,6 +531,11 @@ export function TaskSidePanel({
     controller.selectTab(tabId);
     const tab = controller.tabs.find((candidate) => candidate.id === tabId);
     if (!tab) return;
+    if (tab.payload.kind === "plugin-record") {
+      navigateRecord({ pluginId: tab.payload.pluginId, recordId: tab.payload.recordId });
+      return;
+    }
+    if (recordSelection) navigateRecord(null);
     if (tab.payload.kind === "workspace-file") {
       viewer.open(tab.payload);
     } else if (tab.payload.kind === "files-browser") {
@@ -521,6 +562,7 @@ export function TaskSidePanel({
     if (tabId === "subtasks") subtasksDismissedRef.current = true;
     const tab = controller.tabs.find((candidate) => candidate.id === tabId);
     controller.closeTab(tabId);
+    if (tabId === controller.activeTabId && tab?.payload.kind === "plugin-record") navigateRecord(null);
     if (tabId === controller.activeTabId && (tab?.payload.kind === "workspace-file" || tab?.payload.kind === "files-browser")) {
       viewer.close();
     }
@@ -556,16 +598,18 @@ export function TaskSidePanel({
     const document = tab.payload.kind === "issue-document" ? documentByKey.get(tab.payload.documentKey) : null;
     const browserIndex = browsersQuery.data?.findIndex((browser) => tab.payload.kind === "browser" && (browser.id === tab.payload.browserId || browser.sessionId === tab.payload.browserId)) ?? -1;
     const browserLabel = browserIndex >= 0 && (browsersQuery.data?.length ?? 0) > 1 ? `Browser ${browserIndex + 1}` : null;
+    const payload = tab.payload;
+    const record = payload.kind === "plugin-record" ? recordPanels.records.find(r => (r.pluginId === payload.pluginId || r.pluginKey === payload.pluginId) && r.recordId === payload.recordId) : null;
     return {
       id: tab.id,
       type: tab.type,
-      label: browserLabel ?? (tab.payload.kind === "subtasks" && tasksTab ? "Tasks" : document ? documentDisplayTitle(document) : tab.label),
+      label: record ? recordPanelTab(record).label : browserLabel ?? (tab.payload.kind === "subtasks" && tasksTab ? "Tasks" : document ? documentDisplayTitle(document) : tab.label),
       ariaLabel: tab.payload.kind === "subtasks" ? taskLabel : tab.ariaLabel,
       closable: true,
       contentMode: tab.contentMode,
       icon: tabIcon(tab),
     };
-  }), [controller.tabs, documentByKey, taskCount, taskLabel, tasksTab, browsersQuery.data]);
+  }), [controller.tabs, recordPanels.records, documentByKey, taskCount, taskLabel, tasksTab, browsersQuery.data]);
 
   const launcherSections = useMemo<SidePanelLauncherSection[]>(() => {
     const primary: SidePanelLauncherItem[] = conversationAgentId ? [
@@ -605,6 +649,13 @@ export function TaskSidePanel({
     const sections: SidePanelLauncherSection[] = [
       { id: "open", label: "Open", items: primary },
     ];
+    if (recordPanels.records.length) sections.push({ id: "source-records", label: "Linked records", items: recordPanels.records.map(record => ({
+      id: recordPanelTab(record).id,
+      label: recordPanelTab(record).label,
+      description: record.link.title,
+      icon: record.kind === "pull" ? <GitPullRequest /> : <CircleDot />,
+      alreadyOpen: controller.tabs.some(tab => tab.id === recordPanelTab(record).id),
+    })) });
     if (documentItems.length > 0) {
       sections.push({ id: "documents", label: "Task documents", items: documentItems });
     }
@@ -627,10 +678,18 @@ export function TaskSidePanel({
       });
     }
     return sections;
-  }, [browsersQuery.data, conversationAgentId, taskCount, taskLabel, tasksTab?.hasError, controller.tabs, documents, fileTabsEnabled, planDocument, recentFilesQuery.data, recentFilesQuery.isError, recentFilesQuery.isLoading, subtasksAvailable]);
+  }, [recordPanels.records, browsersQuery.data, conversationAgentId, taskCount, taskLabel, tasksTab?.hasError, controller.tabs, documents, fileTabsEnabled, planDocument, recentFilesQuery.data, recentFilesQuery.isError, recentFilesQuery.isLoading, subtasksAvailable]);
 
   function selectLauncherItem(item: SidePanelLauncherItem) {
     markInteracted();
+    const record = recordPanels.records.find(record => recordPanelTab(record).id === item.id);
+    if (record) {
+      controller.openTab(recordPanelTab(record));
+      navigateRecord({ pluginId: record.pluginId, recordId: record.recordId });
+      setLauncherOpen(false);
+      return;
+    }
+    if (recordSelection) navigateRecord(null);
     if (item.id.startsWith("browser:")) controller.openTab(taskPanelBrowserTab(item.id.slice(8)));
     else if (item.id === "properties") controller.openTab(taskPanelPropertiesTab());
     else if (item.id === "subtasks") {
@@ -706,6 +765,8 @@ export function TaskSidePanel({
   let content: ReactNode;
   if (!activeTab) {
     content = <SidePanelLauncher sections={launcherSections} onSelect={selectLauncherItem} />;
+  } else if (activeTab.payload.kind === "plugin-record") {
+    content = <TaskRecordPanelContent issue={issue} payload={activeTab.payload} data={recordPanels} />;
   } else if (activeTab.payload.kind === "browser") {
     content = null; // Mounted below independently of the selected tab.
   } else if (activeTab.payload.kind === "properties") {

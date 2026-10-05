@@ -190,6 +190,11 @@ export interface HostServices {
     ): Promise<void>;
   };
 
+  /** Provides a credential-free view of native chat connector endpoints. */
+  chat: {
+    listEndpoints(params: WorkerToHostMethods["chat.endpoints.list"][0]): Promise<WorkerToHostMethods["chat.endpoints.list"][1]>;
+  };
+
   /** Provides `companies.list`, `companies.get`. */
   companies: {
     list(params: WorkerToHostMethods["companies.list"][0]): Promise<WorkerToHostMethods["companies.list"][1]>;
@@ -427,6 +432,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Provider span sink — only a plugin that registers environment drivers may
   // emit a provider span. The gate rejects a span from any other plugin.
   "span.record": "environment.drivers.register",
+
+  // Native chat connectors
+  "chat.endpoints.list": "chat.endpoints.read",
 
   // Companies
   "companies.list": "companies.read",
@@ -803,6 +811,11 @@ export function createHostClientHandlers(
     // Provider span sink. The context carries the host-minted `traceparent`.
     "span.record": gated("span.record", async (params, context) => {
       return services.tracer.record(params, context);
+    }),
+
+    // Native chat connectors
+    "chat.endpoints.list": gated("chat.endpoints.list", async (params) => {
+      return services.chat.listEndpoints(params);
     }),
 
     // Companies

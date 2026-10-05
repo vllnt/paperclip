@@ -45,6 +45,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   // Data read operations
   "companies.list": ["companies.read"],
   "companies.get": ["companies.read"],
+  "chat.endpoints.list": ["chat.endpoints.read"],
   "projects.list": ["projects.read"],
   "projects.get": ["projects.read"],
   "projects.managed.get": ["projects.managed"],
@@ -160,6 +161,8 @@ const UI_SLOT_CAPABILITIES: Record<PluginUiSlotType, PluginCapability> = {
   projectSidebarItem: "ui.sidebar.register",
   page: "ui.page.register",
   detailTab: "ui.detailTab.register",
+  taskListToolbar: "ui.detailTab.register",
+  taskListSection: "ui.detailTab.register",
   taskDetailView: "ui.detailTab.register",
   dashboardWidget: "ui.dashboardWidget.register",
   globalToolbarButton: "ui.action.register",
@@ -171,6 +174,7 @@ const UI_SLOT_CAPABILITIES: Record<PluginUiSlotType, PluginCapability> = {
   commentContextMenuItem: "ui.action.register",
   settingsPage: "instance.settings.register",
   companySettingsPage: "instance.settings.register",
+  agentSettings: "ui.detailTab.register",
   routeSidebar: "ui.sidebar.register",
 };
 

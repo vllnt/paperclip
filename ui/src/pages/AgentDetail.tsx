@@ -133,6 +133,7 @@ import {
   useResourceMemberships,
 } from "../hooks/useResourceMemberships";
 import { Badge } from "@/components/ui/badge";
+import { PluginSlotOutlet } from "@/plugins/slots";
 import {
   AGENT_DETAIL_NAVIGATION,
   agentDetailHref,
@@ -1447,7 +1448,20 @@ export function AgentDetail() {
       )}
 
       {activeView === "tools" && resolvedCompanyId && (
-        <AgentToolsTab agent={agent} companyId={resolvedCompanyId} />
+        <>
+          <PluginSlotOutlet
+            slotTypes={["agentSettings"]}
+            entityType="agent"
+            context={{
+              companyId: resolvedCompanyId,
+              companyPrefix: companyPrefix ?? null,
+              entityId: agent.id,
+              entityType: "agent",
+            }}
+            className="space-y-4"
+          />
+          <AgentToolsTab agent={agent} companyId={resolvedCompanyId} />
+        </>
       )}
 
       {activeView === "channels" && resolvedCompanyId && (

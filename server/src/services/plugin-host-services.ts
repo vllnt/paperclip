@@ -3,6 +3,7 @@ import {
   activityLog,
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
+  chatEndpoints,
   budgetIncidents,
   companyMemberships,
   costEvents,
@@ -13,7 +14,7 @@ import {
   principalPermissionGrants,
   projects as projectsTable,
 } from "@paperclipai/db";
-import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
+import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte, ne } from "drizzle-orm";
 import type {
   HostServices,
   Company,
@@ -76,6 +77,7 @@ import { isIP } from "node:net";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
+import { instanceSettingsService } from "./instance-settings.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
@@ -1704,6 +1706,56 @@ export function buildHostServices(
       },
     },
 
+    chat: {
+      async listEndpoints(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const experimental = await instanceSettingsService(db).getExperimental();
+        const rows = await db
+          .select({
+            id: chatEndpoints.id,
+            companyId: chatEndpoints.companyId,
+            connectionId: chatEndpoints.connectionId,
+            provider: chatEndpoints.provider,
+            status: chatEndpoints.status,
+            assignedAgentId: chatEndpoints.assignedAgentId,
+            assignedAgentName: agentsTable.name,
+            botExternalId: chatEndpoints.botExternalId,
+            botUsername: chatEndpoints.botUsername,
+            botLabel: chatEndpoints.botDisplayName,
+            capabilities: chatEndpoints.capabilities,
+            lastError: chatEndpoints.lastError,
+            activatedAt: chatEndpoints.activatedAt,
+          })
+          .from(chatEndpoints)
+          .innerJoin(
+            agentsTable,
+            and(
+              eq(agentsTable.id, chatEndpoints.assignedAgentId),
+              eq(agentsTable.companyId, chatEndpoints.companyId),
+            ),
+          )
+          .where(
+            and(
+              eq(chatEndpoints.companyId, companyId),
+              ne(chatEndpoints.status, "archived"),
+              eq(chatEndpoints.provider, params.provider ?? "github"),
+              ...(params.agentId ? [eq(chatEndpoints.assignedAgentId, params.agentId)] : []),
+            ),
+          )
+          .orderBy(desc(chatEndpoints.updatedAt));
+        return {
+          chatConnectorsEnabled: experimental.enableChatConnectors,
+          endpoints: rows.map((row) => ({
+            ...row,
+            provider: "github" as const,
+            capabilities: (row.capabilities ?? {}) as unknown as Record<string, boolean>,
+            activatedAt: row.activatedAt?.toISOString() ?? null,
+          })),
+        };
+      },
+    },
+
     companies: {
       async list(params) {
         return applyWindow((await companies.list()) as Company[], params);
@@ -1923,6 +1975,8 @@ export function buildHostServices(
         );
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
+          // Keep a plugin's retry keys separate from board and other plugins.
+          idempotencyKey: params.idempotencyKey ? `plugin:${pluginKey}:${params.idempotencyKey}` : undefined,
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
@@ -1959,6 +2013,9 @@ export function buildHostServices(
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        if (typeof patch.projectId === "string") {
+          requireInCompany("Project", await projects.getById(patch.projectId), companyId);
+        }
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }

@@ -10,6 +10,7 @@ import {
   taskPanelAgentTasksTab,
   taskPanelArtifactsTab,
   taskPanelDocumentTab,
+  taskPanelPluginRecordTab,
   taskPanelPropertiesTab,
   writeTaskSidePanelState,
 } from "@/lib/task-side-panel-state";
@@ -29,6 +30,8 @@ const browserFixture = vi.hoisted(() => ({ data: [] as import("@paperclipai/shar
 vi.mock("@/hooks/useTaskBrowsers", () => ({ useTaskBrowsers: () => ({ data: browserFixture.data, isError: false }) }));
 vi.mock("@/api/browser-use", () => ({ browserUseApi: { viewer: browserFixture.viewer, control: browserFixture.control, presence: vi.fn(async () => ({ accepted: true })) } }));
 const fixture = vi.hoisted(() => ({
+  recordsLoading: false,
+  records: [] as any[],
   documents: [] as IssueDocument[] | undefined,
   plan: null as IssueDocument | null | undefined,
 }));
@@ -42,6 +45,15 @@ const routeFixture = vi.hoisted(() => ({
   },
   navigate: vi.fn(),
 }));
+
+vi.mock("@/plugins/task-record-panels", async importOriginal => {
+  const original = await importOriginal<typeof import("@/plugins/task-record-panels")>();
+  return { ...original,
+    useTaskRecordPanels: () => ({ records: fixture.records, loading: fixture.recordsLoading, error: null, retry: vi.fn() }),
+    TaskRecordPanelContent: ({ payload }: any) => fixture.records.some(record => record.pluginId === payload.pluginId && record.recordId === payload.recordId) ? <div>Source record {payload.recordId}</div> : <div>Record unavailable</div>,
+  };
+});
+
 
 vi.mock("@/hooks/useIssueDocuments", () => ({
   useIssueDocuments: () => ({ data: fixture.documents }),
@@ -130,6 +142,8 @@ describe("TaskSidePanel", () => {
 
   beforeEach(() => {
     window.localStorage.clear();
+    fixture.recordsLoading = false;
+    fixture.records = [];
     browserFixture.data = [];
     browserFixture.control.mockClear();
     fixture.documents = [];
@@ -310,6 +324,72 @@ describe("TaskSidePanel", () => {
       agentChat.enabled = true;
     }
   });
+
+  const sourceRecords = () => [
+    { pluginId: "plugin-uuid", pluginKey: "github", recordId: "issue:1", kind: "issue", link: { label: "#1" } },
+    { pluginId: "plugin-uuid", pluginKey: "github", recordId: "pull:2", kind: "pull", link: { label: "#2" } },
+  ];
+
+  it("opens the source issue by default on a fresh task", async () => {
+    fixture.records = sourceRecords();
+    await render(panel());
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #1");
+    expect(container.textContent).toContain("Source record issue:1");
+  });
+
+  it.each(["github", "plugin-uuid"])("opens a deep linked PR using %s without leaving the task", async pluginId => {
+    fixture.records = sourceRecords();
+    routeFixture.location.search = `?taskPlugin=${pluginId}&taskRecord=pull%3A2`;
+    await render(panel());
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("PR #2");
+    expect(container.textContent).toContain("Source record pull:2");
+    expect(routeFixture.navigate).not.toHaveBeenCalled();
+  });
+
+  it("waits for source authorization before opening a requested record", async () => {
+    fixture.recordsLoading = true;
+    routeFixture.location.search = "?taskPlugin=github&taskRecord=pull%3A2";
+    await render(panel());
+    expect(container.textContent).toContain("Properties content");
+    expect(container.textContent).not.toContain("Record unavailable");
+    fixture.recordsLoading = false;
+    fixture.records = sourceRecords();
+    await render(panel());
+    expect(container.textContent).toContain("Source record pull:2");
+  });
+
+  it("switches to Properties and clears record routing, then closes the active record", async () => {
+    fixture.records = sourceRecords();
+    routeFixture.location.search = "?taskPlugin=github&taskRecord=pull%3A2&other=kept";
+    await render(panel());
+    await act(async () => container.querySelector<HTMLButtonElement>('#side-panel-tab-properties')!.click());
+    expect(container.textContent).toContain("Properties content");
+    expect(routeFixture.navigate).toHaveBeenLastCalledWith(expect.objectContaining({ pathname: "/issues/PAP-1", search: "?other=kept" }), expect.anything());
+    await act(async () => container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="PR #2"]')!.click());
+    expect(container.textContent).toContain("Source record pull:2");
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Close PR #2"]')!.click());
+    expect(container.textContent).toContain("Properties content");
+    expect(container.querySelector('[role="tab"][aria-label="PR #2"]')).toBeNull();
+  });
+
+  it("preserves an intentionally selected saved Properties tab instead of forcing source records", async () => {
+    fixture.records = sourceRecords();
+    writeTaskSidePanelState("user-1", "company-1", "task-1", {
+      state: { tabs: [taskPanelPropertiesTab(), taskPanelPluginRecordTab({ pluginId: "plugin-uuid", recordId: "issue:1", recordKind: "issue", label: "Issue #1" })], activeTabId: "properties" },
+      launcherOpen: false, userInteracted: true, autoPlanHandled: false, updatedAt: 1,
+    });
+    await render(panel());
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Properties");
+  });
+
+  it("opens an unavailable tab for unknown record deep links without mounting the record", async () => {
+    fixture.records = sourceRecords();
+    routeFixture.location.search = "?taskPlugin=foreign&taskRecord=pull%3A2";
+    await render(panel());
+    expect(container.textContent).toContain("Record unavailable");
+    expect(container.textContent).not.toContain("Source record pull:2");
+  });
+
 
   it("opens Properties on first visit", async () => {
     await render(panel());

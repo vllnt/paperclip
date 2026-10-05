@@ -232,6 +232,24 @@ describe("plugin UI slot validators", () => {
     expect(parsed.error.issues.some((issue) => issue.message.includes("reserved by the host"))).toBe(true);
   });
 
+  it("accepts agent settings slots only with an agent target", () => {
+    const parsed = pluginUiSlotDeclarationSchema.parse({
+      type: "agentSettings",
+      id: "github-agent-settings",
+      displayName: "GitHub identity",
+      exportName: "GitHubAgentSettings",
+      entityTypes: ["agent"],
+    });
+    expect(parsed.entityTypes).toEqual(["agent"]);
+    expect(() => pluginUiSlotDeclarationSchema.parse({
+      type: "agentSettings",
+      id: "invalid-agent-settings",
+      displayName: "Invalid",
+      exportName: "Invalid",
+      entityTypes: ["project"],
+    })).toThrow();
+  });
+
   it("accepts workspace entity types as detailTab targets", () => {
     const parsed = pluginUiSlotDeclarationSchema.parse({
       type: "detailTab",
@@ -446,5 +464,36 @@ describe("login pty transport capability and legacy alias", () => {
     );
 
     expect(rejected.success).toBe(false);
+  });
+});
+
+
+describe("plugin task-list sections", () => {
+  const slot = { type: "taskListSection", id: "external-issues", displayName: "External issues", exportName: "ExternalIssues", entityTypes: ["company", "project"] };
+  it("accepts explicitly scoped company and project task lists", () => {
+    expect(pluginUiSlotDeclarationSchema.parse(slot)).toEqual(slot);
+  });
+  it("rejects unscoped and unsupported task-list targets", () => {
+    expect(pluginUiSlotDeclarationSchema.safeParse({ ...slot, entityTypes: [] }).success).toBe(false);
+    expect(pluginUiSlotDeclarationSchema.safeParse({ ...slot, entityTypes: ["issue"] }).success).toBe(false);
+  });
+});
+
+
+describe("native task creation providers", () => {
+  const manifest = { id: "test.tasks", apiVersion: 1, version: "1.0.0", displayName: "Tasks", description: "External task destinations", author: "Test", categories: ["connector"], capabilities: ["ui.action.register"], entrypoints: { worker: "./worker.js", ui: "./ui.js" }, taskCreation: { label: "GitHub", listAction: "destinations", publishAction: "publish", linksAction: "task-links" } };
+  it("preserves task creation declarations and requires the action capability and UI entrypoint", () => {
+    expect(pluginManifestV1Schema.parse(manifest).taskCreation).toEqual(manifest.taskCreation);
+    expect(pluginManifestV1Schema.safeParse({ ...manifest, capabilities: ["issues.read"] }).success).toBe(false);
+    expect(pluginManifestV1Schema.safeParse({ ...manifest, entrypoints: { worker: "./worker.js" } }).success).toBe(false);
+  });
+});
+
+describe("task toolbar slots", () => {
+  it("accepts company and project toolbars and rejects other targets", () => {
+    const slot = { type: "taskListToolbar", id: "sync", displayName: "Sync", exportName: "Sync", entityTypes: ["company", "project"] };
+    expect(pluginUiSlotDeclarationSchema.safeParse(slot).success).toBe(true);
+    expect(pluginUiSlotDeclarationSchema.safeParse({ ...slot, entityTypes: [] }).success).toBe(false);
+    expect(pluginUiSlotDeclarationSchema.safeParse({ ...slot, entityTypes: ["issue"] }).success).toBe(false);
   });
 });

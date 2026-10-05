@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   readTaskSidePanelState,
   taskPanelDocumentTab,
+  taskPanelPluginRecordTab,
   taskPanelFilesTab,
   taskPanelPropertiesTab,
   taskPanelSkillTab,
@@ -95,6 +96,22 @@ describe("task side-panel persistence", () => {
     const restored = readTaskSidePanelState("user-1", "company-1", "task-1", false);
     expect(restored?.state.tabs.map((tab) => tab.id)).toEqual(["properties", "subtasks"]);
     expect(restored?.state.activeTabId).toBe("subtasks");
+  });
+
+  it("round-trips issue and PR tabs with account, company and task isolation", () => {
+    const issueTab = taskPanelPluginRecordTab({ pluginId: "github", recordId: "repo:issue:1", recordKind: "issue", label: "Issue #1" });
+    const prTab = taskPanelPluginRecordTab({ pluginId: "github", recordId: "repo:pull:2", recordKind: "pull", label: "PR #2" });
+    writeTaskSidePanelState("u1", "c1", "t1", { state: { tabs: [issueTab, prTab], activeTabId: prTab.id }, launcherOpen: false, userInteracted: true, autoPlanHandled: false, updatedAt: 1 });
+    expect(readTaskSidePanelState("u1", "c1", "t1", false)?.state).toEqual({ tabs: [issueTab, prTab], activeTabId: prTab.id });
+    expect(readTaskSidePanelState("u2", "c1", "t1", false)).toBeNull();
+    expect(readTaskSidePanelState("u1", "c2", "t1", false)).toBeNull();
+    expect(readTaskSidePanelState("u1", "c1", "t2", false)).toBeNull();
+  });
+
+  it.each([{ recordId: "" }, { pluginId: "" }, { recordId: "x".repeat(513) }, { recordKind: "arbitrary" }])("drops malformed persisted source payloads %j", invalid => {
+    const tab = taskPanelPluginRecordTab({ pluginId: "github", recordId: "issue:1", recordKind: "issue", label: "Issue #1" });
+    writeTaskSidePanelState("u1", "c1", "t1", { state: { tabs: [taskPanelPropertiesTab(), { ...tab, payload: { ...tab.payload, ...invalid } as any }], activeTabId: tab.id }, launcherOpen: false, userInteracted: true, autoPlanHandled: false, updatedAt: 1 });
+    expect(readTaskSidePanelState("u1", "c1", "t1", false)?.state.tabs).toEqual([taskPanelPropertiesTab()]);
   });
 
   it("retains only the 50 most recently written tasks", () => {

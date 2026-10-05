@@ -43,6 +43,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   EnvironmentVariablesEditor,
   type EnvironmentVariablesEditorHandle,
@@ -2366,11 +2367,9 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
               {environmentForm.driver === "sandbox" ? (
                 <div className="space-y-3">
                   <Field label="Provider" hint="Installed run-capable sandbox provider plugins appear here.">
-                    <select
-                      className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+                    <Select
                       value={environmentForm.sandboxProvider}
-                      onChange={(e) => {
-                        const nextProviderKey = e.target.value;
+                      onValueChange={(nextProviderKey) => {
                         const nextProvider = pluginSandboxProviders.find((provider) => provider.provider === nextProviderKey) ?? null;
                         setEnvironmentForm((current) => ({
                           ...current,
@@ -2384,12 +2383,17 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
                         }));
                       }}
                     >
-                      {pluginSandboxProviders.map((provider) => (
-                        <option key={provider.provider} value={provider.provider}>
-                          {provider.displayName}
-                        </option>
-                      ))}
-                    </select>
+                      <SelectTrigger className="w-full" data-testid="environment-sandbox-provider-select">
+                        <SelectValue placeholder="Select a provider" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {pluginSandboxProviders.map((provider) => (
+                          <SelectItem key={provider.provider} value={provider.provider}>
+                            {provider.displayName}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
                   </Field>
                   {selectedSandboxProvider?.description ? (
                     <div className="text-xs text-muted-foreground">

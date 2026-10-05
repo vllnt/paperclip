@@ -1,3 +1,4 @@
+import { useNavigate } from "@/lib/router";
 import { useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { ProjectRepository } from "@paperclipai/shared";
@@ -20,6 +21,7 @@ export function NewProjectDialog() {
 
 export function NewProjectForm({ companyId, onClose }: { companyId: string; onClose: () => void }) {
   const client = useQueryClient();
+  const navigate = useNavigate();
   const [name, setName] = useState("");
   const [repos, setRepos] = useState<ProjectRepository[]>([]);
   const [connecting, setConnecting] = useState(false);
@@ -54,7 +56,7 @@ export function NewProjectForm({ companyId, onClose }: { companyId: string; onCl
           </div>
         </div>
         <div role="region" aria-label="Source repositories" tabIndex={0} className="min-h-0 overflow-y-auto overscroll-contain px-5 pb-1 outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring">
-          <ProjectRepositoryInput companyId={companyId} selected={repos} onChange={setRepos} onConnect={() => setConnecting(true)} disabled={create.isPending} />
+          <ProjectRepositoryInput companyId={companyId} selected={repos} onChange={setRepos} onConnect={(path) => { if (path) { onClose(); navigate(path); } else setConnecting(true); }} disabled={create.isPending} />
         </div>
         {create.isError && <p role="alert" className="px-5 pt-3 text-sm text-destructive">{create.error.message}</p>}
         <div className="flex shrink-0 justify-end gap-2 px-5 py-5">

@@ -5,6 +5,9 @@ import { projectToolContext } from "../services/project-tool-context.js";
 import { persistActivity, publishActivity } from "../services/activity-log.js";
 import { z } from "zod";
 import { normalizeProjectRepositoryUrl, resolveProjectRepositorySelection } from "../services/project-repositories.js";
+import { listPluginProjectRepositories, mergeRepositoryOptions } from "../services/plugin-project-repositories.js";
+import { pluginRegistryService } from "../services/plugin-registry.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
@@ -48,7 +51,7 @@ import { secretService } from "../services/secrets.js";
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 const SHARED_WORKSPACE_STOP_AND_RESTART_ACTIONS = new Set(["stop", "restart"]);
 
-export function projectRoutes(db: Db) {
+export function projectRoutes(db: Db, options: { pluginWorkerManager?: Pick<PluginWorkerManager, "call"> } = {}) {
   const router = Router();
   const svc = projectService(db);
 
@@ -59,10 +62,21 @@ export function projectRoutes(db: Db) {
     return context;
   }
 
-  async function selectedRepositories(req: Request, companyId: string, ids: string[], existing: import("@paperclipai/shared").ProjectWorkspace[] = []) {
+  async function repositoryOptions(req: Request, companyId: string) {
     const viewer = await repositoryViewer(req);
+    const builtIn = await toolAccessService(db).listProjectRepositories(companyId, viewer.userId, viewer.localTrusted);
+    // The plugin catalog is a board surface. Never impersonate an agent's responsible user.
+    if (req.actor.type !== "board" || !options.pluginWorkerManager) return builtIn;
+    const contributed = await listPluginProjectRepositories(
+      await pluginRegistryService(db).listByStatus("ready"), options.pluginWorkerManager,
+      companyId, req.actor.userId ?? null,
+    );
+    return mergeRepositoryOptions(builtIn, contributed);
+  }
+
+  async function selectedRepositories(req: Request, companyId: string, ids: string[], existing: import("@paperclipai/shared").ProjectWorkspace[] = []) {
     if (!ids.length) return [];
-    const available = await toolAccessService(db).listProjectRepositories(companyId, viewer.userId, viewer.localTrusted);
+    const available = await repositoryOptions(req, companyId);
     return resolveProjectRepositorySelection(ids, available.repositories, existing);
   }
   const access = accessService(db);
@@ -187,8 +201,7 @@ export function projectRoutes(db: Db) {
   router.get("/companies/:companyId/project-repositories", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const viewer = await repositoryViewer(req);
-    res.json(await toolAccessService(db).listProjectRepositories(companyId, viewer.userId, viewer.localTrusted));
+    res.json(await repositoryOptions(req, companyId));
   });
 
   router.put("/projects/:id/repositories", validate(z.object({ repositoryIds: z.array(z.string().regex(/^\d+$/)) })), async (req, res) => {

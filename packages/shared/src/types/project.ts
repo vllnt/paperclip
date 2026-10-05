@@ -128,4 +128,8 @@ export interface ProjectRepositoryOptions {
   repositories: ProjectRepository[];
   connectionCount: number;
   failedConnectionCount: number;
+  /** Provider notices, including partial access and truncated results. */
+  warnings?: string[];
+  /** Optional company-relative connection settings page supplied by a plugin. */
+  setupPath?: string;
 }

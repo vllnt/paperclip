@@ -44,6 +44,7 @@ const mockCompanyContext = vi.hoisted(() => ({
 }));
 const mockUsePluginSlots = vi.hoisted(() => vi.fn(() => ({ slots: [] as unknown[], isLoading: false })));
 const mockPluginSlotMount = vi.hoisted(() => vi.fn());
+const mockPluginSlotOutlet = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/projects", () => ({ projectsApi: mockProjectsApi }));
 vi.mock("../api/issues", () => ({ issuesApi: mockIssuesApi }));
@@ -78,7 +79,7 @@ vi.mock("@/plugins/slots", () => ({
     mockPluginSlotMount(props);
     return <div data-testid="plugin-slot-mount" />;
   },
-  PluginSlotOutlet: () => null,
+  PluginSlotOutlet: (props: unknown) => { mockPluginSlotOutlet(props); return null; },
   usePluginSlots: mockUsePluginSlots,
 }));
 vi.mock("@/plugins/launchers", () => ({ PluginLauncherOutlet: () => null }));
@@ -293,8 +294,13 @@ describe("ProjectDetail", () => {
     });
 
     const props = mockIssuesList.mock.calls.at(-1)?.[0];
+    expect(props.toolbarActions.props).toMatchObject({ slotTypes: ["taskListToolbar"], entityType: "project", context: { projectId: props.projectId } });
     expect(props).toEqual(expect.objectContaining({ projectId: "project-1" }));
     expect(props).not.toHaveProperty("projectTimelineHref");
+    expect(mockPluginSlotOutlet).toHaveBeenCalledWith(expect.objectContaining({
+      slotTypes: ["taskListSection"], entityType: "project",
+      context: expect.objectContaining({ companyId: "company-1", projectId: "project-1", entityId: "project-1" }),
+    }));
   });
 
   describe("plugin detail-tab deep links", () => {

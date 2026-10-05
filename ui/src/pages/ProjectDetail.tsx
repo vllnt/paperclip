@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { Link, useParams, useNavigate, useLocation, Navigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -185,7 +186,7 @@ function ProjectTilePicker({
 
 /* ── List (issues) tab content ── */
 
-function ProjectIssuesList({ projectId, companyId }: { projectId: string; companyId: string }) {
+function ProjectIssuesList({ projectId, companyId, toolbarActions }: { projectId: string; companyId: string; toolbarActions?: ReactNode }) {
   const queryClient = useQueryClient();
 
   const { data: agents } = useQuery({
@@ -242,6 +243,7 @@ function ProjectIssuesList({ projectId, companyId }: { projectId: string; compan
       projects={projects}
       liveIssueIds={liveIssueIds}
       projectId={projectId}
+      toolbarActions={toolbarActions}
       viewStateKey="paperclip:project-issues-view"
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
     />
@@ -857,7 +859,17 @@ export function ProjectDetail() {
 
 
       {activeTab === "list" && project?.id && resolvedCompanyId && (
-        <ProjectIssuesList projectId={project.id} companyId={resolvedCompanyId} />
+        <>
+          <ProjectIssuesList projectId={project.id} companyId={resolvedCompanyId}
+            toolbarActions={<PluginSlotOutlet slotTypes={["taskListToolbar"]} entityType="project"
+              context={{ companyId: resolvedCompanyId, companyPrefix: companyPrefix ?? null, projectId: project.id,
+                projectRef: canonicalProjectRef, entityId: project.id, entityType: "project" }}
+              className="flex items-center gap-2" itemClassName="inline-flex" missingBehavior="placeholder" />} />
+          <PluginSlotOutlet slotTypes={["taskListSection"]} entityType="project"
+            context={{ companyId: resolvedCompanyId, companyPrefix: companyPrefix ?? null, projectId: project.id,
+              projectRef: canonicalProjectRef, entityId: project.id, entityType: "project" }}
+            className="space-y-6" missingBehavior="placeholder" />
+        </>
       )}
 
       {activeTab === "plugin-operations" && project?.id && resolvedCompanyId && project.managedByPlugin && (
