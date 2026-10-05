@@ -14,6 +14,12 @@ class Guard(unittest.TestCase):
             self.assertNotIn(value, str(guard.violations([value])))
     def test_allows_placeholders_and_documentation_domains(self):
         self.assertEqual(guard.violations(["${PAPERCLIP_PUBLIC_URL}", "https://example.invalid/v1", "127.0.0.1:3100"]), [])
+    def test_skips_only_published_exception_commits(self):
+        value = ".".join(["100", "90", "1", "2"])
+        log = "\n".join(["\0commit published", "+++ b/a", "+" + value, "\0commit fresh", "+++ b/b", "+ok", "-" + value])
+        self.assertEqual(guard.added_lines(log, frozenset({"published"})), ["ok"])
+        self.assertEqual(guard.added_lines(log, frozenset()), [value, "ok"])
+        self.assertTrue(guard.violations(guard.added_lines(log.replace("published", "other"), frozenset({"published"}))))
 
 if __name__ == "__main__":
     unittest.main()

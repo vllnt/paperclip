@@ -10,16 +10,34 @@ PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----"),
     "operator filesystem path": re.compile(r"/(?:Users|home)/[a-z][a-z0-9_-]+/(?:\.ssh|\.local|Github)"),
 }
+# Commits already published to main that the guard cannot remove from history
+# (main rejects force pushes). Each entry must also remove the value from the
+# current tree in a later commit. Never add a commit that has not been published.
+PUBLISHED_EXCEPTIONS = frozenset({
+    # Tailnet gateway host mapping in deploy/compose*.yaml; replaced by
+    # PAPERCLIP_AI_GATEWAY_HOST and PAPERCLIP_AI_GATEWAY_HOST_IP.
+    "6e3d56d8f52a0a9e9cc00978e394e7c253c02c2a",
+})
+COMMIT_MARKER = "\0commit "
 
 def violations(lines):
     return sorted({label for line in lines for label, pattern in PATTERNS.items() if pattern.search(line)})
 
+def added_lines(log_output, exceptions=PUBLISHED_EXCEPTIONS):
+    """Return lines added by commits in `git log --format=%x00commit %H -p` output, skipping exceptions."""
+    added, skip = [], False
+    for line in log_output.splitlines():
+        if line.startswith(COMMIT_MARKER):
+            skip = line[len(COMMIT_MARKER):].strip() in exceptions
+        elif not skip and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    return added
+
 def main():
     end = sys.argv[1] if len(sys.argv) > 1 else "HEAD"
     subprocess.run(["git", "merge-base", "--is-ancestor", BASE, end], check=True)
-    patch = subprocess.check_output(["git", "log", "--format=", "-p", "--diff-filter=AM", BASE + ".." + end], text=True)
-    added = [line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++")]
-    found = violations(added)
+    patch = subprocess.check_output(["git", "log", "--format=%x00commit %H", "-p", "--diff-filter=AM", BASE + ".." + end], text=True)
+    found = violations(added_lines(patch))
     names = subprocess.check_output(["git", "diff", "--name-only", BASE, end], text=True).splitlines()
     if any(re.search(r"(?:^|/)\.env(?:$|\.(?!example$|sample$|template$))", name) for name in names):
         found.append("runtime environment file")
