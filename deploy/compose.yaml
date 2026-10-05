@@ -23,7 +23,7 @@ services:
       PAPERCLIP_DB_BACKUP_ENABLED: "false"
       NODE_OPTIONS: --max-old-space-size=1536
     extra_hosts:
-      - "api01.tail74d27a.ts.net:100.72.184.192"
+      - "${PAPERCLIP_AI_GATEWAY_HOST:?required}:${PAPERCLIP_AI_GATEWAY_HOST_IP:?required}"
     volumes:
       - /var/lib/paperclip/home:/paperclip
       - /var/lib/paperclip/secrets/master-key:/run/secrets/master-key:ro

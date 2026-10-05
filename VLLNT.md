@@ -31,7 +31,9 @@ The public image package must allow anonymous pulls. Coolify must have automatic
 deployments enabled, previews disabled, `/deploy/compose.yaml` as its Compose path,
 and `/deploy/compose.yaml` as its watch path. The operator configures runtime values
 privately, including `PAPERCLIP_PUBLIC_URL`, database and auth
-secrets. Existing private ingress and certificates remain operator-managed.
+secrets, and the private AI gateway host mapping (`PAPERCLIP_AI_GATEWAY_HOST` and
+`PAPERCLIP_AI_GATEWAY_HOST_IP`, rendered into `extra_hosts`). Compose refuses to
+start without them. Existing private ingress and certificates remain operator-managed.
 
 The Compose manifest uses `/var/lib/paperclip` as its generic persistent root.
 The operator can map existing data there with a host-side symlink. Coolify validates
@@ -62,6 +64,9 @@ tests, UI typechecking and the complete production image build.
 
 The security check runs Gitleaks with full redaction against all commits added
 since the upstream base and rejects private network literals and runtime env files.
+`PUBLISHED_EXCEPTIONS` in `scripts/check-public-config.py` lists commits that were
+already pushed to `main` with such literals. History cannot be rewritten, so each
+exception must be removed from the current tree by a later commit.
 It runs on main pushes and pull requests. CI runs after publication; it cannot erase
 a secret already pushed. GitHub push protection catches supported secret formats,
 not every possible confidential value. Before your first push from each checkout,
