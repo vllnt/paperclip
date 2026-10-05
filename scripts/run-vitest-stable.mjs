@@ -32,6 +32,7 @@ const nonServerProjects = [
   "@paperclipai/plugin-daytona",
   "@paperclipai/plugin-sdk",
   "@vllnt/paperclip-plugin-cliproxyapi",
+  "@vllnt/paperclip-github",
   "@paperclipai/create-paperclip-plugin",
   "@paperclipai/ui",
   "paperclipai",

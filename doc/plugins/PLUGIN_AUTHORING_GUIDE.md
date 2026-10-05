@@ -639,15 +639,24 @@ menu when no unique contribution exists, discovery fails, the module is missing,
 or rendering throws. The slot is a React-only contract; do not use a custom
 element export. This replaces only the menu, not company policy or authorization.
 
-## VLLNT fork: bundled Providers
+## VLLNT fork: bundled Providers and GitHub
 
 `packages/plugins/plugin-providers` is the fork-owned Providers setup plugin,
 auto-installed on self-hosted startup once built. It contributes **Org → Providers**
 and uses the owning AI Connections API, credential vault, and access controls.
 It does not manage a proxy server or store its own copy of credentials.
 See [AI Connections](../connections/AI-CONNECTIONS.md#existing-cliproxyapi-and-compatible-gateways)
-for origin approval and supported client protocols. Other plugins continue to use
-the external package workflow.
+for origin approval and supported client protocols.
+
+`packages/plugins/plugin-github` (`vllnt.paperclip-github`) is the fork-owned GitHub
+plugin, auto-installed the same way. It connects projects to repositories through a
+company's own GitHub App, syncs issues and pull requests with native tasks, and uses
+the project repository, task creation, task link and agent settings extension points
+described above. Each company connects its App on the plugin's **GitHub** page; until
+then the plugin shows setup guidance only. See its
+[README](../../packages/plugins/plugin-github/README.md).
+
+Other plugins continue to use the external package workflow.
 
 
 ### Supply repositories to the native Projects picker

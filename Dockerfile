@@ -47,6 +47,7 @@ COPY packages/plugins/paperclip-plugin-fake-sandbox/package.json packages/plugin
 COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-wiki/
 COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
 COPY packages/plugins/plugin-providers/package.json packages/plugins/plugin-providers/
+COPY packages/plugins/plugin-github/package.json packages/plugins/plugin-github/
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
@@ -138,6 +139,7 @@ RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
+RUN pnpm --filter @vllnt/paperclip-github build
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built
 # commit into dist/build-info.json. The build context has no .git, so the
 # script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the

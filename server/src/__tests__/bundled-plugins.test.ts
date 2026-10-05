@@ -166,15 +166,17 @@ describe("resolveBundledPluginInstalls", () => {
     expect(resolved).toHaveLength(1);
   });
 
-  it("includes Providers by default and preserves the kubernetes bundle location", () => {
-    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes", "providers"]);
-    const [entry, providers] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
+  it("includes Providers and GitHub by default and preserves the kubernetes bundle location", () => {
+    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes", "providers", "github"]);
+    const [entry, providers, github] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
       catalogRoot: resolveBundledCatalogRoot({}),
       env: {},
       enforceCatalogRoot: false,
     });
     expect(providers).toMatchObject({ key: "providers", pluginKey: "vllnt.paperclip-plugin-cliproxyapi" });
     expect(providers.localPath).toMatch(/packages\/plugins\/plugin-providers$/);
+    expect(github).toMatchObject({ key: "github", pluginKey: "vllnt.paperclip-github" });
+    expect(github.localPath).toMatch(/packages\/plugins\/plugin-github$/);
     // Preserve the existing sandbox-provider location.
     expect(entry).toEqual({
       key: "kubernetes",

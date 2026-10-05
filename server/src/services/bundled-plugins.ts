@@ -73,6 +73,12 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
     selfHostedPath: fileURLToPath(new URL("../../../packages/plugins/plugin-providers", import.meta.url)),
   },
   {
+    key: "github",
+    pluginKey: "vllnt.paperclip-github",
+    relativePath: "plugin-github",
+    selfHostedPath: fileURLToPath(new URL("../../../packages/plugins/plugin-github", import.meta.url)),
+  },
+  {
     key: "createos",
     pluginKey: "paperclip.createos-sandbox-provider",
     relativePath: "sandbox-providers/createos",
@@ -117,10 +123,10 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
 
 /**
  * Keys ensured on a self-hosted instance (no managed config present).
- * The fork includes Providers alongside the kubernetes sandbox provider.
- * Both are installed only when their built bundle is present.
+ * The fork includes Providers and GitHub alongside the kubernetes sandbox
+ * provider. Each is installed only when its built bundle is present.
  */
-export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes", "providers"];
+export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes", "providers", "github"];
 
 export function resolveBundledCatalogRoot(
   env: Record<string, string | undefined>,
