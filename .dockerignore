@@ -45,3 +45,5 @@ packages/paperclip-runner/scripts/*-smoke.mjs
 
 # UI typechecking imports the runner boundary fixtures.
 !packages/paperclip-runner/test-support/**
+
+packages/grok-acp/bin
