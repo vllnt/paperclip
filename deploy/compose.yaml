@@ -22,6 +22,8 @@ services:
       PAPERCLIP_SECRETS_STRICT_MODE: "true"
       PAPERCLIP_DB_BACKUP_ENABLED: "false"
       NODE_OPTIONS: --max-old-space-size=1536
+    extra_hosts:
+      - "api01.tail74d27a.ts.net:100.72.184.192"
     volumes:
       - /var/lib/paperclip/home:/paperclip
       - /var/lib/paperclip/secrets/master-key:/run/secrets/master-key:ro
