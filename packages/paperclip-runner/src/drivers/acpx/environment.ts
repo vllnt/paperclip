@@ -86,17 +86,14 @@ export function createSanitizedAcpxSpawnInput(
   agent: QualifiedAcpxAgent,
 ): SanitizedAcpxSpawnInput {
   const source = environment ?? process.env;
+  const candidate = isCandidate(agent);
   const result: NodeJS.ProcessEnv = {};
-  const credentialNames =
-    agent === "pi"
-      ? ["OPENROUTER_API_KEY"]
-      : agent === "claude"
-        ? ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
-        : [
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "CODEX_API_KEY",
-          ];
+  // Managed AI gateway connections also pass their approved endpoint and bearer token.
+  const credentialNames: readonly string[] = agent === "claude"
+    ? [...ACPX_CREDENTIAL_NAMES.claude, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]
+    : agent === "codex"
+      ? [...ACPX_CREDENTIAL_NAMES.codex, "OPENAI_BASE_URL"]
+      : ACPX_CREDENTIAL_NAMES[agent];
   const allowed = new Set([
     "PATH",
     "LANG",
@@ -124,6 +121,9 @@ export function createSanitizedAcpxSpawnInput(
   let retainedBytes = 0;
   for (const [key, value] of Object.entries(source)) {
     if (typeof value !== "string") continue;
+    // Candidate credentials must be explicitly bound to this run. Locale and
+    // transport settings may come from the host; login state never does.
+    if (candidate && environment === undefined && credentialNames.includes(key)) continue;
     if (!allowed.has(key) && !/^LC_[A-Z0-9_]{1,32}$/.test(key)) continue;
     if (key.includes("\0") || value.includes("\0")) {
       throw new Error("ACPX environment contains a null byte");

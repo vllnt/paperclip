@@ -32,6 +32,7 @@ export interface AiConnectionPickerProps {
   unmanaged?: boolean;
   onChange: (binding: AiConnectionBinding) => void;
   onConnect: () => void;
+  onReconnect?: () => void;
   onRetry?: () => void;
 }
 
@@ -47,6 +48,7 @@ export function AiConnectionPicker({
   unmanaged,
   onChange,
   onConnect,
+  onReconnect,
   onRetry,
 }: AiConnectionPickerProps) {
   const compatible = connections.filter((connection) =>
@@ -160,6 +162,13 @@ export function AiConnectionPicker({
         <p role="status" className="text-xs text-destructive">
           {problem}
         </p>
+      )}
+      {!readOnly && onReconnect && (
+        <div className="flex justify-end">
+          <Button type="button" variant="outline" size="sm" onClick={onReconnect}>
+            Reconnect account
+          </Button>
+        </div>
       )}
       {error && (
         <div className="flex items-center gap-2">

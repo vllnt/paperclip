@@ -28,4 +28,4 @@ jobs:
         run: |
           python3 scripts/test-public-config.py
           python3 scripts/check-public-config.py
-          /tmp/gitleaks-bin/gitleaks git . --redact --no-banner --log-opts='8f8a0ab7effbd6a0584107d8038736c134ee5047..HEAD'
+          /tmp/gitleaks-bin/gitleaks git . --redact --no-banner --log-opts='1c07b5903b1b11139b1e1ce052a3cd4885865d90..HEAD'

@@ -1,6 +1,9 @@
 # VLLNT Paperclip fork
 
-Based on upstream `v2026.1001.0` (`8f8a0ab7effbd6a0584107d8038736c134ee5047`).
+Based on upstream `master` at `1c07b5903b1b11139b1e1ce052a3cd4885865d90` (after
+`canary/v2026.1004.0-canary.2`), merged in `7501843e9`. The publication guard scans only commits
+added after this upstream base; update the base in `scripts/check-public-config.py`,
+`.github/workflows/security.yml` and `.githooks/pre-push` with each upstream merge.
 `main` owns VLLNT changes; `upstream/master` remains the upstream reference.
 Upstream publishing workflows are not enabled on this fork's main branch.
 

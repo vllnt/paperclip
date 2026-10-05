@@ -3,7 +3,7 @@ import re
 import subprocess
 import sys
 
-BASE = "8f8a0ab7effbd6a0584107d8038736c134ee5047"
+BASE = "1c07b5903b1b11139b1e1ce052a3cd4885865d90"
 PATTERNS = {
     "private DNS name": re.compile(r"(?i)\b[a-z0-9-]+\.tail[a-z0-9]+\.ts\.net\b"),
     "private IPv4 address": re.compile(r"(?<![\d.])(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3})(?![\d.])"),
