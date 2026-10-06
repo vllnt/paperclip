@@ -23,6 +23,13 @@ export async function saveCredentials(companyId: string, credentials: Credential
 export async function saveConfiguration(companyId: string, config: SavedApp | Record<string, never>) {
   await hostApi(`/plugins/${PLUGIN_ID}/config`, "POST", { companyId, configJson: config });
 }
+export async function connectCompanyApp(companyId: string, config: SavedApp) {
+  return hostApi(`/plugins/${PLUGIN_ID}/actions/company-app.connect`, "POST", {
+    companyId,
+    params: { appId: config.appId, privateKeySecretId: config.privateKey.secretId },
+  });
+}
+
 export async function ensureCanConfigure(companyId: string) {
   const health = await hostApi<{ deploymentMode: string }>("/health");
   if (health.deploymentMode !== "local_trusted") {

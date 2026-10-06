@@ -1,6 +1,6 @@
 # GitHub for Paperclip
 
-A fork-bundled plugin in `vllnt/paperclip` (`packages/plugins/plugin-github`) using **your own GitHub App**, independent of Paperclip Cloud. Version **0.10.1** makes Paperclip the working surface for the full issue-to-PR loop: GitHub issues become native tasks, agents can work and use GitHub tools, Paperclip can fan out multiple review agents, and approved PRs can be reviewed, merged or auto-merged from Paperclip. New Task can create a linked GitHub issue. GitHub remains the source of truth; Paperclip is the control and execution surface.
+A fork-bundled plugin in `vllnt/paperclip` (`packages/plugins/plugin-github`) using **your own GitHub App**, independent of Paperclip Cloud. Version **0.11.0** makes Paperclip the working surface for the full issue-to-PR loop: GitHub issues become native tasks, agents can work and use GitHub tools, Paperclip can fan out multiple review agents, and approved PRs can be reviewed, merged or auto-merged from Paperclip. New Task can create a linked GitHub issue. GitHub remains the source of truth; Paperclip is the control and execution surface.
 
 ## Install and connect
 
@@ -33,6 +33,99 @@ For Apps created by earlier versions: open the permission links on the plugin pa
 | Organization Projects | Read and write | Organization Projects v2 |
 
 Normal repository operations use fresh installation tokens restricted to the selected repository and required permission. Issue transfers include both accessible repositories in the same installation; organization Projects use an installation token with the permissions needed for project items. The normal setup needs no copied PEM, installation ID, OAuth secret or webhook tunnel when Paperclip is public over HTTPS: the generated App subscribes to issue, PR, review, comment and check events. Localhost remains polling-only because GitHub cannot reach a loopback URL. The advanced existing-App form accepts an App ID and PEM.
+
+## Manage with the API/CLI
+
+Version 0.11.0 stores each company’s GitHub App connection in company-scoped
+plugin state. The private key is referenced by a Paperclip company secret; the
+`company-app.connect` action accepts only that secret’s ID and never accepts a
+PEM. The old instance config remains a migration fallback only while one
+company is in scope. Once a second company is present, connect an App for each
+company with the actions below. An empty owner list denies every installation
+and repository.
+
+The CLI calls the host bridge routes, so board authentication and company access
+are still enforced by Paperclip. Set `PAPERCLIP_API_URL` and
+`PAPERCLIP_API_KEY` in the environment before running these examples. Keep the
+private key in a file or secret manager and expose it to `secrets create` through
+`--value-env`, never as a command argument.
+
+```sh
+export PAPERCLIP_API_URL=https://paperclip.example.test
+export PAPERCLIP_API_KEY=board-token
+export VLLNT_GITHUB_PRIVATE_KEY="$(cat /secure/v-agents.pem)"
+export ANTHM_GITHUB_PRIVATE_KEY="$(cat /secure/anthm-agents.pem)"
+
+VLLNT_SECRET_ID="$(paperclipai secrets create \
+  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec \
+  --name 'GitHub App v-agents private key' --provider local_encrypted \
+  --value-env VLLNT_GITHUB_PRIVATE_KEY --json | node -e 'let d="";process.stdin.on("data", c => d += c).on("end", () => process.stdout.write(JSON.parse(d).id))')"
+ANTHM_SECRET_ID="$(paperclipai secrets create \
+  -C 2cae571f-5b44-4253-b73b-7700335a4ccf \
+  --name 'GitHub App anthm-agents private key' --provider local_encrypted \
+  --value-env ANTHM_GITHUB_PRIVATE_KEY --json | node -e 'let d="";process.stdin.on("data", c => d += c).on("end", () => process.stdout.write(JSON.parse(d).id))')"
+
+# Persist only secret references and public App metadata so the host can authorize
+# the scheduled job after a worker restart. The action below verifies the key.
+paperclipai plugin config:set vllnt.paperclip-github \
+  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec \
+  --payload-json "{\"appId\":\"5203754\",\"appSlug\":\"v-agents\",\"appName\":\"v-agents\",\"privateKey\":{\"type\":\"secret_ref\",\"secretId\":\"$VLLNT_SECRET_ID\",\"version\":\"latest\"}}" --json
+paperclipai plugin config:set vllnt.paperclip-github \
+  -C 2cae571f-5b44-4253-b73b-7700335a4ccf \
+  --payload-json "{\"appId\":\"5203763\",\"appSlug\":\"anthm-agents\",\"appName\":\"anthm-agents\",\"privateKey\":{\"type\":\"secret_ref\",\"secretId\":\"$ANTHM_SECRET_ID\",\"version\":\"latest\"}}" --json
+
+VLLNT_PARAMS="$(mktemp)"
+printf '{"appId":"5203754","privateKeySecretId":"%s"}\n' "$VLLNT_SECRET_ID" > "$VLLNT_PARAMS"
+paperclipai plugin action vllnt.paperclip-github company-app.connect \
+  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-file "$VLLNT_PARAMS" --json
+rm -f "$VLLNT_PARAMS"
+
+ANTHM_PARAMS="$(mktemp)"
+printf '{"appId":"5203763","privateKeySecretId":"%s"}\n' "$ANTHM_SECRET_ID" > "$ANTHM_PARAMS"
+paperclipai plugin action vllnt.paperclip-github company-app.connect \
+  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-file "$ANTHM_PARAMS" --json
+rm -f "$ANTHM_PARAMS"
+
+BNT_OWNER='bnt''vllnt' # shell concatenation yields the GitHub login
+paperclipai plugin action vllnt.paperclip-github allowed-owners.set \
+  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec \
+  --params-json "{\"owners\":[\"vllnt\",\"maiaos\",\"$BNT_OWNER\"]}" --json
+paperclipai plugin action vllnt.paperclip-github allowed-owners.set \
+  -C 2cae571f-5b44-4253-b73b-7700335a4ccf \
+  --params-json '{"owners":["Anthm-FR"]}' --json
+
+paperclipai plugin action vllnt.paperclip-github repositories.list \
+  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-json '{"refresh":true}' --json
+paperclipai plugin action vllnt.paperclip-github repositories.list \
+  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-json '{"refresh":true}' --json
+
+paperclipai plugin action vllnt.paperclip-github sync.trigger \
+  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-json '{}' --json
+paperclipai plugin action vllnt.paperclip-github sync.trigger \
+  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-json '{}' --json
+```
+
+The stable company-management action keys are:
+
+- `company-app.status`, `company-app.connect`, `company-app.disconnect`
+- `allowed-owners.get`, `allowed-owners.set` (GitHub logins are case-insensitive)
+- `repositories.list` (returns only allowlisted owners)
+- `sync.trigger` (starts one company’s sync and returns its company ID)
+
+Invoke them with `paperclipai plugin action <pluginKey|pluginId> <actionKey>
+-C <companyId> [--params-json <json> | --params-file <path>]`. The generic
+`paperclipai plugin data <pluginKey|pluginId> <dataKey>` command uses the same
+`-C`, `--params-json` and `--params-file` options for plugins that register data
+handlers. The equivalent host routes are
+`POST /api/plugins/:pluginId/actions/:key` and
+`POST /api/plugins/:pluginId/data/:key`, with body `{companyId, params}`.
+
+Mutating connection and allowlist actions require a board user who is an
+instance administrator. Status, owner reads, repository listing and sync
+triggering remain company-scoped; no action returns a private key, secret value
+or installation token. `company-app.disconnect` leaves the Paperclip secret in
+place so a later reconnect can reuse it; revoke the App or delete the secret
+separately when it should no longer be usable.
 
 ## GitHub inside Tasks and Projects
 
@@ -238,6 +331,13 @@ the same PR revision, so their perspectives stay independent. Native Paperclip
 owns bot identity and governed formal reviews; the plugin App remains the
 repository/task management actor.
 
+
+## 0.11.0 — Company GitHub Apps and owner allowlists
+
+GitHub App credentials, owner allowlists and repository discovery can be managed
+per company through the Paperclip action bridge and CLI. Scheduled sync runs in
+the host-authorized company context for each configured company. See **Manage
+with the API/CLI** above for the vllnt and anthm setup.
 
 ## 0.10.1 — Native connector boundary and skill-first workflow
 

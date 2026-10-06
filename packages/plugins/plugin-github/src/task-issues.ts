@@ -7,7 +7,13 @@ import type { LinkedProject, TaskRepositories } from "./contracts.js";
 type Credentials = (companyId: string) => Promise<{ id: string; pem: string }>;
 
 /** Linked sources stay in Paperclip; issue content stays on GitHub. */
-export function registerTaskIssues(ctx: PluginContext, github: GitHubClient, credentials: Credentials, cache = new GitHubReadCache()) {
+export function registerTaskIssues(
+  ctx: PluginContext,
+  github: GitHubClient,
+  credentials: Credentials,
+  cache = new GitHubReadCache(),
+  isConfigured?: (companyId: string) => Promise<boolean>,
+) {
   async function links(companyId: string, projectId: unknown) {
     if (projectId !== undefined && (typeof projectId !== "string" || !projectId)) throw new Error("Invalid project.");
     const linked = new Map<string, { name: string; projects: LinkedProject[] }>();
@@ -32,9 +38,11 @@ export function registerTaskIssues(ctx: PluginContext, github: GitHubClient, cre
   }
   async function repositories(companyId: string, projectId?: unknown, refresh = false): Promise<TaskRepositories> {
     const linked = await links(companyId, projectId);
-    const config = await ctx.config.get(companyId);
-    const configured = !!config.appId && !!config.privateKey;
-    if (!configured || !linked.size) return { configured, repositories: [], linkedCount: linked.size, warnings: [] };
+    const legacyConfig = isConfigured ? null : await ctx.config.get(companyId);
+    const configured = isConfigured
+      ? await isConfigured(companyId)
+      : Boolean(legacyConfig?.appId && legacyConfig?.privateKey);
+    if (!linked.size || !configured) return { configured, repositories: [], linkedCount: linked.size, warnings: [] };
     const auth = await credentials(companyId);
     const data = await cache.catalog(companyId, auth, github, refresh);
     const repositories = data.repositories.flatMap(repo => {

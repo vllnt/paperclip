@@ -82,6 +82,10 @@ it("shows deleted-task tombstones and retries association failures without losin
 });
 it("isolates cached issue content and native mappings by company", async () => {
   const f = fixture(); const a = await f.read();
+  await f.h.ctx.state.set({ scopeKind: "company", scopeId: "c2", namespace: "connection", stateKey: "app" }, {
+    appId: "12", appSlug: "app", appName: "App", privateKey: { type: "secret_ref", secretId: "key" },
+  });
+  await f.h.ctx.state.set({ scopeKind: "company", scopeId: "c2", namespace: "connection", stateKey: "allowed-owners" }, ["org"]);
   const b = await f.read({}, { ...actor, companyId: "c2", actor: { ...actor.actor, companyId: "c2" } });
   expect(a.rows[0].paperclipTask.id).not.toBe(b.rows[0].paperclipTask.id);
   expect(f.catalog).toHaveBeenCalledTimes(2);

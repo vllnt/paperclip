@@ -1,6 +1,44 @@
 import { createPrivateKey, sign } from "node:crypto";
 import type { AppIdentity, Catalog, Credentials, GitHubIssue, IssuePage, Repository } from "./contracts.js";
 
+const ownerPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+
+/** Normalize the company-owned GitHub owner allowlist without ever broadening it. */
+export function normalizeAllowedOwners(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const owners = new Map<string, string>();
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const owner = item.trim();
+    if (!ownerPattern.test(owner)) continue;
+    owners.set(owner.toLowerCase(), owner);
+  }
+  return [...owners.values()];
+}
+
+/** Validate an operator-provided GitHub owner allowlist without silently broadening it. */
+export function validateAllowedOwners(value: unknown): string[] {
+  if (!Array.isArray(value)) throw new Error("Allowed owners must be an array of GitHub logins or organization names.");
+  if (value.length > 100) throw new Error("Allow at most 100 GitHub owners.");
+  const owners = new Map<string, string>();
+  for (const item of value) {
+    if (typeof item !== "string") throw new Error("Each allowed owner must be a GitHub login or organization name.");
+    const owner = item.trim();
+    if (!ownerPattern.test(owner)) throw new Error(`Invalid GitHub owner: ${owner || "(empty)"}.`);
+    owners.set(owner.toLowerCase(), owner);
+  }
+  return [...owners.values()];
+}
+
+export function ownerFromRepository(fullName: string): string {
+  return fullName.split("/", 1)[0]?.toLowerCase() ?? "";
+}
+
+export function ownerAllowed(allowedOwners: readonly string[], owner: string): boolean {
+  const wanted = owner.trim().toLowerCase();
+  return wanted.length > 0 && normalizeAllowedOwners(allowedOwners).some(value => value.toLowerCase() === wanted);
+}
+
 export class GitHubError extends Error {
   constructor(public status: number) {
     super(status === 401 ? "GitHub rejected the App credentials. Reconnect or generate a new private key."
@@ -104,17 +142,25 @@ export class GitHubClient {
     }
     return data.data;
   }
-  async catalog(id: string, pem: string): Promise<Catalog> {
+  async catalog(id: string, pem: string, allowedOwners: readonly string[] = []): Promise<Catalog> {
+    const owners = normalizeAllowedOwners(allowedOwners);
+    const ownerSet = new Set(owners.map(owner => owner.toLowerCase()));
     const jwt = appJwt(id, pem);
     const { data } = await this.request<any>("/app", jwt);
     const app = identity(data);
     if (app.id !== id) throw new Error("The GitHub App identity changed. Reconnect the App.");
     const result: Catalog = { app, installations: [], repositories: [], warnings: [], truncated: false };
+    if (!owners.length) {
+      result.warnings.push("No GitHub owners are allowlisted for this company. Add at least one owner in GitHub connection settings.");
+      return result;
+    }
     for (let page = 1; page <= 10; page++) {
       const response = await this.request<any[]>(`/app/installations?per_page=100&page=${page}`, jwt);
       for (const row of response.data) {
         if (!Number.isSafeInteger(row.id) || !row.account?.login) continue;
-        const installation = { id: row.id, login: String(row.account.login), suspended: !!row.suspended_at, issuesWrite: row.permissions?.issues === "write", permissions: row.permissions ?? {}, accountType: row.account.type === "Organization" ? "Organization" as const : "User" as const,
+        const login = String(row.account.login);
+        if (!ownerSet.has(login.toLowerCase())) continue;
+        const installation = { id: row.id, login, suspended: !!row.suspended_at, issuesWrite: row.permissions?.issues === "write", permissions: row.permissions ?? {}, accountType: row.account.type === "Organization" ? "Organization" as const : "User" as const,
           settingsUrl: `https://github.com/${row.account.type === "Organization" ? `organizations/${encodeURIComponent(row.account.login)}/settings` : "settings"}/installations/${row.id}` };
         result.installations.push(installation);
       }
@@ -129,7 +175,7 @@ export class GitHubClient {
           const response = await this.request<{ repositories: any[] }>(`/installation/repositories?per_page=100&page=${page}`, token);
           for (const row of response.data.repositories) {
             const fullName = repoName(row.html_url);
-            if (fullName && Number.isSafeInteger(row.id)) result.repositories.push({
+            if (fullName && ownerSet.has(ownerFromRepository(fullName)) && Number.isSafeInteger(row.id)) result.repositories.push({
               id: row.id, name: String(row.name), fullName, url: `https://github.com/${fullName}`,
               installationId: installation.id, owner: installation.login, private: !!row.private, issuesWrite: installation.issuesWrite, permissions: installation.permissions
             });

@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { PLUGIN_ID } from "./contracts.js";
 const manifest: PaperclipPluginManifestV1 = {
-  id: PLUGIN_ID, apiVersion: 1, version: "0.10.1", displayName: "GitHub",
+  id: PLUGIN_ID, apiVersion: 1, version: "0.11.0", displayName: "GitHub",
   description: "Manage GitHub repositories, Projects and synced tasks with Paperclip’s native GitHub channel and review connector.",
   author: "VLLNT", categories: ["connector"],
   capabilities: ["companies.read", "agents.read", "chat.endpoints.read", "issues.create", "issues.update", "issues.wakeup", "jobs.schedule", "events.subscribe", "webhooks.receive", "projects.read", "project.workspaces.read", "issues.read", "plugin.state.read", "plugin.state.write",
@@ -47,6 +47,7 @@ The operator can edit this skill for each company, repository or organization po
       personalLogin: { type: "string" },
       appId: { type: "string", pattern: "^[1-9][0-9]*$" },
       appSlug: { type: "string" }, appName: { type: "string" },
+      allowedOwners: { type: "array", items: { type: "string", pattern: "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$" }, maxItems: 100 },
       webhookSecret: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
       privateKey: { type: "object", format: "secret-ref", properties: {
         type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" }

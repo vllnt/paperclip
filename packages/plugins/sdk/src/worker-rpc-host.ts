@@ -1960,6 +1960,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       agentId: stringOrNull(rawActor?.agentId),
       runId: stringOrNull(rawActor?.runId),
       companyId: stringOrNull(rawActor?.companyId),
+      ...(rawActor?.isInstanceAdmin === true ? { isInstanceAdmin: true } : {}),
     });
     return Object.freeze({
       actor,

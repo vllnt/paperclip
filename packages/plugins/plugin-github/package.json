@@ -1,6 +1,6 @@
 {
   "name": "@vllnt/paperclip-github",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "type": "module",
   "private": true,
   "description": "Connect your GitHub App, repositories, and issues to Paperclip.",
@@ -49,5 +49,8 @@
     "type": "git",
     "url": "https://github.com/vllnt/paperclip",
     "directory": "packages/plugins/plugin-github"
+  },
+  "engines": {
+    "node": ">=24.11.0"
   }
 }

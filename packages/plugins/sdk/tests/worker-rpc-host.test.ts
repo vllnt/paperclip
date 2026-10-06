@@ -148,6 +148,27 @@ describe("worker performAction context", () => {
         },
         companyId: null,
       });
+      await expect(callWorker("performAction", {
+        key: "inspect",
+        companyId: "company-a",
+        params: {},
+        actorContext: {
+          type: "user",
+          userId: "admin",
+          agentId: null,
+          runId: null,
+          companyId: "company-a",
+          isInstanceAdmin: true,
+        },
+      })).resolves.toMatchObject({
+        actor: {
+          type: "user",
+          userId: "admin",
+          companyId: "company-a",
+          isInstanceAdmin: true,
+        },
+        companyId: "company-a",
+      });
     } finally {
       worker.stop();
       hostReadline.close();

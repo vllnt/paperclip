@@ -42,5 +42,8 @@
     "type": "git",
     "url": "https://github.com/vllnt/paperclip",
     "directory": "packages/plugins/plugin-providers"
+  },
+  "engines": {
+    "node": ">=24.11.0"
   }
 }

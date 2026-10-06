@@ -134,7 +134,7 @@ describe("GitHub transport and access", () => {
       if (url.endsWith("page=1")) return json({ repositories: [{ id: 22, name: "repo", html_url: repository.url, private: true }] }, 200, true);
       return json({ repositories: [{ id: 23, name: "other", html_url: "https://github.com/acme/other" }] });
     });
-    const catalog = await new GitHubClient(fetcher as typeof fetch).catalog("12", pem);
+    const catalog = await new GitHubClient(fetcher as typeof fetch).catalog("12", pem, ["acme", "paused", "denied"]);
     expect(catalog.repositories.map(r => r.id)).toEqual([23,22]);
     expect(catalog.warnings).toHaveLength(2);
     expect(catalog.truncated).toBe(false);
@@ -234,4 +234,100 @@ it("creates and patches issues with repository-scoped write tokens and preserves
   expect(fetcher.mock.calls[1][0]).toBe("https://api.github.com/repos/acme/repo/issues");
   expect(fetcher.mock.calls[3][1].method).toBe("PATCH");
   expect(JSON.stringify(fetcher.mock.calls)).not.toContain(pem);
+});
+
+describe("company GitHub App actions", () => {
+  const admin = (company: string): PluginPerformActionContext => ({ companyId: company, actor: { type: "user", userId: "admin", agentId: null, runId: null, companyId: company, isInstanceAdmin: true } });
+  const member = (company: string): PluginPerformActionContext => ({ companyId: company, actor: { type: "user", userId: "member", agentId: null, runId: null, companyId: company } });
+
+  it("connects only through an existing company secret ref and never returns the key", async () => {
+    const h = createTestHarness({ manifest });
+    const client = new GitHubClient();
+    vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("-----BEGIN " + "PRIVATE KEY----- secret -----END " + "PRIVATE KEY-----");
+    vi.spyOn(client, "verify").mockResolvedValue({ id: "5203754", slug: "v-agents", name: "v-agents" });
+    register(h.ctx, client);
+    const result = await h.performAction<any>("company-app.connect", { companyId, appId: "5203754", privateKeySecretId: "secret-vllnt" }, admin(companyId));
+    expect(result).toMatchObject({ configured: true, app: { id: "5203754", slug: "v-agents" } });
+    expect(JSON.stringify(result)).not.toContain("PRIVATE KEY");
+    expect(await h.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "app" })).toEqual(expect.objectContaining({
+      appId: "5203754", privateKey: { type: "secret_ref", secretId: "secret-vllnt", version: "latest" },
+    }));
+    expect(JSON.stringify(await h.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "app" }))).not.toContain("PRIVATE KEY");
+    await expect(h.performAction("company-app.connect", { companyId, appId: "5203754", privateKey: "-----BEGIN " + "PRIVATE KEY-----" }, admin(companyId))).rejects.toThrow("never a plaintext private key");
+    await expect(h.performAction("company-app.connect", { companyId, appId: "5203754", privateKeySecretId: "secret-vllnt" }, member(companyId))).rejects.toThrow("administrator");
+  });
+
+  it("enforces a case-insensitive owner allowlist and fails closed", async () => {
+    const h = createTestHarness({ manifest });
+    const client = new GitHubClient();
+    register(h.ctx, client);
+    await expect(h.performAction("allowed-owners.set", { companyId, owners: ["vllnt", "bad owner"] }, admin(companyId))).rejects.toThrow("Invalid GitHub owner");
+    await expect(h.performAction<any>("allowed-owners.set", { companyId, owners: ["VLLNT", "maiaos", "vllnt"] }, admin(companyId))).resolves.toEqual({ companyId, owners: ["vllnt", "maiaos"] });
+    await expect(h.performAction<any>("allowed-owners.get", { companyId }, member(companyId))).resolves.toEqual({ companyId, owners: ["vllnt", "maiaos"] });
+    await expect(h.performAction<any>("allowed-owners.set", { companyId, owners: [] }, admin(companyId))).resolves.toEqual({ companyId, owners: [] });
+  });
+
+  it("selects each company's App and filters repositories before exposure", async () => {
+    const configs: Record<string, Record<string, unknown>> = {
+      vllnt: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "v-key" }, allowedOwners: ["vllnt"] },
+      anthm: { appId: "5203763", privateKey: { type: "secret_ref", secretId: "a-key" }, allowedOwners: ["Anthm-FR"] },
+    };
+    const h = createTestHarness({ manifest });
+    vi.spyOn(h.ctx.config, "get").mockImplementation(async (id?: string) => configs[id ?? ""] ?? {});
+    vi.spyOn(h.ctx.secrets, "resolve").mockImplementation(async (_ref, options) => `${options?.companyId}-pem`);
+    const client = new GitHubClient();
+    const calls: string[] = [];
+    vi.spyOn(client, "catalog").mockImplementation(async (id, _pem, owners) => {
+      const allowlist = owners ?? [];
+      calls.push(`${id}:${allowlist.join(",")}`);
+      const owner = allowlist[0] ?? "none";
+      return { app: { id, slug: owner, name: owner }, installations: [], repositories: [
+        { id: 1, name: "allowed", fullName: `${owner}/allowed`, owner, url: `https://github.com/${owner}/allowed`, installationId: 1, private: true },
+        { id: 2, name: "foreign", fullName: "foreign/repo", owner: "foreign", url: "https://github.com/foreign/repo", installationId: 2, private: true },
+      ], warnings: [], truncated: false };
+    });
+    register(h.ctx, client);
+    await h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "connection", stateKey: "app" }, {
+      appId: "5203754", appSlug: "v-agents", appName: "v-agents", privateKey: { type: "secret_ref", secretId: "v-key" },
+    });
+    await h.ctx.state.set({ scopeKind: "company", scopeId: "anthm", namespace: "connection", stateKey: "app" }, {
+      appId: "5203763", appSlug: "anthm-agents", appName: "anthm-agents", privateKey: { type: "secret_ref", secretId: "a-key" },
+    });
+    const v = await h.performAction<any>("repositories.list", { companyId: "vllnt" }, member("vllnt"));
+    const a = await h.performAction<any>("repositories.list", { companyId: "anthm" }, member("anthm"));
+    expect(calls).toEqual(["5203754:vllnt", "5203763:Anthm-FR"]);
+    expect(v.repositories.map((repo: any) => repo.fullName)).toEqual(["vllnt/allowed"]);
+    expect(a.repositories.map((repo: any) => repo.fullName)).toEqual(["Anthm-FR/allowed"]);
+    await expect(h.performAction("manage-repository", { companyId: "vllnt", op: "metadata", repositoryId: 2 }, member("vllnt"))).rejects.toThrow("not accessible through this company");
+  });
+
+  it("returns a clear connection error when a company triggers sync without an App", async () => {
+    const h = createTestHarness({ manifest });
+    register(h.ctx, new GitHubClient());
+    await expect(h.performAction("sync.trigger", { companyId }, member(companyId))).rejects.toThrow("Connect a GitHub App for this company first.");
+  });
+
+  it("runs scheduled sync only for configured company IDs, never wildcard companies.list", async () => {
+    const configs: Record<string, Record<string, unknown>> = {
+      vllnt: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "v-key" }, allowedOwners: ["vllnt"] },
+      anthm: { appId: "5203763", privateKey: { type: "secret_ref", secretId: "a-key" }, allowedOwners: ["Anthm-FR"] },
+    };
+    const h = createTestHarness({ manifest });
+    vi.spyOn(h.ctx.config, "get").mockImplementation(async (id?: string) => configs[id ?? ""] ?? {});
+    vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("pem");
+    const client = new GitHubClient();
+    vi.spyOn(client, "catalog").mockImplementation(async (id) => ({ app: { id, slug: "app", name: "App" }, installations: [], repositories: [], warnings: [], truncated: false }));
+    register(h.ctx, client);
+    await h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "connection", stateKey: "app" }, {
+      appId: "5203754", appSlug: "v-agents", appName: "v-agents", privateKey: { type: "secret_ref", secretId: "v-key" },
+    });
+    await h.ctx.state.set({ scopeKind: "company", scopeId: "anthm", namespace: "connection", stateKey: "app" }, {
+      appId: "5203763", appSlug: "anthm-agents", appName: "anthm-agents", privateKey: { type: "secret_ref", secretId: "a-key" },
+    });
+    await h.performAction("catalog", { companyId: "vllnt" }, member("vllnt"));
+    await h.performAction("catalog", { companyId: "anthm" }, member("anthm"));
+    const listCompanies = vi.spyOn(h.ctx.companies, "list").mockRejectedValue(new Error("company context is required"));
+    await expect(h.runJob("github-sync")).resolves.toBeUndefined();
+    expect(listCompanies).not.toHaveBeenCalled();
+  });
 });

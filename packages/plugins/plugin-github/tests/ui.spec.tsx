@@ -68,7 +68,7 @@ describe("minimal setup UI", () => {
     action("catalog").mockResolvedValue({ app, installations: [], repositories: [], warnings: [], truncated: false });
     action("projects").mockResolvedValue({ projects: [], truncated: false });
     const fetcher = vi.fn().mockResolvedValueOnce(json({ deploymentMode: "local_trusted" })).mockResolvedValueOnce(json(null))
-      .mockResolvedValueOnce(json({ id: "s1" })).mockResolvedValueOnce(json({}));
+      .mockResolvedValueOnce(json({ id: "s1" })).mockResolvedValueOnce(json({})).mockResolvedValueOnce(json({}));
     vi.stubGlobal("fetch", fetcher);
     render(<GitHubPage context={context} />);
     await screen.findByText("My App");
@@ -83,14 +83,15 @@ describe("minimal setup UI", () => {
   it("automatically resumes a saved vault reference after a config failure", async () => {
     const config = { appId: "12", appName: app.name, appSlug: app.slug, privateKey: { type: "secret_ref", secretId: "s1", version: "latest" } };
     sessionStorage.setItem(`${PLUGIN_ID}:c1:u1:saved`, JSON.stringify(config));
-    const fetcher = vi.fn().mockResolvedValue(json({})); vi.stubGlobal("fetch", fetcher);
+    const fetcher = vi.fn().mockResolvedValueOnce(json({})).mockResolvedValueOnce(json({})); vi.stubGlobal("fetch", fetcher);
     action("status").mockResolvedValue({ configured: true, app });
     action("catalog").mockResolvedValue({ app, installations: [], repositories: [], warnings: [], truncated: false });
     action("projects").mockResolvedValue({ projects: [], truncated: false });
     render(<GitHubPage context={context} />);
     await screen.findByText("My App");
-    expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(fetcher.mock.calls[0][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0][0]).toBe(`/api/plugins/${PLUGIN_ID}/actions/company-app.connect`);
+    expect(fetcher.mock.calls[1][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
     expect(sessionStorage.getItem(`${PLUGIN_ID}:c1:u1:saved`)).toBeNull();
   });
   it("marks verified access green and separates destructive actions from their explanation", async () => {

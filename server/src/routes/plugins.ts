@@ -786,6 +786,7 @@ export function pluginRoutes(
         agentId: null,
         runId: req.actor.runId ?? null,
         companyId: scopedCompanyId,
+        ...(req.actor.isInstanceAdmin ? { isInstanceAdmin: true } : {}),
       };
     }
     return {
