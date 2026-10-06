@@ -8,7 +8,7 @@ export function header(headers: Record<string, string | string[]>, name: string)
 
 /** Verify GitHub's X-Hub-Signature-256 against the exact raw request body. */
 export function verifyGitHubSignature(rawBody: string, signature: string | undefined, secret: string | undefined): boolean {
-  if (!secret) return true; // Existing installations may not have configured a webhook secret yet.
+  if (!secret) return false;
   if (!signature?.startsWith("sha256=")) return false;
   const expected = Buffer.from(`sha256=${createHmac("sha256", secret).update(rawBody).digest("hex")}`);
   const supplied = Buffer.from(signature);

@@ -5,10 +5,10 @@ import { register } from "../src/worker.js";
 import { GitHubClient } from "../src/github.js";
 const companyId = "c1";
 const options = { companyId, actor: { type: "user" as const, userId: "u1", companyId, agentId: null, runId: null } };
-const repo = { id: 22, name: "repo", fullName: "org/repo", url: "https://github.com/org/repo", installationId: 33, owner: "org", private: true };
+const repo = { id: 22, name: "repo", fullName: "org/repo", url: "https://github.com/org/repo", installationId: 33, owner: "org", ownerId: 1, private: true };
 const otherRepo = { ...repo, id: 23, name: "other", fullName: "org/other", url: "https://github.com/org/other" };
 function fixture() {
-  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "key" } } });
+  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "key" }, allowedOwners: [{ id: 1, login: "org" }] } });
   const secret = vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("fixture-pem");
   h.seed({ projects: [{ id: "p1", companyId, name: "One" }, { id: "p2", companyId, name: "Two" }, { id: "foreign", companyId: "c2", name: "Foreign" }] as any,
     projectWorkspaces: [{ id: "w1", companyId, projectId: "p1", repoUrl: repo.url }, { id: "w2", companyId, projectId: "p2", repoUrl: repo.url + ".git" },

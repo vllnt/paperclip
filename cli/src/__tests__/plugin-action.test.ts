@@ -21,11 +21,40 @@ describe("plugin action/data CLI commands", () => {
   beforeEach(() => {
     dir = mkdtempSync(path.join(tmpdir(), "paperclip-plugin-cli-"));
     vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
     vi.restoreAllMocks();
+  });
+
+  it("requires an explicit company for action and data commands", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(program().parseAsync([
+      "plugin", "action", "vllnt.paperclip-github", "company-app.status",
+      "--api-base", "http://localhost:3100", "--api-key", "board-token",
+    ], { from: "user" })).rejects.toThrow(/company-id/);
+    await expect(program().parseAsync([
+      "plugin", "data", "vllnt.paperclip-github", "allowed-owners.get",
+      "--api-base", "http://localhost:3100", "--api-key", "board-token",
+    ], { from: "user" })).rejects.toThrow(/company-id/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a legacy payload whose company differs from -C", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: {} }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => { throw new Error(`process.exit unexpectedly called with "${code}"`); }) as never);
+    await expect(program().parseAsync([
+      "plugin", "action", "vllnt.paperclip-github", "company-app.status", "-C", COMPANY_ID,
+      "--payload-json", JSON.stringify({ companyId: "other-company" }),
+      "--api-base", "http://localhost:3100", "--api-key", "board-token",
+    ], { from: "user" })).rejects.toThrow(/process\.exit/);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("payload companyId must match"));
+    expect(fetchMock).not.toHaveBeenCalled();
+    exit.mockRestore();
   });
 
   it("sends company scope and params-json to plugin actions", async () => {

@@ -110,12 +110,24 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
       sessionStorage.setItem(sessionKey + ":saved", JSON.stringify(savedConfig.current));
     }
     if (!savedConfig.current) throw new Error("Start GitHub setup again.");
-    await connectCompanyApp(companyId, savedConfig.current);
-    // Keep a company config row so the host can authorize proactive scheduled
-    // jobs after a worker restart. It contains only public App metadata and a
-    // secret reference; the PEM remains in Paperclip Secrets.
-    await saveConfiguration(companyId, savedConfig.current);
-    const slug = savedConfig.current.appSlug;
+    const config = savedConfig.current;
+    let configSaved = false;
+    try {
+      // The config route creates the host secret binding. Connect resolves the
+      // reference through that binding, so it must run second.
+      await saveConfiguration(companyId, config);
+      configSaved = true;
+      await connectCompanyApp(companyId, config);
+    } catch (error) {
+      // Do not leave an unverified App or a newly-created secret binding behind.
+      // A failed rollback is still surfaced; the operator can retry from the
+      // saved browser reference.
+      if (configSaved) {
+        try { await saveConfiguration(companyId, {}); } catch { /* preserve the original error */ }
+      }
+      throw error;
+    }
+    const slug = config.appSlug;
     sessionStorage.removeItem(sessionKey + ":saved"); sessionStorage.removeItem(sessionKey);
     savedConfig.current = null;
     setPem("");
@@ -137,7 +149,14 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
     }
     void task(async () => {
       const recovery = sessionStorage.getItem(sessionKey + ":saved");
-      if (recovery) { savedConfig.current = JSON.parse(recovery); await persist(false); return; }
+      if (recovery) {
+        savedConfig.current = JSON.parse(recovery);
+        const current = await statusAction({ companyId }) as Status;
+        setStatus(current);
+        setAllowedOwners((current.allowedOwners ?? []).join(", "));
+        setError("A saved GitHub connection is waiting to be completed. Retry saving connection.");
+        return;
+      }
       if (code) {
         const pending = JSON.parse(sessionStorage.getItem(sessionKey) ?? "null");
         if (!pending || pending.state !== state || pending.returnUrl !== returnUrl) throw new Error("This setup was started in another browser or company. Open GitHub setup here and try again.");

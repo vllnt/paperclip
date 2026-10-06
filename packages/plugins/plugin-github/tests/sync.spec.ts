@@ -7,10 +7,10 @@ import { matchingRule, mergeSnapshots, validateSettings } from "../src/sync.js";
 import type { AutomationRule, GitHubIssue } from "../src/contracts.js";
 const companyId = "c1";
 const actor = { companyId, actor: { type: "user" as const, userId: "u1", companyId, agentId: null, runId: null } };
-const repo = { id: 22, name: "repo", fullName: "org/repo", url: "https://github.com/org/repo", installationId: 33, owner: "org", private: true, issuesWrite: true };
+const repo = { id: 22, name: "repo", fullName: "org/repo", ownerId: 1, url: "https://github.com/org/repo", installationId: 33, owner: "org", private: true, issuesWrite: true };
 const issue = (id: number, patch: Partial<GitHubIssue> = {}): GitHubIssue => ({ id, number: id, title: `Issue ${id}`, body: "Description", state: "open", stateReason: null, labels: ["bug"], assignees: ["alex"], url: `${repo.url}/issues/${id}`, repository: repo.fullName, updatedAt: "2026-10-04T12:00:00Z", ...patch });
 function fixture() {
-  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "key" } } });
+  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "key" }, allowedOwners: [{ id: 1, login: "org" }] } });
   vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("fixture-pem");
   h.seed({ projects: [{ id: "p1", companyId, name: "One" }, { id: "p2", companyId, name: "Two" }] as any,
     projectWorkspaces: [{ id: "w1", companyId, projectId: "p1", repoUrl: repo.url }, { id: "w2", companyId, projectId: "p2", repoUrl: repo.url }] as any,
@@ -40,11 +40,11 @@ describe("native GitHub task sync", () => {
     f.h.seed({ companies: [{ id: companyId, name: "Company", issuePrefix: "C", issueCounter: 1, status: "active" }] as any });
     const pull = issue(7, { title: "PR seven", url: `${repo.url}/pull/7` });
     const issueComment = { ...pull, pull_request: { url: `${repo.url}/pulls/7` } };
-    const commentResult = await f.service.handleWebhook({ headers: { "x-github-delivery": "delivery-comment" }, requestId: "delivery-comment", parsedBody: { action: "created", repository: { id: repo.id }, issue: issueComment } });
+    const commentResult = await f.service.handleWebhook({ companyId, headers: { "x-github-delivery": "delivery-comment" }, requestId: "delivery-comment", parsedBody: { action: "created", repository: { id: repo.id }, issue: issueComment } });
 expect(commentResult?.kind).toBe("pull");
     expect((await f.native()).every(task => task.originKind !== "plugin:vllnt.paperclip-github:issue")).toBe(true);
     f.get.mockResolvedValue(pull);
-    const checkResult = await f.service.handleWebhook({ headers: { "x-github-delivery": "delivery-check" }, requestId: "delivery-check", parsedBody: { action: "completed", repository: { id: repo.id }, check_run: { check_suite: { pull_requests: [{ number: 7 }] } } } });
+    const checkResult = await f.service.handleWebhook({ companyId, headers: { "x-github-delivery": "delivery-check" }, requestId: "delivery-check", parsedBody: { action: "completed", repository: { id: repo.id }, check_run: { check_suite: { pull_requests: [{ number: 7 }] } } } });
     expect(checkResult?.kind).toBe("pull");
     expect(checkResult?.taskId).toBeTruthy();
   });

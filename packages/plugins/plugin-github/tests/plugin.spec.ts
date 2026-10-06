@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import type { PluginPerformActionContext } from "@paperclipai/plugin-sdk";
-import { generateKeyPairSync, verify } from "node:crypto";
+import { createHmac, generateKeyPairSync, verify } from "node:crypto";
 import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
+import githubPlugin from "../src/worker.js";
 import { GitHubClient, appJwt, repoName } from "../src/github.js";
 import { SetupService, boardScope, callbackUrl } from "../src/setup.js";
 
@@ -27,13 +28,13 @@ function setupFixture() {
 }
 
 describe("guided App registration", () => {
-  it("prefills management permissions and public webhook subscriptions", async () => {
+  it("prefills management permissions and keeps webhook delivery disabled", async () => {
     const { setup, harness } = setupFixture();
     const start = await setup.start({ companyId, returnUrl, owner: "acme", name: "Paperclip test" }, actor);
     expect(start.actionUrl).toMatch(/^https:\/\/github.com\/organizations\/acme\/settings\/apps\/new\?state=/);
     expect(start.manifest).toMatchObject({ default_permissions: { metadata: "read", issues: "write" },
-      redirect_url: returnUrl, setup_url: returnUrl, request_oauth_on_install: false, hook_attributes: { active: true, url: `${new URL(returnUrl).origin}/api/plugins/vllnt.paperclip-github/webhooks/github` },
-      default_events: ["issues", "pull_request", "pull_request_review", "pull_request_review_comment", "issue_comment", "check_run"] });
+      redirect_url: returnUrl, setup_url: returnUrl, request_oauth_on_install: false, hook_attributes: { active: false, url: "https://example.com/events" },
+      default_events: [] });
     expect(start.manifest.default_permissions).toEqual({ metadata: "read", issues: "write", pull_requests: "write", contents: "write", checks: "write", statuses: "read", organization_projects: "write" });
     const stored = harness.getState({ scopeKind: "company", scopeId: companyId, namespace: "setup", stateKey: "user-one" });
     expect(JSON.stringify(stored)).not.toContain(start.state);
@@ -48,14 +49,14 @@ describe("guided App registration", () => {
     expect(hook.active).toBe(false);
     expect(start.manifest.default_events).toEqual([]);
   });
-  it("enables delivery for a public HTTPS callback", async () => {
+  it("keeps delivery disabled for a public HTTPS callback on this Tailnet-only deployment", async () => {
     const { setup } = setupFixture();
     const localReturn = "https://paperclip.example/ACME/github-projects";
     const start = await setup.start({ companyId, returnUrl: localReturn }, actor);
     const hook = start.manifest.hook_attributes as { url: string; active: boolean };
-    expect(hook.url).toBe("https://paperclip.example/api/plugins/vllnt.paperclip-github/webhooks/github");
-    expect(hook.active).toBe(true);
-    expect(start.manifest.default_events).toContain("issues");
+    expect(hook.url).toBe("https://example.com/events");
+    expect(hook.active).toBe(false);
+    expect(start.manifest.default_events).toEqual([]);
   });
   it("binds setup to the authenticated user, company and return URL", async () => {
     const { setup, convert } = setupFixture();
@@ -139,6 +140,18 @@ describe("GitHub transport and access", () => {
     expect(catalog.warnings).toHaveLength(2);
     expect(catalog.truncated).toBe(false);
   });
+  it("pins allowlisted owners to numeric GitHub account IDs across login renames", async () => {
+    const response = (accountId: number, login: string) => vi.fn(async (url: string) => {
+      if (url.endsWith("/app")) return json(app);
+      if (url.includes("/app/installations?")) return json([{ id: 33, account: { id: accountId, login, type: "Organization" } }]);
+      if (url.endsWith("/access_tokens")) return json({ token: "installation-token" });
+      return json({ repositories: [{ id: 22, name: "repo", html_url: repository.url, private: true }] });
+    });
+    const renamed = await new GitHubClient(response(10, "renamed-org") as typeof fetch).catalog("12", pem, [{ id: 10, login: "old-org" }]);
+    expect(renamed.repositories.map(repo => repo.fullName)).toEqual(["acme/repo"]);
+    const reRegistered = await new GitHubClient(response(11, "old-org") as typeof fetch).catalog("12", pem, [{ id: 10, login: "old-org" }]);
+    expect(reRegistered.repositories).toEqual([]);
+  });
   it("uses repository-scoped tokens, excludes PRs and preserves next-page information", async () => {
     const fetcher = vi.fn().mockResolvedValueOnce(json({ token: "short-lived" })).mockResolvedValueOnce(json([
       { id: 1, number: 1, title: "Issue", state: "open", updated_at: "now", assignees: [{ login: "me" }] },
@@ -171,12 +184,12 @@ describe("managed GitHub workflow skill", () => {
 
 describe("company-scoped project and task integration", () => {
   function fixture() {
-    const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "secret" } } });
+    const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "secret" }, allowedOwners: [{ id: 1, login: "acme" }] } });
     vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue(pem);
     h.seed({ projects: [{ id: "p1", companyId, name: "Project" } as any], issues: [{ id: "i1", companyId, projectId: "p1" } as any],
       projectWorkspaces: [{ id: "w1", companyId, projectId: "p1", name: "renamed by user", repoUrl: repository.url } as any] });
     const client = new GitHubClient();
-    const catalog = vi.spyOn(client, "catalog").mockResolvedValue({ app: { ...app, id: "12" }, installations: [], repositories: [repository], warnings: [], truncated: false });
+    const catalog = vi.spyOn(client, "catalog").mockResolvedValue({ app: { ...app, id: "12" }, installations: [], repositories: [{ ...repository, ownerId: 1 }], warnings: [], truncated: false });
     const issues = vi.spyOn(client, "issues").mockResolvedValue({ issues: [], nextPage: null, repository: repository.fullName });
     register(h.ctx, client);
     return { h, catalog, issues };
@@ -241,36 +254,107 @@ describe("company GitHub App actions", () => {
   const member = (company: string): PluginPerformActionContext => ({ companyId: company, actor: { type: "user", userId: "member", agentId: null, runId: null, companyId: company } });
 
   it("connects only through an existing company secret ref and never returns the key", async () => {
-    const h = createTestHarness({ manifest });
+    const h = createTestHarness({ manifest, config: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "secret-vllnt" } } });
     const client = new GitHubClient();
-    vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("-----BEGIN " + "PRIVATE KEY----- secret -----END " + "PRIVATE KEY-----");
     vi.spyOn(client, "verify").mockResolvedValue({ id: "5203754", slug: "v-agents", name: "v-agents" });
     register(h.ctx, client);
     const result = await h.performAction<any>("company-app.connect", { companyId, appId: "5203754", privateKeySecretId: "secret-vllnt" }, admin(companyId));
     expect(result).toMatchObject({ configured: true, app: { id: "5203754", slug: "v-agents" } });
     expect(JSON.stringify(result)).not.toContain("PRIVATE KEY");
-    expect(await h.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "app" })).toEqual(expect.objectContaining({
-      appId: "5203754", privateKey: { type: "secret_ref", secretId: "secret-vllnt", version: "latest" },
-    }));
+    expect(await h.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "app" })).toBeNull();
     expect(JSON.stringify(await h.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "app" }))).not.toContain("PRIVATE KEY");
     await expect(h.performAction("company-app.connect", { companyId, appId: "5203754", privateKey: "-----BEGIN " + "PRIVATE KEY-----" }, admin(companyId))).rejects.toThrow("never a plaintext private key");
     await expect(h.performAction("company-app.connect", { companyId, appId: "5203754", privateKeySecretId: "secret-vllnt" }, member(companyId))).rejects.toThrow("administrator");
   });
 
   it("enforces a case-insensitive owner allowlist and fails closed", async () => {
-    const h = createTestHarness({ manifest });
+    const h = createTestHarness({ manifest, config: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "key" } } });
     const client = new GitHubClient();
+    vi.spyOn(client, "resolveOwners").mockImplementation(async (_id, _pem, owners) => owners.map((login, index) => ({ id: index + 1, login })));
     register(h.ctx, client);
     await expect(h.performAction("allowed-owners.set", { companyId, owners: ["vllnt", "bad owner"] }, admin(companyId))).rejects.toThrow("Invalid GitHub owner");
     await expect(h.performAction<any>("allowed-owners.set", { companyId, owners: ["VLLNT", "maiaos", "vllnt"] }, admin(companyId))).resolves.toEqual({ companyId, owners: ["vllnt", "maiaos"] });
+    expect(h.getState({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "allowed-owners" })).toEqual([{ id: 1, login: "vllnt" }, { id: 2, login: "maiaos" }]);
     await expect(h.performAction<any>("allowed-owners.get", { companyId }, member(companyId))).resolves.toEqual({ companyId, owners: ["vllnt", "maiaos"] });
     await expect(h.performAction<any>("allowed-owners.set", { companyId, owners: [] }, admin(companyId))).resolves.toEqual({ companyId, owners: [] });
   });
 
+  it("uses state-pinned owners ahead of legacy config logins", async () => {
+    const h = createTestHarness({ manifest, config: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "key" }, allowedOwners: ["legacy-login"] } });
+    const client = new GitHubClient();
+    const owners: unknown[] = [];
+    vi.spyOn(client, "catalog").mockImplementation(async (_id, _pem, allowlist) => {
+      owners.push(allowlist);
+      return { app: { id: "5203754", slug: "app", name: "App" }, installations: [], repositories: [], warnings: [], truncated: false };
+    });
+    register(h.ctx, client);
+    await h.ctx.state.set({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "allowed-owners" }, [{ id: 10, login: "renamed-org" }]);
+    await h.performAction("repositories.list", { companyId }, member(companyId));
+    expect(owners).toEqual([[{ id: 10, login: "renamed-org" }]]);
+  });
+
+  it("fails closed for a legacy login-only owner state until it is reset", async () => {
+    const h = createTestHarness({ manifest, config: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "key" } } });
+    const client = new GitHubClient();
+    const catalog = vi.spyOn(client, "catalog").mockResolvedValue({ app: { id: "5203754", slug: "app", name: "App" }, installations: [], repositories: [], warnings: [], truncated: false });
+    register(h.ctx, client);
+    await h.ctx.state.set({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "allowed-owners" }, ["legacy-login"]);
+    const result = await h.performAction<any>("repositories.list", { companyId }, member(companyId));
+    expect(result.repositories).toEqual([]);
+    expect(catalog).toHaveBeenCalledWith("5203754", expect.any(String), []);
+  });
+
+  it("keeps config rotation authoritative and does not read an old connection state binding", async () => {
+    const h = createTestHarness({ manifest, config: { appId: "100", privateKey: { type: "secret_ref", secretId: "secret-a" } } });
+    const client = new GitHubClient();
+    const calls: Array<{ id: string; pem: string }> = [];
+    vi.spyOn(h.ctx.secrets, "resolve").mockImplementation(async (ref: any) => `pem-${ref.secretId}`);
+    vi.spyOn(client, "catalog").mockImplementation(async (id, pem) => {
+      calls.push({ id, pem });
+      return { app: { id, slug: "app", name: "App" }, installations: [], repositories: [], warnings: [], truncated: false };
+    });
+    register(h.ctx, client);
+    await h.performAction("repositories.list", { companyId }, member(companyId));
+    h.setConfig({ appId: "200", privateKey: { type: "secret_ref", secretId: "secret-b" } });
+    await h.performAction("repositories.list", { companyId, refresh: true }, member(companyId));
+    expect(calls).toEqual([{ id: "100", pem: "pem-secret-a" }, { id: "200", pem: "pem-secret-b" }]);
+    expect(h.getState({ scopeKind: "company", scopeId: companyId, namespace: "connection", stateKey: "app" })).toBeUndefined();
+  });
+
+  it("keeps disconnected companies out of proactive work and restores them on reconnect", async () => {
+    const config = { appId: "5203754", privateKey: { type: "secret_ref", secretId: "key" } };
+    const h = createTestHarness({ manifest, config });
+    const client = new GitHubClient();
+    vi.spyOn(client, "verify").mockResolvedValue({ id: "5203754", slug: "app", name: "App" });
+    const service = register(h.ctx, client);
+    await service.updateConfiguredCompany(companyId, config);
+    expect([...service.companyIds]).toEqual([companyId]);
+    await h.performAction("company-app.disconnect", { companyId }, admin(companyId));
+    expect([...service.companyIds]).toEqual([]);
+    await service.updateConfiguredCompany(companyId, config);
+    expect([...service.companyIds]).toEqual([]);
+    await h.performAction("company-app.connect", { companyId, appId: "5203754", privateKeySecretId: "key" }, admin(companyId));
+    expect([...service.companyIds]).toEqual([companyId]);
+  });
+
+  it("rejects one App ID from being connected to two companies", async () => {
+    const configs: Record<string, Record<string, unknown>> = {
+      first: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "first-key" } },
+      second: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "second-key" } },
+    };
+    const h = createTestHarness({ manifest });
+    vi.spyOn(h.ctx.config, "get").mockImplementation(async company => configs[company ?? ""] ?? {});
+    const client = new GitHubClient();
+    vi.spyOn(client, "verify").mockImplementation(async id => ({ id, slug: "app", name: "App" }));
+    register(h.ctx, client);
+    await h.performAction("company-app.connect", { companyId: "first", appId: "5203754", privateKeySecretId: "first-key" }, admin("first"));
+    await expect(h.performAction("company-app.connect", { companyId: "second", appId: "5203754", privateKeySecretId: "second-key" }, admin("second"))).rejects.toThrow("already connected to another company");
+  });
+
   it("selects each company's App and filters repositories before exposure", async () => {
     const configs: Record<string, Record<string, unknown>> = {
-      vllnt: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "v-key" }, allowedOwners: ["vllnt"] },
-      anthm: { appId: "5203763", privateKey: { type: "secret_ref", secretId: "a-key" }, allowedOwners: ["Anthm-FR"] },
+      vllnt: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "v-key" }, allowedOwners: [{ id: 1, login: "vllnt" }] },
+      anthm: { appId: "5203763", privateKey: { type: "secret_ref", secretId: "a-key" }, allowedOwners: [{ id: 2, login: "Anthm-FR" }] },
     };
     const h = createTestHarness({ manifest });
     vi.spyOn(h.ctx.config, "get").mockImplementation(async (id?: string) => configs[id ?? ""] ?? {});
@@ -279,20 +363,14 @@ describe("company GitHub App actions", () => {
     const calls: string[] = [];
     vi.spyOn(client, "catalog").mockImplementation(async (id, _pem, owners) => {
       const allowlist = owners ?? [];
-      calls.push(`${id}:${allowlist.join(",")}`);
-      const owner = allowlist[0] ?? "none";
+      calls.push(`${id}:${allowlist.map((owner: any) => typeof owner === "string" ? owner : owner.login).join(",")}`);
+      const owner = typeof allowlist[0] === "string" ? allowlist[0] : allowlist[0]?.login ?? "none";
       return { app: { id, slug: owner, name: owner }, installations: [], repositories: [
-        { id: 1, name: "allowed", fullName: `${owner}/allowed`, owner, url: `https://github.com/${owner}/allowed`, installationId: 1, private: true },
-        { id: 2, name: "foreign", fullName: "foreign/repo", owner: "foreign", url: "https://github.com/foreign/repo", installationId: 2, private: true },
+        { id: 1, name: "allowed", fullName: `${owner}/allowed`, owner, ownerId: owner === "vllnt" ? 1 : 2, url: `https://github.com/${owner}/allowed`, installationId: 1, private: true },
+        { id: 2, name: "foreign", fullName: "foreign/repo", owner: "foreign", ownerId: 999, url: "https://github.com/foreign/repo", installationId: 2, private: true },
       ], warnings: [], truncated: false };
     });
     register(h.ctx, client);
-    await h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "connection", stateKey: "app" }, {
-      appId: "5203754", appSlug: "v-agents", appName: "v-agents", privateKey: { type: "secret_ref", secretId: "v-key" },
-    });
-    await h.ctx.state.set({ scopeKind: "company", scopeId: "anthm", namespace: "connection", stateKey: "app" }, {
-      appId: "5203763", appSlug: "anthm-agents", appName: "anthm-agents", privateKey: { type: "secret_ref", secretId: "a-key" },
-    });
     const v = await h.performAction<any>("repositories.list", { companyId: "vllnt" }, member("vllnt"));
     const a = await h.performAction<any>("repositories.list", { companyId: "anthm" }, member("anthm"));
     expect(calls).toEqual(["5203754:vllnt", "5203763:Anthm-FR"]);
@@ -309,25 +387,80 @@ describe("company GitHub App actions", () => {
 
   it("runs scheduled sync only for configured company IDs, never wildcard companies.list", async () => {
     const configs: Record<string, Record<string, unknown>> = {
-      vllnt: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "v-key" }, allowedOwners: ["vllnt"] },
-      anthm: { appId: "5203763", privateKey: { type: "secret_ref", secretId: "a-key" }, allowedOwners: ["Anthm-FR"] },
+      vllnt: { appId: "5203754", privateKey: { type: "secret_ref", secretId: "v-key" }, allowedOwners: [{ id: 1, login: "vllnt" }] },
+      anthm: { appId: "5203763", privateKey: { type: "secret_ref", secretId: "a-key" }, allowedOwners: [{ id: 2, login: "Anthm-FR" }] },
     };
     const h = createTestHarness({ manifest });
     vi.spyOn(h.ctx.config, "get").mockImplementation(async (id?: string) => configs[id ?? ""] ?? {});
     vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("pem");
     const client = new GitHubClient();
     vi.spyOn(client, "catalog").mockImplementation(async (id) => ({ app: { id, slug: "app", name: "App" }, installations: [], repositories: [], warnings: [], truncated: false }));
-    register(h.ctx, client);
-    await h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "connection", stateKey: "app" }, {
-      appId: "5203754", appSlug: "v-agents", appName: "v-agents", privateKey: { type: "secret_ref", secretId: "v-key" },
-    });
-    await h.ctx.state.set({ scopeKind: "company", scopeId: "anthm", namespace: "connection", stateKey: "app" }, {
-      appId: "5203763", appSlug: "anthm-agents", appName: "anthm-agents", privateKey: { type: "secret_ref", secretId: "a-key" },
-    });
+    const service = register(h.ctx, client);
+    expect([...service.companyIds]).toEqual([]);
+    await h.performAction("catalog", { companyId: "vllnt" }, member("vllnt"));
+    expect([...service.companyIds]).toEqual([]);
+    service.companyIds.add("vllnt");
+    service.companyIds.add("anthm");
     await h.performAction("catalog", { companyId: "vllnt" }, member("vllnt"));
     await h.performAction("catalog", { companyId: "anthm" }, member("anthm"));
     const listCompanies = vi.spyOn(h.ctx.companies, "list").mockRejectedValue(new Error("company context is required"));
     await expect(h.runJob("github-sync")).resolves.toBeUndefined();
     expect(listCompanies).not.toHaveBeenCalled();
+  });
+
+  it("continues scheduled sync after one company settings failure", async () => {
+    const configs: Record<string, Record<string, unknown>> = {
+      first: { appId: "100", privateKey: { type: "secret_ref", secretId: "first-key" }, allowedOwners: [{ id: 1, login: "first" }] },
+      second: { appId: "200", privateKey: { type: "secret_ref", secretId: "second-key" }, allowedOwners: [{ id: 2, login: "second" }] },
+    };
+    const h = createTestHarness({ manifest });
+    h.seed({ projects: [{ id: "p-second", companyId: "second", name: "Second" } as any], projectWorkspaces: [{ id: "w-second", companyId: "second", projectId: "p-second", repoUrl: "https://github.com/second/repo" } as any] });
+    vi.spyOn(h.ctx.config, "get").mockImplementation(async company => configs[company ?? ""] ?? {});
+    vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("pem");
+    const client = new GitHubClient();
+    const catalog = vi.spyOn(client, "catalog").mockResolvedValue({ app: { id: "200", slug: "app", name: "App" }, installations: [], repositories: [], warnings: [], truncated: false });
+    const service = register(h.ctx, client);
+    service.companyIds.add("first"); service.companyIds.add("second");
+    const stateGet = h.ctx.state.get.bind(h.ctx.state);
+    vi.spyOn(h.ctx.state, "get").mockImplementation(async key => {
+      if (key.scopeId === "first" && key.namespace === "sync" && key.stateKey === "settings") throw new Error("first company failed");
+      return stateGet(key);
+    });
+    await expect(h.runJob("github-sync")).resolves.toBeUndefined();
+    expect(catalog).toHaveBeenCalledWith("200", "pem", expect.anything());
+    expect(h.logs.some(log => log.level === "error" && log.message.includes("scheduled sync failed"))).toBe(false);
+  });
+});
+
+describe("company-scoped webhook routing", () => {
+  const configs: Record<string, Record<string, unknown>> = {
+    vllnt: { appId: "100", privateKey: { type: "secret_ref", secretId: "v-key" }, webhookSecret: { type: "secret_ref", secretId: "v-hook" }, allowedOwners: [{ id: 1, login: "vllnt" }] },
+    anthm: { appId: "200", privateKey: { type: "secret_ref", secretId: "a-key" }, webhookSecret: { type: "secret_ref", secretId: "a-hook" }, allowedOwners: [{ id: 2, login: "anthm" }] },
+  };
+  const body = JSON.stringify({ installation: { id: 202 } });
+  const signature = (secret: string) => `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+
+  it("routes by installation, rejects unknown installations, missing secrets and bad signatures", async () => {
+    const h = createTestHarness({ manifest });
+    vi.spyOn(h.ctx.config, "get").mockImplementation(async company => configs[company ?? ""] ?? {});
+    const resolved = vi.spyOn(h.ctx.secrets, "resolve").mockImplementation(async (ref: any, options: any) => options?.configPath === "webhookSecret" ? `hook-${options.companyId}` : `pem-${ref.secretId}`);
+    const hasInstallation = vi.spyOn(GitHubClient.prototype, "hasInstallation").mockImplementation(async (id, _pem, installationId) => (id === "100" && installationId === 101) || (id === "200" && installationId === 202));
+    await githubPlugin.definition.setup(h.ctx);
+    await githubPlugin.definition.onConfigChanged?.(configs.vllnt, { companyId: "vllnt" });
+    await githubPlugin.definition.onConfigChanged?.(configs.anthm, { companyId: "anthm" });
+
+    await githubPlugin.definition.onWebhook?.({ endpointKey: "github", rawBody: body, parsedBody: JSON.parse(body), requestId: "delivery-1", headers: { "x-hub-signature-256": signature("hook-anthm") } });
+    expect(hasInstallation).toHaveBeenCalledWith("100", "pem-v-key", 202);
+    expect(hasInstallation).toHaveBeenCalledWith("200", "pem-a-key", 202);
+    expect(resolved).toHaveBeenLastCalledWith(expect.anything(), { companyId: "anthm", configPath: "webhookSecret" });
+
+    await expect(githubPlugin.definition.onWebhook?.({ endpointKey: "github", rawBody: body, parsedBody: { installation: { id: 999 } }, requestId: "delivery-unknown", headers: { "x-hub-signature-256": signature("hook-anthm") } })).rejects.toThrow("not configured for a company");
+    const noSecret = { ...configs.anthm }; delete noSecret.webhookSecret; configs.anthm = noSecret;
+    await githubPlugin.definition.onConfigChanged?.(noSecret, { companyId: "anthm" });
+    await expect(githubPlugin.definition.onWebhook?.({ endpointKey: "github", rawBody: body, parsedBody: JSON.parse(body), requestId: "delivery-no-secret", headers: { "x-hub-signature-256": signature("hook-anthm") } })).rejects.toThrow("secret is not configured");
+    configs.anthm = { ...noSecret, webhookSecret: { type: "secret_ref", secretId: "a-hook" } };
+    await githubPlugin.definition.onConfigChanged?.(configs.anthm, { companyId: "anthm" });
+    await expect(githubPlugin.definition.onWebhook?.({ endpointKey: "github", rawBody: body, parsedBody: JSON.parse(body), requestId: "delivery-bad-signature", headers: { "x-hub-signature-256": "sha256=bad" } })).rejects.toThrow("signature verification failed");
+    hasInstallation.mockRestore(); resolved.mockRestore();
   });
 });

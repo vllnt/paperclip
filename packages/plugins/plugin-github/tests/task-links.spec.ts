@@ -5,9 +5,9 @@ import { register } from "../src/worker.js";
 import { GitHubClient } from "../src/github.js";
 const companyId = "c1", actor = { type: "user" as const, userId: "u1", companyId };
 const options = { companyId, actor };
-const repo = { id: 22, fullName: "org/repo", name: "repo", url: "https://github.com/org/repo", owner: "org", installationId: 33, private: true, permissions: { issues: "write", pull_requests: "read" } };
+const repo = { id: 22, fullName: "org/repo", name: "repo", url: "https://github.com/org/repo", owner: "org", ownerId: 1, installationId: 33, private: true, permissions: { issues: "write", pull_requests: "read" } };
 async function fixture(permissions = repo.permissions) {
-  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "s1" } } });
+  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "s1" }, allowedOwners: [{ id: 1, login: "org" }] } });
   const secrets = vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("secret");
   h.seed({ issues: [1,2].map(n => ({ id: `t${n}`, companyId, originKind: "plugin:vllnt.paperclip-github:issue", originId: String(n), title: "Issue", status: "todo" })) as any });
   for (const n of [1,2]) await h.ctx.state.set({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: `link:${n}` }, { issueId: `t${n}`, githubId: n, number: n, repositoryId: 22, base: { state: "open" } });

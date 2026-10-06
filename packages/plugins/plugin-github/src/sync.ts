@@ -310,10 +310,10 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     return remote;
   }
   async function run(companyId: string): Promise<SyncReport | null> {
-    const config = await settings(companyId);
-    if (!config.enabled) return null;
     const report: SyncReport = { at: new Date().toISOString(), imported: 0, updated: 0, warnings: [] };
     try {
+      const config = await settings(companyId);
+      if (!config.enabled) return null;
       const data = await sources.repositories(companyId);
       report.warnings.push(...data.warnings);
       const auth = await credentials(companyId);
@@ -368,7 +368,10 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     // Scheduled plugin jobs are instance-scoped at the host boundary. Iterate
     // only company IDs delivered through configChanged/authorized setup state;
     // ctx.companies.list() is a forbidden wildcard call from this context.
-    for (const companyId of configuredCompanies()) await sync(companyId);
+    for (const companyId of configuredCompanies()) {
+      try { await sync(companyId); }
+      catch (error) { ctx.logger.error("GitHub scheduled sync failed", { companyId, error: errorText(error) }); }
+    }
   });
   for (const event of ["issue.updated", "project.created", "project.updated"] as const) {
     ctx.events.on(event, async event => {
@@ -508,22 +511,9 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     if (!kind) return null;
     const receipt = String(input.headers["x-github-delivery"] ?? input.requestId);
     const companyIds = input.companyId ? [input.companyId] : [...configuredCompanies()];
-    // Keep the fallback for direct/unit callers that do not have startup
-    // config delivery; production workers always have the authorized set.
-    if (!companyIds.length) {
-      for (let offset = 0; ; offset += 100) {
-        const page = await ctx.companies.list({ limit: 100, offset });
-        companyIds.push(...page.map(company => company.id));
-        if (page.length < 100) break;
-      }
-    }
     for (const companyId of companyIds) {
-      const config = await ctx.config.get(companyId);
-      // The webhook entrypoint has already matched a state-backed connection
-      // before dispatching here. Direct/unit callers still use the legacy
-      // config match to avoid processing another company's installation.
-      if (!input.companyId && body.installation?.app_id !== undefined && String(config.appId ?? "") !== String(body.installation.app_id)) continue;
-      const repo = await sources.repository(companyId, repositoryId);
+      try {
+        const repo = await sources.repository(companyId, repositoryId);
       if (!repo) continue;
       const receiptKey = key(companyId, `webhook:${receipt}`);
       const prior = await ctx.state.get(receiptKey) as GitHubWebhookResult | null;
@@ -550,8 +540,11 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       }
       const result = { companyId: companyId, action, kind, ...(taskId ? { taskId } : {}), ignored: !taskId };
       await ctx.state.set(receiptKey, result);
-      await ctx.activity.log({ companyId: companyId, message: `GitHub ${kind} webhook processed`, metadata: { action, repositoryId, number: remote.number, taskId, delivery: receipt } });
-      return result;
+        await ctx.activity.log({ companyId: companyId, message: `GitHub ${kind} webhook processed`, metadata: { action, repositoryId, number: remote.number, taskId, delivery: receipt } });
+        return result;
+      } catch (error) {
+        ctx.logger.error("GitHub webhook company processing failed", { companyId, error: errorText(error) });
+      }
     }
     return null;
   }

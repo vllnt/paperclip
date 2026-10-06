@@ -866,7 +866,7 @@ function addPluginBridgeKeyPost(parent: Command, name: string, description: stri
       .description(description)
       .argument("<pluginId>", "Plugin ID or key")
       .argument("<key>", "Endpoint or data/action key")
-      .option("-C, --company-id <id>", "Company ID")
+      .requiredOption("-C, --company-id <id>", "Company ID")
       .option("--params-json <json>", "JSON action/data params")
       .option("--params-file <path>", "Read JSON action/data params from a file")
       .option("--payload-json <json>", "Legacy complete request body", "{}")
@@ -875,10 +875,14 @@ function addPluginBridgeKeyPost(parent: Command, name: string, description: stri
           const ctx = resolveCommandContext(opts);
           const hasParams = opts.paramsJson !== undefined || opts.paramsFile !== undefined;
           const payload = parseJson(opts.payloadJson ?? "{}");
+          if (!hasParams && payload && typeof payload === "object" && !Array.isArray(payload)
+            && "companyId" in payload && (payload as Record<string, unknown>).companyId !== ctx.companyId) {
+            throw new Error("payload companyId must match --company-id.");
+          }
           const body = hasParams
-            ? { ...(ctx.companyId ? { companyId: ctx.companyId } : {}), params: readPluginParams(opts) }
-            : (ctx.companyId && payload && typeof payload === "object" && !Array.isArray(payload)
-              ? { ...(payload as Record<string, unknown>), companyId: ctx.companyId }
+            ? { companyId: ctx.companyId, params: readPluginParams(opts) }
+            : (payload && typeof payload === "object" && !Array.isArray(payload)
+              ? { ...(payload as Record<string, unknown>), ...("companyId" in payload ? {} : { companyId: ctx.companyId }) }
               : payload);
           printOutput(await ctx.api.post(`/api/plugins/${encodeURIComponent(pluginId)}/${suffix}/${encodeURIComponent(key)}`, body), { json: ctx.json });
         } catch (err) {

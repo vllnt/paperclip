@@ -104,3 +104,12 @@ cases without invoking an external provider.
 
 The dependency layer comes from the install-only stage. Test caches are excluded
 from that layer so source-only builds do not invalidate its content.
+
+## Bundled GitHub plugin
+
+`packages/plugins/plugin-github` is company-scoped: each company uses its own
+GitHub App and company secret reference. This Paperclip remains Tailnet-only;
+the plugin creates no public webhook route or Funnel, and GitHub webhook delivery
+is currently disabled. Scheduled polling is the supported synchronization path.
+Any unexpected webhook request fails closed unless its installation belongs to a
+configured company and that company has a configured secret whose HMAC matches.

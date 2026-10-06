@@ -35,19 +35,15 @@ export class SetupService {
     await this.ctx.state.set({ scopeKind: "company", scopeId: companyId, namespace: "setup", stateKey: userId ?? "local-board" }, {
       stateHash: hash(state), companyId, userId, returnUrl, expiresAt: this.now() + 55 * 60_000
     });
-    const callback = new URL(returnUrl);
-    const local = ["localhost", "127.0.0.1", "[::1]"].includes(callback.hostname);
-    const webhookUrl = new URL(`/api/plugins/${PLUGIN_ID}/webhooks/github`, callback.origin).href;
-    const webhookActive = callback.protocol === "https:" && !local;
     return {
       state, actionUrl: `https://github.com/${owner ? `organizations/${owner}/settings` : "settings"}/apps/new?state=${state}`,
-      manifest: { name, url: callback.origin, description: "Sync GitHub issues with Paperclip tasks using your own GitHub App.",
+      manifest: { name, url: new URL(returnUrl).origin, description: "Sync GitHub issues with Paperclip tasks using your own GitHub App.",
         redirect_url: returnUrl, setup_url: returnUrl, setup_on_update: true, public: true,
-        // Local Paperclip cannot receive GitHub callbacks, so it keeps polling.
-        // Public HTTPS Paperclip instances receive issue, PR and review events.
-        request_oauth_on_install: false, hook_attributes: { url: webhookActive ? webhookUrl : "https://example.com/events", active: webhookActive },
+        // This Paperclip is Tailnet-only. GitHub cannot deliver callbacks here,
+        // so keep the required manifest placeholder inactive and use polling.
+        request_oauth_on_install: false, hook_attributes: { url: "https://example.com/events", active: false },
         default_permissions: { metadata: "read", issues: "write", pull_requests: "write", contents: "write", checks: "write", statuses: "read", organization_projects: "write" },
-        default_events: webhookActive ? ["issues", "pull_request", "pull_request_review", "pull_request_review_comment", "issue_comment", "check_run"] : [] }
+        default_events: [] }
     };
   }
   async complete(params: Record<string, unknown>, context: PluginPerformActionContext) {

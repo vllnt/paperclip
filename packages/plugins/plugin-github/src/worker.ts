@@ -1,5 +1,5 @@
 import { definePlugin, runWorker, type EnvSecretRefBinding, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
-import { GitHubClient, normalizeAllowedOwners, repoName, validateAllowedOwners } from "./github.js";
+import { GitHubClient, normalizeAllowedOwnerRecords, repoName, validateAllowedOwners } from "./github.js";
 import { GitHubReadCache } from "./read-cache.js";
 import { registerRecordTasks } from "./pr-tasks.js";
 import { registerTaskLinks } from "./task-links.js";
@@ -10,14 +10,14 @@ import { SetupService, boardScope } from "./setup.js";
 import { registerAgentBots } from "./agent-bots.js";
 import { registerAgentTools } from "./agent-tools.js";
 import { registerNativeGitHub } from "./native-github.js";
-import type { AppIdentity, Status } from "./contracts.js";
+import type { AllowedOwner, AppIdentity, Status } from "./contracts.js";
 import { header, verifyGitHubSignature } from "./github-webhooks.js";
 
-const connectionKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "connection", stateKey: "app" });
 const disconnectedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "connection", stateKey: "disconnected" });
 const ownersKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "connection", stateKey: "allowed-owners" });
-type StoredConnection = { appId: string; appSlug: string; appName: string; privateKey: EnvSecretRefBinding; webhookSecret?: EnvSecretRefBinding };
-let activeConfiguredCompanyIds: Set<string> | undefined;
+const appRegistryKey = { scopeKind: "instance" as const, namespace: "connection", stateKey: "app-companies" };
+type ConfigConnection = { appId: string; appSlug: string; appName: string; privateKey: EnvSecretRefBinding; webhookSecret?: EnvSecretRefBinding };
+type AppRegistry = Record<string, string>;
 
 function secretRef(secretId: string): EnvSecretRefBinding {
   return { type: "secret_ref", secretId, version: "latest" };
@@ -29,37 +29,36 @@ function isSecretRef(value: unknown): value is EnvSecretRefBinding {
 export function register(ctx: PluginContext, github = new GitHubClient()) {
   const setup = new SetupService(ctx, github);
   const configuredCompanyIds = new Set<string>();
-  async function connection(companyId: string): Promise<StoredConnection | null> {
-    configuredCompanyIds.add(companyId);
-    const disconnected = await ctx.state.get(disconnectedKey(companyId));
-    if (disconnected === true) return null;
-    const stored = await ctx.state.get(connectionKey(companyId)) as StoredConnection | null;
-    if (stored && typeof stored.appId === "string" && isSecretRef(stored.privateKey)) return stored;
-    // The old instance-level config is safe only while this worker has one
-    // company in its host-authorized scope. A second company must connect its
-    // own App through company-app.connect instead of inheriting the fallback.
-    if (configuredCompanyIds.size !== 1) return null;
+  let registryQueue = Promise.resolve();
+  async function connection(companyId: string): Promise<ConfigConnection | null> {
+    if (await ctx.state.get(disconnectedKey(companyId)) === true) return null;
     const config = await ctx.config.get(companyId);
     if (typeof config.appId !== "string" || !isSecretRef(config.privateKey)) return null;
     return {
       appId: config.appId,
-      appSlug: typeof config.appSlug === "string" ? config.appSlug : "",
-      appName: typeof config.appName === "string" ? config.appName : "GitHub App",
+      appSlug: typeof config.appSlug === "string" ? config.appSlug : `app-${config.appId}`,
+      appName: typeof config.appName === "string" ? config.appName : `GitHub App ${config.appId}`,
       privateKey: config.privateKey,
       ...(isSecretRef(config.webhookSecret) ? { webhookSecret: config.webhookSecret } : {}),
     };
   }
-  async function allowedOwners(companyId: string): Promise<string[] | undefined> {
+  async function allowedOwners(companyId: string): Promise<AllowedOwner[] | undefined> {
     const stored = await ctx.state.get(ownersKey(companyId));
-    if (stored !== null && stored !== undefined) return normalizeAllowedOwners(stored);
-    // A newly connected company has an explicit connection state. Until its
-    // owner list is set, fail closed. A company that still uses the old
-    // instance-level config keeps its legacy behavior until it migrates.
+    if (stored !== null && stored !== undefined) {
+      const pinned = normalizeAllowedOwnerRecords(stored);
+      return pinned.length && pinned.every(owner => owner.id > 0) ? pinned : [];
+    }
     const config = await ctx.config.get(companyId);
-    if (config.allowedOwners !== undefined) return normalizeAllowedOwners(config.allowedOwners);
-    const storedConnection = await ctx.state.get(connectionKey(companyId));
-    if (storedConnection) return [];
+    // State is authoritative. A config allowlist is accepted only when it
+    // already contains pinned numeric account IDs; legacy login-only config
+    // fails closed until the operator runs allowed-owners.set.
+    const configuredOwners = normalizeAllowedOwnerRecords(config.allowedOwners);
+    if (configuredOwners.length && configuredOwners.every(owner => owner.id > 0)) return configuredOwners;
+    if (typeof config.appId === "string" && isSecretRef(config.privateKey)) return [];
     return undefined;
+  }
+  function displayOwners(owners: readonly AllowedOwner[] | undefined): string[] {
+    return owners?.map(owner => owner.login) ?? [];
   }
   async function credentials(companyId: string) {
     const config = await connection(companyId);
@@ -67,6 +66,62 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     const pem = await ctx.secrets.resolve(config.privateKey, { companyId, configPath: "privateKey" });
     const owners = await allowedOwners(companyId);
     return { id: config.appId, pem, ...(owners === undefined ? {} : { allowedOwners: owners }) };
+  }
+  async function appRegistry(): Promise<AppRegistry> {
+    const stored = await ctx.state.get(appRegistryKey);
+    return stored && typeof stored === "object" ? { ...(stored as AppRegistry) } : {};
+  }
+  async function reserveAppId(companyId: string, appId: string): Promise<void> {
+    const operation = registryQueue.catch(() => {}).then(async () => {
+      const registry = await appRegistry();
+      const owner = registry[appId];
+      if (owner && owner !== companyId) throw new Error(`GitHub App ${appId} is already connected to another company.`);
+      for (const [registeredId, registeredCompany] of Object.entries(registry)) {
+        if (registeredCompany === companyId && registeredId !== appId) delete registry[registeredId];
+      }
+      registry[appId] = companyId;
+      await ctx.state.set(appRegistryKey, registry);
+    });
+    registryQueue = operation.then(() => {}, () => {});
+    return operation;
+  }
+  async function removeCompanyApps(companyId: string): Promise<void> {
+    const operation = registryQueue.catch(() => {}).then(async () => {
+      const registry = await appRegistry();
+      let changed = false;
+      for (const [appId, registeredCompany] of Object.entries(registry)) {
+        if (registeredCompany === companyId) { delete registry[appId]; changed = true; }
+      }
+      if (changed) await ctx.state.set(appRegistryKey, registry);
+    });
+    registryQueue = operation.then(() => {}, () => {});
+    return operation;
+  }
+  async function updateConfiguredCompany(companyId: string, config: Record<string, unknown>): Promise<void> {
+    const configured = typeof config.appId === "string" && isSecretRef(config.privateKey);
+    if (!configured || await ctx.state.get(disconnectedKey(companyId)) === true) {
+      configuredCompanyIds.delete(companyId);
+      await removeCompanyApps(companyId);
+      return;
+    }
+    await reserveAppId(companyId, config.appId as string);
+    configuredCompanyIds.add(companyId);
+  }
+  async function webhookCompany(installationId: number): Promise<string | null> {
+    for (const companyId of configuredCompanyIds) {
+      try {
+        const auth = await credentials(companyId);
+        if (await github.hasInstallation(auth.id, auth.pem, installationId)) return companyId;
+      } catch (error) {
+        ctx.logger.warn("GitHub webhook company lookup failed", { companyId, error: error instanceof Error ? error.message : "unknown" });
+      }
+    }
+    return null;
+  }
+  async function webhookSecret(companyId: string): Promise<string> {
+    const config = await connection(companyId);
+    if (!config?.webhookSecret) throw new Error("GitHub webhook secret is not configured for this company.");
+    return ctx.secrets.resolve(config.webhookSecret, { companyId, configPath: "webhookSecret" });
   }
   const cache = new GitHubReadCache();
   const sources = registerTaskIssues(ctx, github, credentials, cache, async companyId => Boolean(await connection(companyId)));
@@ -88,7 +143,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     const config = await connection(companyId);
     const owners = await allowedOwners(companyId);
     const app: AppIdentity | null = config ? { id: config.appId, slug: config.appSlug, name: config.appName } : null;
-    return { configured: !!config, app, allowedOwners: owners ?? [] };
+    return { configured: !!config, app, allowedOwners: displayOwners(owners) };
   }
 
   ctx.actions.register("company-app.status", async (params, actor) => {
@@ -102,40 +157,51 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     if (typeof params.appId !== "string" || !/^[1-9][0-9]*$/.test(params.appId.trim())) throw new Error("Enter a valid GitHub App ID.");
     if (typeof params.privateKeySecretId !== "string" || !params.privateKeySecretId.trim()) throw new Error("privateKeySecretId must reference an existing company secret.");
     const privateKey = secretRef(params.privateKeySecretId.trim());
+    const configured = await ctx.config.get(companyId);
+    if (configured.appId !== params.appId.trim() || !isSecretRef(configured.privateKey) || configured.privateKey.secretId !== privateKey.secretId) {
+      throw new Error("Save this company’s GitHub App config before connecting it.");
+    }
     const pem = await ctx.secrets.resolve(privateKey, { companyId, configPath: "privateKey" });
     const app = await github.verify(params.appId.trim(), pem);
-    let webhookSecret: EnvSecretRefBinding | undefined;
     if (params.webhookSecretId !== undefined) {
       if (typeof params.webhookSecretId !== "string" || !params.webhookSecretId.trim()) throw new Error("webhookSecretId must reference an existing company secret.");
-      webhookSecret = secretRef(params.webhookSecretId.trim());
-      await ctx.secrets.resolve(webhookSecret, { companyId, configPath: "webhookSecret" });
+      if (!isSecretRef(configured.webhookSecret) || configured.webhookSecret.secretId !== params.webhookSecretId.trim()) {
+        throw new Error("Save the webhook secret binding in this company’s plugin config before connecting it.");
+      }
+      await ctx.secrets.resolve(secretRef(params.webhookSecretId.trim()), { companyId, configPath: "webhookSecret" });
     }
-    await ctx.state.set(connectionKey(companyId), { appId: app.id, appSlug: app.slug, appName: app.name, privateKey, ...(webhookSecret ? { webhookSecret } : {}) } satisfies StoredConnection);
+    await reserveAppId(companyId, app.id);
     await ctx.state.delete(disconnectedKey(companyId));
-    configuredCompanyIds.add(companyId); cache.invalidate(companyId);
+    configuredCompanyIds.add(companyId);
+    cache.invalidate(companyId);
+    const owners = await allowedOwners(companyId);
     await ctx.activity.log({ companyId, message: "GitHub App connected", metadata: { appId: app.id } });
-    return { configured: true, app: { id: app.id, slug: app.slug, name: app.name }, allowedOwners: (await allowedOwners(companyId)) ?? [] } satisfies Status;
+    return { configured: true, app: { id: app.id, slug: app.slug, name: app.name }, allowedOwners: displayOwners(owners) } satisfies Status;
   });
   ctx.actions.register("company-app.disconnect", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
     requireAdmin(actor);
     await ctx.state.set(disconnectedKey(companyId), true);
+    configuredCompanyIds.delete(companyId);
+    await removeCompanyApps(companyId);
     cache.invalidate(companyId);
     await ctx.activity.log({ companyId, message: "GitHub App disconnected" });
-    return { configured: false, app: null, allowedOwners: (await allowedOwners(companyId)) ?? [] } satisfies Status;
+    return { configured: false, app: null, allowedOwners: displayOwners(await allowedOwners(companyId)) } satisfies Status;
   });
   ctx.actions.register("allowed-owners.get", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
-    return { companyId, owners: (await allowedOwners(companyId)) ?? [] };
+    return { companyId, owners: displayOwners(await allowedOwners(companyId)) };
   });
   ctx.actions.register("allowed-owners.set", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
     requireAdmin(actor);
-    const owners = validateAllowedOwners(params.owners);
-    await ctx.state.set(ownersKey(companyId), owners);
+    const requested = validateAllowedOwners(params.owners);
+    const auth = requested.length ? await credentials(companyId) : null;
+    const resolved = requested.length ? await github.resolveOwners(auth!.id, auth!.pem, requested) : [];
+    await ctx.state.set(ownersKey(companyId), resolved);
     cache.invalidate(companyId);
-    await ctx.activity.log({ companyId, message: "GitHub owner allowlist updated", metadata: { ownerCount: owners.length } });
-    return { companyId, owners };
+    await ctx.activity.log({ companyId, message: "GitHub owner allowlist updated", metadata: { ownerCount: resolved.length } });
+    return { companyId, owners: displayOwners(resolved) };
   });
   ctx.actions.register("repositories.list", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
@@ -147,7 +213,11 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     const { companyId } = boardScope(params, actor);
     await credentials(companyId);
     if (params.refresh === true) cache.invalidate(companyId);
-    void sync.sync(companyId).catch(() => {});
+    else {
+      const report = await ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: "report" }) as import("./contracts.js").SyncReport | null;
+      if (report && Date.now() - Date.parse(report.at) < 60_000) return { started: false, companyId };
+    }
+    void sync.sync(companyId).catch(error => ctx.logger.error("GitHub sync trigger failed", { companyId, error: error instanceof Error ? error.message : "unknown" }));
     return { started: true, companyId };
   });
 
@@ -245,13 +315,13 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     const refs = await sync.ensureTasks(companyId, repository, result.data.issues);
     return { ...result.data, cache: result.cache, issues: result.data.issues.map(issue => ({ ...issue, ...refs.get(issue.id) })) };
   });
-  return { ...sync, companyIds: configuredCompanyIds, invalidateCache: (companyId?: string | null) => cache.invalidate(companyId) };
+  return { ...sync, companyIds: configuredCompanyIds, invalidateCache: (companyId?: string | null) => cache.invalidate(companyId), updateConfiguredCompany, webhookCompany, webhookSecret };
 }
 let runtime: ReturnType<typeof register> | undefined;
 let pluginContext: PluginContext | undefined;
 const plugin = definePlugin({
   multiCompanyConfig: true,
-  async setup(ctx) { pluginContext = ctx; runtime = register(ctx); activeConfiguredCompanyIds = runtime.companyIds; },
+  async setup(ctx) { pluginContext = ctx; runtime = register(ctx); },
   async onWebhook(input: PluginWebhookInput) {
     if (input.endpointKey !== "github") throw new Error("Unknown GitHub webhook endpoint.");
     if (!runtime || !pluginContext) return;
@@ -259,31 +329,22 @@ const plugin = definePlugin({
     const delivery = header(deliveries, "x-github-delivery") ?? input.requestId;
     const payload = input.parsedBody && typeof input.parsedBody === "object" ? input.parsedBody as Record<string, unknown> : {};
     const installation = payload.installation && typeof payload.installation === "object" ? payload.installation as Record<string, unknown> : {};
-    const appId = installation.app_id === undefined ? undefined : String(installation.app_id);
-    let matchedConfig = false;
-    for (const companyId of activeConfiguredCompanyIds ?? []) {
-      if (await pluginContext.state.get(disconnectedKey(companyId)) === true) continue;
-      const config = await pluginContext.config.get(companyId);
-      const stored = await pluginContext.state.get(connectionKey(companyId)) as StoredConnection | null;
-      if (appId !== undefined && String(stored?.appId ?? config.appId ?? "") !== appId) continue;
-      matchedConfig = true;
-      let secret: string | undefined;
-      const secretRefValue = stored?.webhookSecret ?? config.webhookSecret;
-      if (isSecretRef(secretRefValue)) secret = await pluginContext.secrets.resolve(secretRefValue, { companyId, configPath: "webhookSecret" });
-      if (!verifyGitHubSignature(input.rawBody, header(deliveries, "x-hub-signature-256"), secret)) throw new Error("GitHub webhook signature verification failed.");
+    const installationId = installation.id;
+    if (!Number.isSafeInteger(installationId) || Number(installationId) < 1) throw new Error("GitHub webhook installation is missing.");
+    const companyId = await runtime.webhookCompany(Number(installationId));
+    if (!companyId) throw new Error("GitHub webhook installation is not configured for a company.");
+    const secret = await runtime.webhookSecret(companyId);
+    if (!verifyGitHubSignature(input.rawBody, header(deliveries, "x-hub-signature-256"), secret)) throw new Error("GitHub webhook signature verification failed.");
+    try {
       await runtime.handleWebhook({ companyId, headers: deliveries, parsedBody: input.parsedBody, requestId: delivery });
-      return;
+    } catch (error) {
+      pluginContext.logger.error("GitHub webhook processing failed", { companyId, error: error instanceof Error ? error.message : "unknown" });
+      throw error;
     }
-    // Unknown app installations are ignored after signature validation. With no
-    // configured secret, this preserves compatibility with older App installs.
-    if (!matchedConfig && !verifyGitHubSignature(input.rawBody, header(deliveries, "x-hub-signature-256"), undefined)) throw new Error("GitHub webhook signature verification failed.");
   },
   async onConfigChanged(config, context) {
     if (context?.companyId) {
-      activeConfiguredCompanyIds?.add(context.companyId);
-      runtime?.companyIds.add(context.companyId);
-      // Startup and live config delivery are the host-authorized company list.
-      // Never discover companies through a wildcard worker call.
+      await runtime?.updateConfiguredCompany(context.companyId, config);
       runtime?.invalidateCache(context.companyId);
     }
   },

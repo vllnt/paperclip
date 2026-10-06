@@ -4,10 +4,10 @@ import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
 import { GitHubClient } from "../src/github.js";
 const actor = { companyId: "c1", actor: { type: "user" as const, userId: "u1", companyId: "c1", agentId: null, runId: null } };
-const repo = { id: 22, name: "repo", fullName: "org/repo", url: "https://github.com/org/repo", installationId: 33, owner: "org", private: true, issuesWrite: true, permissions: { issues: "write" } };
+const repo = { id: 22, name: "repo", fullName: "org/repo", url: "https://github.com/org/repo", installationId: 33, owner: "org", ownerId: 1, private: true, issuesWrite: true, permissions: { issues: "write" } };
 const row = { id: 101, number: 1, title: "Remote issue", body: "Description", state: "open", updated_at: "2026-10-04T12:00:00Z", html_url: repo.url + "/issues/1", assignees: [], labels: [] };
 function fixture() {
-  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "key" } } });
+  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "key" }, allowedOwners: [{ id: 1, login: "org" }] } });
   vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("pem");
   const github = new GitHubClient();
   const catalog = vi.spyOn(github, "catalog").mockResolvedValue({ app: { id: "12", slug: "app", name: "App" }, installations: [], repositories: [repo], warnings: [], truncated: false });
@@ -85,7 +85,7 @@ it("isolates cached issue content and native mappings by company", async () => {
   await f.h.ctx.state.set({ scopeKind: "company", scopeId: "c2", namespace: "connection", stateKey: "app" }, {
     appId: "12", appSlug: "app", appName: "App", privateKey: { type: "secret_ref", secretId: "key" },
   });
-  await f.h.ctx.state.set({ scopeKind: "company", scopeId: "c2", namespace: "connection", stateKey: "allowed-owners" }, ["org"]);
+  await f.h.ctx.state.set({ scopeKind: "company", scopeId: "c2", namespace: "connection", stateKey: "allowed-owners" }, [{ id: 1, login: "org" }]);
   const b = await f.read({}, { ...actor, companyId: "c2", actor: { ...actor.actor, companyId: "c2" } });
   expect(a.rows[0].paperclipTask.id).not.toBe(b.rows[0].paperclipTask.id);
   expect(f.catalog).toHaveBeenCalledTimes(2);
@@ -94,7 +94,7 @@ it("isolates cached issue content and native mappings by company", async () => {
 
 it("associates accessible Project issue items and preserves restricted items without inventing tasks", async () => {
   const f = fixture();
-  f.catalog.mockResolvedValue({ app: { id: "12", slug: "app", name: "App" }, installations: [{ id: 33, login: "org", suspended: false, accountType: "Organization", permissions: { organization_projects: "read" } }], repositories: [repo], warnings: [], truncated: false });
+  f.catalog.mockResolvedValue({ app: { id: "12", slug: "app", name: "App" }, installations: [{ id: 33, accountId: 1, login: "org", suspended: false, accountType: "Organization", permissions: { organization_projects: "read" } }], repositories: [repo], warnings: [], truncated: false });
   vi.spyOn(f.github, "graphql").mockImplementation(async (_token, query) => query.includes("items(") ? { node: { items: { nodes: [
     { id: "ITEM", content: { __typename: "Issue", fullDatabaseId: "3000000001", number: row.number, title: row.title, body: row.body, issueState: "OPEN", repository: { nameWithOwner: repo.fullName } } },
     { id: "RESTRICTED", content: null },
