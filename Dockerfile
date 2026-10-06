@@ -135,9 +135,11 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm exec vitest run packages/shared/src/company-environment-defaults.test.ts server/src/__tests__/instance-settings-service.test.ts server/src/__tests__/instance-settings-routes.test.ts packages/adapters/codex-local/src/company-model-catalog.test.ts packages/adapters/claude-local/src/current-model-catalog.test.ts ui/src/lib/agent-setup-fields.test.ts ui/src/lib/test-agent-setup.test.ts ui/src/lib/saved-provider-credentials.test.ts packages/adapters/codex-local/src/server/test.remote.test.ts packages/adapters/codex-local/src/server/runtime-config.test.ts packages/adapters/codex-local/src/server/execute.remote.test.ts
 RUN pnpm check:token-gates
+# The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
+# after the SDK build, so build the SDK before typechecking the UI.
+RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
-RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built

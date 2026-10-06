@@ -25,6 +25,12 @@ then pushes those two files to `main`. Coolify watches `deploy/compose.yaml` on
 the runtime host. A newer source commit prevents an older build from publishing a
 deployment record. Generated-only paths are excluded from CI to avoid a build loop.
 
+Every pull request into `main` also builds the same production target without
+publishing it (`.github/workflows/image-build-check.yml`). It reads the production
+build cache but never writes to it. A Dockerfile or build failure therefore blocks
+the pull request instead of surfacing only after merge, when the publish job fails
+and `main` keeps running the previous image.
+
 CI uses only the job-scoped GitHub token for this repository and its image package.
 It has no production, Tailnet, proxy, database or Coolify access credentials.
 The public image package must allow anonymous pulls. Coolify must have automatic
