@@ -90,8 +90,9 @@ const SELF_REVIEW_VERDICTS = { '-a': 'approve', '--approve': 'approve', '-r': 'r
 function selfReviewFallbackArgs(args, scratch) {
   const flag = args.find(arg => SELF_REVIEW_VERDICTS[arg]);
   const verdict = SELF_REVIEW_VERDICTS[flag];
-  const prefix = '**Review verdict: ' + verdict + '.** GitHub does not let a pull request author ' + verdict
-    + ' on their own pull request, so this verdict is posted as a comment review.';
+  const prefix = '**Review verdict: ' + verdict + '.** GitHub does not let an author '
+    + (verdict === 'approve' ? 'approve their own pull request' : 'request changes on their own pull request')
+    + ', so this verdict is posted as a comment review.';
   return rewriteGhBody([...args.filter(arg => arg !== flag), '--comment'],
     body => body.trim() ? prefix + '\n\n' + body : prefix, true, scratch);
 }

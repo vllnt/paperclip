@@ -258,7 +258,7 @@ if (args.includes('--approve') || args.includes('-r')) { process.stderr.write('f
     const [refused, fallback] = await calls(log);
     expect(refused!.args).toEqual(["pr", "review", "12", "--approve", "--body", "_Posted by Paperclip agent Peter Injected: yes (run run-1)._"]);
     expect(fallback!.args).toEqual(["pr", "review", "12", "--body", expect.any(String), "--comment"]);
-    expect(bodyOf(fallback!.args)).toMatch(/^\*\*Review verdict: approve\.\*\* GitHub does not let a pull request author approve[\s\S]*\n\n_Posted by Paperclip agent/);
+    expect(bodyOf(fallback!.args)).toMatch(/^\*\*Review verdict: approve\.\*\* GitHub does not let an author approve their own pull request, so[\s\S]*\n\n_Posted by Paperclip agent/);
     await exec(launcher, ["pr", "review", "12", "-r", "-b", "Fix the test"], { cwd: repo, env });
     const requested = (await calls(log)).at(-1)!;
     expect(requested.args).toEqual(["pr", "review", "12", "--body", expect.any(String), "--comment"]);
