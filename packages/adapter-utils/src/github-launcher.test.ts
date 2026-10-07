@@ -183,6 +183,87 @@ describe("managed GitHub launchers", () => {
     expect(result.stderr).toContain("capability_rejected");
     expect(requests).toEqual({ broker: 0, bridge: 1 });
   });
+  // Agents can act as a person's GitHub account; their work must stay distinguishable.
+  async function attributedLauncher(name: "git" | "gh", realSource?: string) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-attribution-"));
+    cleanups.push(() => rm(root, {recursive:true,force:true}));
+    const bin = path.join(root,"managed"), realBin = path.join(root,"real"), repo = path.join(root,"repo");
+    for (const dir of [bin, realBin, repo]) await mkdir(dir);
+    await writeFile(path.join(bin,name), githubLauncherSource(), {mode:0o700});
+    if (realSource) await writeFile(path.join(realBin,name), realSource, {mode:0o700});
+    const server = createServer((_req,res) => {
+      res.setHeader("content-type","application/json");
+      res.end(JSON.stringify({status:"available",env:{GH_TOKEN:"managed-token"},attribution:{agentName:"Peter\nInjected: yes",runId:"run-1"}}));
+    });
+    await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const env = {...hostEnv,...githubBrokerEnvironment({},{url:`http://127.0.0.1:${(server.address() as {port:number}).port}`,token:"run-capability"}),
+      PATH:`${bin}:${realBin}:${process.env.PATH}`};
+    return { root, repo, env, launcher: path.join(bin,name) };
+  }
+  // Records each real gh invocation, including body-file contents, then fails or succeeds like GitHub.
+  const fakeGh = (log: string) => `#!/usr/bin/env node
+const fs=require('node:fs'), args=process.argv.slice(2);
+const file=args.indexOf('--body-file');
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({args, file: file<0 ? null : fs.readFileSync(args[file+1],'utf8')})+'\\n');
+if (args.includes('--approve') || args.includes('-r')) { process.stderr.write('failed to create review: GraphQL: Can not approve your own pull request (addPullRequestReview)\\n'); process.exit(1); }
+`;
+  const calls = async (log: string) => (await import("node:fs/promises")).readFile(log, "utf8")
+    .then(text => text.trim().split("\n").map(line => JSON.parse(line) as {args: string[]; file: string | null}));
+  it("marks every agent commit with a sanitized attribution trailer, once", async () => {
+    const { repo, env, launcher } = await attributedLauncher("git");
+    const git = async (...args: string[]) => (await exec(launcher, args, { cwd: repo, env })).stdout.trim();
+    await git("init");
+    await git("-c", "user.name=bntvllnt", "-c", "user.email=b@example.test", "commit", "--allow-empty", "-m", "Work\n\nCo-Authored-By: Paperclip <noreply@paperclip.ing>");
+    await git("-C", repo, "-c", "user.name=bntvllnt", "-c", "user.email=b@example.test", "commit", "--amend", "--no-edit", "--allow-empty");
+    expect(await git("log", "-1", "--format=%B")).toBe(
+      "Work\n\nCo-Authored-By: Paperclip <noreply@paperclip.ing>\nPaperclip-Agent: Peter Injected: yes (run run-1)");
+  });
+  it("adds an attribution footer to every gh body form without editing the agent's files", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-footer-log-"));
+    cleanups.push(() => rm(root, {recursive:true,force:true}));
+    const log = path.join(root, "calls.jsonl");
+    const { repo, env, launcher } = await attributedLauncher("gh", fakeGh(log));
+    const footer = "_Posted by Paperclip agent Peter Injected: yes (run run-1)._";
+    await writeFile(path.join(repo, "body.md"), "From a file\n");
+    for (const args of [
+      ["pr", "create", "--title", "T", "--body", "Long body"],
+      ["pr", "comment", "12", "-b", "Short"],
+      ["pr", "review", "12", "--comment", "--body=Equals"],
+      ["issue", "comment", "12", "--body-file", "body.md"],
+      ["pr", "comment", "12", "--body", `Already signed\n\n---\n${footer}`],
+      ["pr", "edit", "12", "--add-label", "bug"],
+      ["pr", "list"],
+    ]) await exec(launcher, args, { cwd: repo, env });
+    const piped = exec(launcher, ["pr", "comment", "12", "-F", "-"], { cwd: repo, env });
+    piped.child.stdin!.end("From stdin");
+    await piped;
+    const recorded = await calls(log);
+    expect(recorded.map(call => call.args.at(-1))).toEqual([
+      `Long body\n\n---\n${footer}`, `Short\n\n---\n${footer}`, `Equals\n\n---\n${footer}`,
+      expect.stringContaining("body-"), `Already signed\n\n---\n${footer}`, "bug", "list", expect.stringContaining("body-"),
+    ]);
+    expect(recorded[3]!.file).toBe(`From a file\n\n---\n${footer}`);
+    expect(recorded[7]!.file).toBe(`From stdin\n\n---\n${footer}`);
+    expect(await (await import("node:fs/promises")).readFile(path.join(repo, "body.md"), "utf8")).toBe("From a file\n");
+  });
+  it("posts a verdict as a comment review when GitHub refuses it on the account's own pull request", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-review-log-"));
+    cleanups.push(() => rm(root, {recursive:true,force:true}));
+    const log = path.join(root, "calls.jsonl");
+    const { repo, env, launcher } = await attributedLauncher("gh", fakeGh(log));
+    const result = await exec(launcher, ["pr", "review", "12", "--approve"], { cwd: repo, env });
+    expect(result.stderr).toContain("posting it as a comment review");
+    const bodyOf = (args: string[]) => args[args.indexOf("--body") + 1];
+    const [refused, fallback] = await calls(log);
+    expect(refused!.args).toEqual(["pr", "review", "12", "--approve", "--body", "_Posted by Paperclip agent Peter Injected: yes (run run-1)._"]);
+    expect(fallback!.args).toEqual(["pr", "review", "12", "--body", expect.any(String), "--comment"]);
+    expect(bodyOf(fallback!.args)).toMatch(/^\*\*Review verdict: approve\.\*\* GitHub does not let a pull request author approve[\s\S]*\n\n_Posted by Paperclip agent/);
+    await exec(launcher, ["pr", "review", "12", "-r", "-b", "Fix the test"], { cwd: repo, env });
+    const requested = (await calls(log)).at(-1)!;
+    expect(requested.args).toEqual(["pr", "review", "12", "--body", expect.any(String), "--comment"]);
+    expect(bodyOf(requested.args)).toMatch(/^\*\*Review verdict: request changes\.\*\*[\s\S]*\n\nFix the test\n\n---\n_Posted by/);
+  });
   it("captures each command's identity and clears host credentials when the next person has none", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-launcher-test-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));

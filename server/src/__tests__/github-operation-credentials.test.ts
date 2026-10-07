@@ -221,6 +221,7 @@ const support = await getEmbeddedPostgresTestSupport();
           status: "available",
           login: user,
           source: "personal",
+          attribution: { agentName: "Shared", runId: input.runId },
         });
         expect(result.env.GH_TOKEN).toBe(`test-token-${user}`);
         expect(result.env.GIT_AUTHOR_EMAIL).toBe(
@@ -713,6 +714,8 @@ const support = await getEmbeddedPostgresTestSupport();
             status: "unavailable",
             env: {},
             reason: expect.stringContaining("low-trust"),
+            // Attribution only names the acting agent and run; it never carries a credential.
+            attribution: { agentName: "Shared", runId: input.runId },
           });
           expect(vault.resolveSecretValue, source).not.toHaveBeenCalled();
           expect(vault.resolveUserSecretValue, source).not.toHaveBeenCalled();
