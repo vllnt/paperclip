@@ -90,8 +90,8 @@ describe("routine and plugin parity commands", () => {
     await run(["plugin", "bridge:data", "plug", "--payload-json", "{}"]);
     await run(["plugin", "bridge:action", "plug", "--payload-json", "{}"]);
     await run(["plugin", "bridge:stream", "plug", "events", "--duration-ms", "1"]);
-    await run(["plugin", "data", "plug", "key", "--payload-json", "{}"]);
-    await run(["plugin", "action", "plug", "key", "--payload-json", "{}"]);
+    await run(["plugin", "data", "plug", "key", "--company-id", COMPANY_ID, "--payload-json", "{}"]);
+    await run(["plugin", "action", "plug", "key", "--company-id", COMPANY_ID, "--payload-json", "{}"]);
     await run(["plugin", "local-folders", "plug", "--company-id", COMPANY_ID]);
     await run(["plugin", "local-folder:status", "plug", "source", "--company-id", COMPANY_ID]);
     await run(["plugin", "local-folder:validate", "plug", "source", "--company-id", COMPANY_ID, "--payload-json", "{}"]);
