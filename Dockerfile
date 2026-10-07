@@ -142,6 +142,15 @@ RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
+# Build the remaining bundled local plugins here. The production root filesystem
+# is read-only and cannot run the server's install-time auto-build, so a bundled
+# plugin without its dist entrypoints cannot be installed from the UI.
+RUN pnpm --filter @paperclipai/plugin-llm-wiki build \
+  && pnpm --filter @paperclipai/plugin-workspace-diff build \
+  && for plugin in plugin-llm-wiki plugin-workspace-diff plugin-providers plugin-github; do \
+       test -f "packages/plugins/$plugin/dist/manifest.js" \
+         || { echo "ERROR: bundled plugin $plugin has no dist/manifest.js" >&2; exit 1; }; \
+     done
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built
 # commit into dist/build-info.json. The build context has no .git, so the
 # script reads PAPERCLIP_BUILD_COMMIT instead. Docker exposes an ARG to the
@@ -236,7 +245,8 @@ ENV NODE_ENV=production \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
   OPENCODE_ALLOW_ALL_MODELS=true \
-  GEMINI_SANDBOX=false
+  GEMINI_SANDBOX=false \
+  PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD=1
 
 EXPOSE 3100
 
