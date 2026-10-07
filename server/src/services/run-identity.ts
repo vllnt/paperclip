@@ -395,6 +395,41 @@ export async function reserveSteeredIdentity(
   });
 }
 
+/**
+ * Live-input steering (legacy adapters) learns about delivery only when the
+ * provider starts the message, so there is no reservation window to guard:
+ * reserve and accept together. A pending context would make every agent API
+ * call wait for a receipt that can take minutes.
+ */
+export async function acceptAcknowledgedSteeredIdentity(
+  db: Db,
+  input: Parameters<typeof prepareSteeredIdentity>[1],
+) {
+  await db.transaction(async (tx) => {
+    await lockIdentityTask(tx, input.companyId, input.runId);
+    const [run] = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.companyId, input.companyId),
+        ),
+      )
+      .for("no key update");
+    if (!run?.activeIdentityContextId) return;
+    const context = await prepareSteeredIdentity(tx, input);
+    if (context.status === "accepted") return;
+    if (context.status === "rejected") {
+      await tx
+        .update(runIdentityContexts)
+        .set({ status: "pending" })
+        .where(eq(runIdentityContexts.id, context.id));
+    }
+    await acceptSteeredIdentity(tx, { ...context, status: "pending" });
+  });
+}
+
 export async function rejectSteeredIdentity(
   db: Db,
   context: RunIdentityContext,

@@ -28,6 +28,16 @@ describe("normalizeIssueQueuedCommentQueue", () => {
       canEdit: false, canDiscard: false }] }, "issue-1");
     expect(normalized.entries[0]).toMatchObject({ source, canEdit: false, canDiscard: false });
   });
+  it("keeps only a recognised steer-pending marker", () => {
+    const normalized = normalizeIssueQueuedCommentQueue({ protocol: "legacy", steeringDisposition: "available", entries: [
+      { comment: comment("comment-1", "One"), steering: "pending", canEdit: false, canDiscard: false },
+      { comment: comment("comment-2", "Two"), steering: "steered", canEdit: true, canDiscard: true },
+    ] }, "issue-1");
+    expect(normalized).toMatchObject({ protocol: "legacy", steeringDisposition: "available" });
+    expect(normalized.entries[0]).toMatchObject({ steering: "pending" });
+    expect(normalized.entries[1]).not.toHaveProperty("steering");
+  });
+
   it("sorts, deduplicates, and drops malformed queue entries", () => {
     const queue = normalizeIssueQueuedCommentQueue(
       {

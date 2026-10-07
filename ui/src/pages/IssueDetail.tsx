@@ -2188,8 +2188,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         throw new Error(
           "The queued message no longer has an active run target.",
         );
+      // A legacy run acknowledges a steer later, at its next tool boundary; its
+      // timeline placement then comes from the steered activity.
+      const liveInputSteer = effectiveQueuedCommentQueue?.protocol === "legacy";
       const anchorAt = new Date().toISOString();
-      setLocalSteeringPlacements((current) => {
+      if (!liveInputSteer) setLocalSteeringPlacements((current) => {
         const next = new Map(current);
         const sequence = [...current.values()].filter(
           (placement) => placement.targetRunId === targetRunId,
@@ -2204,7 +2207,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         });
         return next;
       });
-      setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
+      if (!liveInputSteer) setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
       try {
         const nextQueue = await issuesApi.steerQueuedComment(
           issueId,

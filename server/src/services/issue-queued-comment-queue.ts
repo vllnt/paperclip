@@ -106,6 +106,8 @@ export type QueuedCommentQueueProtocol = "paperclip_runner_v1" | "legacy";
 export type QueuedCommentQueueSteeringDecision =
   | { protocol: QueuedCommentQueueProtocol; kind: "unsupported" }
   | { protocol: QueuedCommentQueueProtocol; kind: "temporarily_unavailable" }
+  /** A legacy run whose adapter registered live input for this process. */
+  | { protocol: "legacy"; kind: "available" }
   /** Only the caller can probe the live runner. `steeringRunId` names the run to probe. */
   | { protocol: "paperclip_runner_v1"; kind: "probe"; steeringRunId: string };
 
@@ -131,6 +133,8 @@ export function decideQueuedCommentQueueSteering(facts: {
   activeRun: { id: string; runtimeMode: string | null; runtimeModeResolvedAt?: Date | null; runnerProfileJson?: Record<string, unknown> | null } | null;
   assignedAgentAdapterType: string | null;
   queuedCommentCount: number;
+  /** The active legacy run's adapter can take a message mid-run right now. */
+  activeRunTakesLiveInput?: boolean;
 }): QueuedCommentQueueSteeringDecision {
   // The default legacy value is not a selection receipt during preparation.
   // Use the run's immutable dispatch choice, never the agent's mutable settings.
@@ -151,7 +155,10 @@ export function decideQueuedCommentQueueSteering(facts: {
       : "legacy";
 
   if (protocol !== "paperclip_runner_v1") {
-    return { protocol, kind: "unsupported" };
+    // Legacy steering is a capability of the live process, not of the protocol.
+    return facts.state === "deferred" && facts.activeRun && facts.activeRunTakesLiveInput && facts.queuedCommentCount > 0
+      ? { protocol: "legacy", kind: "available" }
+      : { protocol, kind: "unsupported" };
   }
 
   const steeringRun = facts.state === "deferred" ? facts.activeRun : null;
@@ -188,6 +195,8 @@ export function buildQueuedCommentQueueSnapshot<TComment extends QueuedCommentQu
   executionWait?: IssueQueuedCommentQueue["executionWait"];
   actorType: "agent" | "user";
   actorId: string;
+  /** Comments already handed to the active run's live input. */
+  pendingSteeringCommentIds?: ReadonlySet<string>;
 }): IssueQueuedCommentQueue {
   return {
     issueId: facts.issueId,
@@ -198,11 +207,17 @@ export function buildQueuedCommentQueueSnapshot<TComment extends QueuedCommentQu
     protocol: facts.protocol,
     steeringDisposition: facts.steeringDisposition,
     ...(facts.executionWait ? { executionWait: facts.executionWait } : {}),
-    entries: facts.comments.map((comment, position) => ({
-      comment: comment as unknown as IssueComment,
-      position,
-      canEdit: facts.actorType === "user" && comment.authorUserId === facts.actorId,
-      canDiscard: facts.actorType === "user" && comment.authorUserId === facts.actorId,
-    })),
+    entries: facts.comments.map((comment, position) => {
+      // The running process already has the text; an edit or discard can't reach it.
+      const steeringPending = facts.pendingSteeringCommentIds?.has(comment.id) === true;
+      const owns = facts.actorType === "user" && comment.authorUserId === facts.actorId;
+      return {
+        comment: comment as unknown as IssueComment,
+        position,
+        canEdit: owns && !steeringPending,
+        canDiscard: owns && !steeringPending,
+        ...(steeringPending ? { steering: "pending" as const } : {}),
+      };
+    }),
   };
 }

@@ -1352,6 +1352,24 @@ merging the receipt, preserving concurrent provider updates.
 If the run stops during that wait, the request fails with a stale-target error
 and retains the queued input for continuation.
 
+Legacy adapters steer through live input when their process can take a message
+mid-run. Today that is `claude_local` on the CLI engine with a local or SSH
+target. The process reads `--input-format stream-json` and keeps stdin open. The
+adapter registers a steering handle only after Claude Code's `system/init`
+reports `msg_lifecycle_v1`. The queue answers `steeringDisposition: "available"`
+while that handle is registered. ACP, sandbox and `codex_local` runs register no
+handle, so they stay `unsupported` and keep Interrupt. Steer is two-phase:
+- **Pending.** Steer writes the board text as a plain user message, tagged with
+  a UUIDv5 of the run and comment and never with `priority: "now"`. The comment
+  stays queued with `steering: "pending"`, and it can't be edited or discarded.
+- **Steered.** Claude Code's `command_lifecycle started` for that message is the
+  only receipt. The adapter emits it as a `steering_acknowledgement` run event.
+  Only then does the comment leave the queue and the steered identity get
+  accepted, both in one step.
+- **Run ends first.** If the run ends before `started`, the pending state is
+  dropped and the comment stays queued for the next wake. A late or racing
+  receipt can deliver a message twice; it never drops one.
+
 ### Preserve work across handoff and deliver requested files
 
 An agent handoff carries the interrupted run's authorized task history, completed

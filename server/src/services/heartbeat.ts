@@ -56,6 +56,11 @@ import {
   registerAdapterExecutionControl,
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
+import {
+  acknowledgeAdapterSteering,
+  clearAdapterSteering,
+  setAdapterSteeringHandle,
+} from "./adapter-steering.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -23497,6 +23502,13 @@ export function heartbeatService(
             message: event.message,
             payload: event.payload,
           });
+          try {
+            await acknowledgeAdapterSteering(run.id, event);
+          } catch (err) {
+            // The message reached the agent; its comment stays queued, so the
+            // worst case is a duplicate delivery on the next wake.
+            logger.warn({ err, runId: run.id }, "failed to settle steered comment");
+          }
         };
 
         const adapter = getServerAdapter(agent.adapterType);
@@ -24998,6 +25010,7 @@ export function heartbeatService(
                         }
                       },
                     } : {}),
+                    onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
@@ -26765,6 +26778,7 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
         }
+        clearAdapterSteering(run.id);
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.

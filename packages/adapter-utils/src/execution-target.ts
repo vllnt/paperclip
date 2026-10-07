@@ -78,6 +78,7 @@ import {
   resolveCommandForLogs,
   runChildProcess,
   type RunProcessResult,
+  type ChildProcessStdinWriter,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -285,6 +286,12 @@ export interface AdapterExecutionTargetProcessOptions {
    * after local child close or a remotely observed exit, including nonzero exits. */
   onProcessStopped?: () => void;
   terminalResultCleanup?: TerminalResultCleanupOptions;
+  /**
+   * Keep stdin open after the initial `stdin` write and hand the caller a
+   * writer. Only local and SSH targets have live stdin; sandbox targets never
+   * call it, so callers must treat a missing writer as "no live stdin".
+   */
+  onStdinReady?: (writer: ChildProcessStdinWriter) => void;
   /**
    * Sandbox-only: factory from the Paperclip bridge handle that streams the
    * CLI's stdout/stderr during the run. When provided, the batched provider
@@ -917,6 +924,7 @@ export async function runAdapterExecutionTargetProcess(
     cwd: options.cwd,
     env,
     stdin: options.stdin,
+    onStdinReady: options.onStdinReady,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
     onLog: options.onLog,

@@ -566,4 +566,48 @@ describe("parseClaudeStreamJson usage extraction", () => {
     });
     expect(parsed.usageBasis).toBe("per_run");
   });
+
+  // Recorded from Claude Code 2.1.287 with --input-format stream-json: a
+  // message written after the first result ran as a second turn in the same
+  // process. `total_cost_usd` and `modelUsage` are cumulative across results,
+  // while top-level `usage` covers one turn.
+  const twoResultRun = [
+    JSON.stringify({ type: "system", subtype: "init", session_id: "4151052b", model: "claude-haiku-4-5-20251001" }),
+    JSON.stringify({
+      type: "result", subtype: "success", session_id: "4151052b", result: "ONE", num_turns: 1,
+      total_cost_usd: 0.042925,
+      usage: { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 34_108, output_tokens: 56 },
+      modelUsage: { "claude-haiku-4-5-20251001": { inputTokens: 10, outputTokens: 56, cacheReadInputTokens: 0, cacheCreationInputTokens: 34_108, costUSD: 0.042925 } },
+    }),
+    JSON.stringify({ type: "command_lifecycle", command_uuid: "bbbbbbbb-0000-4000-8000-000000000002", state: "started" }),
+    JSON.stringify({
+      type: "result", subtype: "success", session_id: "4151052b", result: "TWO", num_turns: 1,
+      total_cost_usd: 0.0465983,
+      usage: { input_tokens: 10, cache_read_input_tokens: 34_108, cache_creation_input_tokens: 74, output_tokens: 32 },
+      modelUsage: { "claude-haiku-4-5-20251001": { inputTokens: 20, outputTokens: 88, cacheReadInputTokens: 34_108, cacheCreationInputTokens: 34_182, costUSD: 0.0465983 } },
+    }),
+  ];
+
+  it("reports cumulative cost and usage once for a run with several results", () => {
+    const parsed = parseClaudeStreamJson(`${twoResultRun.join("\n")}\n`);
+    expect(parsed.costUsd).toBeCloseTo(0.0465983, 7);
+    expect(parsed.usage).toEqual({
+      inputTokens: 20 + 34_182,
+      outputTokens: 88,
+      cachedInputTokens: 34_108,
+    });
+    expect(parsed.summary).toBe("ONE\n\nTWO");
+    expect(parsed.resultJson?.result).toBe("TWO");
+  });
+
+  it("sums per-turn usage across results when modelUsage is absent", () => {
+    const withoutModelUsage = twoResultRun.map((line) => {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      delete event.modelUsage;
+      return JSON.stringify(event);
+    });
+    const parsed = parseClaudeStreamJson(`${withoutModelUsage.join("\n")}\n`);
+    expect(parsed.usage).toEqual({ inputTokens: 20, outputTokens: 88, cachedInputTokens: 34_108 });
+    expect(parsed.costUsd).toBeCloseTo(0.0465983, 7);
+  });
 });

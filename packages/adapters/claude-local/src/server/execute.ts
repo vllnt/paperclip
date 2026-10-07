@@ -76,6 +76,7 @@ import {
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
 } from "./parse.js";
+import { claudeStreamJsonUserMessage, createClaudeSteeringSession } from "./steering.js";
 import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
@@ -424,6 +425,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   const executionTargetIsSandbox = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox";
+  // Local and SSH processes keep a live stdin, so a board message can steer the
+  // run mid-turn. Sandbox runners take stdin once and report steering unsupported.
+  const liveInput = !executionTargetIsSandbox;
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -850,6 +854,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
+    if (liveInput) args.push("--input-format", "stream-json");
     if (config.managedAiConnection) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
@@ -962,24 +967,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-      onProcessStopped: providerStop.beginInvocation(),
-      cwd,
-      env,
-      stdin: prompt,
-      timeoutSec,
-      graceSec,
-      onSpawn,
-      onRuntimeProgress: ctx.onRuntimeProgress,
-      onLog,
-      runLogTail: paperclipBridge?.runLogTail,
-      settleRunDisposition: paperclipBridge?.settleRunDisposition,
-      terminalResultCleanup: {
-        graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
-      },
-      localProcessSandbox,
-    });
+    const steering = liveInput
+      ? createClaudeSteeringSession({ runId, onSteeringReady: ctx.onSteeringReady, onEvent: ctx.onEvent })
+      : null;
+    let proc: RunProcessResult;
+    try {
+      proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+        onProcessStopped: providerStop.beginInvocation(),
+        cwd,
+        env,
+        stdin: steering ? claudeStreamJsonUserMessage(prompt) : prompt,
+        onStdinReady: steering?.attachStdin,
+        timeoutSec,
+        graceSec,
+        onSpawn,
+        onRuntimeProgress: ctx.onRuntimeProgress,
+        onLog: steering
+          ? async (stream, chunk) => {
+              try {
+                if (stream === "stdout") await steering.observeStdout(chunk);
+              } finally {
+                await onLog(stream, chunk);
+              }
+            }
+          : onLog,
+        runLogTail: paperclipBridge?.runLogTail,
+        settleRunDisposition: paperclipBridge?.settleRunDisposition,
+        terminalResultCleanup: {
+          graceMs: terminalResultCleanupGraceMs,
+          hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+          holdWhile: steering?.holdTerminalCleanup,
+        },
+        localProcessSandbox,
+      });
+    } finally {
+      steering?.close();
+    }
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);

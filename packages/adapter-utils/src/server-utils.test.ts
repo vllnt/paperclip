@@ -38,6 +38,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
+  type ChildProcessStdinWriter,
 } from "./server-utils.js";
 
 describe("runtime connection tool delivery", () => {
@@ -619,6 +620,128 @@ describe("runChildProcess", () => {
     expect(onSpawnCompletedAt).toBeGreaterThanOrEqual(startedAt + spawnDelayMs);
     expect(finishedAt - startedAt).toBeGreaterThanOrEqual(spawnDelayMs);
   });
+
+  it("keeps stdin open for a live writer until the caller ends it", async () => {
+    let writer: ChildProcessStdinWriter | null = null;
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>process.stdout.write('got:'+chunk));process.stdin.on('end',()=>process.stdout.write('eof'));",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "one\n",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async (_stream, chunk) => {
+          if (chunk.includes("got:one") && writer) {
+            expect(writer.write("two\n")).toBe(true);
+            writer.end();
+            expect(writer.ended).toBe(true);
+            expect(writer.write("three\n")).toBe(false);
+          }
+        },
+        onStdinReady: (ready) => {
+          writer = ready;
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("got:one");
+    expect(result.stdout).toContain("got:two");
+    expect(result.stdout).not.toContain("three");
+    expect(result.stdout.endsWith("eof")).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "holds terminal-result cleanup while the caller still expects output",
+    async () => {
+      let writer: ChildProcessStdinWriter | null = null;
+      let hold = true;
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          [
+            "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'first' })}\\n`);",
+            "process.stdin.setEncoding('utf8');",
+            "process.stdin.on('data', (chunk) => process.stdout.write(`${JSON.stringify({ type: 'result', result: chunk.trim() })}\\n`));",
+            "process.stdin.on('end', () => process.exit(0));",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          stdin: "",
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+          onStdinReady: (ready) => {
+            writer = ready;
+            // Release well after several cleanup grace periods have passed.
+            setTimeout(() => {
+              ready.write("second\n");
+              setTimeout(() => {
+                hold = false;
+                ready.end();
+              }, 50);
+            }, 400);
+          },
+          terminalResultCleanup: {
+            graceMs: 100,
+            hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
+            holdWhile: () => hold,
+          },
+        },
+      );
+
+      expect(writer).not.toBeNull();
+      expect(result.signal).toBeNull();
+      expect(result.exitCode).toBe(0);
+      expect(result.terminalResultCleanup).toBeNull();
+      expect(result.stdout).toContain('"result":"second"');
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still stops a lingering child once the cleanup hold ends",
+    async () => {
+      let hold = true;
+      setTimeout(() => {
+        hold = false;
+      }, 300);
+      const startedAt = Date.now();
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          "process.stdout.write(`${JSON.stringify({ type: 'result', result: 'done' })}\\n`); setInterval(() => {}, 1000);",
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+          terminalResultCleanup: {
+            graceMs: 50,
+            hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
+            holdWhile: () => hold,
+          },
+        },
+      );
+
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300);
+      expect(result.signal).toBe("SIGTERM");
+      expect(result.terminalResultCleanup).toMatchObject({ stopped: true, terminalResultSeen: true });
+    },
+  );
 
   it.skipIf(process.platform === "win32")(
     "kills descendant processes on timeout via the process group",

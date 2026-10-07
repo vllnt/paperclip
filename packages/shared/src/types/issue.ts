@@ -996,6 +996,12 @@ export interface IssueQueuedCommentEntry {
   position: number;
   canEdit: boolean;
   canDiscard: boolean;
+  /**
+   * `pending`: handed to the running process's live input, which takes it at
+   * its next tool boundary. It stays queued until the run acknowledges it, and
+   * goes back to plain queued if the run ends first.
+   */
+  steering?: "pending";
 }
 
 /**
