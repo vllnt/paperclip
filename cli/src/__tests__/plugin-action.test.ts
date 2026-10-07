@@ -83,6 +83,20 @@ describe("plugin action/data CLI commands", () => {
     );
   });
 
+  it("sends config:set as the configJson body the config route requires", async () => {
+    const configJson = { appId: "5203754", appSlug: "v-agents", appName: "v-agents", privateKey: { type: "secret_ref", secretId: "secret-id", version: "latest" } };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ configJson }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await program().parseAsync([
+      "plugin", "config:set", "vllnt.paperclip-github", "-C", COMPANY_ID,
+      "--payload-json", JSON.stringify({ configJson }), "--api-base", "http://localhost:3100", "--api-key", "board-token",
+    ], { from: "user" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://localhost:3100/api/plugins/vllnt.paperclip-github/config`,
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ configJson, companyId: COMPANY_ID }) }),
+    );
+  });
+
   it("reads params-file without putting the JSON on the command line payload", async () => {
     const paramsPath = path.join(dir, "owners.json");
     writeFileSync(paramsPath, JSON.stringify({ owners: ["vllnt", "maiaos", BNT_OWNER] }));

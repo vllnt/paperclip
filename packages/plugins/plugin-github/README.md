@@ -36,90 +36,99 @@ Normal repository operations use fresh installation tokens restricted to the sel
 
 ## Manage with the API/CLI
 
-Version 0.11.0 reads each company’s App ID and private-key reference from that
-company’s plugin config. State stores only the owner identity pins, disconnect
-flag and the instance App-ID registry. The `company-app.connect` action accepts
-only a secret ID and never accepts a PEM. Legacy login-only owner config fails
-closed until `allowed-owners.set` resolves and stores numeric GitHub account IDs.
-An empty owner list denies every installation and repository.
+Each company uses its own GitHub App. A company's plugin config names its App ID
+and a reference to the company secret holding the App's private key. The config
+alone grants nothing: `company-app.connect` verifies the key with GitHub and then
+reserves the App ID for that company in the instance registry. A company can use
+its App only while the registry reserves that App ID for it and it has not been
+disconnected. One App ID is never reserved for two companies, so a config that
+names another company's App fails closed. Upgrading from 0.10.1 therefore leaves
+every company disconnected until an instance administrator runs
+`company-app.connect` for it.
 
-The CLI calls the host bridge routes, so board authentication and company access
-are still enforced by Paperclip. Set `PAPERCLIP_API_URL` and
-`PAPERCLIP_API_KEY` in the environment before running these examples. Keep the
-private key in a file or secret manager and expose it to `secrets create` through
-`--value-env`, never as a command argument.
+Owner pins live in plugin state, written only by `allowed-owners.set`, which
+resolves each login to its numeric GitHub account ID through the company's App
+installations. Plugin config holds no owner list. An empty or legacy login-only
+owner list denies every installation and repository.
+
+Run the sequence below once with an instance administrator's board API key. It
+reads each private key from a file into an environment variable that only
+`secrets create --value-env` sees; command lines carry secret IDs, never keys.
 
 ```sh
-export PAPERCLIP_API_URL=https://paperclip.example.test
-export PAPERCLIP_API_KEY=board-token
-VLLNT_SECRET_ID="$(VLLNT_GITHUB_PRIVATE_KEY="$(cat /secure/v-agents.pem)" \
-  paperclipai secrets create \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec \
-  --name 'GitHub App v-agents private key' --provider local_encrypted \
-  --value-env VLLNT_GITHUB_PRIVATE_KEY --json | node -e 'let d="";process.stdin.on("data", c => d += c).on("end", () => process.stdout.write(JSON.parse(d).id))')"
-ANTHM_SECRET_ID="$(ANTHM_GITHUB_PRIVATE_KEY="$(cat /secure/anthm-agents.pem)" \
-  paperclipai secrets create \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf \
-  --name 'GitHub App anthm-agents private key' --provider local_encrypted \
-  --value-env ANTHM_GITHUB_PRIVATE_KEY --json | node -e 'let d="";process.stdin.on("data", c => d += c).on("end", () => process.stdout.write(JSON.parse(d).id))')"
+export PAPERCLIP_API_URL="${PAPERCLIP_API_URL:?Set the Paperclip URL}"
+export PAPERCLIP_API_KEY="${PAPERCLIP_API_KEY:?Set an instance-administrator board API key}"
+V_AGENTS_PEM="${V_AGENTS_PEM:?Set the path of the v-agents private key file}"
+ANTHM_AGENTS_PEM="${ANTHM_AGENTS_PEM:?Set the path of the anthm-agents private key file}"
+PLUGIN=vllnt.paperclip-github
+VLLNT=dc1d1a01-1c00-4a67-89f9-4efdde86c7ec
+ANTHM=2cae571f-5b44-4253-b73b-7700335a4ccf
+json_id() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).id))'; }
 
-# Persist only secret references and public App metadata so the host can authorize
-# the scheduled job after a worker restart. The action below verifies the key.
-paperclipai plugin config:set vllnt.paperclip-github \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec \
-  --payload-json "{\"appId\":\"5203754\",\"appSlug\":\"v-agents\",\"appName\":\"v-agents\",\"privateKey\":{\"type\":\"secret_ref\",\"secretId\":\"$VLLNT_SECRET_ID\",\"version\":\"latest\"}}" --json
-paperclipai plugin config:set vllnt.paperclip-github \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf \
-  --payload-json "{\"appId\":\"5203763\",\"appSlug\":\"anthm-agents\",\"appName\":\"anthm-agents\",\"privateKey\":{\"type\":\"secret_ref\",\"secretId\":\"$ANTHM_SECRET_ID\",\"version\":\"latest\"}}" --json
+# 1. Store each App private key as a company secret; keep only the secret ID.
+VLLNT_SECRET_ID="$(GITHUB_APP_PEM="$(cat "$V_AGENTS_PEM")" paperclipai secrets create -C "$VLLNT" \
+  --name 'GitHub App v-agents private key' --provider local_encrypted --value-env GITHUB_APP_PEM --json | json_id)"
+ANTHM_SECRET_ID="$(GITHUB_APP_PEM="$(cat "$ANTHM_AGENTS_PEM")" paperclipai secrets create -C "$ANTHM" \
+  --name 'GitHub App anthm-agents private key' --provider local_encrypted --value-env GITHUB_APP_PEM --json | json_id)"
 
-VLLNT_PARAMS="$(mktemp)"
-printf '{"appId":"5203754","privateKeySecretId":"%s"}\n' "$VLLNT_SECRET_ID" > "$VLLNT_PARAMS"
-paperclipai plugin action vllnt.paperclip-github company-app.connect \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-file "$VLLNT_PARAMS" --json
-rm -f "$VLLNT_PARAMS"
+# 2. Save each company's App config. config:set replaces the whole config and
+#    requires {"configJson": {...}}, so merge into the current config to keep
+#    settings such as a personal token or webhook secret reference.
+set_app_config() { # <companyId> <appId> <appSlug> <privateKeySecretId>
+  local current payload
+  current="$(paperclipai plugin config "$PLUGIN" -C "$1" --json)"
+  payload="$(CURRENT="$current" node -e '
+    const [appId, slug, secretId] = process.argv.slice(1);
+    const current = JSON.parse(process.env.CURRENT || "null")?.configJson ?? {};
+    process.stdout.write(JSON.stringify({ configJson: { ...current, appId, appSlug: slug, appName: slug,
+      privateKey: { type: "secret_ref", secretId, version: "latest" } } }));' "$2" "$3" "$4")"
+  paperclipai plugin config:set "$PLUGIN" -C "$1" --payload-json "$payload" --json
+}
+set_app_config "$VLLNT" 5203754 v-agents "$VLLNT_SECRET_ID"
+set_app_config "$ANTHM" 5203763 anthm-agents "$ANTHM_SECRET_ID"
 
-ANTHM_PARAMS="$(mktemp)"
-printf '{"appId":"5203763","privateKeySecretId":"%s"}\n' "$ANTHM_SECRET_ID" > "$ANTHM_PARAMS"
-paperclipai plugin action vllnt.paperclip-github company-app.connect \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-file "$ANTHM_PARAMS" --json
-rm -f "$ANTHM_PARAMS"
+# 3. Verify each key with GitHub and reserve each App ID for its company.
+paperclipai plugin action "$PLUGIN" company-app.connect -C "$VLLNT" \
+  --params-json "{\"appId\":\"5203754\",\"privateKeySecretId\":\"$VLLNT_SECRET_ID\"}" --json
+paperclipai plugin action "$PLUGIN" company-app.connect -C "$ANTHM" \
+  --params-json "{\"appId\":\"5203763\",\"privateKeySecretId\":\"$ANTHM_SECRET_ID\"}" --json
 
-paperclipai plugin action vllnt.paperclip-github company-app.status \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-json '{}' --json
-paperclipai plugin action vllnt.paperclip-github company-app.status \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-json '{}' --json
-
+# 4. Pin each company's GitHub owners to numeric account IDs. Install the
+#    company's App on each owner first.
 BNT_OWNER='bnt''vllnt' # shell concatenation yields the GitHub login
-paperclipai plugin action vllnt.paperclip-github allowed-owners.set \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec \
+paperclipai plugin action "$PLUGIN" allowed-owners.set -C "$VLLNT" \
   --params-json "{\"owners\":[\"vllnt\",\"maiaos\",\"$BNT_OWNER\"]}" --json
-paperclipai plugin action vllnt.paperclip-github allowed-owners.set \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf \
+paperclipai plugin action "$PLUGIN" allowed-owners.set -C "$ANTHM" \
   --params-json '{"owners":["Anthm-FR"]}' --json
 
-# allowed-owners.get is an action, so invoke it through `plugin action`.
-paperclipai plugin action vllnt.paperclip-github allowed-owners.get \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-json '{}' --json
-paperclipai plugin action vllnt.paperclip-github allowed-owners.get \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-json '{}' --json
+# 5. Expect "connection": "connected", the company's own App and its owners.
+for company in "$VLLNT" "$ANTHM"; do
+  paperclipai plugin action "$PLUGIN" company-app.status -C "$company" --params-json '{}' --json
+done
 
-paperclipai plugin action vllnt.paperclip-github repositories.list \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-json '{"refresh":true}' --json
-paperclipai plugin action vllnt.paperclip-github repositories.list \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-json '{"refresh":true}' --json
-
-paperclipai plugin action vllnt.paperclip-github sync.trigger \
-  -C dc1d1a01-1c00-4a67-89f9-4efdde86c7ec --params-json '{}' --json
-paperclipai plugin action vllnt.paperclip-github sync.trigger \
-  -C 2cae571f-5b44-4253-b73b-7700335a4ccf --params-json '{}' --json
+# 6. List the repositories each company can reach.
+for company in "$VLLNT" "$ANTHM"; do
+  paperclipai plugin action "$PLUGIN" repositories.list -C "$company" --params-json '{"refresh":true}' --json
+done
 ```
+
+A test runs this block verbatim against a stub CLI, so keep it runnable when
+editing it.
 
 The stable company-management action keys are:
 
-- `company-app.status`, `company-app.connect`, `company-app.disconnect`
-- `allowed-owners.get`, `allowed-owners.set` (GitHub logins are case-insensitive)
+- `company-app.status` returns `configured` and `connection`: `connected`,
+  `disconnected`, `not-configured` (no App config) or `not-connected` (config
+  saved, but `company-app.connect` has not reserved this App ID for the company).
+- `company-app.connect`, `company-app.disconnect`
+- `company-app.release` with `{"appId":"..."}` releases a reservation left by a
+  deleted or abandoned company. Its former owner, if it still exists, fails
+  closed until it connects again.
+- `allowed-owners.get`, `allowed-owners.set` (GitHub logins are case-insensitive;
+  both return the logins and the pinned `accounts` with numeric IDs)
 - `repositories.list` (returns only allowlisted owners)
 - `sync.trigger` (starts one company’s sync and returns its company ID)
+- `sync-status` reports `connection` without loading the private key.
 
 Invoke them with `paperclipai plugin action <pluginKey|pluginId> <actionKey>
 -C <companyId> [--params-json <json> | --params-file <path>]`. The generic
@@ -129,13 +138,24 @@ handlers. The equivalent host routes are
 `POST /api/plugins/:pluginId/actions/:key` and
 `POST /api/plugins/:pluginId/data/:key`, with body `{companyId, params}`.
 
-Mutating connection and allowlist actions require a board user who is an
-instance administrator. Status, owner reads, repository listing and sync
-triggering remain company-scoped; no action returns a private key, secret value
-or installation token. `company-app.disconnect` leaves the Paperclip secret in
-place so a later reconnect can reuse it, while releasing the App ID for another
-company; revoke the App or delete the secret separately when it should no longer
-be usable.
+Connection, release, allowlist and App-creation actions require a board user who
+is an instance administrator. Status, owner reads, repository listing and sync
+triggering remain company-scoped. No action returns a secret value or
+installation token, and only one returns a private key: `complete-setup` returns
+the private key of a newly created App once, to the instance administrator who
+created it, and the settings page immediately stores it as a company secret.
+`company-app.disconnect` leaves the Paperclip secret in place so a later
+reconnect can reuse it, while releasing the App ID for another company; revoke
+the App or delete the secret separately when it should no longer be usable.
+
+Scheduled sync and webhook routing read the connected companies from persisted
+plugin state on every run, so they keep working after a worker restart without a
+config replay. Plugin health reports how many companies are connected and says
+so explicitly when none is. Webhook delivery stays disabled on this Tailnet-only
+deployment. A request that does reach the endpoint is rejected with the same
+message unless its signature matches a connected company's webhook secret; only
+then does the plugin load that company's key and confirm the installation with
+its App.
 
 ## GitHub inside Tasks and Projects
 

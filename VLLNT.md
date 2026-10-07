@@ -108,8 +108,13 @@ from that layer so source-only builds do not invalidate its content.
 ## Bundled GitHub plugin
 
 `packages/plugins/plugin-github` is company-scoped: each company uses its own
-GitHub App and company secret reference. This Paperclip remains Tailnet-only;
-the plugin creates no public webhook route or Funnel, and GitHub webhook delivery
-is currently disabled. Scheduled polling is the supported synchronization path.
-Any unexpected webhook request fails closed unless its installation belongs to a
-configured company and that company has a configured secret whose HMAC matches.
+GitHub App and company secret reference, and `company-app.connect` reserves an
+App ID for exactly one company. The tested operator sequence for the vllnt
+(`v-agents`) and anthm (`anthm-agents`) companies is in
+[the plugin README](packages/plugins/plugin-github/README.md#manage-with-the-apicli).
+This Paperclip remains Tailnet-only; the plugin creates no public webhook route
+or Funnel, and GitHub webhook delivery is currently disabled. Scheduled polling
+is the supported synchronization path. Any unexpected webhook request is
+rejected with one uniform error, before any private key is loaded or GitHub is
+called, unless its HMAC matches a connected company's webhook secret; the
+installation is then confirmed with that company's App only.
