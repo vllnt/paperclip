@@ -9,7 +9,7 @@ vi.mock("@paperclipai/plugin-sdk/ui", () => ({ useHostContext: () => ({ userId: 
   useHostNavigation: () => ({ navigate: mocks.navigate, resolveHref: (p: string) => `/GIT${p}`, linkProps: (p: string) => ({ href: `/GIT${p}` }) }),
   usePluginAction: (key: string) => { if (!mocks.actions.has(key)) mocks.actions.set(key, vi.fn()); return mocks.actions.get(key); }
 }));
-vi.mock("../src/ui/api.js", () => ({ ensureCanConfigure: vi.fn(), hostApi: vi.fn(), saveConfiguration: vi.fn(), saveCredentials: vi.fn(async () => ({ appId: "12", appSlug: "", appName: "App" })) }));
+vi.mock("../src/ui/api.js", () => ({ ensureCanConfigure: vi.fn(), hostApi: vi.fn(), loadConfiguration: vi.fn(async () => ({})), saveConfiguration: vi.fn(), connectCompanyApp: vi.fn(), saveCredentials: vi.fn(async () => ({ appId: "12", appSlug: "", appName: "App" })) }));
 vi.mock("../src/ui/automation.js", () => ({ AutomationSettings: () => <div>Automations</div> }));
 vi.mock("../src/ui/connection-access.js", () => ({ ConnectionAccess: () => null }));
 vi.mock("../src/ui/task-detail.js", () => ({ TaskSyncDetail: ({ issueId }: any) => <div>Task sync {issueId}</div> }));

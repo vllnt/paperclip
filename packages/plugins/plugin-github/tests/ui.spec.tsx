@@ -68,30 +68,102 @@ describe("minimal setup UI", () => {
     action("catalog").mockResolvedValue({ app, installations: [], repositories: [], warnings: [], truncated: false });
     action("projects").mockResolvedValue({ projects: [], truncated: false });
     const fetcher = vi.fn().mockResolvedValueOnce(json({ deploymentMode: "local_trusted" })).mockResolvedValueOnce(json(null))
-      .mockResolvedValueOnce(json({ id: "s1" })).mockResolvedValueOnce(json({}));
+      .mockResolvedValueOnce(json({ id: "s1" })).mockResolvedValueOnce(json(null)).mockResolvedValueOnce(json({})).mockResolvedValueOnce(json({}));
     vi.stubGlobal("fetch", fetcher);
     render(<GitHubPage context={context} />);
     await screen.findByText("My App");
     await waitFor(() => expect(screen.queryByText("Working…")).toBeNull());
     expect(action("complete-setup")).toHaveBeenCalledWith({ companyId: "c1", code: "conversion-code", state: "valid-state", returnUrl });
     expect(fetcher.mock.calls[2][1].body).toContain("one-time-pem");
-    expect(fetcher.mock.calls[3][1].body).not.toContain("one-time-pem");
+    expect(fetcher.mock.calls[3][0]).toBe(`/api/plugins/${PLUGIN_ID}/config?companyId=c1`);
+    expect(fetcher.mock.calls[4][1].body).not.toContain("one-time-pem");
+    expect(fetcher.mock.calls[4][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
+    expect(fetcher.mock.calls[5][0]).toBe(`/api/plugins/${PLUGIN_ID}/actions/company-app.connect`);
     expect(sessionStorage.length).toBe(0);
     expect(document.body.textContent).not.toContain("one-time-pem");
     expect(window.location.search).toBe("");
   });
-  it("automatically resumes a saved vault reference after a config failure", async () => {
+  it("does not replay a saved vault reference automatically after reload", async () => {
     const config = { appId: "12", appName: app.name, appSlug: app.slug, privateKey: { type: "secret_ref", secretId: "s1", version: "latest" } };
     sessionStorage.setItem(`${PLUGIN_ID}:c1:u1:saved`, JSON.stringify(config));
-    const fetcher = vi.fn().mockResolvedValue(json({})); vi.stubGlobal("fetch", fetcher);
-    action("status").mockResolvedValue({ configured: true, app });
-    action("catalog").mockResolvedValue({ app, installations: [], repositories: [], warnings: [], truncated: false });
-    action("projects").mockResolvedValue({ projects: [], truncated: false });
+    const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
+    action("status").mockResolvedValue({ configured: false, app: null });
     render(<GitHubPage context={context} />);
-    await screen.findByText("My App");
-    expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(fetcher.mock.calls[0][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
+    await screen.findByRole("button", { name: "Create GitHub App" });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(action("company-app.connect")).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem(`${PLUGIN_ID}:c1:u1:saved`)).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry saving connection" })).toBeTruthy();
+  });
+  it("restores the previous config, including unrelated secrets, when the connect action fails", async () => {
+    const config = { appId: "12", appName: app.name, appSlug: app.slug, privateKey: { type: "secret_ref", secretId: "s1", version: "latest" } };
+    const previous = { appId: "9", appSlug: "old", appName: "Old", privateKey: { type: "secret_ref", secretId: "old-key", version: "latest" },
+      personalToken: { type: "secret_ref", secretId: "pat", version: "latest" }, personalLogin: "octo",
+      webhookSecret: { type: "secret_ref", secretId: "hook", version: "latest" } };
+    sessionStorage.setItem(`${PLUGIN_ID}:c1:u1:saved`, JSON.stringify(config));
+    action("status").mockResolvedValue({ configured: false, app: null });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(json({ companyId: "c1", configJson: previous }))
+      .mockResolvedValueOnce(json({}))
+      .mockResolvedValueOnce(json({ error: "connect failed" }, 502))
+      .mockResolvedValueOnce(json({}));
+    vi.stubGlobal("fetch", fetcher);
+    render(<GitHubPage context={context} />);
+    await screen.findByText(/waiting to be completed/);
+    fireEvent.click(screen.getByRole("button", { name: "Retry saving connection" }));
+    await screen.findByText(/could not save this change/);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(fetcher.mock.calls[0][0]).toBe(`/api/plugins/${PLUGIN_ID}/config?companyId=c1`);
+    expect(fetcher.mock.calls[1][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
+    // A different App never inherits the old App's webhook secret.
+    const { webhookSecret: _oldAppHook, ...unrelated } = previous;
+    expect(JSON.parse(fetcher.mock.calls[1][1].body).configJson).toEqual({ ...unrelated, ...config });
+    expect(fetcher.mock.calls[2][0]).toBe(`/api/plugins/${PLUGIN_ID}/actions/company-app.connect`);
+    expect(fetcher.mock.calls[3][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
+    expect(JSON.parse(fetcher.mock.calls[3][1].body).configJson).toEqual(previous);
+    expect(sessionStorage.getItem(`${PLUGIN_ID}:c1:u1:saved`)).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry saving connection" })).toBeTruthy();
+  });
+  it("keeps the webhook secret reference when reconnecting the same App", async () => {
+    const config = { appId: "12", appName: app.name, appSlug: app.slug, privateKey: { type: "secret_ref", secretId: "s2", version: "latest" } };
+    const previous = { appId: "12", appSlug: app.slug, appName: app.name, privateKey: { type: "secret_ref", secretId: "s1", version: "latest" },
+      webhookSecret: { type: "secret_ref", secretId: "hook", version: "latest" } };
+    sessionStorage.setItem(`${PLUGIN_ID}:c1:u1:saved`, JSON.stringify(config));
+    action("status").mockResolvedValue({ configured: false, app: null });
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ companyId: "c1", configJson: previous })).mockResolvedValueOnce(json({})).mockResolvedValueOnce(json({ error: "connect failed" }, 502)).mockResolvedValueOnce(json({}));
+    vi.stubGlobal("fetch", fetcher);
+    render(<GitHubPage context={context} />);
+    await screen.findByText(/waiting to be completed/);
+    fireEvent.click(screen.getByRole("button", { name: "Retry saving connection" }));
+    await screen.findByText(/could not save this change/);
+    expect(JSON.parse(fetcher.mock.calls[1][1].body).configJson).toEqual({ ...previous, ...config });
+  });
+  it("drops a stale saved setup when the company is already connected", async () => {
+    const config = { appId: "12", appName: app.name, appSlug: app.slug, privateKey: { type: "secret_ref", secretId: "s1", version: "latest" } };
+    sessionStorage.setItem(`${PLUGIN_ID}:c1:u1:saved`, JSON.stringify(config));
+    const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
+    action("status").mockResolvedValue({ configured: true, app });
+    action("catalog").mockResolvedValue({ app, installations: [{ id: 33, login: "acme" }], repositories: [repository], warnings: [], truncated: false });
+    render(<GitHubPage context={context} />);
+    await screen.findByText("Connected");
+    expect(screen.queryByRole("button", { name: "Retry saving connection" })).toBeNull();
+    expect(screen.queryByText(/waiting to be completed/)).toBeNull();
     expect(sessionStorage.getItem(`${PLUGIN_ID}:c1:u1:saved`)).toBeNull();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(action("company-app.connect")).not.toHaveBeenCalled();
+  });
+  it("disconnects through the company action without rewriting the plugin config", async () => {
+    action("status").mockResolvedValue({ configured: true, app });
+    action("catalog").mockResolvedValue({ app, installations: [{ id: 33, login: "acme" }], repositories: [repository], warnings: [], truncated: false });
+    action("company-app.disconnect").mockResolvedValue({ configured: false, app: null, allowedOwners: [] });
+    const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
+    render(<GitHubPage context={context} />);
+    await screen.findByText("Connected");
+    fireEvent.click(screen.getByRole("button", { name: "Disconnect…", hidden: true }));
+    fireEvent.click(screen.getByRole("button", { name: "Disconnect GitHub", hidden: true }));
+    await screen.findByRole("button", { name: "Create GitHub App" });
+    expect(action("company-app.disconnect")).toHaveBeenCalledWith({ companyId: "c1" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
   it("marks verified access green and separates destructive actions from their explanation", async () => {
     action("status").mockResolvedValue({ configured: true, app });

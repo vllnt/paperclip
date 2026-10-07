@@ -11,7 +11,7 @@ export async function hostApi<T>(path: string, method = "GET", body?: unknown): 
   }
   return res.status === 204 ? undefined as T : res.json();
 }
-export interface SavedApp { appId: string; appSlug: string; appName: string; privateKey: { type: "secret_ref"; secretId: string; version: "latest" } }
+export type SavedApp = { appId: string; appSlug: string; appName: string; privateKey: { type: "secret_ref"; secretId: string; version: "latest" } };
 export async function saveCredentials(companyId: string, credentials: Credentials): Promise<SavedApp> {
   const secret = await hostApi<{ id: string }>(`/companies/${encodeURIComponent(companyId)}/secrets`, "POST", {
     name: `GitHub App ${credentials.id} private key`, provider: "local_encrypted", value: credentials.privateKey,
@@ -20,9 +20,21 @@ export async function saveCredentials(companyId: string, credentials: Credential
   return { appId: credentials.id, appSlug: credentials.slug, appName: credentials.name,
     privateKey: { type: "secret_ref", secretId: secret.id, version: "latest" } };
 }
-export async function saveConfiguration(companyId: string, config: SavedApp | Record<string, never>) {
+export type PluginConfig = Record<string, unknown>;
+export async function loadConfiguration(companyId: string): Promise<PluginConfig> {
+  const saved = await hostApi<{ configJson?: PluginConfig } | null>(`/plugins/${PLUGIN_ID}/config?companyId=${encodeURIComponent(companyId)}`);
+  return saved?.configJson ?? {};
+}
+export async function saveConfiguration(companyId: string, config: PluginConfig) {
   await hostApi(`/plugins/${PLUGIN_ID}/config`, "POST", { companyId, configJson: config });
 }
+export async function connectCompanyApp(companyId: string, config: SavedApp) {
+  return hostApi(`/plugins/${PLUGIN_ID}/actions/company-app.connect`, "POST", {
+    companyId,
+    params: { appId: config.appId, privateKeySecretId: config.privateKey.secretId },
+  });
+}
+
 export async function ensureCanConfigure(companyId: string) {
   const health = await hostApi<{ deploymentMode: string }>("/health");
   if (health.deploymentMode !== "local_trusted") {

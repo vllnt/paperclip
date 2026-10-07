@@ -1,9 +1,24 @@
 import { createHash } from "node:crypto";
+import { normalizeAllowedOwnerRecords } from "./github.js";
+import type { AllowedOwner, Catalog, Installation, Repository } from "./contracts.js";
 import type { GitHubClient } from "./github.js";
 
-export type AppAuth = { id: string; pem: string };
+export type AppAuth = { id: string; pem: string; allowedOwners?: AllowedOwner[] };
 export type CacheInfo = { fetchedAt: string; expiresAt: string };
 type Entry = { companyId: string; expires: number; result: Promise<{ data: unknown; cache: CacheInfo }> };
+
+/** Defense in depth for mocked/stale provider results: never expose an owner outside the company allowlist. */
+export function filterCatalogByOwners(catalog: Catalog, allowedOwners: readonly AllowedOwner[]): Catalog {
+  const owners = normalizeAllowedOwnerRecords(allowedOwners);
+  const ids = new Set(owners.filter(owner => owner.id > 0).map(owner => owner.id));
+  const logins = new Set(owners.map(owner => owner.login.toLowerCase()));
+  const keep = (id: number | undefined, login: string) => ids.size ? (id !== undefined && ids.has(id)) : logins.has(login.toLowerCase());
+  return {
+    ...catalog,
+    installations: catalog.installations.filter((installation: Installation) => keep(installation.accountId, installation.login)),
+    repositories: catalog.repositories.filter((repository: Repository) => keep(repository.ownerId, repository.owner)),
+  };
+}
 
 /** Worker-local read cache. Never persists credentials or serves expired/error results. */
 export class GitHubReadCache {
@@ -33,6 +48,7 @@ export class GitHubReadCache {
     catch (error) { if (this.entries.get(key) === entry) this.entries.delete(key); throw error; }
   }
   async catalog(companyId: string, auth: AppAuth, github: GitHubClient, refresh = false) {
-    return (await this.read(companyId, auth, "catalog", () => github.catalog(auth.id, auth.pem), refresh)).data;
+    const result = (await this.read(companyId, auth, "catalog", () => github.catalog(auth.id, auth.pem, auth.allowedOwners ?? []), refresh)).data;
+    return auth.allowedOwners === undefined ? result : filterCatalogByOwners(result, auth.allowedOwners);
   }
 }

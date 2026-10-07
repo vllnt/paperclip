@@ -1,5 +1,47 @@
 import { createPrivateKey, sign } from "node:crypto";
-import type { AppIdentity, Catalog, Credentials, GitHubIssue, IssuePage, Repository } from "./contracts.js";
+import type { AllowedOwner, AppIdentity, Catalog, Credentials, GitHubIssue, IssuePage, Repository } from "./contracts.js";
+
+const ownerPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+
+/** Validate an operator-provided GitHub owner allowlist without silently broadening it. */
+export function validateAllowedOwners(value: unknown): string[] {
+  if (!Array.isArray(value)) throw new Error("Allowed owners must be an array of GitHub logins or organization names.");
+  if (value.length > 100) throw new Error("Allow at most 100 GitHub owners.");
+  const owners = new Map<string, string>();
+  for (const item of value) {
+    if (typeof item !== "string") throw new Error("Each allowed owner must be a GitHub login or organization name.");
+    const owner = item.trim();
+    if (!ownerPattern.test(owner)) throw new Error(`Invalid GitHub owner: ${owner || "(empty)"}.`);
+    owners.set(owner.toLowerCase(), owner);
+  }
+  return [...owners.values()];
+}
+
+export function ownerFromRepository(fullName: string): string {
+  return fullName.split("/", 1)[0]?.toLowerCase() ?? "";
+}
+
+/** Normalize persisted owner identities. A zero ID is accepted only for direct
+ * legacy client calls; company state written by allowed-owners.set always pins
+ * a positive GitHub account ID. */
+export function normalizeAllowedOwnerRecords(value: unknown): AllowedOwner[] {
+  if (!Array.isArray(value)) return [];
+  const owners = new Map<string, AllowedOwner>();
+  for (const item of value) {
+    if (typeof item === "string") {
+      const login = item.trim();
+      if (ownerPattern.test(login)) owners.set(login.toLowerCase(), { id: 0, login });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const login = typeof record.login === "string" ? record.login.trim() : "";
+    const id = record.id;
+    if (!ownerPattern.test(login) || !Number.isSafeInteger(id) || Number(id) < 0) continue;
+    owners.set(login.toLowerCase(), { id: Number(id), login });
+  }
+  return [...owners.values()];
+}
 
 export class GitHubError extends Error {
   constructor(public status: number) {
@@ -104,17 +146,62 @@ export class GitHubClient {
     }
     return data.data;
   }
-  async catalog(id: string, pem: string): Promise<Catalog> {
+  async resolveOwners(id: string, pem: string, requested: readonly string[]): Promise<AllowedOwner[]> {
+    const wanted = validateAllowedOwners(requested);
+    if (!wanted.length) return [];
+    const byLogin = new Map<string, AllowedOwner>();
+    const jwt = appJwt(id, pem);
+    for (let page = 1; page <= 10; page++) {
+      const response = await this.request<any[]>(`/app/installations?per_page=100&page=${page}`, jwt);
+      for (const row of response.data) {
+        const login = typeof row.account?.login === "string" ? row.account.login : "";
+        const accountId = row.account?.id;
+        if (login && Number.isSafeInteger(accountId) && Number(accountId) > 0) {
+          byLogin.set(login.toLowerCase(), { id: Number(accountId), login });
+        }
+      }
+      if (!response.next) break;
+    }
+    return wanted.map(login => {
+      const owner = byLogin.get(login.toLowerCase());
+      if (!owner) throw new Error(`GitHub owner ${login} is not installed on this App. Install the App first, then retry.`);
+      return owner;
+    });
+  }
+
+  /** Identify a webhook installation without applying the repository owner allowlist. */
+  async hasInstallation(id: string, pem: string, installationId: number): Promise<boolean> {
+    if (!Number.isSafeInteger(installationId) || installationId < 1) return false;
+    const jwt = appJwt(id, pem);
+    for (let page = 1; page <= 10; page++) {
+      const response = await this.request<any[]>(`/app/installations?per_page=100&page=${page}`, jwt);
+      if (response.data.some(row => Number.isSafeInteger(row?.id) && row.id === installationId)) return true;
+      if (!response.next) return false;
+    }
+    return false;
+  }
+
+  async catalog(id: string, pem: string, allowedOwners: readonly (string | AllowedOwner)[] = []): Promise<Catalog> {
+    const owners = normalizeAllowedOwnerRecords(allowedOwners);
+    const ownerIds = new Set(owners.filter(owner => owner.id > 0).map(owner => owner.id));
+    const ownerLogins = new Set(owners.map(owner => owner.login.toLowerCase()));
     const jwt = appJwt(id, pem);
     const { data } = await this.request<any>("/app", jwt);
     const app = identity(data);
     if (app.id !== id) throw new Error("The GitHub App identity changed. Reconnect the App.");
     const result: Catalog = { app, installations: [], repositories: [], warnings: [], truncated: false };
+    if (!owners.length) {
+      result.warnings.push("No GitHub owners are allowlisted for this company. Add at least one owner in GitHub connection settings.");
+      return result;
+    }
     for (let page = 1; page <= 10; page++) {
       const response = await this.request<any[]>(`/app/installations?per_page=100&page=${page}`, jwt);
       for (const row of response.data) {
         if (!Number.isSafeInteger(row.id) || !row.account?.login) continue;
-        const installation = { id: row.id, login: String(row.account.login), suspended: !!row.suspended_at, issuesWrite: row.permissions?.issues === "write", permissions: row.permissions ?? {}, accountType: row.account.type === "Organization" ? "Organization" as const : "User" as const,
+        const login = String(row.account.login);
+        const accountId = Number.isSafeInteger(row.account.id) && row.account.id > 0 ? Number(row.account.id) : undefined;
+        if (ownerIds.size ? !accountId || !ownerIds.has(accountId) : !ownerLogins.has(login.toLowerCase())) continue;
+        const installation = { accountId, id: row.id, login, suspended: !!row.suspended_at, issuesWrite: row.permissions?.issues === "write", permissions: row.permissions ?? {}, accountType: row.account.type === "Organization" ? "Organization" as const : "User" as const,
           settingsUrl: `https://github.com/${row.account.type === "Organization" ? `organizations/${encodeURIComponent(row.account.login)}/settings` : "settings"}/installations/${row.id}` };
         result.installations.push(installation);
       }
@@ -129,9 +216,10 @@ export class GitHubClient {
           const response = await this.request<{ repositories: any[] }>(`/installation/repositories?per_page=100&page=${page}`, token);
           for (const row of response.data.repositories) {
             const fullName = repoName(row.html_url);
-            if (fullName && Number.isSafeInteger(row.id)) result.repositories.push({
+            const ownerMatches = ownerIds.size ? ownerIds.has(installation.accountId ?? -1) : ownerLogins.has(ownerFromRepository(fullName ?? ""));
+            if (fullName && ownerMatches && Number.isSafeInteger(row.id)) result.repositories.push({
               id: row.id, name: String(row.name), fullName, url: `https://github.com/${fullName}`,
-              installationId: installation.id, owner: installation.login, private: !!row.private, issuesWrite: installation.issuesWrite, permissions: installation.permissions
+              installationId: installation.id, owner: installation.login, ownerId: installation.accountId, private: !!row.private, issuesWrite: installation.issuesWrite, permissions: installation.permissions
             });
           }
           if (!response.next) break;

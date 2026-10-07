@@ -1,5 +1,5 @@
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { Command, Option } from "commander";
 import {
   scaffoldPluginProject,
@@ -85,6 +85,8 @@ interface PluginInitOptions extends BaseClientOptions {
 
 interface PluginJsonOptions extends BaseClientOptions {
   payloadJson?: string;
+  paramsJson?: string;
+  paramsFile?: string;
 }
 
 interface PluginStreamOptions extends BaseClientOptions {
@@ -708,8 +710,8 @@ export function registerPluginCommands(program: Command): void {
         }
       }),
   );
-  addPluginKeyPost(plugin, "data", "Get plugin URL-keyed data", "data");
-  addPluginKeyPost(plugin, "action", "Invoke plugin URL-keyed action", "actions");
+  addPluginBridgeKeyPost(plugin, "data", "Get plugin URL-keyed data", "data");
+  addPluginBridgeKeyPost(plugin, "action", "Invoke plugin URL-keyed action", "actions");
   addPluginLocalFolderGet(plugin, "local-folders", "List plugin local folder bindings");
   addPluginLocalFolderKeyGet(plugin, "local-folder:status", "Get plugin local folder status", "status");
   addPluginLocalFolderKeyPost(plugin, "local-folder:validate", "Validate plugin local folder binding", "validate");
@@ -833,14 +835,70 @@ function addPluginJobPost(parent: Command, name: string, description: string, su
 }
 
 function addPluginKeyPost(parent: Command, name: string, description: string, suffix: string): void {
-  addCommonClientOptions(parent.command(name).description(description).argument("<pluginId>", "Plugin ID or key").argument("<key>", "Endpoint or data/action key").option("--payload-json <json>", "JSON payload", "{}").action(async (pluginId: string, key: string, opts: PluginJsonOptions) => {
-    try {
-      const ctx = resolveCommandContext(opts);
-      printOutput(await ctx.api.post(`/api/plugins/${encodeURIComponent(pluginId)}/${suffix}/${encodeURIComponent(key)}`, parseJson(opts.payloadJson ?? "{}")), { json: ctx.json });
-    } catch (err) {
-      handleCommandError(err);
-    }
-  }));
+  addCommonClientOptions(
+    parent
+      .command(name)
+      .description(description)
+      .argument("<pluginId>", "Plugin ID or key")
+      .argument("<key>", "Endpoint or data/action key")
+      .option("--payload-json <json>", "JSON payload", "{}")
+      .action(async (pluginId: string, key: string, opts: PluginJsonOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          printOutput(
+            await ctx.api.post(
+              `/api/plugins/${encodeURIComponent(pluginId)}/${suffix}/${encodeURIComponent(key)}`,
+              parseJson(opts.payloadJson ?? "{}"),
+            ),
+            { json: ctx.json },
+          );
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+}
+
+function addPluginBridgeKeyPost(parent: Command, name: string, description: string, suffix: string): void {
+  addCommonClientOptions(
+    parent
+      .command(name)
+      .description(description)
+      .argument("<pluginId>", "Plugin ID or key")
+      .argument("<key>", "Endpoint or data/action key")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .option("--params-json <json>", "JSON action/data params")
+      .option("--params-file <path>", "Read JSON action/data params from a file")
+      .option("--payload-json <json>", "Legacy complete request body", "{}")
+      .action(async (pluginId: string, key: string, opts: PluginCompanyOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const hasParams = opts.paramsJson !== undefined || opts.paramsFile !== undefined;
+          const payload = parseJson(opts.payloadJson ?? "{}");
+          if (!hasParams && payload && typeof payload === "object" && !Array.isArray(payload)
+            && "companyId" in payload && (payload as Record<string, unknown>).companyId !== ctx.companyId) {
+            throw new Error("payload companyId must match --company-id.");
+          }
+          const body = hasParams
+            ? { companyId: ctx.companyId, params: readPluginParams(opts) }
+            : (payload && typeof payload === "object" && !Array.isArray(payload)
+              ? { ...(payload as Record<string, unknown>), ...("companyId" in payload ? {} : { companyId: ctx.companyId }) }
+              : payload);
+          printOutput(await ctx.api.post(`/api/plugins/${encodeURIComponent(pluginId)}/${suffix}/${encodeURIComponent(key)}`, body), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+}
+
+function readPluginParams(opts: PluginJsonOptions): Record<string, unknown> {
+  if (opts.paramsJson !== undefined && opts.paramsFile !== undefined) throw new Error("Use only one of --params-json or --params-file.");
+  const raw = opts.paramsFile !== undefined ? readFileSync(opts.paramsFile, "utf8") : (opts.paramsJson ?? "{}");
+  const value = parseJson(raw);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Plugin params must be a JSON object.");
+  return value as Record<string, unknown>;
 }
 
 function addPluginLocalFolderGet(parent: Command, name: string, description: string): void {

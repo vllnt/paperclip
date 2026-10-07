@@ -744,6 +744,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         agentId: null,
         runId: null,
         companyId: null,
+        isInstanceAdmin: true,
       },
       renderEnvironment: null,
     });

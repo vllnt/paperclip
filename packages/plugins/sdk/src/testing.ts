@@ -612,6 +612,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       agentId: stringOrNull(actorInput?.agentId),
       runId: stringOrNull(actorInput?.runId),
       companyId,
+      ...(actorInput?.isInstanceAdmin === true ? { isInstanceAdmin: true } : {}),
     });
     return Object.freeze({ actor, companyId });
   }

@@ -2,14 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
+import { seedConnection } from "./connection.js";
 import { GitHubClient, GitHubError } from "../src/github.js";
 import { matchingRule, mergeSnapshots, validateSettings } from "../src/sync.js";
 import type { AutomationRule, GitHubIssue } from "../src/contracts.js";
 const companyId = "c1";
 const actor = { companyId, actor: { type: "user" as const, userId: "u1", companyId, agentId: null, runId: null } };
-const repo = { id: 22, name: "repo", fullName: "org/repo", url: "https://github.com/org/repo", installationId: 33, owner: "org", private: true, issuesWrite: true };
+const repo = { id: 22, name: "repo", fullName: "org/repo", ownerId: 1, url: "https://github.com/org/repo", installationId: 33, owner: "org", private: true, issuesWrite: true };
 const issue = (id: number, patch: Partial<GitHubIssue> = {}): GitHubIssue => ({ id, number: id, title: `Issue ${id}`, body: "Description", state: "open", stateReason: null, labels: ["bug"], assignees: ["alex"], url: `${repo.url}/issues/${id}`, repository: repo.fullName, updatedAt: "2026-10-04T12:00:00Z", ...patch });
-function fixture() {
+async function fixture() {
   const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "key" } } });
   vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("fixture-pem");
   h.seed({ projects: [{ id: "p1", companyId, name: "One" }, { id: "p2", companyId, name: "Two" }] as any,
@@ -27,6 +28,7 @@ function fixture() {
       ...(input.state ? { state: input.state, stateReason: input.state_reason } : {}), updatedAt: "2026-10-04T12:01:00Z" };
     remote.set(number, next); return next;
   });
+  await seedConnection(h, companyId, "12");
   const service = register(h.ctx, client);
   const native = () => h.ctx.issues.list({ companyId });
   return { h, client, service, remote, list, create, update, get, catalog, native };
@@ -36,20 +38,20 @@ const rule: AutomationRule = { id: "route-alex", name: "Alex to Engineer", enabl
 
 describe("native GitHub task sync", () => {
   it("classifies pull request issue comments as PRs and check runs refresh the linked PR task", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.h.seed({ companies: [{ id: companyId, name: "Company", issuePrefix: "C", issueCounter: 1, status: "active" }] as any });
     const pull = issue(7, { title: "PR seven", url: `${repo.url}/pull/7` });
     const issueComment = { ...pull, pull_request: { url: `${repo.url}/pulls/7` } };
-    const commentResult = await f.service.handleWebhook({ headers: { "x-github-delivery": "delivery-comment" }, requestId: "delivery-comment", parsedBody: { action: "created", repository: { id: repo.id }, issue: issueComment } });
+    const commentResult = await f.service.handleWebhook({ companyId, headers: { "x-github-delivery": "delivery-comment" }, requestId: "delivery-comment", parsedBody: { action: "created", repository: { id: repo.id }, issue: issueComment } });
 expect(commentResult?.kind).toBe("pull");
     expect((await f.native()).every(task => task.originKind !== "plugin:vllnt.paperclip-github:issue")).toBe(true);
     f.get.mockResolvedValue(pull);
-    const checkResult = await f.service.handleWebhook({ headers: { "x-github-delivery": "delivery-check" }, requestId: "delivery-check", parsedBody: { action: "completed", repository: { id: repo.id }, check_run: { check_suite: { pull_requests: [{ number: 7 }] } } } });
+    const checkResult = await f.service.handleWebhook({ companyId, headers: { "x-github-delivery": "delivery-check" }, requestId: "delivery-check", parsedBody: { action: "completed", repository: { id: repo.id }, check_run: { check_suite: { pull_requests: [{ number: 7 }] } } } });
     expect(checkResult?.kind).toBe("pull");
     expect(checkResult?.taskId).toBeTruthy();
   });
   it("imports open issues as Todo and closed issues as Done/Cancelled once across projects and concurrent syncs", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.remote.set(2, issue(2, { state: "closed", stateReason: "completed", title: "Same title" }));
     f.remote.set(3, issue(3, { state: "closed", stateReason: "not_planned", title: "Same title" }));
     await Promise.all([f.service.sync(companyId), f.service.sync(companyId)]);
@@ -60,7 +62,7 @@ expect(commentResult?.kind).toBe("pull");
     expect(f.update).not.toHaveBeenCalled();
   });
   it("walks all pages, including empty pages, and preserves other repositories after a partial failure", async () => {
-    const f = fixture();
+    const f = await fixture();
     f.list.mockImplementation(async (_id, _pem, _repo, page) => ({ issues: page === 1 ? [] : [issue(2)], nextPage: page === 1 ? 2 : null, repository: repo.fullName }));
     await f.service.sync(companyId);
     expect(await f.native()).toHaveLength(1);
@@ -71,7 +73,7 @@ expect(commentResult?.kind).toBe("pull");
     expect(await f.native()).toHaveLength(1);
   });
   it("syncs edits in both directions, preserves in-progress statuses, and does not echo writes", async () => {
-    const f = fixture(); await f.service.sync(companyId); const [native] = await f.native();
+    const f = await fixture(); await f.service.sync(companyId); const [native] = await f.native();
     await f.h.ctx.issues.update(native.id, { title: "Local title", status: "in_progress" }, companyId);
     f.remote.set(1, issue(1, { body: "Remote body" }));
     await f.service.sync(companyId);
@@ -84,7 +86,7 @@ expect(commentResult?.kind).toBe("pull");
     expect((await f.native())[0].status).toBe("todo");
   });
   it("reports competing edits and resolves the chosen version explicitly", async () => {
-    const f = fixture(); await f.service.sync(companyId); const [native] = await f.native();
+    const f = await fixture(); await f.service.sync(companyId); const [native] = await f.native();
     await f.h.ctx.issues.update(native.id, { title: "Local" }, companyId); f.remote.set(1, issue(1, { title: "Remote" }));
     expect((await f.service.sync(companyId))?.warnings[0]).toContain("Conflicting title");
     expect((await f.native())[0].title).toBe("Local"); expect(f.update).not.toHaveBeenCalled();
@@ -92,7 +94,7 @@ expect(commentResult?.kind).toBe("pull");
     expect((await f.native())[0].title).toBe("Remote");
   });
   it("keeps pending native edits when GitHub denies write access and recovers after access returns", async () => {
-    const f = fixture(); await f.service.sync(companyId); const [native] = await f.native();
+    const f = await fixture(); await f.service.sync(companyId); const [native] = await f.native();
     await f.h.ctx.issues.update(native.id, { title: "Local" }, companyId);
     f.update.mockRejectedValueOnce(new GitHubError(403));
     expect((await f.service.sync(companyId))?.warnings[0]).toContain("denied");
@@ -100,26 +102,26 @@ expect(commentResult?.kind).toBe("pull");
     await f.service.sync(companyId); expect(f.remote.get(1)?.title).toBe("Local");
   });
   it("defers incoming changes while an agent holds the task", async () => {
-    const f = fixture(); await f.service.sync(companyId); const [native] = await f.native();
+    const f = await fixture(); await f.service.sync(companyId); const [native] = await f.native();
     f.h.seed({ issues: [{ ...native, checkoutRunId: "run" }] }); f.remote.set(1, issue(1, { title: "Later" }));
     expect((await f.service.sync(companyId))?.warnings[0]).toContain("agent is working");
     expect((await f.native())[0].title).toBe("Issue 1");
   });
   it("recovers the native creation receipt after a state-write crash", async () => {
-    const f = fixture(), save = f.h.ctx.state.set;
+    const f = await fixture(), save = f.h.ctx.state.set;
     const failing = vi.spyOn(f.h.ctx.state, "set").mockImplementation(async (key, value) => { if (key.stateKey === "link:1") throw new Error("Simulated storage failure"); return save(key, value); });
     await f.service.sync(companyId); expect(await f.native()).toHaveLength(1);
     failing.mockRestore(); await f.service.sync(companyId); expect(await f.native()).toHaveLength(1);
   });
   it("stops syncing a task moved to a project without this repository", async () => {
-    const f = fixture(); await f.service.sync(companyId); const [native] = await f.native();
+    const f = await fixture(); await f.service.sync(companyId); const [native] = await f.native();
     f.h.seed({ issues: [{ ...native, projectId: null, title: "Private local edit" }] });
     const report = await f.service.sync(companyId);
     expect(f.update).not.toHaveBeenCalled();
     expect(report?.warnings.join(" ")).toContain("no longer linked");
   });
   it("rechecks a changed issue before writing when the repository listing is stale", async () => {
-    const f = fixture(); await f.service.sync(companyId); const [native] = await f.native();
+    const f = await fixture(); await f.service.sync(companyId); const [native] = await f.native();
     await f.h.ctx.issues.update(native.id, { title: "Local" }, companyId);
     f.remote.set(1, issue(1, { title: "Remote changed after listing" }));
     f.list.mockResolvedValue({ issues: [issue(1)], nextPage: null, repository: repo.fullName });
@@ -128,7 +130,7 @@ expect(commentResult?.kind).toBe("pull");
     expect(report?.warnings.join(" ")).toContain("Conflicting title");
   });
   it("pauses background work and never reads a foreign task before resolving credentials", async () => {
-    const f = fixture(); await f.h.ctx.state.set(settingsKey, { enabled: false, rules: [] });
+    const f = await fixture(); await f.h.ctx.state.set(settingsKey, { enabled: false, rules: [] });
     expect(await f.service.sync(companyId)).toBeNull(); expect(f.catalog).not.toHaveBeenCalled();
     const foreign = await f.h.ctx.issues.create({ companyId: "c2", title: "Foreign", projectId: "p1" });
     await expect(f.h.performAction("publish-task", { issueId: foreign.id, destinationId: "22" }, actor)).rejects.toThrow();
@@ -139,7 +141,7 @@ expect(commentResult?.kind).toBe("pull");
 
 describe("publication and automation", () => {
   it("creates and links one GitHub issue, retaining a hidden receipt through subsequent edits", async () => {
-    const f = fixture(); const native = await f.h.ctx.issues.create({ companyId, projectId: "p1", title: "Created here" });
+    const f = await fixture(); const native = await f.h.ctx.issues.create({ companyId, projectId: "p1", title: "Created here" });
     await f.h.performAction("publish-task", { issueId: native.id, destinationId: "22" }, actor);
     await f.h.performAction("publish-task", { issueId: native.id, destinationId: "22" }, actor);
     await f.service.sync(companyId); expect(f.create).toHaveBeenCalledTimes(1); expect(await f.native()).toHaveLength(2);
@@ -149,7 +151,7 @@ describe("publication and automation", () => {
     expect((await f.native()).find(i => i.id === native.id)?.description).not.toContain("<!--");
   });
   it("recovers a successful GitHub POST whose response was lost without posting twice", async () => {
-    const f = fixture(); const native = await f.h.ctx.issues.create({ companyId, projectId: "p1", title: "Created here" });
+    const f = await fixture(); const native = await f.h.ctx.issues.create({ companyId, projectId: "p1", title: "Created here" });
     f.create.mockImplementationOnce(async (_id, _pem, _repo, input) => { f.remote.set(50, issue(50, input)); throw new Error("Response lost"); });
     const result = await f.h.performAction<any>("publish-task", { issueId: native.id, destinationId: "22" }, actor);
     expect(result.warning).toContain("Response lost");
@@ -157,14 +159,14 @@ describe("publication and automation", () => {
     expect((await f.h.ctx.issues.get(native.id, companyId))?.originId).toBe("50");
   });
   it("does not repost when a creation result is unknown, and retries definitive denials safely", async () => {
-    const f = fixture(); const native = await f.h.ctx.issues.create({ companyId, projectId: "p1", title: "Unknown" });
+    const f = await fixture(); const native = await f.h.ctx.issues.create({ companyId, projectId: "p1", title: "Unknown" });
     f.create.mockRejectedValueOnce(new GitHubError(403)); await f.h.performAction("publish-task", { issueId: native.id, destinationId: "22" }, actor);
     f.create.mockRejectedValueOnce(new Error("Timeout")); await f.service.sync(companyId); await f.service.sync(companyId);
     expect(f.create).toHaveBeenCalledTimes(2);
     expect((await f.service.sync(companyId))?.warnings.join(" ")).toContain("unconfirmed");
   });
   it("uses first matching rule, wakes once, and preserves manual routing until the match changes", async () => {
-    const f = fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup").mockResolvedValue({} as any);
+    const f = await fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup").mockResolvedValue({} as any);
     await f.h.ctx.state.set(settingsKey, { enabled: true, rules: [rule, { ...rule, id: "second", then: { status: "backlog" } }] });
     await f.service.sync(companyId); const [native] = await f.native();
     expect(native).toMatchObject({ assigneeAgentId: "a1", assigneeUserId: null, status: "todo", priority: "high" }); expect(wake).toHaveBeenCalledTimes(1);
@@ -175,14 +177,14 @@ describe("publication and automation", () => {
     expect((await f.native())[0].status).toBe("todo"); expect(wake).toHaveBeenCalledTimes(2);
   });
   it("retries failed wakeups with the same idempotency key and rejects foreign agents", async () => {
-    const f = fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup").mockRejectedValueOnce(new Error("Host unavailable")).mockResolvedValue({} as any);
+    const f = await fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup").mockRejectedValueOnce(new Error("Host unavailable")).mockResolvedValue({} as any);
     await f.h.ctx.state.set(settingsKey, { enabled: true, rules: [rule] });
     await f.service.sync(companyId); await f.service.sync(companyId);
     expect(wake).toHaveBeenCalledTimes(2); expect(wake.mock.calls[0][2]?.idempotencyKey).toBe(wake.mock.calls[1][2]?.idempotencyKey);
     await expect(f.h.performAction("save-sync-settings", { settings: { enabled: true, rules: [{ ...rule, then: { agentId: "foreign" } }] } }, actor)).rejects.toThrow("company");
   });
   it("routes closed issues without reopening them or waking agents", async () => {
-    const f = fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup");
+    const f = await fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup");
     f.remote.set(1, issue(1, { state: "closed", stateReason: "completed" }));
     await f.h.ctx.state.set(settingsKey, { enabled: true, rules: [rule] });
     await f.service.sync(companyId);
@@ -190,7 +192,7 @@ describe("publication and automation", () => {
     expect(wake).not.toHaveBeenCalled();
   });
   it.each(["closed", "unmatched", "reassigned"])("cancels a failed wake when the task becomes %s", async (change) => {
-    const f = fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup").mockRejectedValueOnce(new Error("Host unavailable")).mockResolvedValue({} as any);
+    const f = await fixture(); const wake = vi.spyOn(f.h.ctx.issues, "requestWakeup").mockRejectedValueOnce(new Error("Host unavailable")).mockResolvedValue({} as any);
     await f.h.ctx.state.set(settingsKey, { enabled: true, rules: [rule] });
     await f.service.sync(companyId); const [native] = await f.native();
     if (change === "closed") f.remote.set(1, issue(1, { state: "closed", stateReason: "completed" }));

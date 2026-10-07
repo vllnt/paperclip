@@ -1,6 +1,6 @@
 # GitHub for Paperclip
 
-A fork-bundled plugin in `vllnt/paperclip` (`packages/plugins/plugin-github`) using **your own GitHub App**, independent of Paperclip Cloud. Version **0.10.1** makes Paperclip the working surface for the full issue-to-PR loop: GitHub issues become native tasks, agents can work and use GitHub tools, Paperclip can fan out multiple review agents, and approved PRs can be reviewed, merged or auto-merged from Paperclip. New Task can create a linked GitHub issue. GitHub remains the source of truth; Paperclip is the control and execution surface.
+A fork-bundled plugin in `vllnt/paperclip` (`packages/plugins/plugin-github`) using **your own GitHub App**, independent of Paperclip Cloud. Version **0.11.0** makes Paperclip the working surface for the full issue-to-PR loop: GitHub issues become native tasks, agents can work and use GitHub tools, Paperclip can fan out multiple review agents, and approved PRs can be reviewed, merged or auto-merged from Paperclip. New Task can create a linked GitHub issue. GitHub remains the source of truth; Paperclip is the control and execution surface.
 
 ## Install and connect
 
@@ -32,7 +32,132 @@ For Apps created by earlier versions: open the permission links on the plugin pa
 | Commit statuses | Read | PR status contexts |
 | Organization Projects | Read and write | Organization Projects v2 |
 
-Normal repository operations use fresh installation tokens restricted to the selected repository and required permission. Issue transfers include both accessible repositories in the same installation; organization Projects use an installation token with the permissions needed for project items. The normal setup needs no copied PEM, installation ID, OAuth secret or webhook tunnel when Paperclip is public over HTTPS: the generated App subscribes to issue, PR, review, comment and check events. Localhost remains polling-only because GitHub cannot reach a loopback URL. The advanced existing-App form accepts an App ID and PEM.
+Normal repository operations use fresh installation tokens restricted to the selected repository and required permission. Issue transfers include both accessible repositories in the same installation; organization Projects use an installation token with the permissions needed for project items. This Paperclip deployment is Tailnet-only: setup leaves GitHub webhook delivery disabled, creates no public route or Funnel, and scheduled polling is the event path. The advanced existing-App form accepts an App ID and PEM.
+
+## Manage with the API/CLI
+
+Each company uses its own GitHub App. A company's plugin config names its App ID
+and a reference to the company secret holding the App's private key. The config
+alone grants nothing: `company-app.connect` verifies the key with GitHub and then
+reserves the App ID for that company in the instance registry. A company can use
+its App only while the registry reserves that App ID for it and it has not been
+disconnected. One App ID is never reserved for two companies, so a config that
+names another company's App fails closed. Upgrading from 0.10.1 therefore leaves
+every company disconnected until an instance administrator runs
+`company-app.connect` for it.
+
+Owner pins live in plugin state, written only by `allowed-owners.set`, which
+resolves each login to its numeric GitHub account ID through the company's App
+installations. Plugin config holds no owner list. An empty or legacy login-only
+owner list denies every installation and repository.
+
+Run the sequence below once with an instance administrator's board API key. It
+reads each private key from a file into an environment variable that only
+`secrets create --value-env` sees; command lines carry secret IDs, never keys.
+
+```sh
+export PAPERCLIP_API_URL="${PAPERCLIP_API_URL:?Set the Paperclip URL}"
+export PAPERCLIP_API_KEY="${PAPERCLIP_API_KEY:?Set an instance-administrator board API key}"
+V_AGENTS_PEM="${V_AGENTS_PEM:?Set the path of the v-agents private key file}"
+ANTHM_AGENTS_PEM="${ANTHM_AGENTS_PEM:?Set the path of the anthm-agents private key file}"
+PLUGIN=vllnt.paperclip-github
+VLLNT=dc1d1a01-1c00-4a67-89f9-4efdde86c7ec
+ANTHM=2cae571f-5b44-4253-b73b-7700335a4ccf
+json_id() { node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(JSON.parse(d).id))'; }
+
+# 1. Store each App private key as a company secret; keep only the secret ID.
+VLLNT_SECRET_ID="$(GITHUB_APP_PEM="$(cat "$V_AGENTS_PEM")" paperclipai secrets create -C "$VLLNT" \
+  --name 'GitHub App v-agents private key' --provider local_encrypted --value-env GITHUB_APP_PEM --json | json_id)"
+ANTHM_SECRET_ID="$(GITHUB_APP_PEM="$(cat "$ANTHM_AGENTS_PEM")" paperclipai secrets create -C "$ANTHM" \
+  --name 'GitHub App anthm-agents private key' --provider local_encrypted --value-env GITHUB_APP_PEM --json | json_id)"
+
+# 2. Save each company's App config. config:set replaces the whole config and
+#    requires {"configJson": {...}}, so merge into the current config to keep
+#    settings such as a personal token. A webhook secret reference belongs to
+#    its App and is kept only when the App ID is unchanged.
+set_app_config() { # <companyId> <appId> <appSlug> <privateKeySecretId>
+  local current payload
+  current="$(paperclipai plugin config "$PLUGIN" -C "$1" --json)"
+  payload="$(CURRENT="$current" node -e '
+    const [appId, slug, secretId] = process.argv.slice(1);
+    const { webhookSecret, ...current } = JSON.parse(process.env.CURRENT || "null")?.configJson ?? {};
+    if (webhookSecret && current.appId === appId) current.webhookSecret = webhookSecret;
+    process.stdout.write(JSON.stringify({ configJson: { ...current, appId, appSlug: slug, appName: slug,
+      privateKey: { type: "secret_ref", secretId, version: "latest" } } }));' "$2" "$3" "$4")"
+  paperclipai plugin config:set "$PLUGIN" -C "$1" --payload-json "$payload" --json
+}
+set_app_config "$VLLNT" 5203754 v-agents "$VLLNT_SECRET_ID"
+set_app_config "$ANTHM" 5203763 anthm-agents "$ANTHM_SECRET_ID"
+
+# 3. Verify each key with GitHub and reserve each App ID for its company.
+paperclipai plugin action "$PLUGIN" company-app.connect -C "$VLLNT" \
+  --params-json "{\"appId\":\"5203754\",\"privateKeySecretId\":\"$VLLNT_SECRET_ID\"}" --json
+paperclipai plugin action "$PLUGIN" company-app.connect -C "$ANTHM" \
+  --params-json "{\"appId\":\"5203763\",\"privateKeySecretId\":\"$ANTHM_SECRET_ID\"}" --json
+
+# 4. Pin each company's GitHub owners to numeric account IDs. Install the
+#    company's App on each owner first.
+BNT_OWNER='bnt''vllnt' # shell concatenation yields the GitHub login
+paperclipai plugin action "$PLUGIN" allowed-owners.set -C "$VLLNT" \
+  --params-json "{\"owners\":[\"vllnt\",\"maiaos\",\"$BNT_OWNER\"]}" --json
+paperclipai plugin action "$PLUGIN" allowed-owners.set -C "$ANTHM" \
+  --params-json '{"owners":["Anthm-FR"]}' --json
+
+# 5. Expect "connection": "connected", the company's own App and its owners.
+for company in "$VLLNT" "$ANTHM"; do
+  paperclipai plugin action "$PLUGIN" company-app.status -C "$company" --params-json '{}' --json
+done
+
+# 6. List the repositories each company can reach.
+for company in "$VLLNT" "$ANTHM"; do
+  paperclipai plugin action "$PLUGIN" repositories.list -C "$company" --params-json '{"refresh":true}' --json
+done
+```
+
+A test runs this block verbatim against a stub CLI, so keep it runnable when
+editing it.
+
+The stable company-management action keys are:
+
+- `company-app.status` returns `configured` and `connection`: `connected`,
+  `disconnected`, `not-configured` (no App config) or `not-connected` (config
+  saved, but `company-app.connect` has not reserved this App ID for the company).
+- `company-app.connect`, `company-app.disconnect`
+- `company-app.release` with `{"appId":"..."}` releases a reservation left by a
+  deleted or abandoned company. Its former owner, if it still exists, fails
+  closed until it connects again.
+- `allowed-owners.get`, `allowed-owners.set` (GitHub logins are case-insensitive;
+  both return the logins and the pinned `accounts` with numeric IDs)
+- `repositories.list` (returns only allowlisted owners)
+- `sync.trigger` (starts one company’s sync and returns its company ID)
+- `sync-status` reports `connection` without loading the private key.
+
+Invoke them with `paperclipai plugin action <pluginKey|pluginId> <actionKey>
+-C <companyId> [--params-json <json> | --params-file <path>]`. The generic
+`paperclipai plugin data <pluginKey|pluginId> <dataKey>` command uses the same
+`-C`, `--params-json` and `--params-file` options for plugins that register data
+handlers. The equivalent host routes are
+`POST /api/plugins/:pluginId/actions/:key` and
+`POST /api/plugins/:pluginId/data/:key`, with body `{companyId, params}`.
+
+Connection, release, allowlist and App-creation actions require a board user who
+is an instance administrator. Status, owner reads, repository listing and sync
+triggering remain company-scoped. No action returns a secret value or
+installation token, and only one returns a private key: `complete-setup` returns
+the private key of a newly created App once, to the instance administrator who
+created it, and the settings page immediately stores it as a company secret.
+`company-app.disconnect` leaves the Paperclip secret in place so a later
+reconnect can reuse it, while releasing the App ID for another company; revoke
+the App or delete the secret separately when it should no longer be usable.
+
+Scheduled sync and webhook routing read the connected companies from persisted
+plugin state on every run, so they keep working after a worker restart without a
+config replay. Plugin health reports how many companies are connected and says
+so explicitly when none is. Webhook delivery stays disabled on this Tailnet-only
+deployment. A request that does reach the endpoint is rejected with the same
+message unless its signature matches a connected company's webhook secret; only
+then does the plugin load that company's key and confirm the installation with
+its App.
 
 ## GitHub inside Tasks and Projects
 
@@ -87,7 +212,7 @@ Personal Projects use **Connection settings → Personal Projects access**. Crea
 
 ### Write safety and recovery
 
-All management actions require a Paperclip board user and the selected company’s configured App. Repository IDs must be discovered through that App; project ownership, item/field membership and comment/thread ownership are read back before mutation. Browser input cannot supply an arbitrary API path or GraphQL query. A body-free activity entry is written before each provider mutation.
+All management actions require a Paperclip board user and the selected company’s connected App. Repository IDs must be discovered through that App; project ownership, item/field membership and comment/thread ownership are read back before mutation. Browser input cannot supply an arbitrary API path or GraphQL query. A body-free activity entry is written before each provider mutation.
 
 Mutations use a company-scoped durable request receipt. Double submits with the same request ID execute once. A lost network response stays unconfirmed and is not blindly retried. Refresh the item and check the outcome before starting a new action. Definitive HTTP permission/validation rejections may retry. Validation that fails before a provider mutation does not leave a pending receipt. A successful write whose view cannot refresh is explicitly shown as saved.
 
@@ -96,7 +221,7 @@ Mutations use a company-scoped durable request receipt. Double submits with the 
 - Open GitHub issues import as **Todo**. Completed issues import as **Done**; “not planned” issues as **Cancelled**. Pull requests become native tracking tasks when opened from the Tasks PR browser.
 - **New Task → Create in** offers **Paperclip** or **GitHub · owner/repository** for the selected project. The initial choice is Paperclip; an explicit choice is remembered per company and project. GitHub creates one linked native task and one GitHub issue. Attachments, agent execution settings, budgets and approvals stay in Paperclip.
 - Title, description and open/closed state sync both ways. Backlog, Todo, In Progress, In Review and Blocked all correspond to GitHub Open; changing between those native statuses does not reset the task. Done closes as completed; Cancelled closes as not planned; reopening on GitHub returns the task to Todo.
-- Public HTTPS installations also receive signed GitHub issue, PR, review, comment and check webhooks, which create or update native tasks immediately and apply saved routing rules. The scheduled one-minute sync remains the repair path and is the only event path for localhost installations.
+- GitHub webhooks are not delivered to this Tailnet-only Paperclip. Setup leaves the webhook subscription inactive; the scheduled one-minute sync is the event path. If a delivery reaches the endpoint anyway, it is accepted only when its HMAC signature matches a connected company’s webhook secret and its installation belongs to that company’s App.
 - Native filters, search, assignment and task detail work normally because imported issues are ordinary tasks. The task’s **GitHub** panel opens its exact source issue, publishes an existing task, links an existing GitHub issue, or resolves a conflict.
 - Linking an existing issue explicitly adopts GitHub title, description and state on the next sync. An issue already linked to another native task cannot be linked twice.
 - A GitHub issue shared by multiple linked projects produces one task. New imports use the linked project with the smallest stable ID; an existing task keeps its linked project. Moving the task to a project without the repository pauses its synchronization. Unlinking repositories never deletes tasks or GitHub issues.
@@ -130,17 +255,17 @@ No routing rules are enabled until saved. GitHub users and Paperclip agents are 
 - GitHub creation stores intent before POST and includes a hidden HTML receipt in the body. If the response is lost, sync searches all repository issue pages for that receipt. An uncertain POST is never automatically repeated. If no receipt can be found, check GitHub and use **Link an existing GitHub issue**; do not remove receipts from pending publications. Definitive permission/rate-limit rejections can retry after recovery.
 - Partial repository failures retain successful tasks and appear in **Sync needs attention**. The compact **GitHub** control inside the Tasks toolbar shows warnings, last sync time, **Sync now**, and a configuration link. A green connection indicator means repository discovery succeeded; it does not imply every task was synchronized.
 - GitHub assignees, labels and issue bodies are treated as data. Rules are validated fields, not executable expressions. Rule saves and native mutations use host activity logging.
-- Disconnect removes the company’s connection configuration and stops provider access. Projects, native tasks, sync records and vault secrets remain. Revoke GitHub installations/keys on GitHub when appropriate.
+- Disconnect marks the company disconnected and stops provider access. Projects, native tasks, sync records, config and vault secrets remain. Revoke GitHub installations/keys on GitHub when appropriate.
 
 ## Boundaries
 
 This release supports the management operations listed above on GitHub.com. It does not replace repository administration or every GitHub feature: saved Project view/layout configuration, sub-issue/dependency graphs, attachment upload, merge queues, code editing/conflict resolution and branch deletion remain on GitHub. Issue/comment reactions and check reruns are supported where the App permissions allow them; GitHub Actions workflow administration remains on GitHub. GitHub API limits also apply (for example large/binary file diffs and the PR files endpoint limit).
 
-Native task title/description/state sync remains bidirectional. Labels, assignees and comments can now be edited directly on GitHub through these screens; they are not mirrored to Paperclip’s native labels, agent identity or chat. GitHub Projects field conditions are not yet automation-rule inputs. PR review delegation is explicit; merge and auto-merge remain guarded actions that require a current head SHA, GitHub branch protections and explicit confirmation. Public webhook delivery is supported when Paperclip is reachable over HTTPS; Enterprise Server remains outside this release.
+Native task title/description/state sync remains bidirectional. Labels, assignees and comments can now be edited directly on GitHub through these screens; they are not mirrored to Paperclip’s native labels, agent identity or chat. GitHub Projects field conditions are not yet automation-rule inputs. PR review delegation is explicit; merge and auto-merge remain guarded actions that require a current head SHA, GitHub branch protections and explicit confirmation. This Tailnet-only release has no public webhook route or Funnel; Enterprise Server remains outside this release.
 
-Company-scoped configuration and state prevent cross-company task access. Board actions validate their authenticated company; background jobs enumerate companies and use each company’s own configuration. Version 0.10.1 requires the native `chat.endpoints.read` host bridge for agent routing and ships an editable `github-review-workflow` company skill. GitHub App permissions still require installation approval. Plugin workers and same-origin plugin UI are trusted code, subject to the SDK’s supported capability gates; this is not a sandbox.
+Company-scoped configuration and state prevent cross-company task access. Board actions validate their authenticated company; background jobs use only companies delivered through authorized plugin configuration and each company’s own App. Version 0.11.0 requires the native `chat.endpoints.read` host bridge for agent routing and ships an editable `github-review-workflow` company skill. GitHub App permissions still require installation approval. Plugin workers and same-origin plugin UI are trusted code, subject to the SDK’s supported capability gates; this is not a sandbox.
 
-Private keys are stored only in Paperclip Secrets. Config contains vault references, never PEMs. Setup state is random, hashed, company/user/browser-bound, expires after 55 minutes and is consumed before exchange. Tokens are short-lived and not persisted. Public setup registers the Paperclip webhook endpoint and selected GitHub events; localhost setup keeps the required inactive `https://example.com/events` placeholder because GitHub cannot deliver to loopback. If a webhook secret is configured in the plugin connection, deliveries are HMAC verified against the exact raw body. Browser callback URLs may use localhost.
+Private keys are stored only in Paperclip Secrets. Config contains vault references, never PEMs. Setup state is random, hashed, company/user/browser-bound, expires after 55 minutes and is consumed before exchange. Tokens are short-lived and not persisted. Setup always keeps the required inactive `https://example.com/events` placeholder because GitHub webhooks are not delivered to this Tailnet-only Paperclip. If a webhook secret is configured, deliveries are HMAC verified against the exact raw body before any key is loaded, then routed by installation ID for the signing company only; unknown installations, missing secrets and bad signatures fail closed with one uniform error. Browser callback URLs may use localhost.
 
 Repository discovery is bounded to 1,000 installations and 1,000 repositories per installation and reports truncation. Issue pages are all followed, with 20-second provider timeouts and a 4 MB response limit. Initial synchronization time depends on linked issue volume. Host additions required: `projectRepositories`, `taskListToolbar` (alongside `taskListSection`), `taskCreation`, SDK issue project updates and idempotency options, and the staged upgrade approval fix. Older hosts need these extensions before installing this version.
 
@@ -239,6 +364,13 @@ owns bot identity and governed formal reviews; the plugin App remains the
 repository/task management actor.
 
 
+## 0.11.0 — Company GitHub Apps and owner allowlists
+
+GitHub App credentials, owner allowlists and repository discovery can be managed
+per company through the Paperclip action bridge and CLI. Scheduled sync runs in
+the host-authorized company context for each connected company. See **Manage
+with the API/CLI** above for the vllnt and anthm setup.
+
 ## 0.10.1 — Native connector boundary and skill-first workflow
 
 The plugin now treats Paperclip’s native GitHub connector as the authority for Agent Channels, bot identity and governed formal reviews. The plugin owns the user’s GitHub App connection, repository and Projects management, caching, webhooks, task synchronization and safe provider actions. The GitHub page’s **Sync & automations** disclosure checks for an active native GitHub channel and links to `/apps/chat/connect?provider=github&purpose=chat`; agent assignment, reviewer routing and wake operations require a channel assigned to each selected agent. Custom review and merge policy belongs in the editable `github-review-workflow` Paperclip skill; GitHub branch protections remain the final merge gate.
@@ -252,4 +384,3 @@ auto-merge conditions, merge-queue handling and post-merge monitoring. The
 plugin enforces provider permissions, current-SHA guards, idempotency and task
 receipts; the skill decides when an agent should act. Use native GitHub branch
 protections as the final repository-level guard.
-

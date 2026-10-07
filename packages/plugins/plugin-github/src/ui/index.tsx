@@ -7,7 +7,7 @@ import { GitHubAgentSettings } from "./agent-settings.js";
 import React, { useEffect, useRef, useState } from "react";
 import { useHostNavigation, useHostLocation, usePluginAction, type PluginPageProps, type PluginDetailTabProps, type PluginSidebarProps, type PluginWidgetProps } from "@paperclipai/plugin-sdk/ui";
 import { PAGE_PATH, PLUGIN_ID, type AppIdentity, type Catalog, type Credentials, type SetupStart, type Status } from "../contracts.js";
-import { ensureCanConfigure, hostApi, saveConfiguration, saveCredentials, type SavedApp } from "./api.js";
+import { connectCompanyApp, ensureCanConfigure, hostApi, loadConfiguration, saveConfiguration, saveCredentials, type SavedApp } from "./api.js";
 import { styles } from "./styles.js";
 
 const message = (e: unknown) => {
@@ -71,13 +71,16 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
   const startAction = usePluginAction("start-setup");
   const completeAction = usePluginAction("complete-setup");
   const verifyAction = usePluginAction("verify-manual");
+  const disconnectAction = usePluginAction("company-app.disconnect");
   const catalogAction = usePluginAction("catalog");
+  const ownersSetAction = usePluginAction("allowed-owners.set");
   const [status, setStatus] = useState<Status | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [owner, setOwner] = useState("");
+  const [allowedOwners, setAllowedOwners] = useState("");
   const [name, setName] = useState(() => `Paperclip-${context.companyPrefix ?? "GitHub"}`.slice(0, 27) + "-" + Math.random().toString(36).slice(2, 7));
   const [appId, setAppId] = useState("");
   const [pem, setPem] = useState("");
@@ -96,7 +99,7 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
   async function refresh(fresh = true) {
     const data = await catalogAction({ companyId, refresh: fresh }) as Catalog;
     setCatalog(data);
-    setStatus({ configured: true, app: data.app });
+    setStatus(current => ({ configured: true, app: data.app, allowedOwners: current?.allowedOwners ?? [] }));
 
   }
   async function persist(install: boolean) {
@@ -107,12 +110,36 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
       sessionStorage.setItem(sessionKey + ":saved", JSON.stringify(savedConfig.current));
     }
     if (!savedConfig.current) throw new Error("Start GitHub setup again.");
-    await saveConfiguration(companyId, savedConfig.current);
-    const slug = savedConfig.current.appSlug;
+    const config = savedConfig.current;
+    // The config route replaces the whole company config, so keep unrelated
+    // settings such as the personal token. A webhook secret belongs to its App
+    // and is kept only when the App ID does not change.
+    const previous = await loadConfiguration(companyId);
+    const { webhookSecret, ...unrelated } = previous;
+    const kept = previous.appId === config.appId ? previous : unrelated;
+    let configSaved = false;
+    try {
+      // The config route creates the host secret binding. Connect resolves the
+      // reference through that binding, so it must run second.
+      await saveConfiguration(companyId, { ...kept, ...config });
+      configSaved = true;
+      await connectCompanyApp(companyId, config);
+    } catch (error) {
+      // Do not leave an unverified App or a newly-created secret binding behind.
+      // A failed rollback is still surfaced; the operator can retry from the
+      // saved browser reference.
+      if (configSaved) {
+        try { await saveConfiguration(companyId, previous); } catch { /* preserve the original error */ }
+      }
+      throw error;
+    }
+    const slug = config.appSlug;
     sessionStorage.removeItem(sessionKey + ":saved"); sessionStorage.removeItem(sessionKey);
     savedConfig.current = null;
     setPem("");
-    setStatus(await statusAction({ companyId }) as Status);
+    const current = await statusAction({ companyId }) as Status;
+    setStatus(current);
+    setAllowedOwners((current.allowedOwners ?? []).join(", "));
     if (install && /^[a-z0-9-]+$/.test(slug)) window.location.assign(`https://github.com/apps/${slug}/installations/new`);
     else await refresh();
   }
@@ -128,7 +155,20 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
     }
     void task(async () => {
       const recovery = sessionStorage.getItem(sessionKey + ":saved");
-      if (recovery) { savedConfig.current = JSON.parse(recovery); await persist(false); return; }
+      if (recovery) {
+        const current = await statusAction({ companyId }) as Status;
+        setStatus(current);
+        setAllowedOwners((current.allowedOwners ?? []).join(", "));
+        if (current.configured) {
+          // Already connected: the saved reference is stale, so never offer to replay it.
+          sessionStorage.removeItem(sessionKey + ":saved");
+          await refresh(false);
+          return;
+        }
+        savedConfig.current = JSON.parse(recovery);
+        setError("A saved GitHub connection is waiting to be completed. Retry saving connection.");
+        return;
+      }
       if (code) {
         const pending = JSON.parse(sessionStorage.getItem(sessionKey) ?? "null");
         if (!pending || pending.state !== state || pending.returnUrl !== returnUrl) throw new Error("This setup was started in another browser or company. Open GitHub setup here and try again.");
@@ -139,6 +179,7 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
       }
       const current = await statusAction({ companyId }) as Status;
       setStatus(current);
+      setAllowedOwners((current.allowedOwners ?? []).join(", "));
       if (current.configured) await refresh(false);
     });
   }, []);
@@ -167,6 +208,13 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
     const app = await verifyAction({ companyId, appId, privateKey: pem }) as AppIdentity;
     credentials.current = { ...app, privateKey: pem };
     setPem(""); await persist(false);
+  }
+  async function saveOwners() {
+    const owners = allowedOwners.split(",").map(value => value.trim()).filter(Boolean);
+    const result = await ownersSetAction({ companyId, owners }) as { owners: string[] };
+    setAllowedOwners(result.owners.join(", "));
+    setStatus(current => current ? { ...current, allowedOwners: result.owners } : current);
+    await refresh(true);
   }
   const accounts = [...new Set([...(catalog?.installations.map(i => i.login) ?? []), ...(catalog?.app.owner ? [catalog.app.owner] : [])])];
   const connected = !!catalog?.repositories.length && !catalog.warnings.length && !catalog.truncated && !busy && !error;
@@ -216,13 +264,19 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
       <details className="panel"><summary>Connection settings</summary>
         <div className="details-content">
           {status.app?.slug && <a href={`https://github.com/apps/${status.app.slug}/installations/new`} target="_blank" rel="noopener noreferrer" onClick={() => { awaitingInstallation.current = true; }}>Manage repository access</a>}
+          <section className="panel">
+            <h3>Allowed GitHub owners</h3>
+            <p className="muted">Only installations and repositories owned by these GitHub logins or organizations are visible. Empty denies all access.</p>
+            <label>Owners (comma separated)<input value={allowedOwners} onChange={e => setAllowedOwners(e.target.value)} placeholder={"vllnt, maiaos, " + "bnt" + "vllnt"} /></label>
+            <div className="footer"><span /><button disabled={busy} onClick={() => void task(saveOwners)}>Save owner allowlist</button></div>
+          </section>
           <PersonalProjectAccess companyId={companyId} />
           <section className="danger-zone">
             <h2>Disconnect GitHub</h2>
             <p className="muted">Projects and saved secrets will be kept.</p>
             <div className="footer">
               {disconnecting ? <><button disabled={busy} onClick={() => setDisconnecting(false)}>Cancel</button><button className="danger" disabled={busy} onClick={() => void task(async () => {
-                await saveConfiguration(companyId, {}); setStatus({ configured: false, app: null }); setCatalog(null); setDisconnecting(false);
+                await disconnectAction({ companyId }); setStatus({ configured: false, app: null }); setCatalog(null); setDisconnecting(false);
               })}>Disconnect GitHub</button></> : <><span /><button className="danger" disabled={busy} onClick={() => setDisconnecting(true)}>Disconnect…</button></>}
             </div>
           </section>
