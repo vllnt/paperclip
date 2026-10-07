@@ -93,10 +93,11 @@ export function validateSettings(input: unknown): SyncSettings {
   return { enabled: value.enabled, rules };
 }
 
+const DISCONNECTED_DURING_SYNC = "The GitHub App was disconnected during sync.";
 export function registerSync(ctx: PluginContext, github: GitHubClient, credentials: Credentials,
   sources: { repositories(companyId: string, projectId?: unknown): Promise<TaskRepositories>; repository(companyId: string, repositoryId: number): Promise<TaskRepository | null> },
-  invalidate: (companyId: string) => void = () => {},
-  companies: { connected(): Promise<string[]>; state(companyId: string): Promise<ConnectionState> } = { connected: async () => [], state: async () => "not-connected" }) {
+  invalidate: (companyId: string) => void,
+  companies: { connected(): Promise<string[]>; state(companyId: string): Promise<ConnectionState> }) {
   // One worker owns the plugin. Serialize its jobs, UI writes and event handlers
   // per company; host idempotency also covers crashes between create and receipt.
   const queues = new Map<string, Promise<unknown>>();
@@ -310,6 +311,10 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     return remote;
   }
   async function run(companyId: string): Promise<SyncReport | null> {
+    // Only a connected company syncs; disconnecting also stops an in-flight run
+    // before its next repository.
+    const connected = async () => await companies.state(companyId) === "connected";
+    if (!await connected()) return null;
     const report: SyncReport = { at: new Date().toISOString(), imported: 0, updated: 0, warnings: [] };
     try {
       const config = await settings(companyId);
@@ -318,6 +323,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       report.warnings.push(...data.warnings);
       const auth = await credentials(companyId);
       for (const repo of data.repositories) {
+        if (!await connected()) { report.warnings.push(DISCONNECTED_DURING_SYNC); return report; }
         try {
           const remoteIssues: GitHubIssue[] = [];
           for (let page: number | null = 1; page !== null;) {
@@ -345,6 +351,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       const tracked = (await ctx.state.get(key(companyId, "standalone")) as Record<string, { repositoryId: number; number: number }> | null) ?? {};
       for (const [githubId, item] of Object.entries(tracked)) {
         if (data.repositories.some(repo => repo.id === item.repositoryId)) continue;
+        if (!await connected()) { report.warnings.push(DISCONNECTED_DURING_SYNC); return report; }
         try {
           const repo = await sources.repository(companyId, item.repositoryId);
           if (!repo) throw new Error("Repository access is unavailable.");

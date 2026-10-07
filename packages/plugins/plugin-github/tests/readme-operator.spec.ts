@@ -31,7 +31,9 @@ if (args[0] === "secrets" && args[1] === "create") entry.secretValue = process.e
 fs.appendFileSync(process.env.STUB_LOG, JSON.stringify(entry) + "\\n");
 if (!process.env.PAPERCLIP_API_URL || !process.env.PAPERCLIP_API_KEY) { console.error("missing API env"); process.exit(1); }
 if (args[0] === "secrets") console.log(JSON.stringify({ id: "secret-" + company, name: option("--name") }));
-else if (args[0] === "plugin" && args[1] === "config") console.log(company === "${VLLNT}" ? JSON.stringify({ companyId: company, configJson: { personalLogin: "octo" } }) : "null");
+else if (args[0] === "plugin" && args[1] === "config") console.log(JSON.stringify(company === "${VLLNT}"
+  ? { companyId: company, configJson: { personalLogin: "octo", appId: "1", webhookSecret: { type: "secret_ref", secretId: "old-app-hook", version: "latest" } } }
+  : { companyId: company, configJson: { appId: "5203763", webhookSecret: { type: "secret_ref", secretId: "same-app-hook", version: "latest" } } }));
 else console.log("{}");
 `;
 
@@ -70,7 +72,8 @@ describe("README operator sequence", () => {
       const params = (index: number) => JSON.parse(option(calls[index].args, "--params-json"));
       const configs = [3, 5].map(index => JSON.parse(option(calls[index].args, "--payload-json")));
       expect(configs[0]).toEqual({ configJson: { personalLogin: "octo", appId: "5203754", appSlug: "v-agents", appName: "v-agents", privateKey: { type: "secret_ref", secretId: `secret-${VLLNT}`, version: "latest" } } });
-      expect(configs[1]).toEqual({ configJson: { appId: "5203763", appSlug: "anthm-agents", appName: "anthm-agents", privateKey: { type: "secret_ref", secretId: `secret-${ANTHM}`, version: "latest" } } });
+      // A webhook secret reference survives only when the App ID is unchanged.
+      expect(configs[1]).toEqual({ configJson: { appId: "5203763", webhookSecret: { type: "secret_ref", secretId: "same-app-hook", version: "latest" }, appSlug: "anthm-agents", appName: "anthm-agents", privateKey: { type: "secret_ref", secretId: `secret-${ANTHM}`, version: "latest" } } });
       for (const config of configs) {
         expect(Object.keys(config.configJson).every(key => key in (manifest.instanceConfigSchema!.properties as object))).toBe(true);
       }

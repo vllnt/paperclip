@@ -327,7 +327,7 @@ describe("company GitHub App actions", () => {
     h.setConfig({ appId: "100", privateKey: { type: "secret_ref", secretId: "secret-b" } });
     await h.performAction("repositories.list", { companyId, refresh: true }, member(companyId));
     h.setConfig({ appId: "200", privateKey: { type: "secret_ref", secretId: "secret-c" } });
-    await service.reconcileConfig(companyId, { appId: "200", privateKey: { type: "secret_ref", secretId: "secret-c" } });
+    await service.reconcileConfig(companyId);
     await expect(h.performAction("repositories.list", { companyId, refresh: true }, member(companyId))).rejects.toThrow("Connect a GitHub App for this company first.");
     await h.performAction("company-app.connect", { companyId, appId: "200", privateKeySecretId: "secret-c" }, admin(companyId));
     await h.performAction("repositories.list", { companyId, refresh: true }, member(companyId));
@@ -345,7 +345,7 @@ describe("company GitHub App actions", () => {
     expect(await service.connectedCompanies()).toEqual([companyId]);
     await h.performAction("company-app.disconnect", { companyId }, admin(companyId));
     expect(await service.connectedCompanies()).toEqual([]);
-    await service.reconcileConfig(companyId, config);
+    await service.reconcileConfig(companyId);
     expect(await service.connectedCompanies()).toEqual([]);
     await h.performAction("company-app.connect", { companyId, appId: "5203754", privateKeySecretId: "key" }, admin(companyId));
     expect(await service.connectedCompanies()).toEqual([companyId]);

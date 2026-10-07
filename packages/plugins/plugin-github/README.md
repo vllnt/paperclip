@@ -73,13 +73,15 @@ ANTHM_SECRET_ID="$(GITHUB_APP_PEM="$(cat "$ANTHM_AGENTS_PEM")" paperclipai secre
 
 # 2. Save each company's App config. config:set replaces the whole config and
 #    requires {"configJson": {...}}, so merge into the current config to keep
-#    settings such as a personal token or webhook secret reference.
+#    settings such as a personal token. A webhook secret reference belongs to
+#    its App and is kept only when the App ID is unchanged.
 set_app_config() { # <companyId> <appId> <appSlug> <privateKeySecretId>
   local current payload
   current="$(paperclipai plugin config "$PLUGIN" -C "$1" --json)"
   payload="$(CURRENT="$current" node -e '
     const [appId, slug, secretId] = process.argv.slice(1);
-    const current = JSON.parse(process.env.CURRENT || "null")?.configJson ?? {};
+    const { webhookSecret, ...current } = JSON.parse(process.env.CURRENT || "null")?.configJson ?? {};
+    if (webhookSecret && current.appId === appId) current.webhookSecret = webhookSecret;
     process.stdout.write(JSON.stringify({ configJson: { ...current, appId, appSlug: slug, appName: slug,
       privateKey: { type: "secret_ref", secretId, version: "latest" } } }));' "$2" "$3" "$4")"
   paperclipai plugin config:set "$PLUGIN" -C "$1" --payload-json "$payload" --json
@@ -210,7 +212,7 @@ Personal Projects use **Connection settings → Personal Projects access**. Crea
 
 ### Write safety and recovery
 
-All management actions require a Paperclip board user and the selected company’s configured App. Repository IDs must be discovered through that App; project ownership, item/field membership and comment/thread ownership are read back before mutation. Browser input cannot supply an arbitrary API path or GraphQL query. A body-free activity entry is written before each provider mutation.
+All management actions require a Paperclip board user and the selected company’s connected App. Repository IDs must be discovered through that App; project ownership, item/field membership and comment/thread ownership are read back before mutation. Browser input cannot supply an arbitrary API path or GraphQL query. A body-free activity entry is written before each provider mutation.
 
 Mutations use a company-scoped durable request receipt. Double submits with the same request ID execute once. A lost network response stays unconfirmed and is not blindly retried. Refresh the item and check the outcome before starting a new action. Definitive HTTP permission/validation rejections may retry. Validation that fails before a provider mutation does not leave a pending receipt. A successful write whose view cannot refresh is explicitly shown as saved.
 
@@ -219,7 +221,7 @@ Mutations use a company-scoped durable request receipt. Double submits with the 
 - Open GitHub issues import as **Todo**. Completed issues import as **Done**; “not planned” issues as **Cancelled**. Pull requests become native tracking tasks when opened from the Tasks PR browser.
 - **New Task → Create in** offers **Paperclip** or **GitHub · owner/repository** for the selected project. The initial choice is Paperclip; an explicit choice is remembered per company and project. GitHub creates one linked native task and one GitHub issue. Attachments, agent execution settings, budgets and approvals stay in Paperclip.
 - Title, description and open/closed state sync both ways. Backlog, Todo, In Progress, In Review and Blocked all correspond to GitHub Open; changing between those native statuses does not reset the task. Done closes as completed; Cancelled closes as not planned; reopening on GitHub returns the task to Todo.
-- GitHub webhooks are not delivered to this Tailnet-only Paperclip. Setup leaves the webhook subscription inactive; the scheduled one-minute sync is the event path. If a delivery reaches the endpoint anyway, it is accepted only for a known installation with that company’s configured webhook secret and a valid HMAC signature.
+- GitHub webhooks are not delivered to this Tailnet-only Paperclip. Setup leaves the webhook subscription inactive; the scheduled one-minute sync is the event path. If a delivery reaches the endpoint anyway, it is accepted only when its HMAC signature matches a connected company’s webhook secret and its installation belongs to that company’s App.
 - Native filters, search, assignment and task detail work normally because imported issues are ordinary tasks. The task’s **GitHub** panel opens its exact source issue, publishes an existing task, links an existing GitHub issue, or resolves a conflict.
 - Linking an existing issue explicitly adopts GitHub title, description and state on the next sync. An issue already linked to another native task cannot be linked twice.
 - A GitHub issue shared by multiple linked projects produces one task. New imports use the linked project with the smallest stable ID; an existing task keeps its linked project. Moving the task to a project without the repository pauses its synchronization. Unlinking repositories never deletes tasks or GitHub issues.
@@ -263,7 +265,7 @@ Native task title/description/state sync remains bidirectional. Labels, assignee
 
 Company-scoped configuration and state prevent cross-company task access. Board actions validate their authenticated company; background jobs use only companies delivered through authorized plugin configuration and each company’s own App. Version 0.11.0 requires the native `chat.endpoints.read` host bridge for agent routing and ships an editable `github-review-workflow` company skill. GitHub App permissions still require installation approval. Plugin workers and same-origin plugin UI are trusted code, subject to the SDK’s supported capability gates; this is not a sandbox.
 
-Private keys are stored only in Paperclip Secrets. Config contains vault references, never PEMs. Setup state is random, hashed, company/user/browser-bound, expires after 55 minutes and is consumed before exchange. Tokens are short-lived and not persisted. Setup always keeps the required inactive `https://example.com/events` placeholder because GitHub webhooks are not delivered to this Tailnet-only Paperclip. If a webhook secret is configured in the plugin connection, deliveries are routed by installation ID and HMAC verified against the exact raw body; unknown installations, missing secrets and bad signatures fail closed. Browser callback URLs may use localhost.
+Private keys are stored only in Paperclip Secrets. Config contains vault references, never PEMs. Setup state is random, hashed, company/user/browser-bound, expires after 55 minutes and is consumed before exchange. Tokens are short-lived and not persisted. Setup always keeps the required inactive `https://example.com/events` placeholder because GitHub webhooks are not delivered to this Tailnet-only Paperclip. If a webhook secret is configured, deliveries are HMAC verified against the exact raw body before any key is loaded, then routed by installation ID for the signing company only; unknown installations, missing secrets and bad signatures fail closed with one uniform error. Browser callback URLs may use localhost.
 
 Repository discovery is bounded to 1,000 installations and 1,000 repositories per installation and reports truncation. Issue pages are all followed, with 20-second provider timeouts and a 4 MB response limit. Initial synchronization time depends on linked issue volume. Host additions required: `projectRepositories`, `taskListToolbar` (alongside `taskListSection`), `taskCreation`, SDK issue project updates and idempotency options, and the staged upgrade approval fix. Older hosts need these extensions before installing this version.
 
@@ -366,7 +368,7 @@ repository/task management actor.
 
 GitHub App credentials, owner allowlists and repository discovery can be managed
 per company through the Paperclip action bridge and CLI. Scheduled sync runs in
-the host-authorized company context for each configured company. See **Manage
+the host-authorized company context for each connected company. See **Manage
 with the API/CLI** above for the vllnt and anthm setup.
 
 ## 0.10.1 — Native connector boundary and skill-first workflow

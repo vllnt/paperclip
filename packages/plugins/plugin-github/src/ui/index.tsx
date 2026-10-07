@@ -112,13 +112,16 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
     if (!savedConfig.current) throw new Error("Start GitHub setup again.");
     const config = savedConfig.current;
     // The config route replaces the whole company config, so keep unrelated
-    // settings such as the personal token and webhook secret references.
+    // settings such as the personal token. A webhook secret belongs to its App
+    // and is kept only when the App ID does not change.
     const previous = await loadConfiguration(companyId);
+    const { webhookSecret, ...unrelated } = previous;
+    const kept = previous.appId === config.appId ? previous : unrelated;
     let configSaved = false;
     try {
       // The config route creates the host secret binding. Connect resolves the
       // reference through that binding, so it must run second.
-      await saveConfiguration(companyId, { ...previous, ...config });
+      await saveConfiguration(companyId, { ...kept, ...config });
       configSaved = true;
       await connectCompanyApp(companyId, config);
     } catch (error) {

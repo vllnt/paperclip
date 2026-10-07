@@ -60,7 +60,7 @@ describe("one GitHub App per company (registry is authoritative)", () => {
     await f.connect("vllnt", V_APP, "v-key");
     // Operator mistake: anthm's config is saved with v-agents' App ID.
     f.configs.anthm = { appId: V_APP, privateKey: secretRef("a-key") };
-    await f.service.reconcileConfig("anthm", f.configs.anthm);
+    await f.service.reconcileConfig("anthm");
     await expect(f.connect("anthm", V_APP, "a-key")).rejects.toThrow("already connected to another company");
     f.resolve.mockClear(); f.catalog.mockClear();
 
@@ -72,6 +72,7 @@ describe("one GitHub App per company (registry is authoritative)", () => {
     await f.h.runJob("github-sync");
     await flush();
     expect(f.keyResolutions().map(([ref]: any[]) => ref.secretId)).not.toContain("a-key");
+    expect(f.keyResolutions().map(([ref]: any[]) => ref.secretId)).toContain("v-key");
     expect(f.catalog.mock.calls.every(([, pem]) => pem === "pem-v-key")).toBe(true);
     expect(await f.service.connectedCompanies()).toEqual(["vllnt"]);
     expect(await f.h.ctx.state.get(registryKey)).toEqual({ [V_APP]: "vllnt" });
@@ -80,7 +81,7 @@ describe("one GitHub App per company (registry is authoritative)", () => {
   it("never lets a config save claim an App ID; only a verified connect reserves it", async () => {
     const f = fixture();
     f.configs.typo = { appId: V_APP, privateKey: secretRef("garbage-key") };
-    await f.service.reconcileConfig("typo", f.configs.typo);
+    await f.service.reconcileConfig("typo");
     expect(await f.h.ctx.state.get(registryKey)).toBeNull();
     expect(await f.h.performAction<any>("company-app.status", { companyId: "typo" }, member("typo"))).toMatchObject({ configured: false });
 
@@ -98,7 +99,7 @@ describe("one GitHub App per company (registry is authoritative)", () => {
     await f.connect("vllnt", V_APP, "v-key");
     await f.connect("anthm", A_APP, "a-key");
     f.configs.vllnt = { appId: A_APP, privateKey: secretRef("v-key2"), webhookSecret: secretRef("v-hook") };
-    await f.service.reconcileConfig("vllnt", f.configs.vllnt);
+    await f.service.reconcileConfig("vllnt");
     expect(await f.service.connectedCompanies()).toEqual(["anthm"]);
     f.hasInstallation.mockClear();
 
@@ -110,7 +111,7 @@ describe("one GitHub App per company (registry is authoritative)", () => {
 
     // Restoring vllnt's config restores its still-reserved App.
     f.configs.vllnt = { appId: V_APP, privateKey: secretRef("v-key"), webhookSecret: secretRef("v-hook") };
-    await f.service.reconcileConfig("vllnt", f.configs.vllnt);
+    await f.service.reconcileConfig("vllnt");
     expect((await f.service.connectedCompanies()).sort()).toEqual(["anthm", "vllnt"]);
   });
 
@@ -123,6 +124,30 @@ describe("one GitHub App per company (registry is authoritative)", () => {
     expect(await f.h.ctx.state.get(registryKey)).toEqual({});
     await f.connect("vllnt", V_APP, "v-key");
     expect(await f.service.connectedCompanies()).toEqual(["vllnt"]);
+  });
+});
+
+describe("connection changes are serialized per company", () => {
+  it("does not let a connect that was still verifying undo a later disconnect", async () => {
+    const f = fixture();
+    let finishVerify!: () => void;
+    vi.mocked(f.client.verify).mockImplementationOnce(id => new Promise(resolve => { finishVerify = () => resolve({ id, slug: "v-agents", name: "v-agents" }); }));
+    const connecting = f.connect("vllnt", V_APP, "v-key");
+    await flush();
+    const disconnecting = f.h.performAction("company-app.disconnect", { companyId: "vllnt" }, admin("vllnt"));
+    await flush();
+    finishVerify();
+    await Promise.all([connecting, disconnecting]);
+    expect(await f.h.ctx.state.get(registryKey)).toEqual({});
+    expect(await f.h.ctx.state.get(disconnectedKey("vllnt"))).toBe(true);
+    expect(await f.service.connectedCompanies()).toEqual([]);
+  });
+
+  it("records the former owner when an administrator releases an App", async () => {
+    const f = fixture();
+    await f.h.ctx.state.set(registryKey, { [V_APP]: "deleted-company" });
+    await f.h.performAction("company-app.release", { companyId: "vllnt", appId: V_APP }, admin("vllnt"));
+    expect(f.h.activity.at(-1)).toMatchObject({ message: "GitHub App reservation released", metadata: { appId: V_APP, released: true, previousCompanyId: "deleted-company" } });
   });
 });
 
@@ -139,6 +164,41 @@ describe("scheduled sync after a worker restart", () => {
     for (const companyId of ["vllnt", "anthm"]) {
       expect(restarted.h.getState({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: "report" })).toMatchObject({ at: expect.any(String) });
     }
+  });
+
+  it("stops an in-flight sync at the next repository once the company is disconnected", async () => {
+    const f = fixture();
+    const repos = [1, 2].map(id => ({ id, name: `r${id}`, fullName: `vllnt/r${id}`, url: `https://github.com/vllnt/r${id}`, installationId: 101, owner: "vllnt", ownerId: 1, private: true }));
+    f.h.seed({ projects: [{ id: "p1", companyId: "vllnt", name: "P" } as any], projectWorkspaces: repos.map(repo => ({ id: `w${repo.id}`, companyId: "vllnt", projectId: "p1", repoUrl: repo.url })) as any });
+    f.catalog.mockImplementation(async id => ({ app: { id, slug: "app", name: "App" }, installations: [], repositories: repos, warnings: [], truncated: false }));
+    await f.connect("vllnt", V_APP, "v-key");
+    await f.h.ctx.state.set(ownersKey("vllnt"), [{ id: 1, login: "vllnt" }]);
+    const read: number[] = [];
+    vi.spyOn(f.client, "issues").mockImplementation(async (_id, _pem, repo) => {
+      read.push(repo.id);
+      await f.h.performAction("company-app.disconnect", { companyId: "vllnt" }, admin("vllnt"));
+      return { issues: [], nextPage: null, repository: repo.fullName };
+    });
+    const report = await f.service.sync("vllnt");
+    expect(read).toEqual([1]);
+    expect(report?.warnings).toContain("The GitHub App was disconnected during sync.");
+  });
+
+  it("does not run sync for a company that is not connected", async () => {
+    const f = fixture();
+    await f.h.emit("issue.updated", { id: "i1" }, { companyId: "anthm", actorType: "user" } as any);
+    await flush();
+    expect(await f.service.sync("anthm")).toBeNull();
+    expect(f.h.getState({ scopeKind: "company", scopeId: "anthm", namespace: "sync", stateKey: "report" })).toBeUndefined();
+  });
+
+  it("checks the connection for sync.trigger without loading the private key", async () => {
+    const f = fixture();
+    await f.connect("vllnt", V_APP, "v-key");
+    await f.h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "sync", stateKey: "report" }, { at: new Date().toISOString(), imported: 0, updated: 0, warnings: [] });
+    f.resolve.mockClear();
+    expect(await f.h.performAction("sync.trigger", { companyId: "vllnt" }, member("vllnt"))).toEqual({ started: false, companyId: "vllnt" });
+    expect(f.keyResolutions()).toEqual([]);
   });
 
   it("reports distinctly when no company is connected, without loading private keys", async () => {
@@ -197,6 +257,32 @@ describe("webhook authentication before any GitHub call", () => {
     expect(routed?.companyId).toBe("vllnt");
   });
 
+  it("rejects malformed signatures without host calls and resolves each webhook secret at most once a minute", async () => {
+    const f = fixture();
+    await f.connect("vllnt", V_APP, "v-key");
+    await f.connect("anthm", A_APP, "a-key");
+    f.resolve.mockClear();
+    const malformed = webhook({ installation: { id: 101 } });
+    malformed.headers["x-hub-signature-256"] = "sha256=not-hex";
+    await expect(f.service.receiveWebhook(malformed)).rejects.toThrow(REJECTED);
+    expect(f.resolve).not.toHaveBeenCalled();
+    for (let i = 0; i < 40; i++) await expect(f.service.receiveWebhook(webhook({ installation: { id: 101 } }, `guess-${i}`))).rejects.toThrow(REJECTED);
+    expect(f.resolve.mock.calls.map(([ref]: any[]) => ref.secretId).sort()).toEqual(["a-hook", "v-hook"]);
+    expect(f.hasInstallation).not.toHaveBeenCalled();
+  });
+
+  it("rejects uniformly when a webhook secret cannot be resolved and still serves the other company", async () => {
+    const f = fixture();
+    await f.connect("vllnt", V_APP, "v-key");
+    await f.connect("anthm", A_APP, "a-key");
+    f.resolve.mockImplementation(async (ref: any, options: any) => {
+      if (options?.configPath === "webhookSecret" && ref.secretId === "v-hook") throw new Error("Rate limit exceeded");
+      return options?.configPath === "webhookSecret" ? `hook-${ref.secretId}` : `pem-${ref.secretId}`;
+    });
+    await expect(f.service.receiveWebhook(webhook({ installation: { id: 101 } }, "hook-v-hook"))).rejects.toThrow(REJECTED);
+    expect((await f.service.receiveWebhook(webhook({ installation: { id: 202 } }, "hook-a-hook")))?.companyId).toBe("anthm");
+  });
+
   it("treats an empty webhook secret as unconfigured", async () => {
     const f = fixture();
     f.resolve.mockImplementation(async (ref: any, options: any) => options?.configPath === "webhookSecret" ? "" : `pem-${ref.secretId}`);
@@ -218,25 +304,44 @@ describe("webhook authentication before any GitHub call", () => {
   });
 });
 
+// Every action that loads the company's App key while connected. Each other
+// action is credential-free: connection management and setup, status reads,
+// owner/skill/agent/native-channel settings, user-supplied verification, and
+// sync.trigger/save-sync-settings, which only queue the sync covered by sync-now.
+const CREDENTIALED_ACTIONS = ["allowed-owners.set", "automation-options", "catalog", "github-people-options", "issues", "link-task",
+  "linked-repositories", "manage-agent-reviewers", "manage-project", "manage-repository", "management-options", "open-record-task",
+  "pr-task-options", "project-repositories", "publish-task", "repositories.list", "resolve-task-sync", "review-pr-task", "sync-now",
+  "task-destinations", "task-issues", "task-links", "task-repositories", "task-sync-detail"];
+
 describe("disconnect kill switch", () => {
   it("refuses every action, tool, job and webhook path and releases the App", async () => {
     const f = fixture();
     f.h.seed({
       projects: [{ id: "p1", companyId: "vllnt", name: "Project" } as any],
       projectWorkspaces: [{ id: "w1", companyId: "vllnt", projectId: "p1", repoUrl: "https://github.com/vllnt/repo" } as any],
-      issues: [{ id: "i1", companyId: "vllnt", projectId: "p1", title: "Task", status: "todo" } as any],
+      issues: [{ id: "i1", companyId: "vllnt", projectId: "p1", title: "Task", status: "todo" } as any,
+        { id: "t-linked", companyId: "vllnt", projectId: "p1", title: "Linked", status: "todo", originKind: "plugin:vllnt.paperclip-github:issue", originId: "101" } as any],
     });
+    await f.h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "sync", stateKey: "link:101" }, { issueId: "t-linked", githubId: 101, number: 1, repositoryId: 22, base: { state: "open" } });
     const repo = { id: 22, name: "repo", fullName: "vllnt/repo", url: "https://github.com/vllnt/repo", installationId: 101, owner: "vllnt", ownerId: 1, private: true, issuesWrite: true, permissions: { issues: "write" } };
     f.catalog.mockImplementation(async id => ({ app: { id, slug: "app", name: "App" }, installations: [], repositories: [repo], warnings: [], truncated: false }));
     await f.connect("vllnt", V_APP, "v-key");
     await f.h.ctx.state.set(ownersKey("vllnt"), [{ id: 1, login: "vllnt" }]);
     const params = { companyId: "vllnt", issueId: "i1", projectId: "p1", repositoryId: 22, destinationId: "22", number: 1, op: "metadata", requestId: "request-0001", owners: ["vllnt"], keep: "github", state: "open", page: 1 };
     const skipped = new Set(["company-app.connect", "company-app.disconnect", "company-app.release"]);
+    // Minimal valid params that carry each action past its input checks.
+    const overrides: Record<string, Record<string, unknown>> = {
+      "manage-project": { op: "list", owner: "vllnt", ownerType: "Organization" },
+      "open-record-task": { kind: "issue" },
+      "task-links": { issueIds: ["t-linked"] },
+      "manage-agent-reviewers": { op: "request" },
+      "resolve-task-sync": { issueId: "t-linked" },
+    };
     const runActions = async () => {
       const reached: string[] = [];
       for (const key of f.actionKeys.filter(key => !skipped.has(key))) {
         const before = f.keyResolutions().length;
-        await f.h.performAction(key, params, admin("vllnt")).catch(() => {});
+        await f.h.performAction(key, { ...params, ...overrides[key] }, admin("vllnt")).catch(() => {});
         await flush();
         if (f.keyResolutions().length > before) reached.push(key);
       }
@@ -248,8 +353,11 @@ describe("disconnect kill switch", () => {
       return reached;
     };
 
+    // Pin every path that reaches the App key while connected, so a new
+    // credentialed action cannot pass the disconnected phase vacuously.
     const connected = await runActions();
-    expect(connected).toEqual(expect.arrayContaining(["repositories.list", "catalog", "sync.trigger", "allowed-owners.set", "manage-repository", "github_read_issue"]));
+    expect(connected.filter(key => !f.toolNames.includes(key)).sort()).toEqual(CREDENTIALED_ACTIONS);
+    expect(connected.filter(key => f.toolNames.includes(key)).sort()).toEqual([...f.toolNames].sort());
 
     await f.h.performAction("company-app.disconnect", { companyId: "vllnt" }, admin("vllnt"));
     expect(await f.h.ctx.state.get(registryKey)).toEqual({});

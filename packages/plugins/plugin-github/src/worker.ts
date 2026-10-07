@@ -31,6 +31,25 @@ const WEBHOOK_REJECTED = "GitHub webhook rejected.";
 export function register(ctx: PluginContext, github = new GitHubClient()) {
   const setup = new SetupService(ctx, github);
   let registryQueue = Promise.resolve();
+  // One worker owns the plugin. Connect and disconnect for a company run one at
+  // a time, so a connect still verifying its key cannot undo a later disconnect.
+  const connectionQueues = new Map<string, Promise<unknown>>();
+  function serializeConnection<T>(companyId: string, operation: () => Promise<T>): Promise<T> {
+    const next = (connectionQueues.get(companyId) ?? Promise.resolve()).catch(() => {}).then(operation);
+    connectionQueues.set(companyId, next);
+    void next.finally(() => { if (connectionQueues.get(companyId) === next) connectionQueues.delete(companyId); }).catch(() => {});
+    return next;
+  }
+  // Webhook secrets are cached briefly so unauthenticated requests cannot spend
+  // the host's per-company secret-resolve budget, which private keys share.
+  const webhookSecrets = new Map<string, { secretId: string; value: string; expires: number }>();
+  async function webhookSecretValue(companyId: string, ref: EnvSecretRefBinding): Promise<string> {
+    const cached = webhookSecrets.get(companyId);
+    if (cached && cached.secretId === ref.secretId && cached.expires > Date.now()) return cached.value;
+    const value = await ctx.secrets.resolve(ref, { companyId, configPath: "webhookSecret" });
+    webhookSecrets.set(companyId, { secretId: ref.secretId, value, expires: Date.now() + 60_000 });
+    return value;
+  }
   // A company may use its configured App only while the instance registry
   // reserves that App ID for it. Only company-app.connect writes a reservation,
   // after verifying the key, so a config save alone never grants App access.
@@ -113,13 +132,16 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
       return changed;
     });
   }
-  /** Config-change hook. It never reserves an App ID; it only releases one when the App config is removed. */
-  async function reconcileConfig(companyId: string, config: Record<string, unknown>): Promise<void> {
-    if (typeof config.appId !== "string" || !isSecretRef(config.privateKey)) await removeCompanyApps(companyId);
-    else if ((await checkConnection(companyId)).state === "not-connected") {
-      ctx.logger.warn("GitHub App config is not connected for this company; run company-app.connect", { companyId, appId: config.appId });
-    }
+  /**
+   * Config-change hook. It never changes the App registry: access is decided at
+   * read time, and only connect, disconnect and release change reservations.
+   */
+  async function reconcileConfig(companyId: string): Promise<void> {
+    webhookSecrets.delete(companyId);
     cache.invalidate(companyId);
+    if ((await checkConnection(companyId)).state === "not-connected") {
+      ctx.logger.warn("GitHub App config is not connected for this company; run company-app.connect", { companyId });
+    }
   }
   /**
    * Authenticate before any key load or GitHub call: only a request signed with
@@ -128,13 +150,12 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
    */
   async function authenticateWebhook(input: PluginWebhookInput): Promise<string> {
     const signature = header(input.headers, "x-hub-signature-256");
-    if (!signature?.startsWith("sha256=")) throw new Error(WEBHOOK_REJECTED);
+    if (!signature || !/^sha256=[0-9a-f]{64}$/.test(signature)) throw new Error(WEBHOOK_REJECTED);
     const signed: string[] = [];
     for (const { companyId, config } of await connectedConfigs()) {
       if (!config.webhookSecret) continue;
       try {
-        const secret = await ctx.secrets.resolve(config.webhookSecret, { companyId, configPath: "webhookSecret" });
-        if (verifyGitHubSignature(input.rawBody, signature, secret)) signed.push(companyId);
+        if (verifyGitHubSignature(input.rawBody, signature, await webhookSecretValue(companyId, config.webhookSecret))) signed.push(companyId);
       } catch (error) {
         ctx.logger.warn("GitHub webhook secret unavailable", { companyId, error: error instanceof Error ? error.message : "unknown" });
       }
@@ -184,36 +205,42 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     if ("privateKey" in params) throw new Error("company-app.connect accepts a Paperclip company secret ID, never a plaintext private key.");
     if (typeof params.appId !== "string" || !/^[1-9][0-9]*$/.test(params.appId.trim())) throw new Error("Enter a valid GitHub App ID.");
     if (typeof params.privateKeySecretId !== "string" || !params.privateKeySecretId.trim()) throw new Error("privateKeySecretId must reference an existing company secret.");
+    const appId = params.appId.trim();
     const privateKey = secretRef(params.privateKeySecretId.trim());
-    const configured = await ctx.config.get(companyId);
-    if (configured.appId !== params.appId.trim() || !isSecretRef(configured.privateKey) || configured.privateKey.secretId !== privateKey.secretId) {
-      throw new Error("Save this company’s GitHub App config before connecting it.");
-    }
-    const pem = await ctx.secrets.resolve(privateKey, { companyId, configPath: "privateKey" });
-    const app = await github.verify(params.appId.trim(), pem);
-    if (params.webhookSecretId !== undefined) {
-      if (typeof params.webhookSecretId !== "string" || !params.webhookSecretId.trim()) throw new Error("webhookSecretId must reference an existing company secret.");
-      if (!isSecretRef(configured.webhookSecret) || configured.webhookSecret.secretId !== params.webhookSecretId.trim()) {
-        throw new Error("Save the webhook secret binding in this company’s plugin config before connecting it.");
+    return serializeConnection(companyId, async () => {
+      const configured = await ctx.config.get(companyId);
+      if (configured.appId !== appId || !isSecretRef(configured.privateKey) || configured.privateKey.secretId !== privateKey.secretId) {
+        throw new Error("Save this company’s GitHub App config before connecting it.");
       }
-      await ctx.secrets.resolve(secretRef(params.webhookSecretId.trim()), { companyId, configPath: "webhookSecret" });
-    }
-    await reserveAppId(companyId, app.id);
-    await ctx.state.delete(disconnectedKey(companyId));
-    cache.invalidate(companyId);
-    const owners = await allowedOwners(companyId);
-    await ctx.activity.log({ companyId, message: "GitHub App connected", metadata: { appId: app.id } });
-    return { configured: true, connection: "connected", app: { id: app.id, slug: app.slug, name: app.name }, allowedOwners: owners.map(owner => owner.login) } satisfies Status;
+      const pem = await ctx.secrets.resolve(privateKey, { companyId, configPath: "privateKey" });
+      const app = await github.verify(appId, pem);
+      if (params.webhookSecretId !== undefined) {
+        if (typeof params.webhookSecretId !== "string" || !params.webhookSecretId.trim()) throw new Error("webhookSecretId must reference an existing company secret.");
+        if (!isSecretRef(configured.webhookSecret) || configured.webhookSecret.secretId !== params.webhookSecretId.trim()) {
+          throw new Error("Save the webhook secret binding in this company’s plugin config before connecting it.");
+        }
+        await ctx.secrets.resolve(secretRef(params.webhookSecretId.trim()), { companyId, configPath: "webhookSecret" });
+      }
+      await reserveAppId(companyId, app.id);
+      await ctx.state.delete(disconnectedKey(companyId));
+      cache.invalidate(companyId);
+      const owners = await allowedOwners(companyId);
+      await ctx.activity.log({ companyId, message: "GitHub App connected", metadata: { appId: app.id } });
+      return { configured: true, connection: "connected", app: { id: app.id, slug: app.slug, name: app.name }, allowedOwners: owners.map(owner => owner.login) } satisfies Status;
+    });
   });
   ctx.actions.register("company-app.disconnect", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
     requireAdmin(actor);
-    // The flag alone already refuses the company, even if releasing the App ID below is interrupted.
-    await ctx.state.set(disconnectedKey(companyId), true);
-    await removeCompanyApps(companyId);
-    cache.invalidate(companyId);
-    await ctx.activity.log({ companyId, message: "GitHub App disconnected" });
-    return { configured: false, connection: "disconnected", app: null, allowedOwners: (await allowedOwners(companyId)).map(owner => owner.login) } satisfies Status;
+    return serializeConnection(companyId, async () => {
+      // The flag alone already refuses the company, even if releasing the App ID below is interrupted.
+      await ctx.state.set(disconnectedKey(companyId), true);
+      await removeCompanyApps(companyId);
+      webhookSecrets.delete(companyId);
+      cache.invalidate(companyId);
+      await ctx.activity.log({ companyId, message: "GitHub App disconnected" });
+      return { configured: false, connection: "disconnected", app: null, allowedOwners: (await allowedOwners(companyId)).map(owner => owner.login) } satisfies Status;
+    });
   });
   ctx.actions.register("company-app.release", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
@@ -222,9 +249,10 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     const appId = params.appId.trim();
     // Releases a reservation left by a deleted or abandoned company. Its former
     // owner, if it still exists, fails closed until it is connected again.
-    let released = false;
-    await updateRegistry(registry => { released = appId in registry; delete registry[appId]; return released; });
-    await ctx.activity.log({ companyId, message: "GitHub App reservation released", metadata: { appId, released } });
+    let previousCompanyId: string | undefined;
+    await updateRegistry(registry => { previousCompanyId = registry[appId]; delete registry[appId]; return previousCompanyId !== undefined; });
+    const released = previousCompanyId !== undefined;
+    await ctx.activity.log({ companyId, message: "GitHub App reservation released", metadata: { appId, released, ...(released ? { previousCompanyId } : {}) } });
     return { appId, released };
   });
   ctx.actions.register("allowed-owners.get", async (params, actor) => {
@@ -250,7 +278,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
   });
   ctx.actions.register("sync.trigger", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
-    await credentials(companyId);
+    if (!await connection(companyId)) throw new Error("Connect a GitHub App for this company first.");
     if (params.refresh === true) cache.invalidate(companyId);
     else {
       const report = await ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: "report" }) as import("./contracts.js").SyncReport | null;
@@ -378,8 +406,8 @@ const plugin = definePlugin({
     if (!runtime) throw new Error(WEBHOOK_REJECTED);
     await runtime.receiveWebhook(input);
   },
-  async onConfigChanged(config, context) {
-    if (context?.companyId) await runtime?.reconcileConfig(context.companyId, config);
+  async onConfigChanged(_config, context) {
+    if (context?.companyId) await runtime?.reconcileConfig(context.companyId);
   },
   async onHealth() {
     return runtime ? runtime.health() : { status: "degraded", message: "GitHub plugin is starting." };

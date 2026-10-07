@@ -115,12 +115,28 @@ describe("minimal setup UI", () => {
     expect(fetcher).toHaveBeenCalledTimes(4);
     expect(fetcher.mock.calls[0][0]).toBe(`/api/plugins/${PLUGIN_ID}/config?companyId=c1`);
     expect(fetcher.mock.calls[1][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
-    expect(JSON.parse(fetcher.mock.calls[1][1].body).configJson).toEqual({ ...previous, ...config });
+    // A different App never inherits the old App's webhook secret.
+    const { webhookSecret: _oldAppHook, ...unrelated } = previous;
+    expect(JSON.parse(fetcher.mock.calls[1][1].body).configJson).toEqual({ ...unrelated, ...config });
     expect(fetcher.mock.calls[2][0]).toBe(`/api/plugins/${PLUGIN_ID}/actions/company-app.connect`);
     expect(fetcher.mock.calls[3][0]).toBe(`/api/plugins/${PLUGIN_ID}/config`);
     expect(JSON.parse(fetcher.mock.calls[3][1].body).configJson).toEqual(previous);
     expect(sessionStorage.getItem(`${PLUGIN_ID}:c1:u1:saved`)).not.toBeNull();
     expect(screen.getByRole("button", { name: "Retry saving connection" })).toBeTruthy();
+  });
+  it("keeps the webhook secret reference when reconnecting the same App", async () => {
+    const config = { appId: "12", appName: app.name, appSlug: app.slug, privateKey: { type: "secret_ref", secretId: "s2", version: "latest" } };
+    const previous = { appId: "12", appSlug: app.slug, appName: app.name, privateKey: { type: "secret_ref", secretId: "s1", version: "latest" },
+      webhookSecret: { type: "secret_ref", secretId: "hook", version: "latest" } };
+    sessionStorage.setItem(`${PLUGIN_ID}:c1:u1:saved`, JSON.stringify(config));
+    action("status").mockResolvedValue({ configured: false, app: null });
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ companyId: "c1", configJson: previous })).mockResolvedValueOnce(json({})).mockResolvedValueOnce(json({ error: "connect failed" }, 502)).mockResolvedValueOnce(json({}));
+    vi.stubGlobal("fetch", fetcher);
+    render(<GitHubPage context={context} />);
+    await screen.findByText(/waiting to be completed/);
+    fireEvent.click(screen.getByRole("button", { name: "Retry saving connection" }));
+    await screen.findByText(/could not save this change/);
+    expect(JSON.parse(fetcher.mock.calls[1][1].body).configJson).toEqual({ ...previous, ...config });
   });
   it("drops a stale saved setup when the company is already connected", async () => {
     const config = { appId: "12", appName: app.name, appSlug: app.slug, privateKey: { type: "secret_ref", secretId: "s1", version: "latest" } };
