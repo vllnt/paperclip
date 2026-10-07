@@ -49,19 +49,27 @@ async function main() {
       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
-    const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
+    // A bridged sandbox reaches Paperclip only through its callback bridge
+    // (PAPERCLIP_API_URL); the server's public broker URL may not even resolve
+    // there. Other runs keep the broker URL first. A transport failure moves on
+    // to the other route; HTTP answers, including a rejected capability, never do.
+    const routes = env.PAPERCLIP_API_BRIDGE_MODE
+      ? [env.PAPERCLIP_API_URL, env.PAPERCLIP_GITHUB_BROKER_URL]
+      : [env.PAPERCLIP_GITHUB_BROKER_URL, env.PAPERCLIP_API_URL];
+    const urls = [...new Set(routes.filter(Boolean)
+      .map(base => base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials'))];
     try {
     let response;
-    if (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
-      const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
+    if (urls.length && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
       // A slow or restarting control plane must not cost the operation its
       // managed identity, so a failed request is retried before giving up.
       // Busy (409) responses and transport failures keep separate budgets, and
       // the body is read inside the retry so a failed read is retried too.
-      let transportFailures = 0, conflicts = 0, result;
+      // Only the last route spends the transport budget.
+      let transportFailures = 0, conflicts = 0, route = 0, result;
       for (;;) {
         try {
-          response = await fetch(url, {
+          response = await fetch(urls[route], {
             method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
             headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
               'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
@@ -76,6 +84,7 @@ async function main() {
           result = response.ok ? await response.json() : null;
           break;
         } catch (error) {
+          if (route < urls.length - 1) { route += 1; continue; }
           transportFailures += 1;
           if (transportFailures >= 3) throw error;
           await new Promise(resolve => setTimeout(resolve, 500 * transportFailures));

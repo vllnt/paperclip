@@ -7,6 +7,8 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 const exec = promisify(execFile);
+// A test run inside a Paperclip run must not hand the launcher that run's API route.
+const hostEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PAPERCLIP_")));
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
@@ -18,7 +20,7 @@ describe("managed GitHub launchers", () => {
     await mkdir(bin);
     await exec("git", ["init", root]);
     await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
-    const env = { ...process.env, ...githubBrokerEnvironment({
+    const env = { ...hostEnv, ...githubBrokerEnvironment({
       GH_TOKEN: "host-token", GIT_AUTHOR_NAME: "Host", GIT_COMMITTER_NAME: "Host",
     }, { url: "", token: "" }), PATH: `${bin}:${process.env.PATH}` };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: root, env })).stdout.trim();
@@ -52,13 +54,13 @@ describe("managed GitHub launchers", () => {
     const configRoot = path.join(root, "config");
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
     const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
-      ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+      ...hostEnv, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
     expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
     await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
-      ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+      ...hostEnv, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
@@ -77,7 +79,7 @@ describe("managed GitHub launchers", () => {
     await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
     cleanups.push(() => new Promise<void>((resolve,reject) => server.close(error => error ? reject(error) : resolve())));
     const {port} = server.address() as {port:number};
-    const result = await exec(path.join(bin,"gh"), [], {env:{...process.env,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`}});
+    const result = await exec(path.join(bin,"gh"), [], {env:{...hostEnv,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`}});
     expect(JSON.parse(result.stdout)).toEqual({token:null});
     expect(result.stderr).toContain("More than one managed GitHub identity matches this run");
     expect(result.stderr).not.toMatch(/host-token|must-not-be-used|run-capability/);
@@ -105,11 +107,81 @@ describe("managed GitHub launchers", () => {
     await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
     cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const {port} = server.address() as {port:number};
-    const result = await exec(path.join(bin,"gh"), [], {env:{...process.env,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`}});
+    const result = await exec(path.join(bin,"gh"), [], {env:{...hostEnv,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`}});
     expect(JSON.parse(result.stdout)).toEqual({token:"managed-token"});
     expect(requests).toBe(2);
     expect(result.stderr).not.toContain("broker_transport_unavailable");
     expect(result.stderr).not.toMatch(/host-token|run-capability/);
+  });
+  // A sandbox reaches Paperclip through its callback bridge (PAPERCLIP_API_URL);
+  // the server's public broker URL may not resolve there.
+  it.each([
+    { label: "a bridged run uses its bridge, not an unresolvable broker URL", bridged: true, broker: "unresolvable", bridge: "up", used: "bridge" },
+    { label: "a bridged run falls back to the broker URL when its bridge is down", bridged: true, broker: "up", bridge: "offline", used: "broker" },
+    { label: "a run falls back to its API URL when the broker is offline", bridged: false, broker: "offline", bridge: "up", used: "bridge" },
+    { label: "a run keeps the broker URL first", bridged: false, broker: "up", bridge: "up", used: "broker" },
+  ] as const)("$label", async ({ bridged, broker, bridge, used }) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-route-"));
+    cleanups.push(() => rm(root, {recursive:true,force:true}));
+    const bin = path.join(root,"managed"), realBin = path.join(root,"real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin,"gh"), githubLauncherSource(), {mode:0o700});
+    await writeFile(path.join(realBin,"gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));', {mode:0o700});
+    const requests = { broker: [] as Array<string | undefined>[], bridge: [] as Array<string | undefined>[] };
+    const listen = async (name: "broker" | "bridge", state: "up" | "offline") => {
+      const server = createServer((req,res) => {
+        requests[name].push([req.headers.authorization, req.headers["x-paperclip-github-capability"] as string | undefined]);
+        res.setHeader("content-type","application/json");
+        res.end(JSON.stringify({status:"available",env:{GH_TOKEN:`${name}-managed-token`}}));
+      });
+      await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
+      const {port} = server.address() as {port:number};
+      if (state === "offline") await new Promise<void>(resolve => server.close(() => resolve()));
+      else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+      return `http://127.0.0.1:${port}`;
+    };
+    const brokerUrl = broker === "unresolvable" ? "https://paperclip-broker.invalid" : await listen("broker", broker);
+    const bridgeUrl = await listen("bridge", bridge);
+    const result = await exec(path.join(bin,"gh"), [], {env:{
+      ...hostEnv, ...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:brokerUrl,token:"run-capability"}),
+      PAPERCLIP_API_URL:`${bridgeUrl}/api`, PAPERCLIP_API_KEY:"bridge-auth",
+      ...(bridged ? {PAPERCLIP_API_BRIDGE_MODE:"queue_v1"} : {}),
+      PATH:`${bin}:${realBin}:${process.env.PATH}`,
+    }});
+    expect(JSON.parse(result.stdout)).toEqual({token:`${used}-managed-token`});
+    expect(result.stderr).not.toContain("Paperclip: GitHub");
+    // The capability check is unchanged on either route.
+    expect(requests[used]).toEqual([["Bearer bridge-auth","run-capability"]]);
+    if (broker !== "offline" && bridge !== "offline") expect(requests[used === "broker" ? "bridge" : "broker"]).toEqual([]);
+  });
+  it("does not try another route when the broker answers", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-route-rejected-"));
+    cleanups.push(() => rm(root, {recursive:true,force:true}));
+    const bin = path.join(root,"managed"), realBin = path.join(root,"real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin,"gh"), githubLauncherSource(), {mode:0o700});
+    await writeFile(path.join(realBin,"gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));', {mode:0o700});
+    const requests = { broker: 0, bridge: 0 };
+    const listen = async (name: "broker" | "bridge", status: number) => {
+      const server = createServer((_req,res) => {
+        requests[name]++;
+        res.setHeader("content-type","application/json");
+        res.writeHead(status);
+        res.end(JSON.stringify({status:"available",env:{GH_TOKEN:`${name}-managed-token`}}));
+      });
+      await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
+      cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+      return `http://127.0.0.1:${(server.address() as {port:number}).port}`;
+    };
+    const result = await exec(path.join(bin,"gh"), [], {env:{
+      ...hostEnv, ...githubBrokerEnvironment({},{url:await listen("broker", 200),token:"run-capability"}),
+      PAPERCLIP_API_URL:await listen("bridge", 403), PAPERCLIP_API_BRIDGE_MODE:"queue_v1", PAPERCLIP_API_KEY:"bridge-auth",
+      PATH:`${bin}:${realBin}:${process.env.PATH}`,
+    }});
+    // The bridge is tried first and rejects the capability; that answer stands.
+    expect(JSON.parse(result.stdout)).toEqual({token:null});
+    expect(result.stderr).toContain("capability_rejected");
+    expect(requests).toEqual({ broker: 0, bridge: 1 });
   });
   it("captures each command's identity and clears host credentials when the next person has none", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-launcher-test-"));
@@ -141,7 +213,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
     const address = server.address() as { port: number };
-    const env: NodeJS.ProcessEnv = { ...process.env, ...githubBrokerEnvironment({
+    const env: NodeJS.ProcessEnv = { ...hostEnv, ...githubBrokerEnvironment({
       GH_TOKEN: "ambient-host-token", GIT_AUTHOR_NAME: "Host", GIT_AUTHOR_EMAIL: "host@example.test",
     }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` };
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: repo, env })).stdout.trim();
