@@ -47,7 +47,6 @@ The operator can edit this skill for each company, repository or organization po
       personalLogin: { type: "string" },
       appId: { type: "string", pattern: "^[1-9][0-9]*$" },
       appSlug: { type: "string" }, appName: { type: "string" },
-      allowedOwners: { type: "array", items: { type: "string", pattern: "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$" }, maxItems: 100 },
       webhookSecret: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
       privateKey: { type: "object", format: "secret-ref", properties: {
         type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" }

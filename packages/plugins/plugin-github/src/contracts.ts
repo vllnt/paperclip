@@ -10,7 +10,9 @@ export interface GitHubIssue extends TaskAssociation { id: number; number: numbe
 export interface Catalog { app: AppIdentity; installations: Installation[]; repositories: Repository[]; warnings: string[]; truncated: boolean }
 export interface IssuePage { issues: GitHubIssue[]; nextPage: number | null; repository: string }
 export interface SetupStart { state: string; actionUrl: string; manifest: Record<string, unknown> }
-export interface Status { configured: boolean; app: AppIdentity | null; allowedOwners?: string[] }
+/** Why a company can or cannot use its configured App: only "connected" grants access. */
+export type ConnectionState = "connected" | "disconnected" | "not-configured" | "not-connected";
+export interface Status { configured: boolean; connection?: ConnectionState; app: AppIdentity | null; allowedOwners?: string[] }
 
 export interface LinkedProject { id: string; name: string }
 export interface TaskRepository extends Repository { projects: LinkedProject[] }

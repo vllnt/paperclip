@@ -3,7 +3,7 @@ import type { Issue, PluginContext } from "@paperclipai/plugin-sdk";
 import { GitHubClient, GitHubError } from "./github.js";
 import { boardScope } from "./setup.js";
 import { nativeGitHubReady } from "./native-github.js";
-import { PLUGIN_ID, type AutomationRule, type GitHubIssue, type Repository, type SyncReport, type SyncSettings, type TaskRepository, type TaskRepositories } from "./contracts.js";
+import { PLUGIN_ID, type AutomationRule, type ConnectionState, type GitHubIssue, type Repository, type SyncReport, type SyncSettings, type TaskRepository, type TaskRepositories } from "./contracts.js";
 
 const ORIGIN = `plugin:${PLUGIN_ID}:issue` as const;
 const defaults: SyncSettings = { enabled: true, rules: [] };
@@ -96,7 +96,7 @@ export function validateSettings(input: unknown): SyncSettings {
 export function registerSync(ctx: PluginContext, github: GitHubClient, credentials: Credentials,
   sources: { repositories(companyId: string, projectId?: unknown): Promise<TaskRepositories>; repository(companyId: string, repositoryId: number): Promise<TaskRepository | null> },
   invalidate: (companyId: string) => void = () => {},
-  configuredCompanies: () => readonly string[] = () => []) {
+  companies: { connected(): Promise<string[]>; state(companyId: string): Promise<ConnectionState> } = { connected: async () => [], state: async () => "not-connected" }) {
   // One worker owns the plugin. Serialize its jobs, UI writes and event handlers
   // per company; host idempotency also covers crashes between create and receipt.
   const queues = new Map<string, Promise<unknown>>();
@@ -365,10 +365,11 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     return promise;
   }
   ctx.jobs.register("github-sync", async () => {
-    // Scheduled plugin jobs are instance-scoped at the host boundary. Iterate
-    // only company IDs delivered through configChanged/authorized setup state;
+    // Scheduled plugin jobs are instance-scoped at the host boundary, and
     // ctx.companies.list() is a forbidden wildcard call from this context.
-    for (const companyId of configuredCompanies()) {
+    // Iterate the companies connected in persisted state, so a worker restart
+    // without a config replay keeps syncing.
+    for (const companyId of await companies.connected()) {
       try { await sync(companyId); }
       catch (error) { ctx.logger.error("GitHub scheduled sync failed", { companyId, error: errorText(error) }); }
     }
@@ -392,11 +393,9 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
   });
   ctx.actions.register("sync-status", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
-    const connection = await credentials(companyId).then(() => true).catch(error => {
-      if (error instanceof Error && error.message === "Connect a GitHub App for this company first.") return false;
-      throw error;
-    });
-    return { configured: connection, settings: await settings(companyId), busy: running.has(companyId),
+    // Reports the connection without loading the private key.
+    const connection = await companies.state(companyId);
+    return { configured: connection === "connected", connection, settings: await settings(companyId), busy: running.has(companyId),
       report: await ctx.state.get(key(companyId, "report")), pendingCount: Object.keys(await pendingFor(companyId)).length };
   });
   ctx.actions.register("automation-options", async (params, actor) => {
@@ -496,7 +495,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       return { url: remote.url };
     });
   });
-  async function handleWebhook(input: { companyId?: string; headers: Record<string, string | string[]>; parsedBody?: unknown; requestId: string }): Promise<GitHubWebhookResult | null> {
+  async function handleWebhook(input: { companyId: string; headers: Record<string, string | string[]>; parsedBody?: unknown; requestId: string }): Promise<GitHubWebhookResult | null> {
     const body = input.parsedBody && typeof input.parsedBody === "object" ? input.parsedBody as GitHubWebhookPayload : null;
     if (!body?.repository) return null;
     const repositoryId = Number(body.repository.id);
@@ -510,43 +509,38 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     const kind = body.pull_request || pullFromIssue || checkPullNumber ? "pull" as const : body.issue ? "issue" as const : null;
     if (!kind) return null;
     const receipt = String(input.headers["x-github-delivery"] ?? input.requestId);
-    const companyIds = input.companyId ? [input.companyId] : [...configuredCompanies()];
-    for (const companyId of companyIds) {
-      try {
-        const repo = await sources.repository(companyId, repositoryId);
-      if (!repo) continue;
-      const receiptKey = key(companyId, `webhook:${receipt}`);
-      const prior = await ctx.state.get(receiptKey) as GitHubWebhookResult | null;
-      if (prior) return { ...prior, duplicate: true };
-      let remote = kind === "pull" && checkPullNumber ? null : remoteFromWebhook((kind === "pull" ? (body.pull_request ?? pullFromIssue) : body.issue)!, repo);
-      if (kind === "pull" && checkPullNumber) {
-        // check_run payloads omit the PR body/title/head. Fetch the canonical
-        // issue representation so the linked Paperclip PR task is refreshed.
-        const auth = await credentials(companyId);
-        remote = await github.getIssue(auth.id, auth.pem, repo, Number(checkPullNumber));
-      }
-      if (!remote) return null;
-      if (body.requested_reviewer?.login && !remote.assignees.includes(body.requested_reviewer.login)) remote.assignees.push(body.requested_reviewer.login);
-      const configSync = await settings(companyId);
-      let taskId: string | undefined;
-      if (kind === "issue") {
-        const refs = await ensureTasks(companyId, repo, [remote]);
-        taskId = refs.get(remote.id)?.paperclipTask?.id;
-        const native = taskId ? await ctx.issues.get(taskId, companyId) : null;
-        if (native) await applyRule(companyId, native, remote, (await loadLink(companyId, remote.id))!, configSync);
-      } else {
-        const native = await ensurePullTask(companyId, repo, remote, repo.projects.map(p => p.id), configSync);
-        taskId = native?.id;
-      }
-      const result = { companyId: companyId, action, kind, ...(taskId ? { taskId } : {}), ignored: !taskId };
-      await ctx.state.set(receiptKey, result);
-        await ctx.activity.log({ companyId: companyId, message: `GitHub ${kind} webhook processed`, metadata: { action, repositoryId, number: remote.number, taskId, delivery: receipt } });
-        return result;
-      } catch (error) {
-        ctx.logger.error("GitHub webhook company processing failed", { companyId, error: errorText(error) });
-      }
+    // Callers pass the company that authenticated the delivery. Errors propagate
+    // so a failed delivery is never recorded as processed.
+    const companyId = input.companyId;
+    const repo = await sources.repository(companyId, repositoryId);
+    if (!repo) return null;
+    const receiptKey = key(companyId, `webhook:${receipt}`);
+    const prior = await ctx.state.get(receiptKey) as GitHubWebhookResult | null;
+    if (prior) return { ...prior, duplicate: true };
+    let remote = kind === "pull" && checkPullNumber ? null : remoteFromWebhook((kind === "pull" ? (body.pull_request ?? pullFromIssue) : body.issue)!, repo);
+    if (kind === "pull" && checkPullNumber) {
+      // check_run payloads omit the PR body/title/head. Fetch the canonical
+      // issue representation so the linked Paperclip PR task is refreshed.
+      const auth = await credentials(companyId);
+      remote = await github.getIssue(auth.id, auth.pem, repo, Number(checkPullNumber));
     }
-    return null;
+    if (!remote) return null;
+    if (body.requested_reviewer?.login && !remote.assignees.includes(body.requested_reviewer.login)) remote.assignees.push(body.requested_reviewer.login);
+    const configSync = await settings(companyId);
+    let taskId: string | undefined;
+    if (kind === "issue") {
+      const refs = await ensureTasks(companyId, repo, [remote]);
+      taskId = refs.get(remote.id)?.paperclipTask?.id;
+      const native = taskId ? await ctx.issues.get(taskId, companyId) : null;
+      if (native) await applyRule(companyId, native, remote, (await loadLink(companyId, remote.id))!, configSync);
+    } else {
+      const native = await ensurePullTask(companyId, repo, remote, repo.projects.map(p => p.id), configSync);
+      taskId = native?.id;
+    }
+    const result = { companyId, action, kind, ...(taskId ? { taskId } : {}), ignored: !taskId };
+    await ctx.state.set(receiptKey, result);
+    await ctx.activity.log({ companyId, message: `GitHub ${kind} webhook processed`, metadata: { action, repositoryId, number: remote.number, taskId, delivery: receipt } });
+    return result;
   }
 
   return { sync, ensureTasks, handleWebhook, linkForTask: async (companyId: string, issue: Issue) => {

@@ -9,6 +9,11 @@ export function boardScope(params: Record<string, unknown>, context: PluginPerfo
   }
   return { companyId: context.companyId, userId: context.actor.userId };
 }
+export function requireInstanceAdmin(context: PluginPerformActionContext): void {
+  if (context.actor.type !== "user" || context.actor.isInstanceAdmin !== true) {
+    throw new Error("Instance administrator access is required for GitHub connection changes.");
+  }
+}
 export function callbackUrl(value: unknown): string {
   if (typeof value !== "string") throw new Error("Open setup from Paperclip.");
   let url: URL;
@@ -25,6 +30,7 @@ export class SetupService {
   constructor(private ctx: PluginContext, private github: GitHubClient, private now = Date.now) {}
   async start(params: Record<string, unknown>, context: PluginPerformActionContext): Promise<SetupStart> {
     const { companyId, userId } = boardScope(params, context);
+    requireInstanceAdmin(context);
     const returnUrl = callbackUrl(params.returnUrl);
     const owner = typeof params.owner === "string" ? params.owner.trim() : "";
     if (owner && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(owner)) throw new Error("Enter the GitHub organization name, without a URL.");
@@ -48,6 +54,9 @@ export class SetupService {
   }
   async complete(params: Record<string, unknown>, context: PluginPerformActionContext) {
     const { companyId, userId } = boardScope(params, context);
+    // complete() returns the new App's private key once, so only an instance
+    // administrator, who can also save the plugin config, may receive it.
+    requireInstanceAdmin(context);
     const key = `${companyId}:${userId ?? "local-board"}`;
     if (this.busy.has(key)) throw new Error("GitHub setup is already completing. Wait a moment.");
     this.busy.add(key);
@@ -60,7 +69,7 @@ export class SetupService {
       await this.ctx.state.delete(scope);
       const credentials = await this.github.convert(String(params.code ?? ""));
       await this.ctx.activity.log({ companyId, message: "GitHub App registration verified", metadata: { appId: credentials.id } });
-      // The authenticated admin UI immediately writes the PEM to Paperclip Secrets.
+      // The instance-admin UI immediately writes the PEM to Paperclip Secrets.
       // Never put credentials in plugin state, config, logs, browser storage or a URL.
       return credentials;
     } finally { this.busy.delete(key); }

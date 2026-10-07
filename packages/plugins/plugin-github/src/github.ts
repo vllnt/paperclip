@@ -3,19 +3,6 @@ import type { AllowedOwner, AppIdentity, Catalog, Credentials, GitHubIssue, Issu
 
 const ownerPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 
-/** Normalize the company-owned GitHub owner allowlist without ever broadening it. */
-export function normalizeAllowedOwners(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const owners = new Map<string, string>();
-  for (const item of value) {
-    if (typeof item !== "string") continue;
-    const owner = item.trim();
-    if (!ownerPattern.test(owner)) continue;
-    owners.set(owner.toLowerCase(), owner);
-  }
-  return [...owners.values()];
-}
-
 /** Validate an operator-provided GitHub owner allowlist without silently broadening it. */
 export function validateAllowedOwners(value: unknown): string[] {
   if (!Array.isArray(value)) throw new Error("Allowed owners must be an array of GitHub logins or organization names.");
@@ -32,11 +19,6 @@ export function validateAllowedOwners(value: unknown): string[] {
 
 export function ownerFromRepository(fullName: string): string {
   return fullName.split("/", 1)[0]?.toLowerCase() ?? "";
-}
-
-export function ownerAllowed(allowedOwners: readonly string[], owner: string): boolean {
-  const wanted = owner.trim().toLowerCase();
-  return wanted.length > 0 && normalizeAllowedOwners(allowedOwners).some(value => value.toLowerCase() === wanted);
 }
 
 /** Normalize persisted owner identities. A zero ID is accepted only for direct

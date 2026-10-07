@@ -7,7 +7,7 @@ import { GitHubAgentSettings } from "./agent-settings.js";
 import React, { useEffect, useRef, useState } from "react";
 import { useHostNavigation, useHostLocation, usePluginAction, type PluginPageProps, type PluginDetailTabProps, type PluginSidebarProps, type PluginWidgetProps } from "@paperclipai/plugin-sdk/ui";
 import { PAGE_PATH, PLUGIN_ID, type AppIdentity, type Catalog, type Credentials, type SetupStart, type Status } from "../contracts.js";
-import { connectCompanyApp, ensureCanConfigure, hostApi, saveConfiguration, saveCredentials, type SavedApp } from "./api.js";
+import { connectCompanyApp, ensureCanConfigure, hostApi, loadConfiguration, saveConfiguration, saveCredentials, type SavedApp } from "./api.js";
 import { styles } from "./styles.js";
 
 const message = (e: unknown) => {
@@ -111,11 +111,14 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
     }
     if (!savedConfig.current) throw new Error("Start GitHub setup again.");
     const config = savedConfig.current;
+    // The config route replaces the whole company config, so keep unrelated
+    // settings such as the personal token and webhook secret references.
+    const previous = await loadConfiguration(companyId);
     let configSaved = false;
     try {
       // The config route creates the host secret binding. Connect resolves the
       // reference through that binding, so it must run second.
-      await saveConfiguration(companyId, config);
+      await saveConfiguration(companyId, { ...previous, ...config });
       configSaved = true;
       await connectCompanyApp(companyId, config);
     } catch (error) {
@@ -123,7 +126,7 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
       // A failed rollback is still surfaced; the operator can retry from the
       // saved browser reference.
       if (configSaved) {
-        try { await saveConfiguration(companyId, {}); } catch { /* preserve the original error */ }
+        try { await saveConfiguration(companyId, previous); } catch { /* preserve the original error */ }
       }
       throw error;
     }
@@ -150,10 +153,16 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
     void task(async () => {
       const recovery = sessionStorage.getItem(sessionKey + ":saved");
       if (recovery) {
-        savedConfig.current = JSON.parse(recovery);
         const current = await statusAction({ companyId }) as Status;
         setStatus(current);
         setAllowedOwners((current.allowedOwners ?? []).join(", "));
+        if (current.configured) {
+          // Already connected: the saved reference is stale, so never offer to replay it.
+          sessionStorage.removeItem(sessionKey + ":saved");
+          await refresh(false);
+          return;
+        }
+        savedConfig.current = JSON.parse(recovery);
         setError("A saved GitHub connection is waiting to be completed. Retry saving connection.");
         return;
       }

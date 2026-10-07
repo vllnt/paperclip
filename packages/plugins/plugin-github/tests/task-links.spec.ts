@@ -2,12 +2,13 @@ import { describe, it, expect, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
+import { seedConnection } from "./connection.js";
 import { GitHubClient } from "../src/github.js";
 const companyId = "c1", actor = { type: "user" as const, userId: "u1", companyId };
 const options = { companyId, actor };
 const repo = { id: 22, fullName: "org/repo", name: "repo", url: "https://github.com/org/repo", owner: "org", ownerId: 1, installationId: 33, private: true, permissions: { issues: "write", pull_requests: "read" } };
 async function fixture(permissions = repo.permissions) {
-  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "s1" }, allowedOwners: [{ id: 1, login: "org" }] } });
+  const h = createTestHarness({ manifest, config: { appId: "12", privateKey: { type: "secret_ref", secretId: "s1" } } });
   const secrets = vi.spyOn(h.ctx.secrets, "resolve").mockResolvedValue("secret");
   h.seed({ issues: [1,2].map(n => ({ id: `t${n}`, companyId, originKind: "plugin:vllnt.paperclip-github:issue", originId: String(n), title: "Issue", status: "todo" })) as any });
   for (const n of [1,2]) await h.ctx.state.set({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: `link:${n}` }, { issueId: `t${n}`, githubId: n, number: n, repositoryId: 22, base: { state: "open" } });
@@ -15,6 +16,7 @@ async function fixture(permissions = repo.permissions) {
   vi.spyOn(github, "catalog").mockResolvedValue({ app: { id: "12", slug: "app", name: "App" }, installations: [], repositories: [{ ...repo, permissions }], warnings: [], truncated: false });
   vi.spyOn(github, "scopedToken").mockResolvedValue("token");
   const graph = vi.spyOn(github, "graphql").mockResolvedValue({ repository: { i1: { closedByPullRequestsReferences: { nodes: [{ number: 7, title: "Fix", state: "MERGED", isDraft: false, repository: { nameWithOwner: "org/repo" } }], pageInfo: { hasNextPage: false } } }, i2: { closedByPullRequestsReferences: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+  await seedConnection(h, companyId, "12");
   register(h.ctx, github);
   return { h, graph, secrets, github };
 }
