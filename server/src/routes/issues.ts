@@ -2868,6 +2868,21 @@ function diffExecutionParticipants(
   };
 }
 
+/**
+ * Server provenance for a wake that an agent's own blocked transition causes
+ * on itself, from its authenticated run. Admission counts (and, while that run
+ * holds the issue, suppresses) only these wakes, which stops the ANT-3260
+ * re-block loop. Any other actor or agent gets no provenance.
+ */
+function selfReblockWakeCause(
+  actor: { actorType: string; agentId?: string | null; runId?: string | null },
+  wakeAgentId: string,
+) {
+  return actor.actorType === "agent" && actor.agentId === wakeAgentId && actor.runId
+    ? { kind: "self_reblock" as const, runId: actor.runId, actorId: actor.agentId }
+    : undefined;
+}
+
 function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
@@ -13826,13 +13841,10 @@ export function issueRoutes(
           issue: blockedIssue,
           // The unblock owner is woken on behalf of whoever blocked the issue.
           // Admission uses that cause to stop an agent's own re-block loop.
-          wakeup: (agentId, options) =>
-            heartbeat.wakeup(agentId, {
-              ...options,
-              ...(actor.actorType === "agent" && actor.agentId === agentId && actor.runId
-                ? { causedBy: { kind: "self_reblock" as const, runId: actor.runId, actorId: actor.agentId } }
-                : {}),
-            }),
+          wakeup: (agentId, options) => {
+            const causedBy = selfReblockWakeCause(actor, agentId);
+            return heartbeat.wakeup(agentId, { ...options, ...(causedBy ? { causedBy } : {}) });
+          },
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
           },
@@ -14609,6 +14621,12 @@ export function issueRoutes(
               "failed to check existing dependency wake before issue update wake",
             );
           }
+          // An agent that blocks its own issue on blockers that are already
+          // done caused this wake itself, exactly like its unblock request.
+          const causedBy =
+            input.mutation === "blocked_dependency_restored"
+              ? selfReblockWakeCause(actor, input.agentId)
+              : undefined;
           addWakeup(input.agentId, {
             source: "automation",
             triggerDetail: "system",
@@ -14622,6 +14640,7 @@ export function issueRoutes(
             idempotencyKey,
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            ...(causedBy ? { causedBy } : {}),
             contextSnapshot: {
               issueId: input.dependentIssueId,
               taskId: input.dependentIssueId,
@@ -18108,6 +18127,9 @@ export function issueRoutes(
               "failed to check existing dependency wake before issue comment wake",
             );
           }
+          // No self-reblock provenance here: a comment never moves an issue to
+          // blocked, so this wake only follows a blocker that just became done
+          // (real progress), never a restored blocked dependency.
           addWakeup(input.agentId, {
             source: "automation",
             triggerDetail: "system",
