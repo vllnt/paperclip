@@ -189,7 +189,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
-import { ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX } from "./issue-assignment-wakeup.js";
+import { ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX, parseIssueAssignmentIdempotencyKey } from "./issue-assignment-wakeup.js";
 import {
   getStartupTraceContext,
   getStartupTracer,
@@ -3795,7 +3795,8 @@ interface WakeupOptions {
    * Defaults to the requester. Only server code sets it; it never changes
    * authority or the responsible user, only the self-reblock loop guard.
    */
-  causedBy?: { actorType: "user" | "agent" | "system"; actorId: string | null };
+  /** Trusted only: set by the issue mutation route for the authenticated run that re-blocked the issue. */
+  causedBy?: { kind: "self_reblock"; runId: string; actorId: string };
   contextSnapshot?: Record<string, unknown>;
   issueStateGuard?: {
     statuses: string[];
@@ -19729,19 +19730,51 @@ export function heartbeatService(
         await releaseIssueExecutionAndPromote(anchor, { suppressImmediateRecovery: true, anchorRunOnly: true }).catch((err) => {
           logger.warn({ err, queueId: wake.id }, "failed to re-drive a parked self-reblock wake");
         });
+        // Whatever kept it parked (a successor or an execution hold), re-check
+        // at most once per window instead of on every tick.
+        await db.update(agentWakeupRequests).set({
+          payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}]::text[],
+            ${JSON.stringify(buildSelfReblockWakeParkedState(new Date(Date.now() + SELF_REBLOCK_WAKE_WINDOW_MS)))}::jsonb)`,
+          updatedAt: new Date(),
+        }).where(and(
+          eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.companyId, wake.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
+        ));
+      } else {
+        // An issue with no prior run still needs a bounded recovery path. Claim
+        // the parked receipt, then send the original wake through normal
+        // admission so the self-reblock limit is applied again. This gives the
+        // wake a durable audit reason instead of parking it forever.
+        const [claimed] = await db.update(agentWakeupRequests).set({
+          status: "cancelled",
+          reason: "issue_self_reblock_anchor_missing_promoted",
+          finishedAt: new Date(),
+          updatedAt: new Date(),
+        }).where(and(
+          eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.companyId, wake.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
+        )).returning({ id: agentWakeupRequests.id });
+        if (claimed) {
+          const promotedPayload = { ...parseObject(wake.payload) };
+          delete promotedPayload[SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY];
+          promotedPayload.selfReblockPromotion = "anchor_missing";
+          await enqueueWakeup(wake.agentId, {
+            source: (wake.source ?? "automation") as unknown as WakeupOptions["source"],
+            triggerDetail: (wake.triggerDetail ?? "system") as unknown as WakeupOptions["triggerDetail"],
+            reason: wake.reason,
+            payload: promotedPayload,
+            requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+            requestedByActorId: wake.requestedByActorId,
+            idempotencyKey: wake.idempotencyKey,
+          }).catch((err) => {
+            logger.warn({ err, queueId: wake.id }, "failed to promote anchorless parked self-reblock wake");
+          });
+        }
       }
-      // Whatever kept it parked (a successor, an execution hold, no anchor),
-      // re-check at most once per window instead of on every tick.
-      await db.update(agentWakeupRequests).set({
-        payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}]::text[],
-          ${JSON.stringify(buildSelfReblockWakeParkedState(new Date(Date.now() + SELF_REBLOCK_WAKE_WINDOW_MS)))}::jsonb)`,
-        updatedAt: new Date(),
-      }).where(and(
-        eq(agentWakeupRequests.id, wake.id),
-        eq(agentWakeupRequests.companyId, wake.companyId),
-        eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
-      ));
     }
 
     // The cancellation marker is durable intent. Retry while its exact queue
@@ -26959,8 +26992,7 @@ export function heartbeatService(
       agentId,
       reason: reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason),
       mutation: payload.mutation,
-      causeActorType: opts.causedBy ? opts.causedBy.actorType : opts.requestedByActorType,
-      causeActorId: opts.causedBy ? opts.causedBy.actorId : opts.requestedByActorId,
+      causedBy: opts.causedBy,
     });
     if (selfReblockWake) payload = { ...payload, [SELF_REBLOCK_WAKE_PAYLOAD_KEY]: selfReblockWake };
     let issueId =
@@ -27077,6 +27109,12 @@ export function heartbeatService(
       opts.idempotencyKey?.startsWith(ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX)
         ? opts.idempotencyKey
         : null;
+    const assignmentKeyParts = assignmentIdempotencyKey
+      ? parseIssueAssignmentIdempotencyKey(assignmentIdempotencyKey)
+      : null;
+    if (assignmentIdempotencyKey && !assignmentKeyParts) {
+      throw conflict("Invalid assignment idempotency key");
+    }
     const existingAssignmentReceipt = async (queryDb: Db) => {
       if (!assignmentIdempotencyKey) return null;
       return queryDb
@@ -27515,6 +27553,24 @@ export function heartbeatService(
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+
+          if (assignmentKeyParts) {
+            const existingAssignmentReplay = await existingAssignmentReceipt(tx as unknown as Db);
+            const lockedAssignmentIssue = await tx
+              .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId, statusVersion: issues.statusVersion })
+              .from(issues)
+              .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (!lockedAssignmentIssue ||
+                assignmentKeyParts.issueId !== lockedAssignmentIssue.id ||
+                assignmentKeyParts.assigneeAgentId !== agentId ||
+                assignmentKeyParts.assigneeAgentId !== lockedAssignmentIssue.assigneeAgentId ||
+                assignmentKeyParts.assignmentGeneration !== lockedAssignmentIssue.statusVersion &&
+                !existingAssignmentReplay) {
+              throw conflict("Assignment idempotency key does not match the locked issue assignment");
+            }
+          }
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(

@@ -168,7 +168,7 @@ describe("durable inbound chat scheduler receipts", () => {
     const wake = (durableChatRequest: ReturnType<typeof request>) =>
       queueIssueAssignmentWakeup({
         heartbeat,
-        issue: { id: issueId, assigneeAgentId: agentId, status: "in_progress" },
+        issue: { id: issueId, assigneeAgentId: agentId, status: "in_progress", statusVersion: 0 },
         reason: "External chat message received",
         mutation: "chat_message_received",
         contextSource: "chat:slack",
@@ -419,6 +419,7 @@ describe("durable inbound chat scheduler receipts", () => {
         id: f.issueId,
         assigneeAgentId: f.agentId,
         status: "in_progress",
+        statusVersion: 0,
       },
       reason: "External chat message received",
       mutation: "chat_message_received",
@@ -1193,6 +1194,7 @@ describe("durable inbound chat scheduler receipts", () => {
           id: f.issueId,
           assigneeAgentId: f.agentId,
           status: "in_progress",
+          statusVersion: 0,
         },
         reason: "External chat message received",
         mutation: "chat_message_received",

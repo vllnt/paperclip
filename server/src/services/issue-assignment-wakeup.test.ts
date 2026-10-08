@@ -3,6 +3,7 @@ import { HttpError } from "../errors.js";
 import { FailedChatRunRetryAuthorizationError } from "./durable-chat-wakeup.js";
 import {
   buildIssueAssignmentIdempotencyKey,
+  parseIssueAssignmentIdempotencyKey,
   queueIssueAssignmentWakeup,
 } from "./issue-assignment-wakeup.js";
 
@@ -21,7 +22,7 @@ function assign(
 ) {
   return queueIssueAssignmentWakeup({
     heartbeat: { wakeup },
-    issue: { id: "issue-1", assigneeAgentId: input.assigneeAgentId, status: "todo" },
+    issue: { id: "issue-1", assigneeAgentId: input.assigneeAgentId, status: "todo", statusVersion: input.assignmentGeneration ?? 1 },
     reason: "issue_assigned",
     mutation: "update",
     contextSource: "issue.update",
@@ -33,6 +34,14 @@ function assign(
 }
 
 describe("issue assignment wakeup delivery", () => {
+  it("parses only the reserved key shape", () => {
+    expect(parseIssueAssignmentIdempotencyKey("issue-assignment:issue-1:agent-a:4")).toEqual({
+      issueId: "issue-1", assigneeAgentId: "agent-a", assignmentGeneration: 4,
+    });
+    expect(parseIssueAssignmentIdempotencyKey("issue-assignment:issue-1:agent-a:not-a-generation")).toBeNull();
+    expect(parseIssueAssignmentIdempotencyKey("issue-assignment:issue-1:agent-a:4:extra")).toBeNull();
+  });
+
   it("gives A -> B -> A three distinct keys naming the assignee and generation", async () => {
     const wakeup = vi.fn(async (_agentId: string, _opts: unknown) => ({ id: "run" }));
     await assign(wakeup, { assigneeAgentId: "agent-a", assignmentGeneration: 4 });
@@ -87,11 +96,9 @@ describe("issue assignment wakeup delivery", () => {
     expect(wakeup).toHaveBeenCalledTimes(3);
   });
 
-  it("does not retry a wake without an assignment generation, since it has no dedupe key", async () => {
-    const wakeup = vi.fn().mockRejectedValue(wrapped(pgError("40001")));
-
-    await expect(assign(wakeup, { assigneeAgentId: "agent-a", rethrowOnError: false })).resolves.toBeNull();
-    expect(wakeup).toHaveBeenCalledTimes(1);
-    expect(wakeup.mock.calls[0]?.[1]).not.toHaveProperty("idempotencyKey");
+  it("derives the assignment generation from the server issue when the caller omits it", async () => {
+    const wakeup = vi.fn(async (_agentId: string, _opts: unknown) => ({ id: "run-1" }));
+    await expect(assign(wakeup, { assigneeAgentId: "agent-a" })).resolves.toEqual({ id: "run-1" });
+    expect(wakeup.mock.calls[0]?.[1]).toMatchObject({ idempotencyKey: "issue-assignment:issue-1:agent-a:1" });
   });
 });

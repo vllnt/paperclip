@@ -232,6 +232,7 @@ export function summarySlotService(db: Db) {
         identifier: row.identifier ?? null,
         title: row.title,
         status: row.status as IssueStatus,
+        statusVersion: row.statusVersion,
         assigneeAgentId: row.assigneeAgentId ?? null,
       },
     };
@@ -545,6 +546,7 @@ export function summarySlotService(db: Db) {
         title: generationIssue.title,
         status: generationIssue.status as IssueStatus,
         assigneeAgentId: generationIssue.assigneeAgentId ?? null,
+        statusVersion: generationIssue.statusVersion,
       },
       alreadyGenerating: issueDeduplicated,
     };

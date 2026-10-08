@@ -21,32 +21,28 @@ describe("self-reblock wake provenance", () => {
         agentId: AGENT,
         reason: "issue_unblock_requested",
         mutation: undefined,
-        causeActorType: "agent",
-        causeActorId: AGENT,
+        causedBy: { kind: "self_reblock", runId: "run-a", actorId: AGENT },
       }),
-    ).toEqual({ agentId: AGENT, reason: "issue_unblock_requested", causeActorType: "agent", causeActorId: AGENT });
+    ).toEqual({ agentId: AGENT, reason: "issue_unblock_requested", causeActorType: "agent", causeActorId: AGENT, runId: "run-a" });
     expect(
       deriveSelfReblockWakeMarker({
         agentId: AGENT,
         reason: "issue_blockers_resolved",
         mutation: "blocked_dependency_restored",
-        causeActorType: "agent",
-        causeActorId: AGENT,
+        causedBy: { kind: "self_reblock", runId: "run-a", actorId: AGENT },
       }),
     ).toMatchObject({ reason: "issue_blockers_resolved" });
   });
 
   it.each([
-    ["the board", "user", "board-user", "issue_blockers_resolved", "blocked_dependency_restored"],
-    ["another agent", "agent", "agent-b", "issue_blockers_resolved", "blocked_dependency_restored"],
-    ["another agent's unblock request", "agent", "agent-b", "issue_unblock_requested", undefined],
-    ["the system", "system", null, "issue_unblock_requested", undefined],
-    ["the agent completing a real blocker", "agent", AGENT, "issue_blockers_resolved", "blocker_done"],
-    ["an unrelated self wake", "agent", AGENT, "issue_commented", "comment"],
-  ])("never marks a wake caused by %s", (_label, causeActorType, causeActorId, reason, mutation) => {
-    expect(
-      deriveSelfReblockWakeMarker({ agentId: AGENT, reason, mutation, causeActorType, causeActorId }),
-    ).toBeNull();
+    ["the board", null, "issue_blockers_resolved", "blocked_dependency_restored"],
+    ["another agent", { kind: "self_reblock", runId: "run-b", actorId: "agent-b" }, "issue_blockers_resolved", "blocked_dependency_restored"],
+    ["an untrusted reason without server provenance", null, "issue_unblock_requested", undefined],
+    ["the system", null, "issue_unblock_requested", undefined],
+    ["the agent completing a real blocker", { kind: "self_reblock", runId: "run-a", actorId: AGENT }, "issue_blockers_resolved", "blocker_done"],
+    ["an unrelated self wake", { kind: "self_reblock", runId: "run-a", actorId: AGENT }, "issue_commented", "comment"],
+  ])("never marks a wake caused by %s", (_label, causedBy, reason, mutation) => {
+    expect(deriveSelfReblockWakeMarker({ agentId: AGENT, reason, mutation, causedBy: causedBy as { kind: "self_reblock"; runId: string; actorId: string } | null })).toBeNull();
   });
 
   it("reads a marker only for the agent it names", () => {

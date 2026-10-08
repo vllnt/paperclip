@@ -29,6 +29,8 @@ export type SelfReblockWakeMarker = {
   reason: string;
   causeActorType: "agent";
   causeActorId: string;
+  /** The authenticated run that performed the blocked transition. */
+  runId?: string;
 };
 
 /**
@@ -40,10 +42,11 @@ export function deriveSelfReblockWakeMarker(input: {
   agentId: string;
   reason: string | null | undefined;
   mutation: unknown;
-  causeActorType: string | null | undefined;
-  causeActorId: string | null | undefined;
+  /** Trusted server provenance. Public wakeup callers cannot provide this. */
+  causedBy?: { kind: "self_reblock"; runId: string; actorId: string } | null;
 }): SelfReblockWakeMarker | null {
-  if (input.causeActorType !== "agent" || !input.causeActorId || input.causeActorId !== input.agentId) {
+  const cause = input.causedBy;
+  if (!cause || cause.kind !== "self_reblock" || !cause.runId || cause.actorId !== input.agentId) {
     return null;
   }
   const reblockCycle =
@@ -55,7 +58,8 @@ export function deriveSelfReblockWakeMarker(input: {
     agentId: input.agentId,
     reason: input.reason,
     causeActorType: "agent",
-    causeActorId: input.causeActorId,
+    causeActorId: input.agentId,
+    runId: cause.runId,
   };
 }
 
@@ -69,7 +73,7 @@ export function readSelfReblockWakeMarker(
   const marker = raw as Record<string, unknown>;
   if (marker.agentId !== agentId || marker.causeActorId !== agentId) return null;
   if (typeof marker.reason !== "string" || marker.reason.length === 0) return null;
-  return { agentId, reason: marker.reason, causeActorType: "agent", causeActorId: agentId };
+  return { agentId, reason: marker.reason, causeActorType: "agent", causeActorId: agentId, ...(typeof marker.runId === "string" && marker.runId.length > 0 ? { runId: marker.runId } : {}) };
 }
 
 /**

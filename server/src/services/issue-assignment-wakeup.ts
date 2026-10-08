@@ -22,6 +22,18 @@ export function buildIssueAssignmentIdempotencyKey(input: {
   return `${ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX}${input.issueId}:${input.assigneeAgentId}:${input.assignmentGeneration}`;
 }
 
+export function parseIssueAssignmentIdempotencyKey(key: string): {
+  issueId: string;
+  assigneeAgentId: string;
+  assignmentGeneration: number;
+} | null {
+  const match = new RegExp(`^${ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX}([^:]+):([^:]+):(\\d+)$`).exec(key);
+  if (!match) return null;
+  const assignmentGeneration = Number(match[3]);
+  if (!Number.isSafeInteger(assignmentGeneration) || assignmentGeneration < 0) return null;
+  return { issueId: match[1], assigneeAgentId: match[2], assignmentGeneration };
+}
+
 export type IssueAssignmentWakeupOptions = {
   source?: WakeupSource;
   triggerDetail?: WakeupTriggerDetail;
@@ -44,7 +56,7 @@ export interface IssueAssignmentWakeupDeps<TRun = unknown> {
 
 export async function queueIssueAssignmentWakeup<TRun>(input: {
   heartbeat: IssueAssignmentWakeupDeps<TRun>;
-  issue: { id: string; assigneeAgentId: string | null; status: string };
+  issue: { id: string; assigneeAgentId: string | null; status: string; statusVersion: number };
   reason: string;
   mutation: string;
   contextSource: string;
@@ -72,14 +84,16 @@ export async function queueIssueAssignmentWakeup<TRun>(input: {
   const assigneeAgentId = input.issue.assigneeAgentId;
   if (!assigneeAgentId || input.issue.status === "backlog") return;
 
-  const idempotencyKey =
-    input.assignmentGeneration === null || input.assignmentGeneration === undefined
-      ? null
-      : buildIssueAssignmentIdempotencyKey({
-          issueId: input.issue.id,
-          assigneeAgentId,
-          assignmentGeneration: input.assignmentGeneration,
-        });
+  const assignmentGeneration = input.assignmentGeneration ?? input.issue.statusVersion;
+  if (typeof assignmentGeneration !== "number" || !Number.isSafeInteger(assignmentGeneration) || assignmentGeneration < 0) {
+    throw new Error("Assignment wake requires the server issue status version");
+  }
+  const resolvedAssignmentGeneration = assignmentGeneration as number;
+  const idempotencyKey = buildIssueAssignmentIdempotencyKey({
+    issueId: input.issue.id,
+    assigneeAgentId,
+    assignmentGeneration: resolvedAssignmentGeneration,
+  });
   const basePayload: Record<string, unknown> = {
     issueId: input.issue.id,
     mutation: input.mutation,
@@ -120,9 +134,7 @@ export async function queueIssueAssignmentWakeup<TRun>(input: {
 
   const deliver = () => input.heartbeat.wakeup(assigneeAgentId, options);
   try {
-    return await (idempotencyKey
-      ? retryIdempotentDatabaseOperation(deliver, { isTransient: isTransientDatabaseError })
-      : deliver());
+    return await retryIdempotentDatabaseOperation(deliver, { isTransient: isTransientDatabaseError });
   } catch (err) {
     logger.warn(
       { err, issueId: input.issue.id },

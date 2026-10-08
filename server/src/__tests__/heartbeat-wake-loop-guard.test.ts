@@ -240,6 +240,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
         }),
         requestedByActorType: "agent" as const,
         requestedByActorId: input.agentId,
+        causedBy: { kind: "self_reblock" as const, runId: "self-reblock-test-run", actorId: input.agentId },
         contextSnapshot: {
           issueId: input.issueId,
           taskId: input.issueId,
@@ -254,7 +255,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
         idempotencyKey: `issue-unblock:${input.issueId}:${input.blockedTransitionAt.toISOString()}`,
         payload: { issueId: input.issueId, action: "Confirm the blocker is done" },
         contextSnapshot: { wakeReason: "issue_unblock_requested", issueId: input.issueId, taskId: input.issueId },
-        causedBy: { actorType: "agent" as const, actorId: input.agentId },
+        causedBy: { kind: "self_reblock" as const, runId: "self-reblock-test-run", actorId: input.agentId },
       },
     ];
   }
@@ -290,6 +291,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
             reason: "issue_unblock_requested",
             causeActorType: "agent",
             causeActorId: input.agentId,
+            runId: "self-reblock-test-run",
           },
         },
         status: "completed",
@@ -388,6 +390,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
           reason: "issue_unblock_requested",
           causeActorType: "agent",
           causeActorId: input.agentId,
+          runId: "self-reblock-test-run",
         },
         _paperclipWakeContext: { issueId: input.issueId, taskId: input.issueId, wakeReason: "issue_unblock_requested" },
       },
@@ -599,7 +602,6 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       idempotencyKey: `issue-unblock:${issueId}:board`,
       payload: { issueId, action: "Board asked for the unblock" },
       contextSnapshot: { wakeReason: "issue_unblock_requested", issueId, taskId: issueId },
-      causedBy: { actorType: "user", actorId: "board-user" },
     });
     expect(boardRun).toMatchObject({ agentId: unblockOwnerId, status: expect.stringMatching(/queued|running|succeeded/) });
     await waitForIdle();
@@ -695,6 +697,33 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     await waitForIdle();
   });
 
+  it("promotes an expired parked wake directly when no anchor run exists", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "AnchorlessAssignee");
+    const issueId = await seedIssue(companyId, { assigneeAgentId: agentId, status: "blocked" });
+    const wakeId = randomUUID();
+    const wake = deferredSelfWake({ id: wakeId, companyId, agentId, issueId });
+    wake.reason = "issue_unblock_requested";
+    wake.payload._paperclipSelfReblockWakeParked = {
+      notBefore: new Date(Date.now() - 1_000).toISOString(),
+      limit: 3,
+      windowMs: 600_000,
+    };
+    await db.insert(agentWakeupRequests).values(wake);
+
+    await heartbeat.resumeQueuedRuns();
+    const promoted = await waitForCondition(async () => {
+      const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      return rows.some((row) => row.id !== wakeId && row.runId !== null);
+    });
+    expect(promoted).toBe(true);
+    const [original] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(original).toMatchObject({ status: "cancelled", reason: "issue_self_reblock_anchor_missing_promoted" });
+    const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(rows.some((row) => row.reason === "issue_unblock_requested" && row.id !== wakeId)).toBe(true);
+    await waitForIdle();
+  });
+
   it("still wakes an agent that assigns itself a blocked-ready issue from a run elsewhere", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId, "SelfAssigner");
@@ -722,11 +751,11 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     const issueId = await seedIssue(companyId, { assigneeAgentId: agentA, status: "todo" });
 
     async function assign(assigneeAgentId: string, crashAfterCommit: boolean) {
-      const [current] = await db
+      await db
         .update(issues)
         .set({ assigneeAgentId, statusVersion: sql`${issues.statusVersion} + 1` })
-        .where(eq(issues.id, issueId))
-        .returning();
+        .where(eq(issues.id, issueId));
+      const [current] = await db.select().from(issues).where(eq(issues.id, issueId));
       let attempts = 0;
       const result = await queueIssueAssignmentWakeup({
         heartbeat: {
@@ -743,7 +772,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
             return run;
           },
         },
-        issue: { id: issueId, assigneeAgentId, status: current!.status },
+        issue: { id: issueId, assigneeAgentId, status: current!.status, statusVersion: current!.statusVersion },
         reason: "issue_assigned",
         mutation: "update",
         contextSource: "issue.update",

@@ -29,6 +29,7 @@ export async function deliverAgentUnblockNotification(input: {
     idempotencyKey: string;
     payload: { issueId: string; action: string };
     contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
+    causedBy?: { kind: "self_reblock"; runId: string; actorId: string };
   }) => Promise<unknown>;
   markNotified: (notifiedAt: Date) => Promise<unknown>;
   now?: () => Date;

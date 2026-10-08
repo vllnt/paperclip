@@ -96,6 +96,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX } from "../services/issue-assignment-wakeup.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -6144,6 +6145,10 @@ export function agentRoutes(
         ),
       );
     }
+    if (typeof req.body.idempotencyKey === "string" &&
+        req.body.idempotencyKey.startsWith(ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX)) {
+      throw badRequest("Assignment idempotency keys are reserved for server assignment wakes");
+    }
     const run = await heartbeat.wakeup(id, {
       failedRunId: req.body.failedRunId ?? null,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
@@ -6298,6 +6303,10 @@ export function agentRoutes(
     }
     if (typeof body.idempotencyKey === "string" && body.idempotencyKey.length > 0) {
       wakeOpts.idempotencyKey = body.idempotencyKey;
+    }
+    if (typeof wakeOpts.idempotencyKey === "string" &&
+        wakeOpts.idempotencyKey.startsWith(ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX)) {
+      throw badRequest("Assignment idempotency keys are reserved for server assignment wakes");
     }
     const run = await heartbeat.wakeup(id, wakeOpts);
 

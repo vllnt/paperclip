@@ -887,6 +887,47 @@ describe("agent live run routes", () => {
     expect(db.select).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["issue_unblock_requested", "issue_blockers_resolved"])(
+    "does not let an agent forge self-reblock provenance with reason %s",
+    async (reason) => {
+      const selfAgentId = routeAgentId;
+      mockAgentService.getById.mockResolvedValue({
+        id: selfAgentId,
+        companyId: "company-1",
+        name: "Builder",
+        adapterType: "codex_local",
+      });
+      const app = await createApp(undefined, {
+        type: "agent",
+        agentId: selfAgentId,
+        companyId: "company-1",
+        source: "agent_key",
+      });
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${selfAgentId}/wakeup`)
+          .send({ reason, payload: { issueId: "issue-1", mutation: "blocked_dependency_restored" } }),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(res.body.status).toBe("queued");
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        selfAgentId,
+        expect.not.objectContaining({ causedBy: expect.anything() }),
+      );
+    },
+  );
+
+  it("rejects the reserved assignment idempotency namespace on the public wakeup API", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/wakeup`)
+        .send({ idempotencyKey: "issue-assignment:issue-1:agent-1:4" }),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("passes scoped wake fields through the legacy heartbeat invoke route", async () => {
     const res = await requestApp(await createApp(), (baseUrl) =>
       request(baseUrl)

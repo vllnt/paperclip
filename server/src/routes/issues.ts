@@ -13826,7 +13826,9 @@ export function issueRoutes(
           wakeup: (agentId, options) =>
             heartbeat.wakeup(agentId, {
               ...options,
-              causedBy: { actorType: actor.actorType, actorId: actor.actorId },
+              ...(actor.actorType === "agent" && actor.agentId === agentId && actor.runId
+                ? { causedBy: { kind: "self_reblock" as const, runId: actor.runId, actorId: actor.agentId } }
+                : {}),
             }),
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
@@ -14946,6 +14948,7 @@ export function issueRoutes(
                   id: issue.id,
                   assigneeAgentId: agentId,
                   status: issue.status,
+                  statusVersion: issue.statusVersion,
                 },
                 reason: "issue_assigned",
                 mutation: "update",

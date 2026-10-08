@@ -139,6 +139,7 @@ export function summarySlotRoutes(db: Db) {
             id: result.generatingIssue.id,
             assigneeAgentId: result.generatingIssue.assigneeAgentId ?? null,
             status: result.generatingIssue.status,
+            statusVersion: result.generatingIssue.statusVersion,
           },
           reason: "summary_slot_generation_requested",
           mutation: "summary_slot.generate",
