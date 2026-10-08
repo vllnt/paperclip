@@ -9,6 +9,10 @@
  *
  * Wakes caused by anyone else (the board, users, other agents completing
  * blockers) never carry the marker and are never suppressed or limited here.
+ *
+ * The limit slows a stuck loop; it does not stop it: up to about 18 runs per
+ * hour per agent and issue. The agent's daily run and cost caps are the
+ * backstop. Escalating after N parked windows is a follow-up.
  */
 
 /** Server-owned payload key. Admission overwrites any caller-supplied value. */
