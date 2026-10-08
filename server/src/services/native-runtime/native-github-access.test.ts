@@ -88,7 +88,8 @@ it("rejects other scopes, concurrent bindings, browser requests and forged autho
   const response = await request(b, { body: JSON.stringify({ runId: "b", responsibleUserId: "other" }) });
   expect(response.status).toBe(200);
   expect(response.headers.get("cache-control")).toBe("no-store");
-  expect(b.resolveCredentials).toHaveBeenCalledExactlyOnceWith(run("a"));
+  // The body is passed on only as the launcher's operation report; the run stays bound at receipt.
+  expect(b.resolveCredentials).toHaveBeenCalledExactlyOnceWith(run("a"), { runId: "b", responsibleUserId: "other" });
   release(); await b.stop();
   expect(() => b.activate(run("b"))).toThrow("closed");
 });

@@ -1,3 +1,6 @@
+import { onPluginStateWrite } from "./plugin-state-store.js";
+import { GITHUB_WRITE_IDENTITY_STATE } from "@paperclipai/shared";
+import { assertNativeGitHubAppAllowed, githubAppUserFence } from "./github-installation-tokens.js";
 import { withSlackBoardLease } from "./slack-board-lease.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { authorizeSlackBoardPublication } from "./slack-board-authority.js";
@@ -3412,6 +3415,25 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     };
   }
 
+  // I-RO: a GitHub runtime mints installation-wide App tokens inside the Chat SDK adapter, so it never runs for a
+  // company that writes as its App user, nor with such a company's App. Saving an identity policy stops the
+  // runtimes that are now refused; runtimeFor refuses to start or hand them out.
+  const unregisterGitHubIdentityWatch = onPluginStateWrite((write) => {
+    if (shuttingDown || write.scopeKind !== "company" || write.namespace !== GITHUB_WRITE_IDENTITY_STATE.namespace || write.stateKey !== GITHUB_WRITE_IDENTITY_STATE.stateKey) return;
+    void stopAppUserGitHubRuntimes().catch(() => undefined);
+  });
+  async function stopAppUserGitHubRuntimes() {
+    const ids = [...new Set([...runtimeVersions.keys(), ...runtimeInitializations.keys()])];
+    if (!ids.length) return;
+    const rows = await db
+      .select({ id: chatEndpoints.id, companyId: chatEndpoints.companyId, appId: chatEndpoints.botExternalId })
+      .from(chatEndpoints)
+      .where(and(inArray(chatEndpoints.id, ids), eq(chatEndpoints.provider, "github")));
+    for (const row of rows) {
+      if ((await githubAppUserFence(db, { companyId: row.companyId, appId: row.appId })) !== null) await invalidateRuntime(row.id);
+    }
+  }
+
   async function invalidateRuntime(endpointId: string): Promise<boolean> {
     for (const [deliveryId, live] of liveInboundMessages) {
       if (live.runtimeContext?.endpointRuntime === runtime.get(endpointId) && live.thread.id.startsWith("imessage-photon:")) liveInboundMessages.delete(deliveryId);
@@ -3825,6 +3847,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const applied = await endpointRuntime.applyGitHubReceiptReaction(
           { ...payload, ...(githubReceipt ? { githubReceipt } : {}) },
           assertCurrent,
+          (appId) => githubAppUserFence(db, { companyId: action!.companyId, appId }),
           fetchImpl,
         );
         githubReceipt = parseGitHubReceiptIdentity(applied);
@@ -7531,6 +7554,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         };
       }
       if (endpoint.provider === "github") {
+        // The native connector never uses an App-user company's App, nor serves such a company (I-RO).
+        await assertNativeGitHubAppAllowed(db, { companyId: endpoint.companyId, appId: credentials.appId });
         const appJwt = githubAppJwt(credentials.appId, credentials.privateKey);
         const installation = await discoverDedicatedGitHubAppInstallation({
           appJwt,
@@ -7544,6 +7569,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           appJwt,
           installationId: installation.installationId,
           fetch: fetchImpl,
+          fence: await githubAppUserFence(db, { companyId: endpoint.companyId, appId: credentials.appId }),
         });
         return {
           credentials: preparedCredentials,
@@ -7836,6 +7862,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           code: "chat_endpoint_runtime_unavailable",
         });
       }
+      if (record.endpoint.provider === "github") {
+        try {
+          await assertNativeGitHubAppAllowed(db, { companyId: record.endpoint.companyId, appId: record.endpoint.botExternalId });
+        } catch (error) {
+          if (runtime.get(endpoint.id) || runtimeVersions.has(endpoint.id)) await invalidateRuntime(endpoint.id);
+          throw error;
+        }
+      }
       const context = runtimeContextForRecord(record);
       const current = runtime.get(endpoint.id);
       const currentDiscordOwnership = discordGatewayOwnerships.get(endpoint.id);
@@ -7927,6 +7961,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           }
           recordChatWebhookStage("runtime_initializing", record.endpoint.id);
           const credentials = await resolveCredentials(record.endpoint);
+          if (record.endpoint.provider === "github") await assertNativeGitHubAppAllowed(db, { companyId: record.endpoint.companyId, appId: credentials.appId });
           const discordCommands =
             record.endpoint.provider === "discord" &&
             record.endpoint.botExternalId &&
@@ -25311,6 +25346,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           !(await githubRecoverySourceIsCurrent(
             (recovery.payload as GitHubRecoveryReceipt).original,
             credentials,
+            record.endpoint.companyId,
           )))
       ) {
         await settleGitHubWebhookIngress(action.id, {
@@ -25524,6 +25560,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function githubRecoverySourceIsCurrent(
     detail: GitHubAppWebhookDeliveryDetail,
     credentials: Record<string, string>,
+    companyId: string,
   ): Promise<boolean> {
     const comment = detail?.payload?.comment;
     if (
@@ -25539,6 +25576,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       repositoryFullName: detail.payload.repositoryFullName,
       event: detail.event as "issue_comment" | "pull_request_review_comment",
       commentId: comment.id,
+      fence: await githubAppUserFence(db, { companyId, appId: credentials.appId }),
     }).catch((error) => {
       if (error?.statusCode === 404 || error?.statusCode === 410) return null;
       throw error;
@@ -25842,7 +25880,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             );
             continue;
           }
-          if (!(await githubRecoverySourceIsCurrent(detail, credentials))) {
+          if (!(await githubRecoverySourceIsCurrent(detail, credentials, endpoint.companyId))) {
             await rememberGitHubRecoverySkip(
               endpoint,
               context,
@@ -38430,6 +38468,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     getIssueBinding,
     shutdown: async () => {
       shuttingDown = true;
+      unregisterGitHubIdentityWatch();
       await Promise.allSettled([...failedRetryTasks.values()]);
       unregisterFailedRetryAuthority();
       unregisterSlackTaskAuthority();

@@ -363,6 +363,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `api.routes.register` |
 | | `http.outbound` |
 | | `secrets.read-ref` |
+| | `secrets.write-own` |
 | | `environment.drivers.register` |
 | | `local.folders` |
 | **Agent** | `agent.tools.register` |
@@ -1350,3 +1351,14 @@ The response contains only company-scoped endpoint status and bot metadata; it
 never contains provider credentials. Use it as a readiness check for agent
 assignment, wakeups or delegated review work. Native channel setup, identity,
 chat delivery and governed formal reviews remain host-owned.
+
+### Storing a plugin's own secret
+
+A plugin that rotates a credential it owns (for example an OAuth refresh token)
+declares `secrets.write-own` and calls
+`ctx.secrets.storeOwn(value, { companyId, configPath })`. The host writes a new
+version of the one company secret an operator bound at that path of the
+plugin's company config. The secret must be bound there only (not to an
+agent, another plugin or another path); the host never creates a secret or
+touches any other one, records each write, and rate limits it. Never log or
+return the value.

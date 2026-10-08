@@ -9,6 +9,7 @@ import { registerTaskIssues } from "./task-issues.js";
 import { SetupService, boardScope, requireInstanceAdmin as requireAdmin } from "./setup.js";
 import { registerAgentBots } from "./agent-bots.js";
 import { registerAgentTools } from "./agent-tools.js";
+import { registerWriteIdentity } from "./write-identity.js";
 import { registerNativeGitHub } from "./native-github.js";
 import type { AllowedOwner, AppIdentity, ConnectionState, Status } from "./contracts.js";
 import { header, verifyGitHubSignature } from "./github-webhooks.js";
@@ -100,6 +101,18 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     const pem = await ctx.secrets.resolve(config.privateKey, { companyId, configPath: "privateKey" });
     return { id: config.appId, pem, allowedOwners: await allowedOwners(companyId) };
   }
+  // Managed git/gh asks the write identity for a decision on every command, and
+  // secret resolution is rate limited per company, so that path keeps the App
+  // key for one minute. Connection changes clear it.
+  const keys = new Map<string, { expires: number; value: ReturnType<typeof credentials> }>();
+  function identityCredentials(companyId: string): ReturnType<typeof credentials> {
+    const cached = keys.get(companyId);
+    if (cached && cached.expires > Date.now()) return cached.value;
+    const value = credentials(companyId);
+    keys.set(companyId, { expires: Date.now() + 60_000, value });
+    value.catch(() => { if (keys.get(companyId)?.value === value) keys.delete(companyId); });
+    return value;
+  }
   async function appRegistry(): Promise<AppRegistry> {
     const stored = await ctx.state.get(appRegistryKey);
     return stored && typeof stored === "object" ? { ...(stored as AppRegistry) } : {};
@@ -138,6 +151,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
    */
   async function reconcileConfig(companyId: string): Promise<void> {
     webhookSecrets.delete(companyId);
+    keys.delete(companyId);
     cache.invalidate(companyId);
     if ((await checkConnection(companyId)).state === "not-connected") {
       ctx.logger.warn("GitHub App config is not connected for this company; run company-app.connect", { companyId });
@@ -177,12 +191,27 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     throw new Error(WEBHOOK_REJECTED);
   }
   const cache = new GitHubReadCache();
+  const loadCatalog = async (companyId: string, refresh = false) => cache.catalog(companyId, await credentials(companyId), github, refresh);
+  // Reads and the issue mirror use the App; writes follow the company's write identity.
+  const identity = registerWriteIdentity(ctx, github, identityCredentials,
+    async companyId => cache.catalog(companyId, await identityCredentials(companyId), github), undefined,
+    companyId => cache.invalidate(companyId));
+  // I-RO: a company that writes as its App's user has an App that only reads,
+  // so every installation token of that App is read-only and fenced. An App ID
+  // is reserved for one company; an unreadable policy throws, which the client
+  // treats as an App-user company with an empty fence. Other companies keep
+  // their App's write tokens.
+  github.appUserFence = async appId => {
+    const companyId = (await appRegistry())[appId];
+    return companyId === undefined ? null : identity.appUserFence(companyId);
+  };
   const sources = registerTaskIssues(ctx, github, credentials, cache, async companyId => Boolean(await connection(companyId)));
   const sync = registerSync(ctx, github, credentials, sources, companyId => cache.invalidate(companyId),
-    { connected: connectedCompanies, state: async companyId => (await checkConnection(companyId)).state });
+    { connected: connectedCompanies, state: async companyId => (await checkConnection(companyId)).state },
+    { writeToken: identity.writeToken, maintain: identity.maintain });
   registerTaskLinks(ctx, github, credentials, cache, sync.linkForTask);
   registerRecordTasks(ctx, github, credentials, cache, sync.ensureTasks);
-  registerManagement(ctx, github, credentials, sync.sync, cache, sync.ensureTasks);
+  registerManagement(ctx, github, credentials, sync.sync, cache, sync.ensureTasks, identity.writeToken, identity.appUser);
   // Native Paperclip owns Agent Channels and GitHub bot identity. The legacy
   // mapping actions remain registered for state migration, but are not used by
   // reviewer or agent-facing actions.
@@ -223,6 +252,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
       }
       await reserveAppId(companyId, app.id);
       await ctx.state.delete(disconnectedKey(companyId));
+      keys.delete(companyId);
       cache.invalidate(companyId);
       const owners = await allowedOwners(companyId);
       await ctx.activity.log({ companyId, message: "GitHub App connected", metadata: { appId: app.id } });
@@ -237,6 +267,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
       await ctx.state.set(disconnectedKey(companyId), true);
       await removeCompanyApps(companyId);
       webhookSecrets.delete(companyId);
+      keys.delete(companyId);
       cache.invalidate(companyId);
       await ctx.activity.log({ companyId, message: "GitHub App disconnected" });
       return { configured: false, connection: "disconnected", app: null, allowedOwners: (await allowedOwners(companyId)).map(owner => owner.login) } satisfies Status;
@@ -296,10 +327,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     const { companyId } = boardScope(params, actor);
     return ctx.skills.managed.get("github-review-workflow", companyId);
   });
-  registerAgentTools(ctx, github, credentials, async (companyId, refresh = false) => {
-    const auth = await credentials(companyId);
-    return cache.catalog(companyId, auth, github, refresh);
-  });
+  registerAgentTools(ctx, github, credentials, loadCatalog, identity.writeToken);
   async function linkedNames(companyId: string, params: Record<string, unknown>, companyWide = false): Promise<string[]> {
     let projectId = typeof params.projectId === "string" ? params.projectId : null;
     if (typeof params.issueId === "string") {

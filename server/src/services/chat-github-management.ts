@@ -1,3 +1,4 @@
+import { mintNativeGitHubInstallationToken } from "./github-installation-tokens.js";
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { githubBotCredentials } from "./chat-github-client.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
@@ -427,25 +428,19 @@ export function githubChatManagementService(db: Db, fetchImpl = fetch) {
                 !Number.isSafeInteger(Number(repositoryId))
               )
                 throw new Error("Unavailable repository");
-              const issued = await githubBotRequest<{ token?: string }>(
-                fetchImpl,
-                credentials.appJwt,
-                `/app/installations/${credentials.credentials.installationId}/access_tokens`,
-                {
-                  method: "POST",
-                  body: {
-                    repository_ids: [Number(repositoryId)],
-                    permissions: {
-                      contents: "read",
-                      metadata: "read",
-                      issues: "write",
-                      pull_requests: "write",
-                      checks: "write",
-                    },
-                  },
+              await mintNativeGitHubInstallationToken(db, {
+                companyId: bot.companyId,
+                appId: credentials.credentials.appId,
+                installationId: credentials.credentials.installationId,
+                repositories: [Number(repositoryId)],
+                permissions: {
+                  contents: "read",
+                  metadata: "read",
+                  issues: "write",
+                  pull_requests: "write",
+                  checks: "write",
                 },
-              );
-              if (!issued.token) throw new Error("Missing installation token");
+              }, async (call) => (await githubBotRequest<{ token?: string }>(fetchImpl, credentials.appJwt, call.path, { method: "POST", body: call.body })).token);
             } catch {
               inaccessible.push(resource.label ?? resource.providerResourceId);
             }

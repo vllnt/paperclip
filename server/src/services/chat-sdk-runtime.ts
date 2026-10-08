@@ -2810,6 +2810,7 @@ export class ChatSdkEndpointRuntime {
   async applyGitHubReceiptReaction(
     input: GitHubReceiptMutation,
     assertCurrent: () => Promise<void>,
+    appUserFence: (appId: string) => Promise<readonly string[] | null>,
     fetchImpl?: typeof globalThis.fetch,
   ) {
     if (this.provider !== "github" || !this.githubReceiptApp)
@@ -2820,6 +2821,7 @@ export class ChatSdkEndpointRuntime {
       this.githubReceiptApp.installationId,
       input,
       assertCurrent,
+      appUserFence,
       fetchImpl,
     );
   }

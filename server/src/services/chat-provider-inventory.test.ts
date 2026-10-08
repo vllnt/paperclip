@@ -145,7 +145,7 @@ describe("chat provider inventory", () => {
           ],
         }),
       ) as unknown as typeof globalThis.fetch;
-    const result = await listGitHubInstallationRepositories({
+    const result = await listGitHubInstallationRepositories({ fence: null,
       appJwt: "app-jwt",
       installationId: "44",
       fetch,
@@ -306,7 +306,7 @@ describe("chat provider inventory", () => {
       }),
     ).rejects.toThrow("Slack inventory failed: invalid_auth");
     await expect(
-      listGitHubInstallationRepositories({
+      listGitHubInstallationRepositories({ fence: null,
         appJwt: "bad",
         installationId: "1",
         fetch: vi.fn(async () =>
@@ -314,5 +314,14 @@ describe("chat provider inventory", () => {
         ) as unknown as typeof globalThis.fetch,
       }),
     ).rejects.toThrow("GitHub inventory failed: Not Found");
+  });
+});
+
+describe("I-RO (security review round 3)", () => {
+  it("never lists an installation with a whole-installation token of an App-user company's App", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    await expect(listGitHubInstallationRepositories({ fence: ["paperclip/repo"], appJwt: "app-jwt", installationId: "44", fetch }))
+      .rejects.toThrow(/Refused to mint a GitHub App installation token/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

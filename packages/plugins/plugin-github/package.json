@@ -1,6 +1,6 @@
 {
   "name": "@vllnt/paperclip-github",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "type": "module",
   "private": true,
   "description": "Connect your GitHub App, repositories, and issues to Paperclip.",

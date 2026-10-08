@@ -1,17 +1,17 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { PLUGIN_ID } from "./contracts.js";
 const manifest: PaperclipPluginManifestV1 = {
-  id: PLUGIN_ID, apiVersion: 1, version: "0.11.0", displayName: "GitHub",
+  id: PLUGIN_ID, apiVersion: 1, version: "0.12.0", displayName: "GitHub",
   description: "Manage GitHub repositories, Projects and synced tasks with Paperclip’s native GitHub channel and review connector.",
   author: "VLLNT", categories: ["connector"],
   capabilities: ["companies.read", "agents.read", "chat.endpoints.read", "issues.create", "issues.update", "issues.wakeup", "jobs.schedule", "events.subscribe", "webhooks.receive", "projects.read", "project.workspaces.read", "issues.read", "plugin.state.read", "plugin.state.write",
-    "secrets.read-ref", "skills.managed", "http.outbound", "activity.log.write", "ui.page.register", "ui.sidebar.register",
+    "secrets.read-ref", "secrets.write-own", "skills.managed", "http.outbound", "activity.log.write", "ui.page.register", "ui.sidebar.register",
     "ui.detailTab.register", "ui.action.register", "instance.settings.register", "agent.tools.register"],
   entrypoints: { worker: "./dist/worker.js", ui: "./dist/ui" },
   jobs: [{ jobKey: "github-sync", displayName: "Sync GitHub tasks", schedule: "* * * * *" }],
   webhooks: [{ endpointKey: "github", displayName: "GitHub events", description: "Receive issue and pull request events from your GitHub App." }],
   taskCreation: { label: "GitHub", listAction: "task-destinations", publishAction: "publish-task", linksAction: "task-links" },
-  projectRepositories: { listAction: "project-repositories", setupPath: "/github-projects" },
+  projectRepositories: { listAction: "project-repositories", setupPath: "/github-projects", writeIdentityAction: "repository-write-identity", signCommitAction: "repository-sign-commit" },
   skills: [{
     skillKey: "github-review-workflow",
     displayName: "GitHub review workflow",
@@ -50,7 +50,14 @@ The operator can edit this skill for each company, repository or organization po
       webhookSecret: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
       privateKey: { type: "object", format: "secret-ref", properties: {
         type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" }
-      }, required: ["type", "secretId"], additionalProperties: false }
+      }, required: ["type", "secretId"], additionalProperties: false },
+      // App user identity: the App's client ID and secret, the rotating refresh
+      // token the plugin stores back (bind a placeholder secret), and the SSH key
+      // agent commits are signed with.
+      userClientId: { type: "string", pattern: "^[A-Za-z0-9.]{8,100}$" },
+      userClientSecret: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
+      userRefreshToken: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
+      signingKey: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false }
     }
   },
   tools: [

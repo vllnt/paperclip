@@ -67,7 +67,7 @@ export function registerTaskLinks(ctx: PluginContext, github: GitHubClient, cred
         const batch = numbers.slice(start, start + 20), affected = rows.filter(r => batch.includes(r.number));
         try {
           const { data } = await cache.read(companyId, auth, ["task-pulls", repositoryId, batch], async () => {
-            const token = await github.scopedToken(auth.id, auth.pem, repo.installationId, { metadata: "read", issues: "read", pull_requests: "read" });
+            const token = await github.scopedToken(auth.id, auth.pem, repo.installationId, { metadata: "read", issues: "read", pull_requests: "read" }, repo.id);
             const [owner, name] = repo.fullName.split("/");
             return github.graphql<any>(token, relatedPullsQuery(batch), { owner, name });
           }, params.refresh === true);

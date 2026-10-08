@@ -808,6 +808,8 @@ export const pluginManifestV1Schema = z.object({
   projectRepositories: z.object({
     listAction: z.string().min(1).max(100),
     setupPath: z.string().regex(/^\/[a-z0-9][a-z0-9-]*$/).optional(),
+    writeIdentityAction: z.string().min(1).max(100).optional(),
+    signCommitAction: z.string().min(1).max(100).optional(),
   }).optional(),
   taskCreation: z.object({
     label: z.string().trim().min(1).max(50),

@@ -213,6 +213,7 @@ import {
   scrubGitCredentialText,
   type GitRemoteAuthProvider,
 } from "./git-credentials.js";
+import { loadGitHubIdentityPolicy } from "./github-write-identity.js";
 // Re-exported because heartbeat's workspace surface exposed the scrubber before the
 // git-credentials module became its canonical home; existing importers keep working.
 export { scrubGitCredentialText };
@@ -21810,8 +21811,14 @@ export function heartbeatService(
           allowStandingDelegation: false,
         },
       );
+      // A saved GitHub plugin write-identity policy also means managed GitHub,
+      // so its kill switch denies writes instead of handing runs back to a host
+      // credential.
+      const githubConfigured =
+        githubSelection.configured ||
+        Boolean(await loadGitHubIdentityPolicy(db, agent.companyId));
       const useHostGitHub =
-        !githubSelection.configured &&
+        !githubConfigured &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
@@ -23043,7 +23050,7 @@ export function heartbeatService(
       if (!useHostGitHub) {
         const githubLaunchers = await prepareHeartbeatGitHubLaunchers({
           native: agent.adapterType === "paperclip_runner",
-          githubConfigured: githubSelection.configured,
+          githubConfigured,
           agentId: agent.id,
           runId: run.id,
           target: executionTarget,
@@ -24941,7 +24948,7 @@ export function heartbeatService(
                     // Bootstrap with executable/home discovery while keeping
                     // configured provider values and the server-selected
                     // workspace boundary authoritative.
-                    managedGitHub: !useHostGitHub && githubSelection.configured,
+                    managedGitHub: !useHostGitHub && githubConfigured,
                     managedAiCredentialIdentity: managedAiRuntime?.identity,
                     managedAiCredentialHome: managedAiRuntime ? String((managedAiRuntime.config.env as Record<string, unknown>).CODEX_HOME) : undefined,
                     runnerEnvironment: {

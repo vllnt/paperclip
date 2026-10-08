@@ -1291,6 +1291,7 @@ const RUNTIME_TOOLS_SECURITY: Array<Record<string, string[]>> = [
 
 const RUNTIME_TOOLS_OPERATIONS = new Set([
   "POST /runtime-tools/github/credentials",
+  "POST /runtime-tools/github/sign",
   "GET /mcp/runtime-tools",
   "POST /mcp/runtime-tools",
   "POST /runtime-tools/connections/search",
@@ -10272,6 +10273,21 @@ registerCurrentRoute({
     401: r.unauthorized,
     403: r.forbidden,
     409: r.conflict,
+  },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/runtime-tools/github/sign",
+  tags: ["connection-intents"],
+  summary:
+    "Sign a git commit object (tags are refused) for the company's GitHub App user using a run capability with github_credentials scope; browser sessions are rejected",
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    422: r.unprocessable,
   },
 });
 

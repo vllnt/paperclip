@@ -148,12 +148,13 @@ export interface HostServices {
     fetch(params: WorkerToHostMethods["http.fetch"][0]): Promise<WorkerToHostMethods["http.fetch"][1]>;
   };
 
-  /** Provides `secrets.resolve`. */
+  /** Provides `secrets.resolve` and `secrets.storeOwn`. */
   secrets: {
     resolve(
       params: WorkerToHostMethods["secrets.resolve"][0],
       context?: WorkerHostCallContext,
     ): Promise<string>;
+    storeOwn(params: WorkerToHostMethods["secrets.storeOwn"][0]): Promise<void>;
   };
 
   /** Provides `activity.log`. */
@@ -416,6 +417,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
+  "secrets.storeOwn": "secrets.write-own",
 
   // Activity
   "activity.log": "activity.log.write",
@@ -786,6 +788,10 @@ export function createHostClientHandlers(
     "secrets.resolve": gated("secrets.resolve", async (params, context) => {
       const companyId = resolveRequiredCompanyId("secrets.resolve", params, context);
       return services.secrets.resolve({ ...params, companyId }, context);
+    }),
+    "secrets.storeOwn": gated("secrets.storeOwn", async (params, context) => {
+      const companyId = resolveRequiredCompanyId("secrets.storeOwn", params, context);
+      return services.secrets.storeOwn({ ...params, companyId });
     }),
 
     // Activity

@@ -16,7 +16,8 @@ import { logActivity } from "../services/activity-log.js";
 import { accessService } from "../services/access.js";
 import type { heartbeatService } from "../services/heartbeat.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
-import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { resolveGitHubCommitSignature, resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { readGitHubOperation } from "../services/github-write-identity.js";
 
 function bearer(req: Request) {
   const value = req.header("authorization") ?? "";
@@ -44,17 +45,34 @@ export function runtimeConnectionIntentRoutes(db: Db) {
   const router = Router();
   const service = connectionIntentService(db);
 
-  router.post("/runtime-tools/github/credentials", async (req, res) => {
+  function githubCapability(req: Request) {
     // This capability is never accepted as board/session authentication.
     // Node fetch sends Sec-Fetch-Mode too; browsers additionally send Origin or Sec-Fetch-Site.
     if (req.headers.origin || req.headers.cookie || req.headers["sec-fetch-site"]) throw forbidden("GitHub credentials require runtime authentication");
     const claims = verifyRuntimeToolsToken(typeof req.headers["x-paperclip-github-capability"] === "string"
       ? req.headers["x-paperclip-github-capability"] : bearer(req), "github_credentials");
     if (!claims) throw unauthorized("Invalid GitHub runtime capability");
+    return { companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id };
+  }
+
+  router.post("/runtime-tools/github/credentials", async (req, res) => {
+    const run = githubCapability(req);
     res.setHeader("Cache-Control", "no-store");
-    res.json(await resolveGitHubOperationCredentials(db, {
-      companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id,
-    }));
+    res.json(await resolveGitHubOperationCredentials(db, run, readGitHubOperation(req.body)));
+  });
+
+  // The managed git signing program sends each commit object here (tags are refused); the
+  // GitHub plugin signs it with the company's server-held key.
+  router.post("/runtime-tools/github/sign", async (req, res) => {
+    const run = githubCapability(req);
+    res.setHeader("Cache-Control", "no-store");
+    const payload = req.body && typeof req.body === "object" ? (req.body as { payload?: unknown }).payload : undefined;
+    if (typeof payload !== "string") {
+      res.status(400).json({ error: "Send { payload } with the git object as base64" });
+      return;
+    }
+    // A refusal is an answer, not an HTTP failure, so the object never reaches failure logs.
+    res.json(await resolveGitHubCommitSignature(db, run, payload));
   });
 
   router.get("/mcp/runtime-tools", async (req, res) => {

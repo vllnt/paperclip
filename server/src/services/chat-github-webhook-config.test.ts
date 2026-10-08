@@ -296,7 +296,7 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
       .mockResolvedValueOnce(json({ token: "installation-test-token" }, 201))
       .mockResolvedValueOnce(losslessJson(comment))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
-    const result = await getGitHubRecoveryComment({
+    const result = await getGitHubRecoveryComment({ fence: null,
       fetch,
       appToken,
       installationId: delivery.installation_id,
@@ -573,7 +573,7 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
         .mockResolvedValueOnce(new Response("private denied", { status }))
         .mockRejectedValueOnce(new Error("private cleanup failure"));
       await expect(
-        getGitHubRecoveryComment({
+        getGitHubRecoveryComment({ fence: null,
           fetch,
           appToken,
           installationId: delivery.installation_id,
@@ -606,7 +606,7 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
       )
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     await expect(
-      getGitHubRecoveryComment({
+      getGitHubRecoveryComment({ fence: null,
         fetch,
         appToken,
         installationId: delivery.installation_id,
@@ -642,7 +642,7 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
         .mockResolvedValueOnce(losslessJson(value))
         .mockResolvedValueOnce(new Response(null, { status: 204 }));
       await expect(
-        getGitHubRecoveryComment({
+        getGitHubRecoveryComment({ fence: null,
           fetch,
           appToken,
           installationId: delivery.installation_id,
@@ -665,7 +665,7 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
   ])("rejects unsafe repository %s before minting authority", async (name) => {
     const fetch = vi.fn<typeof globalThis.fetch>();
     await expect(
-      getGitHubRecoveryComment({
+      getGitHubRecoveryComment({ fence: null,
         fetch,
         appToken,
         installationId: delivery.installation_id,
@@ -740,7 +740,7 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
         async () => await new Promise<Response>(() => undefined),
       )
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
-    const settled = getGitHubRecoveryComment({
+    const settled = getGitHubRecoveryComment({ fence: null,
       fetch,
       appToken,
       installationId: delivery.installation_id,
@@ -768,7 +768,7 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
       .mockImplementationOnce(
         async () => await new Promise<Response>(() => undefined),
       );
-    const settled = getGitHubRecoveryComment({
+    const settled = getGitHubRecoveryComment({ fence: null,
       fetch,
       appToken,
       installationId: delivery.installation_id,
@@ -780,5 +780,26 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
     expect(await settled).toMatchObject({ id: comment.id, bodySha256 });
     expect(fetch.mock.calls[2]?.[1]?.signal?.aborted).toBe(true);
     expect(fetch).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("I-RO (security review round 3)", () => {
+  it("recovers a comment of an App-user company's App only inside its fence, with a read-only token", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const outside = await getGitHubRecoveryComment({
+      fence: ["anthm-fr/songtrivia"], fetch, appToken, installationId: delivery.installation_id,
+      repositoryFullName, event: "issue_comment", commentId: comment.id,
+    }).catch((error: unknown) => error);
+    expect((outside as Error).message).toMatch(/Refused to mint a GitHub App installation token: .*outside the company's GitHub fence/);
+    expect(fetch).not.toHaveBeenCalled();
+    fetch
+      .mockResolvedValueOnce(json({ token: "installation-test-token" }, 201))
+      .mockResolvedValueOnce(losslessJson(comment))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await getGitHubRecoveryComment({
+      fence: [repositoryFullName.toLowerCase()], fetch, appToken, installationId: delivery.installation_id,
+      repositoryFullName, event: "issue_comment", commentId: comment.id,
+    });
+    expect(JSON.parse(String(fetch.mock.calls[0]![1]!.body))).toEqual({ repositories: ["example"], permissions: { issues: "read", pull_requests: "read" } });
   });
 });

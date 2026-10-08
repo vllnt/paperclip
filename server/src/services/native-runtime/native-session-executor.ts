@@ -10,7 +10,8 @@ import {
 } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
 import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-github-access.js";
-import { resolveGitHubOperationCredentials } from "../github-operation-credentials.js";
+import { resolveGitHubCommitSignature, resolveGitHubOperationCredentials } from "../github-operation-credentials.js";
+import { readGitHubOperation } from "../github-write-identity.js";
 import { bindManagedNativeCredentialTurn, completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import { createLocalNativeQuestionBridge } from "./local-native-question-bridge.js";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
@@ -8291,7 +8292,8 @@ async function executePaperclipNativeSessionWithinScope(
         target: input.runnerExecutionTarget,
         cwd: input.execution.workspace.cwd,
         env: resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment),
-        resolveCredentials: (binding) => resolveGitHubOperationCredentials(input.db, binding),
+        resolveCredentials: (binding, operation) => resolveGitHubOperationCredentials(input.db, binding, readGitHubOperation(operation)),
+        resolveSignature: (binding, payload) => resolveGitHubCommitSignature(input.db, binding, payload),
         onLog: input.onLog,
       });
       releaseGitHubRun = githubAccess.activate(input.execution.binding);

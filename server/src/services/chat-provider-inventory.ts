@@ -1,4 +1,4 @@
-import type { ChatProvider } from "@paperclipai/shared";
+import { mintGitHubInstallationToken, type ChatProvider } from "@paperclipai/shared";
 
 export interface ChatProviderResourceInventoryItem {
   providerResourceId: string;
@@ -173,22 +173,24 @@ export async function listGitHubInstallationRepositories(input: {
   appJwt: string;
   installationId: string;
   fetch: typeof globalThis.fetch;
+  /** I-RO: null when no company writes as this App's user; otherwise the listing (a whole-installation token) is refused. */
+  fence: readonly string[] | null;
 }): Promise<ChatProviderInventoryResult> {
   const headers = {
     accept: "application/vnd.github+json",
     authorization: `Bearer ${input.appJwt}`,
     "x-github-api-version": "2022-11-28",
   };
-  const tokenResponse = await input.fetch(
-    `https://api.github.com/app/installations/${encodeURIComponent(input.installationId)}/access_tokens`,
-    { method: "POST", headers, signal: githubRequestSignal() },
-  );
-  const tokenBody = await jsonResponse<{ token?: string; message?: string }>(
-    tokenResponse,
-    "GitHub",
-  );
-  if (!tokenBody.token)
-    throw new Error("GitHub inventory failed: installation token was missing");
+  const tokenBody: { token?: string } = { token: await mintGitHubInstallationToken({ installationId: input.installationId }, input.fence, async (call) => {
+    const tokenResponse = await input.fetch(`https://api.github.com${call.path}`, {
+      method: "POST", headers, signal: githubRequestSignal(),
+      ...(Object.keys(call.body).length ? { body: JSON.stringify(call.body) } : {}),
+    });
+    const issued = await jsonResponse<{ token?: string; message?: string }>(tokenResponse, "GitHub");
+    if (!issued.token)
+      throw new Error("GitHub inventory failed: installation token was missing");
+    return issued.token;
+  }) };
 
   const resources: ChatProviderResourceInventoryItem[] = [];
   let page = 1;
