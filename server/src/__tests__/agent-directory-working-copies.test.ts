@@ -691,7 +691,7 @@ describe("persistent agent directories", () => {
     await expect(fs.stat(copy.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("stages SSH agent files at the registered root without a nested task workspace", async () => {
+  it("stages SSH agent files at the registered root without a nested task workspace or dependency trees", async () => {
     const remoteCwd = path.join(home, "ssh-task");
     const exclude = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" });
     const stage = vi.spyOn(ssh, "syncDirectoryToSsh").mockImplementation(async input => {
@@ -713,6 +713,10 @@ describe("persistent agent directories", () => {
       expect((await copies.collectStopped({ companyId, runId, target }))?.state).toBe("saved");
       expect(restore).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: copy.executionRoot, restoreGitHistory: false }));
       expect(await fs.readFile(path.join(root, "ssh-note.txt"), "utf8")).toBe("persistent SSH file");
+      // Both directions share the SSH sync-back dependency exclusions.
+      const [{ exclude: uploaded }] = stage.mock.calls.at(-1)!;
+      expect(uploaded).toEqual(expect.arrayContaining([".paperclip-runtime", "node_modules", "*/node_modules/*", ".cache", "*/.next"]));
+      expect(restore).toHaveBeenCalledWith(expect.objectContaining({ baselineSnapshot: expect.objectContaining({ exclude: uploaded }) }));
     } finally { stage.mockRestore(); restore.mockRestore(); exclude.mockRestore(); }
   });
 

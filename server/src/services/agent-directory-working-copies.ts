@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { agents, environmentLeases, environments, agentInstructionWorkingCopies as copies, type Db } from "@paperclipai/db";
-import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
+import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution, sshSyncBackDependencyExcludes } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
@@ -54,11 +54,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (target.transport === "ssh") {
       // Reuse SSH's plain directory transfer without its task-workspace suffix
       // or Git-history discovery. The registered root is the exact writable root.
-      await syncDirectoryToSsh({ spec: target.spec, localDir: row.localRoot, remoteDir: row.executionRoot, exclude: [".paperclip-runtime"] });
+      // Dependency and cache trees stay out in both directions: agent files
+      // cannot store their links anyway, and copying them back fills the host.
+      const exclude = [".paperclip-runtime", ...sshSyncBackDependencyExcludes()];
+      await syncDirectoryToSsh({ spec: target.spec, localDir: row.localRoot, remoteDir: row.executionRoot, exclude });
       return { target, workspaceRemoteDir: row.executionRoot, runtimeRootDir: null,
         assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
         restoreWorkspace: () => restoreWorkspaceFromSshExecution({ spec: target.spec, localDir: row.localRoot,
-          remoteDir: row.executionRoot, baselineSnapshot: { ...baseline(row), exclude: [".paperclip-runtime"] }, restoreGitHistory: false }) };
+          remoteDir: row.executionRoot, baselineSnapshot: { ...baseline(row), exclude }, restoreGitHistory: false }) };
     }
     return prepareAdapterExecutionTargetRuntime({ target, runId: row.runId, adapterKey: "agent-files",
       workspaceLocalDir: row.localRoot, workspaceRemoteDir: row.executionRoot,
