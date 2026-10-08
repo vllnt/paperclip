@@ -293,6 +293,19 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
     });
   });
 
+  it("does not re-run the agent to force a missing comment while the re-check wait is pending", async () => {
+    const { agentId, issueId } = await seed();
+    // This turn posts no issue comment.
+    mockAdapterExecute.mockImplementation(async () => backgroundStopResult());
+
+    const run = await runOnce(agentId, issueId);
+
+    expect(run.status).toBe("succeeded");
+    expect((await loadIssue(issueId)).monitorNextCheckAt).not.toBeNull();
+    expect(await countRuns(agentId)).toBe(1);
+    expect(await pendingWakes(agentId)).toEqual([]);
+  });
+
   it("leaves the waiting issue alone when the stranded-issue reconciler runs", async () => {
     const { agentId, issueId } = await seed();
     mockAdapterExecute.mockImplementation(agentTurn(issueId, backgroundStopResult));

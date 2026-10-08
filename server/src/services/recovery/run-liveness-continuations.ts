@@ -19,8 +19,16 @@ const IDEMPOTENT_WAKE_STATUSES = ["queued", "deferred_issue_execution", "complet
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
-  "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "executionState" | "projectId"
-> & Partial<Pick<typeof issues.$inferSelect, "monitorNextCheckAt">>;
+  | "id"
+  | "companyId"
+  | "identifier"
+  | "title"
+  | "status"
+  | "assigneeAgentId"
+  | "executionState"
+  | "projectId"
+  | "monitorNextCheckAt"
+>;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 
 export type RunContinuationDecision =
