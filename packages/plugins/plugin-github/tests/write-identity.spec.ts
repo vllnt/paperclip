@@ -179,8 +179,8 @@ async function appFixture(options: { revoked?: () => boolean } = {}) {
     /** Pull request reads, to move the head between two of them. */
     prReads: 0,
     rules: [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "lint", integration_id: 15368 }, { context: "typecheck" }] } }] as any[],
-    /** Classic protection of main as GitHub's branch read reports it: it binds administrators. */
-    protection: { enforce_admins: { enabled: true } } as Record<string, unknown>,
+    /** Classic protection of main in the shape GitHub's branch read returns (never with enforce_admins): it binds administrators. */
+    protection: { enabled: true, required_status_checks: { enforcement_level: "everyone", contexts: [], checks: [] } } as Record<string, unknown>,
     appPermissions: { ...permissions } as Record<string, string>,
     unreachable: false,
     refreshGate: null as Promise<void> | null,
@@ -355,7 +355,7 @@ describe("GitHub write identity: App user (anthm)", () => {
     expect(await merge({ pullRequest: 7, expectedHeadSha: "b".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("not the expected"), evidence: { headSha: "a".repeat(40) } });
     const granted = await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) });
     expect(granted).toMatchObject({ identity: "user", credential: { login: "agent-owner" }, evidence: { adminMerge: {
-      pullRequest: 7, headSha: "a".repeat(40), enforceAdmins: true, requiredChecks: ["lint", "typecheck"],
+      pullRequest: 7, headSha: "a".repeat(40), enforcementLevel: "everyone", requiredChecks: ["lint", "typecheck"],
       checks: [{ name: "lint", result: "success" }, { name: "typecheck", result: "success" }],
     } } });
     // The pinned integration must report it; a failing or pending required check blocks the merge.
@@ -372,7 +372,7 @@ describe("GitHub write identity: App user (anthm)", () => {
     expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("lint") });
     // Classic branch protection adds required checks the ruleset does not list.
     f.github.rules = [];
-    f.github.protection = { enforce_admins: { enabled: true }, required_status_checks: { contexts: ["e2e"], checks: [{ context: "e2e", app_id: 15368 }] } };
+    f.github.protection = { enabled: true, required_status_checks: { enforcement_level: "everyone", contexts: ["e2e"], checks: [{ context: "e2e", app_id: 15368 }] } };
     f.github.checkRuns = [{ id: 4, name: "lint", status: "completed", conclusion: "success", app: { id: 15368 } }];
     expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("e2e"), evidence: { requiredChecks: ["e2e"] } });
     f.github.checkRuns = [];
@@ -394,14 +394,36 @@ describe("GitHub write identity: App user (anthm)", () => {
     return { ...f, merge, refused };
   }
 
-  it("refuses an admin merge where administrators may bypass the base branch protection (enforce_admins off or unreported)", async () => {
+  it("allows an admin merge on GitHub's live branch shape: enforcement_level everyone and no enforce_admins key (regression)", async () => {
     const f = await adminMergeFixture();
-    // --admin would skip every rule of the branch, required checks green or not.
-    f.github.protection = { enforce_admins: { enabled: false }, required_status_checks: { contexts: ["lint"], checks: [] } };
-    await f.refused("enforce_admins is off", { base: "main", enforceAdmins: false });
-    // No classic protection: a ruleset alone may list bypass actors the read-only token cannot see.
-    f.github.protection = { enabled: false };
-    await f.refused("enforce_admins is not reported", { enforceAdmins: null });
+    // GET /branches/{branch} as GitHub returns it live, even to an owner: enforce_admins is never part of it.
+    f.github.protection = { enabled: true, required_status_checks: { enforcement_level: "everyone", contexts: ["lint", "typecheck"], checks: [{ context: "lint", app_id: 15368 }, { context: "typecheck", app_id: 15368 }] } };
+    expect(Object.keys(f.github.protection)).toEqual(["enabled", "required_status_checks"]);
+    const decision = await f.merge();
+    expect(decision).toMatchObject({ identity: "user", credential: { login: "agent-owner" }, evidence: { adminMerge: { headSha: "a".repeat(40), enforcementLevel: "everyone", requiredChecks: ["lint", "typecheck"] } } });
+    expect(decision.evidence.adminMerge).not.toHaveProperty("enforceAdmins");
+  });
+
+  it("refuses an admin merge where administrators may bypass the base branch protection (enforcement_level not everyone)", async () => {
+    const f = await adminMergeFixture();
+    // Required checks green or not, --admin would skip every rule of such a branch.
+    const cases: Array<[string, unknown, string, Record<string, unknown>]> = [
+      ["administrators exempt, no required check (live shape)", { enabled: true, required_status_checks: { enforcement_level: "non_admins", contexts: [], checks: [] } }, "enforcement_level non_admins", { base: "main", enforcementLevel: "non_admins" }],
+      ["administrators exempt from required checks", { enabled: true, required_status_checks: { enforcement_level: "non_admins", contexts: ["lint"], checks: [] } }, "enforcement_level non_admins", { enforcementLevel: "non_admins" }],
+      ["required checks off", { enabled: true, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } }, "enforcement_level off", { enforcementLevel: "off" }],
+      ["enforcement_level missing", { enabled: true, required_status_checks: { contexts: ["lint"], checks: [] } }, "enforcement_level not reported", { enforcementLevel: null }],
+      ["an unprotected branch", { enabled: false, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } }, "branch protection off", { enforcementLevel: "off" }],
+      ["protection off, whatever the level says", { enabled: false, required_status_checks: { enforcement_level: "everyone", contexts: ["lint"], checks: [] } }, "branch protection off", { enforcementLevel: "everyone" }],
+      ["no protection object", undefined, "enforcement_level not reported", { enforcementLevel: null }],
+      ["enforce_admins reported off", { enabled: true, enforce_admins: { enabled: false }, required_status_checks: { enforcement_level: "everyone", contexts: ["lint"], checks: [] } }, "enforce_admins off", { enforceAdmins: false }],
+    ];
+    for (const [label, protection, reason, evidence] of cases) {
+      f.github.protection = protection as Record<string, unknown>;
+      const decision = await f.merge();
+      expect(decision, label).toMatchObject({ identity: "user", unavailable: expect.stringContaining(reason), evidence });
+      expect(decision.unavailable, label).toContain('enforcement_level "everyone"');
+      expect(decision, label).not.toHaveProperty("credential");
+    }
   });
 
   it("refuses an admin merge when GitHub does not let Paperclip read the base branch protection", async () => {
@@ -417,16 +439,18 @@ describe("GitHub write identity: App user (anthm)", () => {
   it("refuses an admin merge when the base branch requires no check, even with every reported check green", async () => {
     const f = await adminMergeFixture();
     f.github.rules = [];
-    await f.refused("requires no status check", { enforceAdmins: true, requiredChecks: [] });
+    await f.refused("requires no status check", { enforcementLevel: "everyone", requiredChecks: [] });
     f.github.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [] } }];
-    f.github.protection = { enforce_admins: { enabled: true }, required_status_checks: { contexts: [], checks: [] } };
     await f.refused("requires no status check", { requiredChecks: [] });
   });
 
-  it("allows an admin merge bound by enforce_admins and green required checks on the exact head; a merge without --admin ignores enforce_admins", async () => {
+  it("allows an admin merge bound by enforcement_level everyone, or by enforce_admins if GitHub reports it, with green required checks; a merge without --admin ignores both", async () => {
     const f = await adminMergeFixture();
-    expect(await f.merge()).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: { headSha: "a".repeat(40), enforceAdmins: true, requiredChecks: ["lint", "typecheck"] } } });
-    f.github.protection = { enforce_admins: { enabled: false } };
+    expect(await f.merge()).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: { headSha: "a".repeat(40), enforcementLevel: "everyone", requiredChecks: ["lint", "typecheck"] } } });
+    // enforce_admins is accepted when a response carries it, not required.
+    f.github.protection = { enabled: true, enforce_admins: { enabled: true }, required_status_checks: { contexts: [], checks: [] } };
+    expect(await f.merge()).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: { enforceAdmins: true, enforcementLevel: null } } });
+    f.github.protection = { enabled: true, required_status_checks: { enforcement_level: "non_admins", contexts: [], checks: [] } };
     f.github.rules = [];
     expect(await f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: "a".repeat(40) }))
       .toMatchObject({ credential: { login: "agent-owner" } });

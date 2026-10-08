@@ -412,11 +412,14 @@ export function registerWriteIdentity(
 
   /**
    * An `--admin` merge goes ahead only for the head SHA the caller expects,
-   * only on a base branch whose classic protection binds administrators
-   * (`enforce_admins`) and requires at least one check, and only when every
-   * required check on that head concluded `success` (read with the App's
-   * read-only token). Without `enforce_admins`, `--admin` skips every rule of
-   * the branch; without a required check, nothing bounds what is merged.
+   * only on a base branch whose classic protection binds administrators and
+   * requires at least one check, and only when every required check on that
+   * head concluded `success` (read with the App's read-only token). GitHub's
+   * branch read never includes `enforce_admins` (that needs the Administration
+   * permission); it reports administrators as bound by
+   * `required_status_checks.enforcement_level: "everyone"`. When administrators
+   * are not bound, `--admin` skips every rule of the branch; without a required
+   * check, nothing bounds what is merged.
    */
   async function adminMergeEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, pullRequest: number | null | undefined, expectedHeadSha: string | null | undefined) {
     expectedHeadSha = expectedHeadSha?.toLowerCase() ?? null;
@@ -434,15 +437,19 @@ export function registerWriteIdentity(
     }
     const base = encodeURIComponent(String(pr.base.ref));
     const elsewhere = "Merge it without --admin (gh pr merge) or in the GitHub web UI";
-    // Only classic protection's enforce_admins holds --admin to the rules: ruleset bypass actors are hidden from the read-only token.
+    // Only classic protection that binds administrators holds --admin to its rules: ruleset bypass actors are hidden from the read-only token.
     let branch: any;
     try { branch = (await github.request<any>(`/repos/${repository}/branches/${base}`, token)).data; } catch {
       throw new Denied("Paperclip cannot read the base branch protection, so it cannot tell whether --admin would bypass it; an admin merge is refused.", evidence);
     }
-    const enforced = branch?.protection?.enforce_admins?.enabled;
-    evidence.enforceAdmins = typeof enforced === "boolean" ? enforced : null;
-    if (enforced !== true) {
-      throw new Denied(`The base branch lets administrators bypass its protection (enforce_admins is ${enforced === false ? "off" : "not reported"}), so --admin would skip its rules; an admin merge is refused. ${elsewhere}, or turn on "Do not allow bypassing the above settings" for the base branch.`, evidence);
+    const protection = branch?.protection;
+    // enforcement_level "everyone" is how the branch read reports enforce_admins; enforce_admins itself counts if a response ever carries it.
+    const level = protection?.required_status_checks?.enforcement_level, enforceAdmins = protection?.enforce_admins?.enabled;
+    evidence.enforcementLevel = typeof level === "string" ? level : null;
+    if (typeof enforceAdmins === "boolean") evidence.enforceAdmins = enforceAdmins;
+    if (protection?.enabled !== true || enforceAdmins === false || (level !== "everyone" && enforceAdmins !== true)) {
+      const state = [`branch protection ${protection?.enabled === true ? "on" : "off"}`, `enforcement_level ${evidence.enforcementLevel ?? "not reported"}`, ...(enforceAdmins === false ? ["enforce_admins off"] : [])].join(", ");
+      throw new Denied(`The base branch lets administrators bypass its protection (${state}; Paperclip needs enforcement_level "everyone"), so --admin would skip its rules; an admin merge is refused. ${elsewhere}, or turn on "Do not allow bypassing the above settings" for the base branch.`, evidence);
     }
     // Every page of rules, check runs and statuses is read, or the merge is refused.
     const pages = async <T>(read: (page: number) => Promise<{ items: T[]; next: boolean }>, what: string) => {
@@ -456,7 +463,7 @@ export function registerWriteIdentity(
       const response = await github.request<any[]>(`/repos/${repository}/rules/branches/${base}?per_page=100&page=${page}`, token);
       return { items: Array.isArray(response.data) ? response.data : [], next: response.next };
     }, "branch rules");
-    const classic = branch?.protection?.required_status_checks ?? {};
+    const classic = protection?.required_status_checks ?? {};
     const required = [
       ...(Array.isArray(rules) ? rules : []).filter(rule => rule?.type === "required_status_checks")
         .flatMap(rule => (rule.parameters?.required_status_checks ?? []) as Array<{ context?: unknown; integration_id?: unknown }>)

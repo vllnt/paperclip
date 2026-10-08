@@ -271,18 +271,23 @@ or the API `sha`); an abbreviation is refused. Every `gh pr merge` option must
 be one Paperclip knows and exactly one pull request may be named. The plugin reads the pull
 request, the base branch's rules and classic branch protection, and the head's
 check runs with the App's read-only token, and refuses unless the head equals
-that SHA exactly, the base branch's classic protection binds administrators
-(`enforce_admins`, "Do not allow bypassing the above settings"), the base
-branch requires at least one check, and every required check, from rulesets
-and classic branch protection, concluded `success` in its latest run (from the
-pinned integration when the rule names one). Without `enforce_admins`,
-`--admin` skips every rule of the branch; a ruleset does not stand in for it,
-because the read-only token cannot see a ruleset's bypass actors. Paperclip
-checks the ruleset's required checks itself; its other rules (for example
-required reviews) bind `--admin` only when the App user is not a bypass actor
-of that ruleset. Branch
-protection Paperclip cannot read refuses the merge, and so does a branch that
-requires no check (the checks that happened to report are not a bound). The
+that SHA exactly, the base branch's classic protection is on and binds
+administrators ("Do not allow bypassing the above settings", `enforce_admins`),
+the base branch requires at least one check, and every required check, from
+rulesets and classic branch protection, concluded `success` in its latest run
+(from the pinned integration when the rule names one). GitHub's branch read
+(`GET /repos/{owner}/{repo}/branches/{branch}`) never includes `enforce_admins`;
+it reports administrators as bound with
+`protection.required_status_checks.enforcement_level: "everyone"`
+(`non_admins` when they are not). Paperclip reads that value, and also accepts
+`enforce_admins.enabled: true` if a response carries it. When administrators
+are not bound, `--admin` skips every rule of the branch; a ruleset does not
+stand in for that, because the read-only token cannot see a ruleset's bypass
+actors. Paperclip checks the ruleset's required checks itself; its other rules
+(for example required reviews) bind `--admin` only when the App user is not a
+bypass actor of that ruleset. Branch protection Paperclip cannot read refuses
+the merge, and so does a branch that requires no check (the checks that
+happened to report are not a bound). The
 plugin's own merge (board action and agent tool) and a raw
 `PUT …/pulls/N/merge` count as admin merges, so the same rules apply to them.
 The result is part of the audit record.
