@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1519,6 +1519,59 @@ describe("SSH run directory cleanup", () => {
     await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
       .resolves.toBe("symlink");
     expect((await readdir(outside)).length).toBeGreaterThan(0);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("removes read-only trees and never follows a symlink inside the run directory", async () => {
+    const run = await startRun("SSH run directory contents test");
+    if (!run) return;
+    await run.prepared.restoreWorkspace();
+    const outside = path.join(run.rootDir, "outside-target");
+    await mkdir(outside);
+    await writeFile(path.join(outside, "keep.txt"), "outside\n");
+    await symlink(outside, path.join(run.runDir, "workspace", "escape"));
+    const readOnly = path.join(run.runDir, "workspace", "modcache");
+    await mkdir(readOnly);
+    await writeFile(path.join(readOnly, "locked.txt"), "x");
+    await chmod(readOnly, 0o555);
+
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("removed");
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(outside, "keep.txt"), "utf8")).resolves.toBe("outside\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("does not accept a symlinked marker", async () => {
+    const run = await startRun("SSH run directory symlinked marker test");
+    if (!run) return;
+    const elsewhere = path.join(run.rootDir, "fake-marker");
+    await writeFile(elsewhere, "");
+    await symlink(elsewhere, path.join(run.runDir, SSH_RUN_RESTORED_MARKER));
+
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("not_restored");
+    await expect(stat(path.join(run.runDir, "workspace"))).resolves.toBeTruthy();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("marks a run directory removable when preparation fails before any agent ran", async () => {
+    const rootDir = await createFixtureRootDir();
+    const localDir = path.join(rootDir, "local-workspace");
+    await mkdir(localDir, { recursive: true });
+    await writeFile(path.join(localDir, "ok.txt"), "ok\n");
+    // An unreadable file makes the local tar of the upload fail.
+    await writeFile(path.join(localDir, "unreadable.txt"), "secret\n");
+    await chmod(path.join(localDir, "unreadable.txt"), 0o000);
+    const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH run directory failed prepare test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const runId = randomUUID();
+    const runDir = sshRunDirectory(started.workspaceDir, runId);
+
+    await expect(prepareRemoteManagedRuntime({ spec, runId, adapterKey: "test-adapter", workspaceLocalDir: localDir }))
+      .rejects.toThrow();
+
+    await expect(stat(path.join(runDir, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+    await expect(removeRestoredSshRunDirectory({ spec, remoteRoot: spec.remoteCwd, runId })).resolves.toBe("removed");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("refuses run ids that are not UUIDs and roots that are not normalized absolute paths", async () => {

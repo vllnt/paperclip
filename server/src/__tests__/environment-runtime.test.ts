@@ -1329,7 +1329,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(released[0]?.lease.status).toBe("released");
     }
 
-    expect((await readdir(runsDir)).sort()).toEqual([runs.notRestored.id, runs.live.id].sort());
+    // The removal runs in the background after the release.
+    await vi.waitFor(async () => {
+      expect((await readdir(runsDir)).sort()).toEqual([runs.notRestored.id, runs.live.id].sort());
+    }, { timeout: 15_000, interval: 100 });
   });
 
   it("still releases an SSH lease when its run directory cleanup fails", async () => {
@@ -1351,7 +1354,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.insert(environmentLeases).values({
       id: leaseId, companyId, environmentId: environment.id, heartbeatRunId: runId, status: "active",
       leasePolicy: "ephemeral", provider: "ssh", providerLeaseId: "ssh://ssh-user@ssh.invalid:22/srv/paperclip/workspace",
-      metadata: { driver: "ssh", remoteCwd: "/srv/paperclip/workspace" },
+      metadata: { driver: "ssh", remoteCwd: "/srv/paperclip/workspace", host: "ssh.invalid", port: 22, username: "ssh-user" },
     });
     const warn = vi.spyOn(logger, "warn");
     try {
@@ -1359,10 +1362,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
       expect(released.map((entry) => entry.lease.id)).toEqual([leaseId]);
       expect(released[0]?.lease).toMatchObject({ status: "released" });
-      expect(warn).toHaveBeenCalledWith(
-        expect.objectContaining({ errorKind: "ssh_run_directory_cleanup_failed", leaseId }),
-        expect.any(String),
-      );
+      await vi.waitFor(() => {
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({ errorKind: "ssh_run_directory_cleanup_failed", leaseId }),
+          expect.any(String),
+        );
+      }, { timeout: 25_000, interval: 100 });
     } finally {
       warn.mockRestore();
     }

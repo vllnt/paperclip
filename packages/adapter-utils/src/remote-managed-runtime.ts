@@ -46,9 +46,10 @@ export function sshRunDirectory(remoteRoot: string, runId: string): string {
 }
 
 /**
- * Written into `runs/<runId>` after the run's sync-back finished. Only this
- * marker proves the host holds no unsynced work, so it is what allows
- * {@link removeRestoredSshRunDirectory} to delete the directory.
+ * Written into `runs/<runId>` when the host holds no unsynced work there: after
+ * the run's sync-back finished, or when preparation failed before any agent
+ * ran. Only this marker allows {@link removeRestoredSshRunDirectory} to delete
+ * the directory.
  */
 export const SSH_RUN_RESTORED_MARKER = ".paperclip-restored";
 
@@ -60,15 +61,17 @@ const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
  * root must be a normalized absolute path, and every directory below the root
  * (`.paperclip-runtime`, `runs`, `<runId>`) must be a real directory, never a
  * symlink, so a link an agent planted cannot redirect the removal. `rm -rf`
- * does not follow symlinks inside the tree. Without the restored marker the
- * directory is kept, because it may hold the only copy of the run's work.
+ * and `find` do not follow symlinks inside the tree. Without the restored
+ * marker the directory is kept, because it may hold the only copy of the run's
+ * work. The marker is deleted last, so a removal that fails part way (for
+ * example on a file it cannot delete) reports `rm_failed` and can be retried.
  */
 export async function removeRestoredSshRunDirectory(input: {
   spec: SshConnectionConfig;
   remoteRoot: string;
   runId: string;
   timeoutMs?: number;
-}): Promise<"removed" | "not_restored" | "absent" | "symlink"> {
+}): Promise<"removed" | "not_restored" | "absent" | "symlink" | "rm_failed"> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to remove an SSH run directory for a run id that is not a UUID.");
   }
@@ -86,15 +89,20 @@ export async function removeRestoredSshRunDirectory(input: {
     '  if [ ! -d "$dir" ]; then echo absent; exit 0; fi',
     "done",
     `if [ -L ${shellQuote(marker)} ] || [ ! -f ${shellQuote(marker)} ]; then echo not_restored; exit 0; fi`,
-    `rm -rf -- ${shellQuote(runDir)}`,
-    "echo removed",
+    // Read-only directories (a Go module cache, say) would stop rm -rf.
+    `find ${shellQuote(runDir)} -type d ! -perm -200 -exec chmod u+w {} + 2>/dev/null || true`,
+    `if find ${shellQuote(runDir)} -mindepth 1 -maxdepth 1 ! -name ${shellQuote(SSH_RUN_RESTORED_MARKER)} -exec rm -rf -- {} + \\`,
+    `  && rm -f -- ${shellQuote(marker)} && rmdir -- ${shellQuote(runDir)}; then echo removed; else echo rm_failed; fi`,
   ].join("\n");
   const result = await runSshCommand(input.spec, script, {
     timeoutMs: input.timeoutMs ?? 120_000,
     maxBuffer: 16 * 1024,
   });
   const outcome = result.stdout.trim().split("\n").pop();
-  if (outcome === "removed" || outcome === "not_restored" || outcome === "absent" || outcome === "symlink") {
+  if (
+    outcome === "removed" || outcome === "not_restored" || outcome === "absent" ||
+    outcome === "symlink" || outcome === "rm_failed"
+  ) {
     return outcome;
   }
   throw new Error("SSH run directory removal returned an unexpected result.");
@@ -194,6 +202,13 @@ export async function prepareRemoteManagedRuntime(input: {
   const runDir = syncWorkspace ? sshRunDirectory(baseWorkspaceRemoteDir, input.runId) : null;
   const workspaceRemoteDir = runDir ? path.posix.join(runDir, "workspace") : baseWorkspaceRemoteDir;
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  const marker = runDir ? path.posix.join(runDir, SSH_RUN_RESTORED_MARKER) : null;
+  // Best effort: without the marker the run directory is only kept.
+  const markNothingToKeep = async () => {
+    if (!runDir || !marker) return;
+    await runSshCommand(input.spec, `if [ -d ${shellQuote(runDir)} ]; then : > ${shellQuote(marker)}; fi`)
+      .catch(() => undefined);
+  };
 
   const preparedWorkspace = syncWorkspace
     ? await prepareWorkspaceForSshExecution({
@@ -203,6 +218,10 @@ export async function prepareRemoteManagedRuntime(input: {
         onProgress: input.onProgress,
         workspaceFileMode: input.workspaceFileMode,
         workspaceExclude: input.workspaceExclude,
+      }).catch(async (error: unknown) => {
+        // No agent ran, so a partial upload holds nothing to keep.
+        await markNothingToKeep();
+        throw error;
       })
     : null;
   // The sync-back tar and the merge both use the baseline's exclude list, so
@@ -253,6 +272,7 @@ export async function prepareRemoteManagedRuntime(input: {
         onProgress: input.onProgress,
       });
     }
+    await markNothingToKeep();
     throw error;
   }
 
@@ -313,7 +333,6 @@ export async function prepareRemoteManagedRuntime(input: {
       // The restored marker lets the lease release delete `runs/<runId>`. Clear
       // an earlier restore's marker first, so a restore that fails below never
       // leaves one behind; write it only after every step succeeded.
-      const marker = runDir ? path.posix.join(runDir, SSH_RUN_RESTORED_MARKER) : null;
       const markerCleared = marker
         ? await runSshCommand(input.spec, `rm -f -- ${shellQuote(marker)}`).then(() => true, () => false)
         : false;
@@ -334,10 +353,7 @@ export async function prepareRemoteManagedRuntime(input: {
           readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
         });
       }
-      // Best effort: without the marker the directory is only kept.
-      if (marker && markerCleared) {
-        await runSshCommand(input.spec, `: > ${shellQuote(marker)}`).catch(() => undefined);
-      }
+      if (markerCleared) await markNothingToKeep();
     },
   };
 }
