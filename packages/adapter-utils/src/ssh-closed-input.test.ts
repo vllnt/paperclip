@@ -110,22 +110,30 @@ describe("SSH transfers whose child exits before reading its input", () => {
     expect(rejectionMessage(outcome)).toContain("Connection closed by remote host");
   }, 20_000);
 
-  // Two orders: ssh exits while tar is writing (EPIPE), or the ssh exit is
-  // seen before tar writes at all (the write then stalls instead of failing).
+  // Orders: ssh exits while tar is writing (EPIPE); the ssh exit is seen
+  // before tar writes at all (the write then stalls instead of failing); or ssh
+  // exits only after the pipe filled up, with the progress counter in the pipe
+  // (as in production), which once left tar blocked forever.
   it.each([
-    { order: "ssh exits mid-write", tarDelay: "" },
-    { order: "ssh exits before tar writes", tarDelay: "sleep 1\n" },
-  ])("syncDirectoryToSsh reports the ssh failure instead of crashing or hanging ($order)", async ({ tarDelay }) => {
+    { order: "ssh exits mid-write", sshDelay: "", tarDelay: "", withProgress: false },
+    { order: "ssh exits before tar writes", sshDelay: "", tarDelay: "sleep 1\n", withProgress: false },
+    { order: "ssh exits after the pipe filled, with progress", sshDelay: "sleep 1\n", tarDelay: "", withProgress: true },
+  ])("syncDirectoryToSsh reports the ssh failure instead of crashing or hanging ($order)", async ({ sshDelay, tarDelay, withProgress }) => {
     const realTar = (await execFileAsync("sh", ["-c", "command -v tar"])).stdout.trim();
     await shadowCommands({
-      ssh: SSH_EXITS_WITHOUT_READING,
+      ssh: `${sshDelay}${SSH_EXITS_WITHOUT_READING}`,
       tar: `${tarDelay}exec ${JSON.stringify(realTar)} "$@"`,
     });
     const localDir = await tempDir("paperclip-closed-input-src-");
     await writeFile(path.join(localDir, "big.bin"), randomBytes(LARGE_INPUT_BYTES));
 
     const { outcome, uncaught } = await settleCapturingUncaught(() =>
-      syncDirectoryToSsh({ spec: spec(), localDir, remoteDir: "/remote/workspace" }),
+      syncDirectoryToSsh({
+        spec: spec(),
+        localDir,
+        remoteDir: "/remote/workspace",
+        ...(withProgress ? { onProgress: async () => {} } : {}),
+      }),
     );
 
     expect(errorCodes(uncaught)).toEqual([]);
@@ -151,28 +159,54 @@ describe("SSH transfers whose child exits before reading its input", () => {
     expect(rejectionMessage(outcome)).toContain("Connection closed by remote host");
   }, 20_000);
 
-  // Two orders: tar exits while ssh is streaming (EPIPE), or the tar exit is
-  // seen before ssh sends anything (the write then stalls instead of failing).
+  // Orders: tar exits while ssh is streaming (EPIPE); the tar exit is seen
+  // before ssh sends anything (the write then stalls instead of failing); or tar
+  // exits only after the pipe filled up, with the progress counter in the pipe
+  // (as in production), which once left ssh blocked forever.
   it.each([
-    { order: "tar exits mid-stream", sshDelay: "" },
-    { order: "tar exits before ssh sends", sshDelay: "sleep 1\n" },
-  ])("syncDirectoryFromSsh reports the local tar failure instead of crashing or hanging ($order)", async ({ sshDelay }) => {
+    { order: "tar exits mid-stream", sshDelay: "", tarDelay: "", withProgress: false },
+    { order: "tar exits before ssh sends", sshDelay: "sleep 1\n", tarDelay: "", withProgress: false },
+    { order: "tar exits after the pipe filled, with progress", sshDelay: "", tarDelay: "sleep 1\n", withProgress: true },
+  ])("syncDirectoryFromSsh reports the local tar failure instead of crashing or hanging ($order)", async ({ sshDelay, tarDelay, withProgress }) => {
     await shadowCommands({
       // The remote side streams an archive...
       ssh: `${sshDelay}head -c ${LARGE_INPUT_BYTES} /dev/zero`,
       // ...but the local extract stops reading and exits, like a full disk.
-      tar: 'echo "tar: ./big.bin: Cannot write: No space left on device" >&2\nexit 2',
+      tar: `${tarDelay}echo "tar: ./big.bin: Cannot write: No space left on device" >&2\nexit 2`,
     });
     const localDir = await tempDir("paperclip-closed-input-dst-");
     await mkdir(path.join(localDir, "kept"));
 
     const { outcome, uncaught } = await settleCapturingUncaught(() =>
-      syncDirectoryFromSsh({ spec: spec(), remoteDir: "/remote/workspace", localDir }),
+      syncDirectoryFromSsh({
+        spec: spec(),
+        remoteDir: "/remote/workspace",
+        localDir,
+        ...(withProgress ? { onProgress: async () => {} } : {}),
+      }),
     );
 
     expect(errorCodes(uncaught)).toEqual([]);
     expect(rejectionMessage(outcome)).toContain("No space left on device");
     // A failed restore never clears the local workspace.
     expect(await readdir(localDir)).toEqual(["kept"]);
+  }, 20_000);
+
+  // A local tar that ends successfully before the stream does (a tar that does
+  // not drain its input after the end-of-archive marker) decides the outcome:
+  // the restore completes instead of crashing or hanging.
+  it("syncDirectoryFromSsh completes when tar exits successfully before the stream ends", async () => {
+    await shadowCommands({
+      ssh: `head -c ${LARGE_INPUT_BYTES} /dev/zero`,
+      tar: "head -c 1024 > /dev/null\nexit 0",
+    });
+    const localDir = await tempDir("paperclip-closed-input-dst-");
+
+    const { outcome, uncaught } = await settleCapturingUncaught(() =>
+      syncDirectoryFromSsh({ spec: spec(), remoteDir: "/remote/workspace", localDir, onProgress: async () => {} }),
+    );
+
+    expect(errorCodes(uncaught)).toEqual([]);
+    expect(outcome.status).toBe("fulfilled");
   }, 20_000);
 });

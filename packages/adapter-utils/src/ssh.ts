@@ -1428,6 +1428,7 @@ export async function syncDirectoryToSsh(input: {
     let sshExited = false;
     let tarExitCode: number | null = null;
     let sshExitCode: number | null = null;
+    let sshStoppedEarly = false;
 
     const maybeFinish = () => {
       if (settled || !tarExited || !sshExited) {
@@ -1462,12 +1463,14 @@ export async function syncDirectoryToSsh(input: {
     // and `pipe` leaves that error unhandled, which would crash the server; if
     // the ssh exit is seen first, the pipe stalls instead. Either way nothing
     // reads tar's output any more, so stop tar, which would otherwise block on
-    // a full pipe forever.
-    let sshStoppedEarly = false;
+    // a full pipe forever. Also close tar's stdout and the counter: with the
+    // pipe stalled they hold unread data, so tar's 'close' would never fire.
     const stopTarIfSshStoppedEarly = () => {
       if (tarExited || tar.stdout?.readableEnded) return;
       sshStoppedEarly = true;
       tar.kill("SIGTERM");
+      tar.stdout?.destroy();
+      progress?.counter.destroy();
     };
     ssh.stdin?.on("error", stopTarIfSshStoppedEarly);
     if (progress) {
@@ -1560,6 +1563,7 @@ async function extractDirectoryFromSsh(input: {
       let tarExited = false;
       let sshExitCode: number | null = null;
       let tarExitCode: number | null = null;
+      let tarStoppedEarly = false;
 
       const maybeFinish = () => {
         if (settled || !sshExited || !tarExited) return;
@@ -1590,12 +1594,14 @@ async function extractDirectoryFromSsh(input: {
       // error unhandled, which would crash the server; if the tar exit is seen
       // first, the pipe stalls instead. Either way nothing reads ssh's output
       // any more, so stop ssh, which would otherwise block on a full pipe
-      // forever.
-      let tarStoppedEarly = false;
+      // forever. Also close ssh's stdout and the counter: with the pipe
+      // stalled they hold unread data, so ssh's 'close' would never fire.
       const stopSshIfTarStoppedEarly = () => {
         if (sshExited || ssh.stdout?.readableEnded) return;
         tarStoppedEarly = true;
         ssh.kill("SIGTERM");
+        ssh.stdout?.destroy();
+        progress?.counter.destroy();
       };
       tar.stdin?.on("error", stopSshIfTarStoppedEarly);
       if (progress) {

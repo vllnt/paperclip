@@ -612,7 +612,11 @@ describe("runChildProcess", () => {
 
       expect(uncaught.map((error) => (error as NodeJS.ErrnoException)?.code ?? String(error))).toEqual([]);
       expect(result.exitCode).toBe(3);
-      expect(stdinErrors).toContain("child process closed stdin before reading all input");
+      // Whether the write fails with EPIPE or Node destroys stdin first on the
+      // child's exit depends on event order, so the log line is optional.
+      for (const message of stdinErrors) {
+        expect(message).toBe("child process closed stdin before reading all input");
+      }
     } finally {
       process.off("uncaughtException", onUncaught);
     }
