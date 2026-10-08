@@ -107,6 +107,12 @@ function SortableQueuedMessage({
   };
   const steerDisabled =
     queueMutationDisabled || queue.steeringDisposition !== "available";
+  const steeringPending = entry.steering === "pending";
+  // A legacy run steers only while its process takes live input; Interrupt stays available.
+  const liveInputSteering =
+    queue.protocol === "legacy" &&
+    (queue.steeringDisposition === "available" || steeringPending) &&
+    !entry.source?.requiresFreshSession;
   const steerTitle =
     queue.steeringDisposition === "unsupported"
       ? "This runner does not support steering"
@@ -144,6 +150,34 @@ function SortableQueuedMessage({
       <span className="min-w-0 flex-1 truncate px-1" title={entry.comment.body}>
         {label}
       </span>
+
+      {steeringPending ? (
+        <span
+          role="status"
+          title="The agent takes this message at its next step. It stays queued until then."
+          className="flex h-7 shrink-0 items-center gap-1.5 px-2 text-xs font-medium text-muted-foreground"
+          data-testid={`task-chat-queued-steer-pending-${entry.comment.id}`}
+        >
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+          Steer pending
+        </span>
+      ) : liveInputSteering ? (
+        <button
+          type="button"
+          onClick={onSteer}
+          disabled={steerDisabled}
+          title={steerTitle}
+          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+          data-testid={`task-chat-queued-steer-${entry.comment.id}`}
+        >
+          {action === "steer" ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+          ) : (
+            <CornerDownRight className="h-3.5 w-3.5" aria-hidden />
+          )}
+          Steer
+        </button>
+      ) : null}
 
       {queue.protocol === "legacy" || entry.source?.requiresFreshSession ? (
         <button
@@ -315,9 +349,12 @@ export function TaskChatQueuedMessages({
     ) {
       return;
     }
+    // A legacy run takes a steer at its next tool boundary, so the row stays
+    // queued (as "Steer pending") until the run acknowledges it.
+    const liveInputSteer = action === "steer" && queue.protocol === "legacy";
     const deliveredIds = action === "interrupt"
       ? entries.map((entry) => entry.comment.id)
-      : action === "steer" ? [commentId] : [];
+      : action === "steer" && !liveInputSteer ? [commentId] : [];
     for (const id of deliveredIds) optimisticDeliveryIds.current.add(id);
     if (deliveredIds.length) {
       setEntries((current) => current.filter(
@@ -343,7 +380,9 @@ export function TaskChatQueuedMessages({
         );
       }
       setAnnouncement(
-        action === "steer"
+        liveInputSteer
+          ? "Message sent to the running agent. It stays queued until the agent picks it up."
+          : action === "steer"
           ? "Message steered into the active turn."
           : action === "interrupt"
             ? "Queued messages will be sent when the previous run has stopped."

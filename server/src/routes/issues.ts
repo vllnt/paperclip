@@ -18,8 +18,14 @@ import {
   reconcileSteeredIdentity,
   reserveSteeredIdentity,
   acceptSteeredIdentity,
+  acceptAcknowledgedSteeredIdentity,
   rejectSteeredIdentity,
 } from "../services/run-identity.js";
+import {
+  adapterSteeringAvailable,
+  pendingAdapterSteeringCommentIds,
+  steerAdapterRun,
+} from "../services/adapter-steering.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
@@ -7020,6 +7026,7 @@ export function issueRoutes(
       activeRun: input.activeRun,
       assignedAgentAdapterType: assignedAgent?.adapterType ?? null,
       queuedCommentCount: comments.length,
+      activeRunTakesLiveInput: adapterSteeringAvailable(input.activeRun?.id),
     });
     const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
       input.issue.conversationAgentId ? "unsupported" : steering.kind !== "probe"
@@ -7041,13 +7048,125 @@ export function issueRoutes(
       comments,
       actorType: input.actor.actorType,
       actorId: input.actor.actorId,
+      pendingSteeringCommentIds: queueState?.state === "deferred"
+        ? pendingAdapterSteeringCommentIds(input.activeRun?.id)
+        : undefined,
     });
     if (wake && queuedInteractionId(wake.payload)) {
       const response = await readQueuedInteractionResponse(input.executor as Db, input.issue.companyId, input.issue.id, wake.payload);
       if (response?.source.requiresFreshSession) queue.steeringDisposition = "unsupported";
-      queue.entries = response ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
+      const steeringPending = queueState?.state === "deferred" && response
+        ? pendingAdapterSteeringCommentIds(input.activeRun?.id).has(response.comment.id)
+        : false;
+      queue.entries = response ? [{
+        comment: response.comment,
+        source: response.source,
+        position: 0,
+        canEdit: false,
+        canDiscard: false,
+        ...(steeringPending ? { steering: "pending" as const } : {}),
+      }] : [];
     }
     return queue;
+  }
+
+  /** The board text as a plain user message, with one provenance line. */
+  function liveInputSteeringText(input: { issueIdentifier: string | null; commentId: string; body: string }) {
+    const where = input.issueIdentifier ? ` on ${input.issueIdentifier}` : "";
+    return `New comment${where} (comment ${input.commentId}):\n\n${input.body}`;
+  }
+
+  /**
+   * Second phase of live-input steering, run once the provider has started the
+   * message. Only now does the comment leave the queue; a run that ends first
+   * never calls this, so the comment stays queued for the next wake.
+   */
+  async function settleLiveInputSteering(input: {
+    issue: { id: string; companyId: string };
+    queueId: string;
+    commentId: string;
+    runId: string;
+    source: "comment" | "interaction";
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    await db.transaction(async (tx) => {
+      await tx
+        .select({ id: issueRows.id })
+        .from(issueRows)
+        .where(and(eq(issueRows.id, input.issue.id), eq(issueRows.companyId, input.issue.companyId)))
+        .for("update");
+      const wake = await tx
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.id, input.queueId), eq(agentWakeupRequests.companyId, input.issue.companyId)))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const now = new Date();
+      // A wake already promoted to a new run delivers the comment again; a
+      // duplicate is acceptable, a dropped message is not.
+      if (wake?.status === "deferred_issue_execution" && readObject(wake.payload).issueId === input.issue.id) {
+        const pendingIds = (await queueCommentsForWake(tx, input.issue.id, wake)).map((comment) => comment.id);
+        if (pendingIds.includes(input.commentId)) {
+          const remainingIds = pendingIds.filter((id) => id !== input.commentId);
+          await tx
+            .update(agentWakeupRequests)
+            .set(remainingIds.length === 0
+              ? { status: "cancelled", finishedAt: now, updatedAt: now }
+              : { payload: withQueuedCommentIdsInWakePayload(wake.payload, remainingIds), updatedAt: now })
+            .where(eq(agentWakeupRequests.id, wake.id));
+        }
+      }
+      const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).for("update");
+      if (!run) return;
+      const result = readObject(run.resultJson);
+      await tx
+        .update(heartbeatRuns)
+        .set({
+          resultJson: {
+            ...result,
+            queuedSteeringAcknowledgements: {
+              ...readObject(result.queuedSteeringAcknowledgements),
+              [input.commentId]: {
+                status: "acknowledged",
+                queueId: input.queueId,
+                turnId: input.runId,
+                acknowledgedAt: now.toISOString(),
+              },
+            },
+          },
+          updatedAt: now,
+        })
+        .where(eq(heartbeatRuns.id, input.runId));
+    });
+    try {
+      await acceptAcknowledgedSteeredIdentity(db, {
+        companyId: input.issue.companyId,
+        runId: input.runId,
+        issueId: input.issue.id,
+        messageId: input.commentId,
+        source: input.source,
+      });
+    } catch (err) {
+      logger.warn({ err, runId: input.runId, commentId: input.commentId }, "failed to accept steered identity");
+    }
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: input.actor.actorType,
+      actorId: input.actor.actorId,
+      agentId: input.actor.agentId,
+      runId: input.actor.runId,
+      agentApiKeyId: input.actor.agentApiKeyId,
+      action: "issue.queued_comment_steered",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        commentId: input.commentId,
+        targetRunId: input.runId,
+        turnId: input.runId,
+        duplicate: false,
+      },
+    });
   }
 
   function assertQueueMutationTarget(input: {
@@ -15581,14 +15700,20 @@ export function issueRoutes(
         eq(agentWakeupRequests.id, req.body.queueId), eq(agentWakeupRequests.companyId, issue.companyId),
       )).then(rows => rows[0]);
       const response = responseWake ? await readQueuedInteractionResponse(db, issue.companyId, issue.id, responseWake.payload) : null;
-      const steeringIdentity = await reserveSteeredIdentity(db, {
-        companyId: issue.companyId,
-        runId: req.body.targetRunId,
-        issueId: issue.id,
-        messageId: commentId,
-        source: response?.comment.id === commentId ? "interaction" : "comment",
-      });
+      const steeringSource = response?.comment.id === commentId ? "interaction" as const : "comment" as const;
+      // A live-input run accepts the identity when the provider starts the
+      // message; reserving it now would hold every agent API call until then.
+      const steeringIdentity = adapterSteeringAvailable(req.body.targetRunId)
+        ? null
+        : await reserveSteeredIdentity(db, {
+          companyId: issue.companyId,
+          runId: req.body.targetRunId,
+          issueId: issue.id,
+          messageId: commentId,
+          source: steeringSource,
+        });
       let steeringDeliveryAttempted = false;
+      let steeringPending = false;
       let acknowledgedTurnId: string | null = null;
       let duplicate = false;
       let queue: IssueQueuedCommentQueue;
@@ -15706,7 +15831,9 @@ export function issueRoutes(
             queueId: req.body.queueId,
             revision: req.body.revision,
           });
-          if (locked.queue.protocol !== "paperclip_runner_v1") {
+          const liveInputSteering =
+            locked.queue.protocol === "legacy" && locked.queue.steeringDisposition === "available";
+          if (locked.queue.protocol !== "paperclip_runner_v1" && !liveInputSteering) {
             throw conflict("This runner does not support same-turn steering", {
               code: "steering_unsupported",
             });
@@ -15723,6 +15850,46 @@ export function issueRoutes(
           if (entry.source?.requiresFreshSession) {
             throw conflict("This approval needs a fresh turn. Interrupt or wait for the current turn to finish.", {
               code: "queued_response_requires_fresh_session",
+            });
+          }
+          if (liveInputSteering) {
+            if (steeringIdentity) {
+              // Live input registered after the reservation; retry without it.
+              throw conflict("Steering is starting up. Your message is still queued.", {
+                code: "steering_temporarily_unavailable",
+                retryable: true,
+              });
+            }
+            const activeRunId = locked.activeRun.id;
+            const delivery = steerAdapterRun(activeRunId, {
+              text: liveInputSteeringText({
+                issueIdentifier: issue.identifier ?? null,
+                commentId,
+                body: entry.comment.body,
+              }),
+              correlationId: commentId,
+              settle: () => settleLiveInputSteering({
+                issue,
+                queueId: req.body.queueId,
+                commentId,
+                runId: activeRunId,
+                source: steeringSource,
+                actor,
+              }),
+            });
+            if (delivery.status !== "pending") {
+              throw conflict(`${delivery.reason}. Your message is still queued.`, {
+                code: "steering_temporarily_unavailable",
+                retryable: true,
+              });
+            }
+            steeringPending = true;
+            return buildQueuedCommentQueue({
+              executor: tx,
+              issue,
+              activeRun: locked.activeRun,
+              actor,
+              queueState: locked.queueState,
             });
           }
           steeringDeliveryAttempted = true;
@@ -15824,15 +15991,17 @@ export function issueRoutes(
         agentId: actor.agentId,
         runId: actor.runId,
         agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.queued_comment_steered",
+        action: steeringPending ? "issue.queued_comment_steer_requested" : "issue.queued_comment_steered",
         entityType: "issue",
         entityId: issue.id,
-        details: {
-          commentId,
-          targetRunId: req.body.targetRunId,
-          turnId: acknowledgedTurnId,
-          duplicate,
-        },
+        details: steeringPending
+          ? { commentId, targetRunId: req.body.targetRunId }
+          : {
+            commentId,
+            targetRunId: req.body.targetRunId,
+            turnId: acknowledgedTurnId,
+            duplicate,
+          },
       });
       res.json(
         await runRedactions.redactForIssue(issue.companyId, issue.id, queue),

@@ -18,7 +18,10 @@ export type QueuedCommentMutationErrorCode =
   | "queued_comment_already_dispatching"
   | "queued_comment_stale_queue"
   | "queued_comment_revision_conflict"
-  | "queued_comment_order_mismatch";
+  | "queued_comment_order_mismatch"
+  | "queued_comment_steer_pending";
+
+const STEER_PENDING_MESSAGE = "This message was already handed to the running agent";
 
 /** The route maps this 1:1 onto the `conflict(...)` HTTP error it threw before this move, using `code` and `message` unchanged. */
 export class QueuedCommentMutationError extends Error {
@@ -89,6 +92,9 @@ export function createEditQueuedComment(deps: { issueLock: QueuedCommentIssueLoc
         const entry = locked.queue.entries.find((candidate) => candidate.comment.id === input.commentId);
         if (!entry) {
           throw new QueuedCommentMutationError("queued_comment_not_pending", "The queued message is no longer pending");
+        }
+        if (entry.steering === "pending") {
+          throw new QueuedCommentMutationError("queued_comment_steer_pending", STEER_PENDING_MESSAGE);
         }
         if (!entry.canEdit) {
           throw new QueuedCommentMutationForbiddenError("Only the queued message author can edit it");
@@ -255,6 +261,9 @@ export function createDiscardQueuedComment(deps: { issueLock: QueuedCommentIssue
         const entry = locked.queue.entries.find((candidate) => candidate.comment.id === input.commentId);
         if (!entry) {
           throw new QueuedCommentMutationError("queued_comment_not_pending", "The queued message is no longer pending");
+        }
+        if (entry.steering === "pending") {
+          throw new QueuedCommentMutationError("queued_comment_steer_pending", STEER_PENDING_MESSAGE);
         }
         const owns = decideQueuedCommentActorOwnsEntry({
           actorType: input.actor.actorType,

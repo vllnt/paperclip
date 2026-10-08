@@ -1723,6 +1723,9 @@ turns keep the Steer label. Steer and Interrupt immediately move the submitted
 messages from the composer queue into the conversation while delivery proceeds.
 Provider acknowledgement remains authoritative; failed delivery restores the
 latest queue with an inline error. Neither action produces a toast.
+A legacy `claude_local` CLI run whose process takes live input also offers Steer.
+That steer stays queued as "Steer pending" until Claude Code reports that the
+message started, and returns to the queue if the run ends first.
 
 ### Managed AI authentication
 

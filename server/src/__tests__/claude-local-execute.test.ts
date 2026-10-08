@@ -3,7 +3,12 @@ import { DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import type {
+  AdapterRuntimeEvent,
+  AdapterRuntimeMcpServer,
+  AdapterSteeringHandle,
+} from "@paperclipai/adapter-utils";
+import { readAdapterSteeringAcknowledgement } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
   claudeCommandSupportsEffortFlag,
@@ -47,9 +52,30 @@ process.exit(${exit});
   await fs.chmod(commandPath, 0o755);
 }
 
+// Reads the prompt the way the real CLI does: with --input-format stream-json
+// stdin stays open, so read one JSON line instead of waiting for EOF.
+const READ_FAKE_CLAUDE_PROMPT = `
+function readPrompt() {
+  if (!process.argv.includes("--input-format")) return fs.readFileSync(0, "utf8");
+  const chunks = [];
+  const buffer = Buffer.alloc(65536);
+  for (;;) {
+    let read = 0;
+    try { read = fs.readSync(0, buffer, 0, buffer.length, null); }
+    catch (error) { if (error.code === "EAGAIN") continue; if (error.code === "EOF") break; throw error; }
+    if (read === 0) break;
+    chunks.push(Buffer.from(buffer.subarray(0, read)));
+    if (buffer.subarray(0, read).includes(10)) break;
+  }
+  const line = Buffer.concat(chunks).toString("utf8").split("\\n")[0];
+  return JSON.parse(line).message.content.map((block) => block.text).join("");
+}
+`;
+
 async function writeFakeClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+${READ_FAKE_CLAUDE_PROMPT}
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
@@ -63,7 +89,7 @@ const mcpConfigPath = mcpConfigIndex >= 0 ? argv[mcpConfigIndex + 1] : null;
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
   argv,
-  prompt: fs.readFileSync(0, "utf8"),
+  prompt: readPrompt(),
   addDir,
   instructionsFilePath,
   instructionsContents: instructionsFilePath ? fs.readFileSync(instructionsFilePath, "utf8") : null,
@@ -96,6 +122,7 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+${READ_FAKE_CLAUDE_PROMPT}
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
@@ -115,7 +142,7 @@ const instructionsFilePath = instructionsIndex >= 0 ? argv[instructionsIndex + 1
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
   argv,
-  prompt: fs.readFileSync(0, "utf8"),
+  prompt: readPrompt(),
   addDir,
   instructionsFilePath,
   instructionsContents: instructionsFilePath ? fs.readFileSync(instructionsFilePath, "utf8") : null,
@@ -135,6 +162,7 @@ console.log(JSON.stringify({ type: "result", session_id: "33333333-3333-4333-833
 async function writeHelpWithEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+${READ_FAKE_CLAUDE_PROMPT}
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
@@ -155,7 +183,7 @@ const instructionsFilePath = instructionsIndex >= 0 ? argv[instructionsIndex + 1
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
   argv,
-  prompt: fs.readFileSync(0, "utf8"),
+  prompt: readPrompt(),
   addDir,
   instructionsFilePath,
   instructionsContents: instructionsFilePath ? fs.readFileSync(instructionsFilePath, "utf8") : null,
@@ -195,13 +223,14 @@ afterEach(() => {
 async function writePoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+${READ_FAKE_CLAUDE_PROMPT}
 if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;
 const payload = {
   argv: process.argv.slice(2),
-  prompt: fs.readFileSync(0, "utf8"),
+  prompt: readPrompt(),
 };
 if (capturePath) {
   const entries = fs.existsSync(capturePath) ? JSON.parse(fs.readFileSync(capturePath, "utf8")) : [];
@@ -232,12 +261,13 @@ console.log(JSON.stringify({ type: "result", session_id: "bbbbbbbb-bbbb-4bbb-8bb
 async function writeAlwaysPoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+${READ_FAKE_CLAUDE_PROMPT}
 if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
   argv: process.argv.slice(2),
-  prompt: fs.readFileSync(0, "utf8"),
+  prompt: readPrompt(),
 };
 if (capturePath) {
   const entries = fs.existsSync(capturePath) ? JSON.parse(fs.readFileSync(capturePath, "utf8")) : [];
@@ -263,6 +293,7 @@ process.exit(1);
 async function writeRetryThenSucceedClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
 const fs = require("node:fs");
+${READ_FAKE_CLAUDE_PROMPT}
 if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
@@ -271,7 +302,7 @@ const promptFileFlagIndex = process.argv.indexOf("--append-system-prompt-file");
 const appendedSystemPromptFilePath = promptFileFlagIndex >= 0 ? process.argv[promptFileFlagIndex + 1] : null;
 const payload = {
   argv: process.argv.slice(2),
-  prompt: fs.readFileSync(0, "utf8"),
+  prompt: readPrompt(),
   claudeConfigDir: process.env.CLAUDE_CONFIG_DIR || null,
   appendedSystemPromptFilePath,
   appendedSystemPromptFileContents: appendedSystemPromptFilePath ? fs.readFileSync(appendedSystemPromptFilePath, "utf8") : null,
@@ -297,6 +328,42 @@ if (shouldFailResume) {
 console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "22222222-2222-4222-8222-222222222222", model: "claude-sonnet" }));
 console.log(JSON.stringify({ type: "assistant", session_id: "22222222-2222-4222-8222-222222222222", message: { content: [{ type: "text", text: "hello" }] } }));
 console.log(JSON.stringify({ type: "result", session_id: "22222222-2222-4222-8222-222222222222", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
+// A Claude Code stand-in that reports message lifecycle and takes a message
+// mid-turn. FAKE_CLAUDE_STEER_MODE=die exits after "queued", before "started".
+async function writeSteerableClaudeCommand(commandPath: string): Promise<void> {
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+if (process.argv.includes("--version")) { process.stdout.write("2.1.287 (Claude Code)\\n"); process.exit(0); }
+const sessionId = "22222222-2222-4222-8222-222222222222";
+const emit = (event) => process.stdout.write(JSON.stringify({ session_id: sessionId, ...event }) + "\\n");
+const received = [];
+let turns = 0;
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  received.push(message);
+  fs.writeFileSync(process.env.PAPERCLIP_TEST_CAPTURE_PATH, JSON.stringify({ argv: process.argv.slice(2), received }));
+  if (turns++ === 0) {
+    emit({ type: "system", subtype: "init", model: "claude-opus-5-5", capabilities: ["interrupt_receipt_v1", "msg_lifecycle_v1"] });
+    emit({ type: "assistant", message: { content: [{ type: "tool_use", id: "tool-1", name: "Bash", input: { command: "sleep 1" } }] } });
+    return;
+  }
+  emit({ type: "command_lifecycle", command_uuid: message.uuid, state: "queued" });
+  if (process.env.FAKE_CLAUDE_STEER_MODE === "die") process.exit(1);
+  setTimeout(() => {
+    emit({ type: "command_lifecycle", command_uuid: message.uuid, state: "started" });
+    emit({ type: "assistant", message: { content: [{ type: "text", text: "PINEAPPLE" }] } });
+    emit({ type: "command_lifecycle", command_uuid: message.uuid, state: "completed" });
+    emit({ type: "result", subtype: "success", result: "PINEAPPLE", total_cost_usd: 0.01, usage: { input_tokens: 3, cache_read_input_tokens: 0, output_tokens: 2 } });
+  }, 50);
+});
+lines.on("close", () => process.exit(0));
 `;
   await fs.writeFile(commandPath, script, "utf8");
   await fs.chmod(commandPath, 0o755);
@@ -410,6 +477,69 @@ describe("claude execute", () => {
       expect(result.exitCode).toBe(0);
       const { argv } = JSON.parse(await fs.readFile(capturePath, "utf8"));
       expect(argv[argv.indexOf("--model") + 1]).toBe(expected);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["steers the live turn and acknowledges the message once it starts", "steer"],
+    ["records no receipt when the process dies before the message starts", "die"],
+  ] as const)("%s", async (_name, mode) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-steer-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root, {
+      commandWriter: writeSteerableClaudeCommand,
+    });
+    const handles: Array<AdapterSteeringHandle | null> = [];
+    const events: AdapterRuntimeEvent[] = [];
+    try {
+      const result = await execute({
+        runId: "run-steer",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath, FAKE_CLAUDE_STEER_MODE: mode },
+          promptTemplate: "Run step 1, then step 2.",
+        },
+        context: {},
+        onLog: async () => {},
+        onEvent: async (event) => {
+          events.push(event);
+        },
+        onSteeringReady: (handle) => {
+          handles.push(handle);
+          if (handle) {
+            expect(handle.steer({ text: "Change of plan: skip step 2.", correlationId: "comment-1" }))
+              .toEqual({ status: "pending" });
+          }
+        },
+      });
+
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf8")) as {
+        argv: string[];
+        received: Array<{ uuid?: string; priority?: string; message: { content: Array<{ text: string }> } }>;
+      };
+      expect(captured.argv).toEqual(expect.arrayContaining(["--input-format", "stream-json"]));
+      expect(captured.received[0]!.message.content[0]!.text).toContain("Run step 1, then step 2.");
+      expect(captured.received[1]).toMatchObject({ message: { content: [{ text: "Change of plan: skip step 2." }] } });
+      expect(captured.received[1]!.uuid).toMatch(/^[0-9a-f-]{36}$/);
+      expect(captured.received[1]).not.toHaveProperty("priority");
+      expect(handles[0]).toBeTruthy();
+      expect(handles.at(-1)).toBeNull();
+
+      const acknowledged = events.map(readAdapterSteeringAcknowledgement).filter(Boolean);
+      if (mode === "steer") {
+        expect(result.exitCode).toBe(0);
+        expect(result.summary).toBe("PINEAPPLE");
+        expect(acknowledged).toEqual(["comment-1"]);
+      } else {
+        expect(result.exitCode).toBe(1);
+        expect(acknowledged).toEqual([]);
+      }
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });
@@ -886,8 +1016,10 @@ describe("claude execute", () => {
     process.env.HOME = root;
     process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
 
+    const onSteeringReady = vi.fn();
     try {
       const result = await execute({
+        onSteeringReady,
         runId: "run-sandbox-auth",
         agent: {
           id: "agent-1",
@@ -940,6 +1072,10 @@ describe("claude execute", () => {
       const capture = JSON.parse(await fs.readFile(capturePath1, "utf8")) as CapturePayload;
       expect(capture.argv).toContain("--dangerously-skip-permissions");
       expect(capture.argv).not.toContain("--allowedTools");
+      // Sandbox runners take stdin once, so the run never offers steering.
+      expect(capture.argv).not.toContain("--input-format");
+      expect(capture.prompt).toContain("Follow the paperclip heartbeat.");
+      expect(onSteeringReady).not.toHaveBeenCalled();
       expect(capture.claudeConfigDir).toBe(path.join(remoteWorkspace, ".paperclip-runtime", "claude", "config"));
       expect(capture.claudeConfigEntries).toContain("settings.json");
       expect(capture.paperclipApiUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);

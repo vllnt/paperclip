@@ -54,6 +54,7 @@ export function normalizeIssueQueuedCommentQueue(
             } } : {}),
           canEdit: entry?.canEdit === true,
           canDiscard: entry?.canDiscard === true,
+          ...(entry?.steering === "pending" ? { steering: "pending" as const } : {}),
         },
       ];
     })

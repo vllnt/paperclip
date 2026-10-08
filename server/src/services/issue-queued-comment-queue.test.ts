@@ -14,6 +14,26 @@ describe("decideQueuedCommentQueueSteering", () => {
     expect(decision).toEqual({ protocol: "legacy", kind: "unsupported" });
   });
 
+  it("offers steering on a legacy run only while its process takes live input", () => {
+    const facts = {
+      state: "deferred" as const,
+      queueRunRuntimeMode: null,
+      activeRun: { id: "run-1", runtimeMode: "legacy" },
+      assignedAgentAdapterType: "claude_local",
+      queuedCommentCount: 1,
+    };
+
+    expect(decideQueuedCommentQueueSteering({ ...facts, activeRunTakesLiveInput: true }))
+      .toEqual({ protocol: "legacy", kind: "available" });
+    // ACP, sandbox and codex_local runs never register live input.
+    expect(decideQueuedCommentQueueSteering({ ...facts, activeRunTakesLiveInput: false }))
+      .toEqual({ protocol: "legacy", kind: "unsupported" });
+    expect(decideQueuedCommentQueueSteering({ ...facts, activeRunTakesLiveInput: true, queuedCommentCount: 0 }))
+      .toEqual({ protocol: "legacy", kind: "unsupported" });
+    expect(decideQueuedCommentQueueSteering({ ...facts, state: "queued", activeRunTakesLiveInput: true }))
+      .toEqual({ protocol: "legacy", kind: "unsupported" });
+  });
+
   it("answers temporarily_unavailable for a promoted native queue with no deferred run", () => {
     const decision = decideQueuedCommentQueueSteering({
       state: "queued",
@@ -129,6 +149,26 @@ describe("buildQueuedCommentQueueSnapshot entry permissions", () => {
 
     expect(queue.entries[0]?.canEdit).toBe(false);
     expect(queue.entries[0]?.canDiscard).toBe(false);
+  });
+
+  it("marks a comment handed to live input as steer pending and locks it", () => {
+    const queue = buildQueuedCommentQueueSnapshot({
+      ...baseFacts,
+      state: "deferred",
+      activeRunId: "run-1",
+      steeringDisposition: "available",
+      actorType: "user",
+      actorId: "user-1",
+      pendingSteeringCommentIds: new Set(["comment-1"]),
+      comments: [
+        { id: "comment-1", updatedAt: new Date(), authorUserId: "user-1" },
+        { id: "comment-2", updatedAt: new Date(), authorUserId: "user-1" },
+      ],
+    });
+
+    expect(queue.entries[0]).toMatchObject({ steering: "pending", canEdit: false, canDiscard: false });
+    expect(queue.entries[1]).toMatchObject({ canEdit: true, canDiscard: true });
+    expect(queue.entries[1]).not.toHaveProperty("steering");
   });
 });
 

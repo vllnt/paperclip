@@ -69,6 +69,21 @@ export interface RunProcessResult {
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
   graceMs?: number;
+  /**
+   * While this returns true the cleanup waits instead of stopping the child,
+   * for example while a message written to live stdin is still running.
+   * Checked again every `graceMs`.
+   */
+  holdWhile?: () => boolean;
+}
+
+/** Live stdin handed to callers that keep the child's stdin open. */
+export interface ChildProcessStdinWriter {
+  /** Writes one chunk. Returns false once stdin has ended or the child is gone. */
+  write(chunk: string): boolean;
+  /** Ends stdin. Safe to call more than once. */
+  end(): void;
+  readonly ended: boolean;
 }
 
 export const UNMANAGED_BACKGROUND_TASK_STOP_REASON =
@@ -4675,6 +4690,11 @@ export async function runChildProcess(
     }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
+    /**
+     * Keep stdin open after writing `stdin` and hand the caller a writer. The
+     * caller owns ending it.
+     */
+    onStdinReady?: (writer: ChildProcessStdinWriter) => void;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   },
@@ -4752,6 +4772,7 @@ export async function runChildProcess(
         let logChain: Promise<void> = Promise.resolve();
         let terminalResultSeen = false;
         let terminalCleanupStarted = false;
+        let terminalCleanupHeld = false;
         let terminalCleanupSignal: NodeJS.Signals | null = null;
         let terminalCleanupForceKilled = false;
         let terminalCleanupTimer: NodeJS.Timeout | null = null;
@@ -4809,6 +4830,14 @@ export async function runChildProcess(
           terminalCleanupTimer = setTimeout(() => {
             terminalCleanupTimer = null;
             if (terminalCleanupStarted || timedOut) return;
+            // A held cleanup re-checks every grace period, and grants one
+            // full grace period after the hold ends before stopping the child.
+            const held = terminalCleanup.holdWhile?.() === true;
+            if (held || terminalCleanupHeld) {
+              terminalCleanupHeld = held;
+              maybeArmTerminalResultCleanup();
+              return;
+            }
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
             signalRunningProcess({ child, processGroupId }, "SIGTERM");
@@ -4877,10 +4906,35 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          const onStdinReady = opts.onStdinReady;
+          // A live writer can outlive the child; a late write must not crash
+          // the server with an unhandled EPIPE.
+          if (onStdinReady) stdin.on("error", () => {});
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);
-            stdin.end();
+            if (!onStdinReady) {
+              stdin.end();
+              return;
+            }
+            const stdinOpen = () =>
+              !stdin.destroyed &&
+              !stdin.writableEnded &&
+              child.exitCode === null &&
+              child.signalCode === null;
+            onStdinReady({
+              write: (chunk) => {
+                if (!stdinOpen()) return false;
+                stdin.write(chunk);
+                return true;
+              },
+              end: () => {
+                if (!stdin.destroyed && !stdin.writableEnded) stdin.end();
+              },
+              get ended() {
+                return !stdinOpen();
+              },
+            });
           });
         }
 
