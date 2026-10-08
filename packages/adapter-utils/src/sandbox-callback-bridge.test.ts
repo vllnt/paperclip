@@ -1526,6 +1526,46 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("admits skill readback and edits plus decision asks, and keeps deciding human-only", () => {
+    const allowed: Array<{ method: string; path: string }> = [
+      { method: "GET", path: "/api/companies/co-1/skills/skill-1" },
+      { method: "GET", path: "/api/companies/co-1/skills/skill-1/files" },
+      { method: "PATCH", path: "/api/companies/co-1/skills/skill-1/files" },
+      { method: "POST", path: "/api/companies/co-1/decisions" },
+      { method: "POST", path: "/api/companies/co-1/decision-archive-proposals" },
+      { method: "GET", path: "/api/decisions/dec-1" },
+      { method: "POST", path: "/api/decisions/dec-1/cancel" },
+    ];
+    for (const request of allowed) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
+    }
+
+    const denied: Array<{ method: string; path: string }> = [
+      { method: "POST", path: "/api/decisions/dec-1/decide" },
+      { method: "POST", path: "/api/decisions/dec-1/dismiss" },
+      { method: "DELETE", path: "/api/companies/co-1/skills/skill-1" },
+      { method: "DELETE", path: "/api/companies/co-1/skills/skill-1/files" },
+      { method: "POST", path: "/api/companies/co-1/skills/import" },
+      { method: "PATCH", path: "/api/companies/co-1/skills/skill-1/files/extra" },
+      { method: "POST", path: "/api/companies/co-1/decision-bundles" },
+      // Listing decisions is board-only on the server.
+      { method: "GET", path: "/api/companies/co-1/decisions" },
+      // queue_v1 forwards the raw path: no query, fragment, encoded or dot segment may ride on a new rule.
+      { method: "PATCH", path: "/api/companies/co-1/skills/s?/files" },
+      { method: "PATCH", path: "/api/companies/co-1/skills/s#/files" },
+      { method: "GET", path: "/api/companies/../skills/s" },
+      { method: "GET", path: "/api/companies/co-1/skills/%2e%2e" },
+      { method: "GET", path: "/api/companies/co-1/skills/.." },
+      { method: "POST", path: "/api/decisions/..%2fdec-1/cancel" },
+      { method: "POST", path: "/api/decisions/dec.1/cancel" },
+    ];
+    for (const request of denied) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
+        `Route not allowed: ${request.method} ${request.path}`,
+      );
+    }
+  });
+
   it("admits listing, uploads and downloads on the default queue route list", () => {
     const attachmentRequests: Array<{ method: string; path: string }> = [
       { method: "GET", path: "/api/issues/issue-1/attachments" },
