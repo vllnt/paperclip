@@ -3,6 +3,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON } from "../../../services/issue-dependency-wakeups.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
@@ -50,11 +51,13 @@ import {
   SELF_REBLOCK_WAKE_PAYLOAD_KEY,
 } from "../domain/self-reblock-wake.js";
 import {
+  CONFIGURATION_INCOMPLETE_FAILURE_CODE,
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
   parseObject,
   readNonEmptyString,
+  WORKSPACE_VALIDATION_FAILURE_CODE,
 } from "../domain/values.js";
 import { requireTransactionScopeTx, TransactionScope } from "../application/ports.js";
 import type {
@@ -314,6 +317,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .update(agentWakeupRequests)
         .set({
           status: "cancelled",
+          // The marker keeps the original reason; this one lets the
+          // dependency backstop see the suppression in the blocked cycle.
+          reason: ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON,
           finishedAt: now,
           error: "Self-caused re-block wake suppressed: the agent owns this issue's execution",
           updatedAt: now,
@@ -891,6 +897,42 @@ async function countRecentSelfReblockWakeRuns(
       ),
     );
   return Number(row?.total ?? 0);
+}
+
+/**
+ * The run a sweep releases to re-drive an issue's parked queue. Its release
+ * must not replay failure handling, so prefer a succeeded run, and otherwise
+ * take the latest terminal non-native run whose failure does not raise a
+ * pre-drain blocked notice.
+ */
+export async function findParkedWakeAnchorRun(
+  db: Db,
+  input: { companyId: string; issueId: string },
+): Promise<{ id: string; companyId: string } | null> {
+  const [anchor] = await db
+    .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+        or(
+          eq(heartbeatRuns.status, "succeeded"),
+          and(
+            inArray(heartbeatRuns.status, ["failed", "timed_out", "cancelled"]),
+            sql`coalesce(${heartbeatRuns.runtimeMode}, '') <> 'native'`,
+            sql`coalesce(${heartbeatRuns.errorCode}, '') not in (${WORKSPACE_VALIDATION_FAILURE_CODE}, ${CONFIGURATION_INCOMPLETE_FAILURE_CODE}, 'model_not_found')`,
+          ),
+        ),
+      ),
+    )
+    .orderBy(
+      sql`case when ${heartbeatRuns.status} = 'succeeded' then 0 else 1 end`,
+      sql`${heartbeatRuns.createdAt} desc`,
+      sql`${heartbeatRuns.id} desc`,
+    )
+    .limit(1);
+  return anchor ?? null;
 }
 
 /** Admission reads the self-reblock run count inside heartbeat's issue-locked transaction. */

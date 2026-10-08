@@ -114,7 +114,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
-  isIssueBlockersResolvedReadyStateSelfSuppressed,
+  isIssueBlockedCycleSelfSuppressed,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
@@ -5802,11 +5802,11 @@ export function recoveryService(
           result.existingWakeSkipped += 1;
           continue;
         }
-        // The assignee re-blocked this issue from its own run on it, so this
-        // ready state is its own decision, not news. Re-delivering it every
-        // tick restarted the ANT-3260 loop after admission suppressed it.
+        // The assignee re-blocked this issue from its own run on it in this
+        // blocked cycle, so the ready state is its own decision, not news.
+        // Re-delivering it every tick restarted the ANT-3260 loop.
         if (
-          await isIssueBlockersResolvedReadyStateSelfSuppressed(db, {
+          await isIssueBlockedCycleSelfSuppressed(db, {
             companyId,
             agentId,
             dependentIssueId: candidate.id,

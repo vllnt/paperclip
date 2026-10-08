@@ -3,6 +3,7 @@ import {
   createAdmissionTransactionScope as buildAdmissionTransactionScope,
   createPostgresWakeQueueAdapter,
   createSelfReblockWakeAdmissionReader,
+  findParkedWakeAnchorRun,
   createWakeAdmissionReader,
   createWakeAdmissionWriter,
 } from "./adapters/postgres.js";
@@ -118,6 +119,9 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
       return buildAdmissionTransactionScope(companyId, tx);
     },
     countRecentSelfReblockWakeRuns: createSelfReblockWakeAdmissionReader().countRecentSelfReblockWakeRuns,
+    findParkedWakeAnchorRun(input: { companyId: string; issueId: string }) {
+      return findParkedWakeAnchorRun(db, input);
+    },
   };
 }
 

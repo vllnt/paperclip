@@ -1,7 +1,7 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, gte, inArray, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests } from "@paperclipai/db";
+import { agentWakeupRequests, issues } from "@paperclipai/db";
 
 export const ISSUE_BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved";
 
@@ -238,22 +238,41 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
   return covering ?? null;
 }
 
-/** Receipt reason when admission suppressed an executing owner's own re-block wake. */
+/** Receipt reason when an executing owner's own re-block wake was suppressed. */
 export const ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON = "issue_self_reblock_wake_suppressed";
 
 /**
- * True when admission suppressed this exact ready state's wake because the
- * woken agent re-blocked the issue from its own run on it (ANT-3260). The
- * periodic backstop must not re-deliver that wake. The key includes the
- * blocked cycle, so a later re-block (by anyone) or a changed blocker set is
- * a new ready state that this check does not cover. This deliberately does
- * not feed `findExistingIssueBlockersResolvedWakeForReadyState`: route-time
- * wakes caused by others must never be treated as already delivered.
+ * True when, in the dependent's current blocked cycle and after its last
+ * blocker was resolved, a wake was suppressed because the assignee re-blocked
+ * the issue from its own run on it (ANT-3260), at admission or at deferred
+ * promotion. The current ready state is then the agent's own decision, so the
+ * periodic backstop must not re-deliver it. A later re-block (by anyone)
+ * starts a new cycle, and a blocker resolved after the suppression is news;
+ * neither is covered. This deliberately does not feed
+ * `findExistingIssueBlockersResolvedWakeForReadyState`: route-time wakes
+ * caused by others must never be treated as already delivered.
  */
-export async function isIssueBlockersResolvedReadyStateSelfSuppressed(
+export async function isIssueBlockedCycleSelfSuppressed(
   db: Db,
   input: IssueBlockersResolvedReadyStateInput & { companyId: string; agentId: string },
 ): Promise<boolean> {
+  const blockedSince = parseWakeCycleDate(input.blockedTransitionAt);
+  const blockerIssueIds = uniqueSortedBlockerIssueIds(input.blockerIssueIds);
+  const [resolved] = blockerIssueIds.length
+    ? await db
+        .select({
+          at: sql<Date | string | null>`max(coalesce(${issues.completedAt}, ${issues.cancelledAt}, ${issues.updatedAt}))`,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, input.companyId),
+            inArray(issues.id, blockerIssueIds),
+            inArray(issues.status, ["done", "cancelled"]),
+          ),
+        )
+    : [];
+  const lastBlockerResolvedAt = resolved?.at ? new Date(resolved.at) : null;
   const rows = await db
     .select({ id: agentWakeupRequests.id })
     .from(agentWakeupRequests)
@@ -261,8 +280,19 @@ export async function isIssueBlockersResolvedReadyStateSelfSuppressed(
       and(
         eq(agentWakeupRequests.companyId, input.companyId),
         eq(agentWakeupRequests.agentId, input.agentId),
-        eq(agentWakeupRequests.idempotencyKey, buildIssueBlockersResolvedWakeStateKey(input)),
         eq(agentWakeupRequests.reason, ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON),
+        or(
+          eq(agentWakeupRequests.idempotencyKey, buildIssueBlockersResolvedWakeStateKey(input)),
+          // Merged or unblock-request receipts carry other keys; the cycle
+          // start scopes them. Both timestamps come from the server clock.
+          blockedSince
+            ? and(
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.dependentIssueId}`,
+                gte(agentWakeupRequests.updatedAt, blockedSince),
+              )
+            : undefined,
+        ),
+        lastBlockerResolvedAt ? gte(agentWakeupRequests.updatedAt, lastBlockerResolvedAt) : undefined,
       ),
     )
     .limit(1);

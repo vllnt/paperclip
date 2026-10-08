@@ -19706,9 +19706,8 @@ export function heartbeatService(
     // A self-reblock wake held back by its limit stays a durable deferred
     // receipt. Once its window has passed and no run holds the issue, re-drive
     // the issue's queue through the same release admission that promotes it.
-    // The anchor run confers no ownership, so the limit decides alone.
-    // Only a succeeded anchor is used: a failed anchor's release would replay
-    // its own failure handling (blocked notices, native recovery).
+    // The anchor run confers no ownership, so the limit decides alone. The
+    // module picks an anchor whose release cannot replay failure handling.
     const dueParkedWakes = await db
       .select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
@@ -19725,11 +19724,7 @@ export function heartbeatService(
       const issueId = String(wake.payload?.issueId);
       if (reDrivenParkedIssues.has(issueId)) continue;
       reDrivenParkedIssues.add(issueId);
-      const [anchor] = await db.select().from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, wake.companyId),
-        eq(heartbeatRuns.status, "succeeded"),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
-      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      const anchor = await wakeQueue.findParkedWakeAnchorRun({ companyId: wake.companyId, issueId });
       if (anchor) {
         await releaseIssueExecutionAndPromote(anchor, { suppressImmediateRecovery: true, anchorRunOnly: true }).catch((err) => {
           logger.warn({ err, queueId: wake.id }, "failed to re-drive a parked self-reblock wake");
@@ -27760,7 +27755,6 @@ export function heartbeatService(
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
               executionRunId: issues.executionRunId,
-              checkoutRunId: issues.checkoutRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
             })
@@ -27796,29 +27790,31 @@ export function heartbeatService(
           // including the board's or another agent's, carries no marker.
           const selfReblockWakeMarker = readSelfReblockWakeMarker(payload, agentId);
           if (selfReblockWakeMarker) {
-            const holdingRunIds = [issue.executionRunId, issue.checkoutRunId].filter(
-              (runId): runId is string => Boolean(runId),
-            );
-            const holdingRun = holdingRunIds.length
-              ? await tx
-                  .select({ id: heartbeatRuns.id })
-                  .from(heartbeatRuns)
-                  .where(
-                    and(
-                      inArray(heartbeatRuns.id, holdingRunIds),
-                      eq(heartbeatRuns.companyId, issue.companyId),
-                      eq(heartbeatRuns.agentId, agentId),
-                    ),
-                  )
-                  .limit(1)
-                  .then((rows) => rows[0] ?? null)
-              : null;
+            // Moving an issue to blocked clears its lock columns, so ownership
+            // is the agent's own running run on this issue, not the lock.
+            const holdingRun = await tx
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, issue.companyId),
+                  eq(heartbeatRuns.agentId, agentId),
+                  eq(heartbeatRuns.status, "running"),
+                  or(
+                    sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                    eq(heartbeatRuns.nativeIssueId, issue.id),
+                  ),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
             if (
               isSelfReblockWakeOwner({
                 agentId,
                 holdingRunAgentId: holdingRun ? agentId : null,
               })
             ) {
+              const suppressedAt = new Date();
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId,
@@ -27837,7 +27833,10 @@ export function heartbeatService(
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
-                finishedAt: new Date(),
+                // Server clock, like the issue's blockedTransitionAt: the
+                // dependency backstop compares the two to scope the cycle.
+                finishedAt: suppressedAt,
+                updatedAt: suppressedAt,
               });
               await logActivity(tx as unknown as Db, {
                 companyId: agent.companyId,

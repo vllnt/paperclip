@@ -30,6 +30,7 @@ import {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-dependency-wakeups.ts";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.ts";
+import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const SUCCESS = {
@@ -199,6 +200,20 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     return issueId;
   }
 
+  /**
+   * Blocks the issue through the issue service, as `PATCH /issues/:id` does.
+   * That stamps a new blocked cycle and clears the lock columns, even while
+   * the agent's own run is still executing the issue.
+   */
+  async function blockIssueAsRoute(issueId: string, ownerAgentId: string) {
+    const blocked = await issueService(db).update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: { agentId: ownerAgentId }, action: "Confirm the blocker is done" },
+    });
+    expect(blocked).toMatchObject({ status: "blocked", executionRunId: null, checkoutRunId: null });
+    return blocked!.blockedTransitionAt!;
+  }
+
   /** What `PATCH /issues/:id` emits when an agent blocks an issue on an already-done blocker. */
   function selfReblockWakes(input: {
     agentId: string;
@@ -301,15 +316,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       if (cycle <= 5) {
         // The run records its disposition: blocked on the done blocker, with
         // itself as the unblock owner ...
-        const blockedTransitionAt = new Date();
-        await db
-          .update(issues)
-          .set({
-            status: "blocked",
-            blockedTransitionAt,
-            unblockDescriptor: { owner: { agentId: ceoId }, action: "Confirm the blocker is done" },
-          })
-          .where(eq(issues.id, issueId));
+        const blockedTransitionAt = await blockIssueAsRoute(issueId, ceoId);
         // ... and the route then emits the same two wakes for the same agent.
         for (const wake of selfReblockWakes({ agentId: ceoId, issueId, blockerId, blockedTransitionAt })) {
           await heartbeat.wakeup(ceoId, wake);
@@ -364,7 +371,99 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     ]);
   });
 
+  /** A self-wake parked behind the agent's own run, as a deferred receipt. */
+  function deferredSelfWake(input: { id: string; companyId: string; agentId: string; issueId: string }) {
+    return {
+      id: input.id,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId: input.issueId,
+        action: "Confirm the blocker is done",
+        _paperclipSelfReblockWake: {
+          agentId: input.agentId,
+          reason: "issue_unblock_requested",
+          causeActorType: "agent",
+          causeActorId: input.agentId,
+        },
+        _paperclipWakeContext: { issueId: input.issueId, taskId: input.issueId, wakeReason: "issue_unblock_requested" },
+      },
+      status: "deferred_issue_execution",
+      requestedAt: new Date(Date.now() - 60_000),
+    };
+  }
+
+  function boardWake() {
+    return {
+      source: "assignment" as const,
+      triggerDetail: "system" as const,
+      reason: "issue_assigned",
+      requestedByActorType: "user" as const,
+      requestedByActorId: "board-user",
+    };
+  }
+
   it("keeps a parked self-wake suppressed when it is promoted after its owner's run releases", async () => {
+    const companyId = await seedCompany();
+    const ceoId = await seedAgent(companyId, "Jarvis");
+    const blockerId = await seedIssue(companyId, { assigneeAgentId: null, status: "done" });
+    const issueId = await seedIssue(companyId, { assigneeAgentId: ceoId });
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+    const parkedWakeId = randomUUID();
+
+    let cycle = 0;
+    mockAdapterExecute.mockImplementation(async (ctx) => {
+      cycle += 1;
+      if (cycle === 1) {
+        // The run re-blocks its issue on the done blocker while an older
+        // self-wake for it sits in the deferred queue.
+        await blockIssueAsRoute(issueId, ceoId);
+        await db.insert(agentWakeupRequests).values(deferredSelfWake({ id: parkedWakeId, companyId, agentId: ceoId, issueId }));
+      }
+      return defaultRun(ctx);
+    });
+
+    const firstRun = await heartbeat.wakeup(ceoId, {
+      ...boardWake(),
+      payload: { issueId, mutation: "update" },
+      contextSnapshot: { issueId, source: "issue.update" },
+    });
+    expect(firstRun).not.toBeNull();
+    await waitForCondition(async () => cycle >= 1);
+    expect(await waitForIdle()).toBe(true);
+    await heartbeat.waitForRunExecutionDrain(firstRun!.id);
+
+    const [parked] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parkedWakeId));
+    expect(parked).toMatchObject({ status: "cancelled", runId: null, reason: "issue_self_reblock_wake_suppressed" });
+    expect(parked!.error).toContain("Self-caused re-block wake suppressed");
+    const suppression = await db
+      .select({ details: activityLog.details, runId: activityLog.runId })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.wake_suppressed_self")));
+    expect(suppression).toEqual([
+      expect.objectContaining({
+        runId: firstRun!.id,
+        details: expect.objectContaining({ phase: "promotion", wakeupRequestId: parkedWakeId }),
+      }),
+    ]);
+
+    // Deferred -> cancelled at promotion: the issue is still blocked on a done
+    // blocker, but this blocked cycle was the agent's own decision, so the
+    // dependency backstop must not restart it either.
+    for (let tick = 0; tick < 3; tick += 1) {
+      await heartbeat.reconcileResolvedDependencyWakes();
+      await heartbeat.resumeQueuedRuns();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(await waitForIdle()).toBe(true);
+    expect(cycle).toBe(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, ceoId))).toHaveLength(1);
+  });
+
+  it("still promotes a board-caused wake queued next to a suppressed self-wake", async () => {
     const companyId = await seedCompany();
     const ceoId = await seedAgent(companyId, "Jarvis");
     const issueId = await seedIssue(companyId, { assigneeAgentId: ceoId });
@@ -375,30 +474,9 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     mockAdapterExecute.mockImplementation(async (ctx) => {
       cycle += 1;
       if (cycle === 1) {
-        // While the run holds the issue, an older self-wake sits in the
-        // deferred queue next to a board-caused unblock.
+        await blockIssueAsRoute(issueId, ceoId);
         await db.insert(agentWakeupRequests).values([
-          {
-            id: parkedWakeId,
-            companyId,
-            agentId: ceoId,
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_execution_deferred",
-            payload: {
-              issueId,
-              action: "Confirm the blocker is done",
-              _paperclipSelfReblockWake: {
-                agentId: ceoId,
-                reason: "issue_unblock_requested",
-                causeActorType: "agent",
-                causeActorId: ceoId,
-              },
-              _paperclipWakeContext: { issueId, taskId: issueId, wakeReason: "issue_unblock_requested" },
-            },
-            status: "deferred_issue_execution",
-            requestedAt: new Date(Date.now() - 60_000),
-          },
+          deferredSelfWake({ id: parkedWakeId, companyId, agentId: ceoId, issueId }),
           {
             id: boardWakeId,
             companyId,
@@ -417,17 +495,16 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
             requestedAt: new Date(Date.now() - 30_000),
           },
         ]);
+      } else {
+        // The board's unblock lets the agent finish the work.
+        await issueService(db).update(issueId, { status: "done" });
       }
       return defaultRun(ctx);
     });
 
     const firstRun = await heartbeat.wakeup(ceoId, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "issue_assigned",
+      ...boardWake(),
       payload: { issueId, mutation: "update" },
-      requestedByActorType: "user",
-      requestedByActorId: "board-user",
       contextSnapshot: { issueId, source: "issue.update" },
     });
     expect(firstRun).not.toBeNull();
@@ -436,21 +513,52 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
 
     const [parked] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parkedWakeId));
     expect(parked).toMatchObject({ status: "cancelled", runId: null });
-    expect(parked!.error).toContain("Self-caused re-block wake suppressed");
-    const suppression = await db
-      .select({ details: activityLog.details, runId: activityLog.runId })
-      .from(activityLog)
-      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.wake_suppressed_self")));
-    expect(suppression).toEqual([
-      expect.objectContaining({
-        runId: firstRun!.id,
-        details: expect.objectContaining({ phase: "promotion", wakeupRequestId: parkedWakeId }),
-      }),
-    ]);
-
-    // The board's unblock in the same queue still promoted into a run.
     const [board] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, boardWakeId));
     expect(board!.runId).not.toBeNull();
+    expect(cycle).toBe(2);
+  });
+
+  it("lets the backstop wake the agent when a blocker resolves after its own suppressed unblock request", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "Jarvis");
+    const blockerId = await seedIssue(companyId, { assigneeAgentId: null, status: "todo" });
+    const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+
+    let cycle = 0;
+    mockAdapterExecute.mockImplementation(async (ctx) => {
+      cycle += 1;
+      if (cycle === 1) {
+        // The run blocks its issue on a still-pending blocker and names itself
+        // the unblock owner; that self wake is suppressed.
+        await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+        const blockedTransitionAt = await blockIssueAsRoute(issueId, agentId);
+        const [, unblockWake] = selfReblockWakes({ agentId, issueId, blockerId, blockedTransitionAt });
+        await heartbeat.wakeup(agentId, unblockWake!);
+      }
+      return defaultRun(ctx);
+    });
+
+    const firstRun = await heartbeat.wakeup(agentId, {
+      ...boardWake(),
+      payload: { issueId, mutation: "update" },
+      contextSnapshot: { issueId, source: "issue.update" },
+    });
+    expect(firstRun).not.toBeNull();
+    await waitForCondition(async () => cycle >= 1);
+    expect(await waitForIdle()).toBe(true);
+    await heartbeat.waitForRunExecutionDrain(firstRun!.id);
+    expect(
+      await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.reason, "issue_self_reblock_wake_suppressed")),
+    ).toHaveLength(1);
+
+    // Someone else completes the blocker later and its route wake is lost.
+    // That resolution is news: the backstop must deliver it.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await issueService(db).update(blockerId, { status: "done" });
+    const result = await heartbeat.reconcileResolvedDependencyWakes();
+    expect(result).toMatchObject({ healed: 1, selfReblockSkipped: 0 });
+    await waitForCondition(async () => cycle >= 2);
+    expect(await waitForIdle()).toBe(true);
     expect(cycle).toBe(2);
   });
 
