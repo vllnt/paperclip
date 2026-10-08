@@ -2581,7 +2581,10 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
     }
   }
 
-  const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|\beval\b|\bpython\s+-c\b|\bnode\s+-e\b/i;
+  // `eval` counts only in shell command position (line start, after a separator,
+  // inside `$(`/backticks or after a `$ ` prompt): a file named `eval-audits.md`
+  // or a tool subcommand such as `agent-browser eval` is not dynamic shell execution.
+  const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|(?:^|[\n;&|(`{]|\$\(|\$ )\s*eval\s|\bpython\s+-c\b|\bnode\s+-e\b/i;
   const secretExfilPattern = /\b(?:cat|printenv|env|grep)\b[\s\S]{0,160}(?:\.aws\/credentials|\.ssh\/|\.npmrc|id_rsa|OPENAI_API_KEY|ANTHROPIC_API_KEY|API_KEY|TOKEN|SECRET)[\s\S]{0,160}\b(?:curl|wget|nc|netcat|scp)\b/i;
   const networkPattern = /\b(?:curl|wget|fetch|httpie|nc|netcat|scp|ssh)\b|https?:\/\//i;
   const secretReferencePattern = /\b(?:process\.env|printenv|\$[A-Z][A-Z0-9_]{2,}|API_KEY|TOKEN|SECRET|PASSWORD|\.env)\b/i;
@@ -2608,7 +2611,8 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
     if (secretExfilPattern.test(text)) {
       pushFinding(findings, "secret_exfiltration", "error", "Secret exfiltration pattern is not allowed.", file.path);
     }
-    if (networkPattern.test(text)) {
+    // Documentation naturally names URLs and network tools; flag only files that can run.
+    if (!isMarkdownPath(file.path) && networkPattern.test(text)) {
       pushFinding(findings, "network_reference", "warning", "Skill content references network-capable commands or URLs.", file.path);
     }
     if (secretReferencePattern.test(text)) {
