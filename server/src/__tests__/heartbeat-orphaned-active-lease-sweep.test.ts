@@ -192,6 +192,77 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
   });
 
+  describe("SSH leases", () => {
+    // Every run on one SSH environment records the same provider lease id: the
+    // host workspace root. On pc01 (2026-10-08) 30 leases of crash-orphaned
+    // runs shared that id with each other and with the live runs, so the
+    // shared-resource guard deferred every one of them on every tick (bumping
+    // only `updatedAt`), they never released, and issue recovery stayed
+    // blocked on "has not finished releasing its authority".
+    const sshTarget = "ssh://node@worker.invalid:2222/home/node/workspaces";
+    const backoffMs = 5 * 60 * 1000;
+
+    async function seedSshEnvironment() {
+      const seeded = await seedCompanyAgentAndEnvironment();
+      await db.update(environments).set({ driver: "ssh", config: {} })
+        .where(eq(environments.id, seeded.environmentId));
+      return seeded;
+    }
+
+    async function insertSshLease(input: { companyId: string; environmentId: string; heartbeatRunId: string }) {
+      const id = randomUUID();
+      const acquiredAt = oldEnough();
+      await db.insert(environmentLeases).values({
+        id, companyId: input.companyId, environmentId: input.environmentId, heartbeatRunId: input.heartbeatRunId,
+        status: "active", leasePolicy: "ephemeral", provider: "ssh", providerLeaseId: sshTarget,
+        metadata: { driver: "ssh" }, acquiredAt, lastUsedAt: acquiredAt, createdAt: acquiredAt, updatedAt: acquiredAt,
+      });
+      return id;
+    }
+
+    // One reaper tick: the orphan sweep, then the pending_cleanup sweep, both
+    // with the production backoff. Then every lease ages past that backoff, as
+    // if the next tick ran five minutes later.
+    async function runTicks(heartbeat: ReturnType<typeof heartbeatService>, ticks: number) {
+      for (let tick = 0; tick < ticks; tick += 1) {
+        await heartbeat.sweepOrphanedActiveLeases({ backoffMs });
+        await heartbeat.sweepPendingCleanupLeases({ backoffMs });
+        await db.update(environmentLeases).set({ updatedAt: oldEnough() });
+      }
+    }
+
+    it("releases the leases of terminal runs although other leases share their SSH target", async () => {
+      const { companyId, agentId, environmentId } = await seedSshEnvironment();
+      const liveRunId = await insertHeartbeatRun({ companyId, agentId, status: "running" });
+      const liveLeaseId = await insertSshLease({ companyId, environmentId, heartbeatRunId: liveRunId });
+      const orphanLeaseIds = [];
+      for (const status of ["interrupted", "cancelled"]) {
+        const runId = await insertHeartbeatRun({ companyId, agentId, status });
+        orphanLeaseIds.push(await insertSshLease({ companyId, environmentId, heartbeatRunId: runId }));
+      }
+
+      await runTicks(heartbeatService(db), 3);
+
+      for (const leaseId of orphanLeaseIds) {
+        const row = await leaseRow(leaseId);
+        expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
+        expect(row?.releasedAt).toBeInstanceOf(Date);
+      }
+      const live = await leaseRow(liveLeaseId);
+      expect(live).toMatchObject({ status: "active", releasedAt: null });
+    });
+
+    it("never releases the lease of a live run, however old it is", async () => {
+      const { companyId, agentId, environmentId } = await seedSshEnvironment();
+      const liveRunId = await insertHeartbeatRun({ companyId, agentId, status: "running" });
+      const liveLeaseId = await insertSshLease({ companyId, environmentId, heartbeatRunId: liveRunId });
+
+      await runTicks(heartbeatService(db), 3);
+
+      expect(await leaseRow(liveLeaseId)).toMatchObject({ status: "active", releasedAt: null, failureReason: null });
+    });
+  });
+
   it("test_flips_an_active_lease_when_its_run_is_failed", async () => {
     const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
     const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed" });

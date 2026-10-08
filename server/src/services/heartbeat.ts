@@ -625,6 +625,7 @@ import {
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
+import { getEnvironmentDriverTraits } from "./environment-driver-traits.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
 import {
@@ -18691,8 +18692,15 @@ export function heartbeatService(
     for (const { lease } of rows) {
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
-      // must not tear down a sandbox that a different lease still owns.
-      if (lease.provider && lease.providerLeaseId) {
+      // must not tear down a sandbox that a different lease still owns. An SSH
+      // lease id instead names the host workspace every run on the environment
+      // shares, and its cleanup tears nothing down; guarding it would defer
+      // every orphaned SSH lease forever while any run on that host is live.
+      // An unknown driver keeps the guard.
+      const leaseDriver = typeof lease.metadata?.driver === "string" ? lease.metadata.driver : null;
+      const ownsProviderResource =
+        getEnvironmentDriverTraits(leaseDriver)?.leaseOwnsProviderResource ?? true;
+      if (ownsProviderResource && lease.provider && lease.providerLeaseId) {
         const [otherOwner] = await db
           .select({ id: environmentLeases.id })
           .from(environmentLeases)
