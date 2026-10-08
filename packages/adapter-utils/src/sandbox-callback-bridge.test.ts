@@ -1577,6 +1577,71 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  /** Wraps a runner so each command returns at most `maxChars` of stdout, keeping the head or the tail. */
+  function createStdoutCappedRunner(maxChars: number, keep: "head" | "tail") {
+    const inner = createExecRunner();
+    return {
+      execute: async (input: Parameters<typeof inner.execute>[0]): Promise<RunProcessResult> => {
+        const result = await inner.execute(input);
+        const stdout = keep === "tail" ? result.stdout.slice(-maxChars) : result.stdout.slice(0, maxChars);
+        return { ...result, stdout };
+      },
+    };
+  }
+
+  async function writeEnvelopeFixture(bytes: number): Promise<{ filePath: string; content: string }> {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-read-"));
+    cleanupDirs.push(rootDir);
+    const filePath = path.join(rootDir, "request.json");
+    // A JSON envelope like the bridge writes: a base64 body inside a JSON string.
+    const body = Buffer.from(Buffer.alloc(bytes).map((_, index) => (index * 31 + 7) % 251)).toString("base64");
+    const content = JSON.stringify({ id: "req-1", bodyEncoding: "base64", body }).slice(0, bytes);
+    await writeFile(filePath, content, "utf8");
+    return { filePath, content };
+  }
+
+  it("reads a multi-megabyte envelope through a provider that keeps only the last 4 MiB of stdout", async () => {
+    // CreateOS keeps the last 4,194,304 characters of command stdout.
+    const runner = createStdoutCappedRunner(4_194_304, "tail");
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: os.tmpdir() });
+    const { filePath, content } = await writeEnvelopeFixture(3_500_000);
+
+    await expect(client.readTextFile(filePath, content.length)).resolves.toBe(content);
+    await expect(client.readTextFile(filePath)).resolves.toBe(content);
+  });
+
+  it("reads through a provider with a 1 MiB stdout buffer", async () => {
+    const runner = createStdoutCappedRunner(1_048_576, "head");
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: os.tmpdir() });
+    const { filePath, content } = await writeEnvelopeFixture(1_200_000);
+
+    await expect(client.readTextFile(filePath, content.length)).resolves.toBe(content);
+  });
+
+  it.each(["head", "tail"] as const)(
+    "fails loudly instead of returning a corrupt envelope when the provider cuts output (keeps %s)",
+    async (keep) => {
+      const runner = createStdoutCappedRunner(200_000, keep);
+      const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: os.tmpdir() });
+      const { filePath, content } = await writeEnvelopeFixture(600_000);
+
+      await expect(client.readTextFile(filePath, content.length)).rejects.toThrow(/provider truncated command output/);
+    },
+  );
+
+  it("reads an empty file and still enforces the size limit", async () => {
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner: createExecRunner(),
+      remoteCwd: os.tmpdir(),
+    });
+    const { filePath: emptyPath } = await writeEnvelopeFixture(0);
+    await expect(client.readTextFile(emptyPath, 10)).resolves.toBe("");
+    const { filePath, content } = await writeEnvelopeFixture(2_000);
+    await expect(client.readTextFile(filePath, content.length - 1)).rejects.toThrow(
+      "Bridge envelope exceeded the configured size limit.",
+    );
+  });
+
   it.each([
     [4 * 60 * 60 * 1000, 30_000],
     [250, 250],

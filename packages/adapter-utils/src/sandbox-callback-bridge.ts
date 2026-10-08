@@ -85,6 +85,11 @@ const BACKSTOP_WRITE_RETRY_MS = 50;
 // call every poll interval.
 const MAX_TRANSIENT_ITERATION_BACKOFF_MS = 5_000;
 const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
+// Raw bytes read back per remote command. Providers cap the stdout they
+// return (CreateOS keeps the last 4 MiB, SSH buffers 1 MiB), and a single
+// `base64 < file` read of a multi-megabyte request envelope silently lost its
+// head. 512 KiB encodes to about 710 KB of base64 output, under every cap.
+const REMOTE_READ_CHUNK_BYTES = 512 * 1024;
 export const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
 const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
@@ -715,13 +720,39 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       return Number(result.stdout.trim());
     },
     readTextFile: async (remotePath, maxBytes) => {
-      const command = maxBytes === undefined
-        ? `base64 < ${shellQuote(remotePath)}`
-        : `head -c ${Math.trunc(maxBytes) + 1} ${shellQuote(remotePath)} | base64`;
-      const result = await runChecked(`read ${remotePath}`, command);
-      const bytes = Buffer.from(result.stdout.replace(/\s+/g, ""), "base64");
-      if (maxBytes !== undefined && bytes.length > maxBytes) throw new Error("Bridge envelope exceeded the configured size limit.");
-      return bytes.toString("utf8");
+      // Read in slices. Each command prints one base64 slice and then the
+      // file's total size on its own last line, so a slice the provider cut
+      // short (from either end) fails here instead of decoding to a corrupt
+      // envelope.
+      const quoted = shellQuote(remotePath);
+      const slices: Buffer[] = [];
+      let offset = 0;
+      for (;;) {
+        const result = await runChecked(
+          `read ${remotePath}`,
+          `tail -c +${offset + 1} ${quoted} | head -c ${REMOTE_READ_CHUNK_BYTES} | base64; printf '\\n%s\\n' "$(wc -c < ${quoted})"`,
+        );
+        const lines = result.stdout.trim().split(/\r?\n/);
+        const totalBytes = Number((lines.pop() ?? "").trim());
+        if (!Number.isSafeInteger(totalBytes) || totalBytes < 0) {
+          throw new Error(`Bridge read of ${remotePath} returned no file size; the provider truncated command output.`);
+        }
+        if (maxBytes !== undefined && totalBytes > maxBytes) {
+          throw new Error("Bridge envelope exceeded the configured size limit.");
+        }
+        const slice = Buffer.from(lines.join("").replace(/\s+/g, ""), "base64");
+        const expected = Math.max(0, Math.min(REMOTE_READ_CHUNK_BYTES, totalBytes - offset));
+        if (slice.length !== expected) {
+          throw new Error(
+            `Bridge read of ${remotePath} returned ${slice.length} of ${expected} bytes at offset ${offset}; ` +
+              "the provider truncated command output.",
+          );
+        }
+        slices.push(slice);
+        offset += slice.length;
+        if (offset >= totalBytes) break;
+      }
+      return Buffer.concat(slices).toString("utf8");
     },
     writeTextFile: async (remotePath, body) => {
       const remoteDir = path.posix.dirname(remotePath);
