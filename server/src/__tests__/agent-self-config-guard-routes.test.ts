@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
@@ -273,6 +274,21 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       fields: ["adapterConfig.filesystemSandboxCommand"],
     },
     {
+      label: "adapterConfig.acpxPermissionMode",
+      body: { adapterConfig: { acpxPermissionMode: "approve-all" } },
+      fields: ["adapterConfig.acpxPermissionMode"],
+    },
+    {
+      label: "adapterConfig.maxEstimatedSessionCostUsd",
+      body: { adapterConfig: { maxEstimatedSessionCostUsd: 1_000 } },
+      fields: ["adapterConfig.maxEstimatedSessionCostUsd"],
+    },
+    {
+      label: "adapterConfig.networkScope",
+      body: { adapterConfig: { networkScope: "allow" } },
+      fields: ["adapterConfig.networkScope"],
+    },
+    {
       label: "a future dangerously* adapter flag",
       body: { adapterConfig: { dangerouslyEnableFutureEscapeHatch: true } },
       fields: ["adapterConfig.dangerouslyEnableFutureEscapeHatch"],
@@ -407,7 +423,10 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     const higherCapRevision = await findRevision(
       db,
       agentId,
-      (afterConfig) => JSON.stringify(afterConfig.runtimeConfig).includes('"maxDailyRuns":50'),
+      (afterConfig) => isDeepStrictEqual(
+        afterConfig.runtimeConfig,
+        { heartbeat: { ...STORED_RUNTIME_CONFIG.heartbeat, maxDailyRuns: 50 } },
+      ),
     );
 
     const res = await request(createApp(db, agentActor(companyId, agentId)))

@@ -106,6 +106,67 @@ describe("agent self-config protected field diff", () => {
     ]);
   });
 
+  it("flags executables, state directories, tool sets, runner limits, and sandbox scope", () => {
+    expect(changesFor({
+      adapterConfig: {
+        acpAgentCommand: "/tmp/acp",
+        hermesCommand: "/tmp/hermes",
+        stateDir: "/tmp/state",
+        acpStateDir: "/tmp/acp-state",
+        toolsets: "all",
+        enabledToolsets: ["terminal"],
+        engine: "cli",
+        acpxPermissionMode: "approve-all",
+        codexPermissionMode: "allow",
+        maxEstimatedSessionCostUsd: 1000,
+        maxIterations: 8,
+        idleTimeoutMs: 1,
+        managedProfileId: "other-profile",
+        agentCoreRetentionAcknowledged: true,
+        networkScope: "allow",
+        filesystemScope: "host",
+      },
+    })).toEqual([
+      "adapterConfig.acpAgentCommand",
+      "adapterConfig.acpStateDir",
+      "adapterConfig.acpxPermissionMode",
+      "adapterConfig.agentCoreRetentionAcknowledged",
+      "adapterConfig.codexPermissionMode",
+      "adapterConfig.enabledToolsets",
+      "adapterConfig.engine",
+      "adapterConfig.filesystemScope",
+      "adapterConfig.hermesCommand",
+      "adapterConfig.idleTimeoutMs",
+      "adapterConfig.managedProfileId",
+      "adapterConfig.maxEstimatedSessionCostUsd",
+      "adapterConfig.maxIterations",
+      "adapterConfig.networkScope",
+      "adapterConfig.stateDir",
+      "adapterConfig.toolsets",
+    ]);
+  });
+
+  it("flags unlisted keys that match a protected name pattern", () => {
+    expect(changesFor({
+      adapterConfig: {
+        futureCommand: "/tmp/x",
+        futurePermissionMode: "allow",
+        maxFutureSpendUsd: 1,
+        probeTimeoutSec: 1,
+        futureProfileId: "p",
+        futureRetentionAcknowledged: true,
+        notes: "unprotected",
+      },
+    })).toEqual([
+      "adapterConfig.futureCommand",
+      "adapterConfig.futurePermissionMode",
+      "adapterConfig.futureProfileId",
+      "adapterConfig.futureRetentionAcknowledged",
+      "adapterConfig.maxFutureSpendUsd",
+      "adapterConfig.probeTimeoutSec",
+    ]);
+  });
+
   it("lists every field a rollback would change, including environment and profile fields", () => {
     const existing = {
       name: "Worker",

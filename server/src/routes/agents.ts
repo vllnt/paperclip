@@ -5512,7 +5512,7 @@ export function agentRoutes(
     const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
       (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
     );
-    if (!profileOnlyChange) {
+    if (!profileOnlyChange && req.actor.type === "agent" && req.actor.agentId === existing.id) {
       const requestedAdapterConfigForGuard = asRecord(patchData.adapterConfig);
       const protectedAfterPatch = agentProtectedConfigAfterPatch(
         existing,

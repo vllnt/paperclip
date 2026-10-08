@@ -17,17 +17,19 @@ const PROTECTED_TOP_LEVEL_KEYS = [
 
 /**
  * adapterConfig keys an agent may not change on itself. They select the model,
- * effort, or service tier; set per-run limits; choose the executable, its
- * arguments, its environment variables, its state directory, or the endpoint
- * that serves the run; or relax approvals, sandboxing, tool sets, and gateway
- * permissions. `env` is compared per variable. Any key that starts with
- * `dangerously` or ends with `Command` is also protected, so a new adapter
- * escape hatch or executable override is covered without a change here.
+ * engine, profile, or service tier; set per-run, spend, or session limits;
+ * choose the executable, its arguments, its environment variables, its state
+ * directory, the endpoint, or the runtime environment that serves the run; or
+ * relax approvals, sandbox scope, tool sets, gateway permissions, or data
+ * retention consent. `env` is compared per variable.
  */
 export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
   "model",
   "provider",
   "acpxAgent",
+  "engine",
+  "managedProfileId",
+  "agentCoreProfileId",
   "fastMode",
   "effort",
   "reasoningEffort",
@@ -37,11 +39,19 @@ export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
   "variant",
   "maxTurns",
   "maxTurnsPerRun",
+  "maxIterations",
+  "maxOutputTokens",
+  "maxEstimatedSessionCostUsd",
+  "maxSessionListCostUsd",
   "timeoutSec",
+  "timeoutSeconds",
   "timeoutMs",
+  "idleTimeoutMs",
   "graceSec",
   "outputInactivityTimeoutMs",
   "waitTimeoutMs",
+  "warmHandleIdleMs",
+  "lifecycleMode",
   "command",
   "agentCommand",
   "acpAgentCommand",
@@ -53,16 +63,25 @@ export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
   "env",
   "url",
   "apiBaseUrl",
+  "runtimeEnvType",
+  "runtimeEnvName",
   "dangerouslySkipPermissions",
   "dangerouslyBypassApprovalsAndSandbox",
   "dangerouslyBypassSandbox",
   "dangerouslyAllowInsecureRemoteHttp",
   "permissionMode",
   "acpPermissionMode",
+  "acpxPermissionMode",
+  "opencodePermissionMode",
+  "codexPermissionMode",
   "nonInteractivePermissions",
   "acpNonInteractivePermissions",
   "sandbox",
   "filesystemSandboxCommand",
+  "filesystemScope",
+  "filesystemExtraPaths",
+  "networkScope",
+  "networkAllowlist",
   "approvalMode",
   "yolo",
   "alwaysApprove",
@@ -72,7 +91,25 @@ export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
   "disableDeviceAuth",
   "scopes",
   "role",
+  "managedAgentsRetentionAcknowledged",
+  "agentCoreRetentionAcknowledged",
 ] as const;
+
+/**
+ * Name patterns for adapterConfig keys that are protected even when they are
+ * not listed: escape hatches, executables, permission modes, `max*` limits,
+ * timeouts, profile selectors, and retention consents. They cover a new
+ * adapter key of the same kind without a change here.
+ */
+const PROTECTED_ADAPTER_CONFIG_KEY_PATTERNS: readonly RegExp[] = [
+  /^dangerously/i,
+  /Command$/,
+  /PermissionMode$/i,
+  /^max[A-Z]/,
+  /[tT]imeout(Sec|Seconds|Ms)$/,
+  /ProfileId$/,
+  /RetentionAcknowledged$/,
+];
 
 const PROTECTED_ADAPTER_CONFIG_KEY_SET: ReadonlySet<string> = new Set(AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS);
 
@@ -104,7 +141,8 @@ function sortedUnionKeys(before: Record<string, unknown>, after: Record<string, 
 }
 
 function isProtectedAdapterConfigKey(key: string) {
-  return PROTECTED_ADAPTER_CONFIG_KEY_SET.has(key) || /^dangerously/i.test(key) || /Command$/.test(key);
+  return PROTECTED_ADAPTER_CONFIG_KEY_SET.has(key)
+    || PROTECTED_ADAPTER_CONFIG_KEY_PATTERNS.some((pattern) => pattern.test(key));
 }
 
 /**
