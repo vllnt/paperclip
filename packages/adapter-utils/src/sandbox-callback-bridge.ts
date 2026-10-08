@@ -134,9 +134,9 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/agents\/[^/]+\/skills$/ },
   { method: "POST", path: /^\/api\/agents\/[^/]+\/skills\/sync$/ },
   { method: "PATCH", path: /^\/api\/agents\/[^/]+\/instructions-path$/ },
-  // Wakeup: the server lets an agent wake only itself in its own company, and keeps failedRunId retries
-  // board-only and debug traces instance-admin-only. The id slot excludes ?, #, %, . and \ like the
-  // skill and decision rules.
+  // Wakeup: the server lets an agent wake only itself in its own company (forceFreshSession included),
+  // and keeps failedRunId retries board-only and debug traces instance-admin-only. The id slot excludes
+  // ?, #, %, . and \ like the skill and decision rules.
   { method: "POST", path: /^\/api\/agents\/[^/?#%.\\]+\/wakeup$/ },
 
   // Read-only schema discovery for validated control-plane requests.
