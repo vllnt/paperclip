@@ -79,6 +79,8 @@ const apiPrefixes: Record<string, string> = {
 const ROUTE_LITERAL_PATTERN =
   /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
 const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
+const ROUTE_METHOD_LOOP_PATTERN =
+  /for\s*\(\s*const\s+method\s+of\s+\[([^\]]+)\][^)]*\)\s*\{\s*router\[method\]\(\s*["'`]([^"'`]+)["'`]/g;
 const HTTP_METHODS = new Set([
   "get",
   "put",
@@ -175,6 +177,20 @@ function loadActualRoutes() {
         unknownRouteFiles.push(file);
       }
       continue;
+    }
+
+    // `for (const method of ["get", "post"] as const) router[method]("/path", ...)`.
+    // Any other computed registration would be invisible here, so it fails the test.
+    const loopMatches = [...source.matchAll(ROUTE_METHOD_LOOP_PATTERN)].length;
+    if ((source.match(/\brouter\[/g) ?? []).length !== loopMatches) {
+      unknownRouteFiles.push(`${file} (computed router[...] registration)`);
+    }
+    for (const match of source.matchAll(ROUTE_METHOD_LOOP_PATTERN)) {
+      for (const method of match[1].match(/get|post|put|patch|delete/g) ?? []) {
+        routes.add(
+          `${method.toUpperCase()} ${normalizeExpressPath(resolveMountedPath(file, prefix, match[2]))}`,
+        );
+      }
     }
 
     for (const match of source.matchAll(ROUTE_LITERAL_PATTERN)) {

@@ -1355,6 +1355,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
   "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
 
+  "GET /api/companies/{companyId}/chats",
+  "GET /api/companies/{companyId}/chats/{agentRef}",
+  "POST /api/companies/{companyId}/chats/{agentRef}",
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
   "DELETE /api/issues/{id}/documents/{key}",
@@ -3905,6 +3908,26 @@ registry.registerPath({
   description: "Requires Agent Chat to be enabled. Returns accessible conversations in the company, ordered by most recent activity. Each agent has one conversation per user.",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Get the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. `agentRef` is an agent ID or URL key. Returns the conversation issue, or null when none exists yet. Read-only.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Open the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. Returns the existing conversation issue, or creates it. `agentRef` is an agent ID or URL key.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
