@@ -1,0 +1,243 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import { buildOpenApiSpec } from "../routes/openapi.js";
+import {
+  collectCoverage,
+  extractCliCalls,
+  extractUiCalls,
+  findCliRegistrationPrefixes,
+  loadSharedConstants,
+  loadSpecOperations,
+  matchOperation,
+  renderCoverageMarkdown,
+} from "../../scripts/api-coverage-matrix.js";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const sharedConstants = await loadSharedConstants(REPO_ROOT);
+
+/**
+ * API calls whose path the scanner can't resolve statically, or that dispatch
+ * generically (`/api/${resource}`). Their operations can't be checked against
+ * the OpenAPI document, so this list is pinned: a new entry fails the test.
+ * Prefer a literal path (or `apiPath` template) over adding to this list.
+ */
+const KNOWN_UNRESOLVED_CALLS = [
+  "cli/src/commands/client/asset.ts POST path",
+  "cli/src/commands/client/auth.ts POST `${apiPath`/api/cli-auth/challenges/${id}`}/${action}`",
+  "cli/src/commands/client/company.ts POST importApiPath",
+  "cli/src/commands/client/company.ts POST previewApiPath",
+  "cli/src/commands/client/company.ts POST transferPreviewPath",
+  "cli/src/commands/client/run.ts GET `${path}?${params.toString()}`",
+  "cli/src/commands/client/teams.ts POST catalogTeamCompanyPath(ctx.companyId, catalogRef, \"install\")",
+  "cli/src/commands/client/teams.ts POST catalogTeamCompanyPath(ctx.companyId, catalogRef, \"preview\")",
+  "cli/src/commands/client/workspace.ts PATCH path",
+  "cli/src/commands/client/workspace.ts POST path",
+  "ui/src/api/announcements.ts GET `/api/announcements/${path}`",
+  "ui/src/api/auth.ts PATCH `/api/auth${path}`",
+  "ui/src/api/auth.ts POST `/api/auth${path}`",
+  "ui/src/api/client.ts GET path: string",
+  "ui/src/api/document-annotations.ts GET `${targetBasePath(target)}${qs ? `?${qs}` : \"\"}`",
+  "ui/src/api/document-annotations.ts GET `${targetBasePath(target)}/${threadId}`",
+  "ui/src/api/document-annotations.ts PATCH `${targetBasePath(target)}/${threadId}`",
+  "ui/src/api/document-annotations.ts POST `${targetBasePath(target)}/${threadId}/comments`",
+  "ui/src/api/document-annotations.ts POST targetBasePath(target)",
+  "ui/src/api/summarySlots.ts GET summarySlotPath(selector)",
+  "ui/src/api/summarySlots.ts GET summarySlotPath(selector, \"/revisions\")",
+  "ui/src/api/summarySlots.ts POST summarySlotPath(selector, \"/generate\")",
+];
+
+describe("api coverage matrix scanner", () => {
+  it("resolves UI client paths from templates, helpers, concatenation and query suffixes", () => {
+    const source = `
+import { api } from "./client";
+const LIST_PATH = "/widgets?scope=accessible";
+function widgetPath(id: string, companyId?: string, suffix = "") {
+  return withCompanyScope(\`/widgets/\${encodeURIComponent(id)}\${suffix}\`, companyId);
+}
+export const widgetsApi = {
+  list: () => api.get(LIST_PATH),
+  activity: (companyId: string, qs: string) =>
+    api.get<Widget[]>(\`/companies/\${companyId}/activity\${qs ? \`?\${qs}\` : ""}\`),
+  pause: (id: string) => api.post(widgetPath(id, undefined, "/pause"), {}),
+  rollback: (id: string, revisionId: string) => api.post(widgetPath(id, undefined, \`/revisions/\${revisionId}/rollback\`), {}),
+  byName: (companyId: string) => api.get("/companies/" + encodeURIComponent(companyId) + "/widgets" + "?x=1"),
+  remove: (id: string, purge?: boolean) => api.delete(\`/widgets/\${id}\${purge ? "?purge=true" : ""}\`),
+  unresolved: (base: string) => api.get(\`\${base}/x\`),
+};`;
+    const calls = extractUiCalls("ui/src/api/widgets.ts", source);
+    expect(calls.map((call) => [call.label, call.method, call.path])).toEqual([
+      ["widgetsApi.list", "GET", "/api/widgets"],
+      ["widgetsApi.activity", "GET", "/api/companies/{}/activity"],
+      ["widgetsApi.pause", "POST", "/api/widgets/{}/pause"],
+      ["widgetsApi.rollback", "POST", "/api/widgets/{}/revisions/{}/rollback"],
+      ["widgetsApi.byName", "GET", "/api/companies/{}/widgets"],
+      ["widgetsApi.remove", "DELETE", "/api/widgets/{}"],
+      ["widgetsApi.unresolved", "GET", null],
+    ]);
+  });
+
+  it("labels CLI calls by their command and expands command-registering helpers and tuple loops", () => {
+    const source = `
+export function registerWidgetCommands(program: Command): void {
+  const widget = program.command("widget").description("Widgets");
+  widget
+    .command("get")
+    .argument("<id>")
+    .action(async (id: string, opts: Options) => {
+      await ctx.api.get(apiPath\`/api/widgets/\${id}\`);
+    });
+  for (const [name, path] of [
+    ["pause", "pause"],
+    ["heartbeat:invoke", "heartbeat/invoke"],
+  ] as const) {
+    widget.command(name).action(async (id: string) => {
+      await ctx.api.post(\`\${apiPath\`/api/widgets/\${id}\`}/\${path}\`, {});
+    });
+  }
+  addIdGet(widget, "runs", "List runs", "widgets", "runs");
+}
+function addIdGet(parent: Command, name: string, description: string, resource: string, suffix?: string): void {
+  parent.command(name).action(async (id: string) => {
+    await ctx.api.get(\`/api/\${resource}/\${encodeURIComponent(id)}\${suffix ? \`/\${suffix}\` : ""}\`);
+  });
+}
+async function resolveWidget(ref: string) {
+  return ctx.api.get(apiPath\`/api/widgets/\${ref}\`);
+}`;
+    const calls = extractCliCalls("cli/src/commands/client/widget.ts", source);
+    expect(calls.map((call) => [call.label, call.method, call.path])).toEqual([
+      ["paperclipai widget get", "GET", "/api/widgets/{}"],
+      ["paperclipai", "GET", "/api/widgets/{}"],
+      ["paperclipai widget runs", "GET", "/api/widgets/{}/runs"],
+      ["paperclipai widget pause", "POST", "/api/widgets/{}/pause"],
+      ["paperclipai widget heartbeat:invoke", "POST", "/api/widgets/{}/heartbeat/invoke"],
+    ]);
+  });
+
+  it("finds raw fetch calls, putRaw, and helpers called with loop variables", () => {
+    const ui = extractUiCalls(
+      "ui/src/api/health.ts",
+      `export const healthApi = {
+  restart: async () => {
+    const res = await fetch("/api/health/dev-server/restart", { method: "POST" });
+    return res.json();
+  },
+  external: () => fetch("https://example.test/x"),
+};`,
+    );
+    expect(ui.map((call) => [call.method, call.path])).toEqual([["POST", "/api/health/dev-server/restart"]]);
+
+    const cli = extractCliCalls(
+      "cli/src/commands/client/cost.ts",
+      `export function registerCostCommands(program: Command): void {
+  const cost = program.command("cost").description("Costs");
+  for (const [name, path] of [["summary", "costs/summary"], ["by-agent", "costs/by-agent"]] as const) {
+    addCompanyGet(cost, name, "Read costs", path);
+  }
+  cost.command("upload").action(async () => {
+    await fetch(buildApiUrl(ctx.api.apiBase, apiPath\`/api/companies/\${id}/attachments\`), { method: "POST", body });
+    await api.putRaw(apiPath\`/api/transfers/\${id}/parts/\${index}\`, bytes);
+  });
+}
+function addCompanyGet(parent: Command, name: string, description: string, path: string): void {
+  parent.command(name).action(async () => {
+    await ctx.api.get(\`\${apiPath\`/api/companies/\${ctx.companyId}\`}/\${path}\`);
+  });
+}`,
+    );
+    expect(cli.map((call) => [call.label, call.method, call.path])).toEqual([
+      ["paperclipai cost upload", "POST", "/api/companies/{}/attachments"],
+      ["paperclipai cost upload", "PUT", "/api/transfers/{}/parts/{}"],
+      ["paperclipai cost summary", "GET", "/api/companies/{}/costs/summary"],
+      ["paperclipai cost by-agent", "GET", "/api/companies/{}/costs/by-agent"],
+    ]);
+  });
+
+  it("resolves a local path variable only from an enclosing scope", () => {
+    const calls = extractUiCalls(
+      "ui/src/api/widgets.ts",
+      `export const widgetsApi = {
+  a: () => {
+    const base = \`/widgets\`;
+    return api.get(\`\${base}/a\`);
+  },
+  b: (base: string) => api.get(\`\${base}/b\`),
+};`,
+    );
+    expect(calls.map((call) => call.path)).toEqual(["/api/widgets/a", null]);
+  });
+
+  it("prefixes CLI files registered under a command group in cli/src/index.ts", () => {
+    const index = `
+import { registerRunCommands } from "./commands/client/run.js";
+import { registerAgentCommands } from "./commands/client/agent.js";
+const run = program.command("run").description("Run Paperclip");
+registerRunCommands(run);
+registerAgentCommands(program);`;
+    const prefixes = findCliRegistrationPrefixes(index, "cli/src/index.ts");
+    expect([...prefixes]).toEqual([["cli/src/commands/client/run.ts", ["run"]]]);
+    const calls = extractCliCalls(
+      "cli/src/commands/client/run.ts",
+      `export function registerRunCommands(command: Command): void {
+  command.command("list").action(async () => { await ctx.api.get(apiPath\`/api/companies/\${id}/heartbeat-runs\`); });
+}`,
+      { registrationPrefix: prefixes.get("cli/src/commands/client/run.ts") },
+    );
+    expect(calls.map((call) => call.label)).toEqual(["paperclipai run list"]);
+  });
+
+  it("prefers the most literal operation when matching a call path", () => {
+    const operations = loadSpecOperations({
+      paths: {
+        "/api/agents/{id}": { get: { summary: "Get an agent" } },
+        "/api/agents/me": { get: { summary: "Get the current agent" } },
+        "/api/llms/agent-configuration/{adapterType}.txt": { get: { summary: "Adapter docs" } },
+      },
+    });
+    expect(matchOperation("GET", "/api/agents/me", operations)?.path).toBe("/api/agents/me");
+    expect(matchOperation("GET", "/api/agents/{}", operations)?.path).toBe("/api/agents/{id}");
+    expect(matchOperation("GET", "/api/llms/agent-configuration/{}.txt", operations)?.path).toBe(
+      "/api/llms/agent-configuration/{adapterType}.txt",
+    );
+    expect(matchOperation("POST", "/api/agents/{}", operations)).toBeNull();
+  });
+});
+
+describe("api coverage matrix against the repository", () => {
+  const operations = loadSpecOperations(buildOpenApiSpec());
+  const result = collectCoverage({ repoRoot: REPO_ROOT, operations, sharedConstants });
+  const describeCall = (call: { method: string; path: string | null; file: string; line: number }) =>
+    `${call.method} ${call.path} (${call.file}:${call.line})`;
+
+  it("documents every route the board UI client calls", () => {
+    expect(result.uiCalls.length).toBeGreaterThan(500);
+    expect(result.uiUndocumented.map(describeCall)).toEqual([]);
+  });
+
+  it("documents every route the CLI calls", () => {
+    expect(result.cliCalls.length).toBeGreaterThan(200);
+    expect(result.cliUndocumented.map(describeCall)).toEqual([]);
+  });
+
+  it("pins the calls the scanner can't check against the document", () => {
+    const keys = [...result.uiCalls, ...result.cliCalls]
+      .filter((call) => call.path === null)
+      .concat(result.dynamicCalls)
+      .map((call) => `${call.file} ${call.method} ${call.raw.replace(/\s+/g, " ")}`);
+    expect([...new Set(keys)].sort()).toEqual(KNOWN_UNRESOLVED_CALLS);
+  });
+
+  it("renders the matrix with a row per documented operation and its UI and CLI callers", () => {
+    const markdown = renderCoverageMarkdown(result);
+    const rows = markdown.split("\n").filter((line) => /^\| `(GET|POST|PUT|PATCH|DELETE) \//.test(line));
+    expect(rows).toHaveLength(operations.length);
+    expect(markdown).toContain(
+      "| `PATCH /api/agents/{id}` | Update an agent | board or agent key | `agentsApi.update` | `paperclipai agent update` |",
+    );
+    expect(markdown).toContain("| `GET /api/companies/{companyId}/costs/by-agent` |");
+    expect(rows.find((row) => row.startsWith("| `GET /api/companies/{companyId}/costs/by-agent` |"))).toContain(
+      "`paperclipai cost by-agent`",
+    );
+  });
+});
