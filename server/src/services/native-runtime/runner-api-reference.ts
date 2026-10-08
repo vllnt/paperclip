@@ -22,7 +22,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "PATCH /api/agents/{}": {
     "section": "Agents",
-    "description": "Update agent config or budget"
+    "description": "Update agent config or budget. An agent cannot change its own run limits, budget, model, role, or permissions, or un-pause itself, without `agents:configure` for itself."
   },
   "POST /api/agents/{}/pause": {
     "section": "Agents",

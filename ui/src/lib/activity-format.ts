@@ -67,6 +67,7 @@ const ACTIVITY_ROW_VERBS: Record<string, string> = {
   "agent.terminated": "terminated",
   "agent.key_created": "created API key for",
   "agent.budget_updated": "updated budget for",
+  "agent.self_config_update_denied": "was blocked from changing its own limits, budget, model, role, or permissions on",
   "agent.runtime_session_reset": "reset session for",
   "heartbeat.invoked": "invoked heartbeat for",
   "heartbeat.cancelled": "cancelled heartbeat for",

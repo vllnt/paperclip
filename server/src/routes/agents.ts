@@ -106,6 +106,12 @@ import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
+import {
+  agentProtectedConfigAfterPatch,
+  collectAgentPermissionChanges,
+  collectAgentProtectedConfigChanges,
+} from "./agent-self-config-authz.js";
+import { normalizeAgentPermissions } from "../services/agent-permissions.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
@@ -2841,6 +2847,47 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  /**
+   * An agent may not raise its own run caps, budget, model, or permissions on
+   * the strength of allow_self. These changes need the same direct
+   * agents:configure grant (for itself) that editing a peer needs, and every
+   * refusal is logged so operators can see the attempt.
+   */
+  async function assertCanChangeOwnProtectedAgentFields(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    fields: string[],
+    surface: "patch" | "config_rollback" | "permissions",
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId !== targetAgent.id || fields.length === 0) return;
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
+      scope: { requiresChangeGrant: true, targetAgentId: targetAgent.id },
+    });
+    if (decision.allowed) return;
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: targetAgent.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "agent.self_config_update_denied",
+      entityType: "agent",
+      entityId: targetAgent.id,
+      details: { surface, fields, ...authorizationDeniedDetails(decision) },
+    });
+    throw forbidden(
+      `Agents cannot change their own run limits, budget, model, role, or permissions (${fields.join(", ")}). `
+        + "Ask a board user, or an agent with agents:configure for this agent, to make the change.",
+      { code: "agent_self_protected_config_change", ...authorizationDeniedDetails(decision), fields },
+    );
+  }
+
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
     await assertCanApplyProtectedAgentChange(
       req,
@@ -4369,6 +4416,20 @@ export function agentRoutes(
     if (!rollbackConfig) {
       throw unprocessable("Invalid revision snapshot");
     }
+    await assertCanChangeOwnProtectedAgentFields(
+      req,
+      existing,
+      collectAgentProtectedConfigChanges(existing, {
+        adapterType: typeof rollbackConfig.adapterType === "string" ? rollbackConfig.adapterType : existing.adapterType,
+        adapterConfig: rollbackConfig.adapterConfig,
+        runtimeConfig: rollbackConfig.runtimeConfig,
+        budgetMonthlyCents: typeof rollbackConfig.budgetMonthlyCents === "number"
+          ? rollbackConfig.budgetMonthlyCents
+          : existing.budgetMonthlyCents,
+        role: typeof rollbackConfig.role === "string" ? rollbackConfig.role : existing.role,
+      }),
+      "config_rollback",
+    );
     assertProviderTraceSettingTransition(
       req,
       rollbackConfig.runtimeConfig,
@@ -4991,6 +5052,15 @@ export function agentRoutes(
         res.status(403).json({ error: "Only CEO can manage permissions" });
         return;
       }
+      await assertCanChangeOwnProtectedAgentFields(
+        req,
+        existing,
+        collectAgentPermissionChanges(
+          existing.permissions,
+          normalizeAgentPermissions({ ...existing.permissions, ...req.body }),
+        ),
+        "permissions",
+      );
     } else {
       await assertBoardCanManageAgentsForCompany(req, existing.companyId);
     }
@@ -5449,6 +5519,21 @@ export function agentRoutes(
     // from the patch so it never reaches the update values.
     const applyStoredClaudeLogin = patchData.applyStoredClaudeLogin === true;
     delete patchData.applyStoredClaudeLogin;
+    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
+    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
+      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
+    );
+    if (!profileOnlyChange) {
+      await assertCanChangeOwnProtectedAgentFields(
+        req,
+        existing,
+        collectAgentProtectedConfigChanges(
+          existing,
+          agentProtectedConfigAfterPatch(existing, patchData, replaceAdapterConfig),
+        ),
+        "patch",
+      );
+    }
     if (hasOwn(patchData, "adapterConfig")) {
       const adapterConfig = asRecord(patchData.adapterConfig);
       if (!adapterConfig) {
@@ -5595,10 +5680,6 @@ export function agentRoutes(
         },
       );
     }
-    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
-    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
-      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
-    );
     if (profileOnlyChange) {
       await assertCanApplyAgentProfileChange(req, existing);
     } else {

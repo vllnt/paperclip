@@ -70,6 +70,11 @@ describe("activity formatting", () => {
     expect(formatIssueActivityAction("issue.reviewers_updated", details, { agentMap })).toBe("updated reviewers");
   });
 
+  it("labels a refused agent self-config change", () => {
+    expect(formatActivityVerb("agent.self_config_update_denied", { fields: ["runtimeConfig.heartbeat.maxDailyRuns"] }))
+      .toBe("was blocked from changing its own limits, budget, model, role, or permissions on");
+  });
+
   it("formats monitor activity with direct verbs", () => {
     expect(formatActivityVerb("issue.monitor_scheduled")).toBe("scheduled monitor on");
     expect(formatActivityVerb("issue.monitor_exhausted")).toBe("exhausted monitor on");
