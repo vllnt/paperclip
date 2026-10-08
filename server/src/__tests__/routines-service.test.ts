@@ -1224,6 +1224,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(run.status).toBe("issue_created");
     expect(run.linkedIssueId).toBeTruthy();
+    const [createdIssue] = await db
+      .select({ statusVersion: issues.statusVersion })
+      .from(issues)
+      .where(eq(issues.id, run.linkedIssueId!));
     expect(wakeups).toEqual([
       {
         agentId,
@@ -1234,6 +1238,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
           payload: { issueId: run.linkedIssueId, mutation: "create" },
           requestedByActorType: undefined,
           requestedByActorId: null,
+          // A routine-created issue is an assignment event: its wake names the
+          // assignee and assignment generation, so a retry cannot run it twice.
+          idempotencyKey: `issue-assignment:${run.linkedIssueId}:${agentId}:${createdIssue!.statusVersion}`,
           contextSnapshot: { issueId: run.linkedIssueId, source: "routine.dispatch" },
         },
       },

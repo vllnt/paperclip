@@ -99,6 +99,7 @@ import {
   inArray,
   isNull,
   isNotNull,
+  like,
   lt,
   lte,
   ne,
@@ -188,6 +189,15 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import { isUniqueViolation } from "../db-errors.js";
+import {
+  decideIssueAssignmentWakeRefusal,
+  ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX,
+  ISSUE_ASSIGNMENT_WAKE_REFUSAL_LOG_LEVEL,
+  ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON,
+  type IssueAssignmentWakeRefusal,
+  parseIssueAssignmentIdempotencyKey,
+} from "./issue-assignment-wakeup.js";
 import {
   getStartupTraceContext,
   getStartupTracer,
@@ -435,7 +445,10 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -547,7 +560,16 @@ import {
   isResolvedInteractionContinuationWakeContext,
 } from "../modules/run-dispatch/index.js";
 import {
+  buildSelfReblockWakeParkedState,
   createWakeQueue,
+  decideSelfReblockWakeLimit,
+  deriveSelfReblockWakeMarker,
+  isSelfReblockWakeOwner,
+  readSelfReblockWakeMarker,
+  SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY,
+  SELF_REBLOCK_WAKE_PAYLOAD_KEY,
+  SELF_REBLOCK_WAKE_WINDOW_MS,
+  selfReblockWakeWindowStart,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type PostCommitEffect as WakeQueuePostCommitEffect,
@@ -784,6 +806,13 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
+/** Backs one live receipt per `issue-assignment:<issue>:<assignee>:<generation>` key. */
+const ISSUE_ASSIGNMENT_IDEMPOTENCY_UNIQUE_INDEX = "agent_wakeup_requests_issue_assignment_idempotency_uq";
+/**
+ * The unique index's WHERE clause, spelled as literal SQL so the planner can
+ * prove a lookup matches the partial index (a bound parameter cannot).
+ */
+const ISSUE_ASSIGNMENT_LIVE_RECEIPT_PREDICATE = sql`${agentWakeupRequests.idempotencyKey} LIKE 'issue-assignment:%:%:%' AND ${agentWakeupRequests.status} NOT IN ('skipped', 'failed', 'cancelled')`;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -3773,6 +3802,14 @@ interface WakeupOptions {
   idempotencyKey?: string | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
+  /**
+   * Internal provenance: the actor whose action produced this wake, when it
+   * differs from the requester (an unblock-owner notification has none).
+   * Defaults to the requester. Only server code sets it; it never changes
+   * authority or the responsible user, only the self-reblock loop guard.
+   */
+  /** Trusted only: set by the issue mutation route for the authenticated run that re-blocked the issue. */
+  causedBy?: { kind: "self_reblock"; runId: string; actorId: string };
   contextSnapshot?: Record<string, unknown>;
   issueStateGuard?: {
     statuses: string[];
@@ -9667,6 +9704,16 @@ export function heartbeatService(
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    // The same on-demand gates enqueueWakeup applies before it writes a
+    // skipped receipt. Recovery checks them first so a policy-disabled agent
+    // costs no receipt per sweep.
+    getOnDemandWakePolicyBlock: async (agentId) => {
+      const agent = await getAgent(agentId);
+      if (!agent) return null;
+      const policy = parseHeartbeatPolicy(agent);
+      if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
+      return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+    },
   });
   const runDispatch = createRunDispatch(db);
 
@@ -19609,6 +19656,74 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  /**
+   * A parked self-reblock wake on an issue with no prior run has no release to
+   * promote it, so the sweep re-admits the original wake with its own reason,
+   * context and self-reblock provenance: admission applies the limit (or the
+   * owner suppression) again. One transaction holds a per-wake promotion lock
+   * and retires the parked receipt only after the re-admitted wake is durable
+   * under a key derived from it. A crash before that commit leaves the wake
+   * parked, and the next sweep finds the re-admitted receipt by that key
+   * instead of admitting it twice. If nothing was admitted (still over the
+   * limit, or admission failed), the receipt stays parked with its reason.
+   */
+  async function promoteAnchorlessParkedSelfReblockWake(
+    wake: typeof agentWakeupRequests.$inferSelect,
+    repark: (executor: Db, wake: typeof agentWakeupRequests.$inferSelect) => Promise<unknown>,
+  ) {
+    const promotionKey = `self-reblock-anchor-missing:${wake.id}`;
+    await db.transaction(async (tx) => {
+      const locks = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${promotionKey}, 0)) as acquired`,
+      );
+      if (!locks[0]?.acquired) return;
+      const promotionReceipt = () => tx
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.idempotencyKey, promotionKey)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!(await promotionReceipt())) {
+        const {
+          [SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY]: _parkedState,
+          [DEFERRED_WAKE_CONTEXT_KEY]: parkedContext,
+          ...payload
+        } = parseObject(wake.payload);
+        const marker = readSelfReblockWakeMarker(wake.payload, wake.agentId);
+        await enqueueWakeup(wake.agentId, {
+          source: (wake.source ?? "automation") as unknown as WakeupOptions["source"],
+          triggerDetail: (wake.triggerDetail ?? "system") as unknown as WakeupOptions["triggerDetail"],
+          // A limit-parked receipt's own reason is the deferral, not the wake.
+          reason: marker?.reason ?? wake.reason,
+          payload: { ...payload, selfReblockPromotion: "anchor_missing" },
+          contextSnapshot: parseObject(parkedContext),
+          requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+          requestedByActorId: wake.requestedByActorId,
+          idempotencyKey: promotionKey,
+          ...(marker?.runId
+            ? { causedBy: { kind: "self_reblock" as const, runId: marker.runId, actorId: marker.causeActorId } }
+            : {}),
+        }).catch((err) => {
+          logger.warn({ err, queueId: wake.id }, "anchorless parked self-reblock wake was not re-admitted");
+        });
+      }
+      if (await promotionReceipt()) {
+        await tx.update(agentWakeupRequests).set({
+          status: "cancelled",
+          reason: "issue_self_reblock_anchor_missing_promoted",
+          finishedAt: new Date(),
+          updatedAt: new Date(),
+        }).where(and(
+          eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.companyId, wake.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+      } else {
+        await repark(tx as unknown as Db, wake);
+      }
+    });
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -19668,6 +19783,53 @@ export function heartbeatService(
       await releaseIssueExecutionAndPromote(latest, { suppressImmediateRecovery: true }).catch(err => {
         logger.warn({ err, queueId: wake.id }, "failed to promote stranded legacy comments");
       });
+    }
+
+    // A self-reblock wake held back by its limit stays a durable deferred
+    // receipt. Once its window has passed and no run holds the issue, re-drive
+    // the issue's queue through the same release admission that promotes it.
+    // The anchor run confers no ownership, so the limit decides alone. The
+    // module picks an anchor whose release cannot replay failure handling.
+    const dueParkedWakes = await db
+      .select({ wake: agentWakeupRequests })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`))
+      .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
+      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        isNull(issues.executionRunId),
+        sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
+      .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    // Re-check a wake that stays parked (a successor, an execution hold, or the
+    // limit again) at most once per window instead of on every tick.
+    const reparkDueSelfReblockWake = (executor: Db, wake: typeof agentWakeupRequests.$inferSelect) =>
+      executor.update(agentWakeupRequests).set({
+        payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}]::text[],
+          ${JSON.stringify(buildSelfReblockWakeParkedState(new Date(Date.now() + SELF_REBLOCK_WAKE_WINDOW_MS)))}::jsonb)`,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(agentWakeupRequests.id, wake.id),
+        eq(agentWakeupRequests.companyId, wake.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
+      )).returning({ id: agentWakeupRequests.id });
+    const reDrivenParkedIssues = new Set<string>();
+    for (const { wake } of dueParkedWakes) {
+      const issueId = String(wake.payload?.issueId);
+      if (reDrivenParkedIssues.has(issueId)) continue;
+      reDrivenParkedIssues.add(issueId);
+      const anchor = await wakeQueue.findParkedWakeAnchorRun({ companyId: wake.companyId, issueId });
+      if (anchor) {
+        await releaseIssueExecutionAndPromote(anchor, { suppressImmediateRecovery: true, anchorRunOnly: true }).catch((err) => {
+          logger.warn({ err, queueId: wake.id }, "failed to re-drive a parked self-reblock wake");
+        });
+        await reparkDueSelfReblockWake(db, wake);
+      } else {
+        await promoteAnchorlessParkedSelfReblockWake(wake, reparkDueSelfReblockWake).catch((err) => {
+          logger.warn({ err, queueId: wake.id }, "failed to promote anchorless parked self-reblock wake");
+        });
+      }
     }
 
     // The cancellation marker is durable intent. Retry while its exact queue
@@ -26802,7 +26964,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; anchorRunOnly?: boolean } = {},
   ) {
     try {
       const source = await getRun(run.id);
@@ -26810,6 +26972,7 @@ export function heartbeatService(
         companyId: run.companyId,
         runId: run.id,
         now: new Date(),
+        ...(options.anchorRunOnly ? { anchorRunOnly: true } : {}),
         // A durable authentication card owns recovery. This covers the review path,
         // while continuation classification blocks periodic generic retries.
         suppressImmediateRecovery: options.suppressImmediateRecovery || isAiAuthenticationBlocked(source),
@@ -26849,6 +27012,9 @@ export function heartbeatService(
     if (payload) {
       delete payload.queuedCommentInterrupt;
       delete payload.manualUserWake;
+      // Loop-guard provenance is derived below from server facts only.
+      delete payload[SELF_REBLOCK_WAKE_PAYLOAD_KEY];
+      delete payload[SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -26875,6 +27041,15 @@ export function heartbeatService(
     // A run's merged context cannot establish which caller authored one receipt.
     // Overwrite caller-supplied nested context rather than trusting it.
     payload = { ...payload, [DEFERRED_WAKE_CONTEXT_KEY]: { ...enrichedContextSnapshot } };
+    // Record who caused an unblock/re-block wake, so deferral and promotion
+    // keep the original reason and self-vs-other provenance with the receipt.
+    const selfReblockWake = deriveSelfReblockWakeMarker({
+      agentId,
+      reason: reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason),
+      mutation: payload.mutation,
+      causedBy: opts.causedBy,
+    });
+    if (selfReblockWake) payload = { ...payload, [SELF_REBLOCK_WAKE_PAYLOAD_KEY]: selfReblockWake };
     let issueId =
       readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
     if (executionReconciliationWake && !issueId) return null;
@@ -26980,6 +27155,89 @@ export function heartbeatService(
       if (receipt) assertDurableChatWakeupReceipt(durableRequest, receipt);
       return receipt;
     };
+    // An assignment wake's key names one assignee and one assignment generation.
+    // Replaying it (a retry after a lost acknowledgement, or recovery racing the
+    // route) returns the committed receipt instead of admitting a duplicate. A
+    // partial unique index backs this check for writers outside the issue lock.
+    const assignmentIdempotencyKey =
+      !durableRequest &&
+      opts.idempotencyKey?.startsWith(ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX)
+        ? opts.idempotencyKey
+        : null;
+    const assignmentKeyParts = assignmentIdempotencyKey
+      ? parseIssueAssignmentIdempotencyKey(assignmentIdempotencyKey)
+      : null;
+    const existingAssignmentReceipt = async (queryDb: Db) => {
+      if (!assignmentIdempotencyKey) return null;
+      return queryDb
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, agent.companyId),
+            eq(agentWakeupRequests.idempotencyKey, assignmentIdempotencyKey),
+            // The unique index's own predicate, so this is one index probe.
+            ISSUE_ASSIGNMENT_LIVE_RECEIPT_PREDICATE,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+    };
+    // The newest assignment generation recorded for the issue. The issue
+    // filter uses the company/payload-issue index, so the lookup under the
+    // issue lock reads only this issue's receipts. A refusal is not an
+    // assignment and never supersedes one.
+    const newestRecordedAssignmentGeneration = async (queryDb: Db, issueIdForKey: string) =>
+      queryDb
+        .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, agent.companyId),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueIdForKey}`,
+          like(agentWakeupRequests.idempotencyKey, `${ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX}${issueIdForKey}:%`),
+          sql`${agentWakeupRequests.reason} is distinct from ${ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON}`,
+        ))
+        .then((rows) => rows.reduce<number | null>((newest, row) => {
+          const generation = row.idempotencyKey
+            ? parseIssueAssignmentIdempotencyKey(row.idempotencyKey)?.assignmentGeneration
+            : undefined;
+          return generation !== undefined && (newest === null || generation > newest) ? generation : newest;
+        }, null));
+    const assignmentRefusalReceipt = (
+      refusal: IssueAssignmentWakeRefusal,
+      details: Record<string, unknown>,
+    ) => {
+      // Every refusal is durable and logged: the assignee would otherwise wait
+      // on a wake that never runs, with nothing to show why.
+      logger[ISSUE_ASSIGNMENT_WAKE_REFUSAL_LOG_LEVEL[refusal]](
+        { agentId, companyId: agent.companyId, issueId, idempotencyKey: assignmentIdempotencyKey, refusal, ...details },
+        "assignment wake refused",
+      );
+      return {
+        companyId: agent.companyId,
+        agentId,
+        source,
+        triggerDetail,
+        reason: ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON,
+        payload: {
+          ...(payload ?? {}),
+          heartbeatSkip: { reason: ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON, refusal, requestedReason: reason, ...details },
+        },
+        status: "skipped",
+        requestedByActorType: opts.requestedByActorType ?? null,
+        requestedByActorId: opts.requestedByActorId ?? null,
+        idempotencyKey: assignmentIdempotencyKey,
+        finishedAt: new Date(),
+      } satisfies typeof agentWakeupRequests.$inferInsert;
+    };
+    if (assignmentIdempotencyKey && (!assignmentKeyParts || !issueId)) {
+      // A malformed reserved key, or one on a wake without an issue, can never
+      // be checked against the issue lock. Admission below checks the rest.
+      await db.insert(agentWakeupRequests).values(
+        assignmentRefusalReceipt(assignmentKeyParts ? "assignee_mismatch" : "malformed_key", { wakeIssueId: issueId ?? null }),
+      );
+      return null;
+    }
     const priorReceipt = await existingDurableReceipt(db);
     if (priorReceipt) {
       // Replaying an admission receipt is not fresh authority to dispatch it.
@@ -27403,6 +27661,32 @@ export function heartbeatService(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
+          if (assignmentKeyParts) {
+            const lockedAssignmentIssue = await tx
+              .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId, statusVersion: issues.statusVersion })
+              .from(issues)
+              .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            const newestRecordedGeneration = lockedAssignmentIssue
+              ? await newestRecordedAssignmentGeneration(tx as unknown as Db, lockedAssignmentIssue.id)
+              : null;
+            const refusal = decideIssueAssignmentWakeRefusal({
+              key: assignmentKeyParts,
+              wakeAgentId: agentId,
+              lockedIssue: lockedAssignmentIssue,
+              newestRecordedGeneration,
+            });
+            if (refusal) {
+              await tx.insert(agentWakeupRequests).values(assignmentRefusalReceipt(refusal, {
+                lockedAssigneeAgentId: lockedAssignmentIssue?.assigneeAgentId ?? null,
+                lockedStatusVersion: lockedAssignmentIssue?.statusVersion ?? null,
+                newestRecordedGeneration,
+              }));
+              return { kind: "skipped" as const };
+            }
+          }
+
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
@@ -27534,6 +27818,26 @@ export function heartbeatService(
           );
           if (durableReceipt)
             return { kind: "durable" as const, receipt: durableReceipt };
+          const assignmentReceipt = await existingAssignmentReceipt(
+            tx as unknown as Db,
+          );
+          if (assignmentReceipt) {
+            // A replay after a lost acknowledgement still starts its queued run.
+            const [assignedRun] = assignmentReceipt.runId
+              ? await tx
+                  .select()
+                  .from(heartbeatRuns)
+                  .where(
+                    and(
+                      eq(heartbeatRuns.id, assignmentReceipt.runId),
+                      eq(heartbeatRuns.companyId, agent.companyId),
+                    ),
+                  )
+              : [];
+            return assignedRun
+              ? { kind: "replayed" as const, run: assignedRun }
+              : { kind: "durable" as const, receipt: assignmentReceipt };
+          }
           const failedChatRetry = await authorizeFailedChatRunRetryWake(
             db,
             tx as unknown as Db,
@@ -27650,6 +27954,78 @@ export function heartbeatService(
               finishedAt: new Date(),
             });
             return { kind: "skipped" as const };
+          }
+
+          // An agent that re-blocks an issue from its own run on it never
+          // wakes itself on that issue again (ANT-3260). Every other wake,
+          // including the board's or another agent's, carries no marker.
+          const selfReblockWakeMarker = readSelfReblockWakeMarker(payload, agentId);
+          if (selfReblockWakeMarker) {
+            // Moving an issue to blocked clears its lock columns, so ownership
+            // is the agent's own running run on this issue, not the lock.
+            const holdingRun = await tx
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, issue.companyId),
+                  eq(heartbeatRuns.agentId, agentId),
+                  eq(heartbeatRuns.status, "running"),
+                  or(
+                    sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                    eq(heartbeatRuns.nativeIssueId, issue.id),
+                  ),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (
+              isSelfReblockWakeOwner({
+                agentId,
+                holdingRunAgentId: holdingRun ? agentId : null,
+              })
+            ) {
+              const suppressedAt = new Date();
+              await tx.insert(agentWakeupRequests).values({
+                ...durableReceiptFields,
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON,
+                payload: {
+                  ...(payload ?? {}),
+                  heartbeatSkip: {
+                    reason: ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON,
+                    requestedReason: selfReblockWakeMarker.reason,
+                  },
+                },
+                status: "skipped",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                // Server clock, like the issue's blockedTransitionAt: the
+                // dependency backstop compares the two to scope the cycle.
+                finishedAt: suppressedAt,
+                updatedAt: suppressedAt,
+              });
+              await logActivity(tx as unknown as Db, {
+                companyId: agent.companyId,
+                actorType: "system",
+                actorId: "issue_wake_loop_guard",
+                agentId,
+                runId: holdingRun?.id ?? null,
+                action: "issue.wake_suppressed_self",
+                entityType: "issue",
+                entityId: issue.id,
+                details: {
+                  reason: selfReblockWakeMarker.reason,
+                  phase: "admission",
+                  cause: "self_reblock_owner",
+                },
+              });
+              return { kind: "skipped" as const };
+            }
           }
 
           if (opts.failedRunId) {
@@ -28558,6 +28934,89 @@ export function heartbeatService(
             }
           }
 
+          // A non-owner's own re-block wakes may start at most
+          // SELF_REBLOCK_WAKE_LIMIT runs on this issue per window. A wake over
+          // the limit is parked as a durable deferred receipt, never dropped:
+          // the issue's release drain or the resume sweep admits it once the
+          // window has passed. Wakes caused by anyone else are not counted.
+          if (selfReblockWakeMarker) {
+            const limitNow = new Date();
+            const limit = decideSelfReblockWakeLimit({
+              recentSelfReblockRunCount: await wakeQueue.countRecentSelfReblockWakeRuns(
+                wakeQueue.createAdmissionTransactionScope(agent.companyId, tx as unknown as Db),
+                {
+                  companyId: agent.companyId,
+                  agentId,
+                  issueId: issue.id,
+                  since: selfReblockWakeWindowStart(limitNow),
+                },
+              ),
+              now: limitNow,
+            });
+            if (limit.kind === "park") {
+              const parkedState = buildSelfReblockWakeParkedState(limit.notBefore);
+              const [parked] = await tx
+                .select({ id: agentWakeupRequests.id })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.companyId, agent.companyId),
+                    eq(agentWakeupRequests.agentId, agentId),
+                    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                    sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} is not null`,
+                  ),
+                )
+                .orderBy(asc(agentWakeupRequests.requestedAt))
+                .limit(1);
+              if (parked) {
+                // One parked receipt per agent and issue carries the deferral.
+                await tx
+                  .update(agentWakeupRequests)
+                  .set({
+                    coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                    updatedAt: limitNow,
+                  })
+                  .where(eq(agentWakeupRequests.id, parked.id));
+              } else {
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason: "issue_wake_rate_limited",
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId: issue.id,
+                    [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+                    [SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY]: parkedState,
+                  },
+                  status: "deferred_issue_execution",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                });
+              }
+              await logActivity(tx as unknown as Db, {
+                companyId: agent.companyId,
+                actorType: "system",
+                actorId: "issue_wake_loop_guard",
+                agentId,
+                runId: null,
+                action: "issue.wake_rate_limited",
+                entityType: "issue",
+                entityId: issue.id,
+                details: {
+                  reason: selfReblockWakeMarker.reason,
+                  outcome: "deferred",
+                  ...parkedState,
+                },
+              });
+              return { kind: "deferred" as const };
+            }
+          }
+
           const dailyCapBlock = await getHeartbeatDailyCapBlock(
             agent,
             policy,
@@ -28774,9 +29233,18 @@ export function heartbeatService(
 
           return { kind: "queued" as const, run: newRun };
         })
-        .catch((error) => {
+        .catch(async (error) => {
           if (isExternalChatWaitAuthorizationContention(error))
             return { kind: "deferred" as const };
+          // A writer outside this issue lock committed the same assignment
+          // generation first. Its receipt is the one delivery of this wake.
+          if (
+            assignmentIdempotencyKey &&
+            isUniqueViolation(error, ISSUE_ASSIGNMENT_IDEMPOTENCY_UNIQUE_INDEX)
+          ) {
+            const receipt = await existingAssignmentReceipt(db);
+            if (receipt) return { kind: "durable" as const, receipt };
+          }
           throw error;
         });
 

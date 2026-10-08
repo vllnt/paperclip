@@ -5,6 +5,7 @@ import * as instructionWorkingCopies from "../services/agent-instruction-working
 import * as runEvents from "../services/heartbeat-run-events.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { randomUUID } from "node:crypto";
+import { logger } from "../middleware/logger.js";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -10546,6 +10547,153 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(promoted).toMatchObject({ status: "queued", retryOfRunId: runId });
   });
+
+  it("dispatches a newly assigned review participant with no prior run", async () => {
+    const { companyId, agentId, issueId } =
+      await seedAssignedTodoNoRunFixture();
+    const stageId = randomUUID();
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    const wake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake).toMatchObject({
+      companyId,
+      agentId,
+      source: "assignment",
+      reason: "issue_assigned",
+      payload: expect.objectContaining({
+        issueId,
+        mutation: "review_assignment_recovery",
+      }),
+    });
+    expect(wake?.payload).toMatchObject({
+      currentStageId: stageId,
+      currentStageType: "review",
+    });
+    // The reviewer is the issue's agent assignee, so this is that assignment's
+    // missed wake and carries its assignment key: a retry or a racing sweep
+    // for the same generation replays one receipt. (The route's review-stage
+    // wake carries no assignment key.)
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(wake?.idempotencyKey).toBe(
+      `issue-assignment:${issueId}:${agentId}:${issueRow!.statusVersion}`,
+    );
+  });
+
+  it("R4-B: leaves a reviewer who is not the issue's agent assignee alone, with no refusal on any sweep", async () => {
+    const { agentId, issueId } = await seedAssignedTodoNoRunFixture();
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        assigneeAgentId: null,
+        executionState: {
+          status: "pending",
+          currentStageId: randomUUID(),
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, issueId));
+    const errorLog = vi.spyOn(logger, "error");
+    const warnLog = vi.spyOn(logger, "warn");
+
+    try {
+      const heartbeat = heartbeatService(db);
+      for (let sweep = 0; sweep < 3; sweep += 1) {
+        const result = await heartbeat.reconcileStrandedAssignedIssues();
+        expect(result.reviewParticipantRequeued).toBe(0);
+      }
+
+      // No assignment exists for this reviewer, so recovery dispatches nothing
+      // and admission has nothing to refuse (base behaviour).
+      expect(
+        await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)),
+      ).toEqual([]);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toEqual([]);
+      const refusalLogs = [...errorLog.mock.calls, ...warnLog.mock.calls]
+        .filter((call) => call.some((arg) => arg === "assignment wake refused"));
+      expect(refusalLogs).toEqual([]);
+    } finally {
+      errorLog.mockRestore();
+      warnLog.mockRestore();
+    }
+  });
+
+  it.each([
+    ["wakeOnDemand is disabled", { heartbeat: { wakeOnDemand: false } }],
+    ["the daily run cap is reached", { heartbeat: { maxDailyRuns: 0 } }],
+  ])(
+    "defers a review participant dispatch without receipts when %s",
+    async (_label, runtimeConfig) => {
+      const { agentId, issueId } = await seedAssignedTodoNoRunFixture();
+      await db.update(agents).set({ runtimeConfig }).where(eq(agents.id, agentId));
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          executionState: {
+            status: "pending",
+            currentStageId: randomUUID(),
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId, userId: null },
+            returnAssignee: { type: "agent", agentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      const heartbeat = heartbeatService(db);
+      for (let sweep = 0; sweep < 3; sweep += 1) {
+        const result = await heartbeat.reconcileStrandedAssignedIssues();
+        expect(result.reviewParticipantRequeued).toBe(0);
+        expect(result.reviewParticipantDispatchDeferred).toBe(1);
+      }
+
+      // Three sweeps, zero skipped receipts: the policy gate runs first.
+      expect(
+        await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, agentId)),
+      ).toEqual([]);
+    },
+  );
 
   it("still re-enqueues stranded assigned todo recovery when an old queued wake exists", async () => {
     const { companyId, agentId, issueId, runId } =

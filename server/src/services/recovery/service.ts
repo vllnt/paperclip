@@ -114,9 +114,12 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  isIssueBlockedCycleSelfSuppressed,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
+import { queueIssueAssignmentWakeup } from "../issue-assignment-wakeup.js";
+import type { IssueExecutionState } from "@paperclipai/shared";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -924,6 +927,12 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * The heartbeat policy reason (`wakeOnDemand` disabled, daily run/cost
+     * cap) that would make an on-demand wake for this agent a skipped
+     * receipt, or null when the agent can be woken now.
+     */
+    getOnDemandWakePolicyBlock?: (agentId: string) => Promise<string | null>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -1724,6 +1733,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId?: string | null,
+    options: { includeClaimedOrDeferred?: boolean } = {},
   ) {
     return db
       .select({ id: agentWakeupRequests.id })
@@ -1731,7 +1741,9 @@ export function recoveryService(
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
-          eq(agentWakeupRequests.status, "queued"),
+          options.includeClaimedOrDeferred
+            ? inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"])
+            : eq(agentWakeupRequests.status, "queued"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
         ),
@@ -2030,28 +2042,82 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     agentId: string,
   ) {
-    return deps.enqueueWakeup(agentId, {
-      source: "assignment",
-      triggerDetail: "system",
+    return queueIssueAssignmentWakeup({
+      heartbeat: { wakeup: deps.enqueueWakeup },
+      // Recovery redelivers a missed assignment wake as that assignment event:
+      // if the route's wake for the same generation committed meanwhile,
+      // admission returns its receipt instead of starting a second run.
+      assignmentEvent: true,
+      issue: { ...issue, assigneeAgentId: agentId },
       reason: "issue_assigned",
-      payload: withRecoveryContext(
-        {
-          issueId: issue.id,
-          mutation: "assigned_todo_liveness_dispatch",
-        },
-        "normal_model",
-      ),
+      mutation: "assigned_todo_liveness_dispatch",
+      contextSource: "issue.assigned_todo_liveness_dispatch",
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryContext(
-        {
-          issueId: issue.id,
-          taskId: issue.id,
-          wakeReason: "issue_assigned",
-          source: "issue.assigned_todo_liveness_dispatch",
-        },
-        "normal_model",
-      ),
+      wakeupOptions: {
+        payload: withRecoveryContext(
+          {
+            issueId: issue.id,
+            mutation: "assigned_todo_liveness_dispatch",
+          },
+          "normal_model",
+        ),
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: "issue_assigned",
+            source: "issue.assigned_todo_liveness_dispatch",
+          },
+          "normal_model",
+        ),
+      },
+      rethrowOnError: true,
+    });
+  }
+
+  /**
+   * Only for a reviewer who is the issue's agent assignee: the dispatch is
+   * that assignment's missed wake, under the assignee's assignment key.
+   */
+  async function enqueueInitialAssignedReviewDispatch(
+    issue: typeof issues.$inferSelect,
+    pendingExecutionState: Pick<IssueExecutionState, "currentStageId" | "currentStageType">,
+  ) {
+    return queueIssueAssignmentWakeup({
+      heartbeat: { wakeup: deps.enqueueWakeup },
+      assignmentEvent: true,
+      issue,
+      reason: "issue_assigned",
+      mutation: "review_assignment_recovery",
+      contextSource: "issue.review_assignment_recovery",
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      wakeupOptions: {
+        payload: withRecoveryContext(
+          {
+            issueId: issue.id,
+            mutation: "review_assignment_recovery",
+            currentStageId: pendingExecutionState.currentStageId ?? null,
+            currentStageType: pendingExecutionState.currentStageType ?? null,
+          },
+          "normal_model",
+        ),
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: "issue_assigned",
+            source: "issue.review_assignment_recovery",
+            reviewRecoveryInstruction:
+              "This reviewer was assigned without a prior run. Review the pending execution stage now, or mark the issue blocked with the exact unblock action.",
+            currentStageId: pendingExecutionState.currentStageId ?? null,
+            currentStageType: pendingExecutionState.currentStageType ?? null,
+          },
+          "normal_model",
+        ),
+      },
+      rethrowOnError: true,
     });
   }
 
@@ -4355,6 +4421,7 @@ export function recoveryService(
       successfulRunHandoffEscalated: 0,
       successfulRunHandoffRetried: 0,
       reviewParticipantRequeued: 0,
+      reviewParticipantDispatchDeferred: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
@@ -4917,10 +4984,55 @@ export function recoveryService(
         }
         const participantLatestRun = participantLatestRunForRecovery;
 
-        if (
-          !participantLatestRun ||
-          !isTerminalIssueRun(participantLatestRun)
-        ) {
+        if (!participantLatestRun) {
+          if (!agentInvokable) {
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_review",
+              latestRun: participantLatestRun,
+              notice: buildExecutionReviewParticipantUnavailableNoticeSeed(),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          } else if (issue.assigneeAgentId !== participantAgentId) {
+            // The reviewer is not the issue's agent assignee, so there is no
+            // assignment for this dispatch to deliver. Leave it as base did.
+            result.skipped += 1;
+          } else if (
+            // A claimed or deferred wake for this reviewer will still run.
+            await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId, {
+              includeClaimedOrDeferred: true,
+            })
+          ) {
+            result.skipped += 1;
+          } else if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
+            result.skipped += 1;
+          } else if (await deps.getOnDemandWakePolicyBlock?.(participantAgentId)) {
+            // The reviewer's own policy (wakeOnDemand off, daily cap reached)
+            // would turn this wake into a skipped receipt on every sweep.
+            // Leave the dispatch pending, with no receipt, until it changes.
+            result.reviewParticipantDispatchDeferred += 1;
+          } else {
+            const queued = await enqueueInitialAssignedReviewDispatch(
+              issue,
+              pendingExecutionState,
+            );
+            if (queued) {
+              result.reviewParticipantRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          }
+          continue;
+        }
+
+        if (!isTerminalIssueRun(participantLatestRun)) {
           if (!agentInvokable) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
@@ -5537,6 +5649,7 @@ export function recoveryService(
       checked: 0,
       healed: 0,
       existingWakeSkipped: 0,
+      selfReblockSkipped: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -5701,6 +5814,21 @@ export function recoveryService(
           });
         if (existingWake) {
           result.existingWakeSkipped += 1;
+          continue;
+        }
+        // The assignee re-blocked this issue from its own run on it in this
+        // blocked cycle, so the ready state is its own decision, not news.
+        // Re-delivering it every tick restarted the ANT-3260 loop.
+        if (
+          await isIssueBlockedCycleSelfSuppressed(db, {
+            companyId,
+            agentId,
+            dependentIssueId: candidate.id,
+            blockerIssueIds: readiness.blockerIssueIds,
+            blockedTransitionAt: candidate.blockedTransitionAt,
+          })
+        ) {
+          result.selfReblockSkipped += 1;
           continue;
         }
 

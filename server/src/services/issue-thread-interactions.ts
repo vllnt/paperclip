@@ -348,6 +348,7 @@ type IssueWakeTarget = {
   assigneeAgentId: string | null;
   assigneeUserId?: string | null;
   status: string;
+  statusVersion: number;
   workMode?: string;
 };
 
@@ -2307,6 +2308,7 @@ export function issueThreadInteractionService(
             assigneeAgentId: completedIssue.assigneeAgentId ?? null,
             assigneeUserId: completedIssue.assigneeUserId ?? null,
             status: completedIssue.status,
+            statusVersion: completedIssue.statusVersion,
           };
         }
       } else if (
@@ -2338,6 +2340,7 @@ export function issueThreadInteractionService(
             assigneeAgentId: returnedIssue.assigneeAgentId ?? null,
             assigneeUserId: returnedIssue.assigneeUserId ?? null,
             status: returnedIssue.status,
+            statusVersion: returnedIssue.statusVersion,
             ...(acceptedPlanStartsExecution
               ? { workMode: returnedIssue.workMode }
               : {}),
@@ -2360,6 +2363,7 @@ export function issueThreadInteractionService(
             assigneeAgentId: executionIssue.assigneeAgentId ?? null,
             assigneeUserId: executionIssue.assigneeUserId ?? null,
             status: executionIssue.status,
+            statusVersion: executionIssue.statusVersion,
             workMode: executionIssue.workMode,
           };
         }
@@ -4051,6 +4055,7 @@ export function issueThreadInteractionService(
             id: createdIssue.id,
             assigneeAgentId: createdIssue.assigneeAgentId ?? null,
             status: createdIssue.status,
+            statusVersion: createdIssue.statusVersion,
           });
         }
 

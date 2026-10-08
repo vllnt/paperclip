@@ -2252,7 +2252,9 @@ export function buildHostServices(
             pluginKey,
             contextSource,
           },
-          idempotencyKey: params.idempotencyKey ?? null,
+          // Namespaced like other plugin keys: a plugin can never name a
+          // server key such as the reserved issue-assignment generation key.
+          idempotencyKey: params.idempotencyKey ? `plugin:${pluginKey}:${params.idempotencyKey}` : null,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
           contextSnapshot: {
@@ -2320,7 +2322,9 @@ export function buildHostServices(
               pluginKey,
               contextSource,
             },
-            idempotencyKey: params.idempotencyKeyPrefix ? `${params.idempotencyKeyPrefix}:${issue.id}` : null,
+            idempotencyKey: params.idempotencyKeyPrefix
+              ? `plugin:${pluginKey}:${params.idempotencyKeyPrefix}:${issue.id}`
+              : null,
             requestedByActorType: "system",
             requestedByActorId: pluginId,
             contextSnapshot: {

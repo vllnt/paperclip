@@ -84,6 +84,11 @@ export const agentWakeupRequests = pgTable(
     chatCompletionIdempotencyUq: uniqueIndex("agent_wakeup_requests_chat_completion_uq")
       .on(table.companyId, table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'chat-completion:%'`),
+    // One live receipt per issue, assignee and assignment generation. The
+    // pattern matches only issue-assignment:<issue>:<assignee>:<generation>.
+    issueAssignmentIdempotencyUq: uniqueIndex("agent_wakeup_requests_issue_assignment_idempotency_uq")
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'issue-assignment:%:%:%' AND ${table.status} NOT IN ('skipped', 'failed', 'cancelled')`),
     companyPayloadIssueIdx: index("agent_wakeup_requests_company_payload_issue_idx").on(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,

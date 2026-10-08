@@ -1,0 +1,27 @@
+-- Lock: the build holds a SHARE lock on agent_wakeup_requests for one heap
+-- scan at boot. Reads continue; every insert/update/delete of a wake request
+-- (wake admission, run finalization) waits until the build commits, and an
+-- old instance still serving during a rolling restart waits too. Measured on
+-- an embedded Postgres 18 (Apple silicon, NVMe): 1,000,000 rows / 1.3 GB heap
+-- built in 3.7 s with a cold cache, about 3 s of blocked writes per GB of
+-- heap. The time is roughly linear in the heap size, so scale by the
+-- production heap size and allow for slower disks.
+--
+-- The runner sets no lock_timeout or statement_timeout. The build first waits
+-- for every open transaction that wrote to agent_wakeup_requests, and new wake
+-- writes queue behind the waiting build, so a long transaction stretches the
+-- stall. Deploy at low write traffic.
+--
+-- Before deploying, the operator measures the table and checks for duplicate
+-- live assignment receipts. The second query must return no rows, or the build
+-- fails and the boot migration aborts:
+--   SELECT count(*) AS rows, pg_size_pretty(pg_relation_size('agent_wakeup_requests')) AS heap
+--     FROM agent_wakeup_requests
+--   SELECT company_id, idempotency_key, count(*)
+--     FROM agent_wakeup_requests
+--    WHERE idempotency_key LIKE 'issue-assignment:%:%:%'
+--      AND status NOT IN ('skipped', 'failed', 'cancelled')
+--    GROUP BY company_id, idempotency_key
+--   HAVING count(*) > 1
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: The migration runner applies every migration inside BEGIN/COMMIT (packages/db/src/client.ts runInTransaction, and the drizzle migrator), so CREATE INDEX CONCURRENTLY cannot run here. This additive partial unique index matches only issue-assignment:<issue>:<assignee>:<generation> keys, a shape no earlier release writes, so existing rows cannot violate it and old code never writes it. The lock duration and pre-deploy checks are above.
+CREATE UNIQUE INDEX IF NOT EXISTS "agent_wakeup_requests_issue_assignment_idempotency_uq" ON "agent_wakeup_requests" USING btree ("company_id","idempotency_key") WHERE "agent_wakeup_requests"."idempotency_key" LIKE 'issue-assignment:%:%:%' AND "agent_wakeup_requests"."status" NOT IN ('skipped', 'failed', 'cancelled');

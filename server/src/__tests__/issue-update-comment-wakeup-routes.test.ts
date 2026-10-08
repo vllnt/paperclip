@@ -243,6 +243,7 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     title: "Wake test",
     executionPolicy: null,
     executionState: null,
+    statusVersion: 0,
     hiddenAt: null,
     ...overrides,
   };
@@ -323,6 +324,37 @@ describe("issue update comment wakeups", () => {
       reason: reassigned ? "issue_assigned" : "issue_status_changed",
       payload: expect.objectContaining({ issueId: existing.id }),
     }));
+  });
+
+  it("keys each assignment wake by assignee and assignment generation, so A -> B -> A stays distinct", async () => {
+    // statusVersion advances on every assignee change; the route passes it on.
+    const hops = [
+      { from: PREVIOUS_AGENT_ID, to: ASSIGNEE_AGENT_ID, statusVersion: 4 },
+      { from: ASSIGNEE_AGENT_ID, to: PREVIOUS_AGENT_ID, statusVersion: 5 },
+      { from: PREVIOUS_AGENT_ID, to: ASSIGNEE_AGENT_ID, statusVersion: 6 },
+    ];
+    const app = await createApp();
+    for (const hop of hops) {
+      const existing = makeIssue({ assigneeAgentId: hop.from, assigneeUserId: null, statusVersion: hop.statusVersion - 1 });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.update.mockResolvedValue(
+        makeIssue({ assigneeAgentId: hop.to, assigneeUserId: null, statusVersion: hop.statusVersion }),
+      );
+      const calls = mockHeartbeatService.wakeup.mock.calls.length;
+      const res = await request(app).patch(`/api/issues/${existing.id}`).send({ assigneeAgentId: hop.to });
+      expect(res.status).toBe(200);
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup.mock.calls.length).toBe(calls + 1));
+    }
+
+    const keys = mockHeartbeatService.wakeup.mock.calls.map(
+      ([agentId, opts]) => [agentId, (opts as { reason?: string; idempotencyKey?: string }).reason, (opts as { idempotencyKey?: string }).idempotencyKey],
+    );
+    const issueId = makeIssue().id;
+    expect(keys).toEqual([
+      [ASSIGNEE_AGENT_ID, "issue_assigned", `issue-assignment:${issueId}:${ASSIGNEE_AGENT_ID}:4`],
+      [PREVIOUS_AGENT_ID, "issue_assigned", `issue-assignment:${issueId}:${PREVIOUS_AGENT_ID}:5`],
+      [ASSIGNEE_AGENT_ID, "issue_assigned", `issue-assignment:${issueId}:${ASSIGNEE_AGENT_ID}:6`],
+    ]);
   });
 
   it.each([null, "active"] as const)("includes the new comment and shared session key in assignment wakes (external: %s)", async (externalConversationState) => {
