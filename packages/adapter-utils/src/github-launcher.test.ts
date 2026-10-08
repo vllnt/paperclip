@@ -1,5 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
+import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -893,9 +894,9 @@ require('node:fs').appendFileSync(${JSON.stringify(seen)}, JSON.stringify(Object
       if (url.endsWith("/runtime-tools/github/sign")) {
         if (refuse) return { body: { unavailable: "GitHub writes are switched off for this company (write identity kill switch)." } };
         const object = path.join(keys, "object");
-        execFileSync("sh", ["-c", `cat > ${JSON.stringify(object)}`], { input: Buffer.from(body.payload, "base64") });
+        writeFileSync(object, Buffer.from(body.payload, "base64"));
         execFileSync("ssh-keygen", ["-Y", "sign", "-n", "git", "-f", path.join(keys, "key"), object], { stdio: "ignore" });
-        return { body: { signature: execFileSync("cat", [`${object}.sig`]).toString() } };
+        return { body: { signature: readFileSync(`${object}.sig`, "utf8") } };
       }
       return { body: { status: "available", signingKey: publicKey, env: { ...identity, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.useConfigOnly", GIT_CONFIG_VALUE_0: "true" } } };
     });

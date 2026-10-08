@@ -305,7 +305,11 @@ async function brokerPost(env, route, body) {
     ? [env.PAPERCLIP_API_URL, env.PAPERCLIP_GITHUB_BROKER_URL]
     : [env.PAPERCLIP_GITHUB_BROKER_URL, env.PAPERCLIP_API_URL];
   const urls = [...new Set(routes.filter(Boolean)
-    .map(base => base.replace(/\/+$/, '').replace(/\/api$/, '') + route))];
+    .map(base => {
+      let end = base.length;
+      while (end > 0 && base.charCodeAt(end - 1) === 47) end -= 1;
+      return base.slice(0, end).replace(/\/api$/, '') + route;
+    }))];
   if (!urls.length || !env.PAPERCLIP_GITHUB_BROKER_TOKEN) return null;
   // A slow or restarting control plane must not cost the operation its
   // managed identity, so a failed request is retried before giving up.

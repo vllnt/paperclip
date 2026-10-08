@@ -766,3 +766,16 @@ describe("security review round 4 (attack regressions)", () => {
     expect(classifyGitHubCommand("git", ["push", "origin", "HEAD:main"]).privileged).toContain("pushToMain");
   });
 });
+
+describe("parseGitHubDestination on hostile input", () => {
+  it("rejects a path of many slashes in linear time (CodeQL polynomial regex)", () => {
+    const slashes = "/".repeat(200_000);
+    for (const value of [`https://github.com/${slashes}x`, `https://github.com/Anthm-FR${slashes}songtrivia${slashes}x`, `git@github.com:${slashes}a`]) {
+      const started = performance.now();
+      const destination = parseGitHubDestination(value, "git");
+      expect(performance.now() - started).toBeLessThan(250);
+      expect(destination.kind).not.toBe("github");
+    }
+    expect(parseGitHubDestination("https://github.com/Anthm-FR/songtrivia.git", "git")).toMatchObject({ kind: "github", repository: "anthm-fr/songtrivia" });
+  });
+});

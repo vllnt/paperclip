@@ -352,9 +352,19 @@ export type GitHubDestination =
 
 const foreignDestination = (reason: string): GitHubDestination => ({ kind: "foreign", reason });
 
+/** `path` without leading and trailing slashes, in linear time (no backtracking regex on agent input). */
+function trimSlashes(path: string): string {
+  let start = 0;
+  let end = path.length;
+  while (start < end && path.charCodeAt(start) === 47) start += 1;
+  while (end > start && path.charCodeAt(end - 1) === 47) end -= 1;
+  return path.slice(start, end);
+}
+
 /** `owner/name` from a URL or scp path: exactly two percent-decoded segments, then normalized. */
 function repositoryFromPath(path: string): { repository: string; wiki: boolean } | null {
-  const segments = path.replace(/^\/+/, "").replace(/\/+$/, "").split("/");
+  if (path.length > 2048) return null;
+  const segments = trimSlashes(path).split("/");
   if (segments.length !== 2) return null;
   const decoded: string[] = [];
   for (const segment of segments) {

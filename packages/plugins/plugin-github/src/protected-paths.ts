@@ -71,7 +71,9 @@ function globRegex(pattern: string): RegExp {
  * Case-insensitive, so a case change never escapes a pattern.
  */
 export function matchesProtectedPath(pattern: string, path: string): boolean {
-  const trimmed = pattern.replace(/\/+$/, "");
+  let end = pattern.length;
+  while (end > 0 && pattern.charCodeAt(end - 1) === 47) end -= 1;
+  const trimmed = pattern.slice(0, end);
   const anchored = trimmed.includes("/");
   // `x/**` covers `x` itself too: a file, symlink or submodule named like the directory.
   const clean = trimmed.replace(/\/\*\*$/, "");
