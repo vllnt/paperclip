@@ -74,7 +74,24 @@ command.
 ```sh
 npx paperclipai agent list
 npx paperclipai agent get <agent-id>
+
+# Change one config value; other keys and secrets stay as they are
+npx paperclipai agent config set <agent-id> runtimeConfig.heartbeat.maxDailyRuns=64
+npx paperclipai agent config set <agent-id> adapterConfig.model=gpt-5 adapterConfig.effort=high
+npx paperclipai agent config set <agent-id> --unset adapterConfig.env.DEBUG
+npx paperclipai agent config set <agent-id> adapterConfig.model=gpt-5 --dry-run   # print the patch only
+
+# Read config (secrets stay redacted)
+npx paperclipai agent config get <agent-id>
+npx paperclipai agent config get <agent-id> runtimeConfig.heartbeat
 ```
+
+`agent config set` takes `path=value` pairs under `adapterConfig.` or `runtimeConfig.`. A value that is
+valid JSON (`64`, `true`, `{"type":"secret_ref","secretId":"..."}`) is sent as JSON; anything else is sent
+as text. Quote a number to keep it as text: `adapterConfig.effort='"64"'`. Put `--unset` after the
+assignments, because it takes every following path. The command sends a merge patch
+(`PATCH /api/agents/{id}` with `mergeConfig: true`), so the server records a config revision and nothing
+else in the config changes.
 
 ## Skills Commands
 
