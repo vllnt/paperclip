@@ -744,6 +744,16 @@ describe("openapi routes", () => {
     });
   });
 
+  it("documents merge-patch updates for agent config", () => {
+    const { spec } = loadSpecRoutes();
+    const update = spec.paths["/api/agents/{id}"].patch;
+    expect(update.requestBody.content["application/json"].schema.properties.mergeConfig).toMatchObject({
+      type: "boolean",
+    });
+    expect(update.description).toContain("JSON merge patches (RFC 7396)");
+    expect(update.description).toContain("never have to be resent");
+  });
+
   it("documents board-only repository discovery and selection", () => {
     const { spec } = loadSpecRoutes();
     const discovery = spec.paths["/api/companies/{companyId}/project-repositories"].get;

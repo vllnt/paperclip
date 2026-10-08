@@ -3467,6 +3467,16 @@ registry.registerPath({
   path: "/api/agents/{id}",
   tags: ["agents"],
   summary: "Update an agent",
+  description:
+    "By default `adapterConfig` merges at the top level and `runtimeConfig` is replaced. Set " +
+    "`replaceAdapterConfig: true` to replace `adapterConfig`. Set `mergeConfig: true` to apply `adapterConfig` and " +
+    "`runtimeConfig` as JSON merge patches (RFC 7396) over the stored config: only the named keys change, `null` " +
+    "removes a key, arrays replace, and each `adapterConfig.env` entry and `adapterConfig.workspaceStrategy` is " +
+    "replaced whole. Keys you do not name keep their stored values, including secrets, so they never have to be " +
+    "resent. An env value read back from GET as a redacted plain binding restores the stored value. The merged " +
+    "configs are validated like a full update. A config that changed while the patch was applied returns 409. " +
+    "`mergeConfig` cannot be combined with `replaceAdapterConfig` or an `adapterType` change, and cannot remove " +
+    "`runtimeConfig.aiConnection` (422).",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateAgentSchema.omit({ permissions: true })),
@@ -3476,6 +3486,8 @@ registry.registerPath({
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 

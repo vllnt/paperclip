@@ -155,11 +155,34 @@ export const updateAgentSchema = objectWithoutDefaults(
   .extend({
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
+    /**
+     * Apply `adapterConfig` and `runtimeConfig` as JSON merge patches (RFC 7396)
+     * over the stored config: only the given keys change, `null` removes a key,
+     * and `adapterConfig.env` entries are replaced per key. Secrets the patch
+     * doesn't name are kept, so they never have to be resent.
+     */
+    mergeConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
   });
 
 export type UpdateAgent = z.infer<typeof updateAgentSchema>;
+
+/** A JSON merge patch object (RFC 7396): `null` values remove keys. */
+const configMergePatchSchema = z.record(z.string(), z.unknown());
+
+/**
+ * `PATCH /api/agents/:id` body when `mergeConfig` is true. `adapterConfig` and
+ * `runtimeConfig` are merge patches; the server validates them with the
+ * ordinary config schemas after merging them over the stored config.
+ */
+export const updateAgentMergePatchSchema = updateAgentSchema.extend({
+  mergeConfig: z.literal(true),
+  adapterConfig: configMergePatchSchema.optional(),
+  runtimeConfig: configMergePatchSchema.optional(),
+});
+
+export type UpdateAgentMergePatch = z.infer<typeof updateAgentMergePatchSchema>;
 
 export const updateAgentInstructionsPathSchema = z.object({
   path: z.string().trim().min(1).nullable(),
