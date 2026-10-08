@@ -2109,6 +2109,31 @@ export function computeProviderQuotaRetrySchedule(input: {
   };
 }
 
+/**
+ * The checks that need no database: a failed legacy run in the
+ * provider_quota family whose model returned no output. Native runs are
+ * excluded because native recovery owns their retries.
+ *
+ * @returns True when the run still needs the durable-evidence check.
+ */
+export function isProviderQuotaUsefulActionCandidate(input: {
+  outcome: string;
+  native: boolean;
+  outputTokens: number;
+  errorCode: string | null;
+  resultJson: Record<string, unknown> | null;
+}) {
+  return (
+    input.outcome === "failed" &&
+    !input.native &&
+    input.outputTokens === 0 &&
+    readHeartbeatRunErrorFamily({
+      errorCode: input.errorCode,
+      resultJson: input.resultJson,
+    }) === "provider_quota"
+  );
+}
+
 async function resolveRunScopedMentionedSkillKeys(input: {
   db: Db;
   companyId: string;
@@ -18726,19 +18751,15 @@ export function heartbeatService(
    */
   async function withProviderQuotaUsefulActionMarker(input: {
     run: typeof heartbeatRuns.$inferSelect;
+    native: boolean;
     outcome: string;
     errorCode: string | null;
     outputTokens: number;
     resultJson: Record<string, unknown> | null;
   }) {
     const { resultJson } = input;
-    // Native runs are excluded: native recovery owns their retries.
     const marked =
-      input.outcome === "failed" &&
-      input.run.runtimeMode !== "native" &&
-      input.outputTokens === 0 &&
-      readHeartbeatRunErrorFamily({ errorCode: input.errorCode, resultJson }) ===
-        "provider_quota" &&
+      isProviderQuotaUsefulActionCandidate(input) &&
       !(await runLeftDurableActionEvidence(input.run));
     if (!marked && !(resultJson && "providerQuotaBeforeUsefulAction" in resultJson)) {
       return resultJson;
@@ -25968,6 +25989,8 @@ export function heartbeatService(
 
         const persistedResultJson = await withProviderQuotaUsefulActionMarker({
           run,
+          // The in-memory run predates native selection; use the resolution.
+          native: nativeRuntimeResolution.kind === "native",
           outcome,
           errorCode: runErrorCode,
           outputTokens: normalizedUsage?.outputTokens ?? 0,

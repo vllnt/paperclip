@@ -27,6 +27,7 @@ import { buildIssueAssignmentIdempotencyKey } from "../services/issue-assignment
 import {
   computeProviderQuotaRetrySchedule,
   heartbeatService,
+  isProviderQuotaUsefulActionCandidate,
 } from "../services/heartbeat.ts";
 
 vi.mock("../telemetry.js", () => ({
@@ -75,6 +76,26 @@ describe("computeProviderQuotaRetrySchedule", () => {
     expect(pastWindow?.dueAt.toISOString()).toBe(new Date(now.getTime() + 60 * MINUTE_MS).toISOString());
     const pastAttempts = computeProviderQuotaRetrySchedule({ attempt: 9, now, chainStartedAt: now, policy, random: () => 0.5 });
     expect(pastAttempts).toMatchObject({ phase: "slow", baseDelayMs: 60 * MINUTE_MS });
+  });
+});
+
+describe("isProviderQuotaUsefulActionCandidate", () => {
+  const base = {
+    outcome: "failed", native: false, outputTokens: 0,
+    errorCode: "provider_quota", resultJson: { errorFamily: "provider_quota" },
+  };
+
+  it("accepts a failed legacy quota run with no model output", () => {
+    expect(isProviderQuotaUsefulActionCandidate(base)).toBe(true);
+  });
+
+  it.each([
+    ["a native run", { native: true }],
+    ["model output", { outputTokens: 1 }],
+    ["a timed-out run", { outcome: "timed_out" }],
+    ["another failure family", { errorCode: "codex_transient_upstream", resultJson: { errorFamily: "transient_upstream" } }],
+  ])("rejects %s", (_label, override) => {
+    expect(isProviderQuotaUsefulActionCandidate({ ...base, ...override })).toBe(false);
   });
 });
 
