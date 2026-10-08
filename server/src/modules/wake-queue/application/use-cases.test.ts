@@ -105,6 +105,9 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     cancelDeferredWake: vi.fn(async () => true),
     normalizeDeferredWakeCommentIds: vi.fn(async (input) => wakeCandidate({ id: input.wakeId, queuedCommentIds: input.liveCommentIds })),
     failDeferredWake: vi.fn(async () => true),
+    suppressSelfReblockDeferredWake: vi.fn(async () => true),
+    countRecentSelfReblockWakeRuns: vi.fn(async () => 0),
+    parkSelfReblockDeferredWake: vi.fn(async () => true),
     getPauseHoldFacts: vi.fn(async () => ({
       activePauseHold: false,
       treeHoldInteractionWake: false,
@@ -144,6 +147,147 @@ function createFakeRecovery(): RecoveryEscalationPort {
     escalateStrandedRecoveryIssueInPlace: vi.fn(async () => {}),
   };
 }
+
+describe("releaseIssueExecution self-reblock guard", () => {
+  const NOW = new Date("2026-10-08T01:00:00.000Z");
+  const selfMarker = (agentId: string) => ({
+    agentId,
+    reason: "issue_unblock_requested",
+    causeActorType: "agent" as const,
+    causeActorId: agentId,
+  });
+
+  async function releaseWith(input: {
+    candidate: DeferredWakeCandidate;
+    issue?: IssueSnapshot;
+    run?: RunSnapshot;
+    recentRuns?: number;
+    anchorRunOnly?: boolean;
+  }) {
+    const queue = [input.candidate];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async ({ excludedWakeIds }) => {
+        const next = queue.shift() ?? null;
+        return next && excludedWakeIds?.includes(next.id) ? null : next;
+      }),
+      countRecentSelfReblockWakeRuns: vi.fn(async () => input.recentRuns ?? 0),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, input.issue ?? ISSUE, input.run ?? RUN),
+      recovery: createFakeRecovery(),
+    });
+    const result = await release({
+      companyId: RUN.companyId,
+      runId: RUN.id,
+      now: NOW,
+      ...(input.anchorRunOnly ? { anchorRunOnly: true } : {}),
+    });
+    return { result, transaction };
+  }
+
+  it("suppresses a parked self-wake when its owner's run releases", async () => {
+    // The finishing agent owns the issue and parked its own unblock wake.
+    const { result, transaction } = await releaseWith({
+      candidate: wakeCandidate({ agentId: RUN.agentId, selfReblockWake: selfMarker(RUN.agentId) }),
+    });
+    expect(result.outcome.kind).not.toBe("promoted");
+    expect(transaction.suppressSelfReblockDeferredWake).toHaveBeenCalledWith(
+      expect.objectContaining({ wakeId: "wake-1", agentId: RUN.agentId, finishingRunId: RUN.id, reason: "issue_unblock_requested" }),
+    );
+    expect(transaction.claimDeferredWakeForPromotion).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+  });
+
+  it("promotes the assignee's own re-block wake when another agent's run releases", async () => {
+    // Being the assignee is not ownership: the agent is not running on the issue.
+    const { result, transaction } = await releaseWith({
+      issue: { ...ISSUE, assigneeAgentId: AGENT.id },
+      candidate: wakeCandidate({ selfReblockWake: selfMarker(AGENT.id) }),
+    });
+    expect(transaction.suppressSelfReblockDeferredWake).not.toHaveBeenCalled();
+    expect(result.outcome.kind).toBe("promoted");
+  });
+
+  it("keeps a parked wake in place when its own agent's run releases before the window ends", async () => {
+    const { transaction } = await releaseWith({
+      candidate: wakeCandidate({
+        agentId: RUN.agentId,
+        selfReblockWake: selfMarker(RUN.agentId),
+        selfReblockParkedUntil: new Date(NOW.getTime() + 60_000),
+      }),
+    });
+    expect(transaction.suppressSelfReblockDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+  });
+
+  it("promotes a non-owner's own re-block wake under the limit", async () => {
+    const { result, transaction } = await releaseWith({
+      candidate: wakeCandidate({ selfReblockWake: selfMarker(AGENT.id) }),
+      recentRuns: 2,
+    });
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.countRecentSelfReblockWakeRuns).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: AGENT.id, issueId: ISSUE.id, since: new Date(NOW.getTime() - 10 * 60 * 1000) }),
+    );
+    expect(transaction.suppressSelfReblockDeferredWake).not.toHaveBeenCalled();
+  });
+
+  it("parks, never cancels, a non-owner's own re-block wake over the limit", async () => {
+    const { result, transaction } = await releaseWith({
+      candidate: wakeCandidate({ selfReblockWake: selfMarker(AGENT.id) }),
+      recentRuns: 3,
+    });
+    expect(result.outcome.kind).not.toBe("promoted");
+    expect(transaction.parkSelfReblockDeferredWake).toHaveBeenCalledWith(
+      expect.objectContaining({ wakeId: "wake-1", notBefore: new Date(NOW.getTime() + 10 * 60 * 1000) }),
+    );
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.failDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.findNextDeferredWake).toHaveBeenLastCalledWith(
+      expect.objectContaining({ excludedWakeIds: ["wake-1"] }),
+    );
+  });
+
+  it("keeps a parked wake deferred until its window has passed", async () => {
+    const { transaction } = await releaseWith({
+      candidate: wakeCandidate({
+        selfReblockWake: selfMarker(AGENT.id),
+        selfReblockParkedUntil: new Date(NOW.getTime() + 1_000),
+      }),
+    });
+    expect(transaction.countRecentSelfReblockWakeRuns).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a sweep's anchor run as the owner", async () => {
+    const { result, transaction } = await releaseWith({
+      candidate: wakeCandidate({ agentId: RUN.agentId, selfReblockWake: selfMarker(RUN.agentId) }),
+      issue: { ...ISSUE, assigneeAgentId: "someone-else" },
+      anchorRunOnly: true,
+    });
+    expect(transaction.suppressSelfReblockDeferredWake).not.toHaveBeenCalled();
+    expect(result.outcome.kind).toBe("promoted");
+  });
+
+  it("never limits or suppresses a wake caused by anyone else", async () => {
+    const { result, transaction } = await releaseWith({
+      candidate: wakeCandidate({
+        agentId: RUN.agentId,
+        reason: "issue_execution_deferred",
+        wakeReason: "issue_blockers_resolved",
+        requestedByActorType: "user",
+        requestedByActorId: "board-user",
+        preservesIndependentContinuation: true,
+      }),
+      recentRuns: 99,
+    });
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.countRecentSelfReblockWakeRuns).not.toHaveBeenCalled();
+    expect(transaction.suppressSelfReblockDeferredWake).not.toHaveBeenCalled();
+  });
+});
 
 describe("releaseIssueExecution", () => {
   it.each(["closing", "mixed_comments", "explicit_resume", "interaction", "other_source_task", "parent_open"])(
@@ -1165,5 +1309,57 @@ describe("admitWakeBehindIssueExecution", () => {
     expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
     expect(writer.mergeIntoExistingDeferredWake).not.toHaveBeenCalled();
     expect(writer.insertNewDeferredWake).not.toHaveBeenCalled();
+  });
+});
+
+describe("admitWakeBehindIssueExecution self-reblock provenance", () => {
+  const marker = {
+    agentId: "wake-agent",
+    reason: "issue_unblock_requested",
+    causeActorType: "agent",
+    causeActorId: "wake-agent",
+  };
+  const deferredSelfWake = {
+    id: "deferred-self-wake",
+    payload: {
+      issueId: "issue-1",
+      _paperclipSelfReblockWake: marker,
+    },
+    deferredContext: { wakeReason: "issue_unblock_requested" },
+    coalescedCount: 0,
+  };
+
+  async function mergeInto(incomingPayload: Record<string, unknown>, requestedBy: { type: "user" | "agent"; id: string }) {
+    const writer = createFakeAdmissionWriter();
+    const admit = createAdmitWakeBehindIssueExecution({
+      reader: createFakeAdmissionReader({ findExistingDeferredWake: vi.fn(async () => deferredSelfWake) }),
+      writer,
+      helpers: createFakeAdmissionHelpers({ shouldDeferFollowupWakeForSameIssue: vi.fn(() => true) }),
+    });
+    await admit(SCOPE, admissionInput({
+      payload: incomingPayload,
+      requestedByActorType: requestedBy.type,
+      requestedByActorId: requestedBy.id,
+    }));
+    const call = vi.mocked(writer.mergeIntoExistingDeferredWake).mock.calls[0]?.[1];
+    return call?.mergedPayload ?? null;
+  }
+
+  it("keeps the self marker when only self wakes merge", async () => {
+    const merged = await mergeInto(
+      { issueId: "issue-1", _paperclipSelfReblockWake: marker },
+      { type: "agent", id: "wake-agent" },
+    );
+    expect(merged).toMatchObject({ _paperclipSelfReblockWake: marker });
+  });
+
+  it("lets a board unblock merged into a deferred self wake proceed unlimited", async () => {
+    const merged = await mergeInto(
+      { issueId: "issue-1", mutation: "blocker_done" },
+      { type: "user", id: "board-user" },
+    );
+    expect(merged).not.toBeNull();
+    expect(merged).not.toHaveProperty("_paperclipSelfReblockWake");
+    expect(merged).not.toHaveProperty("_paperclipSelfReblockWakeParked");
   });
 });

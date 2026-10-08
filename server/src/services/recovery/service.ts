@@ -114,9 +114,12 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  isIssueBlockersResolvedReadyStateSelfSuppressed,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
+import { buildIssueAssignmentIdempotencyKey } from "../issue-assignment-wakeup.js";
+import type { IssueExecutionState } from "@paperclipai/shared";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -1724,6 +1727,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId?: string | null,
+    options: { includeClaimedOrDeferred?: boolean } = {},
   ) {
     return db
       .select({ id: agentWakeupRequests.id })
@@ -1731,7 +1735,9 @@ export function recoveryService(
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
-          inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+          options.includeClaimedOrDeferred
+            ? inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"])
+            : eq(agentWakeupRequests.status, "queued"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
         ),
@@ -2058,12 +2064,19 @@ export function recoveryService(
   async function enqueueInitialAssignedReviewDispatch(
     issue: typeof issues.$inferSelect,
     agentId: string,
-    pendingExecutionState: Record<string, unknown>,
+    pendingExecutionState: Pick<IssueExecutionState, "currentStageId" | "currentStageType">,
   ) {
     return deps.enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
+      // Same key as the route's assignment wake for this assignee and
+      // generation, so the backstop and a late route retry admit one wake.
+      idempotencyKey: buildIssueAssignmentIdempotencyKey({
+        issueId: issue.id,
+        assigneeAgentId: agentId,
+        assignmentGeneration: issue.statusVersion,
+      }),
       payload: withRecoveryContext(
         {
           issueId: issue.id,
@@ -4969,7 +4982,10 @@ export function recoveryService(
               result.skipped += 1;
             }
           } else if (
-            await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)
+            // A claimed or deferred wake for this reviewer will still run.
+            await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId, {
+              includeClaimedOrDeferred: true,
+            })
           ) {
             result.skipped += 1;
           } else if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
@@ -5607,6 +5623,7 @@ export function recoveryService(
       checked: 0,
       healed: 0,
       existingWakeSkipped: 0,
+      selfReblockSkipped: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -5771,6 +5788,21 @@ export function recoveryService(
           });
         if (existingWake) {
           result.existingWakeSkipped += 1;
+          continue;
+        }
+        // The assignee re-blocked this issue from its own run on it, so this
+        // ready state is its own decision, not news. Re-delivering it every
+        // tick restarted the ANT-3260 loop after admission suppressed it.
+        if (
+          await isIssueBlockersResolvedReadyStateSelfSuppressed(db, {
+            companyId,
+            agentId,
+            dependentIssueId: candidate.id,
+            blockerIssueIds: readiness.blockerIssueIds,
+            blockedTransitionAt: candidate.blockedTransitionAt,
+          })
+        ) {
+          result.selfReblockSkipped += 1;
           continue;
         }
 

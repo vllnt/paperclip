@@ -117,22 +117,35 @@ vi.mock("../services/issue-dependency-wakeups.js", async () => {
   };
 });
 
-async function createApp() {
+async function createApp(options: { companyAgentIds?: string[] } = {}) {
   const emptyRows: unknown[] = [];
   const whereResult = {
     limit: vi.fn(async () => emptyRows),
-    for: vi.fn(() => whereResult),
     then: async (resolve: (rows: unknown[]) => unknown) => resolve(emptyRows),
   };
   const query: Record<string, unknown> = {};
   query.innerJoin = vi.fn(() => query);
   query.where = vi.fn(() => whereResult);
-  const routeDb: Record<string, any> = {
-    select: vi.fn(() => ({
-      from: vi.fn(() => query),
+  // Answers the unblock-owner lookup ("agent belongs to the issue company").
+  const agentRows = (options.companyAgentIds ?? []).map((id) => ({ id }));
+  const agentQuery = {
+    where: vi.fn(() => ({
+      limit: vi.fn(async () => agentRows),
+      then: async (resolve: (rows: unknown[]) => unknown) => resolve(agentRows),
     })),
   };
-  routeDb.transaction = async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => callback(routeDb);
+  // `vi.resetModules()` gives the route its own schema objects, so match the
+  // table by drizzle's global name symbol rather than by identity.
+  const isAgentsTable = (table: unknown) =>
+    (table as Record<symbol, unknown> | null)?.[Symbol.for("drizzle:Name")] === "agents";
+  const routeDb = {
+    select: vi.fn(() => ({
+      from: vi.fn((table: unknown) => (isAgentsTable(table) ? agentQuery : query)),
+    })),
+    // Records the unblock owner's notification time after the wake.
+    update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(async () => []) })) })),
+    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+  };
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -243,7 +256,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
   });
 
-  it("suppresses a wake when a newly blocked issue lists only terminal blockers", async () => {
+  it("wakes an assigned blocked issue when blockers are applied after the blocker is already done", async () => {
     const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const childIssueId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     mockIssueService.getById.mockResolvedValue({
@@ -299,8 +312,78 @@ describe("issue dependency wakeups in issue routes", () => {
       });
 
     expect(res.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(mockWakeup).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-2",
+        expect.objectContaining({
+          reason: "issue_blockers_resolved",
+          payload: expect.objectContaining({
+            issueId: parentIssueId,
+            resolvedBlockerIssueId: childIssueId,
+            mutation: "blocked_dependency_restored",
+          }),
+          contextSnapshot: expect.objectContaining({
+            source: "issue.blockers_restored",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("wakes the unblock owner on behalf of whoever blocked the issue", async () => {
+    // The cause lets admission tell an agent's own re-block loop from a board request.
+    const issueId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const UNBLOCK_OWNER_AGENT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const blocked = {
+      id: issueId,
+      companyId: "company-1",
+      identifier: "PAP-300",
+      title: "Needs an unblock",
+      description: null,
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-2",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue({ ...blocked, status: "todo" });
+    mockIssueService.update.mockResolvedValue({
+      ...blocked,
+      status: "blocked",
+      blockedTransitionAt: new Date(),
+      blockedOwnerNotifiedAt: null,
+      unblockDescriptor: { owner: { agentId: UNBLOCK_OWNER_AGENT_ID }, action: "Rotate the deploy key" },
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId,
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+
+    const res = await request(await createApp({ companyAgentIds: [UNBLOCK_OWNER_AGENT_ID] }))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "blocked",
+        unblockDescriptor: { owner: { agentId: UNBLOCK_OWNER_AGENT_ID }, action: "Rotate the deploy key" },
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockWakeup).toHaveBeenCalledWith(
+      UNBLOCK_OWNER_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_unblock_requested",
+        payload: expect.objectContaining({ issueId }),
+        causedBy: { actorType: "user", actorId: "local-board" },
+      }),
+    );
   });
 
   it("wakes the parent when all direct children become terminal", async () => {
@@ -641,7 +724,20 @@ describe("issue dependency wakeups in issue routes", () => {
           blockedTransitionAt,
         }),
       );
-      expect(mockWakeup).not.toHaveBeenCalled();
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-2",
+        expect.objectContaining({
+          reason: "issue_blockers_resolved",
+          idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+            dependentIssueId: parentIssueId,
+            blockerIssueIds: [childIssueId],
+            blockedTransitionAt,
+          }),
+          payload: expect.objectContaining({
+            mutation: "blocked_dependency_restored",
+          }),
+        }),
+      );
     });
   });
 

@@ -51,45 +51,6 @@ describe("routable blocked notifications", () => {
     expect(markNotified).not.toHaveBeenCalled();
   });
 
-  it("suppresses a self-owned unblock wake when the current run re-blocks the issue", async () => {
-    const wakeup = vi.fn(async () => undefined);
-    const markNotified = vi.fn(async () => undefined);
-    const allowWake = vi.fn(async () => false);
-
-    await expect(
-      deliverAgentUnblockNotification({
-        issue: blockedIssue(),
-        wakeup,
-        allowWake,
-        markNotified,
-      }),
-    ).resolves.toBe(false);
-    expect(allowWake).toHaveBeenCalledWith(agentId);
-    expect(wakeup).not.toHaveBeenCalled();
-    expect(markNotified).not.toHaveBeenCalled();
-  });
-
-  it("stops a repeated self-reblock cycle even as the blocked timestamp changes", async () => {
-    const wakeup = vi.fn(async () => undefined);
-    const markNotified = vi.fn(async () => undefined);
-    const allowWake = vi.fn(async () => false);
-
-    for (let cycle = 0; cycle < 90; cycle += 1) {
-      await deliverAgentUnblockNotification({
-        issue: blockedIssue({
-          transitionAt: new Date(ROUTABLE_BLOCKED_ROLLOUT_AT.getTime() + cycle + 1),
-        }),
-        wakeup,
-        allowWake,
-        markNotified,
-      });
-    }
-
-    expect(allowWake).toHaveBeenCalledTimes(90);
-    expect(wakeup).not.toHaveBeenCalled();
-    expect(markNotified).not.toHaveBeenCalled();
-  });
-
   it("deduplicates one transition and notifies again after a blocked flap", async () => {
     const wakeup = vi.fn(async () => undefined);
     const markNotified = vi.fn(async () => undefined);

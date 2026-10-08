@@ -1,8 +1,26 @@
 import { logger } from "../middleware/logger.js";
+import { isTransientDatabaseError, retryIdempotentDatabaseOperation } from "../database-retry.js";
 import type { DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 
 type WakeupTriggerDetail = "manual" | "ping" | "callback" | "system";
 type WakeupSource = "timer" | "assignment" | "on_demand" | "automation";
+
+/** Heartbeat admission deduplicates keys with this prefix (one live receipt per key). */
+export const ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX = "issue-assignment:";
+
+/**
+ * One assignment wake per issue, assignee and assignment generation. The
+ * generation is the issue's `statusVersion` after the assignment, which every
+ * assignee change advances, so A -> B -> A yields three distinct keys while a
+ * retry of the same assignment reuses its key.
+ */
+export function buildIssueAssignmentIdempotencyKey(input: {
+  issueId: string;
+  assigneeAgentId: string;
+  assignmentGeneration: number;
+}) {
+  return `${ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX}${input.issueId}:${input.assigneeAgentId}:${input.assignmentGeneration}`;
+}
 
 export type IssueAssignmentWakeupOptions = {
   source?: WakeupSource;
@@ -17,15 +35,15 @@ export type IssueAssignmentWakeupOptions = {
   durableChatRequest?: DurableChatWakeupRequest;
 };
 
-export interface IssueAssignmentWakeupDeps {
+export interface IssueAssignmentWakeupDeps<TRun = unknown> {
   wakeup: (
     agentId: string,
     opts: IssueAssignmentWakeupOptions,
-  ) => Promise<unknown>;
+  ) => Promise<TRun>;
 }
 
-export async function queueIssueAssignmentWakeup(input: {
-  heartbeat: IssueAssignmentWakeupDeps;
+export async function queueIssueAssignmentWakeup<TRun>(input: {
+  heartbeat: IssueAssignmentWakeupDeps<TRun>;
   issue: { id: string; assigneeAgentId: string | null; status: string };
   reason: string;
   mutation: string;
@@ -41,69 +59,76 @@ export async function queueIssueAssignmentWakeup(input: {
   attachmentOmissionReasons?: Record<string, number> | null;
   rethrowOnError?: boolean;
   durableChatRequest?: DurableChatWakeupRequest;
-  /** Exact wake options from an issue update, retained while adding retry/idempotency. */
+  /**
+   * The issue's `statusVersion` after this assignment. When set, the wake
+   * carries `buildIssueAssignmentIdempotencyKey`, admission stores at most one
+   * live receipt for it, and only then is a transient database failure
+   * retried: a disconnected write may already have committed.
+   */
+  assignmentGeneration?: number | null;
+  /** Exact wake options from an issue update; the base fields fill any gaps. */
   wakeupOptions?: IssueAssignmentWakeupOptions;
-}) {
-  if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
+}): Promise<TRun | null | undefined> {
+  const assigneeAgentId = input.issue.assigneeAgentId;
+  if (!assigneeAgentId || input.issue.status === "backlog") return;
 
-  const baseOptions: IssueAssignmentWakeupOptions = {
+  const idempotencyKey =
+    input.assignmentGeneration === null || input.assignmentGeneration === undefined
+      ? null
+      : buildIssueAssignmentIdempotencyKey({
+          issueId: input.issue.id,
+          assigneeAgentId,
+          assignmentGeneration: input.assignmentGeneration,
+        });
+  const basePayload: Record<string, unknown> = {
+    issueId: input.issue.id,
+    mutation: input.mutation,
+    ...(input.taskKey ? { taskKey: input.taskKey } : {}),
+    ...(input.wakeCommentId ? { wakeCommentId: input.wakeCommentId } : {}),
+  };
+  const baseContextSnapshot: Record<string, unknown> = {
+    issueId: input.issue.id,
+    source: input.contextSource,
+    ...(input.taskKey ? { taskKey: input.taskKey } : {}),
+    ...(input.wakeCommentId ? { wakeCommentId: input.wakeCommentId } : {}),
+    ...(input.wakeCommentId && input.attachmentOmissionReasons
+      ? {
+          externalAttachmentOmissions: [
+            {
+              commentId: input.wakeCommentId,
+              reasons: input.attachmentOmissionReasons,
+            },
+          ],
+        }
+      : {}),
+  };
+  const override = input.wakeupOptions ?? {};
+  const options: IssueAssignmentWakeupOptions = {
     source: "assignment",
     triggerDetail: "system",
     reason: input.reason,
-    idempotencyKey: `issue-assignment:${input.issue.id}:${input.reason}`,
-    payload: {
-      issueId: input.issue.id,
-      mutation: input.mutation,
-      ...(input.taskKey ? { taskKey: input.taskKey } : {}),
-      ...(input.wakeCommentId ? { wakeCommentId: input.wakeCommentId } : {}),
-    },
     requestedByActorType: input.requestedByActorType,
     requestedByActorId: input.requestedByActorId ?? null,
     ...(input.durableChatRequest
       ? { durableChatRequest: input.durableChatRequest }
       : {}),
-    contextSnapshot: {
-      issueId: input.issue.id,
-      source: input.contextSource,
-      ...(input.taskKey ? { taskKey: input.taskKey } : {}),
-      ...(input.wakeCommentId ? { wakeCommentId: input.wakeCommentId } : {}),
-      ...(input.wakeCommentId && input.attachmentOmissionReasons
-        ? {
-            externalAttachmentOmissions: [
-              {
-                commentId: input.wakeCommentId,
-                reasons: input.attachmentOmissionReasons,
-              },
-            ],
-          }
-        : {}),
-    },
-  };
-  const override = input.wakeupOptions ?? {};
-  const options: IssueAssignmentWakeupOptions = {
-    ...baseOptions,
     ...override,
-    idempotencyKey: override.idempotencyKey ?? baseOptions.idempotencyKey,
-    payload: { ...baseOptions.payload, ...(override.payload ?? {}) },
-    contextSnapshot: { ...baseOptions.contextSnapshot, ...(override.contextSnapshot ?? {}) },
+    ...(idempotencyKey ? { idempotencyKey } : {}),
+    payload: { ...basePayload, ...(override.payload ?? {}) },
+    contextSnapshot: { ...baseContextSnapshot, ...(override.contextSnapshot ?? {}) },
   };
 
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return await input.heartbeat.wakeup(input.issue.assigneeAgentId, options);
-    } catch (err) {
-      lastError = err;
-      if (attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 100 : 500));
-      }
-    }
+  const deliver = () => input.heartbeat.wakeup(assigneeAgentId, options);
+  try {
+    return await (idempotencyKey
+      ? retryIdempotentDatabaseOperation(deliver, { isTransient: isTransientDatabaseError })
+      : deliver());
+  } catch (err) {
+    logger.warn(
+      { err, issueId: input.issue.id },
+      "failed to wake assignee on issue assignment",
+    );
+    if (input.rethrowOnError) throw err;
+    return null;
   }
-
-  logger.warn(
-    { err: lastError, issueId: input.issue.id },
-    "failed to wake assignee on issue assignment after retries",
-  );
-  if (input.rethrowOnError) throw lastError;
-  return null;
 }

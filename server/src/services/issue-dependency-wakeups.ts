@@ -237,3 +237,34 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
   );
   return covering ?? null;
 }
+
+/** Receipt reason when admission suppressed an executing owner's own re-block wake. */
+export const ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON = "issue_self_reblock_wake_suppressed";
+
+/**
+ * True when admission suppressed this exact ready state's wake because the
+ * woken agent re-blocked the issue from its own run on it (ANT-3260). The
+ * periodic backstop must not re-deliver that wake. The key includes the
+ * blocked cycle, so a later re-block (by anyone) or a changed blocker set is
+ * a new ready state that this check does not cover. This deliberately does
+ * not feed `findExistingIssueBlockersResolvedWakeForReadyState`: route-time
+ * wakes caused by others must never be treated as already delivered.
+ */
+export async function isIssueBlockersResolvedReadyStateSelfSuppressed(
+  db: Db,
+  input: IssueBlockersResolvedReadyStateInput & { companyId: string; agentId: string },
+): Promise<boolean> {
+  const rows = await db
+    .select({ id: agentWakeupRequests.id })
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        eq(agentWakeupRequests.idempotencyKey, buildIssueBlockersResolvedWakeStateKey(input)),
+        eq(agentWakeupRequests.reason, ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
+}

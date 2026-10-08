@@ -10594,6 +10594,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       currentStageId: stageId,
       currentStageType: "review",
     });
+    // The backstop shares the route's assignment key, so the two dedupe.
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(wake?.idempotencyKey).toBe(
+      `issue-assignment:${issueId}:${agentId}:${issueRow!.statusVersion}`,
+    );
   });
 
   it("still re-enqueues stranded assigned todo recovery when an old queued wake exists", async () => {

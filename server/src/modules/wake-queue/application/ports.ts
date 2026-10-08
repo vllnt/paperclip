@@ -1,4 +1,5 @@
 import type { ReleaseRecoveryBlockedNoticeKind } from "../domain/policy.js";
+import type { SelfReblockWakeMarker } from "../domain/self-reblock-wake.js";
 import type {
   InvokableAgentSnapshot,
   IssueSnapshot,
@@ -83,6 +84,10 @@ export type DeferredWakeCandidate = {
   wakeReason: string | null;
   /** Exact failed-chat retry authority revalidated by the transaction-bound adapter. */
   authorizedFailedChatRetry?: boolean;
+  /** Present only when every merged contribution was the agent's own unblock/re-block cycle wake. */
+  selfReblockWake?: SelfReblockWakeMarker | null;
+  /** Set while the self-reblock limit holds the wake back; the drain skips it until then. */
+  selfReblockParkedUntil?: Date | null;
 };
 
 export type PromoteDeferredWakeInput = {
@@ -136,6 +141,33 @@ export interface WakeQueueTransaction {
   }): Promise<DeferredWakeCandidate | null>;
   /** Sets `status = 'failed'` guarded by the current `deferred_issue_execution` status. */
   failDeferredWake(input: { companyId: string; wakeId: string; now: Date }): Promise<boolean>;
+  /**
+   * Cancels an owner's own re-block wake (guarded on the deferred status) and
+   * records `issue.wake_suppressed_self`, so the suppression stays auditable.
+   */
+  suppressSelfReblockDeferredWake(input: {
+    companyId: string;
+    wakeId: string;
+    issueId: string;
+    agentId: string;
+    finishingRunId: string;
+    reason: string;
+    now: Date;
+  }): Promise<boolean>;
+  /** Runs started since `since` from this agent's own re-block wakes on this issue. */
+  countRecentSelfReblockWakeRuns(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    since: Date;
+  }): Promise<number>;
+  /** Keeps the wake deferred and records when the self-reblock limit allows it again. */
+  parkSelfReblockDeferredWake(input: {
+    companyId: string;
+    wakeId: string;
+    notBefore: Date;
+    now: Date;
+  }): Promise<boolean>;
   getPauseHoldFacts(input: {
     companyId: string;
     issueId: string;

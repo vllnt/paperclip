@@ -43,6 +43,13 @@ import { extractWakeCommentIds } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
+  buildSelfReblockWakeParkedState,
+  readSelfReblockWakeMarker,
+  readSelfReblockWakeParkedUntil,
+  SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY,
+  SELF_REBLOCK_WAKE_PAYLOAD_KEY,
+} from "../domain/self-reblock-wake.js";
+import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
@@ -165,6 +172,8 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     deferredContextSeed,
     deferredCommentIds,
     wakeReason,
+    selfReblockWake: readSelfReblockWakeMarker(payload, row.agentId),
+    selfReblockParkedUntil: readSelfReblockWakeParkedUntil(payload),
   };
 }
 
@@ -289,6 +298,60 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const rows = await tx
         .update(agentWakeupRequests)
         .set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, wakeId),
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      return rows.length > 0;
+    },
+
+    async suppressSelfReblockDeferredWake({ companyId, wakeId, issueId, agentId, finishingRunId, reason, now }) {
+      const rows = await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: "Self-caused re-block wake suppressed: the agent owns this issue's execution",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, wakeId),
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (rows.length === 0) return false;
+      await tx.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "issue_wake_loop_guard",
+        agentId,
+        runId: finishingRunId,
+        action: "issue.wake_suppressed_self",
+        entityType: "issue",
+        entityId: issueId,
+        details: { reason, wakeupRequestId: wakeId, phase: "promotion", cause: "self_reblock_owner" },
+      });
+      return true;
+    },
+
+    async countRecentSelfReblockWakeRuns(input) {
+      return countRecentSelfReblockWakeRuns(tx, input);
+    },
+
+    async parkSelfReblockDeferredWake({ companyId, wakeId, notBefore, now }) {
+      const rows = await tx
+        .update(agentWakeupRequests)
+        .set({
+          payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), array[${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}]::text[], ${JSON.stringify(buildSelfReblockWakeParkedState(notBefore))}::jsonb)`,
+          updatedAt: now,
+        })
         .where(
           and(
             eq(agentWakeupRequests.id, wakeId),
@@ -799,6 +862,50 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
 }
 
 /**
+ * Counts runs started since `since` from this agent's own re-block wakes on
+ * this issue. A coalesced receipt started no run of its own, so it does not
+ * count. Promoted rows keep their marker, so deferral cannot hide a run.
+ */
+async function countRecentSelfReblockWakeRuns(
+  tx: Db,
+  input: { companyId: string; agentId: string; issueId: string; since: Date },
+): Promise<number> {
+  const [row] = await tx
+    .select({ total: sql<number>`count(*)::integer` })
+    .from(agentWakeupRequests)
+    .innerJoin(
+      heartbeatRuns,
+      and(
+        eq(heartbeatRuns.id, agentWakeupRequests.runId),
+        eq(heartbeatRuns.companyId, agentWakeupRequests.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        sql`${agentWakeupRequests.status} <> 'coalesced'`,
+        sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PAYLOAD_KEY} ->> 'agentId' = ${input.agentId}`,
+        sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'issueId') = ${input.issueId}`,
+        sql`${heartbeatRuns.createdAt} >= ${input.since.toISOString()}::timestamptz`,
+      ),
+    );
+  return Number(row?.total ?? 0);
+}
+
+/** Admission reads the self-reblock run count inside heartbeat's issue-locked transaction. */
+export function createSelfReblockWakeAdmissionReader() {
+  return {
+    countRecentSelfReblockWakeRuns(
+      scope: TransactionScope,
+      input: { companyId: string; agentId: string; issueId: string; since: Date },
+    ): Promise<number> {
+      return countRecentSelfReblockWakeRuns(requireAdmissionTx(scope, input.companyId), input);
+    },
+  };
+}
+
+/**
  * Builds the temporary transaction-scope handle the admission port needs.
  * `heartbeat.ts` calls this through `createWakeQueue`'s own wrapper; it
  * never builds a `TransactionScope` itself.
@@ -878,6 +985,9 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // A wake parked by the self-reblock limit keeps its own provenance;
+            // other wakes queue beside it instead of inheriting its actor.
+            sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} is null`,
             ...(durableActor
               ? [
                   durableActor.type === null

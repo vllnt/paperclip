@@ -2,6 +2,7 @@ import type { Db } from "@paperclipai/db";
 import {
   createAdmissionTransactionScope as buildAdmissionTransactionScope,
   createPostgresWakeQueueAdapter,
+  createSelfReblockWakeAdmissionReader,
   createWakeAdmissionReader,
   createWakeAdmissionWriter,
 } from "./adapters/postgres.js";
@@ -36,6 +37,19 @@ export type {
   TransactionScope,
 } from "./application/ports.js";
 export type { AdmitWakeBehindIssueExecutionInput, AdmitWakeBehindIssueExecutionResult, ReleaseIssueExecutionInput } from "./application/use-cases.js";
+export {
+  buildSelfReblockWakeParkedState,
+  decideSelfReblockWakeLimit,
+  deriveSelfReblockWakeMarker,
+  isSelfReblockWakeOwner,
+  readSelfReblockWakeMarker,
+  SELF_REBLOCK_WAKE_LIMIT,
+  SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY,
+  SELF_REBLOCK_WAKE_PAYLOAD_KEY,
+  SELF_REBLOCK_WAKE_WINDOW_MS,
+  selfReblockWakeWindowStart,
+} from "./domain/self-reblock-wake.js";
+export type { SelfReblockWakeMarker } from "./domain/self-reblock-wake.js";
 export {
   QueuedCommentMutationError,
   QueuedCommentMutationForbiddenError,
@@ -103,6 +117,7 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
     createAdmissionTransactionScope(companyId: string, tx: Db): TransactionScope {
       return buildAdmissionTransactionScope(companyId, tx);
     },
+    countRecentSelfReblockWakeRuns: createSelfReblockWakeAdmissionReader().countRecentSelfReblockWakeRuns,
   };
 }
 
