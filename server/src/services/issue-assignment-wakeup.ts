@@ -34,6 +34,47 @@ export function parseIssueAssignmentIdempotencyKey(key: string): {
   return { issueId: match[1], assigneeAgentId: match[2], assignmentGeneration };
 }
 
+/** Receipt reason when heartbeat admission refuses an assignment-keyed wake. */
+export const ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON = "issue_assignment_wake_refused";
+
+export type IssueAssignmentWakeRefusal =
+  | "malformed_key"
+  | "assignee_mismatch"
+  | "generation_ahead"
+  | "superseded";
+
+/**
+ * Admission rule for an assignment-keyed wake, evaluated under the issue lock.
+ * The wake may run only for the issue's current agent assignee, for a
+ * generation the issue has reached, and when no newer assignment has been
+ * recorded. A status-only change after the assignment advances `statusVersion`
+ * but records no assignment, so it never refuses the wake; A -> B -> A records
+ * B's and A's newer generations, so A's first key is superseded.
+ */
+export function decideIssueAssignmentWakeRefusal(input: {
+  key: { issueId: string; assigneeAgentId: string; assignmentGeneration: number } | null;
+  wakeAgentId: string;
+  lockedIssue: { id: string; assigneeAgentId: string | null; statusVersion: number } | null;
+  /** Newest generation among this issue's assignment receipts, refusals excluded. */
+  newestRecordedGeneration: number | null;
+}): IssueAssignmentWakeRefusal | null {
+  const { key, lockedIssue } = input;
+  if (!key) return "malformed_key";
+  if (
+    !lockedIssue ||
+    key.issueId !== lockedIssue.id ||
+    key.assigneeAgentId !== input.wakeAgentId ||
+    key.assigneeAgentId !== lockedIssue.assigneeAgentId
+  ) {
+    return "assignee_mismatch";
+  }
+  if (key.assignmentGeneration > lockedIssue.statusVersion) return "generation_ahead";
+  if (input.newestRecordedGeneration !== null && input.newestRecordedGeneration > key.assignmentGeneration) {
+    return "superseded";
+  }
+  return null;
+}
+
 export type IssueAssignmentWakeupOptions = {
   source?: WakeupSource;
   triggerDetail?: WakeupTriggerDetail;

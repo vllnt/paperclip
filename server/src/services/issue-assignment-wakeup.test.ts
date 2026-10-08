@@ -3,6 +3,7 @@ import { HttpError } from "../errors.js";
 import { FailedChatRunRetryAuthorizationError } from "./durable-chat-wakeup.js";
 import {
   buildIssueAssignmentIdempotencyKey,
+  decideIssueAssignmentWakeRefusal,
   parseIssueAssignmentIdempotencyKey,
   queueIssueAssignmentWakeup,
 } from "./issue-assignment-wakeup.js";
@@ -142,4 +143,25 @@ describe("issue assignment wakeup delivery", () => {
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
+  it("admits an assignment key for the current assignee up to the locked generation", () => {
+    const key = { issueId: "issue-1", assigneeAgentId: "agent-a", assignmentGeneration: 4 };
+    const lockedIssue = { id: "issue-1", assigneeAgentId: "agent-a", statusVersion: 4 };
+    const decide = (overrides: Partial<Parameters<typeof decideIssueAssignmentWakeRefusal>[0]>) =>
+      decideIssueAssignmentWakeRefusal({ key, wakeAgentId: "agent-a", lockedIssue, newestRecordedGeneration: null, ...overrides });
+
+    expect(decide({})).toBeNull();
+    // A status-only change after the assignment advanced the version (R3-R).
+    expect(decide({ lockedIssue: { ...lockedIssue, statusVersion: 6 } })).toBeNull();
+    // Its own receipt (a replay) is not newer than itself.
+    expect(decide({ newestRecordedGeneration: 4 })).toBeNull();
+
+    expect(decide({ key: null })).toBe("malformed_key");
+    expect(decide({ lockedIssue: null })).toBe("assignee_mismatch");
+    expect(decide({ wakeAgentId: "agent-b" })).toBe("assignee_mismatch");
+    expect(decide({ lockedIssue: { ...lockedIssue, assigneeAgentId: "agent-b" } })).toBe("assignee_mismatch");
+    expect(decide({ lockedIssue: { ...lockedIssue, id: "issue-2" } })).toBe("assignee_mismatch");
+    expect(decide({ lockedIssue: { ...lockedIssue, statusVersion: 3 } })).toBe("generation_ahead");
+    // A -> B -> A recorded newer generations, so A's first key is stale.
+    expect(decide({ newestRecordedGeneration: 6 })).toBe("superseded");
+  });
 });

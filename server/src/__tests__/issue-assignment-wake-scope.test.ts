@@ -19,6 +19,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueTreeControlRoutes } from "../routes/issue-tree-control.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { issueService } from "../services/issues.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
@@ -297,4 +298,37 @@ describeEmbeddedPostgres("issue assignment wake scope", () => {
     expect(resumes[0]!.runId).not.toBe(assignmentRun.id);
   });
 
+  it("R3-R: a status-only change between the assignment commit and its wake does not drop the wake", async () => {
+    const { agentId, issueId } = await seed("todo");
+    // The assignment committed at this generation ...
+    const [assigned] = await db.select().from(issues).where(eq(issues.id, issueId));
+    // ... then a status-only change advanced the status version (DB trigger)
+    // before the route's asynchronous wake reached admission.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    const [moved] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(moved!.statusVersion).toBeGreaterThan(assigned!.statusVersion);
+
+    const run = await queueIssueAssignmentWakeup({
+      heartbeat,
+      assignmentEvent: true,
+      issue: { id: issueId, assigneeAgentId: agentId, status: assigned!.status, statusVersion: assigned!.statusVersion },
+      reason: "issue_assigned",
+      mutation: "update",
+      contextSource: "issue.update",
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      rethrowOnError: true,
+    });
+    expect(run).toMatchObject({ agentId });
+    expect(await waitForIdle()).toBe(true);
+
+    expect(await receiptsFor(agentId, "issue_assignment_wake_refused")).toEqual([]);
+    const [receipt] = await receiptsFor(agentId, "issue_assigned");
+    expect(receipt).toMatchObject({
+      idempotencyKey: `issue-assignment:${issueId}:${agentId}:${assigned!.statusVersion}`,
+      runId: (run as { id: string }).id,
+    });
+    const [assignmentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, receipt!.id));
+    expect(assignmentRun).toMatchObject({ agentId, status: "succeeded" });
+  });
 });

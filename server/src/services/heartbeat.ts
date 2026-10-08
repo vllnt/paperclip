@@ -99,6 +99,7 @@ import {
   inArray,
   isNull,
   isNotNull,
+  like,
   lt,
   lte,
   ne,
@@ -189,7 +190,13 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
-import { ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX, parseIssueAssignmentIdempotencyKey } from "./issue-assignment-wakeup.js";
+import {
+  decideIssueAssignmentWakeRefusal,
+  ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX,
+  ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON,
+  type IssueAssignmentWakeRefusal,
+  parseIssueAssignmentIdempotencyKey,
+} from "./issue-assignment-wakeup.js";
 import {
   getStartupTraceContext,
   getStartupTracer,
@@ -800,6 +807,11 @@ const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 /** Backs one live receipt per `issue-assignment:<issue>:<assignee>:<generation>` key. */
 const ISSUE_ASSIGNMENT_IDEMPOTENCY_UNIQUE_INDEX = "agent_wakeup_requests_issue_assignment_idempotency_uq";
+/**
+ * The unique index's WHERE clause, spelled as literal SQL so the planner can
+ * prove a lookup matches the partial index (a bound parameter cannot).
+ */
+const ISSUE_ASSIGNMENT_LIVE_RECEIPT_PREDICATE = sql`${agentWakeupRequests.idempotencyKey} LIKE 'issue-assignment:%:%:%' AND ${agentWakeupRequests.status} NOT IN ('skipped', 'failed', 'cancelled')`;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -27139,9 +27151,6 @@ export function heartbeatService(
     const assignmentKeyParts = assignmentIdempotencyKey
       ? parseIssueAssignmentIdempotencyKey(assignmentIdempotencyKey)
       : null;
-    if (assignmentIdempotencyKey && !assignmentKeyParts) {
-      throw conflict("Invalid assignment idempotency key");
-    }
     const existingAssignmentReceipt = async (queryDb: Db) => {
       if (!assignmentIdempotencyKey) return null;
       return queryDb
@@ -27151,24 +27160,68 @@ export function heartbeatService(
           and(
             eq(agentWakeupRequests.companyId, agent.companyId),
             eq(agentWakeupRequests.idempotencyKey, assignmentIdempotencyKey),
-            notInArray(agentWakeupRequests.status, ["skipped", "failed", "cancelled"]),
+            // The unique index's own predicate, so this is one index probe.
+            ISSUE_ASSIGNMENT_LIVE_RECEIPT_PREDICATE,
           ),
         )
-        .orderBy(asc(agentWakeupRequests.requestedAt))
         .limit(1)
         .then((rows) => rows[0] ?? null);
     };
-    const assignmentReceiptKeysForIssue = async (queryDb: Db, issueIdForKey: string) =>
+    // The newest assignment generation recorded for the issue. The issue
+    // filter uses the company/payload-issue index, so the lookup under the
+    // issue lock reads only this issue's receipts. A refusal is not an
+    // assignment and never supersedes one.
+    const newestRecordedAssignmentGeneration = async (queryDb: Db, issueIdForKey: string) =>
       queryDb
         .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
         .from(agentWakeupRequests)
         .where(and(
           eq(agentWakeupRequests.companyId, agent.companyId),
-          sql`${agentWakeupRequests.idempotencyKey} like ${ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX + issueIdForKey + ":%"}`,
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueIdForKey}`,
+          like(agentWakeupRequests.idempotencyKey, `${ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX}${issueIdForKey}:%`),
+          sql`${agentWakeupRequests.reason} is distinct from ${ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON}`,
         ))
-        .then((rows) => rows
-          .map((row) => row.idempotencyKey)
-          .filter((key): key is string => typeof key === "string"));
+        .then((rows) => rows.reduce<number | null>((newest, row) => {
+          const generation = row.idempotencyKey
+            ? parseIssueAssignmentIdempotencyKey(row.idempotencyKey)?.assignmentGeneration
+            : undefined;
+          return generation !== undefined && (newest === null || generation > newest) ? generation : newest;
+        }, null));
+    const assignmentRefusalReceipt = (
+      refusal: IssueAssignmentWakeRefusal,
+      details: Record<string, unknown>,
+    ) => {
+      // Every refusal is durable and loud: the assignee would otherwise wait
+      // on a wake that never runs, with nothing to show why.
+      logger.error(
+        { agentId, companyId: agent.companyId, issueId, idempotencyKey: assignmentIdempotencyKey, refusal, ...details },
+        "assignment wake refused",
+      );
+      return {
+        companyId: agent.companyId,
+        agentId,
+        source,
+        triggerDetail,
+        reason: ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON,
+        payload: {
+          ...(payload ?? {}),
+          heartbeatSkip: { reason: ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON, refusal, requestedReason: reason, ...details },
+        },
+        status: "skipped",
+        requestedByActorType: opts.requestedByActorType ?? null,
+        requestedByActorId: opts.requestedByActorId ?? null,
+        idempotencyKey: assignmentIdempotencyKey,
+        finishedAt: new Date(),
+      } satisfies typeof agentWakeupRequests.$inferInsert;
+    };
+    if (assignmentIdempotencyKey && (!assignmentKeyParts || !issueId)) {
+      // A malformed reserved key, or one on a wake without an issue, can never
+      // be checked against the issue lock. Admission below checks the rest.
+      await db.insert(agentWakeupRequests).values(
+        assignmentRefusalReceipt(assignmentKeyParts ? "assignee_mismatch" : "malformed_key", { wakeIssueId: issueId ?? null }),
+      );
+      return null;
+    }
     const priorReceipt = await existingDurableReceipt(db);
     if (priorReceipt) {
       // Replaying an admission receipt is not fresh authority to dispatch it.
@@ -27593,38 +27646,28 @@ export function heartbeatService(
           );
 
           if (assignmentKeyParts) {
-            const existingAssignmentReplay = await existingAssignmentReceipt(tx as unknown as Db);
             const lockedAssignmentIssue = await tx
               .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId, statusVersion: issues.statusVersion })
               .from(issues)
               .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
               .limit(1)
               .then((rows) => rows[0] ?? null);
-            if (!lockedAssignmentIssue ||
-                assignmentKeyParts.issueId !== lockedAssignmentIssue.id ||
-                assignmentKeyParts.assigneeAgentId !== agentId ||
-                assignmentKeyParts.assigneeAgentId !== lockedAssignmentIssue.assigneeAgentId) {
-              throw conflict("Assignment idempotency key does not match the locked issue assignment");
-            }
-            if (existingAssignmentReplay) {
-              // Status versions also advance on ordinary status transitions. For
-              // a replay, the server's assignment receipts are the durable
-              // assignment history: only the newest key for this issue may be
-              // replayed, so A -> B -> A cannot revive A's old receipt.
-              const newestAssignmentGeneration = (await assignmentReceiptKeysForIssue(tx as unknown as Db, lockedAssignmentIssue.id))
-                .map((key) => parseIssueAssignmentIdempotencyKey(key))
-                .filter((parts): parts is NonNullable<typeof parts> => Boolean(parts))
-                .reduce<number | null>((newest, parts) =>
-                  newest === null || parts.assignmentGeneration > newest ? parts.assignmentGeneration : newest,
-                null);
-              if (newestAssignmentGeneration !== assignmentKeyParts.assignmentGeneration) {
-                throw conflict("Assignment idempotency key is stale for the locked issue assignment");
-              }
-            } else if (assignmentKeyParts.assignmentGeneration !== lockedAssignmentIssue.statusVersion) {
-              // A fresh assignment wake must name the version observed under the
-              // issue lock. A caller cannot mint a generation for a different
-              // assignment; retries use the committed receipt branch above.
-              throw conflict("Assignment idempotency key does not match the locked issue assignment");
+            const newestRecordedGeneration = lockedAssignmentIssue
+              ? await newestRecordedAssignmentGeneration(tx as unknown as Db, lockedAssignmentIssue.id)
+              : null;
+            const refusal = decideIssueAssignmentWakeRefusal({
+              key: assignmentKeyParts,
+              wakeAgentId: agentId,
+              lockedIssue: lockedAssignmentIssue,
+              newestRecordedGeneration,
+            });
+            if (refusal) {
+              await tx.insert(agentWakeupRequests).values(assignmentRefusalReceipt(refusal, {
+                lockedAssigneeAgentId: lockedAssignmentIssue?.assigneeAgentId ?? null,
+                lockedStatusVersion: lockedAssignmentIssue?.statusVersion ?? null,
+                newestRecordedGeneration,
+              }));
+              return { kind: "skipped" as const };
             }
           }
 

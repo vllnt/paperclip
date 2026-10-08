@@ -373,6 +373,13 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     ]);
   });
 
+  /** Runs started by an assignment wake (follow-up repair runs excluded). */
+  const assignmentRunsFor = (agentId: string) =>
+    db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = 'issue_assigned'`));
+
   /** A self-wake parked behind the agent's own run, as a deferred receipt. */
   function deferredSelfWake(input: { id: string; companyId: string; agentId: string; issueId: string }) {
     return {
@@ -746,7 +753,9 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     await db.update(issues)
       .set({ statusVersion: sql`${issues.statusVersion} + 1` })
       .where(eq(issues.id, issueId));
+    const runsBeforeRefusal = await assignmentRunsFor(agentId);
 
+    // A generation the issue never reached is refused, durably and loudly.
     await expect(heartbeat.wakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
@@ -756,8 +765,23 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       requestedByActorType: "user",
       requestedByActorId: "board-user",
       contextSnapshot: { issueId, source: "issue.update" },
-    })).rejects.toMatchObject({ status: 409 });
+    })).resolves.toBeNull();
     await waitForIdle();
+    const refused = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.idempotencyKey, mismatchedKey));
+    expect(refused).toEqual([
+      expect.objectContaining({
+        status: "skipped",
+        reason: "issue_assignment_wake_refused",
+        runId: null,
+        payload: expect.objectContaining({
+          heartbeatSkip: expect.objectContaining({ refusal: "generation_ahead" }),
+        }),
+      }),
+    ]);
+    expect(await assignmentRunsFor(agentId)).toHaveLength(runsBeforeRefusal.length);
   });
 
   it("still wakes an agent that assigns itself a blocked-ready issue from a run elsewhere", async () => {
@@ -845,7 +869,9 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     expect(firstRuns).toHaveLength(1);
 
     // The first A receipt is no longer current after A -> B -> A. A replay
-    // with that stale key must not revive the old A assignment.
+    // with that stale key must not revive the old A assignment: it is refused
+    // with a skipped receipt instead of starting a run.
+    const runsBeforeReplay = await assignmentRunsFor(agentA);
     await expect(
       heartbeat.wakeup(agentA, {
         source: "assignment",
@@ -857,7 +883,19 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
         requestedByActorId: "board-user",
         contextSnapshot: { issueId, source: "issue.update" },
       }),
-    ).rejects.toMatchObject({ status: 409 });
+    ).resolves.toBeNull();
+    await waitForIdle();
+    expect(await assignmentRunsFor(agentA)).toHaveLength(runsBeforeReplay.length);
+    const staleReplay = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.idempotencyKey, first.key), eq(agentWakeupRequests.reason, "issue_assignment_wake_refused")));
+    expect(staleReplay).toEqual([
+      expect.objectContaining({
+        status: "skipped",
+        payload: expect.objectContaining({ heartbeatSkip: expect.objectContaining({ refusal: "superseded" }) }),
+      }),
+    ]);
 
     // The database itself refuses a second live receipt for the same generation.
     await expect(
