@@ -928,6 +928,21 @@ describe("agent live run routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it("rejects the reserved assignment idempotency namespace on the legacy heartbeat invoke route", async () => {
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/heartbeat/invoke?companyId=company-1`)
+        .send({
+          reason: "issue_assigned",
+          payload: { issueId: "issue-1" },
+          idempotencyKey: "issue-assignment:issue-1:agent-1:4",
+        }),
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toContain("reserved");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("passes scoped wake fields through the legacy heartbeat invoke route", async () => {
     const res = await requestApp(await createApp(), (baseUrl) =>
       request(baseUrl)
