@@ -1,3 +1,5 @@
+import { mintGitHubInstallationToken } from "@paperclipai/shared";
+
 /** Noncritical receipt work stays inside its caller's renewable credential
  * lease. Incomplete reads are never evidence that a reaction was removed. */
 export const GITHUB_RECEIPT_TIMEOUT_MS = 2_000;
@@ -69,6 +71,8 @@ export async function applyGitHubReceiptReaction(
   installationId: number,
   input: GitHubReceiptMutation,
   assertCurrent: () => Promise<void>,
+  /** I-RO: the fence of the App-user company that uses this App, or null (see githubAppUserFence). */
+  appUserFence: (appId: string) => Promise<readonly string[] | null>,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<GitHubReceiptIdentity> {
   const adapter = adapterValue as Adapter;
@@ -208,20 +212,20 @@ export async function applyGitHubReceiptReaction(
     )
       throw unavailable("app_authentication");
     appToken = authentication.token;
-    const tokenResponse = await request(
-      "POST /app/installations/{installation_id}/access_tokens",
-      { installation_id: installationId },
-    );
-    const installation = record(tokenResponse.data);
-    if (
-      tokenResponse.status !== 201 ||
-      typeof installation.token !== "string" ||
-      !installation.token ||
-      installation.token.length > 8192 ||
-      /[\r\n]/.test(installation.token)
-    )
-      throw unavailable("installation_authentication");
-    installationToken = installation.token;
+    // A reaction writes: an App that an App-user company uses (I-RO) never gets this token.
+    installationToken = await mintGitHubInstallationToken({ installationId }, await appUserFence(appId), async (call) => {
+      const tokenResponse = await request(call.route, { installation_id: call.installationId, ...call.body });
+      const installation = record(tokenResponse.data);
+      if (
+        tokenResponse.status !== 201 ||
+        typeof installation.token !== "string" ||
+        !installation.token ||
+        installation.token.length > 8192 ||
+        /[\r\n]/.test(installation.token)
+      )
+        throw unavailable("installation_authentication");
+      return installation.token;
+    });
     let identity = identities.get(adapter as object);
     if (!identity || identity.appId !== appId) {
       const appResponse = await request("GET /app");

@@ -15,6 +15,26 @@ import { notFound } from "../errors.js";
 /** Default namespace used when the plugin does not specify one. */
 const DEFAULT_NAMESPACE = "default";
 
+/** One plugin state write or delete, without its value. */
+export interface PluginStateWrite {
+  pluginId: string;
+  scopeKind: PluginStateScopeKind;
+  scopeId: string | null;
+  namespace: string;
+  stateKey: string;
+}
+const stateWriteListeners = new Set<(write: PluginStateWrite) => void>();
+/** Calls `listener` after every plugin state write or delete in this process; returns its unsubscribe. */
+export function onPluginStateWrite(listener: (write: PluginStateWrite) => void): () => void {
+  stateWriteListeners.add(listener);
+  return () => { stateWriteListeners.delete(listener); };
+}
+function notifyStateWrite(write: PluginStateWrite) {
+  for (const listener of [...stateWriteListeners]) {
+    try { listener(write); } catch { /* A listener never fails the write. */ }
+  }
+}
+
 /**
  * Build the WHERE clause conditions for a scoped state lookup.
  *
@@ -159,6 +179,7 @@ export function pluginStateStore(db: Db) {
             updatedAt: new Date(),
           },
         });
+      notifyStateWrite({ pluginId, scopeKind: input.scopeKind, scopeId, namespace, stateKey: input.stateKey });
     },
 
     /**
@@ -186,6 +207,7 @@ export function pluginStateStore(db: Db) {
       await db
         .delete(pluginState)
         .where(scopeConditions(pluginId, scopeKind, scopeId, namespace, stateKey));
+      notifyStateWrite({ pluginId, scopeKind, scopeId: scopeId ?? null, namespace, stateKey });
     },
 
     /**

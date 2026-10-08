@@ -1603,6 +1603,11 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         return secretsHandler.resolve({ ...params, companyId });
       },
+      async storeOwn(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        await secretsHandler.storeOwn({ ...params, companyId });
+      },
     },
 
     activity: {

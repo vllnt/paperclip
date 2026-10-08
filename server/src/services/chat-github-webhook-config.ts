@@ -1,3 +1,4 @@
+import { mintGitHubInstallationToken } from "@paperclipai/shared";
 import { createHash } from "node:crypto";
 
 const GITHUB_APP_WEBHOOK_CONFIG_URL = "https://api.github.com/app/hook/config";
@@ -604,6 +605,8 @@ export async function getGitHubRecoveryComment(
     repositoryFullName: string;
     event: "issue_comment" | "pull_request_review_comment";
     commentId: string;
+    /** I-RO: null when no company writes as this App's user; otherwise the repository must be in this fence. */
+    fence: readonly string[] | null;
   },
 ): Promise<GitHubRecoveryComment> {
   const id = inputId(input.commentId);
@@ -624,17 +627,18 @@ export async function getGitHubRecoveryComment(
       "github_webhook_recovery_invalid_input",
     );
   }
-  const token = await recoveryRequest({
+  const token = await mintGitHubInstallationToken({
+    installationId,
+    repositories: [fullName],
+    permissions: { issues: "read", pull_requests: "read" },
+  }, input.fence, (call) => recoveryRequest({
     ...input,
     token: input.appToken,
-    path: `/app/installations/${installationId}/access_tokens`,
+    path: call.path,
     method: "POST",
     expectedStatus: 201,
     timeoutMs: 10_000,
-    body: JSON.stringify({
-      repositories: [fullName.split("/")[1]],
-      permissions: { issues: "read", pull_requests: "read" },
-    }),
+    body: JSON.stringify(call.body),
     project: async (response, signal) => {
       const row = record(await readLosslessJson(response, 16_384, signal));
       if (
@@ -644,7 +648,7 @@ export async function getGitHubRecoveryComment(
         invalidResponse();
       return row.token;
     },
-  });
+  }));
   try {
     const kind = input.event === "issue_comment" ? "issues" : "pulls";
     return await recoveryRequest({

@@ -3,6 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { chatEndpoints, toolConnections, type Db } from "@paperclipai/db";
 import { secretService } from "./secrets.js";
 import { conflict, forbidden, unprocessable } from "../errors.js";
+import { assertNativeGitHubAppAllowed, mintNativeGitHubInstallationToken } from "./github-installation-tokens.js";
 
 export function githubAppJwt(
   appId: string,
@@ -93,6 +94,8 @@ export async function githubBotCredentials(
   companyId: string,
   endpointId: string,
 ) {
+  // An App-user company, and an App such a company uses, only read (I-RO): the native connector is off for them.
+  await assertNativeGitHubAppAllowed(db, { companyId });
   const [row] = await db
     .select({ endpoint: chatEndpoints, connection: toolConnections })
     .from(chatEndpoints)
@@ -139,6 +142,7 @@ export async function githubBotCredentials(
   }
   if (!credentials.appId || !credentials.privateKey)
     throw conflict("Connect the GitHub App before continuing");
+  await assertNativeGitHubAppAllowed(db, { companyId, appId: credentials.appId });
   return {
     ...row,
     credentials,
@@ -167,25 +171,22 @@ export async function githubBotRepositoryToken(
     !Number.isSafeInteger(Number(repositoryId))
   )
     throw conflict("Verify the GitHub App installation first");
-  const issued = await githubBotRequest<{ token?: string }>(
-    fetchImpl,
-    result.appJwt,
-    `/app/installations/${encodeURIComponent(result.credentials.installationId)}/access_tokens`,
-    {
-      method: "POST",
-      body: {
-        repository_ids: [Number(repositoryId)],
-        permissions: {
-          contents: "read",
-          metadata: "read",
-          issues: "write",
-          pull_requests: "write",
-          checks: "write",
-        },
-      },
+  return mintNativeGitHubInstallationToken(db, {
+    companyId,
+    appId: result.credentials.appId,
+    installationId: result.credentials.installationId,
+    repositories: [Number(repositoryId)],
+    permissions: {
+      contents: "read",
+      metadata: "read",
+      issues: "write",
+      pull_requests: "write",
+      checks: "write",
     },
-  );
-  if (!issued.token)
-    throw unprocessable("GitHub did not issue an installation token");
-  return issued.token;
+  }, async (call) => {
+    const issued = await githubBotRequest<{ token?: string }>(fetchImpl, result.appJwt, call.path, { method: "POST", body: call.body });
+    if (!issued.token)
+      throw unprocessable("GitHub did not issue an installation token");
+    return issued.token;
+  });
 }

@@ -120,6 +120,7 @@ import {
   connectionIntentBoardRoutes,
   runtimeConnectionIntentRoutes,
 } from "./routes/connection-intents.js";
+import { registerGitHubWriteIdentityWorkers } from "./services/github-write-identity.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { managedAgentProfileRoutes } from "./routes/managed-agent-profiles.js";
 import { remoteAgentProfileRoutes } from "./routes/remote-agent-profiles.js";
@@ -580,6 +581,7 @@ export async function createApp(
 
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
+  registerGitHubWriteIdentityWorkers(workerManager);
   const connectionIntentHeartbeat = heartbeatService(db, {
     pluginWorkerManager: workerManager,
   });

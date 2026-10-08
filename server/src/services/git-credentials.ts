@@ -271,9 +271,10 @@ export function createGitRemoteAuthProvider(
       ));
       if (run?.contextId) {
         const { resolveGitHubOperationCredentials } = await import("./github-operation-credentials.js");
+        // Report the remote so a policy can scope a read token to this repository.
         const result = await resolveGitHubOperationCredentials(db, {
           companyId, runId: context.heartbeatRunId, agentId: context.agentId,
-        });
+        }, { program: "git", args: ["fetch", remoteUrl], remote: remoteUrl });
         if (result.status === "absent") {
           const credential = await resolveCredential();
           return credential ? buildGitAuthInvocation(credential) : null;

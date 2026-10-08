@@ -12,6 +12,29 @@ type Binding = { companyId: string; agentId: string; issueId: string; runId: str
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 export type NativeGitHubAccess = Awaited<ReturnType<typeof createNativeGitHubAccess>>;
 
+const MAX_OPERATION_BODY_BYTES = 256 * 1024;
+/** A git object to sign (at most 1 MiB) as base64 in JSON. */
+const MAX_SIGN_BODY_BYTES = 2 * 1024 * 1024;
+
+/** The launcher's JSON body, or null when absent, oversized or malformed. */
+async function readOperationBody(req: import("node:http").IncomingMessage, limit = MAX_OPERATION_BODY_BYTES): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for await (const chunk of req) {
+      size += (chunk as Buffer).length;
+      if (size > limit) {
+        req.resume();
+        return null;
+      }
+      chunks.push(chunk as Buffer);
+    }
+    return size ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** A process-lifetime transport, with authority only while its controller owns a run.
  * No run token or GitHub credential is stored in the provider's environment/files.
  * The resolver still checks the active run and current identity/grants per operation.
@@ -21,7 +44,10 @@ export async function createNativeGitHubAccess(input: {
   target: LauncherInput["target"];
   cwd: string;
   env: NodeJS.ProcessEnv;
-  resolveCredentials: (binding: Binding) => Promise<unknown>;
+  /** `operation` is the launcher's unvalidated request body; it cannot select a run. */
+  resolveCredentials: (binding: Binding, operation: unknown) => Promise<unknown>;
+  /** Signs one git object (`payload`, base64) for the bound run, like the server's /runtime-tools/github/sign. */
+  resolveSignature?: (binding: Binding, payload: string) => Promise<unknown>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }, startBridge = startAdapterExecutionTargetPaperclipBridge) {
   const token = randomBytes(32).toString("hex");
@@ -34,8 +60,8 @@ export async function createNativeGitHubAccess(input: {
   const server = createServer(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "application/json");
-    req.resume();
     const reply = (status: number, body: unknown) => {
+      req.resume();
       res.writeHead(status);
       res.end(JSON.stringify(body));
     };
@@ -47,7 +73,8 @@ export async function createNativeGitHubAccess(input: {
       reply(403, { error: "GitHub session authentication required" });
       return;
     }
-    if (req.method !== "POST" || req.url !== "/runtime-tools/github/credentials") {
+    const signing = req.url === "/runtime-tools/github/sign" && !!input.resolveSignature;
+    if (req.method !== "POST" || (req.url !== "/runtime-tools/github/credentials" && !signing)) {
       reply(404, { error: "Unknown GitHub session operation" });
       return;
     }
@@ -56,9 +83,16 @@ export async function createNativeGitHubAccess(input: {
       reply(403, { error: "No active GitHub run" });
       return;
     }
+    // Read only after authentication. The binding above was taken at receipt.
+    const body = await readOperationBody(req, signing ? MAX_SIGN_BODY_BYTES : MAX_OPERATION_BODY_BYTES);
+    const payload = signing && body && typeof body === "object" ? (body as { payload?: unknown }).payload : undefined;
+    if (signing && typeof payload !== "string") {
+      reply(400, { error: "Send { payload } with the git object as base64" });
+      return;
+    }
     try {
       // Bind at receipt; body/headers cannot select a run or responsible user.
-      const result = await input.resolveCredentials({ ...binding });
+      const result = signing ? await input.resolveSignature!({ ...binding }, payload as string) : await input.resolveCredentials({ ...binding }, body);
       if (active !== binding || stopped) {
         reply(403, { error: "GitHub run ended during credential acquisition" });
         return;

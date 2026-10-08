@@ -713,6 +713,16 @@ export interface PaperclipPluginManifestV1 {
     listAction: string;
     /** Company-relative path to a declared plugin page, e.g. /github-projects. */
     setupPath?: string;
+    /** Host-only action for managed git/gh operations. Receives GitHubWriteIdentityRequest
+     * from a `system` actor and returns GitHubWriteIdentityDecision: defer to the run's user,
+     * or a credential restricted by the plugin. The plugin must reject every other actor;
+     * the host never forwards the token to a browser.
+     */
+    writeIdentityAction?: string;
+    /** Host-only action that signs a git commit or tag object for managed git. Receives
+     * GitHubSignRequest from a `system` actor and returns GitHubSignDecision.
+     */
+    signCommitAction?: string;
   };
   /** Native New Task destinations. Board actions validate company/project scope.
    * listAction returns { destinations: { id, label, disabledReason? }[] }.

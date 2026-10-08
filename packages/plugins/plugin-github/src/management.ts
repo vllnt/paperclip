@@ -6,11 +6,22 @@ import type { registerSync } from "./sync.js";
 import { boardScope } from "./setup.js";
 import { nativeConnectorRequiredError, nativeGitHubEndpoints, requireNativeGitHubAgents } from "./native-github.js";
 import { ProjectManager, projectReads, projectWrites } from "./management-projects.js";
-import { permission, RepositoryManager, repoReads, repoWrites, integer, text, type Params } from "./management-repository.js";
+import { permission, RepositoryManager, repoReads, repoWrites, repoWriteAction, integer, text, type Params } from "./management-repository.js";
+import type { PluginWriteRequest } from "./write-identity.js";
 
 type Auth = { id: string; pem: string };
-export function registerManagement(ctx: PluginContext, github: GitHubClient, credentials: (companyId: string) => Promise<Auth>, synced: (companyId: string) => Promise<unknown>, cache = new GitHubReadCache(), ensureTasks?: ReturnType<typeof registerSync>["ensureTasks"]) {
+type WriteToken = (companyId: string, repository: string | null, request: PluginWriteRequest) => Promise<string | null>;
+export function registerManagement(ctx: PluginContext, github: GitHubClient, credentials: (companyId: string) => Promise<Auth>, synced: (companyId: string) => Promise<unknown>, cache = new GitHubReadCache(), ensureTasks?: ReturnType<typeof registerSync>["ensureTasks"], writeToken: WriteToken = async () => null, appUser: (companyId: string) => Promise<boolean> = async () => false) {
   const queues = new Map<string, Promise<unknown>>();
+  /**
+   * The App user's token for a board write when the company writes as its App user; null keeps the App.
+   * Asked for inside the company's write queue, right before the write: a kill switch flipped while the
+   * write waited applies to it.
+   */
+  const repositoryWriteToken = (companyId: string, fullName: string, op: string, p: Params) => writeToken(companyId, fullName, {
+    ...repoWriteAction(op, p), source: "board",
+    ...(Number.isSafeInteger(p.number) ? { pullRequest: Number(p.number) } : {}), ...(typeof p.sha === "string" ? { expectedHeadSha: p.sha } : {}),
+  });
   async function personal(companyId: string) {
     const config = await ctx.config.get(companyId);
     if (!config.personalToken) return null;
@@ -160,7 +171,8 @@ export function registerManagement(ctx: PluginContext, github: GitHubClient, cre
     const logins = [...new Set([...endpoints.map(endpoint => endpoint.botUsername).filter((login): login is string => Boolean(login)), ...explicitBotLogins])];
     if (agentIds.length && logins.length !== agentIds.length) throw nativeConnectorRequiredError();
     const reviewers = [...new Set([...humanReviewers, ...logins])];
-    const result = await write(companyId, "reviewers", op, params, beforeWrite => new RepositoryManager(github, auth, repository, beforeWrite).run(op, { ...params, number, reviewers }));
+    const result = await write(companyId, "reviewers", op, params, async beforeWrite =>
+      new RepositoryManager(github, auth, repository, beforeWrite, await repositoryWriteToken(companyId, repository.fullName, op, params)).run(op, { ...params, number, reviewers }));
     await ctx.activity.log({ companyId, message: `GitHub PR reviewers ${params.op === "request" ? "requested" : "removed"}`, metadata: { repositoryId: repository.id, number, agentIds, reviewers } });
     return { ...result as Record<string, unknown>, operation: params.op, authoringIdentity: { kind: "company-app", appId: auth.id }, reviewers, nativeGitHub: { requiredForAgents: true, setupPath: "/apps/chat/connect?provider=github&purpose=chat", mode: "routing-compatibility" } };
   });
@@ -281,7 +293,8 @@ export function registerManagement(ctx: PluginContext, github: GitHubClient, cre
       clean.destinationRepositoryId = destinationRepositoryId;
       clean.destinationNodeId = (await new RepositoryManager(github, auth, destination).run("metadata", {})).node_id;
     }
-    const operation = (beforeWrite?: () => Promise<void>) => new RepositoryManager(github, auth, repository, beforeWrite).run(op, clean);
+    const operation = async (beforeWrite?: () => Promise<void>) =>
+      new RepositoryManager(github, auth, repository, beforeWrite, repoWrites.has(op) ? await repositoryWriteToken(companyId, repository.fullName, op, clean) : null).run(op, clean);
     const { requestId: _requestId, refresh: _refresh, ...readParams } = clean;
     const result = repoWrites.has(op)
       ? await write(companyId, "repository", op, params, operation)
@@ -298,11 +311,16 @@ export function registerManagement(ctx: PluginContext, github: GitHubClient, cre
     const { companyId } = boardScope(params, actor), op = text(params.op, "action", 50);
     if (!projectReads.has(op) && !projectWrites.has(op)) throw new Error("Unknown project action.");
     const { auth, catalog } = await scope(companyId, params, projectWrites.has(op)), ownerLogin = text(params.owner, "account", 100);
-    let token: string, type: "Organization" | "User", personalIdentity: string | undefined;
+    // A write's token is asked for inside the company's write queue, right before the write.
+    let token: () => Promise<string>, type: "Organization" | "User", personalIdentity: string | undefined;
     if (params.ownerType === "User") {
+      // A personal token is outside the App user's fence, kill switch, throttle and audit, so it never writes for such a company.
+      if (projectWrites.has(op) && await appUser(companyId)) {
+        throw new Error("Personal Projects writes are off while this company writes as its GitHub App user: Paperclip cannot fence a personal token. Use an organization Project.");
+      }
       const access = await personal(companyId);
       if (!access || access.login.toLowerCase() !== ownerLogin.toLowerCase()) throw new Error("Connect this personal account in GitHub connection settings first.");
-      token = access.token; personalIdentity = token; type = "User";
+      personalIdentity = access.token; token = async () => access.token; type = "User";
     } else {
       const installation = catalog.installations.find(i => !i.suspended && i.accountType === "Organization" && i.login.toLowerCase() === ownerLogin.toLowerCase());
       if (!installation) throw new Error("Choose an organization connected to this company’s App.");
@@ -310,7 +328,15 @@ export function registerManagement(ctx: PluginContext, github: GitHubClient, cre
       if (!level || (projectWrites.has(op) && level !== "write" && level !== "admin")) throw new Error("Enable Organization Projects read/write on the GitHub App and approve the installation update.");
       const permissions: Record<string, string> = { organization_projects: projectWrites.has(op) ? "write" : "read", metadata: "read" };
       for (const key of ["issues", "pull_requests", "contents"]) if (installation.permissions?.[key]) permissions[key] = projectWrites.has(op) && ["convert-draft", "link-repository", "unlink-repository"].includes(op) ? installation.permissions[key] : "read";
-      token = await github.scopedToken(auth.id, auth.pem, installation.id, permissions); type = "Organization";
+      // Project writes act as the company's App user when it has one; reads stay on the App.
+      // An App-user company's App reads only its fenced repositories (its catalog), never the whole installation (I-RO).
+      const fenced = await appUser(companyId)
+        ? catalog.repositories.filter(repo => repo.installationId === installation.id).map(repo => repo.fullName).sort()
+        : undefined;
+      const appToken = () => fenced ? github.scopedToken(auth.id, auth.pem, installation.id, permissions, fenced) : github.scopedToken(auth.id, auth.pem, installation.id, permissions);
+      if (projectWrites.has(op)) token = async () => await writeToken(companyId, null, { action: "project", source: "board" }) ?? await appToken();
+      else { const minted = await appToken(); token = async () => minted; }
+      type = "Organization";
     }
     const repoNode = async (repositoryId: unknown, number?: unknown) => {
       const repo = catalog.repositories.find(r => r.id === repositoryId);
@@ -320,7 +346,7 @@ export function registerManagement(ctx: PluginContext, github: GitHubClient, cre
       const row = number === undefined ? null : await manager.run("issue", { number: integer(number) });
       return { id: metadata.node_id as string, contentId: row?.node_id as string | undefined };
     };
-    const operation = (beforeWrite?: () => Promise<void>) => new ProjectManager(github, token, { login: ownerLogin, type }, repoNode, beforeWrite).run(op, params);
+    const operation = async (beforeWrite?: () => Promise<void>) => new ProjectManager(github, await token(), { login: ownerLogin, type }, repoNode, beforeWrite).run(op, params);
     const { requestId: _requestId, refresh: _refresh, ...readParams } = params;
     const result = projectWrites.has(op)
       ? await write(companyId, "project", op, params, operation)

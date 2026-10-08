@@ -687,6 +687,17 @@ export interface PluginSecretsClient {
     secretRef: string | EnvSecretRefBinding,
     options?: { companyId?: string; configPath?: string },
   ): Promise<string>;
+
+  /**
+   * Store a new value in the company secret bound to one of this plugin's own
+   * secret config paths, as a new secret version. Requires `secrets.write-own`.
+   *
+   * An operator must first bind an existing company secret at `configPath` in
+   * the plugin's company config; this never creates a secret or touches any
+   * other secret. Use it for credentials the plugin itself rotates, such as an
+   * OAuth refresh token. Never log or return the value.
+   */
+  storeOwn(value: string, options: { companyId: string; configPath: string }): Promise<void>;
 }
 
 /**

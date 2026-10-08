@@ -667,8 +667,20 @@ A connector plugin can declare a repository source without adding its own projec
 projectRepositories: {
   listAction: "project-repositories",
   setupPath: "/github-projects", // optional; must match a declared page route
+  writeIdentityAction: "repository-write-identity", // optional; host-only, for managed git/gh
+  signCommitAction: "repository-sign-commit", // optional; host-only, signs commits for managed git
 }
 ```
+
+`writeIdentityAction` and `signCommitAction` are called only by the server, with
+a `system` actor whose `companyId` matches `params.companyId`; reject every
+other actor. The write identity action receives a `GitHubWriteIdentityRequest`
+(repository, access, action, privileged actions) and returns a
+`GitHubWriteIdentityDecision` from `@paperclipai/shared/github-write-identity`:
+defer to the run's user, a credential (token or identity only), or
+`unavailable`, which fails the operation closed. The sign action receives a
+base64 git object and returns an armored SSH signature or `unavailable`. See
+`doc/execution-github-identity.md`.
 
 Declare `ui.action.register` and register the named worker action. It receives the authenticated board user and authorized company in the ordinary immutable action context, plus `params.companyId`. Return `ProjectRepositoryOptions`: `repositories` (numeric GitHub `id` as a string, `fullName`, canonical HTTPS GitHub `url`, optional `private`, `connections`), `connectionCount`, `failedConnectionCount`, and optional `warnings`. A company without a connection returns zero counts and an empty array. Keep credentials and installation tokens inside the plugin. Counts and warnings should distinguish missing setup, empty access and partial provider failure.
 
