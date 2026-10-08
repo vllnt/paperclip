@@ -8213,8 +8213,21 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const monitorNotes =
+    input.contextSnapshot.source === "issue.monitor"
+      ? readNonEmptyString(input.contextSnapshot.monitorNotes)
+      : null;
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    wait: monitorNotes
+      ? {
+          note: monitorNotes,
+          attempt:
+            typeof input.contextSnapshot.monitorAttemptCount === "number"
+              ? input.contextSnapshot.monitorAttemptCount
+              : null,
+        }
+      : null,
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,
@@ -12097,6 +12110,8 @@ export function heartbeatService(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
           ),
+          // A paused agent keeps its waits; they fire once after it resumes.
+          sql`not exists (select 1 from ${agents} where ${agents.id} = ${issues.assigneeAgentId} and ${agents.status} = 'paused')`,
         ),
       )
       .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))

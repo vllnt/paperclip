@@ -222,6 +222,7 @@ import {
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
   cancelIssueThreadInteractionSchema,
+  issueWaitRequestSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
@@ -10118,6 +10119,14 @@ registerCurrentRoute({
   path: "/api/issues/{id}/monitor/check-now",
   tags: ["issues"],
   summary: "Run an issue monitor check now",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/wait",
+  tags: ["issues"],
+  summary: "Wait on the caller's own issue and re-check it after a bounded delay",
+  body: issueWaitRequestSchema,
 });
 
 registerCurrentRoute({

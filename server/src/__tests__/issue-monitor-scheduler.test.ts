@@ -148,7 +148,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   });
 
   async function seedFixture(input?: {
-    agentStatus?: "active" | "paused";
+    agentStatus?: "active" | "paused" | "terminated";
     issueStatus?: "in_progress" | "in_review";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
@@ -423,8 +423,32 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
+  it("keeps a paused agent's due monitor and fires it once after the agent resumes", async () => {
+    const { issueId, agentId } = await seedFixture({ agentStatus: "paused" });
+    const heartbeat = heartbeatService(db);
+
+    const whilePaused = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(whilePaused.skipped ?? 0).toBe(0);
+    const pausedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(pausedIssue.status).toBe("in_progress");
+    expect(pausedIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:30:00.000Z");
+    expect(parseIssueExecutionState(pausedIssue.executionState)?.monitor).toMatchObject({ status: "scheduled" });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual([]);
+
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+    const afterResume = await heartbeat.tickTimers(new Date("2026-04-11T12:40:00.000Z"));
+    expect(afterResume.enqueued).toBe(1);
+    await heartbeat.tickTimers(new Date("2026-04-11T12:41:00.000Z"));
+
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.map((wake) => wake.reason)).toEqual(["issue_monitor_due"]);
+    const resumedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(resumedIssue.monitorNextCheckAt).toBeNull();
+    expect(resumedIssue.monitorAttemptCount).toBe(1);
+  });
+
   it("clears due monitors that cannot be dispatched and records a skip", async () => {
-    const { issueId } = await seedFixture({ agentStatus: "paused" });
+    const { issueId } = await seedFixture({ agentStatus: "terminated" });
     const heartbeat = heartbeatService(db);
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 

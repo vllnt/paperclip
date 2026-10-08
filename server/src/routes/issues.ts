@@ -1,5 +1,10 @@
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
+import {
+  issueWaitRequestSchema,
+  parseIssueWaitDurationMs,
+  type IssueWaitRequest,
+} from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
 import { createIssueReadTiming } from "../services/issue-read-timing.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
@@ -153,6 +158,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
+import { scheduleIssueWaitMonitor } from "../services/issue-waits.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -12625,6 +12631,66 @@ export function issueRoutes(
 
     res.json({ ok: true });
   });
+
+  // An agent ends its turn with a wait instead of a background process: the
+  // issue keeps its status and the assignee is woken by its monitor later.
+  router.post(
+    "/issues/:id/wait",
+    validate(issueWaitRequestSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      await assertCanManageIssueMonitor(
+        access,
+        req,
+        issue.companyId,
+        issue.assigneeAgentId,
+        true,
+      );
+      const body = req.body as IssueWaitRequest;
+      const delayMs = parseIssueWaitDurationMs(body.in);
+      if (delayMs === null) throw unprocessable("Invalid wait duration");
+      const row = await db
+        .select()
+        .from(issueRows)
+        .where(eq(issueRows.id, issue.id))
+        .then((rows) => rows[0] ?? null);
+      if (!row) throw notFound("Issue not found");
+
+      const actor = getActorInfo(req);
+      const nextCheckAt = new Date(Date.now() + delayMs);
+      const updated = await scheduleIssueWaitMonitor(db, svc, {
+        issue: row,
+        nextCheckAt,
+        notes: `Waiting: ${body.reason}`,
+        serviceName: null,
+        externalRef: null,
+        activity: {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId ?? null,
+          runId: actor.runId ?? null,
+          source: "issue.wait",
+          details: { delayMs, reason: body.reason },
+        },
+      });
+      if (!updated) throw notFound("Issue not found");
+
+      res.json({
+        issueId: issue.id,
+        identifier: issue.identifier ?? null,
+        status: updated.status,
+        nextCheckAt: nextCheckAt.toISOString(),
+        reason: body.reason,
+      });
+    },
+  );
 
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
     assertBoard(req);
