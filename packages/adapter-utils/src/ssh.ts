@@ -321,6 +321,11 @@ async function spawnText(
     });
 
     if (options.stdin != null && child.stdin) {
+      // A child that exits before reading all of its input (a refused SSH
+      // connection, or a remote script that exits early on purpose) makes the
+      // pending write fail with EPIPE. Without a listener that error crashes
+      // the server. The exit status above already reports the outcome.
+      child.stdin.on("error", () => undefined);
       child.stdin.end(options.stdin);
     }
   });
@@ -723,6 +728,11 @@ async function streamLocalFileToSsh(input: {
     });
     source.on("error", fail);
     ssh.on("error", fail);
+    // `pipe` leaves errors on its destination unhandled. If ssh exits before
+    // reading the whole file (for example when the remote `cat` hits a full
+    // disk), the next write fails with EPIPE, which crashed the server. Stop
+    // reading the file instead; the ssh exit status reports why.
+    ssh.stdin?.on("error", () => source.destroy());
     if (input.progress) {
       input.progress.counter.on("error", fail);
       source.pipe(input.progress.counter).pipe(ssh.stdin ?? null);
@@ -730,6 +740,9 @@ async function streamLocalFileToSsh(input: {
       source.pipe(ssh.stdin ?? null);
     }
     ssh.on("close", (code) => {
+      // Nothing reads the file after ssh exits; release it even when an
+      // early exit stalled the pipe without a write error.
+      source.destroy();
       if (settled) return;
       settled = true;
       if ((code ?? 0) !== 0) {
@@ -1421,11 +1434,13 @@ export async function syncDirectoryToSsh(input: {
         return;
       }
       settled = true;
-      if ((tarExitCode ?? 0) !== 0) {
+      // When ssh stopped reading first, tar was stopped on purpose below, so
+      // only the ssh exit status says whether the remote got a whole archive.
+      if (!sshStoppedEarly && (tarExitCode ?? 0) !== 0) {
         reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
         return;
       }
-      if ((sshExitCode ?? 0) !== 0) {
+      if (sshStoppedEarly ? sshExitCode !== 0 : (sshExitCode ?? 0) !== 0) {
         reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
         return;
       }
@@ -1442,6 +1457,19 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
+    // ssh can stop reading before the archive ends (a dropped connection, or a
+    // remote extract on a full disk). The next write then fails with EPIPE,
+    // and `pipe` leaves that error unhandled, which would crash the server; if
+    // the ssh exit is seen first, the pipe stalls instead. Either way nothing
+    // reads tar's output any more, so stop tar, which would otherwise block on
+    // a full pipe forever.
+    let sshStoppedEarly = false;
+    const stopTarIfSshStoppedEarly = () => {
+      if (tarExited || tar.stdout?.readableEnded) return;
+      sshStoppedEarly = true;
+      tar.kill("SIGTERM");
+    };
+    ssh.stdin?.on("error", stopTarIfSshStoppedEarly);
     if (progress) {
       progress.counter.on("error", fail);
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
@@ -1465,6 +1493,7 @@ export async function syncDirectoryToSsh(input: {
     ssh.on("close", (code) => {
       sshExited = true;
       sshExitCode = code;
+      stopTarIfSshStoppedEarly();
       maybeFinish();
     });
     }).finally(auth.cleanup);
@@ -1535,11 +1564,13 @@ async function extractDirectoryFromSsh(input: {
       const maybeFinish = () => {
         if (settled || !sshExited || !tarExited) return;
         settled = true;
-        if ((sshExitCode ?? 0) !== 0) {
+        // When tar stopped reading first, ssh was stopped on purpose below, so
+        // only tar's exit status says whether it extracted a whole archive.
+        if (!tarStoppedEarly && (sshExitCode ?? 0) !== 0) {
           reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
           return;
         }
-        if ((tarExitCode ?? 0) !== 0) {
+        if (tarStoppedEarly ? tarExitCode !== 0 : (tarExitCode ?? 0) !== 0) {
           reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
           return;
         }
@@ -1554,6 +1585,19 @@ async function extractDirectoryFromSsh(input: {
         reject(error);
       };
 
+      // tar can stop reading before the archive ends (for example on a full
+      // disk). The next write then fails with EPIPE, and `pipe` leaves that
+      // error unhandled, which would crash the server; if the tar exit is seen
+      // first, the pipe stalls instead. Either way nothing reads ssh's output
+      // any more, so stop ssh, which would otherwise block on a full pipe
+      // forever.
+      let tarStoppedEarly = false;
+      const stopSshIfTarStoppedEarly = () => {
+        if (sshExited || ssh.stdout?.readableEnded) return;
+        tarStoppedEarly = true;
+        ssh.kill("SIGTERM");
+      };
+      tar.stdin?.on("error", stopSshIfTarStoppedEarly);
       if (progress) {
         progress.counter.on("error", fail);
         ssh.stdout?.pipe(progress.counter).pipe(tar.stdin ?? null);
@@ -1577,6 +1621,7 @@ async function extractDirectoryFromSsh(input: {
       tar.on("close", (code) => {
         tarExited = true;
         tarExitCode = code;
+        stopSshIfTarStoppedEarly();
         maybeFinish();
       });
     });
