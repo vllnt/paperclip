@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { ADAPTER_AGNOSTIC_KEYS } from "@paperclipai/shared";
 
 /**
  * Agent fields that bound how much an agent may run and spend, where it runs,
@@ -18,8 +19,10 @@ const PROTECTED_TOP_LEVEL_KEYS = [
 /**
  * adapterConfig keys an agent may not change on itself. They select the model,
  * engine, profile, or service tier; set per-run, spend, or session limits;
- * choose the executable, its arguments, its environment variables, its state
- * directory, the endpoint, or the runtime environment that serves the run; or
+ * choose the working directory (the workspace and sandbox root when a run has
+ * no project workspace), the executable, its arguments, its environment
+ * variables, its state directory, the endpoint, or the runtime environment
+ * that serves the run; or
  * relax approvals, sandbox scope, tool sets, gateway permissions, or data
  * retention consent. `env` is compared per variable.
  */
@@ -51,7 +54,9 @@ export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
   "outputInactivityTimeoutMs",
   "waitTimeoutMs",
   "warmHandleIdleMs",
+  "acpWarmHandleIdleMs",
   "lifecycleMode",
+  "cwd",
   "command",
   "agentCommand",
   "acpAgentCommand",
@@ -98,7 +103,7 @@ export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
 /**
  * Name patterns for adapterConfig keys that are protected even when they are
  * not listed: escape hatches, executables, permission modes, `max*` limits,
- * timeouts, profile selectors, and retention consents. They cover a new
+ * timeouts, idle timers, profile selectors, and retention consents. They cover a new
  * adapter key of the same kind without a change here.
  */
 const PROTECTED_ADAPTER_CONFIG_KEY_PATTERNS: readonly RegExp[] = [
@@ -107,6 +112,7 @@ const PROTECTED_ADAPTER_CONFIG_KEY_PATTERNS: readonly RegExp[] = [
   /PermissionMode$/i,
   /^max[A-Z]/,
   /[tT]imeout(Sec|Seconds|Ms)$/,
+  /IdleMs$/,
   /ProfileId$/,
   /RetentionAcknowledged$/,
 ];
@@ -217,7 +223,9 @@ export function collectAgentProtectedConfigChanges(
 /**
  * Applies `PATCH /agents/:id` merge rules to the protected fields: adapterConfig
  * merges into the stored config unless `replaceAdapterConfig` is set or the
- * adapter type changes, runtimeConfig replaces the stored config but keeps the
+ * adapter type changes (which keeps the stored adapter-agnostic keys such as
+ * `env` and `cwd` that the request omits), runtimeConfig replaces the stored
+ * config but keeps the
  * stored `aiConnection` when the request leaves it empty, and omitted top-level
  * fields keep their stored value. Callers restore redacted `env` echoes first.
  */
@@ -230,11 +238,18 @@ export function agentProtectedConfigAfterPatch(
   const changingAdapterType = adapterType !== existing.adapterType;
   const existingAdapterConfig = recordOrEmpty(existing.adapterConfig);
   const requestedAdapterConfig = isRecord(patch.adapterConfig) ? patch.adapterConfig : null;
-  const adapterConfig = !requestedAdapterConfig
-    ? (changingAdapterType ? {} : existingAdapterConfig)
+  const adapterConfig: Record<string, unknown> = !requestedAdapterConfig
+    ? (changingAdapterType ? {} : { ...existingAdapterConfig })
     : (replaceAdapterConfig || changingAdapterType
-      ? requestedAdapterConfig
+      ? { ...requestedAdapterConfig }
       : { ...existingAdapterConfig, ...requestedAdapterConfig });
+  if (changingAdapterType) {
+    for (const key of ADAPTER_AGNOSTIC_KEYS) {
+      if (adapterConfig[key] === undefined && existingAdapterConfig[key] !== undefined) {
+        adapterConfig[key] = existingAdapterConfig[key];
+      }
+    }
+  }
 
   const existingRuntimeConfig = recordOrEmpty(existing.runtimeConfig);
   const requestedRuntimeConfig = isRecord(patch.runtimeConfig) ? patch.runtimeConfig : null;

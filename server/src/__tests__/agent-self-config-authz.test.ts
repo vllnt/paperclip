@@ -26,7 +26,7 @@ function changesFor(patch: Record<string, unknown>, replaceAdapterConfig = false
 
 describe("agent self-config protected field diff", () => {
   it("ignores unprotected keys and unchanged protected values", () => {
-    expect(changesFor({ adapterConfig: { cwd: "/elsewhere", notes: "x" } })).toEqual([]);
+    expect(changesFor({ adapterConfig: { search: true, notes: "x" } })).toEqual([]);
     expect(changesFor({
       adapterType: "claude_local",
       adapterConfig: { model: "small-model", env: { A: "1" } },
@@ -56,7 +56,6 @@ describe("agent self-config protected field diff", () => {
     expect(changesFor({ adapterType: "codex_local" })).toEqual([
       "adapterType",
       "adapterConfig.effort",
-      "adapterConfig.env.A",
       "adapterConfig.model",
     ]);
     expect(changesFor({ runtimeConfig: { heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1, dailyRunLimit: 900 } } }))
@@ -125,24 +124,40 @@ describe("agent self-config protected field diff", () => {
         agentCoreRetentionAcknowledged: true,
         networkScope: "allow",
         filesystemScope: "host",
+        cwd: "/",
+        acpWarmHandleIdleMs: 600_000,
+        warmHandleIdleMs: 600_000,
+        lifecycleMode: "warm",
+        runtimeEnvType: "machine",
+        runtimeEnvName: "other-machine",
+        filesystemExtraPaths: ["/"],
+        networkAllowlist: ["*"],
       },
     })).toEqual([
       "adapterConfig.acpAgentCommand",
       "adapterConfig.acpStateDir",
+      "adapterConfig.acpWarmHandleIdleMs",
       "adapterConfig.acpxPermissionMode",
       "adapterConfig.agentCoreRetentionAcknowledged",
       "adapterConfig.codexPermissionMode",
+      "adapterConfig.cwd",
       "adapterConfig.enabledToolsets",
       "adapterConfig.engine",
+      "adapterConfig.filesystemExtraPaths",
       "adapterConfig.filesystemScope",
       "adapterConfig.hermesCommand",
       "adapterConfig.idleTimeoutMs",
+      "adapterConfig.lifecycleMode",
       "adapterConfig.managedProfileId",
       "adapterConfig.maxEstimatedSessionCostUsd",
       "adapterConfig.maxIterations",
+      "adapterConfig.networkAllowlist",
       "adapterConfig.networkScope",
+      "adapterConfig.runtimeEnvName",
+      "adapterConfig.runtimeEnvType",
       "adapterConfig.stateDir",
       "adapterConfig.toolsets",
+      "adapterConfig.warmHandleIdleMs",
     ]);
   });
 
@@ -155,10 +170,12 @@ describe("agent self-config protected field diff", () => {
         probeTimeoutSec: 1,
         futureProfileId: "p",
         futureRetentionAcknowledged: true,
+        futureIdleMs: 1,
         notes: "unprotected",
       },
     })).toEqual([
       "adapterConfig.futureCommand",
+      "adapterConfig.futureIdleMs",
       "adapterConfig.futurePermissionMode",
       "adapterConfig.futureProfileId",
       "adapterConfig.futureRetentionAcknowledged",

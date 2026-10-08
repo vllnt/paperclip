@@ -252,6 +252,7 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       body: { adapterConfig: { env: { CODEX_HOME: { type: "plain", value: "/tmp/other-codex-home" } } } },
       fields: ["adapterConfig.env.CODEX_HOME"],
     },
+    { label: "adapterConfig.cwd", body: { adapterConfig: { cwd: "/" } }, fields: ["adapterConfig.cwd"] },
     { label: "adapterConfig.command", body: { adapterConfig: { command: "/tmp/wrapper" } }, fields: ["adapterConfig.command"] },
     {
       label: "adapterConfig.agentCommand",
@@ -357,7 +358,7 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
 
     const res = await request(createApp(db, agentActor(companyId, agentId)))
       .patch(`/api/agents/${agentId}`)
-      .send({ adapterConfig: { cwd: "/tmp/agent-self-config-next" } });
+      .send({ adapterConfig: { search: true } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.details.fields).toEqual(["adapterConfig.dangerouslyBypassApprovalsAndSandbox"]);
@@ -524,13 +525,10 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
 
     const res = await request(createApp(db, agentActor(companyId, agentId)))
       .patch(`/api/agents/${agentId}`)
-      .send({ adapterConfig: { cwd: "/tmp/agent-self-config-next" } });
+      .send({ adapterConfig: { search: true } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect((await readAgent(db, agentId)).adapterConfig).toEqual({
-      ...STORED_ADAPTER_CONFIG,
-      cwd: "/tmp/agent-self-config-next",
-    });
+    expect((await readAgent(db, agentId)).adapterConfig).toEqual({ ...STORED_ADAPTER_CONFIG, search: true });
     expect(await deniedActivity(db, agentId)).toHaveLength(0);
   });
 
