@@ -103,6 +103,23 @@ async function allowsGitHubCredentialExport(
   );
 }
 
+/**
+ * Who is acting, so managed launchers can mark agent commits and PR text even
+ * when the GitHub actor is a person's account. Never a credential.
+ */
+export type GitHubOperationAttribution = { agentName: string; runId: string };
+
+async function operationAttribution(
+  db: Db,
+  run: typeof heartbeatRuns.$inferSelect,
+): Promise<GitHubOperationAttribution> {
+  const [agent] = await db
+    .select({ name: agents.name })
+    .from(agents)
+    .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)));
+  return { agentName: agent?.name ?? run.agentId, runId: run.id };
+}
+
 /** No company secrets or ambient credentials are consulted by this path. */
 export async function resolveGitHubOperationCredentials(
   db: Db,
@@ -114,6 +131,7 @@ export async function resolveGitHubOperationCredentials(
 ) {
   const { run, context } = await captureRunIdentity(db, input);
   if (!context) throw forbidden("This run predates managed GitHub credentials");
+  const attribution = await operationAttribution(db, run);
   let summary: GitHubCredentialSummary;
   let env: Record<string, string> = {};
   // A sponsored guest's responsible person is an internal accountability field,
@@ -134,6 +152,7 @@ export async function resolveGitHubOperationCredentials(
       identityContextId: context.id,
       revision: context.revision,
       ...summary,
+      attribution,
       env,
     };
   }
@@ -189,6 +208,7 @@ export async function resolveGitHubOperationCredentials(
     identityContextId: context?.id ?? null,
     revision: context?.revision ?? null,
     ...summary,
+    attribution,
     env,
   };
 }
