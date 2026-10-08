@@ -77,6 +77,40 @@ PATCH /api/agents/{agentId}
 }
 ```
 
+By default `adapterConfig` merges at the top level (a partial `env` replaces the whole `env`) and
+`runtimeConfig` is replaced. Set `"replaceAdapterConfig": true` to replace `adapterConfig`.
+
+### Change one config value (merge patch)
+
+Set `"mergeConfig": true` to send only the keys you want to change. `adapterConfig` and `runtimeConfig`
+are applied as JSON merge patches ([RFC 7396](https://www.rfc-editor.org/rfc/rfc7396)) over the stored
+config:
+
+- Keys you name change. Keys you don't name keep their stored values, including secrets, so you never
+  resend a secret to change something else.
+- `null` removes a key.
+- Arrays and scalars replace the stored value.
+- Each `adapterConfig.env` entry is replaced whole (an env binding is never mixed with another), and so is
+  `adapterConfig.workspaceStrategy`.
+- An `adapterConfig.env` value read back from `GET` as `{"type":"plain","value":"***REDACTED***"}` restores the
+  stored value. Other redacted values are not restored, so don't send them back.
+- `runtimeConfig.aiConnection` can't be removed this way (`422`); change the agent's AI connection instead.
+
+```
+PATCH /api/agents/{agentId}
+{
+  "mergeConfig": true,
+  "runtimeConfig": { "heartbeat": { "maxDailyRuns": 64 } },
+  "adapterConfig": { "model": "gpt-5", "env": { "DEBUG": null } }
+}
+```
+
+The merged configs are validated like a full update and recorded as a config revision. If the stored
+config changes while your patch is applied, the request fails with `409`; read it again and retry.
+`mergeConfig` can't be combined with `replaceAdapterConfig` or an `adapterType` change (`422`). Authorization is
+unchanged: board users need `agents:configure` on the agent, and agents keep their existing limits on
+changing themselves.
+
 ## Pause Agent
 
 ```
