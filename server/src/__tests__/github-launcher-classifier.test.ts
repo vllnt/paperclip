@@ -48,23 +48,32 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     return { git, gh, calls };
   }
 
-  it("m1: GH_REPO cannot stand in for the saved default or remote that gh repo edit really acts on", async () => {
+  it("m1: GH_REPO cannot stand in for the saved default or remote that gh repo fork really acts on", async () => {
     const f = await setup();
     f.git("remote", "add", "origin", "https://github.com/Anthm-FR/linkzic.git");
     f.git("config", "remote.origin.gh-resolved", "base");
-    for (const args of [["repo", "edit", "--description", "x"], ["repo", "archive", "--yes"]]) {
-      const refused = await f.gh(args, { GH_REPO: "Anthm-FR/songtrivia" });
-      expect(refused.code, args.join(" ")).toBe(1);
-      expect(refused.stderr, args.join(" ")).toContain("cannot tell which repository");
-    }
+    const refused = await f.gh(["repo", "fork", "--clone=false"], { GH_REPO: "Anthm-FR/songtrivia" });
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain("cannot tell which repository");
     // A saved default other than the remote counts the same way.
     f.git("config", "remote.origin.gh-resolved", "Anthm-FR/wordzic");
-    expect((await f.gh(["repo", "edit", "--description", "x"], { GH_REPO: "Anthm-FR/songtrivia" })).code).toBe(1);
+    expect((await f.gh(["repo", "fork", "--clone=false"], { GH_REPO: "Anthm-FR/songtrivia" })).code).toBe(1);
     expect(await f.calls()).toEqual([]);
     // When GH_REPO and the checkout agree, the command runs.
     f.git("config", "remote.origin.gh-resolved", "base");
-    const agreed = await f.gh(["repo", "edit", "--description", "x"], { GH_REPO: "Anthm-FR/linkzic" });
+    const agreed = await f.gh(["repo", "fork", "--clone=false"], { GH_REPO: "Anthm-FR/linkzic" });
     expect(agreed.code, agreed.stderr).toBe(0);
-    expect(await f.calls()).toEqual([{ args: ["repo", "edit", "--description", "x"], repo: "Anthm-FR/linkzic" }]);
+    expect(await f.calls()).toEqual([{ args: ["repo", "fork", "--clone=false"], repo: "Anthm-FR/linkzic" }]);
+  }, 60_000);
+
+  it("never runs a gh command agents never perform, even when the repository is clear", async () => {
+    const f = await setup();
+    f.git("remote", "add", "origin", "https://github.com/Anthm-FR/linkzic.git");
+    for (const args of [["repo", "archive", "--yes"], ["repo", "edit", "--visibility", "public"], ["api", "-X", "DELETE", "repos/Anthm-FR/linkzic/hooks/1"]]) {
+      const refused = await f.gh(args, { GH_REPO: "Anthm-FR/linkzic" });
+      expect(refused.code, args.join(" ")).toBe(1);
+      expect(refused.stderr, args.join(" ")).toContain("Denied: agents never");
+    }
+    expect(await f.calls()).toEqual([]);
   }, 60_000);
 });

@@ -320,11 +320,16 @@ describe("security review round 3 (attack regressions)", () => {
 describe("security review round 4 (attack regressions)", () => {
   const origin = "https://github.com/Anthm-FR/songtrivia.git";
   it("N3: gh repo verbs without a repository argument are checked against the saved default and remotes, not only GH_REPO", () => {
-    for (const args of [["repo", "edit", "--description", "x"], ["repo", "archive", "--yes"], ["repo", "fork"], ["repo", "unarchive", "--yes"]]) {
+    for (const args of [["repo", "fork"], ["repo", "fork", "--clone=false"]]) {
       const classified = classifyGitHubOperation({ program: "gh", args, remote: origin, ghRepo: "Anthm-FR/anthm-fr", ghResolved: ["Anthm-FR/linkzic"] });
       expect(classified.denied, args.join(" ")).toMatch(/cannot tell which repository/);
       // Without a saved default, the remote counts as well.
       expect(classifyGitHubOperation({ program: "gh", args, remote: origin, ghRepo: "Anthm-FR/anthm-fr" }).denied, args.join(" ")).toMatch(/cannot tell which repository/);
+    }
+    // Archiving, unarchiving or editing a repository is refused whichever repository it names, for every company.
+    for (const args of [["repo", "edit", "--description", "x"], ["repo", "archive", "--yes"], ["repo", "unarchive", "--yes"]]) {
+      expect(classifyGitHubOperation({ program: "gh", args, remote: origin, ghRepo: "Anthm-FR/anthm-fr", ghResolved: ["Anthm-FR/linkzic"] }), args.join(" "))
+        .toMatchObject({ denied: expect.stringMatching(/^Denied: agents never/), integrity: true });
     }
     // GH_REPO and the checkout agree, or the repository is named: one repository.
     expect(classifyGitHubOperation({ program: "gh", args: ["repo", "edit", "--description", "x"], remote: origin, ghRepo: "Anthm-FR/songtrivia" })).toMatchObject({ repository: "anthm-fr/songtrivia" });

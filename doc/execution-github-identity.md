@@ -265,6 +265,37 @@ remote push refspecs, `push.followTags`), a `gh` command that could pick
 between several remotes without `-R`, a `gh api` ref or tag hidden in an
 `--input` or `-F name=@file` file, and a command too long to report whole.
 
+**Operations agents never perform.** These are refused for every company,
+with or without a write identity policy, and no toggle turns them on. No token
+is handed out, and the refusal (`Denied: agents never …`, naming the route) is
+recorded as `github.write_identity_resolved` with the agent and run:
+
+| Operation | Refused routes |
+|---|---|
+| Archive, unarchive, delete, rename, transfer or change the settings of a repository | `gh repo archive\|unarchive\|delete\|rename\|edit\|transfer`; any `gh api` write to `repos/OWNER/REPO` (or `repositories/ID`) itself or to `…/transfer`; GraphQL `archiveRepository`, `unarchiveRepository`, `updateRepository`, `transferRepository` |
+| Delete or force-push a default branch (`main`, `master`) | `git push` with `--delete`/`-d`, `:main`, `+…:main`, `-f`/`--force`/`--force-with-lease` reaching `main`, `--mirror`, `--prune` or `--force` with branch patterns, `+:`, and a push without refspecs whose repository config may force or prune; `gh repo sync --force` on the default branch; `DELETE …/git/refs/heads/main`, `PATCH` there with `force` not `false` or a body Paperclip cannot read; `POST …/branches/main/rename`; GraphQL `deleteRef`, `updateRef`, `updateRefs` (they name the ref by node ID, so every branch: use `git push`) |
+| Change branch protection or rulesets | writes to `…/branches/BRANCH/protection/**`, `…/tags/protection/**`, `…/rulesets/**`, `orgs/ORG/rulesets/**`; GraphQL `create`/`update`/`deleteBranchProtectionRule` and `…RepositoryRuleset` |
+| Change webhooks | writes to `…/hooks/**`, `orgs/ORG/hooks/**` |
+| Change secrets, variables or deploy keys | `gh secret`/`gh variable` writes, `gh repo deploy-key` writes; writes to `…/actions/secrets/**` and `…/actions/variables/**`, `…/dependabot/secrets/**`, `…/codespaces/secrets/**` (repository and organization), `…/keys/**` |
+| Delete deployments, change or delete environments, or mark a deployment inactive | `gh deployment delete`; writes to `…/environments/**`, `DELETE …/deployments/ID`, `POST …/deployments/ID/statuses` with `state=inactive` or a body Paperclip cannot read; GraphQL `deleteDeployment`, `createDeploymentStatus`, `create`/`update`/`deleteEnvironment` |
+
+Requests that could hide one of them are refused for every company as well: a
+GraphQL query or body from a file or stdin or in a `-F` value with a gh
+placeholder, an unreadable GraphQL document, mutation fragments or
+subscriptions, any GraphQL mutation outside the comment and Project fence (it
+names its target by node ID), a `gh api` write whose endpoint Paperclip cannot
+route (`..`, a bad encoding, half-filled placeholders) or holds a gh placeholder
+after `repos/{owner}/{repo}` (gh fills `{branch}` after the check, and a branch
+may be named `heads/main` or `hooks/1`), and a gh option before the verb. A
+`state` or `force` value from a query string, a file or a placeholder counts as
+unknown, and only a literal `force=false` is not forced. Routes are matched
+case-insensitively, after decoding, and a branch name may hold slashes.
+Other branch protection lives at GitHub: a protected branch that is not
+`main` or `master` is protected by its own rules, which agents cannot change.
+Deployment statuses other than `inactive` stay `deploymentApproval`, and
+feature branches may still be force-pushed (with or without a lease) and
+deleted.
+
 An **admin merge** needs the pull request number and the full expected head
 commit SHA (`gh pr merge <n> --admin --match-head-commit <40-character sha>`,
 or the API `sha`); an abbreviation is refused. Every `gh pr merge` option must
