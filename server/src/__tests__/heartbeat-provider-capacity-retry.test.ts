@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, like, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -46,7 +46,7 @@ const CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different 
 const MINUTE_MS = 60_000;
 
 type ScriptedOutcome =
-  | { kind: "capacity"; usefulComment?: boolean }
+  | { kind: "capacity"; usefulComment?: boolean; outputTokens?: number }
   | { kind: "transient" }
   | { kind: "success" };
 
@@ -96,7 +96,11 @@ describeEmbeddedPostgres("provider capacity retries", () => {
         exitCode: 1, signal: null, timedOut: false, provider: "openai", model: "gpt-test",
         errorMessage: "We're currently experiencing high demand.",
         errorCode: "codex_transient_upstream", errorFamily: "transient_upstream",
-        resultJson: { stderr: "We're currently experiencing high demand.", errorFamily: "transient_upstream" },
+        // An adapter cannot exempt its own runs from the cap.
+        resultJson: {
+          stderr: "We're currently experiencing high demand.", errorFamily: "transient_upstream",
+          providerQuotaBeforeUsefulAction: true,
+        },
       };
     }
     if (outcome.usefulComment) {
@@ -110,6 +114,7 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     return {
       exitCode: 1, signal: null, timedOut: false, provider: "openai", model: "gpt-test",
       errorMessage: CAPACITY_MESSAGE, errorCode: "provider_quota", errorFamily: "provider_quota",
+      ...(outcome.outputTokens ? { usage: { inputTokens: 900, outputTokens: outcome.outputTokens } } : {}),
       resultJson: { stdout: "", stderr: CAPACITY_MESSAGE, errorFamily: "provider_quota" },
     };
   }
@@ -127,6 +132,12 @@ describeEmbeddedPostgres("provider capacity retries", () => {
       }),
     });
   }, 20_000);
+
+  beforeEach(async () => {
+    // maxDailyRuns uses the UTC day. Keep each test inside one day.
+    const msToUtcMidnight = 86_400_000 - (Date.now() % 86_400_000);
+    if (msToUtcMidnight < 30_000) await new Promise((resolve) => setTimeout(resolve, msToUtcMidnight + 1_000));
+  });
 
   afterEach(async () => {
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
@@ -263,7 +274,7 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     expect(skipped).toMatchObject({ reason: "heartbeat.daily_run_limit" });
   });
 
-  it("bounds a permanent outage with a daily allowance and records an alarm", async () => {
+  it("bounds a permanent outage: past the daily allowance failures count toward the cap again", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     const { companyId, agentId, issueId } = await seed({
       maxDailyRuns: 1,
@@ -275,20 +286,46 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     expect((await runPendingRetry(companyId))?.status).toBe("failed");
     expect((await runPendingRetry(companyId))?.status).toBe("failed");
 
-    // The third failure is beyond the allowance: it counts as a normal run and
-    // the chain falls back to the default retry budget, which is spent.
-    expect(await pendingRetry(companyId)).toBeNull();
-    expect(executedRunIds).toHaveLength(3);
-    const alarms = await db.select({ action: activityLog.action, entityId: activityLog.entityId, details: activityLog.details })
+    // The third failure passes the allowance of two: the alarm fires once and
+    // the failure counts, so the cap cancels the next retry before the adapter.
+    const alarms = await db.select({ entityId: activityLog.entityId, details: activityLog.details })
       .from(activityLog)
-      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "heartbeat.provider_quota_retry_allowance_exhausted")));
-    expect(alarms).toHaveLength(1);
-    expect(alarms[0]).toMatchObject({ entityId: agentId, details: { limit: 2, observed: 3 } });
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "heartbeat.provider_quota_cap_exemption_exhausted")));
+    expect(alarms).toEqual([{ entityId: agentId, details: expect.objectContaining({ limit: 2, observed: 3 }) }]);
+    expect(await runPendingRetry(companyId)).toMatchObject({
+      status: "cancelled", errorCode: "heartbeat.daily_run_limit",
+    });
+    expect(executedRunIds).toHaveLength(3);
+    expect(await pendingRetry(companyId)).toBeNull();
+  });
 
-    // Beyond the allowance the outage spends the ordinary cap.
-    expect(await heartbeat.wakeup(agentId, {
-      source: "on_demand", triggerDetail: "manual", reason: "manual_check", payload: {}, requestedByActorType: "system",
-    })).toBeNull();
+  it("lets the hourly quota monitor re-dispatch a chain the default budget would have abandoned", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const sourceRunId = randomUUID();
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId, companyId, agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "failed", errorCode: "provider_quota", error: CAPACITY_MESSAGE,
+      startedAt: new Date(), finishedAt: new Date(),
+      scheduledRetryAttempt: 2, scheduledRetryReason: "transient_failure",
+      resultJson: {
+        errorFamily: "provider_quota", providerQuotaBeforeUsefulAction: true,
+        conversationContinuation: "continue_conversation_v1",
+      },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "transient_failure_retry" },
+    });
+
+    // The reconciler arms the hourly provider-quota monitor for the issue.
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const [armed] = await db.select({ monitorNextCheckAt: issues.monitorNextCheckAt }).from(issues).where(eq(issues.id, issueId));
+    expect(armed?.monitorNextCheckAt).toBeTruthy();
+
+    await heartbeat.tickTimers(new Date(armed!.monitorNextCheckAt!.getTime() + 1_000));
+    // Two retries are spent; the default budget would return retry_exhausted.
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, sourceRunId));
+    expect(successor).toMatchObject({
+      status: "scheduled_retry", scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 3,
+    });
   });
 
   it("keeps probing at the slower recovery cadence after the backoff window", async () => {
@@ -325,26 +362,31 @@ describeEmbeddedPostgres("provider capacity retries", () => {
 
   it("leaves non-capacity failures on the existing retry budget and run cap", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
-    const { companyId, agentId, issueId } = await seed({ maxDailyRuns: 2 });
+    const { companyId, agentId, issueId } = await seed({ maxDailyRuns: 3 });
     script = [{ kind: "transient" }, { kind: "transient" }, { kind: "transient" }];
 
     await assign(agentId, issueId);
-    const [first] = await companyRuns(companyId);
-    expect(first!.resultJson).not.toHaveProperty("providerQuotaBeforeUsefulAction");
-    expect((await scheduledRetryEvent(first!.id))?.payload).toMatchObject({ delayMs: 30_000, baseDelayMs: 30_000 });
     expect((await runPendingRetry(companyId))?.status).toBe("failed");
-
-    // Two started failures reach maxDailyRuns: 2, so the second retry is
-    // cancelled before the adapter runs.
-    const capped = await runPendingRetry(companyId);
-    expect(capped).toMatchObject({ status: "cancelled", errorCode: "heartbeat.daily_run_limit" });
-    expect(executedRunIds).toHaveLength(2);
+    expect((await runPendingRetry(companyId))?.status).toBe("failed");
+    const failed = (await companyRuns(companyId)).filter((run) => run.status === "failed");
+    expect(failed).toHaveLength(3);
+    for (const run of failed) expect(run.resultJson).not.toHaveProperty("providerQuotaBeforeUsefulAction");
+    expect((await scheduledRetryEvent(failed[0]!.id))?.payload).toMatchObject({ delayMs: 30_000, baseDelayMs: 30_000 });
+    expect((await scheduledRetryEvent(failed[1]!.id))?.payload).toMatchObject({ delayMs: 30_000, baseDelayMs: 30_000 });
+    // The two-attempt budget is spent and all three failures count toward the cap.
+    expect(await pendingRetry(companyId)).toBeNull();
+    expect(await heartbeat.wakeup(agentId, {
+      source: "on_demand", triggerDetail: "manual", reason: "manual_check", payload: {}, requestedByActorType: "system",
+    })).toBeNull();
   });
 
-  it("treats a capacity failure after useful work as an ordinary failed run", async () => {
+  it.each([
+    ["an issue comment", { usefulComment: true }],
+    ["model output tokens", { outputTokens: 120 }],
+  ] as const)("treats a capacity failure after %s as an ordinary failed run", async (_label, useful) => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     const { companyId, agentId, issueId } = await seed({ maxDailyRuns: 2 });
-    script = [{ kind: "capacity", usefulComment: true }, { kind: "capacity", usefulComment: true }, { kind: "success" }];
+    script = [{ kind: "capacity", ...useful }, { kind: "capacity", ...useful }, { kind: "success" }];
 
     await assign(agentId, issueId);
     const [first] = await companyRuns(companyId);
@@ -352,6 +394,19 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     expect(first!.resultJson).not.toHaveProperty("providerQuotaBeforeUsefulAction");
     expect((await scheduledRetryEvent(first!.id))?.payload).toMatchObject({ delayMs: 30_000 });
     expect((await runPendingRetry(companyId))?.status).toBe("failed");
+    expect(await runPendingRetry(companyId)).toMatchObject({
+      status: "cancelled", errorCode: "heartbeat.daily_run_limit",
+    });
+  });
+
+  it("restores the default budget and cap when providerQuotaRetry is disabled", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { companyId, agentId, issueId } = await seed({ maxDailyRuns: 1, providerQuotaRetry: { enabled: false } });
+    script = [{ kind: "capacity" }, { kind: "success" }];
+
+    await assign(agentId, issueId);
+    const [first] = await companyRuns(companyId);
+    expect((await scheduledRetryEvent(first!.id))?.payload).toMatchObject({ delayMs: 30_000 });
     expect(await runPendingRetry(companyId)).toMatchObject({
       status: "cancelled", errorCode: "heartbeat.daily_run_limit",
     });

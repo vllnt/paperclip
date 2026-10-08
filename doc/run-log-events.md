@@ -274,12 +274,12 @@ suppressed. Missing source context, authorization failures, and other setup
 errors retain their failure classification. An untyped error with the same
 message is also still a failure; cancellation requires the typed ownership guard.
 
-A `provider_quota` failure before any useful action records
+A legacy `provider_quota` failure before any useful action records
 `providerQuotaBeforeUsefulAction: true` in the run result. Its retry receipt
 carries `providerQuotaRetryPhase` (`backoff` or `slow`); a slow-phase receipt
-reads `Scheduled provider quota retry N at the hourly recovery cadence`. When
-the agent's daily allowance is spent, the run receives a warning lifecycle
-event, `Provider quota retry allowance spent`, and keeps the default budget.
+reads `Scheduled provider quota retry N at the hourly recovery cadence`. The
+retry context carries `providerQuotaRetryStartedAt`, the start of the backoff
+window.
 
 Bounded retry exhaustion writes one lifecycle receipt per run, retry reason,
 scheduled attempt, and retry limit. Repeated or concurrent recovery checks reuse

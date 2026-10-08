@@ -70,7 +70,7 @@ const ACTIVITY_ROW_VERBS: Record<string, string> = {
   "agent.runtime_session_reset": "reset session for",
   "heartbeat.invoked": "invoked heartbeat for",
   "heartbeat.cancelled": "cancelled heartbeat for",
-  "heartbeat.provider_quota_retry_allowance_exhausted": "spent the daily provider quota retry allowance for",
+  "heartbeat.provider_quota_cap_exemption_exhausted": "spent the daily provider quota cap exemption for",
   "heartbeat.output_stale_source_resolved": "system-folded stale run on",
   "heartbeat.output_stale_recovery_recursion_refused": "refused recovery-on-recovery for",
   "approval.created": "requested approval",

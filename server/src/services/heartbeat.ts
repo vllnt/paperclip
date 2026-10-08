@@ -2038,28 +2038,27 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
 const PROVIDER_QUOTA_RETRY_BASE_DELAY_MS = 60 * 1000;
 const PROVIDER_QUOTA_RETRY_MAX_BACKOFF_DELAY_MS = 30 * 60 * 1000;
 const PROVIDER_QUOTA_RETRY_JITTER_RATIO = 0.2;
-const PROVIDER_QUOTA_RETRY_ALLOWANCE_EXHAUSTED_ACTION =
-  "heartbeat.provider_quota_retry_allowance_exhausted";
+const PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION =
+  "heartbeat.provider_quota_cap_exemption_exhausted";
 
 export interface ProviderQuotaRetryPolicy {
+  /** False restores the default transient retry budget and charges every quota failure. */
+  enabled: boolean;
   /** Backoff attempts before the chain drops to the hourly recovery cadence. */
   maxAttempts: number;
   /** Backoff window measured from the chain's first quota failure. */
   windowMs: number;
-  /** Per agent and UTC day: quota failures exempt from maxDailyRuns and eligible for this policy. */
+  /** Per agent and UTC day: quota failures exempt from maxDailyRuns. Later ones count. */
   maxDailyUncountedRuns: number;
 }
 
-/**
- * Reads `runtimeConfig.heartbeat.providerQuotaRetry`. Setting
- * `maxDailyUncountedRuns` to 0 restores the default transient retry budget
- * and charges every quota failure to maxDailyRuns.
- */
+/** Reads `runtimeConfig.heartbeat.providerQuotaRetry`. */
 function parseProviderQuotaRetryPolicy(value: unknown): ProviderQuotaRetryPolicy {
   const configured = parseObject(value);
   const bounded = (raw: unknown, fallback: number, max: number) =>
     Math.max(0, Math.min(max, Math.floor(asNumber(raw, fallback))));
   return {
+    enabled: asBoolean(configured.enabled, true),
     maxAttempts: bounded(configured.maxAttempts, 8, 50),
     windowMs: bounded(configured.windowMinutes, 120, 24 * 60) * 60 * 1000,
     maxDailyUncountedRuns: bounded(configured.maxDailyUncountedRuns, 48, 1000),
@@ -9782,9 +9781,11 @@ export function heartbeatService(
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
     },
-    // Mirrors scheduleBoundedRetryForRun's transient budget check: a failed
-    // or interrupted run that has already consumed every bounded transient
-    // attempt cannot be retried again through this lane.
+    // Mirrors scheduleBoundedRetryForRun's default transient budget check: a
+    // failed or interrupted run that has already consumed every bounded
+    // transient attempt cannot be retried again through this lane. A
+    // provider-quota failure before useful action has no fixed ceiling there;
+    // recovery routes it to the quota branch before it can reach this check.
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -15540,29 +15541,21 @@ export function heartbeatService(
 
   /**
    * The provider-quota retry lane applies to a run that failed before any
-   * useful action, while the agent's daily allowance holds. Beyond it the run
-   * keeps the default transient budget, and the day's first overflow is
-   * recorded on the agent so a permanent outage is visible.
+   * useful action. It does not stop on its own: past the backoff window it
+   * keeps one retry per hour, and the daily run cap bounds a permanent
+   * outage once the agent's uncounted allowance is spent.
    */
-  async function resolveProviderQuotaRetry(
+  function resolveProviderQuotaRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
   ) {
+    const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
     if (
+      !policy.enabled ||
       run.status !== "failed" ||
       readHeartbeatRunErrorFamily(run) !== "provider_quota" ||
       parseObject(run.resultJson).providerQuotaBeforeUsefulAction !== true
     ) {
-      return null;
-    }
-    const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
-    if (policy.maxDailyUncountedRuns === 0) return null;
-    const usage = await getHeartbeatDailyRunUsage(agent, null);
-    if (usage.providerQuotaBeforeUsefulAction > policy.maxDailyUncountedRuns) {
-      await recordProviderQuotaRetryAllowanceExhausted(run, agent, {
-        observed: usage.providerQuotaBeforeUsefulAction,
-        limit: policy.maxDailyUncountedRuns,
-      });
       return null;
     }
     const chainStartedAt =
@@ -15572,44 +15565,58 @@ export function heartbeatService(
     return { policy, chainStartedAt };
   }
 
-  async function recordProviderQuotaRetryAllowanceExhausted(
+  /**
+   * Records, once per agent and UTC day, that quota failures before useful
+   * action passed the uncounted allowance and now count toward maxDailyRuns.
+   * Best effort: finalization continues if the alarm cannot be written.
+   */
+  async function recordProviderQuotaCapExemptionExhausted(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
-    usage: { observed: number; limit: number },
   ) {
-    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-    await appendRunEvent(run, {
-      eventType: "lifecycle",
-      stream: "system",
-      level: "warn",
-      message: `Provider quota retry allowance spent (${usage.observed}/${usage.limit} today); this failure keeps the default retry budget and counts toward maxDailyRuns`,
-      payload: { ...usage, issueId },
-    });
-    const { start } = currentUtcDayWindow();
-    const [alreadyRecorded] = await db
-      .select({ id: activityLog.id })
-      .from(activityLog)
-      .where(
-        and(
-          eq(activityLog.companyId, agent.companyId),
-          eq(activityLog.action, PROVIDER_QUOTA_RETRY_ALLOWANCE_EXHAUSTED_ACTION),
-          eq(activityLog.entityType, "agent"),
-          eq(activityLog.entityId, agent.id),
-          gte(activityLog.createdAt, start),
-        ),
-      )
-      .limit(1);
-    if (alreadyRecorded) return;
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: "system",
-      actorId: "heartbeat",
-      agentId: agent.id,
-      action: PROVIDER_QUOTA_RETRY_ALLOWANCE_EXHAUSTED_ACTION,
-      entityType: "agent",
-      entityId: agent.id,
-      details: { ...usage, runId: run.id, issueId },
-    });
+    const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
+    if (!policy.enabled) return;
+    try {
+      const usage = await getHeartbeatDailyRunUsage(agent, null);
+      if (usage.providerQuotaBeforeUsefulAction <= policy.maxDailyUncountedRuns) {
+        return;
+      }
+      const { start } = currentUtcDayWindow();
+      const [alreadyRecorded] = await db
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, agent.companyId),
+            eq(activityLog.action, PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION),
+            eq(activityLog.entityType, "agent"),
+            eq(activityLog.entityId, agent.id),
+            gte(activityLog.createdAt, start),
+          ),
+        )
+        .limit(1);
+      if (alreadyRecorded) return;
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: agent.id,
+        action: PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION,
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          observed: usage.providerQuotaBeforeUsefulAction,
+          limit: policy.maxDailyUncountedRuns,
+          runId: run.id,
+          issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, agentId: agent.id },
+        "failed to record the provider quota cap exemption alarm",
+      );
+    }
   }
 
   async function scheduleBoundedRetryForRun(
@@ -15643,7 +15650,7 @@ export function heartbeatService(
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
       opts?.maxAttempts == null &&
       opts?.delayMs == null
-        ? await resolveProviderQuotaRetry(run, agent)
+        ? resolveProviderQuotaRetry(run, agent)
         : null;
     const maxAttempts = Math.max(
       0,
@@ -15897,12 +15904,10 @@ export function heartbeatService(
             }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-        ...(providerQuotaRetry
-          ? {
-              providerQuotaRetryStartedAt:
-                providerQuotaRetry.chainStartedAt.toISOString(),
-            }
-          : {}),
+        // Only a quota-lane retry carries the chain start; any other retry
+        // drops it so a later quota failure starts a fresh backoff window.
+        providerQuotaRetryStartedAt:
+          providerQuotaRetry?.chainStartedAt.toISOString(),
       },
       "normal_model",
     );
@@ -17139,10 +17144,12 @@ export function heartbeatService(
       // allowance count again, so a permanent outage still meets the cap.
       const observed =
         usage.total -
-        Math.min(
-          usage.providerQuotaBeforeUsefulAction,
-          policy.providerQuotaRetry.maxDailyUncountedRuns,
-        );
+        (policy.providerQuotaRetry.enabled
+          ? Math.min(
+              usage.providerQuotaBeforeUsefulAction,
+              policy.providerQuotaRetry.maxDailyUncountedRuns,
+            )
+          : 0);
       if (observed >= policy.maxDailyRuns) {
         return {
           reason: "heartbeat.daily_run_limit",
@@ -18725,8 +18732,10 @@ export function heartbeatService(
     resultJson: Record<string, unknown> | null;
   }) {
     const { resultJson } = input;
+    // Native runs are excluded: native recovery owns their retries.
     const marked =
       input.outcome === "failed" &&
+      input.run.runtimeMode !== "native" &&
       input.outputTokens === 0 &&
       readHeartbeatRunErrorFamily({ errorCode: input.errorCode, resultJson }) ===
         "provider_quota" &&
@@ -26060,6 +26069,9 @@ export function heartbeatService(
               persistedRun,
               persistedResultJson,
             )) ?? persistedRun;
+          if (persistedResultJson?.providerQuotaBeforeUsefulAction === true) {
+            await recordProviderQuotaCapExemptionExhausted(persistedRun, agent);
+          }
         }
 
         await setWakeupStatus(
