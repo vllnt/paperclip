@@ -1359,6 +1359,14 @@ Per-agent schedule fields in `adapter_config`:
 - `intervalSec` integer (minimum 30)
 - `maxConcurrentRuns` integer; new agents default to `20`; scheduler clamps configured values to `1..50`
 
+Per-agent run limits in `runtime_config.heartbeat`:
+
+- `maxDailyRuns` integer, optional: started runs per agent per UTC day. A run that failed with a provider quota or capacity error (`provider_quota`) before any useful action is not counted, up to `providerQuotaRetry.maxDailyUncountedRuns` per day. "Before any useful action" means the model returned no output tokens and the run created no issue comment, document revision, work product, or non-bookkeeping activity. Failures beyond the allowance count again, so the cap still bounds a permanent outage.
+- `providerQuotaRetry.maxAttempts` (default `8`, clamped `0..50`) and `providerQuotaRetry.windowMinutes` (default `120`, clamped `0..1440`): such a failure is retried with exponential backoff (1, 2, 4 … minutes, capped at 30, ±20% jitter) while both bounds hold, measured from the chain's first failure. After that the chain keeps one retry per hour, so the issue always has a scheduled run.
+- `providerQuotaRetry.maxDailyUncountedRuns` (default `48`, clamped `0..1000`): beyond it, a quota failure keeps the default transient retry budget, and the day's first overflow writes a `heartbeat.provider_quota_retry_allowance_exhausted` activity entry on the agent. `0` disables the quota retry lane and the cap exemption.
+
+Other failure classes keep the default bounded transient retry budget and count toward `maxDailyRuns`.
+
 Scheduler must skip invocation when:
 
 - agent is paused/terminated

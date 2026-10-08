@@ -20,6 +20,11 @@ describe("activity formatting", () => {
     expect(formatActivityVerb("issue.read_unmarked")).toBe("marked unread");
   });
 
+  it("names the provider quota retry allowance alarm", () => {
+    expect(formatActivityVerb("heartbeat.provider_quota_retry_allowance_exhausted"))
+      .toBe("spent the daily provider quota retry allowance for");
+  });
+
   it("formats blocker activity using linked issue identifiers", () => {
     const details = {
       addedBlockedByIssues: [
