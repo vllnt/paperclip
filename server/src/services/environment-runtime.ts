@@ -1213,6 +1213,7 @@ async function removeReleasedSshRunDirectory(db: Db, environment: Environment, l
       Number(metadata.port) !== parsed.config.port ||
       metadata.username !== parsed.config.username
     ) {
+      logger.info({ leaseId: lease.id, runId }, "kept a finished SSH run directory: the environment now points at another host");
       return;
     }
     const outcome = await removeRestoredSshRunDirectory({

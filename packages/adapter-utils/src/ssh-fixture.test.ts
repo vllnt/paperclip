@@ -1530,14 +1530,33 @@ describe("SSH run directory cleanup", () => {
     await writeFile(path.join(outside, "keep.txt"), "outside\n");
     await symlink(outside, path.join(run.runDir, "workspace", "escape"));
     const readOnly = path.join(run.runDir, "workspace", "modcache");
-    await mkdir(readOnly);
+    await mkdir(path.join(readOnly, "sealed"), { recursive: true });
     await writeFile(path.join(readOnly, "locked.txt"), "x");
+    await writeFile(path.join(readOnly, "sealed", "inner.txt"), "x");
+    await chmod(path.join(readOnly, "sealed"), 0o000);
     await chmod(readOnly, 0o555);
 
     await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
       .resolves.toBe("removed");
     await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(outside, "keep.txt"), "utf8")).resolves.toBe("outside\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the marker when the run directory itself cannot be removed, so a retry works", async () => {
+    const run = await startRun("SSH run directory retry test");
+    if (!run) return;
+    await run.prepared.restoreWorkspace();
+    const runsDir = path.dirname(run.runDir);
+    await chmod(runsDir, 0o555);
+    try {
+      await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+        .resolves.toBe("rm_failed");
+      await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+    } finally {
+      await chmod(runsDir, 0o755);
+    }
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("removed");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("does not accept a symlinked marker", async () => {
@@ -1553,6 +1572,8 @@ describe("SSH run directory cleanup", () => {
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("marks a run directory removable when preparation fails before any agent ran", async () => {
+    // The failure comes from an unreadable file, which root can still read.
+    if (process.getuid?.() === 0) return;
     const rootDir = await createFixtureRootDir();
     const localDir = path.join(rootDir, "local-workspace");
     await mkdir(localDir, { recursive: true });

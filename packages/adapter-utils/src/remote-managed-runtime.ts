@@ -89,10 +89,19 @@ export async function removeRestoredSshRunDirectory(input: {
     '  if [ ! -d "$dir" ]; then echo absent; exit 0; fi',
     "done",
     `if [ -L ${shellQuote(marker)} ] || [ ! -f ${shellQuote(marker)} ]; then echo not_restored; exit 0; fi`,
-    // Read-only directories (a Go module cache, say) would stop rm -rf.
-    `find ${shellQuote(runDir)} -type d ! -perm -200 -exec chmod u+w {} + 2>/dev/null || true`,
-    `if find ${shellQuote(runDir)} -mindepth 1 -maxdepth 1 ! -name ${shellQuote(SSH_RUN_RESTORED_MARKER)} -exec rm -rf -- {} + \\`,
-    `  && rm -f -- ${shellQuote(marker)} && rmdir -- ${shellQuote(runDir)}; then echo removed; else echo rm_failed; fi`,
+    // Directories without owner rwx (a Go module cache, say) would stop rm -rf.
+    // A per-directory `-exec ... ;` runs chmod before find descends into that
+    // directory, so nested ones are reached too.
+    `find ${shellQuote(runDir)} -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null || true`,
+    // Delete the marker last and put it back if the directory itself stays, so
+    // a failed removal can always be retried.
+    `if find ${shellQuote(runDir)} -mindepth 1 -maxdepth 1 ! -name ${shellQuote(SSH_RUN_RESTORED_MARKER)} -exec rm -rf -- {} + 2>/dev/null \\`,
+    `  && rm -f -- ${shellQuote(marker)} \\`,
+    `  && { rmdir -- ${shellQuote(runDir)} 2>/dev/null || { : > ${shellQuote(marker)}; false; }; }; then`,
+    "  echo removed",
+    "else",
+    "  echo rm_failed",
+    "fi",
   ].join("\n");
   const result = await runSshCommand(input.spec, script, {
     timeoutMs: input.timeoutMs ?? 120_000,
@@ -204,6 +213,8 @@ export async function prepareRemoteManagedRuntime(input: {
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
   const marker = runDir ? path.posix.join(runDir, SSH_RUN_RESTORED_MARKER) : null;
   // Best effort: without the marker the run directory is only kept.
+  // This relies on each run id being prepared once, before any agent runs in
+  // it (every caller does so: a retry gets a new run id).
   const markNothingToKeep = async () => {
     if (!runDir || !marker) return;
     await runSshCommand(input.spec, `if [ -d ${shellQuote(runDir)} ]; then : > ${shellQuote(marker)}; fi`)
