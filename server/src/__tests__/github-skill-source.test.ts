@@ -199,11 +199,27 @@ describe('GitHub skill repository discovery', () => {
       'SKILL.md': md('web-performance') + docs, 'references/eval-audits.md': 'agent-browser eval -b "$B64"\n',
     }));
     expect(allowed.skills[0]!.error).toBeNull();
-    for (const shell of ['eval "$(fetch-installer)"', 'setup; eval $CMD', 'x=$(eval echo hi)', '```sh\n  eval "$x"\n```', '$ eval "$x"']) {
+    for (const shell of ['eval "$(fetch-installer)"', 'setup; eval $CMD', 'x=$(eval echo hi)', '```sh\n  eval "$x"\n```', '$ eval "$x"',
+      'if [ -f x ]; then eval "$(cat x)"; fi', 'for i in a; do eval "$i"; done', 'else eval "$x"', 'command eval "$x"', 'builtin eval "$x"',
+      '! eval "$x"', 'case a in a) eval "$x";; esac', 'X=1 eval echo OK', 'a\r\neval "$x"', 'a\reval "$x"']) {
       const blocked = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, githubFixture({
         'SKILL.md': `${md('unsafe')}\n${shell}\n`,
       }));
       expect(blocked.skills[0]!.error, shell).toMatch(/execution/);
+    }
+    for (const [file, body] of [['scripts/run.js', 'const x = eval(code);'], ['assets/inline.txt', 'window.eval(code)'], ['scripts/notes.md', 'agent-browser eval x']]) {
+      const runnable = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, githubFixture({ 'SKILL.md': md('unsafe'), [file]: body }));
+      expect(runnable.skills[0]!.error, file).toMatch(/execution/);
+    }
+  });
+  it('audits pathological documentation in linear time', async () => {
+    for (const filler of ['\n', '\n ', '\r\n', 'a=', ' ']) {
+      const started = performance.now();
+      const result = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, githubFixture({
+        'SKILL.md': md('big'), 'references/pad.md': filler.repeat(Math.floor(1_000_000 / filler.length)),
+      }));
+      expect(result.skills[0]!.error, JSON.stringify(filler)).toBeNull();
+      expect(performance.now() - started, JSON.stringify(filler)).toBeLessThan(2_000);
     }
   });
   it('warns about network use only in files that can run, not in documentation', async () => {

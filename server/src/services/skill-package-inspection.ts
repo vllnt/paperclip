@@ -5,10 +5,12 @@ import { skillFileBytes } from './skill-snapshot.js';
 
 /** Inspect explicit Markdown links and inline-code resource paths, not project filenames, prose, or shell commands. */
 function referencesIn(markdown: string) {
-  const text = markdown.replace(/^\s*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^\s*\1\s*$/gm, '');
+  // Indentation is `[ \t]*`, never `\s*`: under `m`, `\s*` crosses newlines and a run of blank
+  // lines becomes quadratic, which blocks the server on a hostile package.
+  const text = markdown.replace(/^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*$/gm, '');
   const references: { target: string; rootRelative: boolean }[] = [];
   // Link/image destinations and reference definitions; optional titles are not part of the path.
-  for (const match of text.matchAll(/(?:!?\[[^\]\n]*\]\(|^\s*\[[^\]\n]+\]:\s*)(?:<([^>\n]+)>|([^\s)]+))/gm)) {
+  for (const match of text.matchAll(/(?:!?\[[^\]\n]*\]\(|^[ \t]*\[[^\]\n]+\]:\s*)(?:<([^>\n]+)>|([^\s)]+))/gm)) {
     references.push({ target: match[1] ?? match[2]!, rootRelative: false });
   }
   for (const match of text.matchAll(/(?<!`)`([^`\n]+)`(?!`)/g)) {
