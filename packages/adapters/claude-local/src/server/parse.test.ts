@@ -145,6 +145,63 @@ describe("detectClaudeLoginRequired", () => {
       }).requiresLogin,
     ).toBe(false);
   });
+
+  it("ignores login words inside stream-json events such as a tool result", () => {
+    // Production runs echoed skills/paperclip/SKILL.md into a tool result. Its
+    // text "rejects unknown or unauthorized recipients" matched the bare
+    // `unauthorized` marker and flipped successful runs to claude_auth_required.
+    const parsed = { type: "result", subtype: "success", is_error: false, result: "Done." };
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", model: "claude-opus-5-5" }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          content: [{
+            type: "tool_result",
+            tool_use_id: "toolu_1",
+            content: "The server rejects unknown or unauthorized recipients. Do not guess IDs.",
+          }],
+        },
+      }),
+      JSON.stringify(parsed),
+    ].join("\n");
+    expect(detectClaudeLoginRequired({ parsed, stdout, stderr: "" }).requiresLogin).toBe(false);
+  });
+
+  it("still classifies the real logged-out Claude CLI output as login required", () => {
+    // Captured from Claude Code 2.1.293 run logged out with `--print
+    // --output-format stream-json --verbose` (trimmed): exit 1, empty stderr.
+    // The prompt reaches the parsed result text, so it survives the stream-json
+    // line filter.
+    const parsed = {
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+      terminal_reason: "api_error",
+      session_id: "s-1",
+    };
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", apiKeySource: "none" }),
+      JSON.stringify({
+        type: "assistant",
+        session_id: "s-1",
+        message: { model: "<synthetic>", content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+      }),
+      JSON.stringify(parsed),
+    ].join("\n");
+    expect(detectClaudeLoginRequired({ parsed, stdout, stderr: "" }).requiresLogin).toBe(true);
+  });
+
+  it("still scans plain-text stdout lines for the login prompt", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: "Not logged in · Please run /login\n",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
 });
 
 describe("isClaudeModelNotFoundError", () => {
