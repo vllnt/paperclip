@@ -2581,7 +2581,13 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
     }
   }
 
-  const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|\beval\b|\bpython\s+-c\b|\bnode\s+-e\b/i;
+  const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|\bpython\s+-c\b|\bnode\s+-e\b/i;
+  // In documentation, `eval` counts only in shell command position (line start, after a
+  // separator, a `$ ` prompt, a control keyword or a leading env assignment): a file named
+  // `eval-audits.md` or a subcommand such as `agent-browser --session=x eval` is not dynamic
+  // execution. `[ \t]*` (not `\s*`) and the bounded value keep it linear. Runnable files keep every `eval`.
+  const docEvalPattern = /(?:^|[\r\n;&|(){`!]|\$ |\b(?:then|do|else|elif|command|builtin)\b|(?<![-\w])[A-Za-z_]\w*=[^\s=]{0,128})[ \t]*eval\s/i;
+  const anyEvalPattern = /\beval\b/i;
   const secretExfilPattern = /\b(?:cat|printenv|env|grep)\b[\s\S]{0,160}(?:\.aws\/credentials|\.ssh\/|\.npmrc|id_rsa|OPENAI_API_KEY|ANTHROPIC_API_KEY|API_KEY|TOKEN|SECRET)[\s\S]{0,160}\b(?:curl|wget|nc|netcat|scp)\b/i;
   const networkPattern = /\b(?:curl|wget|fetch|httpie|nc|netcat|scp|ssh)\b|https?:\/\//i;
   const secretReferencePattern = /\b(?:process\.env|printenv|\$[A-Z][A-Z0-9_]{2,}|API_KEY|TOKEN|SECRET|PASSWORD|\.env)\b/i;
@@ -2602,13 +2608,15 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
     if (file.kind === "asset" && contentLooksBinary(file.bytes)) continue;
 
     const text = file.bytes.toString("utf8");
-    if (remoteExecPattern.test(text)) {
+    const isDocumentation = isMarkdownPath(file.path) && file.kind !== "script";
+    if (remoteExecPattern.test(text) || (isDocumentation ? docEvalPattern : anyEvalPattern).test(text)) {
       pushFinding(findings, "remote_fetch_exec", "error", "Remote-fetch or dynamic execution pattern is not allowed.", file.path);
     }
     if (secretExfilPattern.test(text)) {
       pushFinding(findings, "secret_exfiltration", "error", "Secret exfiltration pattern is not allowed.", file.path);
     }
-    if (networkPattern.test(text)) {
+    // Documentation naturally names URLs and network tools; flag only files that can run.
+    if (!isDocumentation && networkPattern.test(text)) {
       pushFinding(findings, "network_reference", "warning", "Skill content references network-capable commands or URLs.", file.path);
     }
     if (secretReferencePattern.test(text)) {
