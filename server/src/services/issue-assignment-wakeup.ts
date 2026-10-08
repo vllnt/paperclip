@@ -44,6 +44,18 @@ export type IssueAssignmentWakeRefusal =
   | "superseded";
 
 /**
+ * A stale wake after a quick reassignment (`assignee_mismatch`, `superseded`)
+ * is expected and only warns. A key that names a generation the issue never
+ * reached, or is not a valid key at all, means a server bug and is an error.
+ */
+export const ISSUE_ASSIGNMENT_WAKE_REFUSAL_LOG_LEVEL: Record<IssueAssignmentWakeRefusal, "warn" | "error"> = {
+  assignee_mismatch: "warn",
+  superseded: "warn",
+  generation_ahead: "error",
+  malformed_key: "error",
+};
+
+/**
  * Admission rule for an assignment-keyed wake, evaluated under the issue lock.
  * The wake may run only for the issue's current agent assignee, for a
  * generation the issue has reached, and when no newer assignment has been

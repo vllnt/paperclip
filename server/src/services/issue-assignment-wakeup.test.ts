@@ -4,6 +4,7 @@ import { FailedChatRunRetryAuthorizationError } from "./durable-chat-wakeup.js";
 import {
   buildIssueAssignmentIdempotencyKey,
   decideIssueAssignmentWakeRefusal,
+  ISSUE_ASSIGNMENT_WAKE_REFUSAL_LOG_LEVEL,
   parseIssueAssignmentIdempotencyKey,
   queueIssueAssignmentWakeup,
 } from "./issue-assignment-wakeup.js";
@@ -163,5 +164,14 @@ describe("issue assignment wakeup delivery", () => {
     expect(decide({ lockedIssue: { ...lockedIssue, statusVersion: 3 } })).toBe("generation_ahead");
     // A -> B -> A recorded newer generations, so A's first key is stale.
     expect(decide({ newestRecordedGeneration: 6 })).toBe("superseded");
+  });
+
+  it("warns for a stale wake after a quick reassignment and errors for an impossible key", () => {
+    expect(ISSUE_ASSIGNMENT_WAKE_REFUSAL_LOG_LEVEL).toEqual({
+      assignee_mismatch: "warn",
+      superseded: "warn",
+      generation_ahead: "error",
+      malformed_key: "error",
+    });
   });
 });

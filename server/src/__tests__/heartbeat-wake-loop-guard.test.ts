@@ -32,6 +32,7 @@ import { buildIssueBlockersResolvedWakeStateKey } from "../services/issue-depend
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.ts";
 import { issueService } from "../services/issues.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { logger } from "../middleware/logger.ts";
 
 const SUCCESS = {
   exitCode: 0,
@@ -372,6 +373,20 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       "issue_unblock_requested",
     ]);
   });
+
+  /** Log levels of "assignment wake refused" lines written while `action` runs. */
+  async function refusalLogLevels(action: () => Promise<unknown>) {
+    const errorLog = vi.spyOn(logger, "error");
+    const warnLog = vi.spyOn(logger, "warn");
+    try {
+      await action();
+      const refused = (calls: unknown[][]) => calls.filter((call) => call.includes("assignment wake refused")).length;
+      return { error: refused(errorLog.mock.calls), warn: refused(warnLog.mock.calls) };
+    } finally {
+      errorLog.mockRestore();
+      warnLog.mockRestore();
+    }
+  }
 
   /** Runs started by an assignment wake (follow-up repair runs excluded). */
   const assignmentRunsFor = (agentId: string) =>
@@ -755,8 +770,8 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       .where(eq(issues.id, issueId));
     const runsBeforeRefusal = await assignmentRunsFor(agentId);
 
-    // A generation the issue never reached is refused, durably and loudly.
-    await expect(heartbeat.wakeup(agentId, {
+    // A generation the issue never reached is refused, durably and as an error.
+    const levels = await refusalLogLevels(() => expect(heartbeat.wakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
@@ -765,7 +780,8 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       requestedByActorType: "user",
       requestedByActorId: "board-user",
       contextSnapshot: { issueId, source: "issue.update" },
-    })).resolves.toBeNull();
+    })).resolves.toBeNull());
+    expect(levels).toEqual({ error: 1, warn: 0 });
     await waitForIdle();
     const refused = await db
       .select()
@@ -872,7 +888,8 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     // with that stale key must not revive the old A assignment: it is refused
     // with a skipped receipt instead of starting a run.
     const runsBeforeReplay = await assignmentRunsFor(agentA);
-    await expect(
+    // A stale wake after quick reassignments is expected: it only warns.
+    const levels = await refusalLogLevels(() => expect(
       heartbeat.wakeup(agentA, {
         source: "assignment",
         triggerDetail: "system",
@@ -883,7 +900,8 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
         requestedByActorId: "board-user",
         contextSnapshot: { issueId, source: "issue.update" },
       }),
-    ).resolves.toBeNull();
+    ).resolves.toBeNull());
+    expect(levels).toEqual({ error: 0, warn: 1 });
     await waitForIdle();
     expect(await assignmentRunsFor(agentA)).toHaveLength(runsBeforeReplay.length);
     const staleReplay = await db

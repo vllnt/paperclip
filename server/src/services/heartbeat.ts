@@ -193,6 +193,7 @@ import { isUniqueViolation } from "../db-errors.js";
 import {
   decideIssueAssignmentWakeRefusal,
   ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX,
+  ISSUE_ASSIGNMENT_WAKE_REFUSAL_LOG_LEVEL,
   ISSUE_ASSIGNMENT_WAKE_REFUSED_REASON,
   type IssueAssignmentWakeRefusal,
   parseIssueAssignmentIdempotencyKey,
@@ -27206,9 +27207,9 @@ export function heartbeatService(
       refusal: IssueAssignmentWakeRefusal,
       details: Record<string, unknown>,
     ) => {
-      // Every refusal is durable and loud: the assignee would otherwise wait
+      // Every refusal is durable and logged: the assignee would otherwise wait
       // on a wake that never runs, with nothing to show why.
-      logger.error(
+      logger[ISSUE_ASSIGNMENT_WAKE_REFUSAL_LOG_LEVEL[refusal]](
         { agentId, companyId: agent.companyId, issueId, idempotencyKey: assignmentIdempotencyKey, refusal, ...details },
         "assignment wake refused",
       );
