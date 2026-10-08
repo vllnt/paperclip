@@ -2076,15 +2076,18 @@ export function recoveryService(
     });
   }
 
+  /**
+   * Only for a reviewer who is the issue's agent assignee: the dispatch is
+   * that assignment's missed wake, under the assignee's assignment key.
+   */
   async function enqueueInitialAssignedReviewDispatch(
     issue: typeof issues.$inferSelect,
-    agentId: string,
     pendingExecutionState: Pick<IssueExecutionState, "currentStageId" | "currentStageType">,
   ) {
     return queueIssueAssignmentWakeup({
       heartbeat: { wakeup: deps.enqueueWakeup },
       assignmentEvent: true,
-      issue: { ...issue, assigneeAgentId: agentId },
+      issue,
       reason: "issue_assigned",
       mutation: "review_assignment_recovery",
       contextSource: "issue.review_assignment_recovery",
@@ -4996,6 +4999,10 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
+          } else if (issue.assigneeAgentId !== participantAgentId) {
+            // The reviewer is not the issue's agent assignee, so there is no
+            // assignment for this dispatch to deliver. Leave it as base did.
+            result.skipped += 1;
           } else if (
             // A claimed or deferred wake for this reviewer will still run.
             await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId, {
@@ -5013,7 +5020,6 @@ export function recoveryService(
           } else {
             const queued = await enqueueInitialAssignedReviewDispatch(
               issue,
-              participantAgentId,
               pendingExecutionState,
             );
             if (queued) {
