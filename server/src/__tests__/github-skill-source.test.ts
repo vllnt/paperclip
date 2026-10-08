@@ -194,6 +194,7 @@ describe('GitHub skill repository discovery', () => {
       'Use [page audit snippets](references/eval-audits.md) only when needed.',
       '```bash\nagent-browser open https://example.com\nagent-browser eval --stdin < audit.js\n```',
       '| Images without dimensions | `eval` finds `<img>` lacking width |',
+      'agent-browser --session=audit --cdp=9222 eval --stdin < audit.js',
     ].join('\n\n');
     const allowed = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, githubFixture({
       'SKILL.md': md('web-performance') + docs, 'references/eval-audits.md': 'agent-browser eval -b "$B64"\n',
@@ -212,7 +213,7 @@ describe('GitHub skill repository discovery', () => {
       expect(runnable.skills[0]!.error, file).toMatch(/execution/);
     }
   });
-  it('audits pathological documentation in linear time', async () => {
+  it('scans 1 MB of blank-line, whitespace and assignment filler quickly', async () => {
     for (const filler of ['\n', '\n ', '\r\n', 'a=', ' ']) {
       const started = performance.now();
       const result = await scanGitHubSkills({ repositoryUrl: 'https://github.com/acme/skills' }, githubFixture({

@@ -2583,10 +2583,10 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
 
   const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|\bpython\s+-c\b|\bnode\s+-e\b/i;
   // In documentation, `eval` counts only in shell command position (line start, after a
-  // separator, a `$ ` prompt, a control keyword or an env assignment): a file named
-  // `eval-audits.md` or a subcommand such as `agent-browser eval` is not dynamic execution.
-  // `[ \t]*` (not `\s*`) and the bounded `\S{0,128}` keep the scan linear. Runnable files keep every `eval`.
-  const docEvalPattern = /(?:^|[\r\n;&|(){`!]|\$ |\b(?:then|do|else|elif|command|builtin)\b|=\S{0,128})[ \t]*eval\s/i;
+  // separator, a `$ ` prompt, a control keyword or a leading env assignment): a file named
+  // `eval-audits.md` or a subcommand such as `agent-browser --session=x eval` is not dynamic
+  // execution. `[ \t]*` (not `\s*`) and the bounded value keep it linear. Runnable files keep every `eval`.
+  const docEvalPattern = /(?:^|[\r\n;&|(){`!]|\$ |\b(?:then|do|else|elif|command|builtin)\b|(?<![-\w])[A-Za-z_]\w*=[^\s=]{0,128})[ \t]*eval\s/i;
   const anyEvalPattern = /\beval\b/i;
   const secretExfilPattern = /\b(?:cat|printenv|env|grep)\b[\s\S]{0,160}(?:\.aws\/credentials|\.ssh\/|\.npmrc|id_rsa|OPENAI_API_KEY|ANTHROPIC_API_KEY|API_KEY|TOKEN|SECRET)[\s\S]{0,160}\b(?:curl|wget|nc|netcat|scp)\b/i;
   const networkPattern = /\b(?:curl|wget|fetch|httpie|nc|netcat|scp|ssh)\b|https?:\/\//i;
