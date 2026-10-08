@@ -1,7 +1,11 @@
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const execFileAsync = promisify(execFile);
 
 const {
   prepareWorkspaceForSshExecution,
@@ -18,7 +22,8 @@ const {
   syncDirectoryToSsh: vi.fn(async (_input: { localDir: string }) => undefined),
 }));
 
-vi.mock("./ssh.js", () => ({
+vi.mock("./ssh.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./ssh.js")>()),
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
   runSshCommand,
@@ -26,6 +31,7 @@ vi.mock("./ssh.js", () => ({
 }));
 
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { sshSyncBackDependencyExcludes } from "./ssh.js";
 import { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
 
@@ -56,6 +62,79 @@ describe("remote managed runtime", () => {
     }));
     const args = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [{ baselineSnapshot: { entries: Map<string, unknown> } }];
     expect(args[0].baselineSnapshot.entries.has("node_modules/personal.bin")).toBe(true);
+  });
+
+  it.each([
+    { gitBacked: true, label: "Git-backed" },
+    { gitBacked: false, label: "plain" },
+  ])("keeps dependency and cache directories out of the $label SSH sync-back baseline", async ({ gitBacked }) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-deps-"));
+    cleanupDirs.push(root);
+    const files = [
+      "src/index.ts",
+      "dist/index.js",
+      "vendor/lib.go",
+      "node_modules/.pnpm/dep@1.0.0/node_modules/dep/index.js",
+      "packages/app/node_modules/dep/index.js",
+      ".pnpm-store/v10/index.json",
+      ".next/cache/page.js",
+      "packages/app/.turbo/cache.json",
+      ".cache/tool.bin",
+    ];
+    for (const file of files) {
+      await mkdir(path.dirname(path.join(root, file)), { recursive: true });
+      await writeFile(path.join(root, file), file);
+    }
+    if (gitBacked) await execFileAsync("git", ["init", "-q", root]);
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked });
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+      runId: "deps", adapterKey: "test", workspaceLocalDir: root,
+    });
+    await prepared.restoreWorkspace();
+
+    const [{ baselineSnapshot }] = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [
+      { baselineSnapshot: { exclude: string[]; entries: Map<string, unknown> } },
+    ];
+    // The SSH sync-back tar reuses `baselineSnapshot.exclude`, so these
+    // patterns keep remote dependency trees off the host's disk.
+    for (const name of ["node_modules", ".pnpm-store", ".next", ".turbo", ".cache"]) {
+      expect(baselineSnapshot.exclude).toEqual(expect.arrayContaining([name, `${name}/*`, `*/${name}`, `*/${name}/*`]));
+    }
+    // Build output and vendored code may be tracked, so they still sync back.
+    const baselineFiles = [...baselineSnapshot.entries.keys()].filter((entry) => files.includes(entry)).sort();
+    expect(baselineFiles).toEqual(["dist/index.js", "src/index.ts", "vendor/lib.go"]);
+  });
+
+  it("keeps syncing a dependency name that the Git workspace tracks", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-tracked-deps-"));
+    cleanupDirs.push(root);
+    await execFileAsync("git", ["init", "-q", root]);
+    await mkdir(path.join(root, "action", "node_modules", "dep"), { recursive: true });
+    await mkdir(path.join(root, ".cache"), { recursive: true });
+    await writeFile(path.join(root, "action", "node_modules", "dep", "index.js"), "committed");
+    await writeFile(path.join(root, ".cache", "untracked.bin"), "regenerated");
+    await execFileAsync("git", ["-C", root, "add", "action/node_modules/dep/index.js"]);
+    prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked: true });
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+      runId: "tracked-deps", adapterKey: "test", workspaceLocalDir: root,
+    });
+    await prepared.restoreWorkspace();
+
+    const [{ baselineSnapshot }] = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [
+      { baselineSnapshot: { exclude: string[]; entries: Map<string, unknown> } },
+    ];
+    expect(baselineSnapshot.exclude).toEqual([
+      ".git", ".git/*", ".paperclip-runtime",
+      ...sshSyncBackDependencyExcludes([".pnpm-store", ".next", ".turbo", ".cache"]),
+    ]);
+    expect(baselineSnapshot.entries.has("action/node_modules/dep/index.js")).toBe(true);
+    expect(baselineSnapshot.entries.has(".cache/untracked.bin")).toBe(false);
   });
 
 

@@ -54,6 +54,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (target.transport === "ssh") {
       // Reuse SSH's plain directory transfer without its task-workspace suffix
       // or Git-history discovery. The registered root is the exact writable root.
+      // The transfer is exact on purpose: every path except .paperclip-runtime
+      // is a valid agent file (agentFilePath), so the execution-workspace
+      // dependency exclusions (sshSyncBackDependencyExcludes) do not apply.
       await syncDirectoryToSsh({ spec: target.spec, localDir: row.localRoot, remoteDir: row.executionRoot, exclude: [".paperclip-runtime"] });
       return { target, workspaceRemoteDir: row.executionRoot, runtimeRootDir: null,
         assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,

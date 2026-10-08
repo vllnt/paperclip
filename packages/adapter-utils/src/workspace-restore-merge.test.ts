@@ -784,6 +784,40 @@ describe("conflict-preserving directory restore", () => {
 });
 
 
+it.each(["file", "symlink"] as const)("refuses, before writing, to replace a directory holding an excluded tree with a %s", async (kind) => {
+  const root = await fsPromises.realpath(await mkdtemp(path.join(os.tmpdir(), "directory-excluded-default-")));
+  const target = path.join(root, "target"), source = path.join(root, "source");
+  await mkdir(path.join(target, "packages", "app", "node_modules", "dep"), { recursive: true });
+  await writeFile(path.join(target, "packages", "app", "index.ts"), "tracked");
+  await writeFile(path.join(target, "packages", "app", "node_modules", "dep", "index.js"), "host install");
+  const baseline = await captureDirectorySnapshot(target, { exclude: ["node_modules", "*/node_modules", "*/node_modules/*"], diskBacked: true });
+  try {
+    await mkdir(path.join(source, "packages"), { recursive: true });
+    if (kind === "file") await writeFile(path.join(source, "packages", "app"), "replacement");
+    else await symlink("../elsewhere", path.join(source, "packages", "app"));
+    await writeFile(path.join(source, "independent"), "must not partially apply");
+    await expect(mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target }))
+      .rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT", paths: ["packages/app"] });
+    expect(await readFile(path.join(target, "packages", "app", "node_modules", "dep", "index.js"), "utf8")).toBe("host install");
+    expect(await readFile(path.join(target, "packages", "app", "index.ts"), "utf8")).toBe("tracked");
+    await expect(stat(path.join(target, "independent"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally { await disposeDirectorySnapshot(baseline); await rm(root, { recursive: true, force: true }); }
+});
+
+it("still replaces a directory that holds only unchanged baseline entries", async () => {
+  const root = await fsPromises.realpath(await mkdtemp(path.join(os.tmpdir(), "directory-replace-owned-")));
+  const target = path.join(root, "target"), source = path.join(root, "source");
+  await mkdir(path.join(target, "packages", "app", "src"), { recursive: true });
+  await writeFile(path.join(target, "packages", "app", "src", "index.ts"), "tracked");
+  const baseline = await captureDirectorySnapshot(target, { exclude: ["node_modules", "*/node_modules", "*/node_modules/*"], diskBacked: true });
+  try {
+    await mkdir(path.join(source, "packages"), { recursive: true });
+    await writeFile(path.join(source, "packages", "app"), "replacement");
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target });
+    expect(await readFile(path.join(target, "packages", "app"), "utf8")).toBe("replacement");
+  } finally { await disposeDirectorySnapshot(baseline); await rm(root, { recursive: true, force: true }); }
+});
+
 it("strict preflight preserves excluded descendants when a directory becomes a file", async () => {
   const root = await fsPromises.realpath(await mkdtemp(path.join(os.tmpdir(), "directory-excluded-cas-")));
   const target = path.join(root, "target"), source = path.join(root, "source");

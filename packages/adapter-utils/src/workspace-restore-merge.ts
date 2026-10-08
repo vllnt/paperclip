@@ -531,7 +531,7 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   if (entry.kind === "symlink") {
-    await fs.rm(targetPath, { recursive: true, force: true });
+    await removeReplacedEntry(targetPath);
     await fs.symlink(entry.target, targetPath);
     return;
   }
@@ -546,10 +546,50 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
     const existing = await fs.lstat(targetPath).catch(() => null);
-    if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
+    if (existing?.isDirectory()) await removeReplacedEntry(targetPath);
     await fs.rename(temporary, targetPath);
   } finally { await fs.rm(temporary, { force: true }); }
 
+}
+
+// A file or symlink replacing a directory removes it non-recursively. The
+// merge has already deleted the unchanged entries it owns there, and
+// `blockedDirectoryReplacements` refused anything else, so a non-empty
+// directory here means content appeared concurrently and must not be lost.
+async function removeReplacedEntry(targetPath: string): Promise<void> {
+  const existing = await fs.lstat(targetPath).catch(() => null);
+  if (existing?.isDirectory()) await fs.rmdir(targetPath);
+  else await fs.rm(targetPath, { force: true });
+}
+
+/** Source files and symlinks that would replace a target directory still
+ * holding entries this merge does not own: excluded or ignored trees such as
+ * `node_modules`, or files created or edited outside this restore. Replacing
+ * such a directory would delete them, so the merge refuses before writing. */
+async function blockedDirectoryReplacements(
+  targetDir: string, baseline: DirectorySnapshot, source: DirectorySnapshot,
+): Promise<string[]> {
+  const ignored = workspacePathMatcher(baseline.ignoredPaths);
+  const holdsUnownedEntry = async (relative: string): Promise<boolean> => {
+    for (const name of await fs.readdir(path.join(targetDir, relative))) {
+      const child = path.posix.join(relative, name);
+      const owned = baseline.entries.get(child);
+      if (!owned || shouldExcludePath(child, baseline.exclude) || ignored.matches(child)) return true;
+      if (!entriesMatch(await readSnapshotEntry(targetDir, child), owned)) return true;
+      if (owned.kind === "dir" && await holdsUnownedEntry(child)) return true;
+    }
+    return false;
+  };
+  try {
+    const blocked: string[] = [];
+    for (const [relative, entry] of orderedEntries(source)) {
+      // Unchanged entries are never applied, so they replace nothing.
+      if (entry.kind === "dir" || entriesMatch(baseline.entries.get(relative), entry)) continue;
+      const existing = await fs.lstat(path.join(targetDir, relative)).catch(() => null);
+      if (existing?.isDirectory() && await holdsUnownedEntry(relative)) blocked.push(relative);
+    }
+    return blocked;
+  } finally { ignored.close(); }
 }
 
 export async function captureDirectorySnapshot(
@@ -677,6 +717,8 @@ export async function mergeDirectoryWithBaseline(input: {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
         }
+        const blocked = await blockedDirectoryReplacements(canonicalTargetDir, input.baseline, source);
+        if (blocked.length) throw new DirectoryMergeConflict(blocked);
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;

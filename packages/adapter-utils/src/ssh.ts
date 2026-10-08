@@ -413,6 +413,42 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
   return combined.flatMap((entry) => ["--exclude", entry]);
 }
 
+/**
+ * Dependency and cache trees that SSH sync-back of an execution workspace
+ * leaves on the remote. Runs regenerate them, and copying one pnpm
+ * `node_modules` back to the host costs gigabytes per run. Names that
+ * repositories commonly track, such as `dist` and `vendor`, are not listed.
+ * Agent directories (AGENT_HOME) do not use this list: these names are valid
+ * agent-file paths there, so those transfers stay exact.
+ */
+export const SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES = [
+  "node_modules",
+  ".pnpm-store",
+  ".next",
+  ".turbo",
+  ".cache",
+] as const;
+
+/** Exclude patterns for `names` at any depth. Tar and the restore merge both
+ * match these by whole path component. */
+export function sshSyncBackDependencyExcludes(
+  names: readonly string[] = SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES,
+): string[] {
+  return names.flatMap((name) => [name, `${name}/*`, `*/${name}`, `*/${name}/*`]);
+}
+
+/** The dependency names a Git workspace does not track. The working tree
+ * returns only through the file sync, so a tracked name must keep syncing. If
+ * Git cannot answer, every name keeps syncing. */
+export async function untrackedSshSyncBackDependencyDirNames(localDir: string): Promise<string[]> {
+  const pathspecs = SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES.flatMap((name) => [`:(glob)**/${name}`, `:(glob)**/${name}/**`]);
+  const tracked = await runLocalGit(localDir, ["ls-files", "-z", "--", ...pathspecs], {
+    timeout: 60_000,
+    maxBuffer: 64 * 1024 * 1024,
+  }).then((result) => new Set(result.stdout.split("\0").flatMap((entry) => entry.split("/"))), () => null);
+  return tracked ? SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES.filter((name) => !tracked.has(name)) : [];
+}
+
 function tarSpawnEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -604,6 +640,9 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
       recursive: true,
       force: true,
       preserveTimestamps: true,
+      // Without this, fs.cp rewrites relative links to absolute paths inside
+      // `sourceDir`, which is a staging directory deleted right after.
+      verbatimSymlinks: true,
     });
   }));
 }
@@ -1436,17 +1475,18 @@ export async function syncDirectoryToSsh(input: {
   }
 }
 
-export async function syncDirectoryFromSsh(input: {
+// Streams `remoteDir` over SSH as a tar archive and extracts it into
+// `targetDir`. The caller owns `targetDir`; extracting straight into a fresh
+// staging directory keeps a single local copy of the remote tree.
+async function extractDirectoryFromSsh(input: {
   spec: SshRemoteExecutionSpec;
   remoteDir: string;
-  localDir: string;
+  targetDir: string;
   exclude?: string[];
-  preserveLocalEntries?: string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
-  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
     `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
@@ -1479,7 +1519,7 @@ export async function syncDirectoryFromSsh(input: {
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
       });
-      const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
+      const tar = spawn("tar", ["-xf", "-", "-C", input.targetDir], {
         stdio: ["pipe", "ignore", "pipe"],
         env: tarSpawnEnv(),
       });
@@ -1541,15 +1581,38 @@ export async function syncDirectoryFromSsh(input: {
       });
     });
     await progress?.finish();
-
-    await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
-    await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
     await progress?.fail();
     throw error;
   } finally {
-    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
     await auth.cleanup();
+  }
+}
+
+export async function syncDirectoryFromSsh(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  localDir: string;
+  exclude?: string[];
+  preserveLocalEntries?: string[];
+  onProgress?: RuntimeProgressSink;
+  progressLabel?: string;
+}): Promise<void> {
+  // Stage first so a failed transfer never clears `localDir`.
+  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+  try {
+    await extractDirectoryFromSsh({
+      spec: input.spec,
+      remoteDir: input.remoteDir,
+      targetDir: stagingDir,
+      exclude: input.exclude,
+      onProgress: input.onProgress,
+      progressLabel: input.progressLabel,
+    });
+    await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
+    await copyDirectoryContents(stagingDir, input.localDir);
+  } finally {
+    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -1629,10 +1692,12 @@ export async function restoreWorkspaceFromSshExecution(input: {
           onProgress: input.onProgress,
         })
         : null;
-      await syncDirectoryFromSsh({
+      // `stagingDir` is fresh and empty, so extract into it directly rather
+      // than through a second staging copy.
+      await extractDirectoryFromSsh({
         spec: input.spec,
         remoteDir,
-        localDir: stagingDir,
+        targetDir: stagingDir,
         exclude: input.baselineSnapshot.exclude,
         onProgress: input.onProgress,
         progressLabel: "workspace",

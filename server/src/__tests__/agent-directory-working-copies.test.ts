@@ -20,6 +20,7 @@ import type { EnvironmentRuntimeService } from "../services/environment-runtime.
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { shouldExcludePath } from "@paperclipai/adapter-utils/exclude-patterns";
 import { heartbeatRunEvents } from "@paperclipai/db";
 
 describe("persistent agent directories", () => {
@@ -714,6 +715,40 @@ describe("persistent agent directories", () => {
       expect(restore).toHaveBeenCalledWith(expect.objectContaining({ remoteDir: copy.executionRoot, restoreGitHistory: false }));
       expect(await fs.readFile(path.join(root, "ssh-note.txt"), "utf8")).toBe("persistent SSH file");
     } finally { stage.mockRestore(); restore.mockRestore(); exclude.mockRestore(); }
+  });
+
+  it("round-trips a managed agent file under .cache over SSH exactly", async () => {
+    // Only .paperclip-runtime is reserved, so dependency-named folders hold
+    // ordinary agent files. The transport mocks honor each exclude list the
+    // way tar and the restore merge do.
+    const remoteCwd = path.join(home, "ssh-cache-task");
+    const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" });
+    const copyExcluding = (from: string, to: string, exclude: string[]) => fs.cp(from, to, { recursive: true, force: true,
+      filter: source => {
+        const relative = path.relative(from, source).split(path.sep).join("/");
+        return relative === "" || !shouldExcludePath(relative, exclude);
+      } });
+    const stage = vi.spyOn(ssh, "syncDirectoryToSsh").mockImplementation(async input => {
+      await fs.mkdir(path.dirname(input.remoteDir), { recursive: true });
+      await copyExcluding(input.localDir, input.remoteDir, input.exclude ?? []);
+    });
+    const restore = vi.spyOn(ssh, "restoreWorkspaceFromSshExecution").mockImplementation(async input => {
+      await copyExcluding(input.remoteDir!, input.localDir, input.baselineSnapshot?.exclude ?? []);
+    });
+    try {
+      await agentFileStore(db).write({ ...target(), path: ".cache/tool.md", bytes: Buffer.from("v1\n"), baseHash: null }, board());
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      const sshTarget = { kind: "remote" as const, transport: "ssh" as const, environmentId: randomUUID(), remoteCwd,
+        spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd } };
+      const copy = (await copies.prepare({ companyId, agentId, runId, cwd: home, target: sshTarget }))!;
+      expect(await fs.readFile(path.join(copy.executionRoot, ".cache", "tool.md"), "utf8")).toBe("v1\n");
+      await fs.writeFile(path.join(copy.executionRoot, ".cache", "tool.md"), "v2 from SSH\n");
+      expect((await copies.collectStopped({ companyId, runId, target: sshTarget }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, ".cache", "tool.md"), "utf8")).toBe("v2 from SSH\n");
+      expect(stage).toHaveBeenCalledWith(expect.objectContaining({ exclude: [".paperclip-runtime"] }));
+      expect(restore).toHaveBeenCalledWith(expect.objectContaining({ baselineSnapshot: expect.objectContaining({ exclude: [".paperclip-runtime"] }) }));
+    } finally { stage.mockRestore(); restore.mockRestore(); shell.mockRestore(); }
   });
 
   it("deduplicates concurrent stopped callbacks and discards completed operational snapshots", async () => {

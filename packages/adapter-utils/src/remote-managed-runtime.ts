@@ -5,7 +5,9 @@ import {
   prepareWorkspaceForSshExecution,
   runSshCommand,
   restoreWorkspaceFromSshExecution,
+  sshSyncBackDependencyExcludes,
   syncDirectoryToSsh,
+  untrackedSshSyncBackDependencyDirNames,
 } from "./ssh.js";
 import {
   mergeExcludes,
@@ -145,11 +147,25 @@ export async function prepareRemoteManagedRuntime(input: {
         workspaceExclude: input.workspaceExclude,
       })
     : null;
+  // The sync-back tar and the merge both use the baseline's exclude list, so
+  // dependency trees listed here stay on the remote and the host's own copies
+  // are left alone. A Git workspace keeps syncing any name it tracks. A plain
+  // directory cannot say, so it drops them all, as the sandbox lane does.
+  // "all" mode is the exact-copy contract for plain persistent directories:
+  // agent-file checkpoints validate every downloaded byte against a manifest,
+  // so it applies only the caller's `workspaceExclude`.
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
-          ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
-          : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+          ? [
+              ...GIT_ARCHIVE_EXCLUDES,
+              ".paperclip-runtime",
+              ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.workspaceLocalDir)),
+            ]
+          : [
+              ".paperclip-runtime",
+              ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : sshSyncBackDependencyExcludes()),
+            ],
       })
     : null;
 
