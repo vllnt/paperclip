@@ -5052,15 +5052,17 @@ export function agentRoutes(
         res.status(403).json({ error: "Only CEO can manage permissions" });
         return;
       }
-      await assertCanChangeOwnProtectedAgentFields(
-        req,
-        existing,
-        collectAgentPermissionChanges(
+      if (actorAgent.id === existing.id) {
+        const changedPermissions = collectAgentPermissionChanges(
           existing.permissions,
           normalizeAgentPermissions({ ...existing.permissions, ...req.body }),
-        ),
-        "permissions",
-      );
+        );
+        if (changedPermissions.length === 0) {
+          res.json(await buildAgentDetail(existing));
+          return;
+        }
+        await assertCanChangeOwnProtectedAgentFields(req, existing, changedPermissions, "permissions");
+      }
     } else {
       await assertBoardCanManageAgentsForCompany(req, existing.companyId);
     }

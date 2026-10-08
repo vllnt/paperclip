@@ -312,8 +312,22 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     const denied = await deniedActivity(db, agentId);
     expect(denied[0]?.details).toMatchObject({ surface: "permissions" });
 
+    const scopedAssignGrant = { agentIds: [peerId] };
+    await db.insert(principalPermissionGrants).values({
+      companyId,
+      principalType: "agent",
+      principalId: agentId,
+      permissionKey: "tasks:assign",
+      scope: scopedAssignGrant,
+      grantedByUserId: null,
+    });
     const unchanged = await request(app).patch(`/api/agents/${agentId}/permissions`).send(storedPermissions);
     expect(unchanged.status, JSON.stringify(unchanged.body)).toBe(200);
+    const assignGrants = await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(and(eq(principalPermissionGrants.principalId, agentId), eq(principalPermissionGrants.permissionKey, "tasks:assign")));
+    expect(assignGrants.map((grant) => grant.scope)).toEqual([scopedAssignGrant]);
 
     const peer = await request(app).patch(`/api/agents/${peerId}/permissions`).send(body);
     expect(peer.status, JSON.stringify(peer.body)).toBe(200);
