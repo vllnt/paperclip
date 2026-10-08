@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
+import { WorkspaceManifestMap } from "./workspace-manifest.js";
 import {
   captureDirectorySnapshot,
   directorySnapshotSha256,
@@ -833,4 +834,244 @@ it("strict preflight preserves excluded descendants when a directory becomes a f
     expect(await readFile(path.join(target, "folder", "node_modules", "keep"), "utf8")).toBe("excluded contents");
     await expect(stat(path.join(target, "independent"))).rejects.toMatchObject({ code: "ENOENT" });
   } finally { await disposeDirectorySnapshot(baseline); await rm(root, { recursive: true, force: true }); }
+});
+
+describe("parallel restores into one shared project workspace", () => {
+  const WAIT_ENV = "PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS";
+  const savedEnv = new Map<string, string | undefined>();
+  const roots: string[] = [];
+
+  function setEnv(name: string, value: string | undefined): void {
+    if (!savedEnv.has(name)) savedEnv.set(name, process.env[name]);
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    for (const [name, value] of savedEnv) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    savedEnv.clear();
+    while (roots.length > 0) await rm(roots.pop()!, { recursive: true, force: true });
+  });
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  async function until(condition: () => boolean): Promise<void> {
+    for (let waited = 0; !condition(); waited += 10) {
+      if (waited > 5_000) throw new Error("condition not reached");
+      await sleep(10);
+    }
+  }
+
+  async function sharedWorkspace(): Promise<{ root: string; target: string; lockRoot: string }> {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-parallel-restore-")));
+    roots.push(root);
+    setEnv("PAPERCLIP_HOME", path.join(root, "home"));
+    setEnv("PAPERCLIP_INSTANCE_ID", "test-instance");
+    setEnv(WAIT_ENV, undefined);
+    const target = path.join(root, "target");
+    await mkdir(path.join(target, "src"), { recursive: true });
+    await writeFile(path.join(target, "src", "a.ts"), "a0\n");
+    await writeFile(path.join(target, "src", "b.ts"), "b0\n");
+    const lockRoot = path.join(root, "home", "instances", "test-instance", "locks", "directory-merge");
+    return { root, target, lockRoot };
+  }
+
+  async function runWorkspace(root: string, target: string, name: string, edit?: { file: string; text: string }): Promise<string> {
+    const dir = path.join(root, name);
+    await fsPromises.cp(target, dir, { recursive: true });
+    if (edit) await writeFile(path.join(dir, edit.file), edit.text);
+    return dir;
+  }
+
+  it.each([
+    { label: "unset", value: undefined },
+    { label: "not a number", value: "soon" },
+    { label: "zero", value: "0" },
+    { label: "below the 1 s minimum", value: "500" },
+  ])("queues a second restore behind a merge slower than the old 30 s budget (wait setting $label)", async ({ value }) => {
+    const { root, target } = await sharedWorkspace();
+    setEnv(WAIT_ENV, value);
+    const baselineA = await captureDirectorySnapshot(target);
+    const baselineB = await captureDirectorySnapshot(target);
+    const sourceA = await runWorkspace(root, target, "run-a", { file: "src/a.ts", text: "a1\n" });
+    const sourceB = await runWorkspace(root, target, "run-b", { file: "src/b.ts", text: "b1\n" });
+    // A large workspace holds the lock for longer than 30 s. Instead of waiting
+    // that long, run A jumps the clock the waiter reads past 30 s while it holds
+    // the lock, after run B has started waiting.
+    const realNow = Date.now.bind(Date);
+    let skewMs = 0;
+    let lockPolls = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      // waitForLock reads the clock once per poll of a busy lock.
+      if (new Error().stack?.includes("waitForLock")) lockPolls += 1;
+      return realNow() + skewMs;
+    });
+    let markHolding!: () => void;
+    const holding = new Promise<void>((resolve) => { markHolding = resolve; });
+    const mergeA = mergeDirectoryWithBaseline({
+      baseline: baselineA, sourceDir: sourceA, targetDir: target,
+      beforeApply: async () => {
+        markHolding();
+        // Run B read its deadline before its first poll of the busy lock.
+        await until(() => lockPolls >= 1);
+        skewMs = 31_000;
+        await sleep(200);
+      },
+    });
+    await holding;
+    const mergeB = mergeDirectoryWithBaseline({ baseline: baselineB, sourceDir: sourceB, targetDir: target });
+
+    const results = await Promise.allSettled([mergeA, mergeB]);
+
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(await readFile(path.join(target, "src", "a.ts"), "utf8")).toBe("a1\n");
+    expect(await readFile(path.join(target, "src", "b.ts"), "utf8")).toBe("b1\n");
+  });
+
+  it("bounds the wait by PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS and keeps the timeout diagnostics", async () => {
+    const { root, target } = await sharedWorkspace();
+    // Time scaled down 30x: the old 30 s budget becomes 1 s, and run A's merge
+    // holds the lock for 2 s, longer than that. Run B starts once A holds it.
+    async function restoreBehindSlowMerge(name: string, a: string, b: string): Promise<[PromiseSettledResult<void>, PromiseSettledResult<void>]> {
+      const baselineA = await captureDirectorySnapshot(target);
+      const baselineB = await captureDirectorySnapshot(target);
+      const sourceA = await runWorkspace(root, target, `${name}-a`, { file: "src/a.ts", text: a });
+      const sourceB = await runWorkspace(root, target, `${name}-b`, { file: "src/b.ts", text: b });
+      let markHolding!: () => void;
+      const holding = new Promise<void>((resolve) => { markHolding = resolve; });
+      const held = mergeDirectoryWithBaseline({ baseline: baselineA, sourceDir: sourceA, targetDir: target,
+        beforeApply: async () => { markHolding(); await sleep(2_000); } });
+      await holding;
+      const waiter = mergeDirectoryWithBaseline({ baseline: baselineB, sourceDir: sourceB, targetDir: target });
+      return await Promise.allSettled([held, waiter]);
+    }
+
+    setEnv(WAIT_ENV, "5000");
+    const queued = await restoreBehindSlowMerge("queued", "a1\n", "b1\n");
+    expect(queued.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(await readFile(path.join(target, "src", "a.ts"), "utf8")).toBe("a1\n");
+    expect(await readFile(path.join(target, "src", "b.ts"), "utf8")).toBe("b1\n");
+
+    // The old budget, scaled: the waiter fails exactly as production did.
+    setEnv(WAIT_ENV, "1000");
+    const [held, waiter] = await restoreBehindSlowMerge("bounded", "a2\n", "b2\n");
+    expect(held.status).toBe("fulfilled");
+    expect(waiter.status).toBe("rejected");
+    const error = waiter.status === "rejected" ? waiter.reason : null;
+    expect(error).toMatchObject({
+      code: WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
+      workspaceRestoreLock: { ownerState: "alive", ownerSameProcess: true, knownLocalHolder: true },
+    });
+    expect(classifyWorkspaceRestoreFailure(error)).toBe("restore_lock_timeout");
+    expect(error.workspaceRestoreLock.waitMs).toBeGreaterThanOrEqual(900);
+    expect(error.workspaceRestoreLock.waitMs).toBeLessThan(2_000);
+    expect(await readFile(path.join(target, "src", "b.ts"), "utf8")).toBe("b1\n");
+  });
+
+  it("captures a baseline while another restore renames its staged file into place", async () => {
+    const { target } = await sharedWorkspace();
+    const tests = path.join(target, "games", "solo", "leaderboard", "tests");
+    await mkdir(tests, { recursive: true });
+    await writeFile(path.join(tests, "existing.test.ts"), "existing\n");
+    // copySnapshotEntry stages each incoming file beside its target, then
+    // renames it into place. Another run's baseline walk can list the staged
+    // name and then lstat it after the rename.
+    const staged = path.join(tests, `.paperclip-merge-${randomUUID()}`);
+    await writeFile(staged, "incoming\n");
+    // Only the exact staging shape is skipped; a look-alike name is a real file.
+    await writeFile(path.join(tests, ".paperclip-merge-notes"), "notes\n");
+    const realLstat = fsPromises.lstat;
+    vi.spyOn(fsPromises, "lstat").mockImplementation(async (file, options) => {
+      if (String(file) === staged) await fsPromises.rename(staged, path.join(tests, "incoming.test.ts"));
+      return await realLstat(file, options);
+    });
+
+    const snapshot = await captureDirectorySnapshot(target);
+
+    const paths = [...snapshot.entries].map(([relative]) => relative);
+    expect(paths).toContain("games/solo/leaderboard/tests/existing.test.ts");
+    expect(paths.filter((relative) => relative.includes(".paperclip-merge-")))
+      .toEqual(["games/solo/leaderboard/tests/.paperclip-merge-notes"]);
+  });
+
+  it("treats entries that vanish mid-walk as absent and still fails on other errors", async () => {
+    const { target } = await sharedWorkspace();
+    await writeFile(path.join(target, "gone-before-lstat.txt"), "x");
+    await writeFile(path.join(target, "gone-before-hash.txt"), "x");
+    await symlink("src/a.ts", path.join(target, "gone-link"));
+    await mkdir(path.join(target, "gone-dir"));
+    await writeFile(path.join(target, "gone-dir", "child.txt"), "x");
+    await mkdir(path.join(target, "replaced-dir"));
+    await writeFile(path.join(target, "replaced-dir", "child.txt"), "x");
+    const vanishAfterLstat = new Set(["gone-before-hash.txt", "gone-link", "gone-dir"]);
+    const realLstat = fsPromises.lstat;
+    const lstatSpy = vi.spyOn(fsPromises, "lstat").mockImplementation(async (file, options) => {
+      const name = path.basename(String(file));
+      if (name === "gone-before-lstat.txt") await rm(file);
+      const stats = await realLstat(file, options);
+      if (vanishAfterLstat.has(name)) await rm(file, { recursive: true });
+      // Another restore replaces this directory with a file: opendir gets ENOTDIR.
+      if (name === "replaced-dir") {
+        await rm(file, { recursive: true });
+        await writeFile(file, "now a file");
+      }
+      return stats;
+    });
+
+    const snapshot = await captureDirectorySnapshot(target, { diskBacked: true });
+    try {
+      // lstat saw both directories, so they stay recorded; their vanished
+      // contents do not.
+      expect([...snapshot.entries].map(([relative]) => relative)).toEqual(["gone-dir", "replaced-dir", "src", "src/a.ts", "src/b.ts"]);
+    } finally { await disposeDirectorySnapshot(snapshot); }
+
+    lstatSpy.mockImplementation(async (file, options) => {
+      if (path.basename(String(file)) === "a.ts") throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return await realLstat(file, options);
+    });
+    await expect(captureDirectorySnapshot(target)).rejects.toMatchObject({ code: "EACCES" });
+    await expect(captureDirectorySnapshot(path.join(target, "missing-root"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("skips the lock and the merge when the run changed nothing against its baseline", async () => {
+    const { root, target, lockRoot } = await sharedWorkspace();
+    const baseline = await captureDirectorySnapshot(target, { diskBacked: true });
+    const review = await runWorkspace(root, target, "review");
+    // An engineer's restore lands while the read-only review is still running.
+    await writeFile(path.join(target, "src", "a.ts"), "engineer\n");
+    const rename = vi.spyOn(fsPromises, "rename");
+    try {
+      await mergeDirectoryWithBaseline({ baseline, sourceDir: review, targetDir: target });
+    } finally { await disposeDirectorySnapshot(baseline); }
+
+    await expect(lstat(lockRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(rename).not.toHaveBeenCalled();
+    expect(await readFile(path.join(target, "src", "a.ts"), "utf8")).toBe("engineer\n");
+
+    // The merge owns snapshots a caller passes in, also when it skips.
+    const source = await captureDirectorySnapshot(review, { diskBacked: true });
+    const current = await captureDirectorySnapshot(target, { diskBacked: true });
+    const owned = [source, current].map(({ entries }) => entries instanceof WorkspaceManifestMap ? entries.manifest.filePath : "");
+    await mergeDirectoryWithBaseline({ baseline: await captureDirectorySnapshot(review), sourceDir: review, targetDir: target,
+      snapshots: { source, current } });
+    for (const filePath of owned) await expect(lstat(filePath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(lockRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("still locks and runs the hooks for an unchanged tree", async () => {
+    const { root, target, lockRoot } = await sharedWorkspace();
+    const baseline = await captureDirectorySnapshot(target);
+    const review = await runWorkspace(root, target, "review");
+    const beforeApply = vi.fn(async () => undefined);
+    const afterApply = vi.fn(async () => undefined);
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: review, targetDir: target, beforeApply, afterApply });
+
+    expect(beforeApply).toHaveBeenCalledTimes(1);
+    expect(afterApply).toHaveBeenCalledTimes(1);
+    expect(await readdir(lockRoot)).toEqual([expect.stringMatching(/\.lock\.sqlite$/)]);
+  });
 });

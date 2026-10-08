@@ -935,6 +935,95 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(localRepo, "run-b.txt"), "utf8")).resolves.toBe("from run b\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("never uploads another restore's staged merge file", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-workspace");
+    const nested = path.join(localDir, "packages", "tests");
+    await mkdir(nested, { recursive: true });
+    await writeFile(path.join(nested, "existing.test.ts"), "existing\n", "utf8");
+    // A concurrent restore stages this file and renames it away; tar would
+    // fail if it vanished mid-archive. A look-alike name is a real file.
+    await writeFile(path.join(nested, `.paperclip-merge-${randomUUID()}`), "staged\n", "utf8");
+    await writeFile(path.join(nested, ".paperclip-merge-notes"), "notes\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH staged merge file test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    await prepareWorkspaceForSshExecution({ spec, localDir, remoteDir: started.workspaceDir });
+
+    const listing = await runSshCommand(config, `ls -a ${JSON.stringify(path.posix.join(started.workspaceDir, "packages", "tests"))}`);
+    expect(listing.stdout.split("\n").filter((name) => name.startsWith(".paperclip-merge-"))).toEqual([".paperclip-merge-notes"]);
+    expect(listing.stdout).toContain("existing.test.ts");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("restores a read-only SSH run without the merge lock but still imports a commit-only run", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "read-only SSH restore test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = {
+      ...config,
+      remoteCwd: started.workspaceDir,
+    } as const;
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = path.join(rootDir, "paperclip-home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const lockRoot = path.join(rootDir, "paperclip-home", "instances", "test-instance", "locks", "directory-merge");
+    try {
+      const review = await prepareRemoteManagedRuntime({
+        spec,
+        runId: "review",
+        adapterKey: "test-adapter",
+        workspaceLocalDir: localRepo,
+      });
+      // Another run's restore lands in the shared workspace while the review runs.
+      await writeFile(path.join(localRepo, "tracked.txt"), "from an engineer\n", "utf8");
+
+      await review.restoreWorkspace();
+
+      await expect(stat(lockRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("from an engineer\n");
+
+      const commitOnly = await prepareRemoteManagedRuntime({
+        spec,
+        runId: "commit-only",
+        adapterKey: "test-adapter",
+        workspaceLocalDir: localRepo,
+      });
+      await runSshCommand(
+        config,
+        `cd ${JSON.stringify(commitOnly.workspaceRemoteDir)} && git -c user.name="Paperclip SSH" -c user.email=ssh@paperclip.dev commit --allow-empty -m "remote empty commit" >/dev/null`,
+        { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+      );
+
+      await commitOnly.restoreWorkspace();
+
+      expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote empty commit");
+      await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("from an engineer\n");
+    } finally {
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("preserves nested per-run files across sequential SSH restores with stale baselines", async () => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");

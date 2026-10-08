@@ -8,10 +8,26 @@ locking. Network filesystems that do not provide that locking are not supported.
 
 Each target has a permanent `<hash>.lock.sqlite` file. An open SQLite
 `BEGIN IMMEDIATE` transaction holds its reserved file lock for the entire write
-operation. Contenders retry without blocking the Node event loop, up to the
-existing 30-second limit. Closing the connection releases the lock; the operating
-system also releases it when the process exits or crashes. Independent targets
-use different files and can proceed concurrently.
+operation. Contenders retry without blocking the Node event loop. Closing the
+connection releases the lock; the operating system also releases it when the
+process exits or crashes. Independent targets use different files and can
+proceed concurrently.
+
+A workspace restore waits up to 10 minutes. Parallel runs on one project
+workspace restore into it one at a time, and one merge of a large tree can hold
+the lock for more than 30 seconds, so a restore must wait for the whole queue
+ahead of it. Set `PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS` (1 second to 1
+hour) to change the wait. Other writers keep the 30-second limit. A timeout
+still fails the run with `restore_lock_timeout` and the owner diagnostics below.
+Waiters poll the lock; it grants no queue order. The wait bounds how long one
+restore can keep losing to others.
+
+A restore whose files match the run's baseline, and whose remote Git HEAD is
+already in the local history, has nothing to apply. It returns without taking
+the lock, so read-only runs do not lengthen the queue. Snapshot walks and SSH
+sync archives never include a merge's staged `.paperclip-merge-<uuid>` files.
+A snapshot walk treats an entry as absent when another writer deletes or
+renames it, or replaces its parent directory with a file, during the walk.
 
 This uses the same built-in `node:sqlite` dependency as workspace manifests.
 See [SQLite file locking](https://www.sqlite.org/lockingv3.html) for the reserved

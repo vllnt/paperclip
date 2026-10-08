@@ -143,22 +143,48 @@ async function hashFile(filePath: string): Promise<string> {
   });
 }
 
+// copySnapshotEntry stages each incoming file beside its target as
+// `.paperclip-merge-<uuid>`, then renames it into place. Another run can walk
+// or archive the same tree while a merge runs, so snapshot walks and sync tars
+// skip exactly these names.
+const MERGE_STAGING_PREFIX = ".paperclip-merge-";
+const UUID_GROUP_LENGTHS = [8, 4, 4, 4, 12];
+const MERGE_STAGING_NAME = new RegExp(
+  `^${MERGE_STAGING_PREFIX.replaceAll(".", "\\.")}${UUID_GROUP_LENGTHS.map((length) => `[0-9a-f]{${length}}`).join("-")}$`,
+);
+/** The tar `--exclude` glob for the merge staging names a snapshot walk skips. */
+export const MERGE_STAGING_TAR_EXCLUDE = `${MERGE_STAGING_PREFIX}${UUID_GROUP_LENGTHS.map((length) => "[0-9a-f]".repeat(length)).join("-")}`;
+
+// Another run's restore can delete or rename an entry after the walk lists it,
+// or replace its parent directory with a file. Such an entry is absent; every
+// other error still fails the walk.
+function absentIfVanished(error: unknown): null {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  if (code === "ENOENT" || code === "ENOTDIR") return null;
+  throw error;
+}
+
 async function* walkDirectory(
   root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, relative = "",
 ): AsyncGenerator<[string, SnapshotEntry]> {
-  const current = relative ? path.join(root, relative) : root;
-  for await (const entry of await fs.opendir(current)) {
+  // The root must exist. Only a directory below it may vanish mid-walk.
+  const directory = relative ? await fs.opendir(path.join(root, relative)).catch(absentIfVanished) : await fs.opendir(root);
+  if (!directory) return;
+  for await (const entry of directory) {
+    if (MERGE_STAGING_NAME.test(entry.name)) continue;
     const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
     if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
     const fullPath = path.join(root, nextRelative);
-    const stats = await fs.lstat(fullPath);
-    if (stats.isDirectory()) {
+    const stats = await fs.lstat(fullPath).catch(absentIfVanished);
+    if (stats?.isDirectory()) {
       yield [nextRelative, { kind: "dir" }];
       yield* walkDirectory(root, exclude, ignored, nextRelative);
-    } else if (stats.isSymbolicLink()) {
-      yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
-    } else if (stats.isFile()) {
-      yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath) }];
+    } else if (stats?.isSymbolicLink()) {
+      const target = await fs.readlink(fullPath).catch(absentIfVanished);
+      if (target !== null) yield [nextRelative, { kind: "symlink", target }];
+    } else if (stats?.isFile()) {
+      const hash = await hashFile(fullPath).catch(absentIfVanished);
+      if (hash !== null) yield [nextRelative, { kind: "file", mode: stats.mode, hash }];
     }
   }
 }
@@ -202,6 +228,11 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
 }
 
 const LOCK_WAIT_MS = 30_000;
+// Parallel runs on one project workspace restore into it one at a time, and
+// one merge of a large tree can hold the lock for more than 30 s. A restore
+// therefore waits for the whole queue ahead of it, within this bound.
+// Operators can set PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS to 1 s to 1 h.
+const WORKSPACE_RESTORE_LOCK_WAIT_MS = 10 * 60_000;
 const LOCK_DIAGNOSTIC_READ_TIMEOUT_MS = 100;
 const activeDirectoryMergeLocks = new Set<string>();
 const MAX_LOCK_DIAGNOSTIC_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -496,8 +527,8 @@ export async function withDirectoryMergeLock<T>(
   fn: (canonicalTargetDir: string) => Promise<T>,
   env: NodeJS.ProcessEnv = process.env,
   diagnosticOperation?: DirectoryMergeLockOperation,
-  // Test seam only: overrides how long acquisition waits before it reports a
-  // timeout. Production callers must omit this and keep the real budget.
+  // How long acquisition waits before it reports a timeout. Short critical
+  // sections keep the 30 s default; workspace restores pass their own budget.
   waitMs: number = LOCK_WAIT_MS,
 ): Promise<T> {
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
@@ -537,7 +568,7 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
   }
   // An interrupted restore must not leave a truncated current file. Keep the
   // incoming tree until its owner records success; exact retries deduplicate.
-  const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
+  const temporary = path.join(path.dirname(targetPath), `${MERGE_STAGING_PREFIX}${randomUUID()}`);
   try {
     await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, temporary);
@@ -692,6 +723,19 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   return [...conflicts].sort();
 }
 
+function workspaceRestoreLockWaitMs(): number {
+  const configured = Number(process.env.PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS);
+  return Number.isFinite(configured) && configured >= 1000 ? Math.min(configured, 60 * 60_000) : WORKSPACE_RESTORE_LOCK_WAIT_MS;
+}
+
+function snapshotsMatch(left: DirectorySnapshot, right: DirectorySnapshot): boolean {
+  if (left.entries.size !== right.entries.size) return false;
+  for (const [relative, entry] of left.entries) {
+    if (!entriesMatch(entry, right.entries.get(relative))) return false;
+  }
+  return true;
+}
+
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
@@ -706,6 +750,13 @@ export async function mergeDirectoryWithBaseline(input: {
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
   const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
   try {
+    // A source equal to its baseline deletes and copies nothing and cannot
+    // conflict. With no hooks to run, it skips the lock, so read-only runs do
+    // not queue behind other restores into the same workspace.
+    if (!input.beforeApply && !input.afterApply && snapshotsMatch(input.baseline, source)) {
+      await disposeDirectorySnapshot(input.snapshots?.current ?? null);
+      return;
+    }
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
       await input.beforeApply?.();
       // Strict preflight must see excluded children before a directory is
@@ -736,7 +787,7 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
-    });
+    }, process.env, undefined, workspaceRestoreLockWaitMs());
   } finally { await disposeDirectorySnapshot(source); }
 }
 
