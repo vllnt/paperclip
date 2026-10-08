@@ -32,6 +32,7 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
+import { removeRestoredSshRunDirectory } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import {
   getActiveStepContext,
   runWithRuntimeParent,
@@ -1176,6 +1177,65 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
+const TERMINAL_RUN_STATUSES: readonly string[] = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"];
+// The removal runs in the background, so it can afford a large, busy tree.
+const SSH_RUN_DIRECTORY_REMOVAL_TIMEOUT_MS = 10 * 60 * 1000;
+
+// Every SSH run syncs into its own `runs/<runId>` directory on the host, and
+// nothing removed it, so finished runs filled a worker disk (519 directories,
+// 67 GB, 2026-10-08). After the lease releases, remove the run's directory.
+// Best effort and in the background: the lease is already released, a slow
+// delete never holds up the run's teardown, and a failure only keeps the
+// directory. It runs only for a terminal run on the host the lease was
+// acquired on, and the directory goes only when the run's sync-back left its
+// restored marker, so a run whose restore failed or never ran (a crash) keeps
+// the only copy of its work.
+async function removeReleasedSshRunDirectory(db: Db, environment: Environment, lease: EnvironmentLease): Promise<void> {
+  const runId = lease.heartbeatRunId;
+  const metadata = lease.metadata ?? {};
+  const remoteRoot = typeof metadata.remoteCwd === "string" ? metadata.remoteCwd : null;
+  if (lease.provider !== "ssh" || lease.leasePolicy !== "ephemeral" || !runId || !remoteRoot) return;
+  if (!["released", "expired", "failed"].includes(lease.status)) return;
+  try {
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return;
+    const parsed = await resolveEnvironmentDriverConfigForRuntime(db, lease.companyId, environment, {
+      issueId: lease.issueId,
+      heartbeatRunId: runId,
+    });
+    if (parsed.driver !== "ssh") return;
+    // An environment re-pointed after the acquire names another host.
+    if (
+      metadata.host !== parsed.config.host ||
+      Number(metadata.port) !== parsed.config.port ||
+      metadata.username !== parsed.config.username
+    ) {
+      logger.info({ leaseId: lease.id, runId }, "kept a finished SSH run directory: the environment now points at another host");
+      return;
+    }
+    const outcome = await removeRestoredSshRunDirectory({
+      spec: parsed.config,
+      remoteRoot,
+      runId,
+      timeoutMs: SSH_RUN_DIRECTORY_REMOVAL_TIMEOUT_MS,
+    });
+    if (outcome === "symlink" || outcome === "rm_failed") {
+      logger.warn({ leaseId: lease.id, runId, outcome }, "kept a finished SSH run directory");
+    } else if (outcome === "not_restored") {
+      logger.info({ leaseId: lease.id, runId, outcome }, "kept a finished SSH run directory without a completed sync-back");
+    }
+  } catch {
+    // Log a constant kind only: an SSH error can carry host or credential detail.
+    logger.warn(
+      { errorKind: "ssh_run_directory_cleanup_failed", leaseId: lease.id, runId },
+      "could not remove a finished SSH run directory; it stays on the host",
+    );
+  }
+}
+
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
 
@@ -1216,7 +1276,22 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      const released = await environmentsSvc.releaseLease(input.lease.id, input.status);
+      // Never awaited: it cannot throw, and a large delete must not delay the
+      // run's teardown.
+      if (released) void removeReleasedSshRunDirectory(db, input.environment, released);
+      return released;
+    },
+
+    async retryPendingSandboxTeardown({ lease }) {
+      // An SSH lease is bookkeeping on a shared host: like `releaseRunLease`
+      // above, releasing it destroys nothing there. A crash between a run's
+      // end and its lease release leaves the lease to the orphan sweeps, which
+      // release it through this teardown. Never treat another provider's
+      // resource as an SSH no-op cleanup.
+      if (lease.provider !== "ssh") {
+        throw new Error("SSH lease cleanup cannot release a non-SSH provider resource.");
+      }
     },
 
     async realizeWorkspace(input) {

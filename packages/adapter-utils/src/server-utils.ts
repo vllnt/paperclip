@@ -4877,6 +4877,13 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          // A child that exits before reading its whole prompt (for example an
+          // `ssh` whose connection drops) makes the pending write fail with
+          // EPIPE. Without a listener that error crashes the server. The exit
+          // status still reports the run's outcome.
+          stdin.on("error", (err) =>
+            onLogError(err, runId, "child process closed stdin before reading all input"),
+          );
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);

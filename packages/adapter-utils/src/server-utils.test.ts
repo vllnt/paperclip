@@ -587,6 +587,41 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("reports the exit of a child that closes stdin before reading its prompt instead of crashing on EPIPE", async () => {
+    // Regression: the unread prompt made the pending stdin write fail with
+    // EPIPE on a socket with no 'error' listener, which crashed the server.
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown) => {
+      uncaught.push(error);
+    };
+    const stdinErrors: string[] = [];
+    process.on("uncaughtException", onUncaught);
+    try {
+      const result = await runChildProcess(randomUUID(), "sh", ["-c", "exit 3"], {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "x".repeat(8 * 1024 * 1024),
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        onLogError: (_err, _runId, message) => {
+          stdinErrors.push(message);
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(uncaught.map((error) => (error as NodeJS.ErrnoException)?.code ?? String(error))).toEqual([]);
+      expect(result.exitCode).toBe(3);
+      // Whether the write fails with EPIPE or Node destroys stdin first on the
+      // child's exit depends on event order, so the log line is optional.
+      for (const message of stdinErrors) {
+        expect(message).toBe("child process closed stdin before reading all input");
+      }
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
