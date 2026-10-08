@@ -414,10 +414,12 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 /**
- * Dependency and cache trees that SSH sync-back leaves on the remote. Runs
- * regenerate them, and copying one pnpm `node_modules` back to the host costs
- * gigabytes per run. Names that repositories commonly track, such as `dist`
- * and `vendor`, are not listed.
+ * Dependency and cache trees that SSH sync-back of an execution workspace
+ * leaves on the remote. Runs regenerate them, and copying one pnpm
+ * `node_modules` back to the host costs gigabytes per run. Names that
+ * repositories commonly track, such as `dist` and `vendor`, are not listed.
+ * Agent directories (AGENT_HOME) do not use this list: these names are valid
+ * agent-file paths there, so those transfers stay exact.
  */
 export const SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES = [
   "node_modules",
