@@ -447,7 +447,6 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
-import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -13378,9 +13377,6 @@ export function heartbeatService(
         .where(eq(agents.id, run.agentId))
         .then((rows) => rows[0] ?? null),
     ]);
-
-    // A legitimately waiting issue is alive: the wait's wake re-checks it.
-    if (issue && hasActiveIssueWait(issue)) return;
 
     const budgetBlock =
       issue && agent

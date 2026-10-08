@@ -15,6 +15,7 @@ import { useSidebar } from "../context/SidebarContext";
 import { queryKeys } from "../lib/queryKeys";
 import { isPlatformManagedEnvironment } from "../lib/managed-sandbox-environment";
 import { AgentStatusBadge, AgentStatusCapsule } from "../components/StatusBadge";
+import { agentDisplayStatus, agentWaitTitle } from "../lib/agent-display-status";
 import { MembershipAction } from "../components/MembershipAction";
 import { StarToggle } from "../components/StarToggle";
 import { EntityRow } from "../components/EntityRow";
@@ -441,7 +442,7 @@ export function Agents() {
                 />
               )}
               <span className="w-20 flex justify-end">
-                <AgentStatusBadge status={agent.status} />
+                <AgentStatusBadge status={agentDisplayStatus(agent)} title={agentWaitTitle(agent)} />
               </span>
               <StarToggle
                 size="row"

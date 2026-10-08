@@ -921,6 +921,7 @@ export type {
   ManagedSettingMetadata,
   BackupRetentionPolicy,
   Agent,
+  AgentWaitState,
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
