@@ -32,6 +32,7 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
+import { removeRestoredSshRunDirectory } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import {
   getActiveStepContext,
   runWithRuntimeParent,
@@ -1176,6 +1177,44 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
+const TERMINAL_RUN_STATUSES: readonly string[] = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"];
+
+// Every SSH run syncs into its own `runs/<runId>` directory on the host, and
+// nothing removed it, so finished runs filled a worker disk (519 directories,
+// 67 GB, 2026-10-08). After the lease releases, remove the run's directory.
+// Best effort: the lease is already released and a failure only keeps the
+// directory. It runs only for a terminal run, and the directory goes only when
+// the run's sync-back left its restored marker, so a run whose restore failed
+// or never ran (a crash) keeps the only copy of its work.
+async function removeReleasedSshRunDirectory(db: Db, environment: Environment, lease: EnvironmentLease): Promise<void> {
+  const runId = lease.heartbeatRunId;
+  const remoteRoot = typeof lease.metadata?.remoteCwd === "string" ? lease.metadata.remoteCwd : null;
+  if (lease.provider !== "ssh" || lease.leasePolicy !== "ephemeral" || !runId || !remoteRoot) return;
+  if (!["released", "expired", "failed"].includes(lease.status)) return;
+  try {
+    const [run] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return;
+    const parsed = await resolveEnvironmentDriverConfigForRuntime(db, lease.companyId, environment, {
+      issueId: lease.issueId,
+      heartbeatRunId: runId,
+    });
+    if (parsed.driver !== "ssh") return;
+    const outcome = await removeRestoredSshRunDirectory({ spec: parsed.config, remoteRoot, runId });
+    if (outcome === "symlink") {
+      logger.warn({ leaseId: lease.id, runId }, "kept an SSH run directory that is reached through a symlink");
+    }
+  } catch {
+    // Log a constant kind only: an SSH error can carry host or credential detail.
+    logger.warn(
+      { errorKind: "ssh_run_directory_cleanup_failed", leaseId: lease.id, runId },
+      "could not remove a finished SSH run directory; it stays on the host",
+    );
+  }
+}
+
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
 
@@ -1216,7 +1255,9 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      const released = await environmentsSvc.releaseLease(input.lease.id, input.status);
+      if (released) await removeReleasedSshRunDirectory(db, input.environment, released);
+      return released;
     },
 
     async retryPendingSandboxTeardown({ lease }) {

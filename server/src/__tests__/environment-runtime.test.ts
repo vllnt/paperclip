@@ -1290,6 +1290,84 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
   });
 
+  // Nothing removed `runs/<runId>` on the SSH host, so 519 finished runs filled
+  // a worker disk on 2026-10-08. The release now removes it, only for a
+  // terminal run whose sync-back left the restored marker.
+  it("removes only the SSH run directories of terminal runs whose sync-back finished", async () => {
+    if (!sshFixtureSupport.supported) {
+      console.warn(`Skipping SSH run directory cleanup test: ${sshFixtureSupport.reason ?? "unsupported environment"}`);
+      return;
+    }
+    const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-environment-runtime-ssh-runs-"));
+    fixtureRoots.push(fixtureRoot);
+    const fixture = await startSshEnvLabFixture({ statePath: path.join(fixtureRoot, "state.json") });
+    const sshConfig = await buildSshEnvLabFixtureConfig(fixture);
+    const { companyId, agentId, environment, runId: restoredRunId } = await seedEnvironment({
+      driver: "ssh",
+      name: "Fixture SSH",
+      config: sshConfig,
+    });
+    const runsDir = path.join(sshConfig.remoteWorkspacePath, ".paperclip-runtime", "runs");
+    const runs = {
+      restored: { id: restoredRunId, status: "succeeded", restored: true },
+      notRestored: { id: randomUUID(), status: "failed", restored: false },
+      live: { id: randomUUID(), status: "running", restored: true },
+    };
+    for (const run of Object.values(runs)) {
+      if (run.id !== restoredRunId) {
+        await db.insert(heartbeatRuns).values({ id: run.id, companyId, agentId, invocationSource: "manual", status: "running" });
+      }
+      await runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: run.id, persistedExecutionWorkspace: null });
+      await mkdir(path.join(runsDir, run.id, "workspace"), { recursive: true });
+      await writeFile(path.join(runsDir, run.id, "workspace", "work.txt"), "agent work\n");
+      if (run.restored) await writeFile(path.join(runsDir, run.id, ".paperclip-restored"), "");
+      await db.update(heartbeatRuns).set({ status: run.status }).where(eq(heartbeatRuns.id, run.id));
+    }
+
+    for (const run of Object.values(runs)) {
+      const released = await runtime.releaseRunLeases(run.id);
+      expect(released[0]?.lease.status).toBe("released");
+    }
+
+    expect((await readdir(runsDir)).sort()).toEqual([runs.notRestored.id, runs.live.id].sort());
+  });
+
+  it("still releases an SSH lease when its run directory cleanup fails", async () => {
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "ssh",
+      name: "Unreachable SSH",
+      config: {
+        host: "ssh.invalid",
+        port: 22,
+        username: "ssh-user",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: false,
+      },
+    });
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    const leaseId = randomUUID();
+    await db.insert(environmentLeases).values({
+      id: leaseId, companyId, environmentId: environment.id, heartbeatRunId: runId, status: "active",
+      leasePolicy: "ephemeral", provider: "ssh", providerLeaseId: "ssh://ssh-user@ssh.invalid:22/srv/paperclip/workspace",
+      metadata: { driver: "ssh", remoteCwd: "/srv/paperclip/workspace" },
+    });
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      const released = await runtime.releaseRunLeases(runId);
+
+      expect(released.map((entry) => entry.lease.id)).toEqual([leaseId]);
+      expect(released[0]?.lease).toMatchObject({ status: "released" });
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ errorKind: "ssh_run_directory_cleanup_failed", leaseId }),
+        expect.any(String),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  }, 30_000);
+
   it("acquires and releases a fake sandbox run lease through the runtime seam", async () => {
     const { companyId, environment, runId } = await seedEnvironment({
       driver: "sandbox",

@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +20,12 @@ import {
   stopSshEnvLabFixture,
   type SshEnvLabFixtureState,
 } from "./ssh.js";
-import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import {
+  prepareRemoteManagedRuntime,
+  removeRestoredSshRunDirectory,
+  SSH_RUN_RESTORED_MARKER,
+  sshRunDirectory,
+} from "./remote-managed-runtime.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 const execFileAsync = promisify(execFile);
@@ -1443,4 +1449,88 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(localDir, "node_modules/new.js"), "utf8")).resolves.toBe("remote");
     await expect(readFile(path.join(localDir, "node_modules/kept.js"), "utf8")).resolves.toBe("host\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+});
+
+// Every SSH run syncs into `<remoteCwd>/.paperclip-runtime/runs/<runId>`, and
+// nothing removed it: 519 finished runs filled a worker disk on 2026-10-08.
+// The lease release now deletes it, but only once the sync-back left its
+// restored marker, and only through real directories below the root.
+describe("SSH run directory cleanup", () => {
+  afterEach(drainFixtureTeardowns);
+  afterAll(drainFixtureTeardowns);
+
+  async function startRun(label: string) {
+    const rootDir = await createFixtureRootDir();
+    const localDir = path.join(rootDir, "local-workspace");
+    await mkdir(localDir, { recursive: true });
+    await writeFile(path.join(localDir, "big.bin"), Buffer.alloc(256 * 1024, 7));
+    const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), label);
+    if (!started) return null;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const runId = randomUUID();
+    const prepared = await prepareRemoteManagedRuntime({ spec, runId, adapterKey: "test-adapter", workspaceLocalDir: localDir });
+    const runDir = sshRunDirectory(started.workspaceDir, runId);
+    return { rootDir, localDir, spec, runId, runDir, prepared };
+  }
+
+  it("removes a run directory once its sync-back finished", async () => {
+    const run = await startRun("SSH run directory removal test");
+    if (!run) return;
+    expect(run.prepared.workspaceRemoteDir).toBe(path.posix.join(run.runDir, "workspace"));
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("not_restored");
+
+    await run.prepared.restoreWorkspace();
+    await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("removed");
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("absent");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the run directory when the sync-back fails, even after an earlier restore", async () => {
+    const run = await startRun("SSH run directory failed restore test");
+    if (!run) return;
+    await run.prepared.restoreWorkspace();
+    await writeFile(path.join(run.runDir, "workspace", "unsynced.txt"), "agent work\n");
+
+    const { outcome } = await withTransferShims(run.rootDir, "enospc", () => run.prepared.restoreWorkspace());
+
+    expect(outcome.status).toBe("rejected");
+    await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("not_restored");
+    await expect(readFile(path.join(run.runDir, "workspace", "unsynced.txt"), "utf8")).resolves.toBe("agent work\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it.each(["runs", "run"])("never follows a symlinked %s directory out of the runtime root", async (linked) => {
+    const run = await startRun(`SSH run directory symlink test (${linked})`);
+    if (!run) return;
+    await run.prepared.restoreWorkspace();
+    // Move the real tree outside the root and leave a link in its place.
+    const outside = path.join(run.rootDir, "outside");
+    const linkPath = linked === "runs" ? path.dirname(run.runDir) : run.runDir;
+    await rename(linkPath, outside);
+    await symlink(outside, linkPath);
+
+    await expect(removeRestoredSshRunDirectory({ spec: run.spec, remoteRoot: run.spec.remoteCwd, runId: run.runId }))
+      .resolves.toBe("symlink");
+    expect((await readdir(outside)).length).toBeGreaterThan(0);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("refuses run ids that are not UUIDs and roots that are not normalized absolute paths", async () => {
+    const spec = {
+      host: "ssh.invalid", port: 22, username: "paperclip", remoteWorkspacePath: "/srv/w",
+      privateKey: null, knownHosts: null, strictHostKeyChecking: false,
+    };
+    for (const runId of ["../../etc", "run-commit", "", `${randomUUID()}/..`]) {
+      await expect(removeRestoredSshRunDirectory({ spec, remoteRoot: "/srv/w", runId })).rejects.toThrow("not a UUID");
+    }
+    for (const remoteRoot of ["", "/", "srv/w", "/srv/../etc", "/srv/w/", "/srv//w"]) {
+      await expect(removeRestoredSshRunDirectory({ spec, remoteRoot, runId: randomUUID() })).rejects.toThrow("normalized absolute path");
+    }
+  });
 });

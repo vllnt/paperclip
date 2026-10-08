@@ -1,6 +1,7 @@
 import path from "node:path";
 import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
 import {
+  type SshConnectionConfig,
   type SshRemoteExecutionSpec,
   prepareWorkspaceForSshExecution,
   runSshCommand,
@@ -34,6 +35,70 @@ const REMOTE_ADDITIONAL_SOURCE_HEAVY_DIR_EXCLUDES = [
   ".cache",
   ".git",
 ].flatMap((entry) => [entry, `${entry}/*`, `*/${entry}`, `*/${entry}/*`]);
+
+/**
+ * A synced SSH run works in `<remoteRoot>/.paperclip-runtime/runs/<runId>/workspace`.
+ * Nothing else writes under `runs/<runId>`, so that directory holds only the
+ * run's own copy of the workspace.
+ */
+export function sshRunDirectory(remoteRoot: string, runId: string): string {
+  return path.posix.join(remoteRoot, ".paperclip-runtime", "runs", runId);
+}
+
+/**
+ * Written into `runs/<runId>` after the run's sync-back finished. Only this
+ * marker proves the host holds no unsynced work, so it is what allows
+ * {@link removeRestoredSshRunDirectory} to delete the directory.
+ */
+export const SSH_RUN_RESTORED_MARKER = ".paperclip-restored";
+
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Deletes one run's `runs/<runId>` directory on an SSH host once its sync-back
+ * finished. It is confined to that exact path: the run id must be a UUID, the
+ * root must be a normalized absolute path, and every directory below the root
+ * (`.paperclip-runtime`, `runs`, `<runId>`) must be a real directory, never a
+ * symlink, so a link an agent planted cannot redirect the removal. `rm -rf`
+ * does not follow symlinks inside the tree. Without the restored marker the
+ * directory is kept, because it may hold the only copy of the run's work.
+ */
+export async function removeRestoredSshRunDirectory(input: {
+  spec: SshConnectionConfig;
+  remoteRoot: string;
+  runId: string;
+  timeoutMs?: number;
+}): Promise<"removed" | "not_restored" | "absent" | "symlink"> {
+  if (!RUN_ID_PATTERN.test(input.runId)) {
+    throw new Error("Refusing to remove an SSH run directory for a run id that is not a UUID.");
+  }
+  const root = input.remoteRoot;
+  if (!path.posix.isAbsolute(root) || root === "/" || path.posix.normalize(root) !== root || root.endsWith("/")) {
+    throw new Error("Refusing to remove an SSH run directory under a root that is not a normalized absolute path.");
+  }
+  const runtimeDir = path.posix.join(root, ".paperclip-runtime");
+  const runsDir = path.posix.join(runtimeDir, "runs");
+  const runDir = sshRunDirectory(root, input.runId);
+  const marker = path.posix.join(runDir, SSH_RUN_RESTORED_MARKER);
+  const script = [
+    `for dir in ${[runtimeDir, runsDir, runDir].map(shellQuote).join(" ")}; do`,
+    '  if [ -L "$dir" ]; then echo symlink; exit 0; fi',
+    '  if [ ! -d "$dir" ]; then echo absent; exit 0; fi',
+    "done",
+    `if [ -L ${shellQuote(marker)} ] || [ ! -f ${shellQuote(marker)} ]; then echo not_restored; exit 0; fi`,
+    `rm -rf -- ${shellQuote(runDir)}`,
+    "echo removed",
+  ].join("\n");
+  const result = await runSshCommand(input.spec, script, {
+    timeoutMs: input.timeoutMs ?? 120_000,
+    maxBuffer: 16 * 1024,
+  });
+  const outcome = result.stdout.trim().split("\n").pop();
+  if (outcome === "removed" || outcome === "not_restored" || outcome === "absent" || outcome === "symlink") {
+    return outcome;
+  }
+  throw new Error("SSH run directory removal returned an unexpected result.");
+}
 
 export interface RemoteManagedRuntimeAsset {
   key: string;
@@ -126,15 +191,8 @@ export async function prepareRemoteManagedRuntime(input: {
 }): Promise<PreparedRemoteManagedRuntime> {
   const baseWorkspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const syncWorkspace = input.syncWorkspace !== false;
-  const workspaceRemoteDir = syncWorkspace
-    ? path.posix.join(
-        baseWorkspaceRemoteDir,
-        ".paperclip-runtime",
-        "runs",
-        input.runId,
-        "workspace",
-      )
-    : baseWorkspaceRemoteDir;
+  const runDir = syncWorkspace ? sshRunDirectory(baseWorkspaceRemoteDir, input.runId) : null;
+  const workspaceRemoteDir = runDir ? path.posix.join(runDir, "workspace") : baseWorkspaceRemoteDir;
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
 
   const preparedWorkspace = syncWorkspace
@@ -252,6 +310,13 @@ export async function prepareRemoteManagedRuntime(input: {
     assetDirs,
     additionalSourceDirs,
     restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
+      // The restored marker lets the lease release delete `runs/<runId>`. Clear
+      // an earlier restore's marker first, so a restore that fails below never
+      // leaves one behind; write it only after every step succeeded.
+      const marker = runDir ? path.posix.join(runDir, SSH_RUN_RESTORED_MARKER) : null;
+      const markerCleared = marker
+        ? await runSshCommand(input.spec, `rm -f -- ${shellQuote(marker)}`).then(() => true, () => false)
+        : false;
       if (preparedWorkspace && baselineSnapshot) {
         await restoreWorkspaceFromSshExecution({
           spec: input.spec,
@@ -268,6 +333,10 @@ export async function prepareRemoteManagedRuntime(input: {
           assetDir: path.posix.join(runtimeRootDir, asset.key),
           readFile: (remotePath) => readRemoteFile(input.spec, remotePath),
         });
+      }
+      // Best effort: without the marker the directory is only kept.
+      if (marker && markerCleared) {
+        await runSshCommand(input.spec, `: > ${shellQuote(marker)}`).catch(() => undefined);
       }
     },
   };
