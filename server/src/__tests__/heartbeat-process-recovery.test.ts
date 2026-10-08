@@ -10601,6 +10601,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  it.each([
+    ["wakeOnDemand is disabled", { heartbeat: { wakeOnDemand: false } }],
+    ["the daily run cap is reached", { heartbeat: { maxDailyRuns: 0 } }],
+  ])(
+    "defers a review participant dispatch without receipts when %s",
+    async (_label, runtimeConfig) => {
+      const { agentId, issueId } = await seedAssignedTodoNoRunFixture();
+      await db.update(agents).set({ runtimeConfig }).where(eq(agents.id, agentId));
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          executionState: {
+            status: "pending",
+            currentStageId: randomUUID(),
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId, userId: null },
+            returnAssignee: { type: "agent", agentId, userId: null },
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        })
+        .where(eq(issues.id, issueId));
+
+      const heartbeat = heartbeatService(db);
+      for (let sweep = 0; sweep < 3; sweep += 1) {
+        const result = await heartbeat.reconcileStrandedAssignedIssues();
+        expect(result.reviewParticipantRequeued).toBe(0);
+        expect(result.reviewParticipantDispatchDeferred).toBe(1);
+      }
+
+      // Three sweeps, zero skipped receipts: the policy gate runs first.
+      expect(
+        await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, agentId)),
+      ).toEqual([]);
+    },
+  );
+
   it("still re-enqueues stranded assigned todo recovery when an old queued wake exists", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedStrandedIssueFixture({

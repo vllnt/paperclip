@@ -9690,6 +9690,16 @@ export function heartbeatService(
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+    // The same on-demand gates enqueueWakeup applies before it writes a
+    // skipped receipt. Recovery checks them first so a policy-disabled agent
+    // costs no receipt per sweep.
+    getOnDemandWakePolicyBlock: async (agentId) => {
+      const agent = await getAgent(agentId);
+      if (!agent) return null;
+      const policy = parseHeartbeatPolicy(agent);
+      if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
+      return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+    },
   });
   const runDispatch = createRunDispatch(db);
 

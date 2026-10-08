@@ -927,6 +927,12 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * The heartbeat policy reason (`wakeOnDemand` disabled, daily run/cost
+     * cap) that would make an on-demand wake for this agent a skipped
+     * receipt, or null when the agent can be woken now.
+     */
+    getOnDemandWakePolicyBlock?: (agentId: string) => Promise<string | null>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -4404,6 +4410,7 @@ export function recoveryService(
       successfulRunHandoffEscalated: 0,
       successfulRunHandoffRetried: 0,
       reviewParticipantRequeued: 0,
+      reviewParticipantDispatchDeferred: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
@@ -4990,6 +4997,11 @@ export function recoveryService(
             result.skipped += 1;
           } else if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
             result.skipped += 1;
+          } else if (await deps.getOnDemandWakePolicyBlock?.(participantAgentId)) {
+            // The reviewer's own policy (wakeOnDemand off, daily cap reached)
+            // would turn this wake into a skipped receipt on every sweep.
+            // Leave the dispatch pending, with no receipt, until it changes.
+            result.reviewParticipantDispatchDeferred += 1;
           } else {
             const queued = await enqueueInitialAssignedReviewDispatch(
               issue,
