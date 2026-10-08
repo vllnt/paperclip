@@ -55,6 +55,8 @@ All responses return JSON. Successful responses return the entity directly. Erro
 
 Malformed JSON request bodies return `400` with `{ "error": "Invalid JSON body" }` before the route handler runs. The response does not include request contents or parser details. Correct the JSON before retrying.
 
+Malformed IDs or values return `400` with `{ "error": "Invalid identifier or value in request" }`. For example, `PATCH /api/routines/not-a-uuid` gets `400`, not `500`. This applies to path parameters and to query or body values that the database cannot parse, such as a non-UUID `projectId` filter. The response does not include the submitted value or database details. A well-formed ID that does not exist still returns `404`.
+
 ## Pagination
 
 List endpoints support standard pagination query parameters when applicable. Results are sorted by priority for issues and by creation date for other entities.

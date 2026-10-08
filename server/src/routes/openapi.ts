@@ -1652,6 +1652,20 @@ const FORBIDDEN_RESPONSE = {
   },
 };
 
+// A path value that the database cannot parse (e.g. a malformed UUID) returns
+// 400 from the central error handler, so every operation with a path parameter
+// can answer 400.
+const BAD_REQUEST_RESPONSE = {
+  description: "Bad request",
+  content: {
+    "application/json": {
+      schema: { $ref: "#/components/schemas/Error" },
+    },
+  },
+};
+
+const PATH_PARAMETER_PATTERN = /\{[^}]+\}/;
+
 function operationKey(method: string, path: string) {
   return `${method.toUpperCase()} ${path}`;
 }
@@ -1769,6 +1783,13 @@ function applyDocumentFixups(document: any): any {
         if (!responses["403"]) {
           responses["403"] = FORBIDDEN_RESPONSE;
         }
+      }
+      if (PATH_PARAMETER_PATTERN.test(path)) {
+        const responses = (operation.responses ??= {}) as Record<
+          string,
+          unknown
+        >;
+        responses["400"] ??= BAD_REQUEST_RESPONSE;
       }
       if (CREATED_OPERATIONS.has(key)) {
         applyOperationStatusOverride(operation, "200", "201");
