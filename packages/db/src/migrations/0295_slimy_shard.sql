@@ -7,6 +7,11 @@
 -- heap. The time is roughly linear in the heap size, so scale by the
 -- production heap size and allow for slower disks.
 --
+-- The runner sets no lock_timeout or statement_timeout. The build first waits
+-- for every open transaction that wrote to agent_wakeup_requests, and new wake
+-- writes queue behind the waiting build, so a long transaction stretches the
+-- stall. Deploy at low write traffic.
+--
 -- Before deploying, the operator measures the table and checks for duplicate
 -- live assignment receipts. The second query must return no rows, or the build
 -- fails and the boot migration aborts:
