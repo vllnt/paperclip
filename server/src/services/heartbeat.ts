@@ -784,6 +784,12 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
+const ISSUE_WAKE_RATE_LIMIT_MAX = 3;
+const ISSUE_WAKE_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const ISSUE_WAKE_RATE_LIMIT_REASONS = new Set([
+  "issue_unblock_requested",
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+]);
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -27650,6 +27656,70 @@ export function heartbeatService(
               finishedAt: new Date(),
             });
             return { kind: "skipped" as const };
+          }
+
+          // The issue row lock above serializes this admission with every other
+          // wake for the same issue. Count durable wake receipts while holding
+          // that lock so concurrent re-block/re-unblock cycles cannot all pass
+          // a pre-insert check before their wake is persisted.
+          if (reason && ISSUE_WAKE_RATE_LIMIT_REASONS.has(reason)) {
+            const since = new Date(Date.now() - ISSUE_WAKE_RATE_LIMIT_WINDOW_MS);
+            const recentIssueWakes = await tx
+              .select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.reason, reason),
+                  gte(agentWakeupRequests.requestedAt, since),
+                  sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId') = ${issue.id}`,
+                  notInArray(agentWakeupRequests.status, ["skipped", "cancelled"]),
+                ),
+              )
+              .limit(ISSUE_WAKE_RATE_LIMIT_MAX);
+            if (recentIssueWakes.length >= ISSUE_WAKE_RATE_LIMIT_MAX) {
+              const now = new Date();
+              await tx.insert(agentWakeupRequests).values({
+                ...durableReceiptFields,
+                companyId: agent.companyId,
+                agentId,
+                source,
+                triggerDetail,
+                reason: "issue_wake_rate_limited",
+                payload: {
+                  ...(payload ?? {}),
+                  heartbeatSkip: {
+                    reason: "issue_wake_rate_limited",
+                    requestedReason: reason,
+                    limit: ISSUE_WAKE_RATE_LIMIT_MAX,
+                    windowMs: ISSUE_WAKE_RATE_LIMIT_WINDOW_MS,
+                  },
+                },
+                status: "skipped",
+                requestedByActorType: opts.requestedByActorType ?? null,
+                requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null,
+                finishedAt: now,
+              });
+              await logActivity(tx as unknown as Db, {
+                companyId: agent.companyId,
+                actorType: "system",
+                actorId: "issue_wake_rate_limit",
+                agentId,
+                runId: null,
+                action: "issue.wake_rate_limited",
+                entityType: "issue",
+                entityId: issue.id,
+                details: {
+                  reason,
+                  agentId,
+                  limit: ISSUE_WAKE_RATE_LIMIT_MAX,
+                  windowMs: ISSUE_WAKE_RATE_LIMIT_WINDOW_MS,
+                },
+              });
+              return { kind: "skipped" as const };
+            }
           }
 
           if (opts.failedRunId) {

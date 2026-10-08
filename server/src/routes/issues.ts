@@ -13304,6 +13304,7 @@ export function issueRoutes(
       }
       const enteringBlocked =
         existing.status !== "blocked" && updateFields.status === "blocked";
+      let blockedTransitionHasOnlyTerminalBlockers = false;
       if (enteringBlocked) {
         const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
           ? [...new Set(req.body.blockedByIssueIds as string[])]
@@ -13324,6 +13325,8 @@ export function issueRoutes(
               .then((rows) => rows.length > 0))
           : (await svc.getDependencyReadiness(existing.id))
               .unresolvedBlockerCount > 0;
+        blockedTransitionHasOnlyTerminalBlockers =
+          Boolean(requestedBlockerIds && requestedBlockerIds.length > 0 && !hasUnresolvedBlocker);
         const [pendingInteraction, pendingApproval] = await Promise.all([
           db
             .select({ id: issueThreadInteractions.id })
@@ -13812,6 +13815,15 @@ export function issueRoutes(
         res.status(404).json({ error: "Issue not found" });
         return;
       }
+      const actorOwnsBlockedIssue =
+        enteringBlocked &&
+        actor.actorType === "agent" &&
+        Boolean(
+          actor.agentId &&
+            (actor.agentId === issue.assigneeAgentId ||
+              actor.runId === issue.checkoutRunId ||
+              actor.runId === issue.executionRunId),
+        );
       for (const publication of postCommitActivityPublications)
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
@@ -13822,10 +13834,41 @@ export function issueRoutes(
         await deliverAgentUnblockNotification({
           issue: blockedIssue,
           wakeup: heartbeat.wakeup,
+          allowWake: async (agentId) => {
+            if (blockedTransitionHasOnlyTerminalBlockers) return false;
+            if (actorOwnsBlockedIssue && agentId === actor.agentId) {
+              await logActivity(db, {
+                companyId: blockedIssue.companyId,
+                actorType: "system",
+                actorId: "issue_update",
+                agentId,
+                runId: actor.runId,
+                action: "issue.wake_suppressed_self",
+                entityType: "issue",
+                entityId: blockedIssue.id,
+                details: { reason: "issue_unblock_requested", source: "issue.update" },
+              });
+              return false;
+            }
+            return true;
+          },
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
           },
         });
+        if (blockedTransitionHasOnlyTerminalBlockers) {
+          await logActivity(db, {
+            companyId: blockedIssue.companyId,
+            actorType: "system",
+            actorId: "issue_update",
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "issue.blocked_wake_suppressed",
+            entityType: "issue",
+            entityId: blockedIssue.id,
+            details: { reason: "all_blockers_terminal", source: "issue.update" },
+          });
+        }
         if (ownerNotifiedAt) {
           await db
             .update(issueRows)
@@ -14927,9 +14970,65 @@ export function issueRoutes(
         }
 
         for (const { agentId, wakeup } of wakeups.values()) {
-          heartbeat
-            .wakeup(agentId, wakeup)
-            .then((wakeRun) => {
+          const wakeIssueId =
+            wakeup.payload && typeof wakeup.payload === "object" &&
+            typeof wakeup.payload.issueId === "string"
+              ? wakeup.payload.issueId
+              : issue.id;
+          if (
+            (blockedTransitionHasOnlyTerminalBlockers &&
+              wakeup.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) ||
+            (actorOwnsBlockedIssue &&
+              agentId === actor.agentId &&
+              (wakeup.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON ||
+                wakeup.reason === "issue_unblock_requested"))
+          ) {
+            await logActivity(db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "issue_update",
+              agentId,
+              runId: actor.runId,
+              action: "issue.wake_suppressed_self",
+              entityType: "issue",
+              entityId: wakeIssueId,
+              details: {
+                reason: wakeup.reason,
+                source: wakeup.contextSnapshot?.source ?? "issue.update",
+                ...(blockedTransitionHasOnlyTerminalBlockers
+                  ? { cause: "all_blockers_terminal" }
+                  : { cause: "actor_owns_issue" }),
+              },
+            });
+            continue;
+          }
+          const assignmentWake =
+            wakeup.source === "assignment" && wakeup.reason === "issue_assigned";
+          const wakePromise = assignmentWake
+            ? queueIssueAssignmentWakeup({
+                heartbeat,
+                issue: {
+                  id: wakeIssueId,
+                  assigneeAgentId: agentId,
+                  status: issue.status,
+                },
+                reason: wakeup.reason,
+                mutation:
+                  wakeup.payload && typeof wakeup.payload === "object" &&
+                  typeof wakeup.payload.mutation === "string"
+                    ? wakeup.payload.mutation
+                    : "update",
+                contextSource:
+                  typeof wakeup.contextSnapshot?.source === "string"
+                    ? wakeup.contextSnapshot.source
+                    : "issue.update",
+                requestedByActorType: wakeup.requestedByActorType,
+                requestedByActorId: wakeup.requestedByActorId,
+                rethrowOnError: true,
+                wakeupOptions: wakeup,
+              })
+            : heartbeat.wakeup(agentId, wakeup);
+          wakePromise.then((wakeRun) => {
               if (wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return;
               const payload =
                 wakeup.payload && typeof wakeup.payload === "object"

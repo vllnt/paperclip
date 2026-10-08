@@ -30,6 +30,8 @@ export async function deliverAgentUnblockNotification(input: {
     payload: { issueId: string; action: string };
     contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
   }) => Promise<unknown>;
+  /** Return false to suppress this delivery (for example, an actor-owned wake). */
+  allowWake?: (agentId: string) => Promise<boolean>;
   markNotified: (notifiedAt: Date) => Promise<unknown>;
   now?: () => Date;
 }) {
@@ -40,6 +42,7 @@ export async function deliverAgentUnblockNotification(input: {
 
   const owner = issue.unblockDescriptor.owner;
   if (owner === "board" || !("agentId" in owner)) return false;
+  if (input.allowWake && !(await input.allowWake(owner.agentId))) return false;
 
   await input.wakeup(owner.agentId, {
     source: "automation",

@@ -1731,7 +1731,7 @@ export function recoveryService(
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
-          eq(agentWakeupRequests.status, "queued"),
+          inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
         ),
@@ -2049,6 +2049,42 @@ export function recoveryService(
           taskId: issue.id,
           wakeReason: "issue_assigned",
           source: "issue.assigned_todo_liveness_dispatch",
+        },
+        "normal_model",
+      ),
+    });
+  }
+
+  async function enqueueInitialAssignedReviewDispatch(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+    pendingExecutionState: Record<string, unknown>,
+  ) {
+    return deps.enqueueWakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: withRecoveryContext(
+        {
+          issueId: issue.id,
+          mutation: "review_assignment_recovery",
+          currentStageId: pendingExecutionState.currentStageId ?? null,
+          currentStageType: pendingExecutionState.currentStageType ?? null,
+        },
+        "normal_model",
+      ),
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: withRecoveryContext(
+        {
+          issueId: issue.id,
+          taskId: issue.id,
+          wakeReason: "issue_assigned",
+          source: "issue.review_assignment_recovery",
+          reviewRecoveryInstruction:
+            "This reviewer was assigned without a prior run. Review the pending execution stage now, or mark the issue blocked with the exact unblock action.",
+          currentStageId: pendingExecutionState.currentStageId ?? null,
+          currentStageType: pendingExecutionState.currentStageType ?? null,
         },
         "normal_model",
       ),
@@ -4917,10 +4953,44 @@ export function recoveryService(
         }
         const participantLatestRun = participantLatestRunForRecovery;
 
-        if (
-          !participantLatestRun ||
-          !isTerminalIssueRun(participantLatestRun)
-        ) {
+        if (!participantLatestRun) {
+          if (!agentInvokable) {
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_review",
+              latestRun: participantLatestRun,
+              notice: buildExecutionReviewParticipantUnavailableNoticeSeed(),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          } else if (
+            await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)
+          ) {
+            result.skipped += 1;
+          } else if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
+            result.skipped += 1;
+          } else {
+            const queued = await enqueueInitialAssignedReviewDispatch(
+              issue,
+              participantAgentId,
+              pendingExecutionState,
+            );
+            if (queued) {
+              result.reviewParticipantRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          }
+          continue;
+        }
+
+        if (!isTerminalIssueRun(participantLatestRun)) {
           if (!agentInvokable) {
             const updated = await escalateStrandedAssignedIssue({
               issue,

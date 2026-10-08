@@ -10547,6 +10547,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(promoted).toMatchObject({ status: "queued", retryOfRunId: runId });
   });
 
+  it("dispatches a newly assigned review participant with no prior run", async () => {
+    const { companyId, agentId, issueId } =
+      await seedAssignedTodoNoRunFixture();
+    const stageId = randomUUID();
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    const wake = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake).toMatchObject({
+      companyId,
+      agentId,
+      source: "assignment",
+      reason: "issue_assigned",
+      payload: expect.objectContaining({
+        issueId,
+        mutation: "review_assignment_recovery",
+      }),
+    });
+    expect(wake?.payload).toMatchObject({
+      currentStageId: stageId,
+      currentStageType: "review",
+    });
+  });
+
   it("still re-enqueues stranded assigned todo recovery when an old queued wake exists", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedStrandedIssueFixture({
