@@ -61,7 +61,6 @@ import {
   type SkillPolicyPrincipal,
 } from "../services/company-skill-policy.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
-import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import {
   normalizeSkillPolicySourceLocator,
   type SkillPolicyAction,
@@ -729,23 +728,15 @@ export function companySkillRoutes(db: Db) {
           });
           return { id: created.id };
         },
-        wakeHarnessIssue: async (issueId, agentId) => {
-          const harnessIssue = await issues.getById(issueId);
-          if (!harnessIssue || harnessIssue.companyId !== companyId || harnessIssue.assigneeAgentId !== agentId) {
-            throw new Error("Harness issue assignment changed before wake");
-          }
-          return queueIssueAssignmentWakeup({
-            heartbeat,
-            issue: harnessIssue,
-            reason: "skill_test_run_created",
-            mutation: "skill_test_run_created",
-            contextSource: "company.skill_test_run",
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            wakeupOptions: { payload: { issueId, skillId } },
-            rethrowOnError: true,
-          });
-        },
+        wakeHarnessIssue: async (issueId, agentId) => heartbeat.wakeup(agentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "skill_test_run_created",
+          payload: { issueId, skillId },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: { issueId, source: "company.skill_test_run" },
+        }),
         cleanupHarnessIssue: async (issueId) => {
           const issue = await issues.getById(issueId);
           if (!issue || issue.companyId !== companyId) return;

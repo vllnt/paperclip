@@ -39,7 +39,6 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
-import { queueIssueAssignmentWakeup } from "./issue-assignment-wakeup.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
@@ -2242,26 +2241,30 @@ export function buildHostServices(
           throw new Error(budgetBlock.reason);
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
-        const run = await queueIssueAssignmentWakeup({
-          heartbeat,
-          issue,
+        const run = await heartbeat.wakeup(issue.assigneeAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
           reason: params.reason ?? "plugin_issue_wakeup_requested",
-          mutation: "plugin_wakeup",
-          contextSource,
+          payload: {
+            issueId: issue.id,
+            mutation: "plugin_wakeup",
+            pluginId,
+            pluginKey,
+            contextSource,
+          },
+          // Namespaced like other plugin keys: a plugin can never name a
+          // server key such as the reserved issue-assignment generation key.
+          idempotencyKey: params.idempotencyKey ? `plugin:${pluginKey}:${params.idempotencyKey}` : null,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
-          wakeupOptions: {
-            payload: { issueId: issue.id, pluginId, pluginKey, contextSource },
-            contextSnapshot: {
-              issueId: issue.id,
-              taskId: issue.id,
-              wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
-              source: contextSource,
-              pluginId,
-              pluginKey,
-            },
+          contextSnapshot: {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
+            source: contextSource,
+            pluginId,
+            pluginKey,
           },
-          rethrowOnError: true,
         });
         await logPluginActivity({
           companyId,
@@ -2308,26 +2311,30 @@ export function buildHostServices(
             throw new Error(budgetBlock.reason);
           }
           const contextSource = params.contextSource ?? "plugin.issue.requestWakeups";
-          const run = await queueIssueAssignmentWakeup({
-            heartbeat,
-            issue,
+          const run = await heartbeat.wakeup(issue.assigneeAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
             reason: params.reason ?? "plugin_issue_wakeup_requested",
-            mutation: "plugin_wakeup",
-            contextSource,
+            payload: {
+              issueId: issue.id,
+              mutation: "plugin_wakeup",
+              pluginId,
+              pluginKey,
+              contextSource,
+            },
+            idempotencyKey: params.idempotencyKeyPrefix
+              ? `plugin:${pluginKey}:${params.idempotencyKeyPrefix}:${issue.id}`
+              : null,
             requestedByActorType: "system",
             requestedByActorId: pluginId,
-            wakeupOptions: {
-              payload: { issueId: issue.id, pluginId, pluginKey, contextSource },
-              contextSnapshot: {
-                issueId: issue.id,
-                taskId: issue.id,
-                wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
-                source: contextSource,
-                pluginId,
-                pluginKey,
-              },
+            contextSnapshot: {
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
+              source: contextSource,
+              pluginId,
+              pluginKey,
             },
-            rethrowOnError: true,
           });
           await logPluginActivity({
             companyId,

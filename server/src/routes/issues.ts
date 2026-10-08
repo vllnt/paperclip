@@ -12050,6 +12050,7 @@ export function issueRoutes(
       if (!isOnboardingFirstTask) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue,
           reason: "issue_assigned",
           mutation: "create",
@@ -12293,6 +12294,7 @@ export function issueRoutes(
       if (!serializationContext || !currentSerializedChild) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue,
           reason: "issue_assigned",
           mutation: "create",
@@ -12553,6 +12555,7 @@ export function issueRoutes(
         if (!serializedBlockedChildIds.has(issue.id)) {
           void queueIssueAssignmentWakeup({
             heartbeat,
+            assignmentEvent: true,
             issue,
             reason: "issue_assigned",
             mutation: "accepted_plan_decomposition",
@@ -14944,6 +14947,7 @@ export function issueRoutes(
           const wakePromise = assignmentWake
             ? queueIssueAssignmentWakeup({
                 heartbeat,
+                assignmentEvent: true,
                 issue: {
                   id: issue.id,
                   assigneeAgentId: agentId,
@@ -15198,16 +15202,16 @@ export function issueRoutes(
           checkoutRunId,
         })
       ) {
-        void queueIssueAssignmentWakeup({
-          heartbeat,
-          issue: updated,
-          reason: "issue_checked_out",
-          mutation: "checkout",
-          contextSource: "issue.checkout",
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-          rethrowOnError: true,
-        })
+        void heartbeat
+          .wakeup(req.body.agentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_checked_out",
+            payload: { issueId: issue.id, mutation: "checkout" },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: { issueId: issue.id, source: "issue.checkout" },
+          })
           .catch((err) =>
             logger.warn(
               { err, issueId: issue.id },
@@ -16352,6 +16356,7 @@ export function issueRoutes(
       for (const createdIssue of createdIssues) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue: createdIssue,
           reason: "issue_assigned",
           mutation: "interaction_accept",

@@ -142,6 +142,7 @@ export function summarySlotRoutes(db: Db) {
         }
         await queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue: generatingIssue,
           reason: "summary_slot_generation_requested",
           mutation: "summary_slot.generate",

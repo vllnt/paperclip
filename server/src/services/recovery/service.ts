@@ -2044,6 +2044,10 @@ export function recoveryService(
   ) {
     return queueIssueAssignmentWakeup({
       heartbeat: { wakeup: deps.enqueueWakeup },
+      // Recovery redelivers a missed assignment wake as that assignment event:
+      // if the route's wake for the same generation committed meanwhile,
+      // admission returns its receipt instead of starting a second run.
+      assignmentEvent: true,
       issue: { ...issue, assigneeAgentId: agentId },
       reason: "issue_assigned",
       mutation: "assigned_todo_liveness_dispatch",
@@ -2079,6 +2083,7 @@ export function recoveryService(
   ) {
     return queueIssueAssignmentWakeup({
       heartbeat: { wakeup: deps.enqueueWakeup },
+      assignmentEvent: true,
       issue: { ...issue, assigneeAgentId: agentId },
       reason: "issue_assigned",
       mutation: "review_assignment_recovery",

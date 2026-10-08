@@ -22,6 +22,7 @@ function assign(
 ) {
   return queueIssueAssignmentWakeup({
     heartbeat: { wakeup },
+    assignmentEvent: true,
     issue: { id: "issue-1", assigneeAgentId: input.assigneeAgentId, status: "todo", statusVersion: input.assignmentGeneration ?? 1 },
     reason: "issue_assigned",
     mutation: "update",
@@ -100,4 +101,45 @@ describe("issue assignment wakeup delivery", () => {
     await expect(assign(wakeup, { assigneeAgentId: "agent-a" })).resolves.toEqual({ id: "run-1" });
     expect(wakeup.mock.calls[0]?.[1]).toMatchObject({ idempotencyKey: "issue-assignment:issue-1:agent-a:1" });
   });
+
+  /** A wake that is not an assignment event (checkout, plugin, secret, tree resume). */
+  function nonAssignmentWake(
+    wakeup: (agentId: string, opts: unknown) => Promise<unknown>,
+    idempotencyKey?: string,
+  ) {
+    return queueIssueAssignmentWakeup({
+      heartbeat: { wakeup },
+      issue: { id: "issue-1", assigneeAgentId: "agent-a", status: "in_progress", statusVersion: 4 },
+      reason: "secret_proposal_resolved",
+      mutation: "secret_proposal_approved",
+      contextSource: "secret.proposal.resolution",
+      ...(idempotencyKey ? { wakeupOptions: { idempotencyKey } } : {}),
+      rethrowOnError: true,
+    });
+  }
+
+  it("gives a non-assignment wake no assignment key, so it never replays an old assignment receipt", async () => {
+    const wakeup = vi.fn(async (_agentId: string, _opts: unknown) => ({ id: "run-1" }));
+    await nonAssignmentWake(wakeup);
+    await nonAssignmentWake(wakeup, "plugin:acme.github:wake-1");
+
+    expect(wakeup.mock.calls[0]?.[1]).not.toHaveProperty("idempotencyKey");
+    // A producer's own namespaced key is kept as is.
+    expect(wakeup.mock.calls[1]?.[1]).toMatchObject({ idempotencyKey: "plugin:acme.github:wake-1" });
+  });
+
+  it("rejects a caller-supplied key in the reserved assignment namespace", async () => {
+    const wakeup = vi.fn(async (_agentId: string, _opts: unknown) => ({ id: "run-1" }));
+    await expect(nonAssignmentWake(wakeup, "issue-assignment:issue-1:agent-a:4"))
+      .rejects.toThrow("reserved for assignment events");
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("never retries a non-assignment wake: without the key a replay could run it twice", async () => {
+    const error = wrapped(Object.assign(new Error("closed"), { code: "CONNECTION_CLOSED" }));
+    const wakeup = vi.fn().mockRejectedValue(error);
+    await expect(nonAssignmentWake(wakeup)).rejects.toBe(error);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
 });

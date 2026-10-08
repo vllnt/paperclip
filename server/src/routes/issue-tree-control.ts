@@ -21,7 +21,6 @@ import {
   logActivity,
 } from "../services/index.js";
 import { assertBoard, getAccessibleResource, getActorInfo } from "./authz.js";
-import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -280,20 +279,18 @@ export function issueTreeControlRoutes(
       if (wakeAgents) {
         for (const restoredIssue of statusUpdate.updatedIssues) {
           if (!restoredIssue.assigneeAgentId) continue;
-          const wakeRun = await queueIssueAssignmentWakeup({
-            heartbeat,
-            issue: restoredIssue,
-            reason: "issue_tree_restored",
-            mutation: "tree_restore",
-            contextSource: "issue.tree_restore",
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            wakeupOptions: {
+          const wakeRun = await heartbeat
+            .wakeup(restoredIssue.assigneeAgentId, {
+              source: "assignment",
+              triggerDetail: "system",
+              reason: "issue_tree_restored",
               payload: {
                 issueId: restoredIssue.id,
                 rootIssueId: root.id,
                 restoreHoldId: result.hold.id,
               },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
               contextSnapshot: {
                 issueId: restoredIssue.id,
                 taskId: restoredIssue.id,
@@ -302,8 +299,8 @@ export function issueTreeControlRoutes(
                 rootIssueId: root.id,
                 restoreHoldId: result.hold.id,
               },
-            },
-          }).catch(() => null);
+            })
+            .catch(() => null);
           if (!wakeRun) continue;
           await logActivity(db, {
             companyId: root.companyId,
@@ -466,30 +463,25 @@ export function issueTreeControlRoutes(
               !RESUME_EXECUTABLE_STATUSES.includes(issue.status)
             )
               continue;
-            await queueIssueAssignmentWakeup({
-              heartbeat,
-              issue,
+            await heartbeat.wakeup(issue.assigneeAgentId, {
+              source: "assignment",
+              triggerDetail: "system",
               reason: "issue_tree_resumed",
-              mutation: "tree_resume",
-              contextSource: "issue.tree_resume",
+              payload: {
+                issueId: issue.id,
+                rootIssueId: root.id,
+                holdId: hold.id,
+              },
               requestedByActorType: actor.actorType,
               requestedByActorId: actor.actorId,
-              wakeupOptions: {
-                payload: {
-                  issueId: issue.id,
-                  rootIssueId: root.id,
-                  holdId: hold.id,
-                },
-                contextSnapshot: {
-                  issueId: issue.id,
-                  taskId: issue.id,
-                  wakeReason: "issue_tree_resumed",
-                  source: "issue.tree_resume",
-                  rootIssueId: root.id,
-                  holdId: hold.id,
-                },
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: "issue_tree_resumed",
+                source: "issue.tree_resume",
+                rootIssueId: root.id,
+                holdId: hold.id,
               },
-              rethrowOnError: true,
             });
           } catch (error) {
             const message = errorToMessage(error);

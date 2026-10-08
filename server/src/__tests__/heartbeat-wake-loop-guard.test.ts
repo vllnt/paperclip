@@ -794,6 +794,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       const [current] = await db.select().from(issues).where(eq(issues.id, issueId));
       let attempts = 0;
       const result = await queueIssueAssignmentWakeup({
+        assignmentEvent: true,
         heartbeat: {
           wakeup: async (agentId, opts) => {
             attempts += 1;

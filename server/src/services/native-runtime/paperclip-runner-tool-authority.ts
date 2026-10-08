@@ -1131,6 +1131,7 @@ export class PaperclipRunnerToolAuthority {
     if (assignmentHeartbeat && assignedAgentId && scheduledWakeIds.length > 0) {
       await queueIssueAssignmentWakeup({
         heartbeat: assignmentHeartbeat,
+        assignmentEvent: true,
         issue: {
           id: childId,
           assigneeAgentId: assignedAgentId,
@@ -1236,20 +1237,15 @@ export class PaperclipRunnerToolAuthority {
           record(current.executionState).status === "pending") return;
       if (current.executionRunId && current.executionRunId !== prepared.executionRunId) return;
       try {
-        await queueIssueAssignmentWakeup({
-          heartbeat: this.#assignmentHeartbeat()!,
-          issue: current,
-          reason: "issue_assigned",
-          mutation: "reassign_task_rollback",
-          contextSource: "paperclip_runner.reassign_task_rollback",
-          requestedByActorType: "agent",
-          requestedByActorId: this.binding.agentId,
-          wakeupOptions: {
-            payload: { issueId: taskId, interruptedRunId: prepared.executionRunId },
-            contextSnapshot: { issueId: taskId, forceFreshSession: true },
-            issueStateGuard: { statuses: ["todo", "in_progress"], assigneeAgentId: current.assigneeAgentId, statusVersion: current.statusVersion },
-          },
-          rethrowOnError: true,
+        // Restoring the stopped assignee is not a new assignment generation:
+        // it keeps its own per-interrupted-run restore key.
+        await this.binding.enqueueWakeup(current.assigneeAgentId, {
+          source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+          payload: { issueId: taskId, mutation: "reassign_task_rollback", interruptedRunId: prepared.executionRunId },
+          idempotencyKey: `${durableKey}:restore:${prepared.executionRunId}:${current.statusVersion}`,
+          requestedByActorType: "agent", requestedByActorId: this.binding.agentId,
+          contextSnapshot: { issueId: taskId, source: "paperclip_runner.reassign_task_rollback", forceFreshSession: true },
+          issueStateGuard: { statuses: ["todo", "in_progress"], assigneeAgentId: current.assigneeAgentId, statusVersion: current.statusVersion },
         });
       } catch (restoreError) {
         throw new AggregateError([error, restoreError], "paperclip_runner_reassignment_restore_failed");
@@ -1315,6 +1311,7 @@ export class PaperclipRunnerToolAuthority {
     if (result.scheduledWakeIds.length && this.binding.enqueueWakeup) {
       await queueIssueAssignmentWakeup({
         heartbeat: this.#assignmentHeartbeat()!,
+        assignmentEvent: true,
         issue: {
           id: taskId,
           assigneeAgentId,

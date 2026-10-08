@@ -1973,6 +1973,7 @@ export function routineService(
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
         await queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue: createdIssue,
           reason: "issue_assigned",
           mutation: "create",

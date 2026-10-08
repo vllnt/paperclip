@@ -59,9 +59,32 @@ export interface IssueAssignmentWakeupDeps<TRun = unknown> {
   ) => Promise<TRun>;
 }
 
-export async function queueIssueAssignmentWakeup<TRun>(input: {
+type IssueWakeTarget = {
+  id: string;
+  assigneeAgentId: string | null;
+  status: string;
+  statusVersion?: number;
+};
+
+/**
+ * Only a real assignment event opts in to the reserved assignment key: an
+ * issue created with an assignee, an assign or reassign, a routine-created
+ * issue, a runner create or reassign, and recovery's initial dispatch of a
+ * missed assignment wake. Every other producer (checkout, plugin, secret
+ * resolution, tree resume or restore, rollback) wakes without that key: a
+ * later wake on an unchanged issue is new work, not a replay of the old
+ * assignment.
+ */
+type AssignmentEventScope =
+  | {
+      /** `issue.statusVersion` is the assignment generation the key names. */
+      assignmentEvent: true;
+      issue: IssueWakeTarget & { statusVersion: number };
+    }
+  | { assignmentEvent?: false; issue: IssueWakeTarget };
+
+export async function queueIssueAssignmentWakeup<TRun>(input: AssignmentEventScope & {
   heartbeat: IssueAssignmentWakeupDeps<TRun>;
-  issue: { id: string; assigneeAgentId: string | null; status: string; statusVersion: number };
   reason: string;
   mutation: string;
   contextSource: string;
@@ -82,15 +105,18 @@ export async function queueIssueAssignmentWakeup<TRun>(input: {
   const assigneeAgentId = input.issue.assigneeAgentId;
   if (!assigneeAgentId || input.issue.status === "backlog") return;
 
-  const assignmentGeneration = input.issue.statusVersion;
-  if (!Number.isSafeInteger(assignmentGeneration) || assignmentGeneration < 0) {
-    throw new Error("Assignment wake requires the server issue status version");
+  let idempotencyKey: string | null = null;
+  if (input.assignmentEvent) {
+    const assignmentGeneration = input.issue.statusVersion;
+    if (!Number.isSafeInteger(assignmentGeneration) || assignmentGeneration < 0) {
+      throw new Error("Assignment wake requires the server issue status version");
+    }
+    idempotencyKey = buildIssueAssignmentIdempotencyKey({
+      issueId: input.issue.id,
+      assigneeAgentId,
+      assignmentGeneration,
+    });
   }
-  const idempotencyKey = buildIssueAssignmentIdempotencyKey({
-    issueId: input.issue.id,
-    assigneeAgentId,
-    assignmentGeneration,
-  });
   const basePayload: Record<string, unknown> = {
     issueId: input.issue.id,
     mutation: input.mutation,
@@ -124,6 +150,7 @@ export async function queueIssueAssignmentWakeup<TRun>(input: {
       ? { durableChatRequest: input.durableChatRequest }
       : {}),
     ...override,
+    // An assignment event's key always wins; other wakes keep their own.
     ...(idempotencyKey ? { idempotencyKey } : {}),
     payload: { ...basePayload, ...(override.payload ?? {}) },
     contextSnapshot: { ...baseContextSnapshot, ...(override.contextSnapshot ?? {}) },
@@ -131,7 +158,16 @@ export async function queueIssueAssignmentWakeup<TRun>(input: {
 
   const deliver = () => input.heartbeat.wakeup(assigneeAgentId, options);
   try {
-    return await retryIdempotentDatabaseOperation(deliver, { isTransient: isTransientDatabaseError });
+    // Only this helper mints assignment keys, and only for an assignment event.
+    if (override.idempotencyKey?.startsWith(ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX)) {
+      throw new Error("Assignment idempotency keys are reserved for assignment events");
+    }
+    // A transient failure may hide a committed wake. Only the assignment key
+    // (with its unique index) makes a replay return that wake, so only an
+    // assignment event is retried.
+    return idempotencyKey
+      ? await retryIdempotentDatabaseOperation(deliver, { isTransient: isTransientDatabaseError })
+      : await deliver();
   } catch (err) {
     logger.warn(
       { err, issueId: input.issue.id },
