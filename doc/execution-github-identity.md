@@ -100,7 +100,7 @@ writes off never hands runs back to a host or bot credential.
 
 | Operation | Credential |
 |---|---|
-| Read (`fetch`, `clone`, `gh pr view`, `gh api` GET…) | Read-only installation token for one fenced repository, or for all fenced repositories when the command names none (GraphQL, search, Projects). Cached 50 minutes. |
+| Read (`fetch`, `clone`, `gh pr view`, `gh api` GET…) | Read-only installation token for one fenced repository, or for all fenced repositories when the command names none (GraphQL, search). Either carries org Projects read when the installation grants it. Cached 50 minutes. |
 | Local command (`status`, `commit`, `rebase`…), or a git command that only reaches local paths | No token: only the person's commit identity, plus the signing key for commit-creating commands. |
 | Write | The user token, after the gates below. |
 

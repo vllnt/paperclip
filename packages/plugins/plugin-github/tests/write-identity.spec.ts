@@ -296,7 +296,7 @@ describe("GitHub write identity: App user (anthm)", () => {
     const read = await f.read("Anthm-FR/linkzic");
     expect(read).toMatchObject({ identity: "bot", credential: { token: token("ghs", 1), login: "anthm-agents[bot]", userId: "99" }, author: { login: "agent-owner", userId: USER_ID } });
     expect(f.scoped).toHaveBeenLastCalledWith(APP, "value-a-key", 101,
-      { metadata: "read", contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read", statuses: "read" }, [24]);
+      { metadata: "read", contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read", statuses: "read", organization_projects: "read" }, [24]);
     // Cached per repository: no second mint.
     await f.read("anthm-fr/linkzic");
     expect(f.scoped).toHaveBeenCalledTimes(1);
@@ -311,6 +311,29 @@ describe("GitHub write identity: App user (anthm)", () => {
     expect(await f.decide({ repository: "anthm-fr/songtrivia", access: "none", action: "commit", privileged: [] }))
       .toMatchObject({ identity: "user", credential: { token: null, login: "agent-owner" }, signingKey: expect.stringMatching(/^ssh-ed25519 /) });
     expect(await f.decide({ repository: null, access: "none", action: null, privileged: [] })).toMatchObject({ credential: { token: null } });
+  });
+
+  it("adds org Projects read to a read token that names a repository, when the installation grants it", async () => {
+    // `gh project item-list 34 --owner Anthm-FR` inside a songtrivia checkout: the server names the checkout's repository.
+    const f = await appFixture();
+    await f.authorize();
+    await f.read("anthm-fr/songtrivia");
+    expect(f.scoped).toHaveBeenLastCalledWith(APP, "value-a-key", 101,
+      { metadata: "read", contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read", statuses: "read", organization_projects: "read" }, [22]);
+  });
+
+  it("leaves org Projects out of every read token when the installation does not grant it", async () => {
+    const f = await appFixture();
+    const { organization_projects: _, ...granted } = permissions;
+    vi.mocked(f.client.catalog).mockImplementation(async id => ({ app: { id, slug: "anthm-agents", name: "anthm-agents", permissions: f.github.appPermissions },
+      installations: [{ id: 101, login: "Anthm-FR", accountId: 1, accountType: "Organization" as const, suspended: false, permissions: granted }],
+      repositories: repos.map(repo => ({ ...repo, permissions: granted })), warnings: [], truncated: false }));
+    await f.authorize();
+    await f.read("anthm-fr/songtrivia");
+    await f.read(null);
+    expect(f.scoped).toHaveBeenCalledTimes(2);
+    expect(f.scoped.mock.calls[0]![3]).toEqual({ metadata: "read", contents: "read", issues: "read", pull_requests: "read", actions: "read", checks: "read", statuses: "read" });
+    for (const call of f.scoped.mock.calls) expect(call[3]).not.toHaveProperty("organization_projects");
   });
 
   it("enforces the fence: allowlist, look-alikes, staged repositories and other orgs", async () => {
@@ -884,7 +907,7 @@ describe("I-RO: installation tokens of an App-user company's App only read", () 
     await expect(f.client.createIssue(APP, rsaPem, { ...repo, permissions } as never, { title: "x", body: "y" })).rejects.toThrow(/Refused to mint/);
     await expect(new RepositoryManager(f.client, { id: APP, pem: rsaPem }, { ...repo, permissions } as never).run("comment", { number: 1, body: "x" })).rejects.toThrow(/Refused to mint/);
     expect(minted).toEqual([
-      { permissions: reads, repository_ids: [24] },
+      { permissions: { ...reads, organization_projects: "read" }, repository_ids: [24] },
       { permissions: { ...reads, organization_projects: "read" }, repositories: ["anthm-fr", "linkzic", "nextdle", "songtrivia", "wordzic"] },
       { permissions: { metadata: "read", issues: "read" }, repository_ids: [22] },
       { permissions: { organization_projects: "read", metadata: "read", issues: "read", pull_requests: "read", contents: "read" }, repositories: ["anthm-fr", "linkzic", "nextdle", "songtrivia", "wordzic"] },

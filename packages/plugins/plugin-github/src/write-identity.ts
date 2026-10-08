@@ -199,8 +199,10 @@ export function registerWriteIdentity(
 
   /**
    * A read-only installation token for one fenced repository, or for all of
-   * them when the command names none (GraphQL, search, Projects). Cached for
-   * 50 minutes; installation tokens last one hour.
+   * them when the command names none (GraphQL, search). Either carries org
+   * Projects read when the installation grants it: `gh project` runs inside a
+   * checkout, which names its repository. Cached for 50 minutes; installation
+   * tokens last one hour.
    */
   async function readToken(companyId: string, current: GitHubWriteIdentityPolicy, repository: string | null): Promise<string> {
     const catalog = await loadCatalog(companyId);
@@ -218,7 +220,7 @@ export function registerWriteIdentity(
     const granted = catalog.installations.find(installation => installation.id === installationId)?.permissions ?? targets[0]!.permissions ?? {};
     const permissions: Record<string, string> = { metadata: "read" };
     for (const name of READ_PERMISSIONS) if (granted[name]) permissions[name] = "read";
-    if (!repository && granted.organization_projects) permissions.organization_projects = "read";
+    if (granted.organization_projects) permissions.organization_projects = "read";
     const auth = await credentials(companyId);
     // One repository by ID, or the fenced repositories by name; never the whole installation (I-RO).
     const token = await github.scopedToken(auth.id, auth.pem, installationId, permissions, repository ? [ids[0]!] : scoped.map(repo => repo.fullName).sort());
