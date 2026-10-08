@@ -376,6 +376,7 @@ import {
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
+  isSuccessfulRunWithStoppedBackgroundTask,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
@@ -445,6 +446,8 @@ import {
 } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
+import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
+import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -13345,6 +13348,7 @@ export function heartbeatService(
           assigneeAgentId: issues.assigneeAgentId,
           executionState: issues.executionState,
           projectId: issues.projectId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
         })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -13359,6 +13363,9 @@ export function heartbeatService(
         .where(eq(agents.id, run.agentId))
         .then((rows) => rows[0] ?? null),
     ]);
+
+    // A legitimately waiting issue is alive: the wait's wake re-checks it.
+    if (issue && hasActiveIssueWait(issue)) return;
 
     const budgetBlock =
       issue && agent
@@ -25531,6 +25538,11 @@ export function heartbeatService(
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
+        const backgroundTaskStopped = isSuccessfulRunWithStoppedBackgroundTask({
+          errorCode: adapterResult.errorCode ?? null,
+          timedOut: adapterResult.timedOut,
+          resultJson: parseObject(adapterResult.resultJson),
+        });
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
           outcome = latestRun.status;
@@ -25555,6 +25567,9 @@ export function heartbeatService(
           !adapterResult.signal &&
           !processCancellation?.failed
         ) {
+          outcome = "succeeded";
+        } else if (backgroundTaskStopped && !processCancellation?.failed) {
+          // The turn succeeded; only the lingering background task was stopped.
           outcome = "succeeded";
         } else {
           outcome = "failed";
@@ -25707,6 +25722,14 @@ export function heartbeatService(
                 ...(adapterResult.executionRecovery
                   ? { executionRecovery: adapterResult.executionRecovery }
                   : {}),
+                ...(outcome === "succeeded" && backgroundTaskStopped
+                  ? {
+                      backgroundTaskStopped: true,
+                      backgroundTaskStopWarning: adapterResult.errorMessage
+                        ? redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions)
+                        : null,
+                    }
+                  : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
@@ -25814,6 +25837,9 @@ export function heartbeatService(
             payload: {
               status,
               exitCode: adapterResult.exitCode,
+              ...(outcome === "succeeded" && backgroundTaskStopped
+                ? { backgroundTaskStopped: true, signal: adapterResult.signal ?? null }
+                : {}),
               ...(readRunCancellation(finalizedRun.resultJson) ? { cancellation: readRunCancellation(finalizedRun.resultJson) } : {}),
             },
           });
@@ -25837,6 +25863,19 @@ export function heartbeatService(
           }
           const livenessRun = finalizedRun;
           await refreshContinuationSummaryForRun(livenessRun, agent);
+          // Schedule the re-check before release, continuation and handoff run,
+          // so they see the wait and leave the issue alone until it is due.
+          try {
+            await scheduleBackgroundTaskRecheck(db, issuesSvc, {
+              run: livenessRun,
+              agentRuntimeConfig: agent.runtimeConfig,
+            });
+          } catch (err) {
+            logger.warn(
+              { err, runId: livenessRun.id, issueId },
+              "failed to schedule background task re-check",
+            );
+          }
           const skipRunIssueComment =
             parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
           let resolvedPresentationDecision: RunPresentationDecision | null =
