@@ -19655,6 +19655,74 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  /**
+   * A parked self-reblock wake on an issue with no prior run has no release to
+   * promote it, so the sweep re-admits the original wake with its own reason,
+   * context and self-reblock provenance: admission applies the limit (or the
+   * owner suppression) again. One transaction holds a per-wake promotion lock
+   * and retires the parked receipt only after the re-admitted wake is durable
+   * under a key derived from it. A crash before that commit leaves the wake
+   * parked, and the next sweep finds the re-admitted receipt by that key
+   * instead of admitting it twice. If nothing was admitted (still over the
+   * limit, or admission failed), the receipt stays parked with its reason.
+   */
+  async function promoteAnchorlessParkedSelfReblockWake(
+    wake: typeof agentWakeupRequests.$inferSelect,
+    repark: (executor: Db, wake: typeof agentWakeupRequests.$inferSelect) => Promise<unknown>,
+  ) {
+    const promotionKey = `self-reblock-anchor-missing:${wake.id}`;
+    await db.transaction(async (tx) => {
+      const locks = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${promotionKey}, 0)) as acquired`,
+      );
+      if (!locks[0]?.acquired) return;
+      const promotionReceipt = () => tx
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.idempotencyKey, promotionKey)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!(await promotionReceipt())) {
+        const {
+          [SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY]: _parkedState,
+          [DEFERRED_WAKE_CONTEXT_KEY]: parkedContext,
+          ...payload
+        } = parseObject(wake.payload);
+        const marker = readSelfReblockWakeMarker(wake.payload, wake.agentId);
+        await enqueueWakeup(wake.agentId, {
+          source: (wake.source ?? "automation") as unknown as WakeupOptions["source"],
+          triggerDetail: (wake.triggerDetail ?? "system") as unknown as WakeupOptions["triggerDetail"],
+          // A limit-parked receipt's own reason is the deferral, not the wake.
+          reason: marker?.reason ?? wake.reason,
+          payload: { ...payload, selfReblockPromotion: "anchor_missing" },
+          contextSnapshot: parseObject(parkedContext),
+          requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+          requestedByActorId: wake.requestedByActorId,
+          idempotencyKey: promotionKey,
+          ...(marker?.runId
+            ? { causedBy: { kind: "self_reblock" as const, runId: marker.runId, actorId: marker.causeActorId } }
+            : {}),
+        }).catch((err) => {
+          logger.warn({ err, queueId: wake.id }, "anchorless parked self-reblock wake was not re-admitted");
+        });
+      }
+      if (await promotionReceipt()) {
+        await tx.update(agentWakeupRequests).set({
+          status: "cancelled",
+          reason: "issue_self_reblock_anchor_missing_promoted",
+          finishedAt: new Date(),
+          updatedAt: new Date(),
+        }).where(and(
+          eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.companyId, wake.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+      } else {
+        await repark(tx as unknown as Db, wake);
+      }
+    });
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -19732,6 +19800,19 @@ export function heartbeatService(
         sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    // Re-check a wake that stays parked (a successor, an execution hold, or the
+    // limit again) at most once per window instead of on every tick.
+    const reparkDueSelfReblockWake = (executor: Db, wake: typeof agentWakeupRequests.$inferSelect) =>
+      executor.update(agentWakeupRequests).set({
+        payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}]::text[],
+          ${JSON.stringify(buildSelfReblockWakeParkedState(new Date(Date.now() + SELF_REBLOCK_WAKE_WINDOW_MS)))}::jsonb)`,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(agentWakeupRequests.id, wake.id),
+        eq(agentWakeupRequests.companyId, wake.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
+      )).returning({ id: agentWakeupRequests.id });
     const reDrivenParkedIssues = new Set<string>();
     for (const { wake } of dueParkedWakes) {
       const issueId = String(wake.payload?.issueId);
@@ -19742,77 +19823,11 @@ export function heartbeatService(
         await releaseIssueExecutionAndPromote(anchor, { suppressImmediateRecovery: true, anchorRunOnly: true }).catch((err) => {
           logger.warn({ err, queueId: wake.id }, "failed to re-drive a parked self-reblock wake");
         });
-        // Whatever kept it parked (a successor or an execution hold), re-check
-        // at most once per window instead of on every tick.
-        await db.update(agentWakeupRequests).set({
-          payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}]::text[],
-            ${JSON.stringify(buildSelfReblockWakeParkedState(new Date(Date.now() + SELF_REBLOCK_WAKE_WINDOW_MS)))}::jsonb)`,
-          updatedAt: new Date(),
-        }).where(and(
-          eq(agentWakeupRequests.id, wake.id),
-          eq(agentWakeupRequests.companyId, wake.companyId),
-          eq(agentWakeupRequests.status, "deferred_issue_execution"),
-          sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
-        ));
+        await reparkDueSelfReblockWake(db, wake);
       } else {
-        // An issue with no prior run still needs a bounded recovery path. Claim
-        // the parked receipt, then send the original wake through normal
-        // admission so the self-reblock limit is applied again. This gives the
-        // wake a durable audit reason instead of parking it forever.
-        const [claimed] = await db.update(agentWakeupRequests).set({
-          status: "cancelled",
-          reason: "issue_self_reblock_anchor_missing_promoted",
-          finishedAt: new Date(),
-          updatedAt: new Date(),
-        }).where(and(
-          eq(agentWakeupRequests.id, wake.id),
-          eq(agentWakeupRequests.companyId, wake.companyId),
-          eq(agentWakeupRequests.status, "deferred_issue_execution"),
-          sql`(${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} ->> 'notBefore')::timestamptz <= now()`,
-        )).returning({ id: agentWakeupRequests.id });
-        if (claimed) {
-          const promotedPayload = { ...parseObject(wake.payload) };
-          delete promotedPayload[SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY];
-          promotedPayload.selfReblockPromotion = "anchor_missing";
-          const promotionKey = `self-reblock-anchor-missing:${wake.id}`;
-          try {
-            // The original receipt remains the retry anchor until the new wake
-            // is durably admitted. A distinct key makes this promotion itself
-            // idempotent across a lost acknowledgement.
-            const promoted = await enqueueWakeup(wake.agentId, {
-              source: (wake.source ?? "automation") as unknown as WakeupOptions["source"],
-              triggerDetail: (wake.triggerDetail ?? "system") as unknown as WakeupOptions["triggerDetail"],
-              reason: wake.reason,
-              payload: promotedPayload,
-              requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
-              requestedByActorId: wake.requestedByActorId,
-              idempotencyKey: promotionKey,
-            });
-            const [promotionReceipt] = await db
-              .select({ id: agentWakeupRequests.id })
-              .from(agentWakeupRequests)
-              .where(and(
-                eq(agentWakeupRequests.companyId, wake.companyId),
-                eq(agentWakeupRequests.idempotencyKey, promotionKey),
-              ))
-              .limit(1);
-            if (!promoted && !promotionReceipt) throw new Error("anchorless promotion produced no durable receipt");
-          } catch (err) {
-            const parkedPayload = {
-              ...promotedPayload,
-              [SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY]: buildSelfReblockWakeParkedState(
-                new Date(Date.now() + SELF_REBLOCK_WAKE_WINDOW_MS),
-              ),
-            };
-            await db.update(agentWakeupRequests).set({
-              status: "deferred_issue_execution",
-              finishedAt: null,
-              updatedAt: new Date(),
-              payload: parkedPayload,
-            }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "cancelled")));
-            logger.warn({ err, queueId: wake.id }, "failed to promote anchorless parked self-reblock wake");
-          }
-        }
+        await promoteAnchorlessParkedSelfReblockWake(wake, reparkDueSelfReblockWake).catch((err) => {
+          logger.warn({ err, queueId: wake.id }, "failed to promote anchorless parked self-reblock wake");
+        });
       }
     }
 
