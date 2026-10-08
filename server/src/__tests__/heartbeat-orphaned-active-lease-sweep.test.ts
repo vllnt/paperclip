@@ -252,6 +252,23 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       expect(live).toMatchObject({ status: "active", releasedAt: null });
     });
 
+    it("still guards a sandbox lease whose resource a live lease shares", async () => {
+      const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+      const orphanRunId = await insertHeartbeatRun({ companyId, agentId, status: "interrupted" });
+      const liveRunId = await insertHeartbeatRun({ companyId, agentId, status: "running" });
+      const sharedProviderLeaseId = "sandbox://fake/shared-resource";
+      const orphanLeaseId = await insertActiveLease({ companyId, environmentId, heartbeatRunId: orphanRunId,
+        updatedAt: oldEnough(), providerLeaseId: sharedProviderLeaseId });
+      await insertActiveLease({ companyId, environmentId, heartbeatRunId: liveRunId,
+        updatedAt: oldEnough(), providerLeaseId: sharedProviderLeaseId });
+      await db.update(environmentLeases).set({ metadata: { driver: "sandbox" } });
+
+      const result = await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs });
+
+      expect(result).toEqual({ recovered: 0 });
+      expect(await leaseRow(orphanLeaseId)).toMatchObject({ status: "active" });
+    });
+
     it("never releases the lease of a live run, however old it is", async () => {
       const { companyId, agentId, environmentId } = await seedSshEnvironment();
       const liveRunId = await insertHeartbeatRun({ companyId, agentId, status: "running" });

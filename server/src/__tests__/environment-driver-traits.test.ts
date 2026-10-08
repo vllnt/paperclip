@@ -14,24 +14,28 @@ const EXPECTED_TRAITS: Record<string, Omit<EnvironmentDriverTraits, "driver">> =
     runsWorkspaceOffHost: false,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    leaseOwnsProviderResource: false,
   },
   ssh: {
     realizesWorkspace: true,
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    leaseOwnsProviderResource: false,
   },
   sandbox: {
     realizesWorkspace: true,
     runsWorkspaceOffHost: true,
     confinesStagedProjects: true,
     hasLeaseCapabilityModel: true,
+    leaseOwnsProviderResource: true,
   },
   plugin: {
     realizesWorkspace: false,
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    leaseOwnsProviderResource: true,
   },
 };
 
@@ -44,6 +48,7 @@ describe("environment driver traits", () => {
       expect(traits.runsWorkspaceOffHost).toBe(expected.runsWorkspaceOffHost);
       expect(traits.confinesStagedProjects).toBe(expected.confinesStagedProjects);
       expect(traits.hasLeaseCapabilityModel).toBe(expected.hasLeaseCapabilityModel);
+      expect(traits.leaseOwnsProviderResource).toBe(expected.leaseOwnsProviderResource);
     });
   }
 
