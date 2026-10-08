@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
@@ -11,6 +11,9 @@ import {
   companyMemberships,
   costEvents,
   createDb,
+  environments,
+  invites,
+  joinRequests,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import {
@@ -18,6 +21,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { accessRoutes } from "../routes/access.js";
 import { agentRoutes } from "../routes/agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -48,6 +52,23 @@ function createApp(db: Db, actor: Express.Request["actor"]) {
   return app;
 }
 
+function createAccessApp(db: Db, actor: Express.Request["actor"]) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.actor = actor;
+    next();
+  });
+  app.use("/api", accessRoutes(db, {
+    deploymentMode: "authenticated",
+    deploymentExposure: "private",
+    bindHost: "127.0.0.1",
+    allowedHostnames: [],
+  }));
+  app.use(errorHandler);
+  return app;
+}
+
 function agentActor(companyId: string, agentId: string): Express.Request["actor"] {
   return { type: "agent", agentId, companyId, source: "agent_key" };
 }
@@ -65,7 +86,13 @@ function boardActor(companyId: string): Express.Request["actor"] {
 
 async function seedAgent(
   db: Db,
-  input: { role?: string; status?: string; permissions?: Record<string, unknown> } = {},
+  input: {
+    role?: string;
+    status?: string;
+    permissions?: Record<string, unknown>;
+    adapterConfig?: Record<string, unknown>;
+    defaultEnvironmentId?: string | null;
+  } = {},
 ) {
   const [company] = await db
     .insert(companies)
@@ -82,8 +109,9 @@ async function seedAgent(
       role: input.role ?? "engineer",
       status: input.status ?? "idle",
       adapterType: "process",
-      adapterConfig: STORED_ADAPTER_CONFIG,
+      adapterConfig: input.adapterConfig ?? STORED_ADAPTER_CONFIG,
       runtimeConfig: STORED_RUNTIME_CONFIG,
+      defaultEnvironmentId: input.defaultEnvironmentId ?? null,
       budgetMonthlyCents: 1_000,
       permissions: input.permissions ?? {},
     })
@@ -104,6 +132,14 @@ async function seedAgent(
     occurredAt: new Date(),
   });
   return { companyId: company!.id, agentId: agent!.id };
+}
+
+async function seedLocalEnvironment(db: Db) {
+  const [environment] = await db
+    .insert(environments)
+    .values({ name: `Local ${randomUUID()}`, driver: "local" })
+    .returning();
+  return environment!.id;
 }
 
 async function seedPeer(db: Db, companyId: string) {
@@ -137,6 +173,13 @@ async function readAgent(db: Db, agentId: string) {
   return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0]!);
 }
 
+async function findRevision(db: Db, agentId: string, matches: (afterConfig: Record<string, unknown>) => boolean) {
+  const revisions = await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agentId));
+  const revision = revisions.find((row) => matches(row.afterConfig));
+  if (!revision) throw new Error("revision not found");
+  return revision;
+}
+
 async function deniedActivity(db: Db, agentId: string) {
   return db
     .select()
@@ -159,7 +202,10 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     await db.delete(agentConfigRevisions);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
+    await db.delete(joinRequests);
+    await db.delete(invites);
     await db.delete(agents);
+    await db.delete(environments);
     await db.delete(companies);
   });
 
@@ -198,7 +244,38 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     {
       label: "adapterType",
       body: { adapterType: "claude_local" },
-      fields: ["adapterType", "adapterConfig.model", "adapterConfig.effort"],
+      fields: ["adapterType", "adapterConfig.effort", "adapterConfig.model"],
+    },
+    {
+      label: "adapterConfig.env",
+      body: { adapterConfig: { env: { CODEX_HOME: { type: "plain", value: "/tmp/other-codex-home" } } } },
+      fields: ["adapterConfig.env.CODEX_HOME"],
+    },
+    { label: "adapterConfig.command", body: { adapterConfig: { command: "/tmp/wrapper" } }, fields: ["adapterConfig.command"] },
+    {
+      label: "adapterConfig.agentCommand",
+      body: { adapterConfig: { agentCommand: "/tmp/acp-wrapper" } },
+      fields: ["adapterConfig.agentCommand"],
+    },
+    {
+      label: "adapterConfig.dangerouslySkipPermissions",
+      body: { adapterConfig: { dangerouslySkipPermissions: true } },
+      fields: ["adapterConfig.dangerouslySkipPermissions"],
+    },
+    {
+      label: "adapterConfig.permissionMode",
+      body: { adapterConfig: { permissionMode: "bypassPermissions" } },
+      fields: ["adapterConfig.permissionMode"],
+    },
+    {
+      label: "adapterConfig.filesystemSandboxCommand",
+      body: { adapterConfig: { filesystemSandboxCommand: "/tmp/not-bwrap" } },
+      fields: ["adapterConfig.filesystemSandboxCommand"],
+    },
+    {
+      label: "a future dangerously* adapter flag",
+      body: { adapterConfig: { dangerouslyEnableFutureEscapeHatch: true } },
+      fields: ["adapterConfig.dangerouslyEnableFutureEscapeHatch"],
     },
     { label: "budgetMonthlyCents", body: { budgetMonthlyCents: 1_000_000 }, fields: ["budgetMonthlyCents"] },
     { label: "spentMonthlyCents", body: { spentMonthlyCents: 0 }, fields: ["spentMonthlyCents"] },
@@ -212,7 +289,9 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       .send(body);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("Agents cannot change their own run limits, budget, model, role, or permissions");
+    expect(res.body.error).toContain(
+      "Agents cannot change their own run limits, budget, model, environment, sandbox, role, or permissions",
+    );
     expect(res.body.error).toContain(fields[0]);
     expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields });
 
@@ -237,6 +316,52 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       entityType: "agent",
       details: { surface: "patch", fields, reason: "deny_no_grant" },
     });
+  });
+
+  it("denies an agent changing its own default environment", async () => {
+    const environmentId = await seedLocalEnvironment(db);
+    const { companyId, agentId } = await seedAgent(db, { defaultEnvironmentId: environmentId });
+
+    const res = await request(createApp(db, agentActor(companyId, agentId)))
+      .patch(`/api/agents/${agentId}`)
+      .send({ defaultEnvironmentId: null });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.fields).toEqual(["defaultEnvironmentId"]);
+    expect((await readAgent(db, agentId)).defaultEnvironmentId).toBe(environmentId);
+    expect((await deniedActivity(db, agentId))[0]?.details).toMatchObject({ fields: ["defaultEnvironmentId"] });
+  });
+
+  it("denies an edit that would make the server turn on a default bypass flag", async () => {
+    const { companyId, agentId } = await seedAgent(db);
+    await db
+      .update(agents)
+      .set({ adapterType: "codex_local", adapterConfig: { model: "gpt-5", cwd: "/tmp/agent-self-config" } })
+      .where(eq(agents.id, agentId));
+
+    const res = await request(createApp(db, agentActor(companyId, agentId)))
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { cwd: "/tmp/agent-self-config-next" } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.fields).toEqual(["adapterConfig.dangerouslyBypassApprovalsAndSandbox"]);
+    expect((await readAgent(db, agentId)).adapterConfig).toEqual({ model: "gpt-5", cwd: "/tmp/agent-self-config" });
+  });
+
+  it("still lets an agent echo back its own redacted env unchanged", async () => {
+    const storedAdapterConfig = { ...STORED_ADAPTER_CONFIG, env: { LOG_LEVEL: { type: "plain", value: "debug" } } };
+    const { companyId, agentId } = await seedAgent(db, { adapterConfig: storedAdapterConfig });
+    const app = createApp(db, agentActor(companyId, agentId));
+
+    const detail = await request(app).get(`/api/agents/${agentId}`);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+    expect(detail.body.adapterConfig.env.LOG_LEVEL.value).not.toBe("debug");
+
+    const res = await request(app).patch(`/api/agents/${agentId}`).send({ adapterConfig: detail.body.adapterConfig });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect((await readAgent(db, agentId)).adapterConfig).toEqual(storedAdapterConfig);
+    expect(await deniedActivity(db, agentId)).toHaveLength(0);
   });
 
   it("denies a paused agent un-pausing itself through PATCH", async () => {
@@ -279,15 +404,14 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       .patch(`/api/agents/${agentId}`)
       .send({ runtimeConfig: { heartbeat: { ...STORED_RUNTIME_CONFIG.heartbeat, maxDailyRuns: 2 } } })
       .expect(200);
-    const [higherCapRevision] = await db
-      .select()
-      .from(agentConfigRevisions)
-      .where(eq(agentConfigRevisions.agentId, agentId))
-      .orderBy(agentConfigRevisions.createdAt)
-      .limit(1);
+    const higherCapRevision = await findRevision(
+      db,
+      agentId,
+      (afterConfig) => JSON.stringify(afterConfig.runtimeConfig).includes('"maxDailyRuns":50'),
+    );
 
     const res = await request(createApp(db, agentActor(companyId, agentId)))
-      .post(`/api/agents/${agentId}/config-revisions/${higherCapRevision!.id}/rollback`)
+      .post(`/api/agents/${agentId}/config-revisions/${higherCapRevision.id}/rollback`)
       .send({});
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
@@ -295,6 +419,49 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     expect((await readAgent(db, agentId)).runtimeConfig).toMatchObject({ heartbeat: { maxDailyRuns: 2 } });
     const denied = await deniedActivity(db, agentId);
     expect(denied[0]?.details).toMatchObject({ surface: "config_rollback" });
+  });
+
+  it("denies an agent rolling its own config back to a revision with another environment", async () => {
+    const environmentId = await seedLocalEnvironment(db);
+    const { companyId, agentId } = await seedAgent(db);
+    const board = createApp(db, boardActor(companyId));
+    await request(board).patch(`/api/agents/${agentId}`).send({ defaultEnvironmentId: environmentId }).expect(200);
+    await request(board).patch(`/api/agents/${agentId}`).send({ defaultEnvironmentId: null }).expect(200);
+    const environmentRevision = await findRevision(
+      db,
+      agentId,
+      (afterConfig) => afterConfig.defaultEnvironmentId === environmentId,
+    );
+
+    const res = await request(createApp(db, agentActor(companyId, agentId)))
+      .post(`/api/agents/${agentId}/config-revisions/${environmentRevision.id}/rollback`)
+      .send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.fields).toEqual(["defaultEnvironmentId"]);
+    expect((await readAgent(db, agentId)).defaultEnvironmentId).toBeNull();
+  });
+
+  it("denies an agent rolling back any change to its own config, but allows a no-op rollback", async () => {
+    const { companyId, agentId } = await seedAgent(db);
+    const board = createApp(db, boardActor(companyId));
+    await request(board).patch(`/api/agents/${agentId}`).send({ title: "Old title" }).expect(200);
+    await request(board).patch(`/api/agents/${agentId}`).send({ title: "Current title" }).expect(200);
+    const oldTitleRevision = await findRevision(db, agentId, (afterConfig) => afterConfig.title === "Old title");
+    const currentTitleRevision = await findRevision(db, agentId, (afterConfig) => afterConfig.title === "Current title");
+    const app = createApp(db, agentActor(companyId, agentId));
+
+    const changing = await request(app)
+      .post(`/api/agents/${agentId}/config-revisions/${oldTitleRevision.id}/rollback`)
+      .send({});
+    expect(changing.status, JSON.stringify(changing.body)).toBe(403);
+    expect(changing.body.details.fields).toEqual(["title"]);
+    expect((await readAgent(db, agentId)).title).toBe("Current title");
+
+    const noOp = await request(app)
+      .post(`/api/agents/${agentId}/config-revisions/${currentTitleRevision.id}/rollback`)
+      .send({});
+    expect(noOp.status, JSON.stringify(noOp.body)).toBe(200);
   });
 
   it("denies a CEO agent changing its own permissions but not a peer's or an unchanged resubmit", async () => {
@@ -381,6 +548,25 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     expect(after.budgetMonthlyCents).toBe(5_000);
   });
 
+  it("keeps today's behaviour for a granted agent changing its own env and environment", async () => {
+    const environmentId = await seedLocalEnvironment(db);
+    const { companyId, agentId } = await seedAgent(db);
+    await grantAgentConfigure(db, companyId, agentId, { agentIds: [agentId] });
+
+    const res = await request(createApp(db, agentActor(companyId, agentId)))
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        adapterConfig: { env: { LOG_LEVEL: { type: "plain", value: "info" } } },
+        defaultEnvironmentId: environmentId,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const after = await readAgent(db, agentId);
+    expect(after.defaultEnvironmentId).toBe(environmentId);
+    expect(after.adapterConfig).toMatchObject({ env: { LOG_LEVEL: { type: "plain", value: "info" } } });
+    expect(await deniedActivity(db, agentId)).toHaveLength(0);
+  });
+
   it.each([
     { label: "company-wide", scope: null },
     { label: "scoped to itself", scope: "self" },
@@ -400,5 +586,176 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     expect(after.adapterConfig).toMatchObject({ model: "large-model" });
     expect(after.runtimeConfig).toMatchObject({ heartbeat: { maxDailyRuns: 50 } });
     expect(await deniedActivity(db, agentId)).toHaveLength(0);
+  });
+
+  describe("OpenClaw invite replay on an approved agent", () => {
+    const gatewayUrl = "wss://gateway.example.test/";
+
+    async function seedApprovedOpenClawJoin(status: "approved" | "pending_approval" = "approved") {
+      const token = `pcp_invite_${randomUUID()}`;
+      const gatewayToken = `${randomUUID()}${randomUUID()}`.replace(/-/g, "");
+      const joinDefaults = {
+        url: gatewayUrl,
+        headers: { "x-openclaw-token": gatewayToken },
+        timeoutSec: 600,
+        disableDeviceAuth: true,
+      };
+      const [company] = await db
+        .insert(companies)
+        .values({ name: `Replay ${randomUUID()}`, issuePrefix: `RP${randomUUID().slice(0, 6).toUpperCase()}` })
+        .returning();
+      const [agent] = await db
+        .insert(agents)
+        .values({
+          companyId: company!.id,
+          name: `Gateway ${randomUUID().slice(0, 8)}`,
+          role: "engineer",
+          adapterType: "openclaw_gateway",
+          adapterConfig: joinDefaults,
+          runtimeConfig: {},
+          permissions: {},
+        })
+        .returning();
+      const [invite] = await db
+        .insert(invites)
+        .values({
+          companyId: company!.id,
+          tokenHash: createHash("sha256").update(token).digest("hex"),
+          allowedJoinTypes: "agent",
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+          acceptedAt: new Date(),
+        })
+        .returning();
+      const [joinRequest] = await db
+        .insert(joinRequests)
+        .values({
+          inviteId: invite!.id,
+          companyId: company!.id,
+          requestType: "agent",
+          status,
+          requestIp: "127.0.0.1",
+          agentName: agent!.name,
+          adapterType: "openclaw_gateway",
+          agentDefaultsPayload: joinDefaults,
+          createdAgentId: status === "approved" ? agent!.id : null,
+        })
+        .returning();
+      return { token, companyId: company!.id, agent: agent!, joinRequestId: joinRequest!.id, joinDefaults };
+    }
+
+    function replayBody(agentName: string, agentDefaultsPayload: Record<string, unknown>) {
+      return { requestType: "agent", agentName, adapterType: "openclaw_gateway", agentDefaultsPayload };
+    }
+
+    it("denies a replay that would change the agent's protected fields, before any write", async () => {
+      const fixture = await seedApprovedOpenClawJoin();
+
+      const res = await request(createAccessApp(db, { type: "none", source: "none" }))
+        .post(`/api/invites/${fixture.token}/accept`)
+        .send(replayBody(fixture.agent.name, { timeoutSec: 86_400 }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({
+        code: "agent_self_protected_config_change",
+        fields: ["adapterConfig.timeoutSec"],
+      });
+      expect((await readAgent(db, fixture.agent.id)).adapterConfig).toEqual(fixture.joinDefaults);
+      const [joinRequest] = await db.select().from(joinRequests).where(eq(joinRequests.id, fixture.joinRequestId));
+      expect(joinRequest!.agentDefaultsPayload).toEqual(fixture.joinDefaults);
+      expect((await deniedActivity(db, fixture.agent.id))[0]).toMatchObject({
+        actorType: "user",
+        actorId: "invite-anon",
+        details: {
+          surface: "join_replay",
+          fields: ["adapterConfig.timeoutSec"],
+          joinRequestId: fixture.joinRequestId,
+        },
+      });
+    });
+
+    it("still lets a replay refresh the gateway token", async () => {
+      const fixture = await seedApprovedOpenClawJoin();
+      const nextGatewayToken = `${randomUUID()}${randomUUID()}`.replace(/-/g, "");
+
+      const res = await request(createAccessApp(db, { type: "none", source: "none" }))
+        .post(`/api/invites/${fixture.token}/accept`)
+        .send(replayBody(fixture.agent.name, { headers: { "x-openclaw-token": nextGatewayToken } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+      expect((await readAgent(db, fixture.agent.id)).adapterConfig).toMatchObject({
+        url: gatewayUrl,
+        timeoutSec: 600,
+        headers: { "x-openclaw-token": nextGatewayToken },
+      });
+      expect(await deniedActivity(db, fixture.agent.id)).toHaveLength(0);
+    });
+
+    it.each([
+      {
+        label: "a signed-in user with no grant for the agent",
+        actor: (): Express.Request["actor"] => ({
+          type: "board",
+          userId: "stranger-user",
+          companyIds: [],
+          memberships: [],
+          isInstanceAdmin: false,
+          source: "session",
+        }),
+        actorType: "user",
+        actorId: "stranger-user",
+      },
+      {
+        label: "the agent itself without a grant",
+        actor: (companyId?: string, agentId?: string): Express.Request["actor"] =>
+          agentActor(companyId ?? "", agentId ?? ""),
+        actorType: "agent",
+        actorId: null,
+      },
+    ])("denies a protected replay change from $label", async ({ actor, actorType, actorId }) => {
+      const fixture = await seedApprovedOpenClawJoin();
+      await db.insert(companyMemberships).values({
+        companyId: fixture.companyId,
+        principalType: "agent",
+        principalId: fixture.agent.id,
+        status: "active",
+        membershipRole: "member",
+      });
+
+      const res = await request(createAccessApp(db, actor(fixture.companyId, fixture.agent.id)))
+        .post(`/api/invites/${fixture.token}/accept`)
+        .send(replayBody(fixture.agent.name, { url: "wss://other-gateway.example.test/", scopes: ["operator.admin"] }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.fields).toEqual(["adapterConfig.scopes", "adapterConfig.url"]);
+      expect((await readAgent(db, fixture.agent.id)).adapterConfig).toEqual(fixture.joinDefaults);
+      expect((await deniedActivity(db, fixture.agent.id))[0]).toMatchObject({
+        actorType,
+        actorId: actorId ?? fixture.agent.id,
+        details: { surface: "join_replay" },
+      });
+    });
+
+    it("still lets a pending join request replay", async () => {
+      const fixture = await seedApprovedOpenClawJoin("pending_approval");
+
+      const res = await request(createAccessApp(db, { type: "none", source: "none" }))
+        .post(`/api/invites/${fixture.token}/accept`)
+        .send(replayBody(fixture.agent.name, { timeoutSec: 86_400 }));
+
+      expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+      expect((await readAgent(db, fixture.agent.id)).adapterConfig).toEqual(fixture.joinDefaults);
+      expect(await deniedActivity(db, fixture.agent.id)).toHaveLength(0);
+    });
+
+    it("keeps today's behaviour for a board actor replay", async () => {
+      const fixture = await seedApprovedOpenClawJoin();
+
+      const res = await request(createAccessApp(db, boardActor(fixture.companyId)))
+        .post(`/api/invites/${fixture.token}/accept`)
+        .send(replayBody(fixture.agent.name, { timeoutSec: 86_400 }));
+
+      expect(res.status, JSON.stringify(res.body)).toBeLessThan(300);
+      expect((await readAgent(db, fixture.agent.id)).adapterConfig).toMatchObject({ timeoutSec: 86_400 });
+    });
   });
 });

@@ -263,7 +263,11 @@ function diffConfigSnapshot(
   return CONFIG_REVISION_FIELDS.filter((field) => !jsonEqual(before[field], after[field]));
 }
 
-function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$inferInsert> {
+/**
+ * Maps a config revision snapshot to the exact patch a rollback applies.
+ * Exported so the rollback route can check that same patch before applying it.
+ */
+export function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$inferInsert> {
   if (!isPlainRecord(snapshot)) throw unprocessable("Invalid revision snapshot");
 
   if (typeof snapshot.name !== "string" || snapshot.name.length === 0) {

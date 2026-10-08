@@ -72,7 +72,7 @@ describe("activity formatting", () => {
 
   it("labels a refused agent self-config change", () => {
     expect(formatActivityVerb("agent.self_config_update_denied", { fields: ["runtimeConfig.heartbeat.maxDailyRuns"] }))
-      .toBe("was blocked from changing its own limits, budget, model, role, or permissions on");
+      .toBe("was blocked from changing its own protected settings on");
   });
 
   it("formats monitor activity with direct verbs", () => {

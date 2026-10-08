@@ -94,6 +94,11 @@ import {
   resolveHumanInviteRole,
 } from "../services/company-member-roles.js";
 import { humanJoinGrantsFromDefaults } from "../services/invite-grants.js";
+import { collectAgentProtectedConfigChanges } from "./agent-self-config-authz.js";
+import {
+  assertAgentProtectedChangeGranted,
+  type AgentProtectedChangeActivityActor,
+} from "./agent-protected-change-guard.js";
 import {
   collapseDuplicatePendingHumanJoinRequests,
   findReusableHumanJoinRequest,
@@ -3827,6 +3832,62 @@ export function accessRoutes(
         throw badRequest(joinDefaults.fatalErrors.join("; "));
       }
 
+      /**
+       * A replay on an approved join request rewrites the live agent's adapter
+       * config. The invite holder is that agent, so the replay must pass the
+       * same protected-field check as a direct agent config change. Board
+       * callers are judged by the same authorization rule as `PATCH /agents/:id`.
+       */
+      const replayActivityActor: AgentProtectedChangeActivityActor = req.actor.type === "agent"
+        ? {
+          actorType: "agent",
+          actorId: req.actor.agentId ?? "invite-agent",
+          agentId: req.actor.agentId ?? null,
+          runId: req.actor.runId ?? null,
+          agentApiKeyId: req.actor.keyId ?? null,
+        }
+        : {
+          actorType: "user",
+          actorId: req.actor.userId ?? (req.actor.type === "board" ? "board" : "invite-anon"),
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+        };
+      const assertReplayMayRewriteAgent = async (
+        targetAgent: NonNullable<Awaited<ReturnType<typeof agents.getById>>>,
+        joinRequestId: string,
+      ) => {
+        await assertAgentProtectedChangeGranted({
+          db,
+          access,
+          req,
+          activityActor: replayActivityActor,
+          target: targetAgent,
+          fields: collectAgentProtectedConfigChanges(targetAgent, {
+            ...targetAgent,
+            adapterType: adapterType ?? targetAgent.adapterType,
+            adapterConfig: {
+              ...(isPlainObject(targetAgent.adapterConfig) ? targetAgent.adapterConfig : {}),
+              ...(joinDefaults.normalized ?? {}),
+            },
+          }),
+          surface: "join_replay",
+          details: { inviteId: invite.id, joinRequestId },
+        });
+      };
+      if (
+        inviteAlreadyAccepted &&
+        requestType === "agent" &&
+        adapterType === "openclaw_gateway" &&
+        existingJoinRequestForInvite?.status === "approved" &&
+        existingJoinRequestForInvite.createdAgentId
+      ) {
+        const replayTargetAgent = await agents.getById(existingJoinRequestForInvite.createdAgentId);
+        if (replayTargetAgent) {
+          await assertReplayMayRewriteAgent(replayTargetAgent, existingJoinRequestForInvite.id);
+        }
+      }
+
       const persistedJoinDefaultsPayload =
         requestType === "agent"
           ? await prepareAgentDefaultsPayloadForJoinPersistence({
@@ -3989,6 +4050,7 @@ export function accessRoutes(
           ...existingAdapterConfig,
           ...(joinDefaults.normalized ?? {})
         };
+        await assertReplayMayRewriteAgent(existingAgent, created.id);
         const updatedAgent = await agents.update(created.createdAgentId, {
           adapterType,
           adapterConfig: nextAdapterConfig

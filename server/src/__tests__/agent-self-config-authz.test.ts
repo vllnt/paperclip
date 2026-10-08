@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   agentProtectedConfigAfterPatch,
+  collectAgentConfigRollbackChanges,
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
   type AgentProtectedConfigState,
@@ -16,6 +17,7 @@ const stored: AgentProtectedConfigState = {
   spentMonthlyCents: 700,
   role: "engineer",
   status: "idle",
+  defaultEnvironmentId: "env-1",
 };
 
 function changesFor(patch: Record<string, unknown>, replaceAdapterConfig = false) {
@@ -24,13 +26,14 @@ function changesFor(patch: Record<string, unknown>, replaceAdapterConfig = false
 
 describe("agent self-config protected field diff", () => {
   it("ignores unprotected keys and unchanged protected values", () => {
-    expect(changesFor({ adapterConfig: { cwd: "/elsewhere", env: { A: "2" } } })).toEqual([]);
+    expect(changesFor({ adapterConfig: { cwd: "/elsewhere", notes: "x" } })).toEqual([]);
     expect(changesFor({
       adapterType: "claude_local",
-      adapterConfig: { model: "small-model" },
+      adapterConfig: { model: "small-model", env: { A: "1" } },
       runtimeConfig: { heartbeat: { maxConcurrentRuns: 1, maxDailyRuns: 5 } },
       budgetMonthlyCents: 1_000,
       spentMonthlyCents: 700,
+      defaultEnvironmentId: "env-1",
     })).toEqual([]);
   });
 
@@ -44,15 +47,17 @@ describe("agent self-config protected field diff", () => {
   });
 
   it("treats a replaced adapterConfig that omits a protected key as a change", () => {
-    expect(changesFor({ adapterConfig: { model: "small-model", cwd: "/work" } }, true)).toEqual(["adapterConfig.effort"]);
+    expect(changesFor({ adapterConfig: { model: "small-model", cwd: "/work" } }, true))
+      .toEqual(["adapterConfig.effort", "adapterConfig.env.A"]);
   });
 
   it("flags CLI argument overrides, adapter switches, and heartbeat aliases", () => {
     expect(changesFor({ adapterConfig: { extraArgs: ["--model", "large-model"] } })).toEqual(["adapterConfig.extraArgs"]);
     expect(changesFor({ adapterType: "codex_local" })).toEqual([
       "adapterType",
-      "adapterConfig.model",
       "adapterConfig.effort",
+      "adapterConfig.env.A",
+      "adapterConfig.model",
     ]);
     expect(changesFor({ runtimeConfig: { heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1, dailyRunLimit: 900 } } }))
       .toEqual(["runtimeConfig.heartbeat.dailyRunLimit"]);
@@ -66,6 +71,66 @@ describe("agent self-config protected field diff", () => {
       .toEqual(["status"]);
     expect(collectAgentProtectedConfigChanges(paused, agentProtectedConfigAfterPatch(paused, { status: "paused" }, false)))
       .toEqual([]);
+  });
+
+  it("flags environment selection and env variables per key", () => {
+    expect(changesFor({ defaultEnvironmentId: null })).toEqual(["defaultEnvironmentId"]);
+    expect(changesFor({ defaultEnvironmentId: "env-2" })).toEqual(["defaultEnvironmentId"]);
+    expect(changesFor({ adapterConfig: { env: { A: "1", CODEX_HOME: "/tmp/other" } } }))
+      .toEqual(["adapterConfig.env.CODEX_HOME"]);
+    expect(changesFor({ adapterConfig: { env: { A: "2" } } })).toEqual(["adapterConfig.env.A"]);
+    expect(changesFor({ adapterConfig: { env: {} } })).toEqual(["adapterConfig.env.A"]);
+  });
+
+  it("flags permission bypass, sandbox, endpoint, and any dangerously* adapter key", () => {
+    expect(changesFor({
+      adapterConfig: {
+        dangerouslySkipPermissions: true,
+        dangerouslyBypassApprovalsAndSandbox: true,
+        permissionMode: "bypassPermissions",
+        sandbox: false,
+        filesystemSandboxCommand: "/tmp/not-bwrap",
+        command: "/tmp/wrapper",
+        url: "wss://other-gateway",
+        dangerouslyEnableFutureEscapeHatch: true,
+      },
+    })).toEqual([
+      "adapterConfig.command",
+      "adapterConfig.dangerouslyBypassApprovalsAndSandbox",
+      "adapterConfig.dangerouslyEnableFutureEscapeHatch",
+      "adapterConfig.dangerouslySkipPermissions",
+      "adapterConfig.filesystemSandboxCommand",
+      "adapterConfig.permissionMode",
+      "adapterConfig.sandbox",
+      "adapterConfig.url",
+    ]);
+  });
+
+  it("lists every field a rollback would change, including environment and profile fields", () => {
+    const existing = {
+      name: "Worker",
+      title: "Builder",
+      adapterType: "process",
+      adapterConfig: { cwd: "/work", env: { A: "1" } },
+      runtimeConfig: { heartbeat: { maxDailyRuns: 5 } },
+      defaultEnvironmentId: null,
+      budgetMonthlyCents: 1_000,
+      metadata: null,
+    };
+    expect(collectAgentConfigRollbackChanges(existing, { ...existing })).toEqual([]);
+    expect(collectAgentConfigRollbackChanges(existing, {
+      ...existing,
+      title: "Old title",
+      adapterConfig: { cwd: "/old", env: { A: "1", B: "2" } },
+      runtimeConfig: { heartbeat: { maxDailyRuns: 50 } },
+      defaultEnvironmentId: "env-1",
+    })).toEqual([
+      "adapterConfig.cwd",
+      "adapterConfig.env.B",
+      "defaultEnvironmentId",
+      "runtimeConfig.heartbeat.maxDailyRuns",
+      "title",
+    ]);
   });
 
   it("lists only the permission keys whose value changes", () => {

@@ -1,24 +1,34 @@
 import { isDeepStrictEqual } from "node:util";
 
 /**
- * Agent fields that bound how much an agent may run and spend, or what it may
- * do. An agent may not change these on itself without an explicit
- * `agents:configure` grant for itself; board users and granted agents keep
- * their usual access. `role` is included because the CEO role carries agent
- * creation and permission management.
+ * Agent fields that bound how much an agent may run and spend, where it runs,
+ * or what it may do. An agent may not change these on itself without an
+ * explicit `agents:configure` grant for itself; board users and granted agents
+ * keep their usual access. `role` is included because the CEO role carries
+ * agent creation and permission management.
  */
-const PROTECTED_TOP_LEVEL_KEYS = ["adapterType", "budgetMonthlyCents", "spentMonthlyCents", "role"] as const;
+const PROTECTED_TOP_LEVEL_KEYS = [
+  "adapterType",
+  "budgetMonthlyCents",
+  "spentMonthlyCents",
+  "role",
+  "defaultEnvironmentId",
+] as const;
 
 /**
- * adapterConfig keys that select the model, the reasoning effort, or a per-run
- * limit. `extraArgs`/`args` are included because adapters pass them straight to
- * the CLI, where `--model`, `--effort`, or `--max-turns` would override the
- * protected keys.
+ * adapterConfig keys an agent may not change on itself. They select the model,
+ * effort, or service tier; set per-run limits; choose the executable, its
+ * arguments, its environment variables, its state directory, or the endpoint
+ * that serves the run; or relax approvals, sandboxing, tool sets, and gateway
+ * permissions. `env` is compared per variable. Any key that starts with
+ * `dangerously` or ends with `Command` is also protected, so a new adapter
+ * escape hatch or executable override is covered without a change here.
  */
 export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
   "model",
   "provider",
   "acpxAgent",
+  "fastMode",
   "effort",
   "reasoningEffort",
   "modelReasoningEffort",
@@ -32,9 +42,39 @@ export const AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS = [
   "graceSec",
   "outputInactivityTimeoutMs",
   "waitTimeoutMs",
+  "command",
+  "agentCommand",
+  "acpAgentCommand",
+  "hermesCommand",
+  "stateDir",
+  "acpStateDir",
   "extraArgs",
   "args",
+  "env",
+  "url",
+  "apiBaseUrl",
+  "dangerouslySkipPermissions",
+  "dangerouslyBypassApprovalsAndSandbox",
+  "dangerouslyBypassSandbox",
+  "dangerouslyAllowInsecureRemoteHttp",
+  "permissionMode",
+  "acpPermissionMode",
+  "nonInteractivePermissions",
+  "acpNonInteractivePermissions",
+  "sandbox",
+  "filesystemSandboxCommand",
+  "approvalMode",
+  "yolo",
+  "alwaysApprove",
+  "skipReviewerRequest",
+  "toolsets",
+  "enabledToolsets",
+  "disableDeviceAuth",
+  "scopes",
+  "role",
 ] as const;
+
+const PROTECTED_ADAPTER_CONFIG_KEY_SET: ReadonlySet<string> = new Set(AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS);
 
 export type AgentProtectedConfigState = {
   adapterType: string;
@@ -44,6 +84,7 @@ export type AgentProtectedConfigState = {
   spentMonthlyCents?: number;
   role?: string;
   status?: string;
+  defaultEnvironmentId?: string | null;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,12 +95,46 @@ function recordOrEmpty(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
 }
 
+function hasOwn(value: Record<string, unknown>, key: string) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function sortedUnionKeys(before: Record<string, unknown>, after: Record<string, unknown>) {
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+}
+
+function isProtectedAdapterConfigKey(key: string) {
+  return PROTECTED_ADAPTER_CONFIG_KEY_SET.has(key) || /^dangerously/i.test(key) || /Command$/.test(key);
+}
+
+/**
+ * Appends `path` for each change between `before` and `after`, descending into
+ * plain objects up to `depth` levels so the paths name the changed keys. A
+ * missing side counts as an empty object, so an added or removed object still
+ * reports its keys.
+ */
+function collectChangedPaths(before: unknown, after: unknown, path: string, depth: number, changed: string[]) {
+  const canDescend = (isRecord(before) || isRecord(after))
+    && (before === undefined || isRecord(before))
+    && (after === undefined || isRecord(after));
+  if (depth > 0 && canDescend) {
+    const beforeRecord = recordOrEmpty(before);
+    const afterRecord = recordOrEmpty(after);
+    for (const key of sortedUnionKeys(beforeRecord, afterRecord)) {
+      collectChangedPaths(beforeRecord[key], afterRecord[key], `${path}.${key}`, depth - 1, changed);
+    }
+    return;
+  }
+  if (!isDeepStrictEqual(before, after)) changed.push(path);
+}
+
 /**
  * Lists the protected fields that differ between two agent config states, as
- * dotted paths such as `runtimeConfig.heartbeat.maxDailyRuns`. Every key under
- * `runtimeConfig.heartbeat` is protected: it holds the run caps, concurrency,
- * daily cost cap, and timer cadence, including their legacy aliases. Leaving
- * `paused` is protected because it is a resume, which already needs a grant.
+ * dotted paths such as `runtimeConfig.heartbeat.maxDailyRuns` or
+ * `adapterConfig.env.CODEX_HOME`. Every key under `runtimeConfig.heartbeat` is
+ * protected: it holds the run caps, concurrency, daily cost cap, and timer
+ * cadence, including their legacy aliases. Leaving `paused` is protected
+ * because it is a resume, which already needs a grant.
  */
 export function collectAgentProtectedConfigChanges(
   before: AgentProtectedConfigState,
@@ -75,22 +150,26 @@ export function collectAgentProtectedConfigChanges(
 
   const beforeAdapterConfig = recordOrEmpty(before.adapterConfig);
   const afterAdapterConfig = recordOrEmpty(after.adapterConfig);
-  for (const key of AGENT_SELF_PROTECTED_ADAPTER_CONFIG_KEYS) {
-    if (!isDeepStrictEqual(beforeAdapterConfig[key], afterAdapterConfig[key])) {
-      changed.push(`adapterConfig.${key}`);
-    }
+  for (const key of sortedUnionKeys(beforeAdapterConfig, afterAdapterConfig)) {
+    if (!isProtectedAdapterConfigKey(key)) continue;
+    collectChangedPaths(
+      beforeAdapterConfig[key],
+      afterAdapterConfig[key],
+      `adapterConfig.${key}`,
+      key === "env" ? 1 : 0,
+      changed,
+    );
   }
 
   const beforeRuntimeConfig = recordOrEmpty(before.runtimeConfig);
   const afterRuntimeConfig = recordOrEmpty(after.runtimeConfig);
-  const beforeHeartbeat = recordOrEmpty(beforeRuntimeConfig.heartbeat);
-  const afterHeartbeat = recordOrEmpty(afterRuntimeConfig.heartbeat);
-  const heartbeatKeys = [...new Set([...Object.keys(beforeHeartbeat), ...Object.keys(afterHeartbeat)])].sort();
-  for (const key of heartbeatKeys) {
-    if (!isDeepStrictEqual(beforeHeartbeat[key], afterHeartbeat[key])) {
-      changed.push(`runtimeConfig.heartbeat.${key}`);
-    }
-  }
+  collectChangedPaths(
+    recordOrEmpty(beforeRuntimeConfig.heartbeat),
+    recordOrEmpty(afterRuntimeConfig.heartbeat),
+    "runtimeConfig.heartbeat",
+    1,
+    changed,
+  );
   if (!isDeepStrictEqual(beforeRuntimeConfig.aiConnection, afterRuntimeConfig.aiConnection)) {
     changed.push("runtimeConfig.aiConnection");
   }
@@ -102,7 +181,7 @@ export function collectAgentProtectedConfigChanges(
  * merges into the stored config unless `replaceAdapterConfig` is set or the
  * adapter type changes, runtimeConfig replaces the stored config but keeps the
  * stored `aiConnection` when the request leaves it empty, and omitted top-level
- * fields keep their stored value.
+ * fields keep their stored value. Callers restore redacted `env` echoes first.
  */
 export function agentProtectedConfigAfterPatch(
   existing: AgentProtectedConfigState,
@@ -135,7 +214,29 @@ export function agentProtectedConfigAfterPatch(
     spentMonthlyCents: typeof patch.spentMonthlyCents === "number" ? patch.spentMonthlyCents : existing.spentMonthlyCents,
     role: typeof patch.role === "string" ? patch.role : existing.role,
     status: typeof patch.status === "string" ? patch.status : existing.status,
+    defaultEnvironmentId: hasOwn(patch, "defaultEnvironmentId")
+      ? (typeof patch.defaultEnvironmentId === "string" ? patch.defaultEnvironmentId : null)
+      : existing.defaultEnvironmentId,
   };
+}
+
+/**
+ * Lists every field a config rollback would change, given the exact patch the
+ * rollback applies. A rollback restores a whole snapshot (including the
+ * environment, profile, instructions paths, and workspace commands) and skips
+ * the other agent checks on `PATCH /agents/:id`, so for an agent rolling back
+ * its own config every change counts, not only the protected fields.
+ */
+export function collectAgentConfigRollbackChanges(
+  existing: Record<string, unknown>,
+  restored: Record<string, unknown>,
+): string[] {
+  const changed: string[] = [];
+  for (const key of Object.keys(restored).sort()) {
+    const depth = key === "adapterConfig" || key === "runtimeConfig" ? 2 : 0;
+    collectChangedPaths(existing[key] ?? null, restored[key] ?? null, key, depth, changed);
+  }
+  return changed;
 }
 
 /**
@@ -145,8 +246,7 @@ export function agentProtectedConfigAfterPatch(
 export function collectAgentPermissionChanges(before: unknown, after: unknown): string[] {
   const beforePermissions = recordOrEmpty(before);
   const afterPermissions = recordOrEmpty(after);
-  return [...new Set([...Object.keys(beforePermissions), ...Object.keys(afterPermissions)])]
-    .sort()
+  return sortedUnionKeys(beforePermissions, afterPermissions)
     .filter((key) => !isDeepStrictEqual(beforePermissions[key], afterPermissions[key]))
     .map((key) => `permissions.${key}`);
 }

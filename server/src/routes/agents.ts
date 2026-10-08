@@ -108,9 +108,12 @@ import {
 } from "./workspace-command-authz.js";
 import {
   agentProtectedConfigAfterPatch,
+  collectAgentConfigRollbackChanges,
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
 } from "./agent-self-config-authz.js";
+import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import { configPatchFromSnapshot } from "../services/agents.js";
 import { normalizeAgentPermissions } from "../services/agent-permissions.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
@@ -2860,32 +2863,22 @@ export function agentRoutes(
     surface: "patch" | "config_rollback" | "permissions",
   ) {
     if (req.actor.type !== "agent" || req.actor.agentId !== targetAgent.id || fields.length === 0) return;
-    const decision = await access.decide({
-      actor: req.actor,
-      action: "agent_config:update",
-      resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
-      scope: { requiresChangeGrant: true, targetAgentId: targetAgent.id },
-    });
-    if (decision.allowed) return;
-
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: targetAgent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "agent.self_config_update_denied",
-      entityType: "agent",
-      entityId: targetAgent.id,
-      details: { surface, fields, ...authorizationDeniedDetails(decision) },
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target: targetAgent,
+      fields,
+      surface,
     });
-    throw forbidden(
-      `Agents cannot change their own run limits, budget, model, role, or permissions (${fields.join(", ")}). `
-        + "Ask a board user, or an agent with agents:configure for this agent, to make the change.",
-      { code: "agent_self_protected_config_change", ...authorizationDeniedDetails(decision), fields },
-    );
   }
 
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
@@ -4416,20 +4409,14 @@ export function agentRoutes(
     if (!rollbackConfig) {
       throw unprocessable("Invalid revision snapshot");
     }
-    await assertCanChangeOwnProtectedAgentFields(
-      req,
-      existing,
-      collectAgentProtectedConfigChanges(existing, {
-        adapterType: typeof rollbackConfig.adapterType === "string" ? rollbackConfig.adapterType : existing.adapterType,
-        adapterConfig: rollbackConfig.adapterConfig,
-        runtimeConfig: rollbackConfig.runtimeConfig,
-        budgetMonthlyCents: typeof rollbackConfig.budgetMonthlyCents === "number"
-          ? rollbackConfig.budgetMonthlyCents
-          : existing.budgetMonthlyCents,
-        role: typeof rollbackConfig.role === "string" ? rollbackConfig.role : existing.role,
-      }),
-      "config_rollback",
-    );
+    if (req.actor.type === "agent" && req.actor.agentId === existing.id) {
+      await assertCanChangeOwnProtectedAgentFields(
+        req,
+        existing,
+        collectAgentConfigRollbackChanges(existing, configPatchFromSnapshot(rollbackConfig)),
+        "config_rollback",
+      );
+    }
     assertProviderTraceSettingTransition(
       req,
       rollbackConfig.runtimeConfig,
@@ -5526,12 +5513,32 @@ export function agentRoutes(
       (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
     );
     if (!profileOnlyChange) {
+      const requestedAdapterConfigForGuard = asRecord(patchData.adapterConfig);
+      const protectedAfterPatch = agentProtectedConfigAfterPatch(
+        existing,
+        requestedAdapterConfigForGuard
+          ? {
+            ...patchData,
+            adapterConfig: restoreRedactedAgentEnv(requestedAdapterConfigForGuard, asRecord(existing.adapterConfig) ?? {}),
+          }
+          : patchData,
+        replaceAdapterConfig,
+      );
+      const patchTouchesAdapterConfiguration = hasOwn(patchData, "adapterType") || hasOwn(patchData, "adapterConfig");
       await assertCanChangeOwnProtectedAgentFields(
         req,
         existing,
         collectAgentProtectedConfigChanges(
           existing,
-          agentProtectedConfigAfterPatch(existing, patchData, replaceAdapterConfig),
+          patchTouchesAdapterConfiguration
+            ? {
+              ...protectedAfterPatch,
+              adapterConfig: applyCreateDefaultsByAdapterType(
+                protectedAfterPatch.adapterType,
+                asRecord(protectedAfterPatch.adapterConfig) ?? {},
+              ),
+            }
+            : protectedAfterPatch,
         ),
         "patch",
       );
