@@ -120,13 +120,18 @@ type IssueWakeTarget = {
 };
 
 /**
- * Only a real assignment event opts in to the reserved assignment key: an
- * issue created with an assignee, an assign or reassign, a routine-created
- * issue, a runner create or reassign, and recovery's initial dispatch of a
- * missed assignment wake. Every other producer (checkout, plugin, secret
- * resolution, tree resume or restore, rollback) wakes without that key: a
- * later wake on an unchanged issue is new work, not a replay of the old
- * assignment.
+ * A wake opts in to the reserved assignment key only when it announces one
+ * assignment generation and its producer sends it once per generation: an
+ * issue created with its agent (issue create, child, plan decomposition,
+ * interaction accept, routine, summary slot, skill-test harness, runner
+ * create), an assign or reassign, and recovery's initial dispatch to the
+ * agent assignee. A replay of that key is then the same wake.
+ *
+ * Every other producer wakes without the key, because a later wake at an
+ * unchanged generation is new work, not a replay: checkout, plugin, secret
+ * resolution, chat, tree resume or restore, the runner rollback, and status
+ * cards (the scheduler re-wakes a deduplicated, still-open generating issue at
+ * the same generation; the key would turn that re-wake into a replay).
  */
 type AssignmentEventScope =
   | {
