@@ -243,6 +243,7 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     title: "Wake test",
     executionPolicy: null,
     executionState: null,
+    statusVersion: 0,
     hiddenAt: null,
     ...overrides,
   };

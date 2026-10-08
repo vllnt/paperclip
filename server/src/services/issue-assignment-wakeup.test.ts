@@ -18,7 +18,7 @@ function wrapped(cause: Error) {
 
 function assign(
   wakeup: (agentId: string, opts: unknown) => Promise<unknown>,
-  input: { assigneeAgentId: string; assignmentGeneration?: number | null; rethrowOnError?: boolean },
+  input: { assigneeAgentId: string; assignmentGeneration?: number; rethrowOnError?: boolean },
 ) {
   return queueIssueAssignmentWakeup({
     heartbeat: { wakeup },
@@ -28,7 +28,6 @@ function assign(
     contextSource: "issue.update",
     requestedByActorType: "user",
     requestedByActorId: "board-user",
-    ...(input.assignmentGeneration !== undefined ? { assignmentGeneration: input.assignmentGeneration } : {}),
     rethrowOnError: input.rethrowOnError ?? true,
   });
 }
@@ -96,7 +95,7 @@ describe("issue assignment wakeup delivery", () => {
     expect(wakeup).toHaveBeenCalledTimes(3);
   });
 
-  it("derives the assignment generation from the server issue when the caller omits it", async () => {
+  it("derives the assignment generation only from the server issue snapshot", async () => {
     const wakeup = vi.fn(async (_agentId: string, _opts: unknown) => ({ id: "run-1" }));
     await expect(assign(wakeup, { assigneeAgentId: "agent-a" })).resolves.toEqual({ id: "run-1" });
     expect(wakeup.mock.calls[0]?.[1]).toMatchObject({ idempotencyKey: "issue-assignment:issue-1:agent-a:1" });

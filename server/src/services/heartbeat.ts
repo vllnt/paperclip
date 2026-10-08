@@ -19762,17 +19762,44 @@ export function heartbeatService(
           const promotedPayload = { ...parseObject(wake.payload) };
           delete promotedPayload[SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY];
           promotedPayload.selfReblockPromotion = "anchor_missing";
-          await enqueueWakeup(wake.agentId, {
-            source: (wake.source ?? "automation") as unknown as WakeupOptions["source"],
-            triggerDetail: (wake.triggerDetail ?? "system") as unknown as WakeupOptions["triggerDetail"],
-            reason: wake.reason,
-            payload: promotedPayload,
-            requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
-            requestedByActorId: wake.requestedByActorId,
-            idempotencyKey: wake.idempotencyKey,
-          }).catch((err) => {
+          const promotionKey = `self-reblock-anchor-missing:${wake.id}`;
+          try {
+            // The original receipt remains the retry anchor until the new wake
+            // is durably admitted. A distinct key makes this promotion itself
+            // idempotent across a lost acknowledgement.
+            const promoted = await enqueueWakeup(wake.agentId, {
+              source: (wake.source ?? "automation") as unknown as WakeupOptions["source"],
+              triggerDetail: (wake.triggerDetail ?? "system") as unknown as WakeupOptions["triggerDetail"],
+              reason: wake.reason,
+              payload: promotedPayload,
+              requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+              requestedByActorId: wake.requestedByActorId,
+              idempotencyKey: promotionKey,
+            });
+            const [promotionReceipt] = await db
+              .select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .where(and(
+                eq(agentWakeupRequests.companyId, wake.companyId),
+                eq(agentWakeupRequests.idempotencyKey, promotionKey),
+              ))
+              .limit(1);
+            if (!promoted && !promotionReceipt) throw new Error("anchorless promotion produced no durable receipt");
+          } catch (err) {
+            const parkedPayload = {
+              ...promotedPayload,
+              [SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY]: buildSelfReblockWakeParkedState(
+                new Date(Date.now() + SELF_REBLOCK_WAKE_WINDOW_MS),
+              ),
+            };
+            await db.update(agentWakeupRequests).set({
+              status: "deferred_issue_execution",
+              finishedAt: null,
+              updatedAt: new Date(),
+              payload: parkedPayload,
+            }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "cancelled")));
             logger.warn({ err, queueId: wake.id }, "failed to promote anchorless parked self-reblock wake");
-          });
+          }
         }
       }
     }
@@ -27131,6 +27158,17 @@ export function heartbeatService(
         .limit(1)
         .then((rows) => rows[0] ?? null);
     };
+    const assignmentReceiptKeysForIssue = async (queryDb: Db, issueIdForKey: string) =>
+      queryDb
+        .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, agent.companyId),
+          sql`${agentWakeupRequests.idempotencyKey} like ${ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX + issueIdForKey + ":%"}`,
+        ))
+        .then((rows) => rows
+          .map((row) => row.idempotencyKey)
+          .filter((key): key is string => typeof key === "string"));
     const priorReceipt = await existingDurableReceipt(db);
     if (priorReceipt) {
       // Replaying an admission receipt is not fresh authority to dispatch it.
@@ -27565,9 +27603,27 @@ export function heartbeatService(
             if (!lockedAssignmentIssue ||
                 assignmentKeyParts.issueId !== lockedAssignmentIssue.id ||
                 assignmentKeyParts.assigneeAgentId !== agentId ||
-                assignmentKeyParts.assigneeAgentId !== lockedAssignmentIssue.assigneeAgentId ||
-                assignmentKeyParts.assignmentGeneration !== lockedAssignmentIssue.statusVersion &&
-                !existingAssignmentReplay) {
+                assignmentKeyParts.assigneeAgentId !== lockedAssignmentIssue.assigneeAgentId) {
+              throw conflict("Assignment idempotency key does not match the locked issue assignment");
+            }
+            if (existingAssignmentReplay) {
+              // Status versions also advance on ordinary status transitions. For
+              // a replay, the server's assignment receipts are the durable
+              // assignment history: only the newest key for this issue may be
+              // replayed, so A -> B -> A cannot revive A's old receipt.
+              const newestAssignmentGeneration = (await assignmentReceiptKeysForIssue(tx as unknown as Db, lockedAssignmentIssue.id))
+                .map((key) => parseIssueAssignmentIdempotencyKey(key))
+                .filter((parts): parts is NonNullable<typeof parts> => Boolean(parts))
+                .reduce<number | null>((newest, parts) =>
+                  newest === null || parts.assignmentGeneration > newest ? parts.assignmentGeneration : newest,
+                null);
+              if (newestAssignmentGeneration !== assignmentKeyParts.assignmentGeneration) {
+                throw conflict("Assignment idempotency key is stale for the locked issue assignment");
+              }
+            } else if (assignmentKeyParts.assignmentGeneration !== lockedAssignmentIssue.statusVersion) {
+              // A fresh assignment wake must name the version observed under the
+              // issue lock. A caller cannot mint a generation for a different
+              // assignment; retries use the committed receipt branch above.
               throw conflict("Assignment idempotency key does not match the locked issue assignment");
             }
           }

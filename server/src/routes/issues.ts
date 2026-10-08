@@ -14955,7 +14955,6 @@ export function issueRoutes(
                 contextSource: "issue.update",
                 requestedByActorType: wakeup.requestedByActorType,
                 requestedByActorId: wakeup.requestedByActorId,
-                assignmentGeneration: issue.statusVersion,
                 rethrowOnError: true,
                 wakeupOptions: wakeup,
               })

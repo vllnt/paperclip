@@ -118,7 +118,7 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
-import { buildIssueAssignmentIdempotencyKey } from "../issue-assignment-wakeup.js";
+import { queueIssueAssignmentWakeup } from "../issue-assignment-wakeup.js";
 import type { IssueExecutionState } from "@paperclipai/shared";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -2042,28 +2042,33 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     agentId: string,
   ) {
-    return deps.enqueueWakeup(agentId, {
-      source: "assignment",
-      triggerDetail: "system",
+    return queueIssueAssignmentWakeup({
+      heartbeat: { wakeup: deps.enqueueWakeup },
+      issue: { ...issue, assigneeAgentId: agentId },
       reason: "issue_assigned",
-      payload: withRecoveryContext(
-        {
-          issueId: issue.id,
-          mutation: "assigned_todo_liveness_dispatch",
-        },
-        "normal_model",
-      ),
+      mutation: "assigned_todo_liveness_dispatch",
+      contextSource: "issue.assigned_todo_liveness_dispatch",
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryContext(
-        {
-          issueId: issue.id,
-          taskId: issue.id,
-          wakeReason: "issue_assigned",
-          source: "issue.assigned_todo_liveness_dispatch",
-        },
-        "normal_model",
-      ),
+      wakeupOptions: {
+        payload: withRecoveryContext(
+          {
+            issueId: issue.id,
+            mutation: "assigned_todo_liveness_dispatch",
+          },
+          "normal_model",
+        ),
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: "issue_assigned",
+            source: "issue.assigned_todo_liveness_dispatch",
+          },
+          "normal_model",
+        ),
+      },
+      rethrowOnError: true,
     });
   }
 
@@ -2072,41 +2077,39 @@ export function recoveryService(
     agentId: string,
     pendingExecutionState: Pick<IssueExecutionState, "currentStageId" | "currentStageType">,
   ) {
-    return deps.enqueueWakeup(agentId, {
-      source: "assignment",
-      triggerDetail: "system",
+    return queueIssueAssignmentWakeup({
+      heartbeat: { wakeup: deps.enqueueWakeup },
+      issue: { ...issue, assigneeAgentId: agentId },
       reason: "issue_assigned",
-      // Same key as the route's assignment wake for this assignee and
-      // generation, so the backstop and a late route retry admit one wake.
-      idempotencyKey: buildIssueAssignmentIdempotencyKey({
-        issueId: issue.id,
-        assigneeAgentId: agentId,
-        assignmentGeneration: issue.statusVersion,
-      }),
-      payload: withRecoveryContext(
-        {
-          issueId: issue.id,
-          mutation: "review_assignment_recovery",
-          currentStageId: pendingExecutionState.currentStageId ?? null,
-          currentStageType: pendingExecutionState.currentStageType ?? null,
-        },
-        "normal_model",
-      ),
+      mutation: "review_assignment_recovery",
+      contextSource: "issue.review_assignment_recovery",
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryContext(
-        {
-          issueId: issue.id,
-          taskId: issue.id,
-          wakeReason: "issue_assigned",
-          source: "issue.review_assignment_recovery",
-          reviewRecoveryInstruction:
-            "This reviewer was assigned without a prior run. Review the pending execution stage now, or mark the issue blocked with the exact unblock action.",
-          currentStageId: pendingExecutionState.currentStageId ?? null,
-          currentStageType: pendingExecutionState.currentStageType ?? null,
-        },
-        "normal_model",
-      ),
+      wakeupOptions: {
+        payload: withRecoveryContext(
+          {
+            issueId: issue.id,
+            mutation: "review_assignment_recovery",
+            currentStageId: pendingExecutionState.currentStageId ?? null,
+            currentStageType: pendingExecutionState.currentStageType ?? null,
+          },
+          "normal_model",
+        ),
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: "issue_assigned",
+            source: "issue.review_assignment_recovery",
+            reviewRecoveryInstruction:
+              "This reviewer was assigned without a prior run. Review the pending execution stage now, or mark the issue blocked with the exact unblock action.",
+            currentStageId: pendingExecutionState.currentStageId ?? null,
+            currentStageType: pendingExecutionState.currentStageType ?? null,
+          },
+          "normal_model",
+        ),
+      },
+      rethrowOnError: true,
     });
   }
 

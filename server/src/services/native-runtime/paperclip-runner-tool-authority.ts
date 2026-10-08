@@ -63,6 +63,7 @@ import { approvalService } from "../approvals.js";
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { buildIssueAssignmentIdempotencyKey } from "../issue-assignment-wakeup.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
 import { childReviewOutcomes } from "./child-review-outcomes.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
@@ -1118,7 +1119,11 @@ export class PaperclipRunnerToolAuthority {
           mutation: "create_child",
           parentIssueId: task.parentId ?? null,
         },
-        idempotencyKey: scheduledWakeIds[0]!,
+        idempotencyKey: buildIssueAssignmentIdempotencyKey({
+          issueId: childId,
+          assigneeAgentId: assignedAgentId,
+          assignmentGeneration: Number(result.stateRevision),
+        }),
         requestedByActorType: "agent",
         requestedByActorId: this.binding.agentId,
         contextSnapshot: {
@@ -1218,7 +1223,11 @@ export class PaperclipRunnerToolAuthority {
         await this.binding.enqueueWakeup(current.assigneeAgentId, {
           source: "assignment", triggerDetail: "system", reason: "issue_assigned",
           payload: { issueId: taskId, mutation: "reassign_task_rollback", interruptedRunId: prepared.executionRunId },
-          idempotencyKey: `${durableKey}:restore:${prepared.executionRunId}:${current.statusVersion}`,
+          idempotencyKey: buildIssueAssignmentIdempotencyKey({
+            issueId: taskId,
+            assigneeAgentId: current.assigneeAgentId,
+            assignmentGeneration: current.statusVersion,
+          }),
           requestedByActorType: "agent", requestedByActorId: this.binding.agentId,
           contextSnapshot: { issueId: taskId, source: "paperclip_runner.reassign_task_rollback", forceFreshSession: true },
           issueStateGuard: { statuses: ["todo", "in_progress"], assigneeAgentId: current.assigneeAgentId, statusVersion: current.statusVersion },
@@ -1288,7 +1297,11 @@ export class PaperclipRunnerToolAuthority {
       await this.binding.enqueueWakeup(assigneeAgentId, {
         source: "assignment", triggerDetail: "system", reason: "issue_assigned",
         payload: { issueId: taskId, mutation: "reassign_task", reason },
-        idempotencyKey: result.scheduledWakeIds[0]!, requestedByActorType: "agent", requestedByActorId: this.binding.agentId,
+        idempotencyKey: buildIssueAssignmentIdempotencyKey({
+          issueId: taskId,
+          assigneeAgentId,
+          assignmentGeneration: result.stateRevision,
+        }), requestedByActorType: "agent", requestedByActorId: this.binding.agentId,
         contextSnapshot: { issueId: taskId, source: "paperclip_runner.reassign_task", reassignmentReason: reason },
         issueStateGuard: { statuses: ["todo"], assigneeAgentId, statusVersion: result.stateRevision },
       });

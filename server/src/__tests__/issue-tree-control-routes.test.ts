@@ -73,6 +73,7 @@ describe("issue tree control routes", () => {
     mockIssueService.getById.mockResolvedValue({
       id: "11111111-1111-4111-8111-111111111111",
       companyId: "company-2",
+      statusVersion: 0,
     });
     mockTreeControlService.cancelUnclaimedWakeupsForTree.mockResolvedValue([]);
     mockTreeControlService.cancelIssueStatusesForHold.mockResolvedValue({
@@ -98,6 +99,7 @@ describe("issue tree control routes", () => {
         id: rootId,
         companyId: "company-2",
         status: "todo",
+        statusVersion: 0,
         assigneeAgentId: "agent-parent",
       };
       const issues = [
@@ -106,36 +108,42 @@ describe("issue tree control routes", () => {
           id: "child",
           companyId: "company-2",
           status: "in_progress",
+          statusVersion: 0,
           assigneeAgentId: "agent-child",
         },
         {
           id: "backlog-task",
           companyId: "company-2",
           status: "backlog",
+          statusVersion: 0,
           assigneeAgentId: "parked-agent",
         },
         {
           id: "blocked-task",
           companyId: "company-2",
           status: "blocked",
+          statusVersion: 0,
           assigneeAgentId: "blocked-agent",
         },
         {
           id: "done",
           companyId: "company-2",
           status: "done",
+          statusVersion: 0,
           assigneeAgentId: "agent-done",
         },
         {
           id: "cancelled",
           companyId: "company-2",
           status: "cancelled",
+          statusVersion: 0,
           assigneeAgentId: "agent-cancelled",
         },
         {
           id: "foreign",
           companyId: "company-3",
           status: "todo",
+          statusVersion: 0,
           assigneeAgentId: "agent-foreign",
         },
       ];
@@ -206,7 +214,7 @@ describe("issue tree control routes", () => {
       },
     }));
     mockIssueService.getById.mockResolvedValue({
-      id: rootId, companyId: "company-2", status: "todo", assigneeAgentId: "agent-parent",
+      id: rootId, companyId: "company-2", status: "todo", statusVersion: 0, assigneeAgentId: "agent-parent",
     });
     mockTreeControlService.releaseHold.mockResolvedValue({
       id: holdId, mode: "pause", status: "released", members: [{ issueId: rootId }],
@@ -238,6 +246,7 @@ describe("issue tree control routes", () => {
       id,
       companyId: "company-2",
       status: "todo",
+      statusVersion: 0,
       assigneeAgentId: id,
     }));
     mockHeartbeatService.wakeup.mockRejectedValueOnce(
@@ -533,6 +542,7 @@ describe("issue tree control routes", () => {
         {
           id: "55555555-5555-4555-8555-555555555555",
           status: "todo",
+          statusVersion: 0,
           assigneeAgentId: "22222222-2222-4222-8222-222222222222",
         },
       ],

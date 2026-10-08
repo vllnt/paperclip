@@ -381,9 +381,9 @@ describe("issue dependency wakeups in issue routes", () => {
       expect.objectContaining({
         reason: "issue_unblock_requested",
         payload: expect.objectContaining({ issueId }),
-        causedBy: { actorType: "user", actorId: "local-board" },
       }),
     );
+    expect(mockWakeup.mock.calls[0]?.[1]).not.toHaveProperty("causedBy");
   });
 
   it("wakes the parent when all direct children become terminal", async () => {

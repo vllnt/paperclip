@@ -62,6 +62,7 @@ type TreeStatusUpdateResult = {
     id: string;
     status: IssueStatus;
     assigneeAgentId: string | null;
+    statusVersion: number;
   }>;
 };
 type RestoreTreeStatusResult = TreeStatusUpdateResult & {
@@ -917,6 +918,7 @@ export function issueTreeControlService(db: Db) {
         id: issue.id,
         status: coerceIssueStatus(issue.status),
         assigneeAgentId: issue.assigneeAgentId,
+        statusVersion: issue.statusVersion,
       })),
     };
   }
@@ -1000,11 +1002,13 @@ export function issueTreeControlService(db: Db) {
             id: issues.id,
             status: issues.status,
             assigneeAgentId: issues.assigneeAgentId,
+            statusVersion: issues.statusVersion,
           });
         restored.push(...rows.map((issue) => ({
           id: issue.id,
           status: coerceIssueStatus(issue.status),
           assigneeAgentId: issue.assigneeAgentId,
+          statusVersion: issue.statusVersion,
         })));
       }
 

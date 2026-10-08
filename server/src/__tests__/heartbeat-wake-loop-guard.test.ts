@@ -724,6 +724,42 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
     await waitForIdle();
   });
 
+  it("does not replay an assignment key after the issue generation changes", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, "StaleAssignment");
+    const issueId = await seedIssue(companyId, { assigneeAgentId: agentId, status: "todo" });
+    const [initial] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const key = `issue-assignment:${issueId}:${agentId}:${initial!.statusVersion}`;
+    const mismatchedKey = `issue-assignment:${issueId}:${agentId}:${initial!.statusVersion + 999}`;
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      idempotencyKey: key,
+      payload: { issueId, mutation: "update" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      contextSnapshot: { issueId, source: "issue.update" },
+    });
+    await waitForIdle();
+    await db.update(issues)
+      .set({ statusVersion: sql`${issues.statusVersion} + 1` })
+      .where(eq(issues.id, issueId));
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      idempotencyKey: mismatchedKey,
+      payload: { issueId, mutation: "update" },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+      contextSnapshot: { issueId, source: "issue.update" },
+    })).rejects.toMatchObject({ status: 409 });
+    await waitForIdle();
+  });
+
   it("still wakes an agent that assigns itself a blocked-ready issue from a run elsewhere", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId, "SelfAssigner");
@@ -778,7 +814,6 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
         contextSource: "issue.update",
         requestedByActorType: "user",
         requestedByActorId: "board-user",
-        assignmentGeneration: current!.statusVersion,
         rethrowOnError: true,
       });
       await waitForIdle();
@@ -807,6 +842,21 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.wakeupRequestId, firstReceipts[0]!.id));
     expect(firstRuns).toHaveLength(1);
+
+    // The first A receipt is no longer current after A -> B -> A. A replay
+    // with that stale key must not revive the old A assignment.
+    await expect(
+      heartbeat.wakeup(agentA, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        idempotencyKey: first.key,
+        payload: { issueId, mutation: "update" },
+        requestedByActorType: "user",
+        requestedByActorId: "board-user",
+        contextSnapshot: { issueId, source: "issue.update" },
+      }),
+    ).rejects.toMatchObject({ status: 409 });
 
     // The database itself refuses a second live receipt for the same generation.
     await expect(

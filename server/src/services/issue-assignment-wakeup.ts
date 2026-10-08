@@ -71,28 +71,20 @@ export async function queueIssueAssignmentWakeup<TRun>(input: {
   attachmentOmissionReasons?: Record<string, number> | null;
   rethrowOnError?: boolean;
   durableChatRequest?: DurableChatWakeupRequest;
-  /**
-   * The issue's `statusVersion` after this assignment. When set, the wake
-   * carries `buildIssueAssignmentIdempotencyKey`, admission stores at most one
-   * live receipt for it, and only then is a transient database failure
-   * retried: a disconnected write may already have committed.
-   */
-  assignmentGeneration?: number | null;
   /** Exact wake options from an issue update; the base fields fill any gaps. */
   wakeupOptions?: IssueAssignmentWakeupOptions;
 }): Promise<TRun | null | undefined> {
   const assigneeAgentId = input.issue.assigneeAgentId;
   if (!assigneeAgentId || input.issue.status === "backlog") return;
 
-  const assignmentGeneration = input.assignmentGeneration ?? input.issue.statusVersion;
-  if (typeof assignmentGeneration !== "number" || !Number.isSafeInteger(assignmentGeneration) || assignmentGeneration < 0) {
+  const assignmentGeneration = input.issue.statusVersion;
+  if (!Number.isSafeInteger(assignmentGeneration) || assignmentGeneration < 0) {
     throw new Error("Assignment wake requires the server issue status version");
   }
-  const resolvedAssignmentGeneration = assignmentGeneration as number;
   const idempotencyKey = buildIssueAssignmentIdempotencyKey({
     issueId: input.issue.id,
     assigneeAgentId,
-    assignmentGeneration: resolvedAssignmentGeneration,
+    assignmentGeneration,
   });
   const basePayload: Record<string, unknown> = {
     issueId: input.issue.id,
