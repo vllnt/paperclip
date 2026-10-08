@@ -55,6 +55,7 @@ function generatingIssue(overrides: Record<string, unknown> = {}) {
     title: "Summarize project",
     status: "todo",
     assigneeAgentId: agentId,
+    statusVersion: 0,
     ...overrides,
   };
 }

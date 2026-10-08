@@ -39,6 +39,7 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
+import { queueIssueAssignmentWakeup } from "./issue-assignment-wakeup.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
@@ -2241,28 +2242,26 @@ export function buildHostServices(
           throw new Error(budgetBlock.reason);
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
-        const run = await heartbeat.wakeup(issue.assigneeAgentId, {
-          source: "assignment",
-          triggerDetail: "system",
+        const run = await queueIssueAssignmentWakeup({
+          heartbeat,
+          issue,
           reason: params.reason ?? "plugin_issue_wakeup_requested",
-          payload: {
-            issueId: issue.id,
-            mutation: "plugin_wakeup",
-            pluginId,
-            pluginKey,
-            contextSource,
-          },
-          idempotencyKey: params.idempotencyKey ?? null,
+          mutation: "plugin_wakeup",
+          contextSource,
           requestedByActorType: "system",
           requestedByActorId: pluginId,
-          contextSnapshot: {
-            issueId: issue.id,
-            taskId: issue.id,
-            wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
-            source: contextSource,
-            pluginId,
-            pluginKey,
+          wakeupOptions: {
+            payload: { issueId: issue.id, pluginId, pluginKey, contextSource },
+            contextSnapshot: {
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
+              source: contextSource,
+              pluginId,
+              pluginKey,
+            },
           },
+          rethrowOnError: true,
         });
         await logPluginActivity({
           companyId,
@@ -2309,28 +2308,26 @@ export function buildHostServices(
             throw new Error(budgetBlock.reason);
           }
           const contextSource = params.contextSource ?? "plugin.issue.requestWakeups";
-          const run = await heartbeat.wakeup(issue.assigneeAgentId, {
-            source: "assignment",
-            triggerDetail: "system",
+          const run = await queueIssueAssignmentWakeup({
+            heartbeat,
+            issue,
             reason: params.reason ?? "plugin_issue_wakeup_requested",
-            payload: {
-              issueId: issue.id,
-              mutation: "plugin_wakeup",
-              pluginId,
-              pluginKey,
-              contextSource,
-            },
-            idempotencyKey: params.idempotencyKeyPrefix ? `${params.idempotencyKeyPrefix}:${issue.id}` : null,
+            mutation: "plugin_wakeup",
+            contextSource,
             requestedByActorType: "system",
             requestedByActorId: pluginId,
-            contextSnapshot: {
-              issueId: issue.id,
-              taskId: issue.id,
-              wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
-              source: contextSource,
-              pluginId,
-              pluginKey,
+            wakeupOptions: {
+              payload: { issueId: issue.id, pluginId, pluginKey, contextSource },
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: params.reason ?? "plugin_issue_wakeup_requested",
+                source: contextSource,
+                pluginId,
+                pluginKey,
+              },
             },
+            rethrowOnError: true,
           });
           await logPluginActivity({
             companyId,

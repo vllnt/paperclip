@@ -15198,16 +15198,16 @@ export function issueRoutes(
           checkoutRunId,
         })
       ) {
-        void heartbeat
-          .wakeup(req.body.agentId, {
-            source: "assignment",
-            triggerDetail: "system",
-            reason: "issue_checked_out",
-            payload: { issueId: issue.id, mutation: "checkout" },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: { issueId: issue.id, source: "issue.checkout" },
-          })
+        void queueIssueAssignmentWakeup({
+          heartbeat,
+          issue: updated,
+          reason: "issue_checked_out",
+          mutation: "checkout",
+          contextSource: "issue.checkout",
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          rethrowOnError: true,
+        })
           .catch((err) =>
             logger.warn(
               { err, issueId: issue.id },

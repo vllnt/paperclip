@@ -44,6 +44,11 @@ export type IssueAssignmentWakeupOptions = {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  issueStateGuard?: {
+    statuses: string[];
+    assigneeAgentId: string;
+    statusVersion?: number;
+  };
   durableChatRequest?: DurableChatWakeupRequest;
 };
 

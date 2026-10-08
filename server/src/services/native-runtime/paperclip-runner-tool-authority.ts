@@ -63,7 +63,7 @@ import { approvalService } from "../approvals.js";
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
-import { buildIssueAssignmentIdempotencyKey } from "../issue-assignment-wakeup.js";
+import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupOptions } from "../issue-assignment-wakeup.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
 import { childReviewOutcomes } from "./child-review-outcomes.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
@@ -186,6 +186,24 @@ function canonicalJson(value: unknown): string {
 
 export class PaperclipRunnerToolAuthority {
   constructor(readonly db: Db, readonly binding: Binding) {}
+
+  #assignmentHeartbeat() {
+    if (!this.binding.enqueueWakeup) return null;
+    return {
+      wakeup: (agentId: string, options: IssueAssignmentWakeupOptions) =>
+        this.binding.enqueueWakeup!(agentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: (options.reason ?? "issue_assigned") as "issue_assigned" | "issue_commented",
+          payload: options.payload ?? {},
+          idempotencyKey: options.idempotencyKey ?? "",
+          requestedByActorType: "agent",
+          requestedByActorId: this.binding.agentId,
+          contextSnapshot: options.contextSnapshot ?? {},
+          ...(options.issueStateGuard ? { issueStateGuard: options.issueStateGuard } : {}),
+        }),
+    };
+  }
 
   definitions(): Array<Record<string, unknown>> {
     if (this.binding.nativeReview) {
@@ -1109,28 +1127,26 @@ export class PaperclipRunnerToolAuthority {
     const assignedAgentId = typeof task.assigneeActorId === "string"
       ? task.assigneeActorId
       : null;
-    if (this.binding.enqueueWakeup && assignedAgentId && scheduledWakeIds.length > 0) {
-      await this.binding.enqueueWakeup(assignedAgentId, {
-        source: "assignment",
-        triggerDetail: "system",
-        reason: "issue_assigned",
-        payload: {
-          issueId: childId,
-          mutation: "create_child",
-          parentIssueId: task.parentId ?? null,
-        },
-        idempotencyKey: buildIssueAssignmentIdempotencyKey({
-          issueId: childId,
+    const assignmentHeartbeat = this.#assignmentHeartbeat();
+    if (assignmentHeartbeat && assignedAgentId && scheduledWakeIds.length > 0) {
+      await queueIssueAssignmentWakeup({
+        heartbeat: assignmentHeartbeat,
+        issue: {
+          id: childId,
           assigneeAgentId: assignedAgentId,
-          assignmentGeneration: Number(result.stateRevision),
-        }),
+          status: requiredString(task.status),
+          statusVersion: Number(result.stateRevision),
+        },
+        reason: "issue_assigned",
+        mutation: "create_child",
+        contextSource: "paperclip_runner.create_task",
         requestedByActorType: "agent",
         requestedByActorId: this.binding.agentId,
-        contextSnapshot: {
-          issueId: childId,
-          source: "paperclip_runner.create_task",
-          parentIssueId: task.parentId ?? null,
+        wakeupOptions: {
+          payload: { issueId: childId, parentIssueId: task.parentId ?? null },
+          contextSnapshot: { issueId: childId, parentIssueId: task.parentId ?? null },
         },
+        rethrowOnError: true,
       });
     }
     return result;
@@ -1220,17 +1236,20 @@ export class PaperclipRunnerToolAuthority {
           record(current.executionState).status === "pending") return;
       if (current.executionRunId && current.executionRunId !== prepared.executionRunId) return;
       try {
-        await this.binding.enqueueWakeup(current.assigneeAgentId, {
-          source: "assignment", triggerDetail: "system", reason: "issue_assigned",
-          payload: { issueId: taskId, mutation: "reassign_task_rollback", interruptedRunId: prepared.executionRunId },
-          idempotencyKey: buildIssueAssignmentIdempotencyKey({
-            issueId: taskId,
-            assigneeAgentId: current.assigneeAgentId,
-            assignmentGeneration: current.statusVersion,
-          }),
-          requestedByActorType: "agent", requestedByActorId: this.binding.agentId,
-          contextSnapshot: { issueId: taskId, source: "paperclip_runner.reassign_task_rollback", forceFreshSession: true },
-          issueStateGuard: { statuses: ["todo", "in_progress"], assigneeAgentId: current.assigneeAgentId, statusVersion: current.statusVersion },
+        await queueIssueAssignmentWakeup({
+          heartbeat: this.#assignmentHeartbeat()!,
+          issue: current,
+          reason: "issue_assigned",
+          mutation: "reassign_task_rollback",
+          contextSource: "paperclip_runner.reassign_task_rollback",
+          requestedByActorType: "agent",
+          requestedByActorId: this.binding.agentId,
+          wakeupOptions: {
+            payload: { issueId: taskId, interruptedRunId: prepared.executionRunId },
+            contextSnapshot: { issueId: taskId, forceFreshSession: true },
+            issueStateGuard: { statuses: ["todo", "in_progress"], assigneeAgentId: current.assigneeAgentId, statusVersion: current.statusVersion },
+          },
+          rethrowOnError: true,
         });
       } catch (restoreError) {
         throw new AggregateError([error, restoreError], "paperclip_runner_reassignment_restore_failed");
@@ -1294,16 +1313,25 @@ export class PaperclipRunnerToolAuthority {
     // Replay repairs a failed dispatch. The durable wake key and state/version guard
     // prevent duplicate successors and prevent waking a later, unrelated assignment.
     if (result.scheduledWakeIds.length && this.binding.enqueueWakeup) {
-      await this.binding.enqueueWakeup(assigneeAgentId, {
-        source: "assignment", triggerDetail: "system", reason: "issue_assigned",
-        payload: { issueId: taskId, mutation: "reassign_task", reason },
-        idempotencyKey: buildIssueAssignmentIdempotencyKey({
-          issueId: taskId,
+      await queueIssueAssignmentWakeup({
+        heartbeat: this.#assignmentHeartbeat()!,
+        issue: {
+          id: taskId,
           assigneeAgentId,
-          assignmentGeneration: result.stateRevision,
-        }), requestedByActorType: "agent", requestedByActorId: this.binding.agentId,
-        contextSnapshot: { issueId: taskId, source: "paperclip_runner.reassign_task", reassignmentReason: reason },
-        issueStateGuard: { statuses: ["todo"], assigneeAgentId, statusVersion: result.stateRevision },
+          status: "todo",
+          statusVersion: result.stateRevision,
+        },
+        reason: "issue_assigned",
+        mutation: "reassign_task",
+        contextSource: "paperclip_runner.reassign_task",
+        requestedByActorType: "agent",
+        requestedByActorId: this.binding.agentId,
+        wakeupOptions: {
+          payload: { issueId: taskId, reason },
+          contextSnapshot: { issueId: taskId, reassignmentReason: reason },
+          issueStateGuard: { statuses: ["todo"], assigneeAgentId, statusVersion: result.stateRevision },
+        },
+        rethrowOnError: true,
       });
     }
     return result;
