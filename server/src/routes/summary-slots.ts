@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { generateSummarySlotSchema, writeSummarySlotSchema } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { forbidden, notFound } from "../errors.js";
-import { accessService, heartbeatService, instanceSettingsService, logActivity } from "../services/index.js";
+import { accessService, heartbeatService, instanceSettingsService, issueService, logActivity } from "../services/index.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { summarySlotService } from "../services/summary-slots.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -28,6 +28,7 @@ export function summarySlotRoutes(db: Db) {
   const access = accessService(db);
   const settings = instanceSettingsService(db);
   const svc = summarySlotService(db);
+  const issues = issueService(db);
   const heartbeat = heartbeatService(db);
 
   async function assertSummariesEnabled() {
@@ -133,14 +134,15 @@ export function summarySlotRoutes(db: Db) {
         },
       });
       if (!result.alreadyGenerating) {
+        // The assignment generation is server state, never part of the public
+        // summary-slot contract, so read it from the created issue.
+        const generatingIssue = await issues.getById(result.generatingIssue.id);
+        if (!generatingIssue || generatingIssue.companyId !== companyId) {
+          throw notFound("Summary generation task not found");
+        }
         await queueIssueAssignmentWakeup({
           heartbeat,
-          issue: {
-            id: result.generatingIssue.id,
-            assigneeAgentId: result.generatingIssue.assigneeAgentId ?? null,
-            status: result.generatingIssue.status,
-            statusVersion: result.generatingIssue.statusVersion,
-          },
+          issue: generatingIssue,
           reason: "summary_slot_generation_requested",
           mutation: "summary_slot.generate",
           contextSource: "summary-slot.generate",

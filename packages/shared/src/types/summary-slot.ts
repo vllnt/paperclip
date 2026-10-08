@@ -59,7 +59,6 @@ export interface SummarySlotIssueRef {
   identifier: string | null;
   title: string;
   status: IssueStatus;
-  statusVersion: number;
   assigneeAgentId?: string | null;
 }
 
