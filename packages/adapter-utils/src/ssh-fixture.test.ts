@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -138,6 +138,31 @@ async function startSshEnvLabFixtureOrSkip(statePath: string, label: string) {
     console.warn(`Skipping ${label}: ${sshEnvLabUnsupportedReason}`);
     return null;
   }
+}
+
+// Points os.tmpdir() at `dir` while `fn` runs, so a test can prove that no
+// SSH sync-back staging directory outlives the restore.
+async function withTmpdir<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
+}
+
+async function listSyncBackStagingDirs(dir: string): Promise<string[]> {
+  return (await readdir(dir)).filter((entry) => entry.startsWith("paperclip-ssh-sync-back-"));
+}
+
+async function initGitRepo(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  await git(dir, ["init"]);
+  await git(dir, ["checkout", "-b", "main"]);
+  await git(dir, ["config", "user.name", "Paperclip Test"]);
+  await git(dir, ["config", "user.email", "test@paperclip.dev"]);
 }
 
 interface ParsedProgressLine {
@@ -1065,5 +1090,174 @@ describe("ssh env-lab fixture", () => {
     const recentSubjects = await git(localRepo, ["log", "--pretty=%s", "-3"]);
     expect(recentSubjects).toContain("remote update a");
     expect(recentSubjects).toContain("remote update b");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps remote dependency trees out of the managed-runtime SSH sync-back without touching host copies", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+    const stagingTmp = path.join(rootDir, "tmp");
+
+    await mkdir(stagingTmp, { recursive: true });
+    await initGitRepo(localRepo);
+    await writeFile(path.join(localRepo, ".gitignore"), "node_modules/\n.turbo/\n", "utf8");
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await git(localRepo, ["add", ".gitignore", "tracked.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+    // A host-side install that predates the run.
+    await mkdir(path.join(localRepo, "node_modules", "host-dep"), { recursive: true });
+    await writeFile(path.join(localRepo, "node_modules", "host-dep", "index.js"), "host\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "managed-runtime SSH dependency exclusion test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: "run-deps",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+
+    // The run reinstalls dependencies, builds, and edits source remotely.
+    await runSshCommand(
+      config,
+      [
+        `cd ${JSON.stringify(prepared.workspaceRemoteDir)}`,
+        "rm -rf node_modules/host-dep",
+        "mkdir -p node_modules/.pnpm/remote-dep/node_modules/remote-dep packages/app/node_modules/nested .turbo dist",
+        "printf remote > node_modules/.pnpm/remote-dep/node_modules/remote-dep/index.js",
+        // An unreadable file makes the remote tar fail if it ever archives
+        // node_modules, so a pass proves the tree is excluded at the source
+        // rather than transferred and filtered on the host. (Vacuous as root.)
+        "printf locked > node_modules/.pnpm/remote-dep/locked.bin",
+        "chmod 000 node_modules/.pnpm/remote-dep/locked.bin",
+        "printf nested > packages/app/node_modules/nested/index.js",
+        "printf cache > .turbo/run.log",
+        "printf built > dist/index.js",
+        "printf 'remote\\n' > tracked.txt",
+        "printf 'new\\n' > packages/app/main.ts",
+      ].join(" && "),
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+
+    const progressLines: string[] = [];
+    await withTmpdir(stagingTmp, () => prepared.restoreWorkspace((line) => {
+      progressLines.push(line);
+    }));
+
+    // Source edits and build output (which a repository may track) come back.
+    await expect(readFile(path.join(localRepo, "tracked.txt"), "utf8")).resolves.toBe("remote\n");
+    await expect(readFile(path.join(localRepo, "packages/app/main.ts"), "utf8")).resolves.toBe("new\n");
+    await expect(readFile(path.join(localRepo, "dist/index.js"), "utf8")).resolves.toBe("built");
+    // Remote dependency and cache trees stay on the remote...
+    await expect(stat(path.join(localRepo, "node_modules/.pnpm"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(path.join(localRepo, "packages/app/node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(path.join(localRepo, ".turbo"))).rejects.toMatchObject({ code: "ENOENT" });
+    // ...and the host's own install is neither deleted nor replaced.
+    await expect(readFile(path.join(localRepo, "node_modules/host-dep/index.js"), "utf8")).resolves.toBe("host\n");
+    expect(progressLines.some((line) => line.includes("Restoring workspace from ssh"))).toBe(true);
+    expect(await listSyncBackStagingDirs(stagingTmp)).toEqual([]);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("restores relative symlinks verbatim through the managed-runtime SSH sync-back", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+    const stagingTmp = path.join(rootDir, "tmp");
+
+    await mkdir(stagingTmp, { recursive: true });
+    await initGitRepo(localRepo);
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await symlink("tracked.txt", path.join(localRepo, "alias.txt"));
+    await git(localRepo, ["add", "tracked.txt", "alias.txt"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "managed-runtime SSH symlink restore test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: "run-symlinks",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+    await runSshCommand(
+      config,
+      `cd ${JSON.stringify(prepared.workspaceRemoteDir)} && ln -s tracked.txt remote-alias.txt`,
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+
+    await withTmpdir(stagingTmp, () => prepared.restoreWorkspace());
+
+    // Staging paths must never leak into the persistent workspace as targets.
+    expect(await readlink(path.join(localRepo, "alias.txt"))).toBe("tracked.txt");
+    expect(await readlink(path.join(localRepo, "remote-alias.txt"))).toBe("tracked.txt");
+    await expect(readFile(path.join(localRepo, "remote-alias.txt"), "utf8")).resolves.toBe("base\n");
+    expect(await git(localRepo, ["status", "--short", "--", "alias.txt"])).toBe("");
+    expect(await listSyncBackStagingDirs(stagingTmp)).toEqual([]);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps relative symlinks relative when restoring a directory in place", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-source");
+    const restoreDir = path.join(rootDir, "restore-target");
+    const stagingTmp = path.join(rootDir, "tmp");
+
+    await mkdir(localDir, { recursive: true });
+    await mkdir(restoreDir, { recursive: true });
+    await mkdir(stagingTmp, { recursive: true });
+    await writeFile(path.join(localDir, "target.txt"), "target\n", "utf8");
+    await symlink("target.txt", path.join(localDir, "link.txt"));
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "in-place SSH symlink restore test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const remoteDir = path.posix.join(started.workspaceDir, "symlink-source");
+
+    await syncDirectoryToSsh({ spec, localDir, remoteDir });
+    await withTmpdir(stagingTmp, () => syncDirectoryFromSsh({ spec, remoteDir, localDir: restoreDir }));
+
+    expect(await readlink(path.join(restoreDir, "link.txt"))).toBe("target.txt");
+    await expect(readFile(path.join(restoreDir, "link.txt"), "utf8")).resolves.toBe("target\n");
+    expect(await listSyncBackStagingDirs(stagingTmp)).toEqual([]);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("removes SSH sync-back staging directories and keeps the host workspace when the restore fails", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-workspace");
+    const stagingTmp = path.join(rootDir, "tmp");
+
+    await mkdir(localDir, { recursive: true });
+    await mkdir(stagingTmp, { recursive: true });
+    await writeFile(path.join(localDir, "keep.txt"), "host\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH sync-back failure cleanup test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: "run-restore-failure",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localDir,
+    });
+    // Losing the remote workspace makes the sync-back transfer itself fail.
+    await runSshCommand(config, `rm -rf ${JSON.stringify(prepared.workspaceRemoteDir)}`, {
+      timeoutMs: 30_000,
+      maxBuffer: 256 * 1024,
+    });
+
+    await expect(withTmpdir(stagingTmp, () => prepared.restoreWorkspace())).rejects.toThrow();
+
+    expect(await listSyncBackStagingDirs(stagingTmp)).toEqual([]);
+    await expect(readFile(path.join(localDir, "keep.txt"), "utf8")).resolves.toBe("host\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 });

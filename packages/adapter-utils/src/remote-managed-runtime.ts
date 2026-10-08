@@ -33,6 +33,21 @@ const REMOTE_ADDITIONAL_SOURCE_HEAVY_DIR_EXCLUDES = [
   ".git",
 ].flatMap((entry) => [entry, `${entry}/*`, `*/${entry}`, `*/${entry}/*`]);
 
+// Dependency and cache trees the remote run regenerates. The sync-back tar
+// reuses the baseline's exclude list, so listing them there keeps them off the
+// host (one pnpm `node_modules` is gigabytes) and the merge leaves the host's
+// own copies alone. The working tree returns only through this file sync, so
+// remote edits under these names are dropped even if a repository tracks them
+// (the sandbox lane already drops them on restore). Names repositories commonly
+// track, such as `dist` and `vendor`, stay out of this list.
+const REMOTE_WORKSPACE_DEPENDENCY_DIR_EXCLUDES = [
+  "node_modules",
+  ".pnpm-store",
+  ".next",
+  ".turbo",
+  ".cache",
+].flatMap((entry) => [entry, `${entry}/*`, `*/${entry}`, `*/${entry}/*`]);
+
 export interface RemoteManagedRuntimeAsset {
   key: string;
   localDir: string;
@@ -148,8 +163,13 @@ export async function prepareRemoteManagedRuntime(input: {
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
-          ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
-          : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
+          ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime", ...REMOTE_WORKSPACE_DEPENDENCY_DIR_EXCLUDES]
+          : [
+              ".paperclip-runtime",
+              ...(input.workspaceFileMode === "all"
+                ? input.workspaceExclude ?? []
+                : REMOTE_WORKSPACE_DEPENDENCY_DIR_EXCLUDES),
+            ],
       })
     : null;
 
