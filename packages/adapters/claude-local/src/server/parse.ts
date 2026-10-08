@@ -8,8 +8,8 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// asks the user to log in. The detector matches them against the parsed result
+// and errors, stderr, and the stdout lines that are not stream-json events.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -203,6 +203,11 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+function isStreamJsonEventLine(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed.startsWith("{") && parseJson(trimmed) !== null;
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
@@ -211,10 +216,16 @@ export function detectClaudeLoginRequired(input: {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // The legacy login-prompt markers match the parsed result, the parsed errors,
+  // stderr, and plain-text stdout lines. They skip stdout stream-json events:
+  // those carry model text and tool results (for example a file that says
+  // "unauthorized"). The CLI's real "Not logged in · Please run /login" prompt
+  // also lands in the parsed result text, so skipping the events keeps it.
+  const plainStdout = input.stdout
+    .split(/\r?\n/)
+    .filter((line) => !isStreamJsonEventLine(line))
+    .join("\n");
+  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), plainStdout, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())

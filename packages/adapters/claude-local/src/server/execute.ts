@@ -52,6 +52,7 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
 import {
@@ -1128,6 +1129,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
     const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
     const failed = !parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
+    // Claude reported success, but a background task it started kept the
+    // process alive, so Paperclip stopped it after the final result. Over SSH
+    // the stopped client exits 255. Name that stop instead of leaving a bare
+    // non-zero exit (or a false auth failure) on a run whose turn succeeded.
+    const stoppedLingeringBackgroundTask =
+      parsedSucceeded &&
+      !claudeRefusal &&
+      Boolean(proc.terminalResultCleanup) &&
+      ((proc.exitCode ?? 0) !== 0 || proc.signal != null);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -1155,6 +1165,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+      : stoppedLingeringBackgroundTask
+      ? "Claude finished its turn successfully, but a background task it started was still running, " +
+        `so Paperclip stopped the process (${proc.signal ?? `exit code ${proc.exitCode ?? -1}`}).`
       : null;
     const providerQuota =
       failed &&
@@ -1192,7 +1205,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
-      : loginMeta.requiresLogin
+      // A successful Claude result is never a login failure, even when the
+      // result text happens to contain a login word.
+      : !parsedSucceeded && loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && isClaudeModelNotFoundError({
         parsed,
@@ -1211,6 +1226,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "claude_transient_upstream"
       : claudeRefusal
       ? "claude_refusal"
+      : stoppedLingeringBackgroundTask
+      ? UNMANAGED_BACKGROUND_TASK_STOP_REASON
       : null;
     const errorFamily = providerQuota
       ? "provider_quota"

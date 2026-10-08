@@ -413,6 +413,183 @@ describe("claude remote execution", () => {
     expect(result.errorCode).toBe("duplex_channel_lost");
   });
 
+  describe("auth classification of a run stopped after its final result", () => {
+    // Paperclip stops the process 5s after Claude's final `result` when a
+    // background task the agent started is still running. Over SSH the stopped
+    // client exits 255, so the run is non-zero even though Claude succeeded.
+    const backgroundTaskStop: NonNullable<RunProcessResult["terminalResultCleanup"]> = {
+      kind: "terminal_result_cleanup",
+      stopped: true,
+      stopReason: "unmanaged_background_task_stopped",
+      reason: "unmanaged background task stopped; no durable live path",
+      terminalResultSeen: true,
+      signal: "SIGTERM",
+      forceKilled: false,
+    };
+
+    function successStdout(resultText: string) {
+      return [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-bg", model: "claude-sonnet-5" }),
+        // A tool result that echoes skills/paperclip/SKILL.md, as in production.
+        JSON.stringify({
+          type: "user",
+          session_id: "claude-session-bg",
+          message: {
+            content: [{
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: "The server rejects unknown or unauthorized recipients. Do not guess IDs.",
+            }],
+          },
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          session_id: "claude-session-bg",
+          result: resultText,
+          usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+        }),
+      ].join("\n");
+    }
+
+    async function executeRemote(proc: Partial<RunProcessResult>) {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-auth-"));
+      cleanupDirs.push(rootDir);
+      const workspaceDir = path.join(rootDir, "workspace");
+      await mkdir(workspaceDir, { recursive: true });
+
+      runChildProcess.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: 123,
+        startedAt: new Date().toISOString(),
+        ...proc,
+      });
+
+      return execute({
+        runId: "run-ssh-auth-classification",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        // A model without a minimum CLI version keeps the run to one process.
+        config: { engine: "cli", command: "claude", model: "claude-sonnet-5" },
+        context: {
+          paperclipWorkspace: {
+            cwd: workspaceDir,
+            source: "project_primary",
+          },
+        },
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        onLog: async () => {},
+      });
+    }
+
+    it("reports a successful result stopped for a background task as unmanaged_background_task_stopped, not auth", async () => {
+      const result = await executeRemote({
+        exitCode: 255,
+        stdout: successStdout("Opened the PR and started a CI watcher."),
+        terminalResultCleanup: backgroundTaskStop,
+      });
+
+      expect(result.errorCode).toBe("unmanaged_background_task_stopped");
+      expect(result.errorMessage).toContain("background task");
+      expect(result.resultJson).toMatchObject({ unmanagedBackgroundTask: backgroundTaskStop });
+    });
+
+    it("does not report auth required when the successful result text itself mentions an auth word", async () => {
+      const result = await executeRemote({
+        exitCode: 255,
+        stdout: successStdout("Fixed the unauthorized recipient check."),
+        terminalResultCleanup: backgroundTaskStop,
+      });
+
+      expect(result.errorCode).toBe("unmanaged_background_task_stopped");
+    });
+
+    it("keeps a background-task stop that exited cleanly a success", async () => {
+      const result = await executeRemote({
+        exitCode: 0,
+        stdout: successStdout("Done."),
+        terminalResultCleanup: backgroundTaskStop,
+      });
+
+      expect(result.errorCode).toBeNull();
+      expect(result.errorMessage).toBeNull();
+    });
+
+    it("keeps a refusal stopped for a background task classified as a refusal", async () => {
+      const result = await executeRemote({
+        exitCode: 255,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-bg", model: "claude-sonnet-5" }),
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            stop_reason: "refusal",
+            session_id: "claude-session-bg",
+            result: "I can't help with that.",
+          }),
+        ].join("\n"),
+        terminalResultCleanup: backgroundTaskStop,
+      });
+
+      expect(result.errorCode).toBe("claude_refusal");
+      expect(result.errorMessage).toBeNull();
+    });
+
+    it("still reports claude_auth_required for the real logged-out CLI output", async () => {
+      // Captured from Claude Code 2.1.293 run logged out (trimmed): exit 1,
+      // empty stderr, prompt in the assistant event and the result event.
+      const result = await executeRemote({
+        exitCode: 1,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: "s-1", apiKeySource: "none" }),
+          JSON.stringify({
+            type: "assistant",
+            session_id: "s-1",
+            message: { model: "<synthetic>", content: [{ type: "text", text: "Not logged in · Please run /login" }] },
+          }),
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            is_error: true,
+            result: "Not logged in · Please run /login",
+            terminal_reason: "api_error",
+            session_id: "s-1",
+          }),
+        ].join("\n"),
+      });
+
+      expect(result.errorCode).toBe("claude_auth_required");
+    });
+  });
+
   describe("CLI-lane model pass-through", () => {
     async function executeWithModel(prefix: string, config: Record<string, unknown>) {
       const rootDir = await mkdtemp(path.join(os.tmpdir(), prefix));
