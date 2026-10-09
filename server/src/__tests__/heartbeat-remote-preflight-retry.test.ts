@@ -117,7 +117,7 @@ describeEmbeddedPostgres("heartbeat transient remote preflight failure", () => {
     await db.insert(agents).values({
       id: agentId,
       companyId,
-      name: "Anthm PM",
+      name: "Release PM",
       role: "pm",
       status: "active",
       adapterType: "codex_local",

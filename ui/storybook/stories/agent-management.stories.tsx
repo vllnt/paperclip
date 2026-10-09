@@ -844,7 +844,7 @@ export const ManagementMatrix: Story = {};
 const waitingAgent: Agent = {
   ...agentManagementAgents[0]!,
   id: "agent-waiting",
-  name: "Anthm PM",
+  name: "Release PM",
   status: "idle",
   waitState: { activeWaitCount: 2, nextCheckAt: "2026-10-09T01:20:00.000Z" },
 };
