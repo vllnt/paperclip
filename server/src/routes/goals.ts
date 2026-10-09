@@ -1,12 +1,18 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import { createGoalSchema, updateGoalSchema } from "@paperclipai/shared";
 import { trackGoalCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { goalService, logActivity } from "../services/index.js";
+import type { GoalWriter } from "../services/goals.js";
 import { goalFocusService } from "../services/goal-focus.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { getTelemetryClient } from "../telemetry.js";
+
+/** Board users write every goal field; anyone else is held to the company focus rule in the goal service. */
+function goalWriter(req: Request): GoalWriter {
+  return req.actor.type === "board" ? "board" : "agent";
+}
 
 export function goalRoutes(db: Db) {
   const router = Router();
@@ -42,7 +48,7 @@ export function goalRoutes(db: Db) {
   router.post("/companies/:companyId/goals", validate(createGoalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const goal = await svc.create(companyId, req.body);
+    const goal = await svc.create(companyId, req.body, goalWriter(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -65,7 +71,7 @@ export function goalRoutes(db: Db) {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Goal not found");
     if (!existing) return;
-    const goal = await svc.update(id, req.body);
+    const goal = await svc.update(id, req.body, goalWriter(req));
     if (!goal) {
       res.status(404).json({ error: "Goal not found" });
       return;
@@ -90,7 +96,7 @@ export function goalRoutes(db: Db) {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Goal not found");
     if (!existing) return;
-    const goal = await svc.remove(id);
+    const goal = await svc.remove(id, goalWriter(req));
     if (!goal) {
       res.status(404).json({ error: "Goal not found" });
       return;

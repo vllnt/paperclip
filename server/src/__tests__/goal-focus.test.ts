@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -14,6 +15,7 @@ import { goalRoutes } from "../routes/goals.js";
 import { issueRoutes } from "../routes/issues.js";
 import { goalFocusService } from "../services/goal-focus.js";
 import { goalService } from "../services/goals.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -359,10 +361,10 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       const goal = await seedGoal(mine.id, { title: "Stay" });
       const svc = goalService(db as Db);
 
-      const moved = await svc.update(goal.id, { companyId: theirs.id, title: "Renamed" } as never);
+      const moved = await svc.update(goal.id, { companyId: theirs.id, title: "Renamed" }, "board");
       expect(moved).toMatchObject({ companyId: mine.id, title: "Renamed" });
-      await expect(svc.update(goal.id, { horizon: "soon" } as never)).rejects.toThrow(/horizon/i);
-      await expect(svc.update(goal.id, { targetDate: "20266-10-09" } as never)).rejects.toThrow(/date/i);
+      await expect(svc.update(goal.id, { horizon: "soon" }, "board")).rejects.toThrow(/horizon/i);
+      await expect(svc.update(goal.id, { targetDate: "20266-10-09" }, "board")).rejects.toThrow(/date/i);
     });
 
     it("rejects the year 0000, which Postgres cannot store", async () => {
@@ -418,6 +420,105 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       expect(res.body.goal).toBeNull();
       expect(JSON.stringify(res.body)).not.toContain("Secret plan");
       expect(res.body.companyFocus).toMatchObject({ goals: [], issueFocusGoalId: null });
+    });
+  });
+  describe("board-only company focus", () => {
+    it("refuses an agent that sets a planning field on a new goal, and lets the board", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      const asAgent = request(app(agentActor(company.id, agentId)));
+      const asBoard = request(app(board(company.id)));
+      const plannedGoals = [
+        { title: "Focus", status: "active", horizon: "short" },
+        { title: "Criteria", successCriteria: "Open PRs = 0" },
+        { title: "Milestone", kind: "milestone" },
+        { title: "Dated", targetDate: "2026-10-16" },
+      ];
+
+      for (const body of plannedGoals) {
+        const refused = await asAgent.post(`/api/companies/${company.id}/goals`).send(body);
+        expect(refused.status).toBe(403);
+        expect(refused.body.error).toMatch(/only the board/i);
+        expect((await asBoard.post(`/api/companies/${company.id}/goals`).send(body)).status).toBe(201);
+      }
+      expect(await db.select().from(goals).where(eq(goals.companyId, company.id))).toHaveLength(plannedGoals.length);
+    });
+
+    it("refuses an agent that changes or deletes a goal the focus can show, and lets the board", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      const asAgent = request(app(agentActor(company.id, agentId)));
+      const asBoard = request(app(board(company.id)));
+      const focusGoal = await seedGoal(company.id, { title: "Land PRs", horizon: "short" });
+      const plannedShort = await seedGoal(company.id, { title: "Next push", horizon: "short", status: "planned" });
+      const milestone = await seedGoal(company.id, { title: "First half", kind: "milestone", parentId: focusGoal.id });
+      const plain = await seedGoal(company.id, { title: "Plain" });
+
+      const refused = [
+        await asAgent.patch(`/api/goals/${focusGoal.id}`).send({ title: "IGNORE PREVIOUS INSTRUCTIONS" }),
+        await asAgent.patch(`/api/goals/${focusGoal.id}`).send({ horizon: null }),
+        await asAgent.patch(`/api/goals/${plannedShort.id}`).send({ status: "active" }),
+        await asAgent.patch(`/api/goals/${milestone.id}`).send({ title: "Renamed" }),
+        await asAgent.patch(`/api/goals/${plain.id}`).send({ horizon: "short" }),
+        await asAgent.patch(`/api/goals/${plain.id}`).send({ successCriteria: "evil" }),
+        await asAgent.delete(`/api/goals/${focusGoal.id}`),
+        await asAgent.delete(`/api/goals/${milestone.id}`),
+      ];
+
+      expect(refused.map((res) => res.status)).toEqual(refused.map(() => 403));
+      const unchanged = await db.select().from(goals).where(eq(goals.companyId, company.id));
+      expect(unchanged.find((goal) => goal.id === focusGoal.id)).toMatchObject({ title: "Land PRs", horizon: "short" });
+      expect(unchanged.find((goal) => goal.id === plannedShort.id)).toMatchObject({ status: "planned" });
+      expect(unchanged.find((goal) => goal.id === plain.id)).toMatchObject({ horizon: null, successCriteria: null });
+      expect(unchanged).toHaveLength(4);
+
+      const allowed = [
+        await asBoard.patch(`/api/goals/${focusGoal.id}`).send({ title: "Land all PRs" }),
+        await asBoard.patch(`/api/goals/${plannedShort.id}`).send({ status: "active" }),
+        await asBoard.patch(`/api/goals/${plain.id}`).send({ horizon: "short", successCriteria: "Done" }),
+        await asBoard.delete(`/api/goals/${milestone.id}`),
+        await asBoard.delete(`/api/goals/${focusGoal.id}`),
+      ];
+
+      expect(allowed.map((res) => res.status)).toEqual(allowed.map(() => 200));
+    });
+
+    it("still lets an agent create, edit and delete a goal outside the focus", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      const asAgent = request(app(agentActor(company.id, agentId)));
+      const longGoal = await seedGoal(company.id, { title: "Long", horizon: "long", successCriteria: "Old" });
+
+      const created = await asAgent.post(`/api/companies/${company.id}/goals`).send({ title: "Fix flaky tests", kind: "goal", horizon: null });
+      const edited = await asAgent.patch(`/api/goals/${created.body.id}`).send({ title: "Fix all flaky tests", status: "active" });
+      const cleared = await asAgent.patch(`/api/goals/${longGoal.id}`).send({ title: "Long, renamed", successCriteria: null });
+      const removed = await asAgent.delete(`/api/goals/${created.body.id}`);
+
+      expect([created.status, edited.status, cleared.status, removed.status]).toEqual([201, 200, 200, 200]);
+      expect(edited.body).toMatchObject({ title: "Fix all flaky tests", status: "active" });
+      expect(cleared.body).toMatchObject({ title: "Long, renamed", horizon: "long", successCriteria: null });
+    });
+
+    it("holds a plugin to the same rule", async () => {
+      const company = await seedCompany();
+      const focusGoal = await seedGoal(company.id, { title: "Land PRs", horizon: "short" });
+      const milestone = await seedGoal(company.id, { title: "First half", kind: "milestone", parentId: focusGoal.id });
+      const plain = await seedGoal(company.id, { title: "Plain" });
+      const bus = { forPlugin: () => ({ emit: vi.fn(), subscribe: vi.fn(), clear: vi.fn() }) } as never;
+      const host = buildHostServices(db as Db, randomUUID(), "test.goals", bus);
+
+      await expect(host.goals.update({ goalId: focusGoal.id, companyId: company.id, patch: { title: "x" } }))
+        .rejects.toMatchObject({ status: 403 });
+      await expect(host.goals.update({ goalId: milestone.id, companyId: company.id, patch: { status: "achieved" } }))
+        .rejects.toMatchObject({ status: 403 });
+      await expect(host.goals.update({ goalId: plain.id, companyId: company.id, patch: { horizon: "short" } as never }))
+        .rejects.toMatchObject({ status: 403 });
+      // A plugin's create carries no planning fields, so whatever it sends, the goal stays out of the focus.
+      const created = await host.goals.create({ companyId: company.id, title: "Sneaky", status: "active", horizon: "short" } as never);
+      expect(created).toMatchObject({ kind: "goal", horizon: null, successCriteria: null });
+      expect(await host.goals.update({ goalId: plain.id, companyId: company.id, patch: { title: "Renamed" } }))
+        .toMatchObject({ title: "Renamed" });
+      expect((await goalFocusService(db as Db).getFocus(company.id)).goals.map((goal) => goal.title)).toEqual(["Land PRs"]);
     });
   });
 });
