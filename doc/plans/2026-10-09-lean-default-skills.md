@@ -191,10 +191,10 @@ comment that claims a watcher when `monitorNextCheckAt` is null).
 - `company-skills-service.test.ts` now derives the expected release ids from `releases.json`, so adding a release
   needs no test edit. A second test checks that `v8-lean` seeds as a non-current version and materializes its files.
   Existing companies get the new version the next time their skill inventory refreshes.
-- Dependencies on open pull requests. v8-lean is a snapshot of the live skill, and two open PRs change rules in the
-  live skill. v8-lean carries both, as written in those PRs: agents can hand a block to the board with
-  `unblockDescriptor.owner: "board"` (PR 29), and a wait for CI or a deploy ends the turn with `issue wait` instead of
-  a background process (PR 27). If either PR changes before it merges, update the release. If either is dropped, remove
+- Dependencies on open pull requests. v8-lean is a snapshot of the live skill, and three open PRs change rules in the
+  live skill. v8-lean carries all three, as written in those PRs: agents can hand a block to the board with
+  `unblockDescriptor.owner: "board"` (PR 29), a wait for CI or a deploy ends the turn with `issue wait` instead of
+  a background process (PR 27), and commits carry no co-author trailer while git hooks are never bypassed (PR 58). If either PR changes before it merges, update the release. If either is dropped, remove
   the matching rule, or agents on the lean release will call a route that does not exist. The same applies to any
   later change to `skills/paperclip`: the release does not follow it by itself.
 - Packaging gap (pre-existing, affects v0 and v7 too): the `server` npm package lists `dist`, `ui-dist` and `skills`

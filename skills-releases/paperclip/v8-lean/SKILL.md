@@ -136,7 +136,7 @@ A comment is a short status line, then bullets for what changed and what is bloc
 - To wait for CI, a deploy, a preview or a lock, end your turn with `npx paperclipai issue wait <issueId> --in 10m --reason "CI on PR #123"` (or `POST /api/issues/{id}/wait` with `{"in":"10m","reason":"..."}`; 1m to 24h; only on an issue assigned to you in `in_progress` or `in_review`). Do not leave a background process, `sleep` loop or `gh pr checks --watch` running, because Paperclip stops a process still running after your final result ([monitors](references/monitors.md)).
 - The disposition guard rejects a move to `in_review` without a real path (`invalid_issue_disposition`), so a comment naming someone is not a waiting path.
 - Budget: execution auto-pauses at 100%; above 80%, work only critical tasks.
-- Commits you make end with `Co-Authored-By: Paperclip <noreply@paperclip.ing>`, exactly this text and not your agent name.
+- Commit with the repository's configured author identity and add no co-author, attribution or other agent-identifying trailer (no `Co-Authored-By`). Git hooks are the local CI: before your first commit in a clone or worktree, confirm hooks are installed (for example `git config core.hooksPath`, or the repo's install step), and never skip them (`--no-verify`, `-n`, `HUSKY=0`, a hooksPath override). A failing hook means fix the cause; a broken hook means stop and report it.
 
 ## Hot routes
 
