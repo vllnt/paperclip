@@ -1881,6 +1881,41 @@ describe("SSH run directory reaper", () => {
     expect(await git(run.workspace, ["rev-parse", "agent/work"])).toMatch(/^[0-9a-f]{40}$/);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("keeps a bundle that an earlier reap already published for the run", async () => {
+    const host = await startHost("SSH reaper existing bundle test");
+    if (!host) return;
+    const run = await host.gitRun();
+    const bundlePath = host.preservedBundle(run.runId);
+    await mkdir(path.dirname(bundlePath), { recursive: true });
+    await git(run.workspace, ["bundle", "create", bundlePath, "main"]);
+    const published = await readFile(bundlePath);
+    await writeFile(path.join(run.workspace, "half-deleted.txt"), "state of a degraded second pass\n");
+
+    const result = await host.reap(run.runId);
+
+    expect(result.outcome).toBe("removed");
+    expect((await readFile(bundlePath)).equals(published)).toBe(true);
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("stops the worker script at its time limit, so it cannot outlive the claim that started it", async () => {
+    const host = await startHost("SSH reaper time limit test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+    const lateWrite = path.join(host.rootDir, "late-write");
+
+    await expect(reapSshRunDirectory({
+      spec: host.spec,
+      remoteRoot: host.root,
+      runId: run.runId,
+      timeoutMs: 2000,
+      testHooks: { afterConfine: `sleep 5 && : > '${lateWrite}'` },
+    })).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+
+    await expect(stat(lateWrite)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("does not run commands from a repository config the agent planted", async () => {
     const host = await startHost("SSH reaper hostile config test");
     if (!host) return;

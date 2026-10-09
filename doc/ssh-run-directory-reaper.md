@@ -127,11 +127,24 @@ instead of the run.
   other.
 - **Crash.** A claim not renewed for 15 minutes (a server died mid-removal) is
   reclaimed by the next sweep.
-- **Residual.** A server frozen for more than 15 minutes after it sent the delete
-  can lose its claim while the command still runs on the worker. Then two reapers
-  may delete one directory of a finished run. The run id is never prepared again
-  (a retry gets a new id), so nothing live is under it; closing this fully means
-  renaming the directory on the worker before deleting it.
+- **Time limit.** The worker script runs under `timeout` with the same limit as
+  the SSH call (10 minutes, plus a 30 second kill grace). A dropped connection
+  or a frozen server therefore cannot leave a script running once its claim is
+  stale (15 minutes after the last renewal). A worker without `timeout` runs the
+  script unbounded.
+- **Published bundle.** `preserved/<runId>.bundle` is written once and never
+  replaced. It is saved before any deletion starts, so it is the most complete
+  copy; a later pass over a half-deleted directory would save less. A pass that
+  finds a bundle verifies it and reports the refs it computed, which can differ
+  from the bundle's contents when the first pass saw a different state. A bundle
+  that fails verification keeps the directory (`preserve_failed`) until the
+  30-day cleanup removes it.
+- **Residual.** On a worker without `timeout`, a server frozen for more than
+  15 minutes after it sent the delete can lose its claim while the command still
+  runs. Then two reapers may delete one directory of a finished run, though the
+  second can no longer replace the saved bundle. The run id is never prepared
+  again (a retry gets a new id), so nothing live is under it; closing this fully
+  means renaming the directory on the worker before deleting it.
 
 On the worker, the script resolves the root once, then enters `runs/<runId>`
 and compares the physical path (`pwd -P`) with the expected one. Everything after

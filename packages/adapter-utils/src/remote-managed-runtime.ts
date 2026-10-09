@@ -145,6 +145,7 @@ export function sshPreservedBundlePath(remoteRoot: string, runId: string): strin
 
 const PRESERVED_BUNDLE_MAX_KB = 1024 * 1024;
 const PRESERVED_BUNDLE_RETENTION_DAYS = 30;
+const REAP_KILL_GRACE_SECONDS = 30;
 
 /**
  * Deletes one run's `runs/<runId>` directory on an SSH host for any finished
@@ -163,6 +164,14 @@ const PRESERVED_BUNDLE_RETENTION_DAYS = 30;
  * when an extra worktree holds uncommitted work, or when the bundle cannot be
  * written and verified. Git runs with the repository's `core.fsmonitor` and
  * hooks switched off. Bundles older than 30 days are removed.
+ *
+ * The worker script has its own time limit, `timeoutMs` rounded up to whole
+ * seconds, enforced by `timeout` on the worker (with a 30 s kill grace). A
+ * dropped connection or a stalled caller therefore cannot leave a script
+ * running past the caller's claim on the directory. A worker without
+ * `timeout` runs the script unbounded. A bundle already published for the run
+ * is never replaced: it was written before any deletion started, so it is the
+ * most complete copy, and a later pass may see a half-deleted worktree.
  */
 export async function reapSshRunDirectory(input: {
   spec: SshConnectionConfig;
@@ -185,7 +194,7 @@ export async function reapSshRunDirectory(input: {
   }
   const q = shellQuote;
   const hook = (line: string | undefined) => (line ? [line] : []);
-  const script = [
+  const body = [
     `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
     // The root is resolved once. Everything below is compared with this physical path.
     'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
@@ -276,7 +285,8 @@ export async function reapSshRunDirectory(input: {
     '    size=$(du -k .paperclip-reap.bundle 2>/dev/null | cut -f1); size=${size:-0}',
     `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
     '    mkdir -p "$preserved" 2>/dev/null || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
-    '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && mv -f -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle" ) || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
+    '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && { [ -e "./$id.bundle" ] || [ -L "./$id.bundle" ] || mv -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle"; } ) || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
+    '    rm -f .paperclip-reap.bundle',
     '    G bundle verify "$bundle" >/dev/null 2>&1 || { keep preserve_failed; }',
     '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
     "  fi",
@@ -298,10 +308,13 @@ export async function reapSshRunDirectory(input: {
     '  keep rm_failed',
     "fi",
   ].join("\n");
-  const result = await runSshCommand(input.spec, script, {
-    timeoutMs: input.timeoutMs ?? 10 * 60 * 1000,
-    maxBuffer: 256 * 1024,
-  });
+  const timeoutMs = input.timeoutMs ?? 10 * 60 * 1000;
+  const script = [
+    `body=${q(body)}`,
+    `if command -v timeout >/dev/null 2>&1; then exec timeout -k ${REAP_KILL_GRACE_SECONDS} ${Math.ceil(timeoutMs / 1000)} sh -c "$body"; fi`,
+    'exec sh -c "$body"',
+  ].join("\n");
+  const result = await runSshCommand(input.spec, script, { timeoutMs, maxBuffer: 256 * 1024 });
   const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   const preserved = lines.filter((line) => line.startsWith("preserved ")).map((line) => line.slice("preserved ".length));
   const last = lines[lines.length - 1] ?? "";
