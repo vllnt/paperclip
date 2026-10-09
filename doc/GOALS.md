@@ -32,6 +32,17 @@ project's `goalIds`, and its new tasks inherit the project's goal.
 **Active goals with the short horizon are the company focus.** Make a goal the focus by
 setting its horizon to short term and its status to active. Remove it by changing either.
 
+**Only the board writes the focus**, because every agent reads it on every run. Agents, plugins
+and the onboarding seed pushed with an agent key get 403 when they:
+
+- set `kind` to `milestone`, or set `horizon`, `targetDate` or `successCriteria`, on a new or
+  existing goal;
+- change or delete a goal with the short horizon, in any status, or a milestone.
+
+They can still create, edit and delete other goals, and clear a planning field on a goal
+outside the focus. A plugin's `ctx.goals.create` carries no planning fields at all. Paperclip
+Cloud pushes the onboarding seed as the board.
+
 Agents see the focus in two places:
 
 - `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`: the focus goals with their
@@ -41,14 +52,23 @@ Agents see the focus in two places:
   focus), then tasks that serve a focus goal, then the rest. Each task has `focusGoalId`. The
   order inside each group does not change.
 
-At most 10 focus goals and 5 milestones each are listed, and `successCriteria` is cut to 280
-characters in what agents receive, because agents read the focus on every run.
+**With no focus, nothing changes.** The heartbeat context has no `companyFocus` key, its `goal`
+block has only the keys it had before planning fields, and the inbox keeps its order with no
+`focusGoalId`. The task's `goal` block adds `kind` only for a milestone, and `horizon`,
+`targetDate` and `successCriteria` only when set.
+
+**The focus is small.** At most 10 focus goals and 5 milestones each are listed. Goal titles,
+milestone titles and `successCriteria` are cut to 280 characters in what agents receive, so the
+whole `companyFocus` holds at most about 30,000 characters of text. JSON escaping can make it
+longer for text full of quotes or control characters, and only the board writes that text. A
+goal title can be at most 2,000 characters, the length of a company mission.
 
 The guidance tells agents to work the focus first, finish and land work in review before
 starting new work, and ask the board through an approval if the focus needs more agents, runs
 or budget. Agents never change their own limits.
 
-The focus is advice. If it cannot be read, agents get their normal context and order.
+**The focus is advice.** If it cannot be read within 500 ms, or the read fails, agents get
+their normal context and order, as if no focus were set.
 
 ## Progress
 
@@ -74,8 +94,8 @@ shows the current focus at the top.
 
 | | |
 |---|---|
-| REST | `GET/POST /api/companies/{id}/goals`, `PATCH /api/goals/{id}`, `GET /api/companies/{id}/goals/focus`, `GET /api/companies/{id}/goals/progress` |
-| CLI | `goal create/update --kind --horizon --target-date --success-criteria`, `goal focus` |
+| REST | `GET/POST /api/companies/{id}/goals`, `PATCH/DELETE /api/goals/{id}`, `GET /api/companies/{id}/goals/focus`, `GET /api/companies/{id}/goals/progress` |
+| CLI | `goal create/update --kind --horizon --target-date --success-criteria` (board only), `goal focus` |
 | Agents | `companyFocus` in the heartbeat context, focus-first inbox |
 | Web | Current focus panel and planning details on the Goals page, planning fields in goal properties and the New Goal dialog |
 
@@ -84,5 +104,3 @@ shows the current focus at the top.
 - A time-boxed "focus push" that reallocates agents, runs and routines with one board
   approval and undoes it at the deadline.
 - A success metric that Paperclip measures itself, such as open pull requests from linked PRs.
-- Limiting who may set the short horizon. Today anyone who may edit goals can, as with other
-  goal fields, and each change is in the activity log.
