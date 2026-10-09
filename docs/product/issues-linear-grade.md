@@ -174,7 +174,7 @@ one open issue per origin kind.
 
 ### 6.1 Principles
 
-1. Agents first, humans well served: every capability exists as REST + OpenAPI, CLI, MCP tool,
+1. Agents first, humans well served: every capability exists as REST + OpenAPI, CLI, agent tool,
    and web UI. The web UI is the thinnest of the four.
 2. Reuse what exists: work products for storage, the workspace renderer for branch names,
    `issueService.update` and the execution-policy transition for status.
@@ -307,14 +307,18 @@ Each move writes activity `issue.git_status_automated` with `_previous.status`, 
 
 ### 6.7 Four surfaces, slice 1
 
-| Capability | Web | REST + OpenAPI | CLI | Agent tool (MCP) |
+| Capability | Web | REST + OpenAPI | CLI | Agent tool |
 |---|---|---|---|---|
-| Branch name | header chip, copy, `git switch -c` | `GET /api/issues/{id}/git` | `issue git <id>` | `paperclipGetIssueGit` |
-| Linked PRs | "Pull requests" section, provenance, verify, unlink | same read; `POST /api/issues/{id}/git/pull-requests`; `DELETE …/{workProductId}` | `issue git:link <id> <url>`, `issue git:unlink` | `paperclipLinkPullRequest` |
+| Branch name | header chip, copy, `git switch -c` | `GET /api/issues/{id}/git` | `issue git <id>` | REST through MCP `paperclipApiRequest` |
+| Linked PRs | "Pull requests" section, provenance, verify, unlink | same read; `POST /api/issues/{id}/git/pull-requests`; `DELETE …/{workProductId}` | `issue git:link <id> <url>`, `issue git:unlink` | REST through MCP `paperclipApiRequest` |
 | Automation switch | Instance settings toggle | `PATCH /api/instance/settings/general` (`gitStatusAutomation`) | existing settings command | n/a |
 
-Agent docs go in a new reference file, not `skills/paperclip/SKILL.md` (heading line
-numbers are anchored by the production image build).
+Dedicated MCP tools were built and then removed from slice 1: the runner capability inventory
+fixes the legacy MCP tools at 42, with fold targets and generated files that need the external
+eval corpus, so a build that adds a tool fails the production image check. Agents use the REST
+routes through `paperclipApiRequest` and the CLI. Dedicated tools belong in a follow-up that
+updates the inventory with the corpus at hand. Agent docs stay out of
+`skills/paperclip/SKILL.md` too (heading line numbers are anchored by the same build).
 
 ## 7. Slice plan (stacked PRs, each shippable)
 
@@ -348,7 +352,7 @@ RED first, then GREEN:
   twice; every status guard in 6.4.
 - Routes: board and agent authorisation, company access, idempotent POST, unlink suppression.
 - Plugin: poll adapter reports only repos linked to the company's projects.
-- CLI and MCP: payload shapes. UI: component tests plus a real browser pass at desktop
+- CLI: payload shapes. UI: component tests plus a real browser pass at desktop
   and mobile widths with zero console errors.
 - Live-DB safety: no migration. Enabling status automation is an explicit settings change.
 

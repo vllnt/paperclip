@@ -88,7 +88,7 @@ not post a comment, so it does not wake an agent.
 
 | Source | How | Works without webhooks |
 |---|---|---|
-| Linked by hand | `POST /api/issues/{id}/git/pull-requests`, `paperclipai issue git:link`, MCP `paperclipLinkPullRequest` | yes |
+| Linked by hand | `POST /api/issues/{id}/git/pull-requests`, `paperclipai issue git:link`, or an agent through the MCP `paperclipApiRequest` tool | yes |
 | Paperclip Cloud relay events | The existing GitHub connection event poll | yes |
 
 A relay event carries the branch, state, and merge flag, but not the title or body. The service
@@ -109,5 +109,22 @@ reads the rest from GitHub only when it needs it (head repository, default branc
 |---|---|
 | REST | `GET /api/issues/{id}/git`, `POST /api/issues/{id}/git/pull-requests`, `DELETE /api/issues/{id}/git/pull-requests/{workProductId}` |
 | CLI | `paperclipai issue git`, `issue git:link`, `issue git:unlink` |
-| MCP tools | `paperclipGetIssueGit`, `paperclipLinkPullRequest`, `paperclipUnlinkPullRequest` |
+| Agent tools | Agents call the REST routes with the MCP `paperclipApiRequest` tool, or run the CLI. See below. |
 | Web | Git section in the issue Properties panel |
+
+### Agent tools
+
+An agent reads or links through the REST routes. With the MCP server, use `paperclipApiRequest`:
+
+```
+paperclipApiRequest { "method": "GET", "path": "/issues/PAP-123/git" }
+paperclipApiRequest { "method": "POST", "path": "/issues/PAP-123/git/pull-requests",
+                      "jsonBody": "{\"url\":\"https://github.com/acme/app/pull/7\"}" }
+```
+
+There are no dedicated MCP tools for this feature yet, on purpose. The runner capability
+inventory (`packages/paperclip-runner/spec/capability`) treats the MCP tools as a fixed legacy
+set of 42. Every tool has a fold target there, and the generated files need the external eval
+corpus (`PAPERCLIP_EVALS_ROOT`). A build that adds a tool fails the production image check.
+Dedicated agent tools should be added through that inventory, with the corpus available.
+
