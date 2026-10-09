@@ -484,3 +484,24 @@ describeEmbeddedPostgres("company storage destinations", () => {
     });
   });
 });
+
+describe("storagePhysicalKey", () => {
+  it("canonicalizes legacy, FIPS, dualstack and China AWS hosts and stays linear on a hostile endpoint", () => {
+    const key = (host: string) => storagePhysicalKey({ endpoint: `https://${host}/`, bucket: "b" });
+    for (const host of [
+      "s3-us-west-2.amazonaws.com",
+      "s3-fips.us-gov-west-1.amazonaws.com",
+      "s3.dualstack.us-east-1.amazonaws.com",
+      "s3.cn-north-1.amazonaws.com.cn",
+    ]) {
+      expect(key(host)).toBe("s3.amazonaws.com/b");
+    }
+    expect(key("evil-s3.amazonaws.com")).toBe("evil-s3.amazonaws.com/b");
+
+    // A near-miss of the AWS suffix after many dashes: the earlier pattern backtracked for seconds here.
+    const hostile = `s3${"--".repeat(22)}.amazonaws.co`;
+    const started = performance.now();
+    expect(key(hostile)).toBe(`${hostile}/b`);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+});

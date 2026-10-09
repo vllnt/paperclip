@@ -91,8 +91,12 @@ function probeErrorCode(error: unknown): ProbeErrorCode {
   return "probe_failed";
 }
 
-/** AWS S3 host names that all address the same global bucket namespace. */
-const AWS_S3_HOST = /^s3([.-][a-z0-9-]+)*\.amazonaws\.com(\.cn)?$/;
+/**
+ * AWS S3 host names that all address the same global bucket namespace. Each
+ * label part starts with exactly one separator it cannot contain, so a host
+ * splits only one way and a hostile endpoint cannot force exponential backtracking.
+ */
+const AWS_S3_HOST = /^s3(?:[.-][a-z0-9]+)*\.amazonaws\.com(?:\.cn)?$/;
 
 /**
  * Canonical endpoint host and bucket: one physical bucket serves one company
