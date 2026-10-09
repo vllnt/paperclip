@@ -73,7 +73,20 @@ command.
 ```sh
 npx paperclipai agent list
 npx paperclipai agent get <agent-id>
+
+# Config history
+npx paperclipai agent config-revisions <agent-id>
+npx paperclipai agent config-revision:get <agent-id> <revision-id>
+npx paperclipai agent config-revision:diff <agent-id> <revision-id> [--json]
+npx paperclipai agent config-revision:rollback <agent-id> <revision-id>
 ```
+
+`config-revision:diff` prints one line per changed leaf as
+`path: before -> after` (`(unset)` marks an added or removed key). Arrays are
+compared as whole values. Secret values are redacted by the server, so a key the
+server recorded as changed with no visible difference prints as
+`<key>: changed (values redacted)`. `--json` prints
+`{ changedKeys, changes: [{ path, kind, before, after }], redactedOnlyKeys }`.
 
 ## Skills Commands
 
