@@ -11,7 +11,7 @@ import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
 import { AsciiArtAnimation } from "@/components/AsciiArtAnimation";
 import { PaperclipLoading } from "@/components/AnimatedPaperclipIcon";
-import { ThemeToggle } from "@/components/ThemeToggle";
+import { ThemeModeSwitch } from "@/components/ThemeModeSwitch";
 import { PaperclipLockup } from "../components/PaperclipLockup";
 
 type AuthMode = "sign_in" | "sign_up";
@@ -102,7 +102,7 @@ export function AuthPage() {
   return (
     <div className="fixed inset-0 flex bg-background">
       <div className="absolute top-4 right-4 z-10">
-        <ThemeToggle />
+        <ThemeModeSwitch />
       </div>
       {/* Left half — form */}
       <div className="w-full md:w-1/2 flex flex-col overflow-y-auto">
