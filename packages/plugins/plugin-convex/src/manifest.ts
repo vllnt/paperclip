@@ -57,7 +57,7 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       reaper: {
         type: "object", additionalProperties: false, properties: {
-          enabled: { type: "boolean" }, ttlHours: { type: "integer", minimum: 1, maximum: 168 },
+          enabled: { type: "boolean" }, ttlHours: { type: "integer", minimum: 3, maximum: 168 },
           quota: { type: "integer", minimum: 1 }, alertPercent: { type: "integer", minimum: 1, maximum: 100 },
         },
       },

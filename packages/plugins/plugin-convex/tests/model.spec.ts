@@ -56,6 +56,7 @@ describe("config", () => {
     [{ grants: [{ agentId: "a", capabilities: ["env-write"], environments: ["production"] }] }, /per-call/],
     [{ grants: [{ agentId: "a", environments: ["preview"] }] }, /grants nothing/],
     [{ reaper: { ttlHours: 200 } }, /ttlHours/],
+    [{ reaper: { ttlHours: 2 } }, /ttlHours/],
     [{ guards: { maxDeletesPerRun: 0 } }, /maxDeletesPerRun/],
     [{ guards: { activityHours: 169 } }, /activityHours/],
   ])("rejects %j", (raw, message) => {

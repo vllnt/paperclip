@@ -291,8 +291,10 @@ export class ConvexService {
     }
     if (deletesSoon && actor.kind === "agent") await this.reserveRunDeletion(actor, config.guards.maxDeletesPerRun);
     await this.withCredential(config, actor.companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.setExpiry(token, name, expiresAt));
-    await this.markManaged(actor.companyId, { [name]: expiresAt });
     await this.audit(actor, "Convex preview expiry set", { ...record, outcome: "expiry-set" }, name);
+    // The expiry is set at Convex; failing to remember it only means a later redeploy will not move it, so it must not report the change as failed.
+    try { await this.markManaged(actor.companyId, { [name]: expiresAt }); }
+    catch { this.d.ctx.logger.warn("Convex managed expiry could not be recorded", { companyId: actor.companyId, deployment: name }); }
     return { dryRun: false, name, expiresAt, previousExpiresAt: target.deployment.expiresAt };
   }
 
@@ -306,11 +308,14 @@ export class ConvexService {
       await this.d.ctx.state.set(managedKey(companyId), { ...(await this.managedExpiries(companyId)), ...changes });
     });
   }
-  /** Forgets deployments that no longer exist, so the record stays as small as the preview list. */
-  pruneManaged(companyId: string, live: ReadonlySet<string>): Promise<void> {
+  /**
+   * Forgets deployments that no longer exist, so the record stays as small as the preview list. Only names that were tracked when the pass began are
+   * considered, so an expiry set during the pass for a preview created after it was listed is kept.
+   */
+  pruneManaged(companyId: string, live: ReadonlySet<string>, trackedAtStart: Iterable<string>): Promise<void> {
     return this.serialize(`managed:${companyId}`, async () => {
       const managed = await this.managedExpiries(companyId);
-      for (const name of Object.keys(managed)) if (!live.has(name)) delete managed[name];
+      for (const name of trackedAtStart) if (!live.has(name)) delete managed[name];
       await this.d.ctx.state.set(managedKey(companyId), managed);
     });
   }

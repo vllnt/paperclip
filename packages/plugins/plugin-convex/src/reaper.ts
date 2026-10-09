@@ -76,7 +76,9 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
           continue;
         }
         if (!assessment!.checked) {
-          entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: assessment!.blocked ?? "not checked" });
+          // Not checkable (no identifier, repository or token): leave it alone, except for a move to a later deadline, which deletes nothing.
+          if (extend) { entry.kept += 1; entry.setExpiry.push({ name: deployment.name, from: current, to: deadline }); }
+          else entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: assessment!.blocked ?? "not checked" });
           continue;
         }
         if (assessment!.reapReason) {
@@ -120,7 +122,8 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
     }
   }
 
-  if (!dryRun && listedAll) await service.pruneManaged(companyId, seen);
+  // Plugin bookkeeping only: nothing at Convex changes, so it also runs in a dry run.
+  if (listedAll) await service.pruneManaged(companyId, seen, Object.keys(managed));
 
   try {
     const quota = await service.quota(config, companyId, reserved);

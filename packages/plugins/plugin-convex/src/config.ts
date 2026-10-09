@@ -118,7 +118,7 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Co
     },
     reaper: {
       enabled: flag(reaper.enabled, "reaper.enabled", false),
-      ttlHours: bounded(reaper.ttlHours, "reaper.ttlHours", 36, 1, 168),
+      ttlHours: bounded(reaper.ttlHours, "reaper.ttlHours", 36, 3, 168),
       quota: bounded(reaper.quota, "reaper.quota", 300, 1, 100_000),
       alertPercent: bounded(reaper.alertPercent, "reaper.alertPercent", 80, 1, 100),
     },

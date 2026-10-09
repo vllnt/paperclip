@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { COMPANY_A, COMPANY_B, GITHUB_TOKEN, PREVIEW_KEY, PROJECT_TOKEN, TEAM_TOKEN, admin, baseConfig, member, ref, run, secretValues, setup, type Fixture } from "./fixture.js";
 import { HOUR, NOW, deployment } from "./fakes.js";
 import { newGuardCache } from "../src/preview-guard.js";
@@ -515,5 +515,51 @@ describe("round 3: secrets and dry runs", () => {
     expect(planned.error).toBeUndefined();
     expect(planned.data).toMatchObject({ dryRun: true, expiresAt: NOW + 25 * HOUR });
     expect((await expire(f, "b", 25)).error).toMatch(/limit of 1 deletions/i);
+  });
+});
+
+
+describe("round 4: reaper bookkeeping edges", () => {
+  const enabled = (extra: Record<string, unknown> = {}) => baseConfig({ reaper: { enabled: true }, ...extra });
+  const managedKey = { scopeKind: "company" as const, scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" };
+
+  it("keeps the expiry of a preview created after the pass listed its project, but drops one that was tracked at the start and is gone", async () => {
+    const f = await setup();
+    await f.h.ctx.state.set(managedKey, { gone: NOW + HOUR, tracked: NOW + HOUR, newcomer: NOW + HOUR });
+    await f.runtime.service.pruneManaged(COMPANY_A, new Set(["tracked"]), ["gone", "tracked"]);
+    expect(Object.keys(f.h.getState(managedKey) as object).sort()).toEqual(["newcomer", "tracked"]);
+  });
+
+  it("prunes tracked expiries in a dry run too, because that only touches plugin state", async () => {
+    const f = await setup();
+    await f.h.ctx.state.set(managedKey, { ghost: NOW + HOUR });
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.mutations()).toHaveLength(0);
+    expect(f.h.getState(managedKey)).toEqual({});
+  });
+
+  it("still moves its own expiry later for a preview the guard cannot check (no preview identifier)", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled() } });
+    f.convex.add(deployment("np", { previewIdentifier: null, lastDeployTime: NOW - 10 * HOUR }));
+    expect((await expire(f, "np", 30)).data.expiresAt).toBe(NOW + 30 * HOUR);
+    f.clock.now += 10 * HOUR;
+    f.convex.deployments.get("np")!.lastDeployTime = f.clock.now - HOUR;
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deployments.get("np")?.expiresAt).toBe(f.clock.now - HOUR + 36 * HOUR);
+  });
+
+  it("reports an expiry as set even if remembering it fails afterwards, and audits it first", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"));
+    const original = f.h.ctx.state.set.bind(f.h.ctx.state);
+    vi.spyOn(f.h.ctx.state, "set").mockImplementation(async (key, value) => {
+      if (key.stateKey === "managed-expiry") throw new Error("state unavailable");
+      return original(key, value);
+    });
+    const result = await expire(f, "feat-x", 48);
+    expect(result.error).toBeUndefined();
+    expect(result.data.expiresAt).toBe(NOW + 48 * HOUR);
+    expect(f.h.activity.some(item => item.metadata?.outcome === "expiry-set")).toBe(true);
+    expect(f.h.logs.some(entry => entry.level === "warn" && /managed expiry/.test(entry.message))).toBe(true);
   });
 });
