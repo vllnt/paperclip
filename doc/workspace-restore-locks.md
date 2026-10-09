@@ -23,6 +23,15 @@ the queue still does. Set `PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS` (1 second
 to 1 hour) to change that budget. Other writers, such as credential files, keep
 a 30-second budget with the same rule. A timeout still fails the run with
 `restore_lock_timeout` and the owner diagnostics below.
+
+A run that fails on this timeout ends with the error code
+`workspace_restore_lock_timeout`, not `adapter_failed`, and its result carries
+`workspaceRestoreFailure: "restore_lock_timeout"`. The server then asks for a
+bounded transient retry, as it does for other self-clearing failures. That retry
+still obeys the reconciliation guard: if the adapter had already started, so
+provider work may have run, the server does not queue a second run and an
+operator must reconcile the first. Only a timeout before any provider work, such
+as the lock for a restarted agent directory at run start, is re-queued.
 Contenders are admitted in arrival order. Each takes a ticket in
 `<hash>.lock.queue.sqlite`, and only the oldest live ticket tries the lock, so
 a newer restore cannot overtake an older one. The tickets order attempts only;
