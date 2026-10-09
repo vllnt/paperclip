@@ -1904,6 +1904,32 @@ describe("SSH run directory reaper", () => {
 
     expect(result).toMatchObject({ outcome: "removed", preserved: expect.arrayContaining([run.headRef, `${run.ns}/earlier-pass`]) });
     expect((await readFile(run.bundlePath)).equals(published)).toBe(true);
+    await expect(stat(path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("rebuilds the bundle when a computed ref moved on since an earlier pass, and keeps the superseded one", async () => {
+    const host = await startHost("SSH reaper stale tip test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const clone = await host.hostClone(run.workspace);
+    const tipA = await git(run.workspace, ["rev-parse", "HEAD"]);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["update-ref", run.headRef, tipA]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef]);
+    const earlier = await readFile(run.bundlePath);
+    await writeFile(path.join(run.workspace, "later.txt"), "later work\n");
+    await git(run.workspace, ["add", "later.txt"]);
+    await git(run.workspace, ["commit", "-q", "-m", "later work"]);
+    const tipB = await git(run.workspace, ["rev-parse", "HEAD"]);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
+    await git(clone, ["fetch", "-q", run.bundlePath, `${run.headRef}:${run.headRef}`]);
+    expect(await git(clone, ["rev-parse", run.headRef])).toBe(tipB);
+    const superseded = path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`);
+    expect((await readFile(superseded)).equals(earlier)).toBe(true);
     await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
@@ -1923,15 +1949,41 @@ describe("SSH run directory reaper", () => {
     await expect(readlink(run.bundlePath)).resolves.toBe(elsewhere);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-  it("keeps the directory when the published bundle does not hold the refs this pass computed", async () => {
+  it("replaces a published bundle that does not hold the refs this pass computed, and keeps the old one", async () => {
     const host = await startHost("SSH reaper unrelated bundle test");
     if (!host) return;
     const run = await runWithAgentCommit(host);
+    const clone = await host.hostClone(run.workspace);
+    const tip = await git(run.workspace, ["rev-parse", "HEAD"]);
     await mkdir(path.dirname(run.bundlePath), { recursive: true });
     await git(run.workspace, ["bundle", "create", run.bundlePath, "main"]);
+    const unrelated = await readFile(run.bundlePath);
 
-    await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+    await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "removed", preserved: [run.headRef] });
 
+    await git(clone, ["fetch", "-q", run.bundlePath, `${run.headRef}:${run.headRef}`]);
+    expect(await git(clone, ["rev-parse", run.headRef])).toBe(tip);
+    const superseded = path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`);
+    expect((await readFile(superseded)).equals(unrelated)).toBe(true);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the directory and the old bundle when the rebuilt bundle cannot be published", async () => {
+    const host = await startHost("SSH reaper unpublishable bundle test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const preservedDir = path.dirname(run.bundlePath);
+    await mkdir(preservedDir, { recursive: true });
+    await git(run.workspace, ["bundle", "create", run.bundlePath, "main"]);
+    const old = await readFile(run.bundlePath);
+    await chmod(preservedDir, 0o555);
+
+    try {
+      await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+    } finally {
+      await chmod(preservedDir, 0o755);
+    }
+
+    expect((await readFile(run.bundlePath)).equals(old)).toBe(true);
     expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 

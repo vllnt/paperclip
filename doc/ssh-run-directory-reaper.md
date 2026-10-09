@@ -64,8 +64,8 @@ The directory stays, with a reason in the activity entry and in the lease's
 - `worktree_dirty`: an extra worktree has uncommitted work.
 - `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
   verify; or `.git` is a link or a file; or the start commit is unknown; or a
-  bundle already at the published path is a link, is not a regular file, or does
-  not hold every ref this pass computed.
+  bundle already at the published path is a link or not a regular file, or the
+  bundle could not be replaced or still does not match this pass's refs exactly.
 - `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
   point (a bind mount on the same device included). Nothing in it is touched.
 - `rm_failed`: the removal failed. It is retried up to 5 times. A mount below the
@@ -142,13 +142,18 @@ instead of the run.
   gives the claim back, records nothing, and logs one warning per environment.
   The directory is tried again on a later sweep, so installing `timeout` on the
   worker (GNU coreutils or busybox) is enough to resume reaping.
-- **Published bundle.** `preserved/<runId>.bundle` is written once and never
-  replaced. It is saved before any deletion starts, so it is the most complete
-  copy; a later pass over a half-deleted directory would save less. A pass that
-  finds a bundle accepts it only if it is a regular file (never a link), it
-  verifies, and it holds every ref this pass computed. The refs reported are
-  the ones the bundle holds. Anything else keeps the directory
-  (`preserve_failed`) until the 30-day cleanup removes the bundle.
+- **Published bundle.** `preserved/<runId>.bundle` is saved before any deletion
+  starts. A pass that finds one never trusts it by name. It is a regular file
+  (never a link), it verifies, and it must list every ref this pass computed at
+  exactly the commit that ref has now. If so, the bundle is reused untouched.
+  If not (a ref moved on since the earlier pass, or the bundle is unrelated), the
+  pass writes a new bundle under a temporary name, verifies it, keeps the old one
+  as `<runId>.superseded.bundle` (a hard link, no copy), and renames the new one
+  into place. It then checks the same exact match again. A link or a non-regular
+  file at the path, a new bundle that does not verify, a rename that fails, or a
+  final mismatch keeps the directory (`preserve_failed`) and never deletes it.
+  The refs reported are the ones the bundle holds. The 30-day cleanup removes
+  old bundles, superseded ones included.
 - **Mounts.** Before it changes anything, the script compares the device of
   `runs/<runId>` with the device of `runs`, and asks `mountpoint` where the worker
   has it, so a bind mount on the same device is caught too. A mismatch keeps the

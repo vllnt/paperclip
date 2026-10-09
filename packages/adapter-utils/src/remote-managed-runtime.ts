@@ -172,11 +172,12 @@ const REAP_KILL_GRACE_SECONDS = 30;
  * dropped connection or a stalled caller therefore cannot leave a script
  * running past the caller's claim on the directory. A worker without
  * `timeout` is not reaped: the result is `unbounded` and nothing is changed.
- * A bundle already published for the run is never replaced: it was written
- * before any deletion started, so it is the most complete copy, and a later
- * pass may see a half-deleted worktree. It is accepted only as a regular file
- * that verifies and holds every ref this pass computed, and the refs reported
- * are the ones it holds. A run directory that is a mount point, or on another
+ * A bundle already published for the run is reused only as a regular file that
+ * verifies and lists every ref this pass computed at exactly the commit it has
+ * now. Otherwise a new bundle is verified under a temporary name, the old one
+ * is kept as `<runId>.superseded.bundle`, and the new one is renamed into
+ * place; any failure, or a final mismatch, keeps the directory. The refs
+ * reported are the ones the bundle holds. A run directory that is a mount point, or on another
  * device than `runs`, is kept as `mount_point`, and the delete stays on the
  * run directory's own filesystem.
  */
@@ -228,6 +229,8 @@ export async function reapSshRunDirectory(input: {
     'ws=workspace; list=.paperclip-reap-refs; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"',
     'kb=$(du -sk . 2>/dev/null | cut -f1); kb=${kb:-0}',
     'keep() { echo "kept $1 $kb"; exit 0; }',
+    // True when bundle $1 verifies and lists every computed ref at the commit it has now.
+    'matches() { G bundle verify "$1" >/dev/null 2>&1 || return 1; G bundle list-heads "$1" > "$list.published" 2>/dev/null || return 1; while IFS= read -r r; do want=$(G rev-parse -q --verify "$r") || return 1; grep -Fxq "$want $r" "$list.published" || return 1; done < "$list"; }',
     // A repository config the agent planted must not run commands here.
     'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
@@ -299,11 +302,21 @@ export async function reapSshRunDirectory(input: {
     '      if [ -L "./$id.bundle" ]; then exit 2; fi',
     '      if [ -e "./$id.bundle" ]; then if [ -f "./$id.bundle" ]; then exit 4; fi; exit 2; fi',
     '      mv -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle" ); pub=$?',
+    // An existing bundle is reused only when it holds every computed ref at
+    // exactly the commit computed now. Otherwise the new bundle is verified under
+    // a temporary name, the old one is kept as <id>.superseded.bundle (a hard
+    // link, so nothing is copied), and the new one is renamed into place.
+    '    if [ "$pub" = 4 ] && ! matches "$bundle"; then',
+    '      ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
+    '        mv -f -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./.$id.bundle.new" ); pub=$?',
+    '      if [ "$pub" = 0 ]; then G bundle verify "$canon/.paperclip-runtime/preserved/.$id.bundle.new" >/dev/null 2>&1 || pub=2; fi',
+    '      ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
+    '        if [ "$pub" = 0 ] && ln -f -- "./$id.bundle" "./$id.superseded.bundle" && mv -f -- "./.$id.bundle.new" "./$id.bundle"; then exit 0; fi',
+    '        rm -f -- "./.$id.bundle.new"; exit 2 ); pub=$?',
+    "    fi",
     '    rm -f .paperclip-reap.bundle',
     '    if [ "$pub" != 0 ] && [ "$pub" != 4 ]; then keep preserve_failed; fi',
-    '    G bundle verify "$bundle" >/dev/null 2>&1 || keep preserve_failed',
-    '    G bundle list-heads "$bundle" > "$list.published" 2>/dev/null || keep preserve_failed',
-    `    while IFS= read -r r; do awk -v r="$r" '$2 == r { found = 1 } END { exit !found }' "$list.published" || keep preserve_failed; done < "$list"`,
+    '    matches "$bundle" || keep preserve_failed',
     `    awk -v p="$ns/" 'index($2, p) == 1 { print $2 }' "$list.published" > "$list.held" || keep preserve_failed`,
     '    mv -f -- "$list.held" "$list"',
     '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
