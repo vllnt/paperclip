@@ -169,6 +169,90 @@ test("System tracks an OS change mid-session, and Dark stays dark when the OS fl
   await expect(page.locator("html")).toHaveClass(/\bdark\b/);
 });
 
+function collectBrowserErrors(page: Page): string[] {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(`console: ${message.text()}`);
+  });
+  return errors;
+}
+
+test("blocked storage on a light OS paints light from the first frame, never dark then light", async ({ page }) => {
+  const prefix = await createCompanyPrefix(page);
+  const errors = collectBrowserErrors(page);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(() => {
+    // Chrome with "block all cookies" throws on any `window.localStorage` access.
+    Object.defineProperty(window, "localStorage", {
+      get(): Storage {
+        throw new DOMException("The operation is insecure.", "SecurityError");
+      },
+    });
+    // The markup ships `<html class="dark">` and the boot script, which runs in <head>,
+    // settles it. Nothing paints before <body> exists, so log the class from there on.
+    const classLog: string[] = [];
+    Reflect.set(window, "__htmlClassLog", classLog);
+    new MutationObserver(() => {
+      if (!document.body) return;
+      const current = document.documentElement.className;
+      if (classLog[classLog.length - 1] !== current) classLog.push(current);
+    }).observe(document, { attributes: true, childList: true, subtree: true });
+  });
+
+  await page.goto(`/${prefix}/dashboard`);
+  await expect(page.locator("main, [role=main], #root > *").first()).toBeVisible();
+  await expectRealPageNotOnboarding(page);
+
+  const classLog: unknown = await page.evaluate(() => Reflect.get(window, "__htmlClassLog"));
+  expect(Array.isArray(classLog) && classLog.length > 0, "the probe saw the <html> element").toBe(true);
+  expect(classLog, "every <html> class from <body> creation to mount").not.toContainEqual(expect.stringMatching(/\bdark\b/));
+  await expect(page.locator("html")).not.toHaveClass(/\bdark\b/);
+  expect((await bodyColors(page)).background).toMatch(PURE_WHITE);
+  expect(errors, "page and console errors").toEqual([]);
+});
+
+for (const viewport of [
+  { name: "desktop", width: 1440, height: 900 },
+  { name: "phone", width: 390, height: 844 },
+]) {
+  test(`the signed-out /auth page offers System, Light and Dark at ${viewport.name} width`, async ({ page }) => {
+    const errors = collectBrowserErrors(page);
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.emulateMedia({ colorScheme: "dark" });
+    // The e2e server runs local_trusted, where /auth redirects away. Present the
+    // authenticated, signed-out responses; the page itself renders for real.
+    await page.route("**/api/health", (route) =>
+      route.fulfill({
+        json: { status: "ok", deploymentMode: "authenticated", deploymentExposure: "private", authReady: true, bootstrapStatus: "ready" },
+      }),
+    );
+    await page.route("**/api/auth/get-session", (route) => route.fulfill({ json: null }));
+    await page.goto("/auth");
+
+    const group = page.getByRole("radiogroup", { name: "Appearance" });
+    await expect(group).toBeVisible();
+    await expect(group.getByRole("radio")).toHaveCount(3);
+    await expect(group.locator('input[aria-label="System"]')).toBeChecked();
+    await expect(page.locator("html")).toHaveClass(/\bdark\b/);
+
+    const box = await group.boundingBox();
+    expect(box && box.x >= 0 && box.x + box.width <= viewport.width, "switch sits inside the viewport").toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+    await page.locator('label[title="Light"]').click();
+    await expect(page.locator("html")).not.toHaveClass(/\bdark\b/);
+    expect(await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY)).toBe("light");
+    expect((await bodyColors(page)).background).toMatch(PURE_WHITE);
+
+    await page.locator('label[title="System"]').click();
+    await expect(group.locator('input[aria-label="System"]')).toBeChecked();
+    await expect(page.locator("html")).toHaveClass(/\bdark\b/);
+    expect(await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY)).toBeNull();
+    expect(errors, "page and console errors").toEqual([]);
+  });
+}
+
 test("the mode switch works at a phone width through the sidebar drawer", async ({ page }) => {
   const prefix = await createCompanyPrefix(page);
   await page.setViewportSize({ width: 390, height: 844 });
