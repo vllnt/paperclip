@@ -132,4 +132,3 @@ inventory (`packages/paperclip-runner/spec/capability`) treats the MCP tools as 
 set of 42. Every tool has a fold target there, and the generated files need the external eval
 corpus (`PAPERCLIP_EVALS_ROOT`). A build that adds a tool fails the production image check.
 Dedicated agent tools should be added through that inventory, with the corpus available.
-
