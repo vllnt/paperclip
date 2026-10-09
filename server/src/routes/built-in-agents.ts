@@ -6,6 +6,8 @@ import { forbidden, notFound } from "../errors.js";
 import { accessService, instanceSettingsService, logActivity } from "../services/index.js";
 import { builtInAgentService } from "../services/built-in-agents.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
+import { collectAgentProtectedConfigChanges } from "../services/agent-self-config-authz.js";
+import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import type { BuiltInAgentState } from "../services/built-in-agents.js";
 
@@ -91,6 +93,46 @@ export function builtInAgentRoutes(db: Db) {
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
+  /**
+   * Provisioning an existing built-in agent applies the caller's adapter type,
+   * adapter config, and budget to it. `agents:create` does not cover that, so
+   * an agent caller must hold `agents:configure` for the target to change a
+   * protected field this way, as it must on `PATCH /agents/:id`.
+   */
+  async function assertAgentCallerMayProvisionProtectedFields(
+    req: Request,
+    companyId: string,
+    key: string,
+    body: { adapterType?: string; adapterConfig?: Record<string, unknown>; budgetMonthlyCents?: number },
+  ) {
+    if (req.actor.type !== "agent") return;
+    if (body.adapterType === undefined && body.adapterConfig === undefined && body.budgetMonthlyCents === undefined) return;
+    const existing = (await svc.get(companyId, key)).agent;
+    if (!existing) return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target: existing,
+      fields: collectAgentProtectedConfigChanges(existing, {
+        adapterType: body.adapterType ?? existing.adapterType,
+        adapterConfig: body.adapterConfig ?? existing.adapterConfig,
+        runtimeConfig: existing.runtimeConfig,
+        budgetMonthlyCents: body.budgetMonthlyCents ?? existing.budgetMonthlyCents,
+      }),
+      surface: "built_in_provision",
+      details: { builtInAgentKey: key },
+    });
   }
 
   async function assertCanControlBuiltInRoutine(req: Request, companyId: string) {
@@ -185,6 +227,7 @@ export function builtInAgentRoutes(db: Db) {
       const key = req.params.key as string;
       await assertBuiltInAgentsEnabled();
       await assertCanProvisionBuiltInAgents(req, companyId);
+      await assertAgentCallerMayProvisionProtectedFields(req, companyId, key, req.body);
       const actor = getActorInfo(req);
       const result = await svc.provision(companyId, key, req.body, {
         requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
