@@ -1172,6 +1172,27 @@ describe("staging files left behind by a killed merge", () => {
     expect((await lstat(link)).isSymbolicLink()).toBe(true);
   });
 
+  it.skipIf(process.platform === "win32")("never cleans through a symlinked ancestor that points outside the workspace", async () => {
+    const { root, target, source } = await workspace();
+    const outside = path.join(root, "outside");
+    await mkdir(path.join(outside, "b"), { recursive: true });
+    await writeFile(path.join(outside, "b", "real.txt"), "outside file\n");
+    const externalStale = await leftover(path.join(outside, "b"), 2 * HOUR_MS);
+    await symlink(outside, path.join(target, "a"));
+    const baseline = await captureDirectorySnapshot(target);
+    // The run's copy has a real directory `a` whose child `b` is now a file.
+    await mkdir(path.join(source, "a"), { recursive: true });
+    await fsPromises.cp(path.join(target, "tests"), path.join(source, "tests"), { recursive: true });
+    await writeFile(path.join(source, "keep.txt"), "keep\n");
+    await writeFile(path.join(source, "a", "b"), "now a file\n");
+
+    await expect(mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target }))
+      .rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT" });
+
+    expect(await readFile(externalStale, "utf8")).toBe("half a copy\n");
+    expect(await readFile(path.join(outside, "b", "real.txt"), "utf8")).toBe("outside file\n");
+  });
+
   it("removes a stale leftover when a file replaces its directory", async () => {
     const { root, target, source } = await workspace();
     const stale = await leftover(path.join(target, "tests"), 2 * HOUR_MS);

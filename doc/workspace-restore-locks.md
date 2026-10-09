@@ -58,7 +58,10 @@ its directory non-empty after the run deleted that directory. When a merge
 removes or replaces a directory and finds it non-empty, it deletes the staging
 files directly inside it and retries once. It deletes only a regular file owned
 by the server's user, older than 15 minutes, found by `lstat` and never through
-a link, and it never recurses. A directory that holds anything else stays.
+a link, and it never recurses. It first checks every directory from the
+workspace root down with `lstat` and refuses a path that has a link or a
+non-directory in it, then checks that the resolved path stays under the root, so
+a link inside the workspace cannot lead the cleanup to a directory outside it. A directory that holds anything else stays.
 
 This uses the same built-in `node:sqlite` dependency as workspace manifests.
 See [SQLite file locking](https://www.sqlite.org/lockingv3.html) for the reserved

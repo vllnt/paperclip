@@ -708,7 +708,7 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   if (entry.kind === "symlink") {
-    await removeReplacedEntry(targetPath);
+    await removeReplacedEntry(targetDir, relative);
     await fs.symlink(entry.target, targetPath);
     return;
   }
@@ -723,7 +723,7 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
     const existing = await fs.lstat(targetPath).catch(() => null);
-    if (existing?.isDirectory()) await removeReplacedEntry(targetPath);
+    if (existing?.isDirectory()) await removeReplacedEntry(targetDir, relative);
     await fs.rename(temporary, targetPath);
   } finally { await fs.rm(temporary, { force: true }); }
 
@@ -737,12 +737,32 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
 // a nested repository this merge does not own.
 const STALE_STAGING_MIN_AGE_MS = 15 * 60_000;
 
-/** Removes stale staging files directly inside `directory`; returns how many.
- * It lstat()s every candidate and removes only a regular file owned by this
- * user, so it never follows or removes a link, and never recurses. */
-async function removeStaleStagingFiles(directory: string): Promise<number> {
-  const parent = await fs.lstat(directory).catch(() => null);
-  if (!parent?.isDirectory()) return 0;
+// `root/relative` as a directory path, only when no component from `root` down
+// is a link or a non-directory and the path still resolves under `root`. The
+// per-component `lstat` does not follow links; `readdir` and `lstat` on a joined
+// path would follow a link in the middle, which could point outside the
+// workspace. The `realpath` check is a second, independent guard.
+async function directoryWithoutLinks(root: string, relative: string): Promise<string | null> {
+  if (relative && !isSafeSnapshotRelativePath(relative)) return null;
+  let current = root;
+  for (const segment of ["", ...(relative ? relative.split("/") : [])]) {
+    current = segment ? path.join(current, segment) : current;
+    const stats = await fs.lstat(current).catch(() => null);
+    if (!stats?.isDirectory()) return null;
+  }
+  const [realRoot, realCurrent] = await Promise.all([fs.realpath(root), fs.realpath(current)]).catch(() => [null, null]);
+  if (!realRoot || !realCurrent) return null;
+  const inside = path.relative(realRoot, realCurrent);
+  return inside === relative.split("/").join(path.sep) || (!relative && inside === "") ? current : null;
+}
+
+/** Removes stale staging files directly inside `root/relative`; returns how
+ * many. It refuses a path with a link in it, and removes only a regular file
+ * owned by this user, so it never follows or removes a link, and never
+ * recurses. */
+async function removeStaleStagingFiles(root: string, relative: string): Promise<number> {
+  const directory = await directoryWithoutLinks(root, relative);
+  if (!directory) return 0;
   const uid = process.getuid?.();
   let removed = 0;
   for (const name of await fs.readdir(directory).catch(() => [])) {
@@ -760,11 +780,12 @@ async function removeStaleStagingFiles(directory: string): Promise<number> {
 // Removes an empty directory. When stale staging files kept it non-empty it
 // removes them and retries once; a directory that still holds anything else is
 // reported as ENOTEMPTY, never emptied.
-async function removeDirectoryDroppingStaleStaging(directory: string): Promise<void> {
+async function removeDirectoryDroppingStaleStaging(root: string, relative: string): Promise<void> {
+  const directory = path.join(root, relative);
   try {
     await fs.rmdir(directory);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || await removeStaleStagingFiles(directory) === 0) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || await removeStaleStagingFiles(root, relative) === 0) throw error;
     await fs.rmdir(directory);
   }
 }
@@ -773,9 +794,10 @@ async function removeDirectoryDroppingStaleStaging(directory: string): Promise<v
 // merge has already deleted the unchanged entries it owns there, and
 // `blockedDirectoryReplacements` refused anything else, so a non-empty
 // directory here means content appeared concurrently and must not be lost.
-async function removeReplacedEntry(targetPath: string): Promise<void> {
+async function removeReplacedEntry(targetDir: string, relative: string): Promise<void> {
+  const targetPath = path.join(targetDir, relative);
   const existing = await fs.lstat(targetPath).catch(() => null);
-  if (existing?.isDirectory()) await removeDirectoryDroppingStaleStaging(targetPath);
+  if (existing?.isDirectory()) await removeDirectoryDroppingStaleStaging(targetDir, relative);
   else await fs.rm(targetPath, { force: true });
 }
 
@@ -788,7 +810,7 @@ async function blockedDirectoryReplacements(
 ): Promise<string[]> {
   const ignored = workspacePathMatcher(baseline.ignoredPaths);
   const holdsUnownedEntry = async (relative: string): Promise<boolean> => {
-    await removeStaleStagingFiles(path.join(targetDir, relative));
+    await removeStaleStagingFiles(targetDir, relative);
     for (const name of await fs.readdir(path.join(targetDir, relative))) {
       const child = path.posix.join(relative, name);
       const owned = baseline.entries.get(child);
@@ -966,7 +988,7 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         // Reverse path order visits descendants before their parent directory.
         for (const [relative, entry] of orderedEntries(input.baseline, true)) {
-          if (entry.kind === "dir" && !source.entries.has(relative)) await removeDirectoryDroppingStaleStaging(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
+          if (entry.kind === "dir" && !source.entries.has(relative)) await removeDirectoryDroppingStaleStaging(canonicalTargetDir, relative).catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
           });
         }
