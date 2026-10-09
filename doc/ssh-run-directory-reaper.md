@@ -63,8 +63,15 @@ The directory stays, with a reason in the activity entry and in the lease's
 - `not_git_backed`: no marker and not a git repository, so nothing can be saved.
 - `worktree_dirty`: an extra worktree has uncommitted work.
 - `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
-  verify; or `.git` is a link or a file; or the start commit is unknown.
-- `rm_failed`: the removal failed. It is retried up to 5 times.
+  verify; or `.git` is a link or a file; or the start commit is unknown; or a
+  bundle already at the published path is a link, is not a regular file, or does
+  not hold every ref this pass computed.
+- `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
+  point (a bind mount on the same device included). Nothing in it is touched.
+- `rm_failed`: the removal failed. It is retried up to 5 times. A mount below the
+  run directory ends here too: the delete stays on the run directory's own
+  filesystem (`find -xdev`), so the mounted contents are left and the mount point
+  itself cannot be removed.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
 - `root_mismatch`: the root recorded on the lease is not the root the environment
   is configured with now (or the lease did not record that root), or it is too
@@ -130,21 +137,28 @@ instead of the run.
 - **Time limit.** The worker script runs under `timeout` with the same limit as
   the SSH call (10 minutes, plus a 30 second kill grace). A dropped connection
   or a frozen server therefore cannot leave a script running once its claim is
-  stale (15 minutes after the last renewal). A worker without `timeout` runs the
-  script unbounded.
+  stale (15 minutes after the last renewal). A worker without `timeout` is not
+  reaped: the script reports `unbounded` before it changes anything, the server
+  gives the claim back, records nothing, and logs one warning per environment.
+  The directory is tried again on a later sweep, so installing `timeout` on the
+  worker (GNU coreutils or busybox) is enough to resume reaping.
 - **Published bundle.** `preserved/<runId>.bundle` is written once and never
   replaced. It is saved before any deletion starts, so it is the most complete
   copy; a later pass over a half-deleted directory would save less. A pass that
-  finds a bundle verifies it and reports the refs it computed, which can differ
-  from the bundle's contents when the first pass saw a different state. A bundle
-  that fails verification keeps the directory (`preserve_failed`) until the
-  30-day cleanup removes it.
-- **Residual.** On a worker without `timeout`, a server frozen for more than
-  15 minutes after it sent the delete can lose its claim while the command still
-  runs. Then two reapers may delete one directory of a finished run, though the
-  second can no longer replace the saved bundle. The run id is never prepared
-  again (a retry gets a new id), so nothing live is under it; closing this fully
-  means renaming the directory on the worker before deleting it.
+  finds a bundle accepts it only if it is a regular file (never a link), it
+  verifies, and it holds every ref this pass computed. The refs reported are
+  the ones the bundle holds. Anything else keeps the directory
+  (`preserve_failed`) until the 30-day cleanup removes the bundle.
+- **Mounts.** Before it changes anything, the script compares the device of
+  `runs/<runId>` with the device of `runs`, and asks `mountpoint` where the worker
+  has it, so a bind mount on the same device is caught too. A mismatch keeps the
+  directory as `mount_point`. A worker where `stat` gives no device id is
+  treated the same way. The delete itself never crosses a filesystem boundary.
+- **Residual.** A server frozen for more than 15 minutes after it sent the delete
+  cannot leave a script running, because the worker stops it at its time limit.
+  The run id is never prepared again (a retry gets a new id), so nothing live is
+  under the directory. Renaming it on the worker before deleting it would still
+  close the last gap fully.
 
 On the worker, the script resolves the root once, then enters `runs/<runId>`
 and compares the physical path (`pwd -P`) with the expected one. Everything after

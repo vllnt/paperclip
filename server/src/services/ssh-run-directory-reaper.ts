@@ -32,6 +32,9 @@ const SWEEP_TIME_BUDGET_MS = 4 * 60 * 1000;
 // Older leases are history: their directories were reaped or are decided.
 const SWEEP_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_REMOVAL_ATTEMPTS = 5;
+
+/** Environments already reported as having a worker without `timeout`, so the log says it once. */
+const environmentsWithoutTimeout = new Set<string>();
 // A claim whose owner has not renewed it for a whole removal plus slack belongs
 // to a server that died or stalled.
 const REAP_CLAIM_STALE_MS = REAP_TIMEOUT_MS + 5 * 60 * 1000;
@@ -446,6 +449,18 @@ async function recordResult(
     logger.warn({ leaseId: lease.id, runId }, "dropped the outcome of a finished SSH run directory removal: its claim was taken over");
     return false;
   };
+  if (result.outcome === "unbounded") {
+    await releaseClaim(db, lease, claim.owner);
+    const environmentKey = lease.environmentId ?? lease.id;
+    if (!environmentsWithoutTimeout.has(environmentKey)) {
+      environmentsWithoutTimeout.add(environmentKey);
+      logger.warn(
+        { environmentId: lease.environmentId },
+        "did not remove finished SSH run directories: the worker has no timeout command to bound the removal script",
+      );
+    }
+    return SKIPPED;
+  }
   if (result.outcome === "absent") {
     if (!await record({ state: "absent", at, trigger: context.trigger })) return SKIPPED;
     return { outcome: "absent", bytesFreed: 0 };

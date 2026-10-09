@@ -1881,21 +1881,86 @@ describe("SSH run directory reaper", () => {
     expect(await git(run.workspace, ["rev-parse", "agent/work"])).toMatch(/^[0-9a-f]{40}$/);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-  it("keeps a bundle that an earlier reap already published for the run", async () => {
+  async function runWithAgentCommit(host: NonNullable<Awaited<ReturnType<typeof startHost>>>) {
+    const run = await host.gitRun();
+    await writeFile(path.join(run.workspace, "agent.txt"), "agent commit\n");
+    await git(run.workspace, ["add", "agent.txt"]);
+    await git(run.workspace, ["commit", "-q", "-m", "agent work"]);
+    const ns = `refs/paperclip/preserved/${run.runId}`;
+    return { ...run, ns, headRef: `${ns}/head`, bundlePath: host.preservedBundle(run.runId) };
+  }
+
+  it("keeps a bundle that an earlier reap published, and reports the refs that bundle holds", async () => {
     const host = await startHost("SSH reaper existing bundle test");
     if (!host) return;
-    const run = await host.gitRun();
-    const bundlePath = host.preservedBundle(run.runId);
-    await mkdir(path.dirname(bundlePath), { recursive: true });
-    await git(run.workspace, ["bundle", "create", bundlePath, "main"]);
-    const published = await readFile(bundlePath);
-    await writeFile(path.join(run.workspace, "half-deleted.txt"), "state of a degraded second pass\n");
+    const run = await runWithAgentCommit(host);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["update-ref", run.headRef, "HEAD"]);
+    await git(run.workspace, ["update-ref", `${run.ns}/earlier-pass`, "HEAD"]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef, `${run.ns}/earlier-pass`]);
+    const published = await readFile(run.bundlePath);
 
     const result = await host.reap(run.runId);
 
-    expect(result.outcome).toBe("removed");
-    expect((await readFile(bundlePath)).equals(published)).toBe(true);
+    expect(result).toMatchObject({ outcome: "removed", preserved: expect.arrayContaining([run.headRef, `${run.ns}/earlier-pass`]) });
+    expect((await readFile(run.bundlePath)).equals(published)).toBe(true);
     await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the directory when the published bundle is a symlink, and does not trust what it points to", async () => {
+    const host = await startHost("SSH reaper symlinked bundle test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const elsewhere = path.join(host.rootDir, "unrelated.bundle");
+    await git(run.workspace, ["bundle", "create", elsewhere, "main"]);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await symlink(elsewhere, run.bundlePath);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+    expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+    await expect(readlink(run.bundlePath)).resolves.toBe(elsewhere);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the directory when the published bundle does not hold the refs this pass computed", async () => {
+    const host = await startHost("SSH reaper unrelated bundle test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["bundle", "create", run.bundlePath, "main"]);
+
+    await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+
+    expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("does not reap on a worker without timeout, because the script would be unbounded", async () => {
+    const host = await startHost("SSH reaper no timeout test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, testHooks: { beforeBound: "PATH=/nonexistent" },
+    });
+
+    expect(result).toEqual({ outcome: "unbounded" });
+    await expect(stat(path.join(run.runDir, "ballast.bin"))).resolves.toBeTruthy();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps a run directory that is on another device than runs, and deletes nothing in it", async () => {
+    const host = await startHost("SSH reaper mount point test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+    const otherDevice = "stat() { for a; do last=$a; done; if [ \"$last\" = . ]; then echo 11; else echo 22; fi; }";
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, testHooks: { afterConfine: otherDevice },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "mount_point" });
+    await expect(stat(path.join(run.runDir, "ballast.bin"))).resolves.toBeTruthy();
+    await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("stops the worker script at its time limit, so it cannot outlive the claim that started it", async () => {

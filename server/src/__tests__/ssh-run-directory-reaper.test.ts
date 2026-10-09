@@ -616,4 +616,20 @@ describeReaper("SSH run directory reaper", () => {
     await sshRunDirectoryReaperService(db, { clock: clock.now }).sweep({ readDiskUsagePercent: async () => 10 });
     expect(await exists(run.runDir)).toBe(false);
   }, 60_000);
+
+  it("gives the claim back and records nothing when the worker has no timeout command, so a later pass can remove the directory", async () => {
+    const run = await releasedRun("failed");
+    const withoutTimeout = sshRunDirectoryReaperService(db, {
+      hooks: { reapRemote: async () => ({ outcome: "unbounded" }) },
+    });
+
+    await withoutTimeout.reapReleasedLease(environment, run.lease);
+
+    expect((await leaseMetadata(run.leaseId))?.sshRunDirectory).toBeUndefined();
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(0);
+
+    await sshRunDirectoryReaperService(db).reapReleasedLease(environment, run.lease);
+    expect(await exists(run.runDir)).toBe(false);
+  }, 60_000);
 });

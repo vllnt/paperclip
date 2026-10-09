@@ -130,12 +130,14 @@ export type SshRunDirectoryKeepReason =
   | "not_git_backed"
   | "worktree_dirty"
   | "preserve_failed"
+  | "mount_point"
   | "rm_failed";
 
 export type SshRunDirectoryReapResult =
   | { outcome: "removed"; bytesFreed: number; preserved: string[] }
   | { outcome: "absent" }
   | { outcome: "symlink" }
+  | { outcome: "unbounded" }
   | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number };
 
 /** Where a reaped run's preserved git state is kept, outside every `runs/<runId>`. */
@@ -169,9 +171,14 @@ const REAP_KILL_GRACE_SECONDS = 30;
  * seconds, enforced by `timeout` on the worker (with a 30 s kill grace). A
  * dropped connection or a stalled caller therefore cannot leave a script
  * running past the caller's claim on the directory. A worker without
- * `timeout` runs the script unbounded. A bundle already published for the run
- * is never replaced: it was written before any deletion started, so it is the
- * most complete copy, and a later pass may see a half-deleted worktree.
+ * `timeout` is not reaped: the result is `unbounded` and nothing is changed.
+ * A bundle already published for the run is never replaced: it was written
+ * before any deletion started, so it is the most complete copy, and a later
+ * pass may see a half-deleted worktree. It is accepted only as a regular file
+ * that verifies and holds every ref this pass computed, and the refs reported
+ * are the ones it holds. A run directory that is a mount point, or on another
+ * device than `runs`, is kept as `mount_point`, and the delete stays on the
+ * run directory's own filesystem.
  */
 export async function reapSshRunDirectory(input: {
   spec: SshConnectionConfig;
@@ -179,7 +186,7 @@ export async function reapSshRunDirectory(input: {
   runId: string;
   timeoutMs?: number;
   /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
-  testHooks?: { afterChecks?: string; afterConfine?: string };
+  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -215,6 +222,9 @@ export async function reapSshRunDirectory(input: {
     'cd "$id" 2>/dev/null || { echo absent; exit 0; }',
     'if [ "$(pwd -P)" != "$canon/.paperclip-runtime/runs/$id" ]; then echo symlink; exit 0; fi',
     ...hook(input.testHooks?.afterConfine),
+    'dev_here=$(stat -c %d . 2>/dev/null || stat -f %d . 2>/dev/null); dev_runs=$(stat -c %d .. 2>/dev/null || stat -f %d .. 2>/dev/null)',
+    'if [ -z "$dev_here" ] || [ "$dev_here" != "$dev_runs" ]; then echo "kept mount_point 0"; exit 0; fi',
+    'if command -v mountpoint >/dev/null 2>&1 && mountpoint -q . 2>/dev/null; then echo "kept mount_point 0"; exit 0; fi',
     'ws=workspace; list=.paperclip-reap-refs; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"',
     'kb=$(du -sk . 2>/dev/null | cut -f1); kb=${kb:-0}',
     'keep() { echo "kept $1 $kb"; exit 0; }',
@@ -285,19 +295,29 @@ export async function reapSshRunDirectory(input: {
     '    size=$(du -k .paperclip-reap.bundle 2>/dev/null | cut -f1); size=${size:-0}',
     `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
     '    mkdir -p "$preserved" 2>/dev/null || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
-    '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && { [ -e "./$id.bundle" ] || [ -L "./$id.bundle" ] || mv -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle"; } ) || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
+    '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
+    '      if [ -L "./$id.bundle" ]; then exit 2; fi',
+    '      if [ -e "./$id.bundle" ]; then if [ -f "./$id.bundle" ]; then exit 4; fi; exit 2; fi',
+    '      mv -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle" ); pub=$?',
     '    rm -f .paperclip-reap.bundle',
-    '    G bundle verify "$bundle" >/dev/null 2>&1 || { keep preserve_failed; }',
+    '    if [ "$pub" != 0 ] && [ "$pub" != 4 ]; then keep preserve_failed; fi',
+    '    G bundle verify "$bundle" >/dev/null 2>&1 || keep preserve_failed',
+    '    G bundle list-heads "$bundle" > "$list.published" 2>/dev/null || keep preserve_failed',
+    `    while IFS= read -r r; do awk -v r="$r" '$2 == r { found = 1 } END { exit !found }' "$list.published" || keep preserve_failed; done < "$list"`,
+    `    awk -v p="$ns/" 'index($2, p) == 1 { print $2 }' "$list.published" > "$list.held" || keep preserve_failed`,
+    '    mv -f -- "$list.held" "$list"',
     '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
     "  fi",
     "fi",
     `( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && find . -maxdepth 1 -type f -name '*.bundle' -mtime +${PRESERVED_BUNDLE_RETENTION_DAYS} -exec rm -f -- {} + ) 2>/dev/null || true`,
-    // Directories without owner rwx (a Go module cache, say) would stop rm -rf.
-    // chmod -R does not follow links.
-    'chmod -R u+rwx -- . 2>/dev/null || true',
+    // Directories without owner rwx (a Go module cache, say) would stop the
+    // delete. A per-directory chmod runs before find descends into that
+    // directory. -xdev keeps both passes on the run directory's own filesystem,
+    // so a mount below it keeps its contents (the delete fails on the mount point).
+    'find . -xdev -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null || true',
     // Empty the directory we are inside, then remove the marker, then the
     // directory itself from its parent, which must still be the real `runs`.
-    'if find . -mindepth 1 -maxdepth 1 ! -name .paperclip-restored -exec rm -rf -- {} + 2>/dev/null \\',
+    'if find . -mindepth 1 -depth -xdev ! -path ./.paperclip-restored -delete 2>/dev/null \\',
     '  && rm -f -- .paperclip-restored \\',
     '  && ( cd .. 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/runs" ] && rmdir -- "$id" 2>/dev/null ); then',
     '  echo "removed $kb"',
@@ -311,17 +331,18 @@ export async function reapSshRunDirectory(input: {
   const timeoutMs = input.timeoutMs ?? 10 * 60 * 1000;
   const script = [
     `body=${q(body)}`,
+    ...(input.testHooks?.beforeBound ? [input.testHooks.beforeBound] : []),
     `if command -v timeout >/dev/null 2>&1; then exec timeout -k ${REAP_KILL_GRACE_SECONDS} ${Math.ceil(timeoutMs / 1000)} sh -c "$body"; fi`,
-    'exec sh -c "$body"',
+    "echo unbounded",
   ].join("\n");
   const result = await runSshCommand(input.spec, script, { timeoutMs, maxBuffer: 256 * 1024 });
   const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   const preserved = lines.filter((line) => line.startsWith("preserved ")).map((line) => line.slice("preserved ".length));
   const last = lines[lines.length - 1] ?? "";
-  if (last === "absent" || last === "symlink") return { outcome: last };
+  if (last === "absent" || last === "symlink" || last === "unbounded") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed) (\d+)$/.exec(last);
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|rm_failed) (\d+)$/.exec(last);
   if (kept) return { outcome: "kept", reason: kept[1] as SshRunDirectoryKeepReason, bytes: Number(kept[2]) * 1024 };
   throw new Error("SSH run directory reap returned an unexpected result.");
 }
