@@ -19,6 +19,7 @@ import {
   releaseIssueTreeHoldSchema,
   respondIssueThreadInteractionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   restoreIssueDocumentRevisionSchema,
   updateIssueSchema,
   updateIssueWorkProductSchema,
@@ -146,6 +147,13 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+}
+
+interface IssueExecutionReconcileOptions extends BaseClientOptions {
+  outcome: string;
+  note: string;
+  expectedRunId?: string;
+  workspaceRepairNote?: string;
 }
 
 interface InteractionAcceptOptions extends BaseClientOptions {
@@ -536,6 +544,32 @@ export function registerIssueCommands(program: Command): void {
             resolutionNote: opts.resolutionNote,
           });
           const result = await ctx.api.post(apiPath`/api/issues/${issueId}/recovery-actions/resolve`, payload);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("reconcile")
+      .description("Record stopped execution outcomes and continue an issue")
+      .argument("<issueId>", "Issue ID")
+      .requiredOption("--outcome <outcome>", "done, none, or mixed")
+      .requiredOption("--note <text>", "Evidence for the observed execution outcome")
+      .option("--expected-run-id <id>", "Require this latest stopped run")
+      .option("--workspace-repair-note <text>", "Evidence that an unsafe workspace was repaired")
+      .action(async (issueId: string, opts: IssueExecutionReconcileOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = reconcileIssueExecutionSchema.parse({
+            outcome: opts.outcome,
+            note: opts.note,
+            expectedRunId: opts.expectedRunId,
+            workspaceRepairNote: opts.workspaceRepairNote,
+          });
+          const result = await ctx.api.post(apiPath`/api/issues/${issueId}/execution/reconcile`, payload);
           printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);

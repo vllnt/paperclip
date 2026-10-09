@@ -1991,6 +1991,7 @@ type IssueWakeDiagnosticsWakeRequestRow = {
   claimedAt: Date | null;
   finishedAt: Date | null;
   error: string | null;
+  payload?: Record<string, unknown> | null;
 };
 type IssueWakeDiagnosticsActivityRow = {
   action: string;
@@ -8652,6 +8653,7 @@ export function issueService(db: Db) {
           claimedAt: agentWakeupRequests.claimedAt,
           finishedAt: agentWakeupRequests.finishedAt,
           error: agentWakeupRequests.error,
+          payload: agentWakeupRequests.payload,
         })
         .from(agentWakeupRequests)
         .where(

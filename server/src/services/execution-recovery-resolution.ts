@@ -4,7 +4,7 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
   chatActions,
   environmentLeases,
@@ -130,6 +130,186 @@ export async function validateExecutionReconciliation(input: {
     exposeLowTrustRaw: false,
   });
   return run;
+}
+
+/**
+ * Record one operator decision for every stopped execution hold on an issue and
+ * hand the issue back to its current agent. The whole reconciliation is one
+ * transaction; validation happens before any hold or issue state is changed.
+ */
+export async function reconcileExecutionHolds(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  outcome: "done" | "none" | "mixed";
+  note: string;
+  expectedRunId?: string;
+  workspaceRepairNote?: string;
+  actorId: string;
+}) {
+  const actionOutcome = input.outcome === "done"
+    ? "completed"
+    : input.outcome === "none"
+      ? "not_performed"
+      : "mixed";
+
+  return input.db.transaction(async (tx) => {
+    await tx.execute(
+      sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+    );
+    const [issue] = await tx
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.id, input.issueId),
+        ),
+      )
+      .for("update");
+    if (!issue) throw conflict("Issue not found");
+    if (!issue.assigneeAgentId || ["done", "cancelled"].includes(issue.status)) {
+      throw conflict("This issue cannot continue because its owner or status changed.");
+    }
+
+    const holds = await tx
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.issueId),
+          eq(issueRecoveryActions.kind, "active_run_watchdog"),
+          inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+          sql`${issueRecoveryActions.evidence}->>'runId' is not null`,
+          inArray(issueRecoveryActions.status, ["active", "escalated", "resolved"]),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.createdAt), desc(issueRecoveryActions.id))
+      .for("update");
+    if (holds.length === 0) throw conflict("Nothing to reconcile for this issue.");
+
+    const newestRunId = holds[0]!.evidence.runId;
+    if (input.expectedRunId && input.expectedRunId !== newestRunId) {
+      throw conflict("The expected execution is stale. Refresh the recovery actions before continuing.");
+    }
+
+    const decisionFor = (runId: string): ExecutionReconciliation => ({
+      runId,
+      providerStopped: true,
+      actionOutcome,
+      outcomeEvidence: input.note,
+      ...(input.workspaceRepairNote
+        ? { workspaceRepairEvidence: input.workspaceRepairNote }
+        : {}),
+    });
+
+    // Validate every source before writing any reconciliation evidence. A live
+    // process, unreleased lease, coordinator, or ownership change rolls back
+    // the complete request instead of leaving a partially reconciled issue.
+    for (const hold of holds) {
+      const runId = hold.evidence.runId;
+      if (typeof runId !== "string") {
+        throw conflict("A recovery hold is missing its source execution.");
+      }
+      await validateExecutionReconciliation({
+        db: tx as unknown as Db,
+        companyId: input.companyId,
+        issueId: input.issueId,
+        agentId: issue.assigneeAgentId,
+        sourceRunId: runId,
+        decision: decisionFor(runId),
+      });
+    }
+
+    const now = new Date();
+    const [updatedIssue] = await tx
+      .update(issues)
+      .set({
+        status: "todo",
+        executionRunId: null,
+        checkoutRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: now,
+      })
+      .where(
+        and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)),
+      )
+      .returning();
+    if (!updatedIssue) throw conflict("Issue changed while reconciling its execution.");
+
+    const reconciledRunIds: string[] = [];
+    const recoveryActionIds: string[] = [];
+    for (const [index, hold] of holds.entries()) {
+      const runId = hold.evidence.runId as string;
+      const decision = decisionFor(runId);
+      await tx
+        .update(nativeRunFinalizations)
+        .set({
+          failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "operator_reconciled" })}::jsonb`,
+        })
+        .where(
+          and(
+            eq(nativeRunFinalizations.companyId, input.companyId),
+            eq(nativeRunFinalizations.runId, runId),
+          ),
+        );
+      await tx
+        .update(issueRecoveryActions)
+        .set({
+          status: "resolved",
+          outcome: "restored",
+          resolutionNote: input.note,
+          resolvedAt: now,
+          updatedAt: now,
+          evidence: {
+            ...hold.evidence,
+            automaticRecovery: undefined,
+            executionReconciliation: {
+              ...decision,
+              actorId: input.actorId,
+              recordedAt: now.toISOString(),
+            },
+            continuationDelivery: index === 0 ? "pending" : "superseded",
+          },
+        })
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, input.companyId),
+            eq(issueRecoveryActions.id, hold.id),
+          ),
+        );
+      reconciledRunIds.push(runId);
+      recoveryActionIds.push(hold.id);
+    }
+
+    await persistActivity(tx as unknown as Db, {
+      companyId: input.companyId,
+      actorType: "user",
+      actorId: input.actorId,
+      action: "issue.execution_reconciled",
+      entityType: "issue",
+      entityId: input.issueId,
+      details: {
+        outcome: input.outcome,
+        actionOutcome,
+        holdsCount: holds.length,
+        reconciledRunIds: [...reconciledRunIds].reverse(),
+        recoveryActionIds: [...recoveryActionIds].reverse(),
+      },
+    });
+
+    return {
+      issue: updatedIssue,
+      agentId: issue.assigneeAgentId,
+      reconciledRunIds,
+      recoveryActionIds,
+      continuationActionId: holds[0]!.id,
+      continuationRunId: newestRunId,
+    };
+  });
 }
 
 /** Durable delivery marker lives on the existing source-scoped recovery action. */

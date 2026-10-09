@@ -2086,6 +2086,14 @@ export function agentRoutes(
       status: "skipped" as const, reason: "execution_reconciliation_required",
       message: blocker.nextAction, issueId,
       executionRunId: blocker.runId, executionAgentId: blocker.agentId, executionAgentName: null,
+      recoveryActionId: blocker.recoveryActionId,
+      runId: blocker.runId,
+      nextAction: {
+        actor: "board" as const,
+        method: "POST" as const,
+        path: `/api/issues/${issueId}/execution/reconcile`,
+        cli: `paperclipai issue reconcile ${issueId}`,
+      },
     };
 
     if (!issue?.executionRunId) {
