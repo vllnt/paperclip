@@ -63,6 +63,11 @@ whole `companyFocus` holds at most about 30,000 characters of text. JSON escapin
 longer for text full of quotes or control characters, and only the board writes that text. A
 goal title can be at most 2,000 characters, the length of a company mission.
 
+The task's own `goal` block in the heartbeat context is cut the same way: its title and
+`successCriteria` are at most 280 characters. Agents may still edit ordinary goals, including the
+company's default goal that tasks with no goal and no project show, so this cut keeps any goal
+text an agent writes short in every other agent's context.
+
 The guidance tells agents to work the focus first, finish and land work in review before
 starting new work, and ask the board through an approval if the focus needs more agents, runs
 or budget. Agents never change their own limits.

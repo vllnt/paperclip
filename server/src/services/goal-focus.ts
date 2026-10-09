@@ -18,8 +18,8 @@ type GoalRow = typeof goals.$inferSelect;
 
 const MAX_FOCUS_GOALS = 10;
 const MAX_MILESTONES_PER_GOAL = 5;
-/** Agents read the focus on every run, so free text in it stays short. */
-const MAX_FOCUS_TEXT = 280;
+/** Agents read goal text in every run's context, so each piece stays short. */
+const MAX_AGENT_CONTEXT_TEXT = 280;
 /** Focus is advice, so a slow read gives up rather than delay an agent's run or inbox. */
 const FOCUS_READ_TIMEOUT_MS = 500;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -51,13 +51,14 @@ function daysUntil(targetDate: string | null, now: Date): number | null {
   return Math.round((Date.parse(`${targetDate}T00:00:00Z`) - today) / DAY_MS);
 }
 
-function truncateText(value: string): string {
-  if (value.length <= MAX_FOCUS_TEXT) return value;
-  return `${value.slice(0, MAX_FOCUS_TEXT - 1)}…`;
+/** The one cut for every goal text that reaches an agent's run context. */
+function capAgentContextText(value: string): string {
+  if (value.length <= MAX_AGENT_CONTEXT_TEXT) return value;
+  return `${value.slice(0, MAX_AGENT_CONTEXT_TEXT - 1)}…`;
 }
 
-function truncateOptionalText(value: string | null): string | null {
-  return value === null ? null : truncateText(value);
+function capOptionalAgentContextText(value: string | null): string | null {
+  return value === null ? null : capAgentContextText(value);
 }
 
 /** The focus goals, nearest target date first, capped so the index and the list always agree. */
@@ -149,12 +150,12 @@ export function goalFocusService(db: Db, options: { now?: () => Date } = {}) {
       guidance: COMPANY_FOCUS_GUIDANCE,
       goals: focusGoals.map((goal): CompanyFocusGoal => ({
         id: goal.id,
-        title: truncateText(goal.title),
+        title: capAgentContextText(goal.title),
         kind: goal.kind,
         level: isGoalLevel(goal.level) ? goal.level : "task",
         targetDate: goal.targetDate,
         daysLeft: daysUntil(goal.targetDate, today),
-        successCriteria: truncateOptionalText(goal.successCriteria),
+        successCriteria: capOptionalAgentContextText(goal.successCriteria),
         ownerAgentId: goal.ownerAgentId,
         progress: rollUp(goal.id, children, counts),
         milestones: (children.get(goal.id) ?? [])
@@ -163,7 +164,7 @@ export function goalFocusService(db: Db, options: { now?: () => Date } = {}) {
           .slice(0, MAX_MILESTONES_PER_GOAL)
           .map((milestone) => ({
             id: milestone.id,
-            title: truncateText(milestone.title),
+            title: capAgentContextText(milestone.title),
             status: isGoalStatus(milestone.status) ? milestone.status : "planned",
             targetDate: milestone.targetDate,
             daysLeft: daysUntil(milestone.targetDate, today),
@@ -208,19 +209,27 @@ export function goalFocusService(db: Db, options: { now?: () => Date } = {}) {
   };
 }
 
+/** A task's goal as its heartbeat context shows it. */
+export type HeartbeatContextGoal = Pick<GoalRow, "id" | "title" | "status" | "level" | "parentId">
+  & Partial<Pick<GoalRow, "kind" | "horizon" | "targetDate" | "successCriteria">>;
+
 /**
- * The planning fields of a task's goal for its heartbeat context, each only when set, so a goal
- * without planning reads exactly as it did before goals had these fields. A missing field counts
- * as unset.
+ * A task's goal for its heartbeat context. The title and success criteria are cut like the focus,
+ * because agents may write ordinary goals, such as the company's default goal, that every agent
+ * then reads. Planning fields appear only when set, so a goal without planning reads as it did
+ * before goals had them; a missing field counts as unset.
  */
-export function goalPlanningFields(
-  goal: Partial<Pick<GoalRow, "kind" | "horizon" | "targetDate" | "successCriteria">>,
-): Partial<Pick<GoalRow, "kind" | "horizon" | "targetDate" | "successCriteria">> {
+export function heartbeatContextGoal(goal: HeartbeatContextGoal): HeartbeatContextGoal {
   return {
+    id: goal.id,
+    title: capAgentContextText(goal.title),
+    status: goal.status,
+    level: goal.level,
+    parentId: goal.parentId,
     ...(goal.kind === "milestone" ? { kind: goal.kind } : {}),
     ...(goal.horizon != null ? { horizon: goal.horizon } : {}),
     ...(goal.targetDate != null ? { targetDate: goal.targetDate } : {}),
-    ...(goal.successCriteria != null ? { successCriteria: truncateText(goal.successCriteria) } : {}),
+    ...(goal.successCriteria != null ? { successCriteria: capAgentContextText(goal.successCriteria) } : {}),
   };
 }
 
