@@ -223,10 +223,19 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     companyId: string,
     agentId: string,
     issueId: string,
-    input: { ageMs: number; reason?: string },
+    input: {
+      ageMs: number;
+      reason?: string;
+      /** Comment ids a comment-driven wake carries, oldest first. */
+      commentIds?: string[];
+      actor?: { type: "agent" | "user" | "system"; id: string };
+    },
   ) {
     const at = new Date(Date.now() - input.ageMs);
     const wakeReason = input.reason ?? SEEDED_WAKE_REASON;
+    const commentIds = input.commentIds ?? [];
+    const latestCommentId = commentIds.at(-1);
+    const actor = input.actor ?? { type: "system" as const, id: "seed" };
     const [wake] = await db
       .insert(agentWakeupRequests)
       .values({
@@ -238,15 +247,32 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
         status: "deferred_issue_execution",
         payload: {
           issueId,
-          _paperclipWakeContext: { issueId, taskId: issueId, wakeReason },
+          ...(latestCommentId ? { commentId: latestCommentId } : {}),
+          _paperclipWakeContext: {
+            issueId,
+            taskId: issueId,
+            wakeReason,
+            ...(latestCommentId
+              ? { wakeCommentId: latestCommentId, commentId: latestCommentId, wakeCommentIds: commentIds }
+              : {}),
+          },
         },
-        requestedByActorType: "system",
-        requestedByActorId: "seed",
+        requestedByActorType: actor.type,
+        requestedByActorId: actor.id,
         requestedAt: at,
         createdAt: at,
         updatedAt: at,
       })
       .returning();
+    // Admission inserts these rows with the column default now(), which keeps
+    // microseconds; a JavaScript Date does not. Seed the sub-millisecond part so
+    // the optimistic claim is tested against real stored precision.
+    await db.execute(sql`
+      update agent_wakeup_requests
+      set requested_at = requested_at + interval '321 microseconds',
+          updated_at = updated_at + interval '321 microseconds'
+      where id = ${wake!.id}
+    `);
     return wake!.id;
   }
 
@@ -271,9 +297,9 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
    * comment legitimately gets a `missing_issue_comment` follow-up from the
    * liveness check, so duplicates are counted by the seeded wake reason.
    */
-  async function runsForSeededWake(issueId: string) {
+  async function runsForSeededWake(issueId: string, wakeReason: string = SEEDED_WAKE_REASON) {
     return (await runsForIssue(issueId)).filter(
-      (run) => (run.contextSnapshot as Record<string, unknown> | null)?.wakeReason === SEEDED_WAKE_REASON,
+      (run) => (run.contextSnapshot as Record<string, unknown> | null)?.wakeReason === wakeReason,
     );
   }
 
@@ -356,6 +382,43 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     const reviewerRuns = (await runsForSeededWake(issueId)).filter((run) => run.agentId === reviewerId);
     expect(reviewerRuns).toHaveLength(1);
     expect(reviewerRuns[0]).toMatchObject({ status: "succeeded" });
+  });
+
+  it("re-delivers a comment-driven wake from another agent, with and without a finished run to anchor to", async () => {
+    const companyId = await seedCompany();
+    const reviewerId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
+    const authorId = await seedAgent(companyId, { name: "Author", maxConcurrentRuns: 3 });
+    const wakeReason = "issue_commented";
+
+    const seedCommentWake = async (title: string, withFinishedRun: boolean) => {
+      const issueId = await seedIssue(companyId, { assigneeAgentId: reviewerId, title, priority: "critical" });
+      if (withFinishedRun) await seedRun(companyId, reviewerId, issueId, { status: "succeeded" });
+      const [comment] = await db
+        .insert(issueComments)
+        .values({ companyId, issueId, authorAgentId: authorId, body: "The pull request is ready for review." })
+        .returning();
+      const wakeId = await seedDeferredWake(companyId, reviewerId, issueId, {
+        ageMs: 30 * MINUTE_MS,
+        reason: wakeReason,
+        commentIds: [comment!.id],
+        actor: { type: "agent", id: authorId },
+      });
+      return { issueId, wakeId };
+    };
+    const anchored = await seedCommentWake("Has a finished run", true);
+    const anchorless = await seedCommentWake("Never ran", false);
+
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    for (const { issueId, wakeId } of [anchored, anchorless]) {
+      const wake = await wakeRow(wakeId);
+      expect(wake.status).not.toBe("deferred_issue_execution");
+      const runs = await runsForSeededWake(issueId, wakeReason);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ agentId: reviewerId, status: "succeeded" });
+      expect(wake.runId).toBe(runs[0]!.id);
+    }
   });
 
   it("re-delivers a wake deferred behind a workspace-busy retry that never produced a run", async () => {

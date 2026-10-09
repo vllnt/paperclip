@@ -101,6 +101,11 @@ export async function listOrphanedDeferredWakes(
  * pass that saw the row's current `updated_at`, so two concurrent passes cannot
  * both drive the same wake. It also moves the wake to the back of the recheck
  * window, so one wake that stays held cannot be re-read on every tick.
+ *
+ * The observed value is a JavaScript `Date`, which keeps milliseconds. A row
+ * inserted with the column default `now()` keeps microseconds, so an exact
+ * comparison would never match it. The stored value is truncated to milliseconds
+ * for the comparison.
  */
 export async function claimDeferredWakeExamination(
   db: Db,
@@ -114,7 +119,7 @@ export async function claimDeferredWakeExamination(
         eq(agentWakeupRequests.id, input.wakeId),
         eq(agentWakeupRequests.companyId, input.companyId),
         eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
-        eq(agentWakeupRequests.updatedAt, input.observedUpdatedAt),
+        sql`date_trunc('milliseconds', ${agentWakeupRequests.updatedAt}) = ${input.observedUpdatedAt.toISOString()}::timestamptz`,
       ),
     )
     .returning({ id: agentWakeupRequests.id });
