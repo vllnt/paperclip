@@ -1,6 +1,6 @@
 # Web app performance: baseline, bottlenecks, targets
 
-Status: Phase 1 (measure) complete on 2026-10-09 at `a91d77cc4`. Phase 2 (small PRs, each with before/after numbers) not started.
+Status: Phase 1 (measure) complete on 2026-10-09 at `a91d77cc4`. Phase 2 (small PRs, each with before/after numbers) is in progress: PRs A to D are open (section 10). Sections 1 to 9 describe the baseline and are not rewritten; section 10 holds the results.
 Scope: the board UI (`ui/`), plus the server code that serves it. No behavior or API contract changes beyond performance.
 
 ## 1. Summary
@@ -242,3 +242,61 @@ node tests/perf/web-app/bundle-report.mjs
 ```
 
 Do not measure while another build is writing `server/ui-dist`, and never point the seed script at a shared instance.
+
+## 10. Phase 2 results (2026-10-09)
+
+All numbers use the fixture and probes from section 2. "Combined" means PR C and PR D together, built and measured on a local branch that merges both. Each cell is the median of 3 to 5 cold-cache runs. Machine load was 8 to 25 during the runs, so every comparison that mattered was repeated or interleaved with the baseline build.
+
+### 10.1 Pull requests
+
+| PR | Change | Bottleneck | Measured effect |
+|---|---|---|---|
+| #53 (A) | Issue detail polls runs and browsers fast only while a run is live or expected; run events also match the open issue by `issueId` | 1 | Idle requests per minute on an open issue: 81 to 11. Busy: 16.5 to 10.1 requests per change |
+| #54 (B) | The first socket open skips refetching instance-level queries (health, session, adapters, settings, sidebar preferences) | 3 | 5 to 7 fewer API calls per page load (settings 26 to 19, board 48 to 43) |
+| #57 (C) | `.br` and `.gz` copies of the assets are written at build time and served to clients that accept them | 2 | Entry chunk 6,549 KB to 1,306 KB on the wire. `wan` board LCP 2,736 to 1,392 ms (-49%) |
+| #68 (D) | 84 pages load as lazy route chunks; chunk groups; a build-time budget; a guarded reload for stale chunks | 5 | First-load JS 9,297 KB to 4,822 KB raw (-48%), 46 to 13 files. `wan` board LCP 2,416 to 1,642 ms (-32%) in an interleaved A/B |
+
+PR C and PR D both edit the plugin list in `ui/vite.config.ts` and the same part of `doc/DEVELOPING.md`. Whichever merges second needs a small rebase. The resolution is to keep both plugins: `bundleBudgetPlugin(...)` then `precompressAssetsPlugin()`. The merged build passes the budget and writes 353 compressed copies.
+
+### 10.2 Combined effect (C + D), against the section 3 baseline
+
+| Profile | Page | FCP | LCP | TTI | JS on the wire |
+|---|---|---|---|---|---|
+| `wan` | dashboard | 2,076 to 624 ms (-70%) | 2,732 to 876 ms (-68%) | 2,911 to 1,113 ms (-62%) | 9,094 to 1,157 KB (-87%) |
+| `wan` | tasks board | 2,088 to 664 ms (-68%) | 2,736 to 1,672 ms (-39%) | 3,054 to 2,111 ms (-31%) | |
+| `wan` | tasks list | 2,156 to 620 ms (-71%) | 3,228 to 1,120 ms (-65%) | 3,290 to 1,053 ms (-68%) | |
+| `wan` | issue, 400 comments | 2,092 to 648 ms (-69%) | 2,952 to 1,224 ms (-59%) | 6,808 to 4,751 ms (-30%) | |
+| `slow` | tasks board | 9,408 to 1,984 ms (-79%) | 9,924 to 2,604 ms (-74%) | 10,284 to 3,059 ms (-70%) | |
+| `slow` | dashboard | 9,344 to 1,816 ms (-81%) | 9,744 to 2,268 ms (-77%) | 10,066 to 2,630 ms (-74%) | |
+| `slow` | issue, 400 comments | 9,340 to 1,876 ms (-80%) | 10,280 to 3,236 ms (-69%) | 13,850 to 6,322 ms (-54%) | |
+| `desktop` | tasks board | 252 to 252 ms | 464 to 484 ms (three repeats: 468, 484, 488) | 534 to 515 ms | |
+
+### 10.3 Targets, status
+
+| Target | Baseline | Now | Status |
+|---|---|---|---|
+| LCP < 2.0 s on the board at 1,000 issues (`wan`) | 2,736 ms | 1,672 ms (C + D) | Met when C and D merge |
+| LCP stretch (`slow`) < 4,000 ms | 9,924 ms | 2,604 ms | Met when C and D merge |
+| INP < 200 ms on the board (4x CPU) | 136 ms | not re-measured after C or D (D changed the layout wrapper, not the board or its handlers) | Unverified; PR F re-measures it |
+| Initial JS -30% | 9,076 KB raw / 2,538 KB gzip | 4,822 KB raw (-48%) / 1,435 KB gzip (-45%) | Met by D alone; budget in D |
+| No idle request storms (at most 5 requests/minute) | issue detail 81/min | 11/min | Not met. The rest is a 4/min `live-runs` safety poll, a 4/min `browsers` poll and an existing 3/min `interactions` poll. A 30 s safety poll would give about 7/min; I kept 15 s until the `issueId` match has run in production |
+| At most 6 requests per change | 16.3 (board) / 16.5 (issue) | 10.1 on the issue page; the board is unchanged | Not met. Needs PR E |
+
+### 10.4 What the measurements corrected
+
+- Two promising ideas were slower and are not in the pull requests. Prefetching the busy routes when idle made TTI about 2 s worse, because importing a chunk also runs it. Starting the open page's chunk at boot, plus prefetch on hover, was worse than plain lazy routes on `wan` (board LCP -7% instead of -32%; first paint 250 ms later). Both were found only because the A/B compared three variants.
+- A single pass under load is not evidence. One desktop pass showed the board 109% slower, and an issue page 196% slower. Interleaved or repeated runs showed no change. Every claim above comes from an interleaved or repeated comparison.
+- Local Chrome uses HTTP/1.1 with 6 connections, so many small chunks look worse here than on the HTTP/2 production ingress. This is why the first chunk plan (196 initial files) was reduced to 13 even though the files were small.
+- In-app navigation to a page whose chunk is not loaded leaves the page area empty for about one round trip. React Router 7 starts navigation as a transition, so a Suspense loader does not show there. A loader keyed by route section did not change this and was removed. Most page chunks are 5 to 25 KB brotli, so the wait is short. Issue detail is about 90 KB.
+- CodeQL reported "missing rate limiting" on a first version of the compressed-asset handler, which called `stat` and `sendFile` for each request. The final version reads the list of copies once and lets `express.static` send them.
+
+### 10.5 What is left
+
+| Item | Why | Notes |
+|---|---|---|
+| E. Board: invalidate only the affected columns; reserve space for columns and cards | 10 to 16 requests and about 95 KB per change on an open board; board CLS 0.10; mobile dashboard CLS 0.38 | The baseline had no mobile profile, so the mobile dashboard shift was first measured on the PR C build; the desktop dashboard shift was 0.05 |
+| F. Memoize rows, cards and chat bubbles; keep the sidebar out of search state | Board 28k, list 154k, thread 92k renders per 11 changes | Re-measure INP in the same PR |
+| G. Trim `app-core` (about 2.3 MB raw) and the shell | `@paperclipai/shared` is about 430 KB of it; `MarkdownEditor` (380 KB) loads in the first page because the new-task dialog is in the shell | Lower `ui/bundle-budget.json` in the same PR |
+| H. The `documents/plan` probe returns 404 as a normal answer | One console error on every issue open | Small; found while verifying the other PRs |
+| I. Connectors promo: cache the image; avoid a late LCP | 187 KB `no-store` image; LCP at 3.4 s until dismissed | Small |
+| Intent prefetch (hover, focus, touch) for the busiest routes | Would remove the first-visit gap on the five busiest routes without idle cost | Needs its own A/B with real pointer input; it was not measured in isolation |
