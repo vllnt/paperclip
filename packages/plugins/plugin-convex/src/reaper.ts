@@ -1,9 +1,11 @@
 import { HOUR_MS, type ConnectionConfig, type ReaperProjectReport, type ReaperReport } from "./contracts.js";
 import { classifyDeployment } from "./classify.js";
-import { GITHUB_UNREADABLE, Refusal, type OpenPullRequestCache } from "./preview-guard.js";
+import { GITHUB_UNREADABLE, newGuardCache, Refusal } from "./preview-guard.js";
 import { isShowable, type Actor, type ConvexService, type DeletionBudget } from "./service.js";
 
 export const reportKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "reaper", stateKey: "last-report" });
+/** Expiries the reaper set itself, by deployment name. Only these follow a redeploy; an expiry a person set is never moved later. */
+const managedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "reaper", stateKey: "managed-expiry" });
 const EXPIRY_TOLERANCE_MS = 5 * 60_000;
 /** An expiry sooner than this would make Convex delete a guarded preview within the hour, so it is never scheduled. */
 const MIN_PLANNED_LEAD_MS = HOUR_MS;
@@ -30,7 +32,10 @@ export async function runReaper(service: ConvexService, companyId: string, optio
   const actor: Actor = options.actor ?? { kind: "reaper", companyId };
   const now = service.d.now();
   const budget: DeletionBudget = { left: config.guards.maxDeletesPerRun, max: config.guards.maxDeletesPerRun };
-  const openCache: OpenPullRequestCache = new Map();
+  const cache = newGuardCache();
+  const seen = new Set<string>();
+  const stored = await ctx.state.get(managedKey(companyId));
+  const managed: Record<string, number> = stored && typeof stored === "object" && !Array.isArray(stored) ? { ...(stored as Record<string, number>) } : {};
   const report: ReaperReport = { at: new Date(now).toISOString(), trigger: options.trigger, dryRun, projects: [], quota: null, errors: [] };
 
   for (const [index, project] of config.projects.entries()) {
@@ -41,6 +46,7 @@ export async function runReaper(service: ConvexService, companyId: string, optio
       const token = await service.listToken(config, companyId, project, index);
       const previews = await service.d.convex.listProjectDeployments(token, project.convexProjectId, "preview");
       entry.previews = previews.length;
+      for (const preview of previews) seen.add(preview.name);
       for (const deployment of previews) {
         const { environment, reason } = classifyDeployment(deployment, project);
         if (deployment.projectId !== project.convexProjectId || environment !== "preview") {
@@ -48,7 +54,7 @@ export async function runReaper(service: ConvexService, companyId: string, optio
           continue;
         }
         const target = { config, project, projectIndex: index, deployment, environment, reason };
-        const assessment = await service.assess(companyId, target, openCache);
+        const assessment = await service.assess(companyId, target, cache);
         if (!assessment.checked) {
           // Without GitHub nothing is known about this project's previews: stop, and neither delete nor shorten any of them.
           if (assessment.blocked === GITHUB_UNREADABLE) throw new Refusal(assessment.blocked);
@@ -63,8 +69,10 @@ export async function runReaper(service: ConvexService, companyId: string, optio
         const lastDeploy = deployment.lastDeployTime ?? deployment.createTime ?? now;
         const target36 = lastDeploy + config.reaper.ttlHours * HOUR_MS;
         const current = deployment.expiresAt;
+        // Shorten to lastDeployTime + TTL. Follow a later deploy only for an expiry this reaper set, never one a person chose.
+        const ours = managed[deployment.name] !== undefined && managed[deployment.name] === current;
         if (target36 - now >= MIN_PLANNED_LEAD_MS) {
-          if (current === null || current > target36 + EXPIRY_TOLERANCE_MS) entry.setExpiry.push({ name: deployment.name, from: current, to: target36 });
+          if (current === null || current > target36 + EXPIRY_TOLERANCE_MS || (ours && current < target36 - EXPIRY_TOLERANCE_MS)) entry.setExpiry.push({ name: deployment.name, from: current, to: target36 });
         } else if (current === null) {
           entry.setExpiry.push({ name: deployment.name, from: null, to: now + config.reaper.ttlHours * HOUR_MS });
         }
@@ -73,7 +81,7 @@ export async function runReaper(service: ConvexService, companyId: string, optio
       for (const item of entry.delete) {
         if (budget.left <= 0) { entry.skipped.push({ ...item, reason: `Deletion limit of ${budget.max} reached for this run.` }); continue; }
         try {
-          await service.deletePreview(actor, config, reserved, item.name, { dryRun: false, budget, openCache, requireReapEvidence: true });
+          await service.deletePreview(actor, config, reserved, item.name, { dryRun: false, budget, cache, requireReapEvidence: true });
           entry.deleted.push(item.name);
         } catch (error) {
           if (error instanceof Refusal) entry.skipped.push({ ...item, reason: error.message });
@@ -82,7 +90,8 @@ export async function runReaper(service: ConvexService, companyId: string, optio
       }
       for (const item of entry.setExpiry) {
         try {
-          await service.setPreviewExpiry(actor, config, reserved, item.name, 0, false, item.to);
+          await service.setPreviewExpiry(actor, config, reserved, item.name, 0, false, { expiryAt: item.to, viaReaper: true });
+          managed[item.name] = item.to;
           entry.expirySet.push(item.name);
         } catch (error) {
           if (error instanceof Refusal) entry.skipped.push({ name: item.name, previewIdentifier: null, reason: error.message });
@@ -93,6 +102,12 @@ export async function runReaper(service: ConvexService, companyId: string, optio
       entry.error = safe(error);
       entry.delete = []; entry.setExpiry = [];
     }
+  }
+
+  if (!dryRun) {
+    // Forget deployments that no longer exist, so the record stays as small as the preview list. Skipped when any project failed to list.
+    if (report.projects.every(item => !item.error)) for (const name of Object.keys(managed)) if (!seen.has(name)) delete managed[name];
+    await ctx.state.set(managedKey(companyId), managed);
   }
 
   try {

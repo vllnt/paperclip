@@ -118,7 +118,7 @@ describe("company isolation", () => {
     });
     eligible(f);
     const result = await del(f, "b-agent", "feat-done", {}, run("b-agent", COMPANY_B));
-    expect(result.error).toMatch(/not mapped to this company/i);
+    expect(result.error).toMatch(/not available for this company/i);
     expect(f.convex.deletes()).toHaveLength(0);
   });
 

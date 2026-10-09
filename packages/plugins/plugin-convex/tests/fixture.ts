@@ -8,10 +8,11 @@ export const COMPANY_A = "company-a";
 export const COMPANY_B = "company-b";
 export const TEAM_TOKEN = "cvx_team_TOPSECRET_0123456789";
 export const PROJECT_TOKEN = "cvx_project_TOPSECRET_9876543210";
+export const PREVIEW_KEY = "cvx_preview_TOPSECRET_5555555555";
 export const GITHUB_TOKEN = "gh-token";
 
 export const ref = (secretId: string) => ({ type: "secret_ref", secretId, version: "latest" });
-export const secretValues: Record<string, string> = { "s-team": TEAM_TOKEN, "s-project": PROJECT_TOKEN, "s-gh": GITHUB_TOKEN };
+export const secretValues: Record<string, string> = { "s-team": TEAM_TOKEN, "s-project": PROJECT_TOKEN, "s-preview": PREVIEW_KEY, "s-gh": GITHUB_TOKEN };
 
 export function baseConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

@@ -28,6 +28,10 @@ export class FakeConvex {
   /** Makes error bodies echo the Authorization header, as a hostile or buggy server could. */
   echoCredentialInErrors = false;
   failDeleteFor = new Set<string>();
+  /** Deletes the deployment, then answers 502, as a proxy that drops the response could. */
+  dropDeleteResponseFor = new Set<string>();
+  /** GET answers with this name instead of the requested one. */
+  answerAs = new Map<string, string>();
 
   add(...items: FakeDeployment[]) { for (const item of items) this.deployments.set(item.name, item); return this; }
   mutations() { return this.calls.filter(call => call.method !== "GET"); }
@@ -45,16 +49,18 @@ export class FakeConvex {
     const parsed = new URL(url);
     const path = parsed.pathname;
     if (parsed.hostname.endsWith(".convex.cloud")) {
-      if (path.endsWith("/get_current_usage")) return json(200, { metrics: { functionCalls: { unit: "calls", usage: { current_day: 10, current_month: 100 } } }, seedStatus: "complete" });
-      if (path.endsWith("/list_usage_limits")) return json(200, { usageLimits: [] });
+      if (path.endsWith("/get_current_usage")) return json(200, { metrics: { functionCalls: { unit: "calls", usage: { current_day: 10, current_month: 100 }, internalNote: "LEAK-ME-usage" } }, seedStatus: "complete", billingToken: "LEAK-ME-billing" });
+      if (path.endsWith("/list_usage_limits")) return json(200, { usageLimits: [{ id: "u1", metric: "functionCalls", window: "day", limitType: "warning", limit: 1000, enabled: true, webhookSecret: "LEAK-ME-limit" }] });
       if (path.endsWith("/list_audit_log_events")) return json(200, { items: [{ actor: { kind: "member", member_id: 3 }, action: "push_config", createTime: NOW - HOUR, metadata: { note: "pushed" }, clientIp: "203.0.113.9", clientUserAgent: "convex-cli" }], pagination: { hasMore: false, nextCursor: null } });
-      if (path.endsWith("/deployment_info")) return json(200, { kind: "cloud", teamId: 1, projectId: 100, id: 5, deploymentType: "preview" });
+      if (path.endsWith("/deployment_info")) return json(200, { kind: "cloud", teamId: 1, projectId: 100, id: 5, deploymentType: "preview", adminKey: "LEAK-ME-info" });
       return fail(404, "NotFound");
     }
     const v1 = path.replace(/^\/v1/, "");
     let match = /^\/deployments\/([^/]+)$/.exec(v1);
     if (match && method === "GET") {
-      const found = this.deployments.get(decodeURIComponent(match[1]));
+      const asked = decodeURIComponent(match[1]);
+      const found = this.deployments.get(asked);
+      if (found && this.answerAs.has(asked)) return json(200, { ...found, name: this.answerAs.get(asked) });
       return found ? json(200, found) : fail(404, "DeploymentNotFound");
     }
     if (match && method === "PATCH") {
@@ -67,6 +73,7 @@ export class FakeConvex {
     if (match && method === "POST") {
       const name = decodeURIComponent(match[1]);
       if (this.failDeleteFor.has(name)) return fail(500, "InternalError");
+      if (this.dropDeleteResponseFor.has(name)) { this.deployments.delete(name); return fail(502, "BadGateway"); }
       return this.deployments.delete(name) ? bare(200) : fail(404, "DeploymentNotFound");
     }
     match = /^\/projects\/([^/]+)\/list_deployments$/.exec(v1);
@@ -98,12 +105,17 @@ export class FakeConvex {
 
 export interface FakePull { number: number; ref: string; state?: "open" | "closed"; merged?: boolean }
 
-/** In-memory GitHub REST subset used by the preview guard. */
+/** In-memory GitHub REST subset used by the preview guard. Lists are paged by 100, like GitHub. */
 export class FakeGitHub {
   pulls: FakePull[] = [];
   branches = new Map<string, string>();
+  /** Extra branch names without a commit date, to build large repositories. */
+  extraBranches = 0;
+  extraOpenPulls = 0;
   calls: string[] = [];
   down = false;
+  /** The token can read pull requests but not branches (answers 404, as a restricted fine-grained token does). */
+  branchesHidden = false;
   validTokens = new Set<string>(["gh-token"]);
 
   fetch: FetchLike = async (url, init) => {
@@ -113,12 +125,18 @@ export class FakeGitHub {
     if (!this.validTokens.has(token)) return json(401, { message: "Bad credentials" });
     const parsed = new URL(url);
     const repoPath = parsed.pathname.replace(/^\/repos\/[^/]+\/[^/]+/, "");
+    const page = Number(parsed.searchParams.get("page") ?? 1);
+    const slice = <T>(items: T[]) => items.slice((page - 1) * 100, page * 100);
     if (repoPath === "/pulls") {
-      const state = parsed.searchParams.get("state");
-      const head = parsed.searchParams.get("head");
-      const list = this.pulls.filter(pull => state === "open" ? (pull.state ?? "open") === "open" : true)
-        .filter(pull => !head || head.endsWith(`:${pull.ref}`));
-      return json(200, list.map(pull => ({ number: pull.number, state: pull.state ?? "open", merged_at: pull.merged ? "2026-10-01T00:00:00Z" : null, head: { ref: pull.ref } })));
+      const closed = parsed.searchParams.get("state") === "closed";
+      const real = this.pulls.filter(pull => (pull.state ?? "open") === (closed ? "closed" : "open"));
+      const filler = closed ? [] : Array.from({ length: this.extraOpenPulls }, (_, i) => ({ number: 100000 + i, ref: `filler-${i}` }));
+      return json(200, slice([...real, ...filler]).map(pull => ({ number: pull.number, state: closed ? "closed" : "open", merged_at: (pull as FakePull).merged ? "2026-10-01T00:00:00Z" : null, head: { ref: pull.ref } })));
+    }
+    if (repoPath === "/branches") {
+      if (this.branchesHidden) return json(404, { message: "Not Found" });
+      const names = [...this.branches.keys(), ...Array.from({ length: this.extraBranches }, (_, i) => `filler-branch-${i}`)];
+      return json(200, slice(names).map(name => ({ name })));
     }
     const branch = /^\/branches\/(.+)$/.exec(repoPath);
     if (branch) {

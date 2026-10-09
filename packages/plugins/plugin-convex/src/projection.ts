@@ -50,3 +50,38 @@ export function projectAuditEvents(raw: unknown, includePii: boolean) {
   const more = raw && typeof raw === "object" ? (raw as { pagination?: { hasMore?: boolean } }).pagination?.hasMore === true : false;
   return { events: out, hasMore: more };
 }
+
+const isFailure = (raw: unknown): raw is { error: string } => !!raw && typeof raw === "object" && "error" in raw && Object.keys(raw).length === 1;
+const record = (raw: unknown): Record<string, unknown> => (raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {});
+
+/** Deployment API answers are projected too; a per-call failure `{error}` passes through unchanged. */
+export function projectDeploymentInfo(raw: unknown) {
+  if (isFailure(raw)) return raw;
+  const info = record(raw);
+  return {
+    kind: text(info.kind), teamId: id(info.teamId), projectId: id(info.projectId), id: id(info.id), deploymentType: text(info.deploymentType),
+    reference: text(info.reference), projectName: text(info.projectName), projectSlug: text(info.projectSlug),
+  };
+}
+
+export function projectUsage(raw: unknown) {
+  if (isFailure(raw)) return raw;
+  const usage = record(raw);
+  const metrics: Record<string, { unit: string | null; currentDay: number | null; currentMonth: number | null }> = {};
+  for (const [name, value] of Object.entries(record(usage.metrics)).slice(0, 40)) {
+    if (!/^[A-Za-z]{1,60}$/.test(name)) continue;
+    const metric = record(value);
+    const window = record(metric.usage);
+    metrics[name] = { unit: text(metric.unit), currentDay: num(window.current_day), currentMonth: num(window.current_month) };
+  }
+  return { seedStatus: text(usage.seedStatus), metrics };
+}
+
+export function projectUsageLimits(raw: unknown) {
+  if (isFailure(raw)) return raw;
+  return {
+    usageLimits: items(raw, "usageLimits").slice(0, 100).map(limit => ({
+      id: text(limit.id), metric: text(limit.metric), window: text(limit.window), limitType: text(limit.limitType), limit: num(limit.limit), enabled: limit.enabled === true,
+    })),
+  };
+}

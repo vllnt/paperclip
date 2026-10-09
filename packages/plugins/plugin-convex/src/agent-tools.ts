@@ -2,7 +2,7 @@ import type { PluginContext, ToolResult, ToolRunContext } from "@paperclipai/plu
 import type { Capability } from "./contracts.js";
 import { ConvexApiError } from "./convex-client.js";
 import { isGranted } from "./grants.js";
-import { projectAuditEvents, projectClasses, projectCustomDomains, projectDeployKeys, projectRegions } from "./projection.js";
+import { projectAuditEvents, projectClasses, projectCustomDomains, projectDeploymentInfo, projectDeployKeys, projectRegions, projectUsage, projectUsageLimits } from "./projection.js";
 import { runReaper } from "./reaper.js";
 import { isShowable, type ConvexService } from "./service.js";
 
@@ -87,19 +87,19 @@ export function registerAgentTools(ctx: PluginContext, service: ConvexService) {
       return {
         name: deployment.name, environment: target.environment, lastDeployTime: deployment.lastDeployTime, createTime: deployment.createTime, expiresAt: deployment.expiresAt,
         expired: deployment.expiresAt !== null && deployment.expiresAt <= now, region: deployment.region, deploymentClass: deployment.deploymentClass,
-        info: out.deployment_info, usage: out.get_current_usage, usageLimits: out.list_usage_limits,
+        info: projectDeploymentInfo(out.deployment_info), usage: projectUsage(out.get_current_usage), usageLimits: projectUsageLimits(out.list_usage_limits),
         unavailable: ["failureRate", "cacheHitRate", "schedulerLag", "functionMetrics", "insights"],
       };
     });
 
   define("convex_get_usage", "Convex deployment usage", "Current-day and current-month usage per metric (Convex marks this endpoint beta).", schema({ name: NAME }, ["name"]), "health-read", async (input, access) => {
     const { target, out } = await deploymentApi(access, String(input.name), "get_usage", ["get_current_usage"]);
-    return { name: target.deployment.name, environment: target.environment, usage: out.get_current_usage };
+    return { name: target.deployment.name, environment: target.environment, usage: projectUsage(out.get_current_usage) };
   });
 
   define("convex_list_usage_limits", "Convex usage limits", "List the deployment's configured usage limits.", schema({ name: NAME }, ["name"]), "health-read", async (input, access) => {
     const { target, out } = await deploymentApi(access, String(input.name), "list_usage_limits", ["list_usage_limits"]);
-    return { name: target.deployment.name, environment: target.environment, usageLimits: out.list_usage_limits };
+    return { name: target.deployment.name, environment: target.environment, usageLimits: projectUsageLimits(out.list_usage_limits) };
   });
 
   define("convex_list_custom_domains", "List Convex custom domains", "List the custom domains of a deployment.", schema({ name: NAME }, ["name"]), "meta-read", async (input, access) => {

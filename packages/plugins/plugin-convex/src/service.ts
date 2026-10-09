@@ -8,7 +8,7 @@ import {
 import { ConvexApiError, ConvexClient } from "./convex-client.js";
 import { isGranted, hasAnyGrant, type AgentIdentity } from "./grants.js";
 import { GitHubReader } from "./github-reader.js";
-import { assessPreview, Refusal, type OpenPullRequestCache, type PreviewAssessment } from "./preview-guard.js";
+import { assessPreview, recheckCache, Refusal, type GuardCache, type PreviewAssessment } from "./preview-guard.js";
 
 const registryKey = { scopeKind: "instance" as const, namespace: "connection", stateKey: "projects" };
 const disconnectedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "connection", stateKey: "disconnected" });
@@ -104,40 +104,57 @@ export class ConvexService {
     });
   }
 
-  // --- credentials: resolved per call, never stored, logged or returned ---
+  // --- credentials: resolved per operation, never stored, logged or returned ---
 
-  private resolveSecret(ref: SecretRef, companyId: string, configPath: string): Promise<string> {
-    return this.d.ctx.secrets.resolve(ref, { companyId, configPath });
+  /** One operation (a tool call or a reaper pass) holds one parsed config, so each secret is resolved at most once per operation (the host limits secret resolution per minute). */
+  private resolved = new WeakMap<ConnectionConfig, Map<string, Promise<string>>>();
+  private resolveSecret(config: ConnectionConfig, ref: SecretRef, companyId: string, configPath: string): Promise<string> {
+    let memo = this.resolved.get(config);
+    if (!memo) { memo = new Map(); this.resolved.set(config, memo); }
+    const known = memo.get(configPath);
+    if (known) return known;
+    const pending = this.d.ctx.secrets.resolve(ref, { companyId, configPath });
+    memo.set(configPath, pending);
+    pending.catch(() => memo!.delete(configPath));
+    return pending;
   }
   /** Listing needs a project token or the team token; a preview deploy key cannot list. */
   async listToken(config: ConnectionConfig, companyId: string, project: ProjectMapping, index: number): Promise<string> {
-    if (project.token) return this.resolveSecret(project.token, companyId, `projects.${index}.token`);
-    if (config.teamToken) return this.resolveSecret(config.teamToken, companyId, "teamToken");
+    if (project.token) return this.resolveSecret(config, project.token, companyId, `projects.${index}.token`);
+    if (config.teamToken) return this.resolveSecret(config, config.teamToken, companyId, "teamToken");
     throw new Refusal("No credential is configured to list this Convex project.");
   }
-  /** Credentials that may act on one deployment by name, cheapest first: preview deploy key, project token, team token. */
-  private async nameCredentials(config: ConnectionConfig, companyId: string, project: ProjectMapping | null, index: number, previewOnly: boolean): Promise<string[]> {
-    const out: string[] = [];
-    const add = async (ref: SecretRef | null, path: string) => { if (ref) out.push(await this.resolveSecret(ref, companyId, path)); };
-    if (project) {
-      if (previewOnly) await add(project.previewDeployKey, `projects.${index}.previewDeployKey`);
-      await add(project.token, `projects.${index}.token`);
-    } else {
-      for (const [i, candidate] of config.projects.entries()) {
-        await add(candidate.previewDeployKey, `projects.${i}.previewDeployKey`);
-        await add(candidate.token, `projects.${i}.token`);
+  /** Credentials that may act on a deployment by name, cheapest first. They are resolved lazily, so the common case resolves one. */
+  private credentialCandidates(config: ConnectionConfig, companyId: string, scope: { project: ProjectMapping; index: number } | null): Array<() => Promise<string>> {
+    const out: Array<() => Promise<string>> = [];
+    const add = (ref: SecretRef | null, path: string) => { if (ref) out.push(() => this.resolveSecret(config, ref, companyId, path)); };
+    const projects = scope ? [scope] : config.projects.map((project, index) => ({ project, index }));
+    for (const { project, index } of projects) {
+      add(project.previewDeployKey, `projects.${index}.previewDeployKey`);
+      add(project.token, `projects.${index}.token`);
+    }
+    add(config.teamToken, "teamToken");
+    return out;
+  }
+  /** Tries each candidate credential in turn. A credential scoped to another project (401/403) or a missing deployment (404) moves on to the next one. */
+  async withCredential<T>(config: ConnectionConfig, companyId: string, scope: { project: ProjectMapping; index: number } | null, use: (token: string) => Promise<T>): Promise<T> {
+    let failure: unknown = null;
+    for (const candidate of this.credentialCandidates(config, companyId, scope)) {
+      try { return await use(await candidate()); }
+      catch (error) {
+        if (error instanceof ConvexApiError && [401, 403, 404].includes(error.status)) { failure = error; continue; }
+        throw error;
       }
     }
-    await add(config.teamToken, "teamToken");
-    return [...new Set(out)];
+    throw failure ?? new Refusal("No credential is configured for this Convex project.");
   }
   async teamToken(config: ConnectionConfig, companyId: string): Promise<string> {
     if (!config.teamToken) throw new Refusal("No team token is configured for this company.");
-    return this.resolveSecret(config.teamToken, companyId, "teamToken");
+    return this.resolveSecret(config, config.teamToken, companyId, "teamToken");
   }
   async githubToken(config: ConnectionConfig, companyId: string): Promise<string | null> {
     if (!config.githubToken) return null;
-    try { return await this.resolveSecret(config.githubToken, companyId, "github.token"); } catch { return null; }
+    try { return await this.resolveSecret(config, config.githubToken, companyId, "github.token"); } catch { return null; }
   }
 
   // --- caller checks ---
@@ -176,20 +193,19 @@ export class ConvexService {
   /** Re-fetches a deployment from Convex at call time and decides everything from that fresh record. */
   async resolveTarget(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string): Promise<Target> {
     if (typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) throw new Refusal("Provide a Convex deployment name.");
-    const companyId = actor.companyId;
-    let deployment: ConvexDeployment | null = null;
-    let failure: unknown = null;
-    for (const token of await this.nameCredentials(config, companyId, null, 0, true)) {
-      try { deployment = await this.d.convex.getDeployment(token, name); break; }
-      catch (error) {
-        // A credential scoped to another project answers 401/403/404; try the next one. Anything else is a real failure.
-        if (error instanceof ConvexApiError && [401, 403, 404].includes(error.status)) { failure = error; continue; }
-        throw error;
-      }
+    // One message for "does not exist", "not reachable" and "belongs to someone else", so names of other companies cannot be probed.
+    const unavailable = () => new Refusal("This Convex deployment is not available for this company.");
+    let deployment: ConvexDeployment | null;
+    try {
+      deployment = await this.withCredential(config, actor.companyId, null, token => this.d.convex.getDeployment(token, name));
+    } catch (error) {
+      if (error instanceof ConvexApiError && [401, 403, 404].includes(error.status)) throw unavailable();
+      throw error;
     }
-    if (!deployment) throw failure instanceof ConvexApiError && failure.status === 404 ? new Refusal("Convex deployment not found.") : new Refusal("Convex deployment is not reachable with this company's credentials.");
+    // Everything that follows is decided from the record Convex returned, and it must be the deployment that was asked for.
+    if (!deployment || deployment.name !== name) throw unavailable();
     const projectIndex = config.projects.findIndex(project => project.convexProjectId === deployment!.projectId);
-    if (projectIndex < 0 || !reserved.has(config.projects[projectIndex].convexProjectId)) throw new Refusal("This deployment is not mapped to this company.");
+    if (projectIndex < 0 || !reserved.has(config.projects[projectIndex].convexProjectId)) throw unavailable();
     const project = config.projects[projectIndex];
     const { environment, reason } = classifyDeployment(deployment, project);
     return { config, project, projectIndex, deployment, environment, reason };
@@ -221,23 +237,31 @@ export class ConvexService {
     if (target.environment !== "preview") throw new Refusal(`Agents cannot change ${target.environment} deployments; only previews. This deployment is classified ${target.environment} (${target.reason}).`);
   }
 
-  async setPreviewExpiry(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, hours: number, dryRun: boolean, expiryAt?: number) {
+  /**
+   * Sets a preview's expiry. Convex deletes a preview when its expiry passes, so an expiry sooner than the activity window is a
+   * deletion: it follows the deletion guards and counts against the agent's per-run deletion cap. The reaper applies its own
+   * policy and passes `viaReaper`.
+   */
+  async setPreviewExpiry(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, hours: number, dryRun: boolean, options: { expiryAt?: number; viaReaper?: boolean } = {}) {
     const target = await this.resolveTarget(actor, config, reserved, name);
     this.requirePreview(target);
     this.requireGrant(actor, config, target.environment, "lifecycle");
     const now = this.d.now();
-    const expiresAt = expiryAt ?? now + hours * HOUR_MS;
+    const expiresAt = options.expiryAt ?? now + hours * HOUR_MS;
     if (expiresAt - now > MAX_PREVIEW_TTL_HOURS * HOUR_MS) throw new Refusal(`A preview expiry can be at most ${MAX_PREVIEW_TTL_HOURS} hours (7 days) from now.`);
     if (expiresAt - now < MIN_EXPIRY_LEAD_MS) throw new Refusal("A preview expiry must be at least 30 minutes from now.");
-    const effectiveDry = dryRun || config.guards.dryRunOnly;
-    const record = { deployment: name, environment: target.environment, capability: "lifecycle", before: { expiresAt: target.deployment.expiresAt }, after: { expiresAt } };
-    if (effectiveDry) {
+    const deletesSoon = !options.viaReaper && expiresAt - now < config.guards.activityHours * HOUR_MS;
+    if (deletesSoon) {
+      const assessment = await this.assess(actor.companyId, target);
+      if (assessment.blocked) throw new Refusal(`${assessment.blocked} An expiry sooner than ${config.guards.activityHours} hours deletes the preview, so it follows the deletion guards.`);
+    }
+    const record = { deployment: name, environment: target.environment, capability: "lifecycle", before: { expiresAt: target.deployment.expiresAt }, after: { expiresAt }, countsAsDeletion: deletesSoon };
+    if (dryRun || config.guards.dryRunOnly) {
       await this.audit(actor, "Convex preview expiry dry run", { ...record, outcome: "dry-run" }, name);
       return { dryRun: true, name, expiresAt, previousExpiresAt: target.deployment.expiresAt };
     }
-    const [token] = await this.nameCredentials(config, actor.companyId, target.project, target.projectIndex, true);
-    if (!token) throw new Refusal("No credential is configured for this Convex project.");
-    await this.d.convex.setExpiry(token, name, expiresAt);
+    if (deletesSoon && actor.kind === "agent") await this.reserveRunDeletion(actor, config.guards.maxDeletesPerRun);
+    await this.withCredential(config, actor.companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.setExpiry(token, name, expiresAt));
     await this.audit(actor, "Convex preview expiry set", { ...record, outcome: "expiry-set" }, name);
     return { dryRun: false, name, expiresAt, previousExpiresAt: target.deployment.expiresAt };
   }
@@ -252,28 +276,35 @@ export class ConvexService {
     });
   }
 
-  async assess(companyId: string, target: Target, openCache?: OpenPullRequestCache): Promise<PreviewAssessment> {
+  async assess(companyId: string, target: Target, cache?: GuardCache): Promise<PreviewAssessment> {
     return assessPreview({
       github: this.d.github, token: await this.githubToken(target.config, companyId), project: target.project,
-      deployment: target.deployment, activityHours: target.config.guards.activityHours, now: this.d.now(), openCache,
+      deployment: target.deployment, activityHours: target.config.guards.activityHours, now: this.d.now(), cache,
     });
   }
 
-  async deletePreview(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, options: { dryRun: boolean; budget?: DeletionBudget; openCache?: OpenPullRequestCache; requireReapEvidence?: boolean }) {
+  /** After a failed or unanswered delete: did the deployment go away anyway? */
+  private async isGone(config: ConnectionConfig, companyId: string, target: Target, name: string): Promise<boolean> {
+    try { await this.withCredential(config, companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.getDeployment(token, name)); return false; }
+    catch (error) { return error instanceof ConvexApiError && error.status === 404; }
+  }
+
+  async deletePreview(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, options: { dryRun: boolean; budget?: DeletionBudget; cache?: GuardCache; requireReapEvidence?: boolean }) {
     const target = await this.resolveTarget(actor, config, reserved, name);
     this.requirePreview(target);
     this.requireGrant(actor, config, target.environment, "lifecycle");
-    const assessment = await this.assess(actor.companyId, target, options.openCache);
+    // The decision re-reads open pull requests and branches; only the closed-PR evidence list may be shared with the planning pass.
+    const assessment = await this.assess(actor.companyId, target, recheckCache(options.cache));
     if (assessment.blocked) throw new Refusal(assessment.blocked);
     if (options.requireReapEvidence && !assessment.reapReason) throw new Refusal("No closed pull request and no idle gone branch was found for this preview, so it was kept.");
     const record = {
       deployment: name, environment: target.environment, capability: "lifecycle", before: this.before(target.deployment),
       evidence: assessment.evidence, reason: assessment.reapReason,
     };
-    const dryRun = options.dryRun || config.guards.dryRunOnly;
-    if (dryRun) {
+    const result = (deleted: boolean, dryRun: boolean) => ({ dryRun, wouldDelete: true, deleted, environment: target.environment, deployment: this.summary(target.deployment, target.environment), evidence: assessment.evidence, reason: assessment.reapReason });
+    if (options.dryRun || config.guards.dryRunOnly) {
       await this.audit(actor, "Convex preview delete dry run", { ...record, outcome: "dry-run" }, name);
-      return { dryRun: true, wouldDelete: true, deleted: false, environment: target.environment, deployment: this.summary(target.deployment, target.environment), evidence: assessment.evidence, reason: assessment.reapReason };
+      return result(false, true);
     }
     // An agent's allowance is per run across every tool call (persisted); the reaper's budget caps one pass on top of that.
     if (actor.kind === "agent") await this.reserveRunDeletion(actor, config.guards.maxDeletesPerRun);
@@ -281,17 +312,23 @@ export class ConvexService {
       if (options.budget.left <= 0) throw new Refusal(`Deletion limit of ${options.budget.max} reached for this run.`);
       options.budget.left -= 1;
     }
-    const [token] = await this.nameCredentials(config, actor.companyId, target.project, target.projectIndex, true);
-    if (!token) throw new Refusal("No credential is configured for this Convex project.");
     await this.audit(actor, "Convex preview deletion requested", { ...record, outcome: "requested" }, name);
     try {
-      await this.d.convex.deleteDeployment(token, name);
+      await this.withCredential(config, actor.companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.deleteDeployment(token, name));
     } catch (error) {
-      await this.audit(actor, "Convex preview delete failed", { ...record, outcome: "failed", error: error instanceof ConvexApiError ? error.message : "Convex could not delete the deployment." }, name);
+      // A transport failure can follow a delete that succeeded. Look before reporting a failure.
+      const unanswered = error instanceof ConvexApiError && (error.status === 0 || error.status >= 500);
+      if (unanswered && await this.isGone(config, actor.companyId, target, name)) {
+        await this.audit(actor, "Convex preview deleted", { ...record, outcome: "deleted-verified", after: null }, name);
+        return result(true, false);
+      }
+      await this.audit(actor, unanswered ? "Convex preview delete outcome unknown" : "Convex preview delete failed",
+        { ...record, outcome: unanswered ? "unknown" : "failed", error: error instanceof ConvexApiError ? error.message : "Convex could not delete the deployment." }, name);
+      if (unanswered) throw new ConvexApiError((error as ConvexApiError).status, "Convex did not confirm the deletion. Check the deployment before retrying.");
       throw error;
     }
     await this.audit(actor, "Convex preview deleted", { ...record, outcome: "deleted", after: null }, name);
-    return { dryRun: false, wouldDelete: true, deleted: true, environment: target.environment, deployment: this.summary(target.deployment, target.environment), evidence: assessment.evidence, reason: assessment.reapReason };
+    return result(true, false);
   }
 
   // --- inventory ---
@@ -318,7 +355,7 @@ export class ConvexService {
     let count = 0;
     let partial = false;
     if (config.teamToken && config.teamId) {
-      const token = await this.resolveSecret(config.teamToken, companyId, "teamToken");
+      const token = await this.resolveSecret(config, config.teamToken, companyId, "teamToken");
       let cursor: string | undefined;
       for (let page = 0; page < 100; page++) {
         const result = await this.d.convex.listTeamDeploymentsPage(token, config.teamId, cursor);

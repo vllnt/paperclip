@@ -4,12 +4,14 @@ export interface PullRequestRef { number: number; headRef: string; state: "open"
 export interface BranchInfo { name: string; lastCommitAt: number | null }
 
 const MAX_OPEN_PAGES = 10;
+const MAX_BRANCH_PAGES = 10;
+const MAX_CLOSED_PAGES = 5;
 const encSegments = (name: string) => name.split("/").map(encodeURIComponent).join("/");
 
 /**
  * Read-only GitHub lookups for the preview guard. It needs a token that can read pull requests and branches of the mapped
  * repository (a fine-grained token with Metadata, Pull requests and Contents read). Any failure throws, and callers treat a
- * throw as "do not delete".
+ * throw as "do not delete". Lists that exceed their page budget also throw, because a missing entry would unprotect a preview.
  */
 export class GitHubReader {
   constructor(private fetchImpl: FetchLike = (url, init) => fetch(url, init)) {}
@@ -32,29 +34,40 @@ export class GitHubReader {
     } finally { clearTimeout(timer); }
   }
 
-  /** Every open pull request head ref. More than the page budget fails closed, because a missing PR would unprotect a preview. */
-  async openPullRequests(repo: string, token: string): Promise<PullRequestRef[]> {
-    const found: PullRequestRef[] = [];
-    for (let page = 1; page <= MAX_OPEN_PAGES; page++) {
-      const items = await this.get<Array<{ number?: number; head?: { ref?: string } }>>(repo, `/pulls?state=open&per_page=100&page=${page}`, token);
+  private async pages<T>(repo: string, token: string, path: (page: number) => string, maxPages: number, complete: boolean): Promise<T[]> {
+    const found: T[] = [];
+    for (let page = 1; page <= maxPages; page++) {
+      const items = await this.get<T[]>(repo, path(page), token);
+      // A 404 on a list means the token cannot see the repository: never read that as "empty".
       if (!Array.isArray(items)) throw new Error("GitHub repository is not readable.");
-      for (const item of items) if (typeof item.number === "number" && typeof item.head?.ref === "string") found.push({ number: item.number, headRef: item.head.ref, state: "open" });
+      found.push(...items);
       if (items.length < 100) return found;
     }
-    throw new Error("Too many open pull requests to check safely.");
+    if (complete) throw new Error("Too many entries to check safely.");
+    return found;
   }
 
-  /** Pull requests (any state) whose head branch has this name. */
-  async pullRequestsForBranch(repo: string, token: string, branch: string): Promise<PullRequestRef[]> {
-    const owner = repo.split("/")[0];
-    const items = await this.get<Array<{ number?: number; state?: string; merged_at?: string | null; head?: { ref?: string } }>>(
-      repo, `/pulls?state=all&per_page=10&head=${encodeURIComponent(`${owner}:${branch}`)}`, token);
-    if (!Array.isArray(items)) throw new Error("GitHub repository is not readable.");
+  /** Every open pull request. More than the page budget fails closed. */
+  async openPullRequests(repo: string, token: string): Promise<PullRequestRef[]> {
+    const items = await this.pages<{ number?: number; head?: { ref?: string } }>(repo, token, page => `/pulls?state=open&per_page=100&page=${page}`, MAX_OPEN_PAGES, true);
+    return items.flatMap(item => typeof item.number === "number" && typeof item.head?.ref === "string" ? [{ number: item.number, headRef: item.head.ref, state: "open" as const }] : []);
+  }
+
+  /** Recently updated closed or merged pull requests. Used only as positive evidence, so a partial list is acceptable. */
+  async recentClosedPullRequests(repo: string, token: string): Promise<PullRequestRef[]> {
+    const items = await this.pages<{ number?: number; merged_at?: string | null; head?: { ref?: string } }>(
+      repo, token, page => `/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`, MAX_CLOSED_PAGES, false);
     return items.flatMap(item => typeof item.number === "number" && typeof item.head?.ref === "string"
-      ? [{ number: item.number, headRef: item.head.ref, state: item.state === "open" ? "open" as const : item.merged_at ? "merged" as const : "closed" as const }] : []);
+      ? [{ number: item.number, headRef: item.head.ref, state: item.merged_at ? "merged" as const : "closed" as const }] : []);
   }
 
-  /** The branch, or null when it does not exist. */
+  /** Every branch name. More than the page budget fails closed, because "no such branch" must mean the branch is gone. */
+  async branchNames(repo: string, token: string): Promise<string[]> {
+    const items = await this.pages<{ name?: string }>(repo, token, page => `/branches?per_page=100&page=${page}`, MAX_BRANCH_PAGES, true);
+    return items.flatMap(item => typeof item.name === "string" ? [item.name] : []);
+  }
+
+  /** The branch's last commit time, or null when the branch does not exist. */
   async branch(repo: string, token: string, name: string): Promise<BranchInfo | null> {
     const item = await this.get<{ name?: string; commit?: { commit?: { committer?: { date?: string }; author?: { date?: string } } } }>(repo, `/branches/${encSegments(name)}`, token);
     if (!item) return null;
