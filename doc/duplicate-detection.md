@@ -50,8 +50,16 @@ after-create check does nothing, the `similar` API answers from the free tiers w
 `degradedReason: "no_key"`, and one `duplicate_detection.skipped` activity entry a day says why. Deleting
 or replacing the secret takes effect within about 30 seconds (keys are kept in memory that long).
 
-Roll out in this order: `suggest` → label real pairs → run the calibration script → `comment` only if
-precision at 0.9 is at least 0.9.
+**Before turning a company on, get an informed opt-in.** `suggest` and `comment` send that company's issue
+titles and descriptions to Vercel AI Gateway and on to TypeSafe (the Jev provider). Only secret-like text
+(tokens, keys, credentials) is redacted and descriptions are cut to 1,500 characters; **names, email
+addresses, customer details and other personal data in issue text are sent as written.** The company's
+owner should agree to that knowingly, and the operator should confirm the provider's retention settings
+first. Zero data retention could not be enabled with the test gateway key (2026-10-09), so assume the
+provider's default retention applies until it is confirmed otherwise (see Settings and Privacy).
+
+Roll out in this order: informed opt-in and retention confirmed → `suggest` → label real pairs → run the
+calibration script for that company → `comment` only if precision at 0.9 is at least 0.9.
 
 ## API and CLI
 
@@ -92,7 +100,19 @@ candidates and comment on or link an existing issue instead of creating another 
 Every newly inserted issue triggers the check from inside the issue service: the main create route,
 child creation (`POST /issues/:id/children`), accepted-plan decomposition, and issues made by routines,
 watchdogs, chat, email and the runtime. A create that resolves to an existing issue does not. The check
-runs after the create returns, never inside it. It records every scored pair in `issue_duplicate_pairs`: both issue ids, the
+runs after the create returns, never inside it.
+
+Three paths write issues without the issue service and are **deliberately not checked**:
+
+| Path | Why it is exempt |
+|---|---|
+| Company import (`issueService.importIssues`) | Bulk-restores issues exported from a company; they are not new work. |
+| `paperclipai worktree:merge-history --apply` | Mirrors issues that already exist in another instance's database, keeping their ids and timestamps. It runs in the CLI process, where no check runs. Run the `similar` API by hand if you want a check. |
+| Pipeline case `open-conversation` (`POST /cases/:caseId/open-conversation`) | Creates the single discussion thread of a pipeline case (one active per case). It is a conversation, not a work item, and a check would flag each reopened thread against its predecessor. |
+
+A test (`server/src/__tests__/issue-insert-paths.test.ts`) lists every direct insert into `issues` in the
+codebase and fails if a new one appears that is neither the issue service's create path nor one of these
+documented exemptions. It records every scored pair in `issue_duplicate_pairs`: both issue ids, the
 lexical score, the Jev probability, the verdict, the model id Jev reported, a SHA-256 of the exact
 input sent, and any later label. It stores **no issue text and no provider response**.
 
@@ -103,19 +123,32 @@ activity entry is written with it. Labelling writes `issue.duplicate_labeled`.
 
 ## Calibration
 
-Thresholds are hypotheses until measured. Export labelled pairs and run:
+Thresholds are hypotheses until measured. The script has two modes:
 
 ```sh
-pnpm --filter @paperclipai/server calibrate:duplicates pairs.json [--tier1-only] [--out report.json]
+# Offline: lexical tier only. No database, no key, nothing leaves the machine.
+pnpm --filter @paperclipai/server calibrate:duplicates pairs.json --tier1-only [--out report.json]
+
+# Tier 1 + Jev, for one company, through the production path.
+pnpm --filter @paperclipai/server calibrate:duplicates pairs.json --company-id <uuid> [--out report.json]
 ```
 
-`pairs.json` is `[{ "id"?, "a": {title, description?}, "b": {…}, "label": "duplicate" | "keep_both" | true | false }]`
-(see `server/scripts/fixtures/duplicate-pairs.sample.json`; that file is synthetic and only shows the
-format). The report lists precision and recall by threshold for tier 1 alone and for tier 1 + Jev, and
-whether precision at the 0.9 comment threshold meets the 0.9 target. It runs the production cascade, so
-prompts, truncation and abstain bands match. Use positives from confirmed duplicates and negatives from
-random same-project pairs plus near-miss pairs (siblings, recurring issues); negatives that are too easy
-inflate precision.
+- **`--tier1-only`** reads text from the file: `[{ "id"?, "a": {title, description?}, "b": {…}, "label" }]`
+  (see `server/scripts/fixtures/duplicate-pairs.sample.json`; that file is synthetic and only shows the format).
+- **`--company-id`** calibrates one company the same way production scores it. The company must already be
+  in `suggest` or `comment` mode (its informed opt-in). Each pair names two of **that company's** issues,
+  `[{ "id"?, "a": {"issueId"}, "b": {"issueId"}, "label" }]`; the script loads their stored text from the
+  database and ignores any text in the file, and it refuses the whole run if any id belongs to another company
+  or does not exist. The key is that company's own `AI_GATEWAY_API_KEY` secret, read through the same resolver
+  as the server and audited as `duplicate-calibration`; every call counts against that company's daily cap.
+  There is **no environment-variable key**. Run it where the instance's database and secrets are configured (the
+  server's environment); without a readable company secret it stops and says so.
+
+`label` is `"duplicate"`, `"keep_both"`, `"distinct"`, `true` or `false`. The report lists precision and recall
+by threshold for tier 1 alone and for tier 1 + Jev, and whether precision at the 0.9 comment threshold meets the
+0.9 target. It runs the production cascade, so prompts, truncation and abstain bands match. Use positives from
+confirmed duplicates and negatives from random same-project pairs plus near-miss pairs (siblings, recurring
+issues); negatives that are too easy inflate precision.
 
 ## Settings
 
@@ -145,13 +178,15 @@ content sent to an external model provider** (Vercel AI Gateway, then TypeSafe).
 - Per pair the request carries only: the new issue's title and description, and the candidate's title,
   description and status. Descriptions are redacted for secrets and cut to 1,500 characters. No ids,
   identifiers, names, comments, projects or attachments.
+- Redaction covers secret-like text only. **Personal data written into a title or description is sent as
+  written**, so opting in is a decision for the company's owner, made knowing that (see Turning it on).
 - The ledger keeps ids, scores and a hash, never text.
 - Jev is stateless here (one request per pair, no prior turns), so there is no context to clear.
 
 ## Limits
 
-- Company import (bulk insert) is not checked. Everything else that inserts through the issue service is.
-  That includes system-made issues (routines, watchdogs), so expect more checks and, in `comment` mode,
+- Company import, `worktree:merge-history --apply` and pipeline `open-conversation` are not checked (see the
+  table above). Everything that inserts through the issue service is. That includes system-made issues (routines, watchdogs), so expect more checks and, in `comment` mode,
   the occasional comment on a system issue. The bounded queue and the daily cap limit the load.
 - An issue created inside a transaction that is still open is retried at 1, 5 and 20 seconds until it is
   visible, then dropped. A rolled-back create is never checked.

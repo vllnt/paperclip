@@ -6,6 +6,9 @@ import {
   type JudgeQuestion,
 } from "../services/judge-client.js";
 
+// Test-only: this opt-in smoke test (never in CI) passes an explicit key from the environment to prove the
+// gateway call works. Production and the calibration script never read a process-wide key; they resolve
+// each company's own AI_GATEWAY_API_KEY secret (see duplicate-detection-factory.ts).
 const live = process.env.PAPERCLIP_JUDGE_LIVE_SMOKE === "1" && Boolean(process.env.AI_GATEWAY_API_KEY);
 
 const questions: Record<string, JudgeQuestion> = {

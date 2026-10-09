@@ -12,8 +12,11 @@ import {
   companySecretVersions,
   companySecrets,
   createDb,
+  issues,
+  judgeUsageDaily,
 } from "@paperclipai/db";
-import { createCompanySecretKeyResolver } from "../services/duplicate-detection-factory.js";
+import { parseLabelledPairRefs } from "../services/duplicate-calibration.js";
+import { createCompanySecretKeyResolver, prepareCompanyCalibration } from "../services/duplicate-detection-factory.js";
 import {
   JUDGE_API_KEY_SECRET_NAME,
   createJudgeClient,
@@ -50,6 +53,8 @@ describeEmbeddedPostgres("duplicate detection gateway keys come from company sec
     process.env.AI_GATEWAY_API_KEY = previousGatewayKey;
     if (previousGatewayKey === undefined) delete process.env.AI_GATEWAY_API_KEY;
     await db.delete(activityLog);
+    await db.delete(judgeUsageDaily);
+    await db.delete(issues);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
@@ -179,5 +184,89 @@ describeEmbeddedPostgres("duplicate detection gateway keys come from company sec
     const company = await seedCompany("Wrong name");
     await giveGatewayKey(company, "some-other-key", "SOME_OTHER_KEY");
     expect(await createCompanySecretKeyResolver(db)(company)).toBeUndefined();
+  });
+  describe("company-bound calibration (no environment key)", () => {
+    async function optIn(companyId: string, mode: "off" | "suggest" | "comment" = "suggest") {
+      await db.update(companies).set({ duplicateDetectionMode: mode }).where(eq(companies.id, companyId));
+    }
+
+    async function seedIssue(companyId: string, title: string, description: string | null = null) {
+      const id = randomUUID();
+      await db.insert(issues).values({ id, companyId, title, description, status: "todo" });
+      return id;
+    }
+
+    function refs(a: string, b: string, label: "duplicate" | "keep_both" = "duplicate") {
+      return parseLabelledPairRefs([
+        { a: { issueId: a, title: "IGNORED file text a" }, b: { issueId: b, title: "IGNORED file text b" }, label },
+      ]);
+    }
+
+    it("refuses a company that has not opted in, even with a key", async () => {
+      const company = await seedCompany("Off");
+      await giveGatewayKey(company, "gateway-key-for-Off");
+      const a = await seedIssue(company, "Remove the client compatibility barrels");
+      const b = await seedIssue(company, "Remove client compat barrels");
+      const setup = await prepareCompanyCalibration(db, company, refs(a, b));
+      expect(setup).toMatchObject({ ok: false });
+      if (!setup.ok) expect(setup.reason).toContain("off");
+    });
+
+    it("refuses issue ids that belong to another company, or do not exist", async () => {
+      const mine = await seedCompany("Mine");
+      const theirs = await seedCompany("Theirs");
+      await optIn(mine);
+      await giveGatewayKey(mine, "gateway-key-for-Mine");
+      const own = await seedIssue(mine, "Rotate the staging database credentials");
+      const foreign = await seedIssue(theirs, "Rotate the staging database credentials now");
+
+      const crossCompany = await prepareCompanyCalibration(db, mine, refs(own, foreign));
+      expect(crossCompany).toMatchObject({ ok: false });
+      if (!crossCompany.ok) expect(crossCompany.reason).toContain(foreign);
+
+      const unknown = randomUUID();
+      expect(await prepareCompanyCalibration(db, mine, refs(own, unknown))).toMatchObject({ ok: false });
+    });
+
+    it("refuses a company without its own secret, even when a process-wide key is set", async () => {
+      process.env.AI_GATEWAY_API_KEY = "process-wide-key-must-not-be-used";
+      const company = await seedCompany("No secret");
+      await optIn(company);
+      const a = await seedIssue(company, "Fix the flaky checkout timeout test");
+      const b = await seedIssue(company, "Fix flaky checkout timeouts test");
+      const setup = await prepareCompanyCalibration(db, company, refs(a, b));
+      expect(setup).toMatchObject({ ok: false });
+      if (!setup.ok) expect(setup.reason).toContain(JUDGE_API_KEY_SECRET_NAME);
+    });
+
+    it("rejects a malformed company id and an export without issue ids", async () => {
+      expect(await prepareCompanyCalibration(db, "not-a-uuid", [])).toMatchObject({ ok: false });
+      expect(() => parseLabelledPairRefs([{ a: { title: "x" }, b: { title: "y" }, label: true }])).toThrow();
+    });
+
+    it("scores stored company text with the company's own key and counts against its cap", async () => {
+      const company = await seedCompany("Calibrate");
+      const other = await seedCompany("Other");
+      await optIn(company, "comment");
+      await giveGatewayKey(company, "gateway-key-for-Calibrate");
+      await giveGatewayKey(other, "gateway-key-for-Other");
+      const a = await seedIssue(company, "Enforce PR assignee and GitHub issue linkage", "Every PR needs an assignee.");
+      const b = await seedIssue(company, "Require assignee and linked issue on every pull request");
+      const { used, transportFor } = recordingTransports();
+
+      const setup = await prepareCompanyCalibration(db, company, refs(a, b), { transportFor });
+      expect(setup.ok).toBe(true);
+      if (!setup.ok) return;
+      expect(setup.pairs).toHaveLength(1);
+      expect(setup.pairs[0]?.a.title).toBe("Enforce PR assignee and GitHub issue linkage");
+      expect(setup.pairs[0]?.a.description).toBe("Every PR needs an assignee.");
+      expect(JSON.stringify(setup.pairs)).not.toContain("IGNORED");
+
+      expect((await ask(setup.judge, company)).ok).toBe(true);
+      expect([...used.keys()]).toEqual(["gateway-key-for-Calibrate"]);
+      const [usage] = await db.select().from(judgeUsageDaily).where(eq(judgeUsageDaily.companyId, company));
+      expect(usage?.calls).toBe(1);
+      expect(await db.select().from(judgeUsageDaily).where(eq(judgeUsageDaily.companyId, other))).toHaveLength(0);
+    });
   });
 });

@@ -62,6 +62,40 @@ export function parseLabelledPairs(json: unknown): LabelledPair[] {
     }));
 }
 
+const labelledPairRefSchema = z.object({
+  id: z.string().optional(),
+  a: z.object({ issueId: z.string().uuid() }).passthrough(),
+  b: z.object({ issueId: z.string().uuid() }).passthrough(),
+  label: labelSchema,
+});
+
+/** A labelled pair named by issue ids. The text is loaded from the company's own issues, never the file. */
+export interface LabelledPairRef {
+  id: string;
+  aIssueId: string;
+  bIssueId: string;
+  duplicate: boolean;
+}
+
+/**
+ * Validates a labelled export for model calibration: `[{ id?, a: {issueId}, b: {issueId}, label }]`.
+ * Every side must name an issue id. Any title or description in the file is ignored, so the text sent
+ * to the gateway is always the company's stored issue text.
+ * @throws ZodError with the path of the first bad entry.
+ */
+export function parseLabelledPairRefs(json: unknown): LabelledPairRef[] {
+  return z
+    .array(labelledPairRefSchema)
+    .min(1)
+    .parse(json)
+    .map((entry, index) => ({
+      id: entry.id ?? `pair-${index + 1}`,
+      aIssueId: entry.a.issueId,
+      bIssueId: entry.b.issueId,
+      duplicate: entry.label,
+    }));
+}
+
 export interface LexicalFeatures {
   titleSimilarity: number;
   descriptionSimilarity: number;
