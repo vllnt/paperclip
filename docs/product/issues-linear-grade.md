@@ -50,32 +50,32 @@ Columns: Linear · GitHub Issues + Projects v2 · Jira · Shortcut · Plane · G
 
 | Capability | Linear | GitHub | Jira | Shortcut | Plane | GitLab | Paperclip today |
 |---|---|---|---|---|---|---|---|
-| Sub-issues | ● | ● † | ● | ● | ● | ● | ● `parentId`; no depth cap |
-| Blocks / blocked-by | ● | ◐ † | ● | ● | ● † | ◐ Premium | ● `blockedByIssueIds`, cycle checks |
-| Duplicate / related | ● † | ◐ † | ● | ○ | ◐ | ◐ relates | ○ (create-time dedup; #40 open) |
-| Per-team or project workflows | ● † | ◐ † | ● | ● | ● | ◐ scoped labels | ○ fixed 7 statuses |
-| Priority | ● † | ◐ field | ● | ? | ● | ◐ | ● 4 levels |
-| Estimates | ● † | ◐ field | ● | ? | ● | ● | ○ |
-| Labels | ● † | ● | ● | ● | ● | ● scoped | ◐ company-level, no edit |
-| Due dates | ● † | ◐ field | ● | ? | ● | ● | ○ |
-| Custom fields | ○ † | ● | ● | ? | ● | ◐ | ○ |
+| Sub-issues | ● | ● 8 levels, 100 each | ● | ● | ● | ● | ● `parentId`; no depth cap |
+| Blocks / blocked-by | ● | ● | ● | ● | ● † | ◐ Premium | ● `blockedByIssueIds`, cycle checks |
+| Duplicate / related | ● † | ◐ "duplicate of" comment | ● | ○ | ◐ | ◐ relates | ○ (create-time dedup; #40 open) |
+| Per-team or project workflows | ● per team, 5 categories + Triage | ◐ Projects Status field | ● | ● | ● | ◐ scoped labels | ○ fixed 7 statuses |
+| Priority | ● † | ◐ org issue field (preview) | ● | ? | ● | ◐ | ● 4 levels |
+| Estimates | ● † | ◐ Effort field | ● | ? | ● | ● | ○ |
+| Labels | ● groups | ● | ● | ● | ● | ● scoped | ◐ company-level, no edit |
+| Due dates | ● † | ◐ Target date field | ● | ? | ● | ● | ○ |
+| Custom fields | ○ † | ● typed, searchable | ● | ? | ● | ◐ | ○ |
 
 ### B. Planning
 
 | Capability | Linear | GitHub | Jira | Shortcut | Plane | GitLab | Paperclip today |
 |---|---|---|---|---|---|---|---|
 | Projects | ● | ● | ● | ● | ● | ● | ● (`leadAgentId` stored, unused) |
-| Cycles / sprints | ● † | ◐ iteration field | ● | ● | ● | ● | ○ |
-| Milestones | ● † | ● | ● versions | ◐ | ◐ modules | ● | ○ |
-| Roadmap / initiatives | ● † | ◐ | ● | ● | ● | ● | ◐ goals hierarchy |
+| Cycles / sprints | ● | ◐ iteration field | ● | ● | ● | ● | ○ |
+| Milestones | ● per project | ● per repo | ● versions | ◐ | ◐ modules | ● | ○ |
+| Roadmap / initiatives | ● | ◐ roadmap layout, no initiatives | ● | ● | ● | ● | ◐ goals hierarchy |
 
 ### C. Intake and automation
 
 | Capability | Linear | GitHub | Jira | Shortcut | Plane | GitLab | Paperclip today |
 |---|---|---|---|---|---|---|---|
-| Triage inbox | ● † | ○ | ◐ JSM intake | ○ | ● separate Triage state | ◐ Service Desk | ○ |
-| Templates / forms | ● † | ● issue forms | ● | ? | ● | ● | ○ |
-| Recurring issues | ● † | ○ | ● scheduled rule | ? | ● | ○ | ● routines |
+| Triage inbox | ● accept, decline, duplicate, snooze | ○ | ◐ JSM intake | ○ | ● separate Triage state | ◐ Service Desk | ○ |
+| Templates / forms | ● | ● issue forms (preview) | ● | ? | ● | ● | ○ |
+| Recurring issues | ● | ○ | ● scheduled rule | ? | ● | ○ | ● routines |
 | SLAs | ◐ † | ○ | ● JSM | ○ | ○ | ◐ † | ○ |
 | Rules engine | ◐ triage rules | ◐ Projects workflows | ● | ◐ | ● | ◐ triage bot | ◐ plugin sync rules |
 
@@ -93,8 +93,8 @@ Columns: Linear · GitHub Issues + Projects v2 · Jira · Shortcut · Plane · G
 
 | Capability | Linear | GitHub | Jira | Shortcut | Plane | GitLab | Paperclip today |
 |---|---|---|---|---|---|---|---|
-| Copy branch name | ● user/key-title | ◐ "Create a branch" links it | ● dev panel | ● `sc-<id>` | ? | ● `%{id}-%{title}`, editable | ◐ agent workspaces only |
-| Auto-link by branch name | ● | ○ | ● key in branch | ● | ? | ● `123-` prefix | ○ |
+| Copy branch name | ● shortcut, format setting; optional assign-me + start | ● `gh issue develop`, sidebar | ● dev panel | ● `sc-<id>` | ? | ● `%{id}-%{title}`, editable | ◐ agent workspaces only |
+| Auto-link by branch name | ● | ◐ only branches made from the issue | ● key in branch | ● | ? | ● `123-` prefix | ○ |
 | Auto-link by PR title/body | ● | ◐ keywords only | ● title | ● title, body, comments | ● `[KEY]` | ● MR description | ○ |
 | Magic words | ● fixes, closes, resolves, completes, implements; refs, part of | ● close/fix/resolve + forms | ◐ smart commits `#done` | ◐ | ◐ brackets | ● close, fix, resolve, implement | ○ |
 | Status on PR open / merge / close | ● per team, per target branch (regex) | ◐ close on merge to default; Projects workflows | ● Automation rules | ● event handlers | ● incl. closed-without-merge | ◐ close on merge to default only | ○ |
@@ -106,8 +106,8 @@ Columns: Linear · GitHub Issues + Projects v2 · Jira · Shortcut · Plane · G
 
 | Capability | Linear | GitHub | Jira | Shortcut | Plane | GitLab | Paperclip today |
 |---|---|---|---|---|---|---|---|
-| Project or component default assignee | ◐ team triage owner | ○ | ● lead / component lead | ○ | ● default + intake owner | ○ | ◐ lead stored, unused |
-| Round-robin, load-balanced rules | ● Business † | ○ | ● | ○ | ◐ | ◐ triage bot | ◐ plugin rules, GitHub-origin only |
+| Project or component default assignee | ○ (templates, triage owner) | ○ | ● lead / component lead | ○ | ● default + intake owner | ○ | ◐ lead stored, unused |
+| Round-robin, load-balanced rules | ◐ triage responsibility + rules; no round-robin documented | ○ | ● | ○ | ◐ | ◐ triage bot | ◐ plugin rules, GitHub-origin only |
 | Capacity or model aware | ○ | ○ | ◐ JSM, humans | ○ | ○ | ○ | ◐ `maxConcurrentRuns` unused for routing |
 | Agent as assignee | ● delegate | ● Copilot | ● Rovo | ◐ | ● | ● Duo | ● native (checkout, runs, policy) |
 | Human stays accountable | ● assignee + delegate | ◐ | ◐ | ? | ? | ? | ◐ `responsibleUserId` |
@@ -119,9 +119,9 @@ Columns: Linear · GitHub Issues + Projects v2 · Jira · Shortcut · Plane · G
 | Analytics | ● | ◐ Projects charts | ● | ● cycle/lead time | ● | ◐ | ○ for issues (cost and run stats only) |
 | Public API | ● GraphQL | ● REST + GraphQL | ● REST | ● REST v3 | ● | ● | ● REST + runtime OpenAPI |
 | Webhooks | ● signed | ● signed | ◐ API ones expire in 30 days | ● † | ● signed | ● † | ◐ plugin events, routine triggers |
-| Official MCP | ● † | ● † | ● remote | ● hosted | ● MIT | ● GA 19.5 | ◐ no work-product/label/relation tools |
-| CLI | ○ | ● `gh` | ● `acli` | ? | ? | ● `glab` † | ◐ no relations or label assignment |
-| GitHub Issues sync | ● † | n/a | ○ | ○ | ● two-way | ◐ † | ◐ title/body/state, polled |
+| Official MCP | ● | ● | ● remote | ● hosted | ● MIT | ● GA 19.5 | ◐ no work-product/label/relation tools |
+| CLI | ○ (importer only) | ● `gh` | ● `acli` | ? | ? | ● `glab` † | ◐ no relations or label assignment |
+| GitHub Issues sync | ● one- or two-way, new issues | n/a | ○ | ○ | ● two-way | ◐ † | ◐ title/body/state, polled |
 
 ### What Paperclip has that none of these do
 
@@ -316,11 +316,11 @@ numbers are anchored by the production image build).
 | # | Slice | Contents | Unlocks |
 |---|---|---|---|
 | 1 | Git links | Branch name; PR auto-link (explicit, Cloud relay, plugin poll); guarded status automation, dark by default; API, OpenAPI, CLI, MCP, web | Leave GitHub Issues for PR tracking |
-| 2 | Git depth | Per-project automation config, target branches, draft handling; commit and trailer linking; checks and review state in the panel; re-check when a run ends; unique index on a new link table | Trust to turn automation on everywhere |
+| 2 | Git depth | Per-project automation config, target branches with regex and a "no action" override (Linear), draft handling; commit and trailer linking; checks and review state in the panel; "ready for merge" state; re-check when a run ends; optional "copy branch also assigns me and starts the task" (Linear's personal toggle); unique index on a new link table | Trust to turn automation on everywhere |
 | 3 | Auto-assignment | Project assignment settings; lead default; rules; capacity and model aware pools; override semantics | No manual hand-off |
 | 4 | Intake and triage | Triage queue, templates and forms, due dates and SLAs, duplicate detection (#40), GitHub issues into triage | Real intake |
 | 5 | GitHub Issues bypass | Adopt and migrate mirrors, one-way publish, Projects field mapping | Retire GitHub Issues |
-| 6 | Planning | Estimates, cycles, milestones, related/duplicate relations, status categories per project | Plan work |
+| 6 | Planning | Estimates, due dates, cycles, milestones, related/duplicate relations, typed searchable fields (GitHub issue fields), status categories per project | Plan work |
 | 7 | Views and daily use | Shared views, query syntax, command palette, subscriptions, email and push | Human comfort |
 | 8 | Insights | Cycle time, throughput, burn-up, agent and human load | Measure |
 
@@ -359,8 +359,8 @@ slice 1 adds its own CLI file), #40 (migration 0296: slice 1 adds none), #29 and
 
 ## Appendix: sources (fetched 2026-10-09)
 
-- Linear: https://linear.app/docs/github · https://linear.app/developers/agents · https://linear.app/docs/assigning-issues
-- GitHub: https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue · https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api
+- Linear: https://linear.app/docs/github · https://linear.app/docs/code-and-reviews · https://linear.app/docs/triage · https://linear.app/docs/assigning-issues · https://linear.app/developers/agents · https://linear.app/developers/webhooks
+- GitHub: https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue · https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/creating-a-branch-for-an-issue · https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api
 - Jira: https://support.atlassian.com/jira-cloud-administration/docs/use-the-github-for-jira-app/ · https://support.atlassian.com/cloud-automation/docs/jira-automation-actions/
 - Shortcut: https://www.shortcut.com/help/integrations/github/
 - Plane: https://docs.plane.so/integrations/github · https://docs.plane.so/core-concepts/intake
