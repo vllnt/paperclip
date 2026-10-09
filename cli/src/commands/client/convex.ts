@@ -33,6 +33,7 @@ interface DeploymentRow {
 interface ReaperProject {
   name: string;
   previews: number;
+  ciMatched?: number;
   delete: Array<{ name: string; reason: string }>;
   deleted: string[];
   setExpiry: unknown[];
@@ -72,6 +73,7 @@ function printReport(report: ReaperReport) {
   for (const project of report.projects) {
     const names = report.dryRun ? project.delete.map(item => item.name) : project.deleted;
     console.log(`${project.name}: ${project.previews} previews, ${report.dryRun ? "would delete" : "deleted"} ${names.length}, expiry ${report.dryRun ? "to set" : "set"} ${report.dryRun ? project.setExpiry.length : project.expirySet.length}, kept ${project.kept}`);
+    if (project.ciMatched !== undefined) console.log(`  CI template matched ${project.ciMatched} of ${project.previews} previews`);
     for (const item of project.delete) console.log(`  ${report.dryRun ? "would delete" : "delete"} ${item.name}: ${item.reason}`);
     for (const item of project.failed) console.log(pc.red(`  failed ${item.name}: ${item.error}`));
     for (const item of project.skipped) console.log(pc.dim(`  skipped ${item.name}: ${item.reason}`));

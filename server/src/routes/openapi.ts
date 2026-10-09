@@ -8943,6 +8943,7 @@ registry.register("ConvexReaperReport", z.object({
   dryRun: z.boolean(),
   projects: z.array(z.object({
     convexProjectId: z.string(), name: z.string(), previews: z.number(), kept: z.number(),
+    ciMatched: z.number().optional().describe("Previews the company's CI preview template matched; absent without a template"),
     delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
     setExpiry: z.array(z.object({ name: z.string(), from: z.number().nullable(), to: z.number() })),
     deleted: z.array(z.string()), expirySet: z.array(z.string()),

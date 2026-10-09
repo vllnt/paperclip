@@ -21,7 +21,7 @@ const status = {
 const report = {
   at: "2026-10-09T12:00:00.000Z", trigger: "schedule", dryRun: true, errors: [],
   quota: { count: 250, quota: 300, percent: 83.3, partial: false, alert: true },
-  projects: [{ convexProjectId: "100", name: "app", previews: 12, delete: [{ name: "old-1", previewIdentifier: "old-1", reason: "closed" }], setExpiry: [], kept: 11, deleted: [], expirySet: [], failed: [], skipped: [],
+  projects: [{ convexProjectId: "100", name: "app", previews: 12, ciMatched: 9, delete: [{ name: "old-1", previewIdentifier: "old-1", reason: "closed" }], setExpiry: [], kept: 11, deleted: [], expirySet: [], failed: [], skipped: [],
     dev: { listed: 9, delete: [{ name: "dev-old", previewIdentifier: "dev/ship-1", reason: "dev deployment unused for 12 days (limit 7)" }], deleted: [], kept: 8, failed: [], skipped: [], executed: false } }],
 };
 
@@ -37,6 +37,7 @@ describe("Convex settings page", () => {
     expect(screen.getByText(/Dry run: reports what it would do/)).toBeTruthy();
     expect(screen.getByLabelText("Last reaper report").textContent).toMatch(/250.*of 300.*83\.3%/);
     expect(screen.getByText(/at or above the alert threshold/)).toBeTruthy();
+    expect(screen.getByLabelText("Last reaper report").textContent).toMatch(/CI template matched 9 of 12 previews/);
     expect(screen.getByLabelText("Last reaper report").textContent).toMatch(/Dev deployments.*9 listed.*1 would be deleted/s);
     expect(document.body.textContent).not.toMatch(/secret_ref|secretId|token value/i);
   });

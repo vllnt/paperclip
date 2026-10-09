@@ -721,7 +721,7 @@ describe("openapi routes", () => {
       expect(spec.components.schemas[name], name).toBeDefined();
     }
     const report = JSON.stringify(spec.components.schemas.ConvexReaperReport);
-    for (const field of ["dev", "executed", "listed"]) expect(report, field).toContain(`"${field}"`);
+    for (const field of ["dev", "executed", "listed", "ciMatched"]) expect(report, field).toContain(`"${field}"`);
     expect(JSON.stringify(spec.components.schemas).toLowerCase()).not.toMatch(/"(token|secret|secretid|privatekey)"\s*:/);
   });
 

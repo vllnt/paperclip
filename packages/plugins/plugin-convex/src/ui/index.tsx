@@ -94,6 +94,7 @@ function ReaperReportView({ report }: { report: ReaperReport | null }) {
       <thead><tr><th>Project</th><th>Previews</th><th>{report.dryRun ? "Would delete" : "Deleted"}</th><th>Expiry set</th><th>Kept</th><th>Issues</th></tr></thead>
       <tbody>{report.projects.map(project => <ProjectRow key={project.convexProjectId} project={project} dryRun={report.dryRun} />)}</tbody>
     </table>
+    {report.projects.some(project => project.ciMatched !== undefined) ? <p className="pcx-note">{report.projects.filter(project => project.ciMatched !== undefined).map(project => `${project.name}: CI template matched ${project.ciMatched} of ${project.previews} previews`).join(" · ")}</p> : null}
     {report.projects.some(project => project.dev) ? <div>
       <h3>Dev deployments</h3>
       {report.projects.map(project => project.dev ? <p key={project.convexProjectId} className={project.dev.error || project.dev.failed.length ? "pcx-error" : undefined}>
