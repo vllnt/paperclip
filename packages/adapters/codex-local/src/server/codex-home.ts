@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { createPaperclipTempDir, removePaperclipTempDir } from "@paperclipai/adapter-utils/paperclip-temp";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
 
@@ -579,8 +580,8 @@ export async function stageCodexHomeForSync(
   options: StageCodexHomeForSyncOptions = {},
 ): Promise<string> {
   const runIdPart = nonEmpty(options.runId ?? undefined);
-  const stagedHome = await fs.mkdtemp(
-    path.join(os.tmpdir(), `paperclip-codex-home-sync-${runIdPart ? `${runIdPart}-` : ""}`),
+  const stagedHome = await createPaperclipTempDir(
+    `paperclip-codex-home-sync-${runIdPart ? `${runIdPart}-` : ""}`,
   );
   try {
     for (const entry of CODEX_SYNC_ALLOWLIST) {
@@ -590,7 +591,7 @@ export async function stageCodexHomeForSync(
   } catch (error) {
     // Fail-closed: never hand back a partial home. Remove the temp dir we
     // created before propagating the failure.
-    await fs.rm(stagedHome, { recursive: true, force: true }).catch(() => {});
+    await removePaperclipTempDir(stagedHome).catch(() => {});
     throw error;
   }
 }

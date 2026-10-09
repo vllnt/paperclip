@@ -76,6 +76,8 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  tempSweepMaxAgeHours: number;
+  tempSweepIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -289,6 +291,23 @@ export function loadConfig(): Config {
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
       : 7;
+  // The temp sweep removes per-run temp entries that a dead process left in
+  // the OS temp directory once no process has changed them for this many
+  // hours. Values below 1 use 1; a non-positive or non-numeric value uses 2.
+  const tempSweepMaxAgeHoursEnv = process.env.PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS?.trim();
+  const tempSweepMaxAgeHoursRaw = Number(tempSweepMaxAgeHoursEnv);
+  const tempSweepMaxAgeHours =
+    tempSweepMaxAgeHoursEnv && Number.isFinite(tempSweepMaxAgeHoursRaw) && tempSweepMaxAgeHoursRaw > 0
+      ? Math.max(tempSweepMaxAgeHoursRaw, 1)
+      : 2;
+  // The sweep also runs on this period. 0 sweeps on startup only; a negative or
+  // non-numeric value uses 60.
+  const tempSweepIntervalMinutesEnv = process.env.PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES?.trim();
+  const tempSweepIntervalMinutesRaw = Number(tempSweepIntervalMinutesEnv);
+  const tempSweepIntervalMinutes =
+    tempSweepIntervalMinutesEnv && Number.isFinite(tempSweepIntervalMinutesRaw) && tempSweepIntervalMinutesRaw >= 0
+      ? tempSweepIntervalMinutesRaw
+      : 60;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -335,6 +354,8 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    tempSweepMaxAgeHours,
+    tempSweepIntervalMinutes,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

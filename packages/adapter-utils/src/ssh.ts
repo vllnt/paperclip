@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import {
   createUnrelatedHistoryGraftCommit,
   commitTreeWithSyncIdentity,
@@ -359,27 +360,36 @@ async function resolveCommandPath(command: string): Promise<string | null> {
   }
 }
 
+// The file lives alone in a fresh `0700` directory, created with `mode`.
 async function withTempFile(
   prefix: string,
   contents: string,
   mode: number,
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const dir = await createPaperclipTempDir(prefix);
+  const cleanup = async () => {
+    await removePaperclipTempDir(dir).catch(() => undefined);
+  };
   const filePath = path.join(dir, "payload");
   const normalizedContents = contents.endsWith("\n") ? contents : `${contents}\n`;
-  await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8" });
-  return {
-    path: filePath,
-    cleanup: async () => {
-      await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
-    },
-  };
+  try {
+    await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { path: filePath, cleanup };
 }
 
 async function createSshAuthArgs(
   config: Pick<SshConnectionConfig, "privateKey" | "knownHosts" | "strictHostKeyChecking">,
 ): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
+  // Run in order. The private key is created last and placed first, so
+  // cleanup removes it before anything else.
   const tempFiles: Array<() => Promise<void>> = [];
+  const cleanup = async () => {
+    for (const removeTempFile of tempFiles) await removeTempFile();
+  };
   const sshArgs = [
     "-o",
     "BatchMode=yes",
@@ -389,28 +399,28 @@ async function createSshAuthArgs(
     `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,
   ];
 
-  if (config.strictHostKeyChecking) {
-    if (config.knownHosts) {
-      const knownHosts = await withTempFile("paperclip-ssh-known-hosts-", config.knownHosts, 0o600);
-      tempFiles.push(knownHosts.cleanup);
-      sshArgs.push("-o", `UserKnownHostsFile=${knownHosts.path}`);
+  try {
+    if (config.strictHostKeyChecking) {
+      if (config.knownHosts) {
+        const knownHosts = await withTempFile("paperclip-ssh-known-hosts-", config.knownHosts, 0o600);
+        tempFiles.push(knownHosts.cleanup);
+        sshArgs.push("-o", `UserKnownHostsFile=${knownHosts.path}`);
+      }
+    } else {
+      sshArgs.push("-o", "UserKnownHostsFile=/dev/null");
     }
-  } else {
-    sshArgs.push("-o", "UserKnownHostsFile=/dev/null");
+
+    if (config.privateKey) {
+      const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
+      tempFiles.unshift(privateKey.cleanup);
+      sshArgs.push("-i", privateKey.path);
+    }
+  } catch (error) {
+    await cleanup();
+    throw error;
   }
 
-  if (config.privateKey) {
-    const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
-    tempFiles.push(privateKey.cleanup);
-    sshArgs.push("-i", privateKey.path);
-  }
-
-  return {
-    args: sshArgs,
-    cleanup: async () => {
-      await Promise.all(tempFiles.map((cleanup) => cleanup()));
-    },
-  };
+  return { args: sshArgs, cleanup };
 }
 
 function tarExcludeArgs(exclude: string[] | undefined): string[] {
@@ -819,7 +829,7 @@ async function importGitWorkspaceToSsh(input: {
   snapshot: LocalGitWorkspaceSnapshot;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
-  const bundleDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-bundle-"));
+  const bundleDir = await createPaperclipTempDir("paperclip-ssh-bundle-");
   const bundlePath = path.join(bundleDir, "workspace.bundle");
   // Per-import unique ref so concurrent imports against the same local repo
   // can't race on `update-ref` between this run's update and bundle create.
@@ -892,7 +902,7 @@ async function importGitWorkspaceToSsh(input: {
       timeout: 10_000,
       maxBuffer: 16 * 1024,
     }).catch(() => undefined);
-    await fs.rm(bundleDir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(bundleDir).catch(() => undefined);
   }
 }
 
@@ -904,7 +914,7 @@ async function exportGitWorkspaceFromSsh(input: {
   resetLocalWorkspace?: boolean;
   onProgress?: RuntimeProgressSink;
 }): Promise<string> {
-  const bundleDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-bundle-"));
+  const bundleDir = await createPaperclipTempDir("paperclip-ssh-bundle-");
   const bundlePath = path.join(bundleDir, "workspace.bundle");
   const importedRef = input.importedRef ?? `refs/paperclip/ssh-sync/imported/${randomUUID()}`;
 
@@ -967,7 +977,7 @@ async function exportGitWorkspaceFromSsh(input: {
         maxBuffer: 16 * 1024,
       }).catch(() => undefined);
     }
-    await fs.rm(bundleDir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(bundleDir).catch(() => undefined);
   }
 }
 
@@ -1657,7 +1667,7 @@ export async function syncDirectoryFromSsh(input: {
   progressLabel?: string;
 }): Promise<void> {
   // Stage first so a failed transfer never clears `localDir`.
-  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+  const stagingDir = await createPaperclipTempDir("paperclip-ssh-sync-back-");
   try {
     await extractDirectoryFromSsh({
       spec: input.spec,
@@ -1670,7 +1680,7 @@ export async function syncDirectoryFromSsh(input: {
     await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
     await copyDirectoryContents(stagingDir, input.localDir);
   } finally {
-    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(stagingDir).catch(() => undefined);
   }
 }
 
@@ -1735,10 +1745,10 @@ export async function restoreWorkspaceFromSshExecution(input: {
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   if (input.baselineSnapshot) {
-    const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
       : null;
+    const stagingDir = await createPaperclipTempDir("paperclip-ssh-sync-back-");
     try {
       const importedHead = input.restoreGitHistory
         ? await exportGitWorkspaceFromSsh({
@@ -1789,7 +1799,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
           maxBuffer: 16 * 1024,
         }).catch(() => undefined);
       }
-      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+      await removePaperclipTempDir(stagingDir).catch(() => undefined);
     }
     return;
   }

@@ -1483,6 +1483,14 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS=<hours>` sets the age at which the temp
+  sweep removes a per-run temp entry (`paperclip-ssh-key-*`,
+  `paperclip-ssh-sync-back-*`, `paperclip-workspace-baseline-*`, and similar)
+  that a dead process left in the OS temp directory. The default is `2`; values
+  below `1` use `1`. The sweep runs on startup, never removes an entry a live run
+  holds, and logs `event: "paperclip_tmp_sweep"` with the count and bytes freed.
+- `PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES=<minutes>` sets how often the temp sweep
+  runs after startup. The default is `60`. A value of `0` sweeps on startup only.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,
