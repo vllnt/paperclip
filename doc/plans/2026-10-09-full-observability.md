@@ -222,7 +222,7 @@ improves (`schema_version`) without touching the operational row; (d) it keeps a
 indexes off the hottest table, where every run event already rewrites the row.
 
 Columns (about 40). Every text column is either a closed enum (values outside the set map
-to `other`) or an identifier restricted to `[a-z0-9_.:@-]`, at most 80 characters. No
+to `other`) or an identifier restricted to `[a-z0-9_.:@/+-]`, at most 80 characters. No
 free text, no hashes.
 
 - **Keys:** `run_id` (PK), `company_id` (FK, leads every index), `agent_id`, `issue_id`, `project_id`, `routine_id`. No FKs to agents or runs: this is an analytics fact and must survive agent deletion.
