@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isUniqueViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isInvalidTextRepresentation, isUniqueViolation } from "../db-errors.js";
 
 const CONSTRAINT = "issues_open_routine_execution_uq";
 
@@ -47,5 +47,24 @@ describe("isUniqueViolation", () => {
     const looped: { cause?: unknown } = {};
     looped.cause = looped;
     expect(isUniqueViolation(looped, CONSTRAINT)).toBe(false);
+  });
+});
+
+describe.each([
+  ["isInvalidTextRepresentation", isInvalidTextRepresentation, "22P02"],
+  ["isForeignKeyViolation", isForeignKeyViolation, "23503"],
+] as const)("%s", (_name, matches, code) => {
+  it("matches the code on the error itself and through Drizzle's cause", () => {
+    expect(matches({ code })).toBe(true);
+    expect(matches(new Error("Failed query: select 1", { cause: { code } }))).toBe(true);
+  });
+
+  it("ignores other codes, non-objects, and self-referential chains", () => {
+    expect(matches({ code: "23505" })).toBe(false);
+    expect(matches(code)).toBe(false);
+    expect(matches(null)).toBe(false);
+    const looped: { cause?: unknown } = {};
+    looped.cause = looped;
+    expect(matches(looped)).toBe(false);
   });
 });
