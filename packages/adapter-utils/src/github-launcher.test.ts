@@ -1030,26 +1030,41 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     // the last moment, as the child starts (after every check the launcher makes), and records the child's arguments and
     // environment.
     // `privateConfig` is text appended to the push child's own private git config as it starts, after chmod (a plain write is
-    // tried first and its outcome kept in private.json).
-    async function childShim(r: GithubLike, actions: string[][] = [], privateConfig = "") {
+    // tried first and its outcome kept in private.json). `listing` is for the read of GitHub's branches (`git ls-remote`): its
+    // actions run once, right after the first read, and `fail` makes every read fail.
+    async function childShim(r: GithubLike, actions: string[][] = [], privateConfig = "", listing: { actions?: string[][]; fail?: boolean } = {}) {
       const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
       const dir = path.join(r.root, "real");
-      await writeFile(path.join(dir, "plan.json"), JSON.stringify({ repo: r.repo, actions, privateConfig }));
+      await writeFile(path.join(dir, "plan.json"), JSON.stringify({ repo: r.repo, actions, privateConfig, listing }));
       await writeFile(path.join(dir, "git"), `#!/usr/bin/env node
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const REAL = ${JSON.stringify(realGit)};
 const args = process.argv.slice(2);
+const plan = JSON.parse(fs.readFileSync(path.join(__dirname, "plan.json"), "utf8"));
+const act = list => {
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  for (const key of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|CONFIG_(COUNT|KEY_.*|VALUE_.*))$/.test(key)) delete env[key];
+  for (const action of list) spawnSync(REAL, action, { cwd: plan.repo, env, stdio: "ignore" });
+};
+if (args.includes("ls-remote")) {
+  if (plan.listing.fail) process.exit(128);
+  const listed = spawnSync(REAL, args, { encoding: "utf8" });
+  const read = path.join(__dirname, "listing.done");
+  if ((plan.listing.actions || []).length && !fs.existsSync(read)) {
+    fs.writeFileSync(read, "1");
+    act(plan.listing.actions);
+  }
+  process.stdout.write(listed.stdout);
+  process.exit(listed.status === null ? 1 : listed.status);
+}
 if (args.includes("push")) {
   fs.appendFileSync(path.join(__dirname, "child.jsonl"), JSON.stringify({ args, env: process.env, cwd: process.cwd() }) + "\\n");
   const done = path.join(__dirname, "plan.done");
   if (!fs.existsSync(done)) {
     fs.writeFileSync(done, "1");
-    const plan = JSON.parse(fs.readFileSync(path.join(__dirname, "plan.json"), "utf8"));
-    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
-    for (const key of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|CONFIG_(COUNT|KEY_.*|VALUE_.*))$/.test(key)) delete env[key];
-    for (const action of plan.actions) spawnSync(REAL, action, { cwd: plan.repo, env, stdio: "ignore" });
+    act(plan.actions);
     if (plan.privateConfig && process.env.GIT_DIR) {
       const file = path.join(process.env.GIT_DIR, "config");
       let plain = "written";
@@ -1200,7 +1215,96 @@ process.exit(result.status === null ? 1 : result.status);
       child = (await shim.children()).at(-1)!;
       expect(child.args).toContain(`--force-with-lease=refs/heads/feature/x:${again}`);
       expect(r.onGitHub("feature/x")).toBe(third);
+      // A name that this checkout resolves is accepted when GitHub lists the same commit, and the child is given that commit.
+      r.git("commit", "--amend", "--allow-empty", "-m", "once more");
+      const fourth = r.tip();
+      expect((await r.push("--force-with-lease=feature/x:origin/feature/x", "origin", "feature/x")).code).toBe(0);
+      child = (await shim.children()).at(-1)!;
+      expect(child.args).toContain(`--force-with-lease=refs/heads/feature/x:${third}`);
+      expect(r.onGitHub("feature/x")).toBe(fourth);
     }, 120_000);
+
+    // Review r6: the expected commit of a lease that comes out of this checkout's refs is tied to what GitHub lists. Someone
+    // else's commit `elsewhere` is on GitHub's feature/x by the time the push runs; a push that is not a descendant of it
+    // would replace it, if the checkout's remote-tracking ref (the agent's to write) could say that was the expected commit.
+    async function elsewhere(r: GithubLike) {
+      r.git("checkout", "-q", "-b", "elsewhere", "main");
+      await r.write("else.ts", "e\n");
+      r.git("add", ".");
+      r.git("commit", "-m", "elsewhere");
+      const commit = r.tip();
+      r.git("push", "origin", "elsewhere");
+      r.git("checkout", "-q", "feature/x");
+      return commit;
+    }
+    const movedTo = (r: GithubLike, commit: string) => [["-C", r.bare, "update-ref", "refs/heads/feature/x", commit], ["update-ref", "refs/remotes/origin/feature/x", commit]];
+
+    it.each([
+      ["a lease without a value", ["--force-with-lease"]],
+      ["a lease for the ref", ["--force-with-lease=feature/x"]],
+      ["a lease named by a remote-tracking ref", ["--force-with-lease=feature/x:origin/feature/x"]],
+    ])("does not let a moved remote-tracking ref set the expected commit of %s: GitHub's branch and the checkout's ref must agree", async (_label, lease) => {
+      const r = await githubLike();
+      const other = await elsewhere(r);
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      // As the branches are read for the check, feature/x is where the checkout has it; right after, it is not, and the
+      // checkout's ref is made to say the same.
+      const shim = await childShim(r, [], "", { actions: movedTo(r, other) });
+      const result = await r.push(...lease, "origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("is not where this checkout last saw it");
+      expect(await shim.children()).toHaveLength(0);
+      expect(r.onGitHub("feature/x")).toBe(other);
+    }, 60_000);
+
+    it("gives the child the commit GitHub listed for a lease, and a branch that moves as the child starts is not replaced", async () => {
+      const r = await githubLike();
+      const other = await elsewhere(r);
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const listed = r.onGitHub("feature/x");
+      const shim = await childShim(r, movedTo(r, other));
+      const result = await r.push("--force-with-lease", "origin", "feature/x");
+      const [child] = await shim.children();
+      // Neither the move of the checkout's ref nor the move of the branch changes what the child expects.
+      expect(child!.args).toContain(`--force-with-lease=refs/heads/feature/x:${listed}`);
+      expect(result.code).not.toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(other);
+    }, 60_000);
+
+    it("ties a lease to GitHub's branches also when the check did not read them", async () => {
+      const r = await githubLike();
+      const other = await elsewhere(r);
+      const listed = r.onGitHub("feature/x");
+      await editWorkflow(r);
+      // The first report already says the push edits a workflow, so GitHub's branches are read only for the lease.
+      r.hooks.first = () => { r.git("update-ref", "refs/remotes/origin/feature/x", other); };
+      const shim = await childShim(r);
+      const result = await r.push("--force-with-lease", "origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("is not where this checkout last saw it");
+      expect(await shim.children()).toHaveLength(0);
+      expect(r.onGitHub("feature/x")).toBe(listed);
+    }, 60_000);
+
+    it("refuses a lease when GitHub's branches cannot be read to tie it to", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const before = r.onGitHub("feature/x");
+      const shim = await childShim(r, [], "", { fail: true });
+      const result = await r.push("--force-with-lease", "origin", "feature/x");
+      // The check could not read them either, so the broker was asked again (and allowed it).
+      expect(r.requests).toHaveLength(2);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("--force-with-lease expects");
+      expect(await shim.children()).toHaveLength(0);
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
 
     it("pushes an annotated tag as the tag object, and deletes by name with a colon", async () => {
       const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });

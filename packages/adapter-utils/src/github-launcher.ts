@@ -413,7 +413,7 @@ const WHOLE_REF = /^refs\/[^\s~^:?*\[\\]+$/;
 // The refspecs of a sealed push as <object>:<full name> (or :<full name> to delete), the options that came from the
 // push's own, and the refs it moves for the checkout's remote-tracking refs and -u. The commits must be those that the
 // broker was told about. A problem names what cannot be written whole.
-function sealedRefspecs(env, globalArgs, specs, options, authorized, name) {
+function sealedRefspecs(env, globalArgs, specs, options, authorized, name, listed) {
   const read = (...args) => (gitOutput(env, globalArgs, args) || '').trim();
   const shas = authorized.shas || [];
   const refspecs = [], updates = [];
@@ -449,31 +449,43 @@ function sealedRefspecs(env, globalArgs, specs, options, authorized, name) {
     updates.push({ destination: target, sha: object, local: full.startsWith('refs/heads/') ? full : null });
   }
   if (used !== shas.length) return changed;
-  // --force-with-lease as an expected old value per ref: what the checkout last saw of the remote's branch, which is what
-  // git compares with, or the value that was named.
+  // --force-with-lease as an expected old value per ref. A commit that the command names (or none, for a ref that must not
+  // exist) is used as it is. A value that comes out of this checkout's refs (the remote-tracking ref that a lease without a
+  // value means, or a name such as origin/x) is the agent's to write, so it is only taken when it is what GitHub lists for the
+  // branch, and the child is given the listed commit: a checkout that disagrees with GitHub is refused, as git refuses a
+  // lease whose remote has moved. listed() is GitHub's branches as read for the check, else as read now.
   const flags = [...options.flags];
   for (const lease of options.leases) {
     const colon = lease === undefined ? -1 : lease.indexOf(':');
     const ref = lease === undefined ? '' : colon < 0 ? lease : lease.slice(0, colon);
     const asked = ref ? [ref.startsWith('refs/') ? ref : 'refs/heads/' + ref] : updates.map(update => update.destination);
     for (const target of asked) {
-      let expected = '';
+      if (!WHOLE_REF.test(target)) return unnamed;
+      let expected = '', fromRefs = true;
       if (colon >= 0) {
         const value = lease.slice(colon + 1);
-        expected = value ? read('rev-parse', '--verify', '-q', value) : '';
-        if (value && !expected) return { problem: 'the value that ' + target.slice(0, 60) + ' is expected to have cannot be read' };
+        fromRefs = !!value && !/^[0-9a-f]{40,64}$/.test(value);
+        expected = fromRefs ? read('rev-parse', '--verify', '-q', value) : value;
+        if (fromRefs && !expected) return { problem: 'the value that ' + target.slice(0, 60) + ' is expected to have cannot be read' };
       } else if (name && target.startsWith('refs/heads/')) {
         expected = read('rev-parse', '--verify', '-q', 'refs/remotes/' + name + '/' + target.slice(11));
       } else return { problem: 'the value that ' + target.slice(0, 60) + ' is expected to have is not known (name it: --force-with-lease=<ref>:<commit>)' };
-      if (!WHOLE_REF.test(target)) return unnamed;
+      if (fromRefs) {
+        const heads = target.startsWith('refs/heads/') ? listed() : undefined;
+        if (heads === undefined) return { problem: 'the value that ' + target.slice(0, 60) + ' is expected to have comes from this checkout and is not a branch (name it: --force-with-lease=<ref>:<commit>)' };
+        if (heads === null) return { problem: 'the branches GitHub has could not be read, so what --force-with-lease expects of ' + target.slice(0, 60) + ' cannot be tied to them', advice: 'Run it again.' };
+        // Equal, so the value in the child's arguments is the one GitHub listed.
+        if ((heads.get(target.slice(11)) || '') !== expected) return { problem: target.slice(0, 60) + ' on GitHub is not where this checkout last saw it, so --force-with-lease would refuse it', advice: 'Fetch, look at what is new on that branch, and run it again.' };
+      }
       flags.push('--force-with-lease=' + target + ':' + expected);
     }
   }
   return { refspecs, flags, updates };
 }
-// The command, environment and private git directory of the sealed push, or { problem }. authorized is the report that the
-// broker answered with a credential: the sealed push must send exactly what it described, to the one URL it listed.
-function sealedPush(env, globalArgs, pushArgs, authorized, scratch) {
+// The command, environment and private git directory of the sealed push, or { problem, advice }. authorized is the report
+// that the broker answered with a credential: the sealed push must send exactly what it described, to the one URL it
+// listed. listing is GitHub's branches as read for the check of that report (null when they were not read).
+function sealedPush(env, globalArgs, pushArgs, authorized, scratch, listing) {
   const options = sealedOptions(pushArgs);
   if (options.problem) return { problem: options.problem };
   const git = gitBinary();
@@ -490,7 +502,14 @@ function sealedPush(env, globalArgs, pushArgs, authorized, scratch) {
   const name = where.configured.length ? where.target : null;
   // Without refspecs git pushes the current branch (the broker was told so: it saw HEAD), and a deletion names its refs.
   const specs = positional.length > 1 || options.deleting ? positional.slice(1) : ['HEAD'];
-  const planned = sealedRefspecs(env, globalArgs, specs, options, authorized, name);
+  // The branches GitHub lists for a lease to be tied to: those the check read, else read now (null when they cannot be).
+  let fetched;
+  const listed = () => {
+    if (listing) return listing.heads;
+    if (fetched === undefined) fetched = remoteRefs(env, globalArgs, url);
+    return fetched ? fetched.heads : null;
+  };
+  const planned = sealedRefspecs(env, globalArgs, specs, options, authorized, name, listed);
   if (planned.problem) return planned;
   const { spawnSync } = require('node:child_process');
   try {
@@ -779,8 +798,9 @@ async function main() {
     configReady = true;
     process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
   } catch { diagnostic('configuration_directory_unavailable'); }
-  // authorized: the report of the command that the broker last answered with a credential.
-  let attribution = null, credentialed = false, report = null, authorized = null;
+  // authorized: the report of the command that the broker last answered with a credential; listing: the branches GitHub
+  // listed when that report was checked (see remoteRefs), which the sealed push ties a lease to.
+  let attribution = null, credentialed = false, report = null, authorized = null, listing = null;
   {
     for (const key of Object.keys(env)) {
       // CODESPACES makes gh send GITHUB_TOKEN to non-github.com hosts. A bare GIT_CONFIG redirects
@@ -874,6 +894,7 @@ async function main() {
       let at = 0;
       while (at < argv.length && argv[at].startsWith('-')) at += GIT_GLOBAL_WITH_VALUE.includes(argv[at]) ? 2 : 1;
       const known = report.pushUrls && report.pushUrls.length === 1 ? remoteRefs(env, argv.slice(0, at), report.pushUrls[0]) : null;
+      listing = known;
       const checked = operation(env, known || 'unknown');
       if (checked.touchesWorkflows !== false) {
         if (!known) process.stderr.write('Paperclip: the branches GitHub has could not be read, so this push is treated as one that may change workflow files.\n');
@@ -925,9 +946,9 @@ async function main() {
   // hooks, and an environment that carries nothing of the checkout's steering.
   let sealedPlan = null;
   if (credentialed && authorized && gitSubcommand === 'push') {
-    sealedPlan = sealedPush(env, argv.slice(0, gitAt), argv.slice(gitAt + 1), authorized, scratch);
+    sealedPlan = sealedPush(env, argv.slice(0, gitAt), argv.slice(gitAt + 1), authorized, scratch, listing);
     if (sealedPlan.problem) {
-      process.stderr.write('Paperclip: this push cannot run with a GitHub credential, because ' + sealedPlan.problem + '. Push one branch to one remote (git push <remote> <branch>) without other options.\n');
+      process.stderr.write('Paperclip: this push cannot run with a GitHub credential, because ' + sealedPlan.problem + '. ' + (sealedPlan.advice || 'Push one branch to one remote (git push <remote> <branch>) without other options.') + '\n');
       process.exit(1);
     }
   }
