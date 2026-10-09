@@ -34,6 +34,8 @@ export class FakeConvex {
   keepAfterDelete = new Set<string>();
   /** After one of these is deleted, reading it answers 500 instead of 404 (a check that cannot tell). */
   flakyAfterDelete = new Set<string>();
+  /** After one of these is deleted, reading it answers 200 with a body that is not a deployment. */
+  junkAfterDelete = new Set<string>();
   private deletedNames = new Set<string>();
   /** Project list requests for these deployment types answer 403 (a token that may not list them). */
   listDenied = new Set<string>();
@@ -68,6 +70,7 @@ export class FakeConvex {
       const asked = decodeURIComponent(match[1]);
       const found = this.deployments.get(asked);
       if (!found && this.flakyAfterDelete.has(asked) && this.deletedNames.has(asked)) return fail(500, "InternalError");
+      if (!found && this.junkAfterDelete.has(asked) && this.deletedNames.has(asked)) return json(200, { unexpected: true });
       if (found && this.answerAs.has(asked)) return json(200, { ...found, name: this.answerAs.get(asked) });
       return found ? json(200, found) : fail(404, "DeploymentNotFound");
     }

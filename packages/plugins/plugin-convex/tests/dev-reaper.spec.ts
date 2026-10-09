@@ -454,6 +454,16 @@ describe("review fixes (PR #46)", () => {
     expect(f.h.activity.some(item => item.metadata?.outcome === "deleted-unverified")).toBe(true);
   });
 
+  it("also reports a delete as unverified when the follow-up read returns something that is not a deployment", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config() } });
+    f.convex.add(dev("old", "dev/ship-1-a", 30));
+    f.convex.junkAfterDelete.add("old");
+    await f.h.runJob("convex-reaper");
+    expect((await report(f)).projects[0].dev.deleted).toEqual(["old"]);
+    expect(f.h.activity.some(item => item.metadata?.outcome === "deleted-unverified")).toBe(true);
+    expect(f.h.activity.some(item => item.metadata?.outcome === "still-exists")).toBe(false);
+  });
+
   it("lets an expiry the plugin set keep following redeploys on a preview the hard guard now covers, but never schedules one", async () => {
     const f = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true } }) } });
     f.convex.add(deployment("feat-stage-x", { lastDeployTime: NOW - 10 * HOUR, expiresAt: NOW + 26 * HOUR }));
