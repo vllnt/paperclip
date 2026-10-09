@@ -394,6 +394,7 @@ export const queryKeys = {
       ["issues", "runner-goal", issueId, agentId ?? "__effective__"] as const,
     workProducts: (issueId: string) =>
       ["issues", "work-products", issueId] as const,
+    git: (issueId: string) => ["issues", "git", issueId] as const,
     fileResources: (
       issueId: string,
       options: {
