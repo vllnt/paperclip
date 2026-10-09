@@ -288,11 +288,15 @@ export function agentProtectedConfigAfterPatch(
  * first-provisions an agent, by comparing the request with a bare new agent.
  * There is no existing agent to compare with, so this is the check that an
  * agent cannot hand a new agent limits it could not set on an existing one.
- * Left out on purpose: `adapterType` (every create picks one), `cwd` (a limit
+ * Left out on purpose: `adapterType` and the runtime selectors `provider`,
+ * `acpxAgent`, and `engine` (every create must pick them), a heartbeat the
+ * request turns off (it grants nothing), `cwd` (a limit
  * only with a sandbox scope, which is protected), the `ceo` role only (other
- * roles carry no authority), and `runtimeConfig.aiConnection` (its own
- * connection-access check governs it). Supplying `canCreateAgents: true`
- * always counts.
+ * roles carry no authority), `adapterConfig.env` (an agent supplies a child's
+ * own auth settings by design; see the open decision in the pull request), and
+ * `runtimeConfig.aiConnection` (its own connection-access check governs it).
+ * Permissions are compared with the fail-closed stored defaults, so
+ * `canCreateAgents: true` and any other extra key count.
  */
 export function collectNewAgentProtectedFields(input: {
   adapterType: string;
@@ -320,14 +324,20 @@ export function collectNewAgentProtectedFields(input: {
     defaultEnvironmentId: input.defaultEnvironmentId ?? null,
   };
   const fields = collectAgentProtectedConfigChanges(baseline, requested)
-    .filter((field) => field !== "adapterConfig.cwd" && field !== "runtimeConfig.aiConnection");
+    .filter((field) => (
+      field !== "adapterConfig.cwd"
+      && field !== "runtimeConfig.aiConnection"
+      && field !== "adapterConfig.provider"
+      && field !== "adapterConfig.acpxAgent"
+      && field !== "adapterConfig.engine"
+      && !(field === "runtimeConfig.heartbeat.enabled" && recordOrEmpty(recordOrEmpty(input.runtimeConfig).heartbeat).enabled === false)
+      && !field.startsWith("adapterConfig.env.")
+    ));
 
   const supplied = recordOrEmpty(input.permissions);
-  const defaults = normalizeAgentPermissions({}, { context: "create" });
+  const failClosed = normalizeAgentPermissions({}, { context: "stored" });
   for (const key of Object.keys(supplied).sort()) {
-    if (!isDeepStrictEqual(defaults[key], supplied[key]) || (key === "canCreateAgents" && supplied[key] === true)) {
-      fields.push(`permissions.${key}`);
-    }
+    if (!isDeepStrictEqual(failClosed[key], supplied[key])) fields.push(`permissions.${key}`);
   }
   return fields;
 }

@@ -4,6 +4,7 @@ import {
   collectAgentConfigRollbackChanges,
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
+  collectNewAgentProtectedFields,
   type AgentProtectedConfigState,
 } from "../services/agent-self-config-authz.js";
 
@@ -226,5 +227,44 @@ describe("agent self-config protected field diff", () => {
     expect(collectAgentPermissionChanges(before, { ...before })).toEqual([]);
     expect(collectAgentPermissionChanges(before, { ...before, canCreateAgents: true, trustPreset: "standard" }))
       .toEqual(["permissions.canCreateAgents", "permissions.trustPreset"]);
+  });
+});
+
+describe("collectNewAgentProtectedFields", () => {
+  it("flags limits, model, budget, bypass flags, canCreateAgents, and the ceo role on a new agent", () => {
+    expect(collectNewAgentProtectedFields({
+      adapterType: "codex_local",
+      adapterConfig: { model: "big", effort: "max", dangerouslyBypassApprovalsAndSandbox: true },
+      runtimeConfig: { heartbeat: { maxDailyRuns: 9_999 }, sessionCompaction: { maxSessionRuns: 500 } },
+      budgetMonthlyCents: 5_000,
+      role: "ceo",
+      permissions: { canCreateAgents: true },
+    }).sort()).toEqual([
+      "adapterConfig.dangerouslyBypassApprovalsAndSandbox",
+      "adapterConfig.effort",
+      "adapterConfig.model",
+      "budgetMonthlyCents",
+      "permissions.canCreateAgents",
+      "role",
+      "runtimeConfig.heartbeat.maxDailyRuns",
+      "runtimeConfig.sessionCompaction.maxSessionRuns",
+    ]);
+  });
+
+  it("flags nothing for a request that only picks the settings every create needs", () => {
+    expect(collectNewAgentProtectedFields({
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "anthropic", acpxAgent: "claude", engine: "cli", cwd: "/work", env: { A: { type: "plain", value: "1" } } },
+      runtimeConfig: { aiConnection, heartbeat: { enabled: false } },
+      role: "engineer",
+      permissions: { canCreateAgents: false },
+    })).toEqual([]);
+  });
+
+  it("still flags a heartbeat the request turns on", () => {
+    expect(collectNewAgentProtectedFields({
+      adapterType: "process",
+      runtimeConfig: { heartbeat: { enabled: true } },
+    })).toEqual(["runtimeConfig.heartbeat.enabled"]);
   });
 });

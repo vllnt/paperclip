@@ -128,6 +128,11 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
     return (await db.select().from(agents).where(eq(agents.companyId, companyId))).length;
   }
 
+  async function childPermissions(companyId: string, creatorId: string | null) {
+    const rows = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    return rows.find((row) => row.id !== creatorId)!.permissions;
+  }
+
   async function deniedForCompany(companyId: string) {
     return db
       .select()
@@ -162,11 +167,6 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
       label: "a permission bypass flag",
       body: { adapterConfig: { dangerouslySkipPermissions: true } },
       fields: ["adapterConfig.dangerouslySkipPermissions"],
-    },
-    {
-      label: "env variables",
-      body: { adapterConfig: { env: { CODEX_HOME: { type: "plain", value: "/tmp/other" } } } },
-      fields: ["adapterConfig.env.CODEX_HOME"],
     },
     {
       label: "the canCreateAgents permission",
@@ -218,6 +218,7 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(await agentCount(companyId)).toBe(2);
       expect(await deniedForCompany(companyId)).toHaveLength(0);
+      expect(await childPermissions(companyId, creatorId)).toMatchObject({ canCreateAgents: false });
     });
 
     it("keeps today's behaviour for an agent holding company-wide agents:configure", async () => {
@@ -253,6 +254,7 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
 
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(await deniedForCompany(companyId)).toHaveLength(0);
+      expect(await childPermissions(companyId, null)).toMatchObject({ canCreateAgents: true });
     });
   });
 

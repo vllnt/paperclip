@@ -2917,6 +2917,21 @@ export function agentRoutes(
     });
   }
 
+  /**
+   * The create default grants `canCreateAgents` to a new agent. An agent that
+   * creates or hires must not hand that on, so the server sets it to false
+   * unless the request asks for true, which the protected-field check has
+   * already refused for a caller without `agents:configure`.
+   */
+  function withoutInheritedCreateAuthority<T extends { permissions?: unknown }>(req: Request, input: T): T {
+    if (req.actor.type !== "agent") return input;
+    const supplied = input.permissions;
+    const permissions = typeof supplied === "object" && supplied !== null && !Array.isArray(supplied)
+      ? { ...supplied }
+      : {};
+    return { ...input, permissions: { canCreateAgents: false, ...permissions } };
+  }
+
   function protectedStateOfAgentRow(row: {
     adapterType: string;
     adapterConfig: unknown;
@@ -4740,7 +4755,7 @@ export function agentRoutes(
     });
     const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig);
     const normalizedHireInput = {
-      ...hireInput,
+      ...withoutInheritedCreateAuthority(req, hireInput),
       adapterConfig: normalizedAdapterConfig,
       runtimeConfig: normalizedRuntimeConfig,
     };
@@ -4765,7 +4780,9 @@ export function agentRoutes(
         req,
         companyId,
         hiredAgentId,
-        { ...hireInput, adapterConfig: inheritRuntimeFrom === "caller" ? {} : hireInput.adapterConfig },
+        inheritRuntimeFrom === "caller"
+          ? { ...hireInput, adapterConfig: {}, defaultEnvironmentId: null }
+          : hireInput,
         "agent_hire",
       );
     }
@@ -5016,6 +5033,7 @@ export function agentRoutes(
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     const agentId = randomUUID();
     await assertAgentMayCreateWithProtectedFields(req, companyId, agentId, createInput, "agent_create");
+    Object.assign(createInput, withoutInheritedCreateAuthority(req, createInput));
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
       agentId,
