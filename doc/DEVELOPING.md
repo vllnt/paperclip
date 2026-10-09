@@ -92,6 +92,10 @@ The vite dev server serves an unbundled module graph. This is fast to reload on 
 
 The preview server binds `0.0.0.0` and accepts any Host, so a tailnet or LAN address (e.g. `http://<host>.ts.net:3101/`) works out of the box. The `/api` proxy sets `x-forwarded-host` and `x-forwarded-proto`, which the server's board mutation guard uses to trust the browser's Origin — mutations from `:3101` succeed against the API on `:3100` without further configuration. An HTTPS tunnel in front of the preview server (ngrok, tailscale funnel) is also supported: the tunnel's `x-forwarded-proto` header is preserved when set.
 
+### Precompressed UI assets
+
+`vite build` writes a `.br` (Brotli) and a `.gz` (gzip) file next to every script, stylesheet, SVG and JSON file in `assets/` that is at least 1 KB and compresses smaller. The server (`server/src/middleware/precompressed-static.ts`) sends the Brotli file to clients that accept it, the gzip file to the rest of the clients that accept gzip, and the plain file otherwise, with `Vary: Accept-Encoding`. The app therefore does not depend on a reverse proxy to compress its own bundle: the 6.4 MB entry chunk is about 1.3 MB on the wire. Range requests and files without a sibling get the plain file. `index.html` and the service worker are not precompressed. The compression adds about 9 s to the UI build.
+
 ## Storybook
 
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.
