@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { formatIssueTree, formatRunAge } from "../commands/client/issue-tree.js";
+import { formatIssueTree, formatRunAge, type IssueTreeResponse } from "../commands/client/issue-tree.js";
 
 const NOW = new Date("2026-10-09T12:00:00.000Z");
+
+type TestRun = NonNullable<IssueTreeResponse["nodes"][number]["lastRun"]>;
 
 function node(input: {
   id: string;
@@ -12,7 +14,7 @@ function node(input: {
   depth: number;
   assigneeAgentId?: string | null;
   assigneeUserId?: string | null;
-  lastRun?: Record<string, unknown> | null;
+  lastRun?: TestRun | null;
 }) {
   return {
     issue: {

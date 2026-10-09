@@ -170,6 +170,23 @@ added, removed, or modified file. Base64 (binary) files print
 `executable: false -> true`. `--json` prints
 `{ fromVersionId, toVersionId, fromRevisionNumber, toRevisionNumber, files: [{ path, change, binary, diff }] }`.
 
+## Environment Lease Commands
+
+```sh
+# Leases of one environment (all statuses unless filtered)
+npx paperclipai environment leases <environment-id> [--status released,failed] [--json]
+
+# A company's leases across environments (default status: active,pending_cleanup)
+npx paperclipai environment leases:list [-C <company-id>] [--status active,expired] [--json]
+
+# One lease
+npx paperclipai environment lease <lease-id>
+```
+
+Lease statuses are `active`, `released`, `expired`, `failed`, `retained`, and
+`pending_cleanup`; `--status` takes a comma-separated list and an unknown value
+is rejected with `400`. These commands need board authentication.
+
 ## Approval Commands
 
 ```sh
