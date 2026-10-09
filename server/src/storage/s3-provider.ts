@@ -129,6 +129,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           Body: input.body,
           ContentType: input.contentType,
           ContentLength: input.contentLength,
+          IfNoneMatch: input.ifNoneMatch,
           ...encryption,
         }),
         { abortSignal: input.signal },
@@ -181,6 +182,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           etag: output.ETag,
           lastModified: toDate(output.LastModified),
           serverSideEncryption: output.ServerSideEncryption,
+          serverSideEncryptionKeyId: output.SSEKMSKeyId,
         };
       } catch (err) {
         const code = (err as { name?: string }).name;

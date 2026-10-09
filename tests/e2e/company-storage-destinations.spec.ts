@@ -95,3 +95,24 @@ test("storage destination form explains a refused endpoint and keeps the input",
   await form.getByTestId("storage-destination-save").click();
   await expect(section.getByTestId("storage-destination-status")).toHaveText("Not probed yet.");
 });
+
+test("a probe of another organization's bucket shows the conflict", async ({ page }) => {
+  const errors = collectConsoleErrors(page);
+  const company = await createCompany(page, "Storage Destinations Claimed E2E");
+  await createSecret(page, company.id, "Archive access key", "AKIA-E2E");
+  await createSecret(page, company.id, "Archive secret key", "secret-e2e");
+  // No S3 here: the server's answer for a bucket another company claimed (ownership marker or claim) is a 409.
+  await page.route(`**/api/companies/${company.id}/storage/destinations/*/probe`, (route) => route.fulfill({
+    status: 409,
+    contentType: "application/json",
+    body: JSON.stringify({ error: "This storage location is not available. Use a bucket of your own.", details: { code: "location_unavailable" } }),
+  }));
+  await page.goto(`/${company.prefix}/company/settings`);
+  const section = page.getByTestId("company-settings-storage-section");
+  await section.getByTestId("storage-destination-add").click();
+  const form = await fillDestination(page, "https://s3.paperclip-e2e.invalid");
+  await form.getByTestId("storage-destination-save").click();
+  await section.getByTestId("storage-destination-probe").click();
+  await expect(section).toContainText("This storage location is not available. Use a bucket of your own.");
+  expect(errors.filter((error) => !error.includes("409"))).toEqual([]);
+});

@@ -134,7 +134,7 @@ function CreateDestinationForm({
           <input className={inputClass} value={bucket} onChange={(event) => setBucket(event.target.value)} data-testid="storage-destination-bucket" />
         </Field>
       </div>
-      <Field label="Prefix" hint="Paperclip writes only under this prefix.">
+      <Field label="Prefix" hint="Paperclip writes under this prefix, plus one ownership marker, .paperclip/owner.json, at the bucket root.">
         <input className={inputClass} value={prefix} onChange={(event) => setPrefix(event.target.value)} data-testid="storage-destination-prefix" />
       </Field>
       <ToggleField label="Path-style addressing (MinIO and some S3-compatible services)" checked={pathStyle} onChange={setPathStyle} />
@@ -248,7 +248,9 @@ export function CompanyStorageDestinationsPanel({ companyId }: { companyId: stri
       <p className="text-sm text-muted-foreground">
         Your organization's own S3-compatible buckets (AWS S3, Cloudflare R2, MinIO, OVH and others). Paperclip
         connects with keys stored as company secrets and never creates buckets, policies or lifecycle rules. Use a
-        private bucket that no other organization uses.
+        private bucket that no other organization uses. The first passing probe claims the bucket for this
+        organization with an ownership marker; the claim stays after a destination is retired, because retiring
+        deletes nothing.
       </p>
       {destinations.isLoading && <p className="text-xs text-muted-foreground">Loading destinations...</p>}
       {destinations.isError && (

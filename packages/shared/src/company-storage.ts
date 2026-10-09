@@ -34,7 +34,13 @@ export const storageS3LocationSchema = z
       .url()
       .max(512)
       .refine((value) => {
-        const url = new URL(value);
+        let url: URL;
+        try {
+          url = new URL(value);
+        } catch {
+          // Zod's url() accepts some values the WHATWG parser refuses (an IPv6 zone id).
+          return false;
+        }
         return ["https:", "http:"].includes(url.protocol)
           && !url.username && !url.password && !url.search && !url.hash && url.pathname === "/";
       }, "Use an S3 endpoint origin, without a path, query or credentials"),

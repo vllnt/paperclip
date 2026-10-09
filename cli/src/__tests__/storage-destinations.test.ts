@@ -85,4 +85,21 @@ describe("storage destinations commands", () => {
     await run(["storage", "destinations", "probe", DESTINATION_ID, "-C", COMPANY_ID]);
     expect(process.exitCode).toBe(1);
   });
+
+  it("reports a bucket another organization claimed as a conflict with its code", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      error: "This storage location is not available. Use a bucket of your own.",
+      details: { code: "location_unavailable" },
+    }, 409)));
+    const printed: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((message: unknown) => {
+      printed.push(String(message));
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit ${code}`);
+    }) as typeof process.exit);
+    await expect(run(["storage", "destinations", "probe", DESTINATION_ID, "-C", COMPANY_ID])).rejects.toThrow("exit 1");
+    expect(printed.join("\n")).toContain("API error 409: This storage location is not available. Use a bucket of your own.");
+    expect(printed.join("\n")).toContain("location_unavailable");
+  });
 });

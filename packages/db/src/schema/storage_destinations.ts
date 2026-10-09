@@ -22,6 +22,10 @@ export const storageDestinations = pgTable("storage_destinations", {
   revision: integer("revision").notNull().default(0),
   credentialRevision: integer("credential_revision").notNull().default(0),
   lastProbeJson: jsonb("last_probe_json").$type<StorageProbeResult>(),
+  /** Random value in the bucket's ownership marker; set before the marker is first written. */
+  ownerNonce: text("owner_nonce"),
+  /** First passing probe. The claim on the bucket outlives retirement: retiring deletes nothing. */
+  claimedAt: timestamp("claimed_at", { withTimezone: true }),
   retiredAt: timestamp("retired_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -29,7 +33,7 @@ export const storageDestinations = pgTable("storage_destinations", {
   // Composite target for company-owned references (archive settings, assets).
   unique("storage_destinations_company_id_uq").on(t.companyId, t.id),
   index("storage_destinations_company_created_idx").on(t.companyId, t.createdAt),
-  index("storage_destinations_active_physical_key_idx").on(t.physicalKey).where(sql`${t.retiredAt} is null`),
+  index("storage_destinations_physical_key_idx").on(t.physicalKey),
   check("storage_destinations_provider_check", sql`${t.provider} in ('s3')`),
   check("storage_destinations_origin_check", sql`${t.origin} in ('company')`),
 ]);

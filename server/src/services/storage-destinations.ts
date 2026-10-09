@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
-import { and, asc, eq, ne, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { storageDestinations, type Db } from "@paperclipai/db";
 import type {
   CreateStorageDestination,
@@ -12,6 +12,7 @@ import type {
   StorageS3Location,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { resolveApprovedRemoteHttpAddresses } from "./remote-http-endpoint-guard.js";
 import { guardedRemoteHttpFetch } from "./remote-http-fetch.js";
@@ -42,6 +43,10 @@ export interface StorageDestinationDeps {
 
 const PROBE_PREFIX = "paperclip-probe";
 const ISOLATION_PROBE_PREFIX = "paperclip-isolation-probe";
+/** Ownership marker at the bucket root, outside any prefix, so every alias and prefix of one bucket finds it. */
+export const STORAGE_OWNER_MARKER_KEY = ".paperclip/owner.json";
+const OWNER_MARKER_FORMAT = "paperclip.storage-owner";
+const OWNER_MARKER_MAX_BYTES = 4096;
 const CLEANUP_TIMEOUT_MS = 10_000;
 const SYSTEM_ACTOR: StorageDestinationActor = { actorType: "system", actorId: "storage" };
 
@@ -57,12 +62,13 @@ const PROBE_ERRORS = {
   access_denied: "The access key is not allowed to write, read and delete objects under this prefix.",
   bucket_not_found: "The bucket does not exist or is in another region.",
   encryption_unsupported: "The provider rejected the requested encryption. Try bucket default encryption.",
-  encryption_mismatch: "The provider stored the object with a different encryption than requested.",
+  encryption_mismatch: "The provider stored the object with a different encryption or KMS key than requested. Give a KMS key as its id or ARN, not an alias.",
   encryption_unverified: "The provider did not confirm the requested encryption. Use bucket default encryption if the provider encrypts at rest.",
   read_mismatch: "The object read back does not match what was written.",
   public_read: "Objects in this bucket can be read without credentials. Make the bucket private.",
   public_read_unverified: "The probe could not confirm that the bucket refuses unauthenticated reads.",
   location_unavailable: "This storage location is not available. Use a bucket of your own.",
+  ownership_unverified: "The access key cannot read and write the ownership marker .paperclip/owner.json at the bucket root. Allow it for that one object.",
   cleanup_failed: "A probe object could not be deleted. Check the delete permission.",
   timeout: "The probe did not finish within its time limit.",
   probe_failed: "The probe failed.",
@@ -100,9 +106,10 @@ const AWS_S3_HOST = /^s3(?:[.-][a-z0-9]+)*\.amazonaws\.com(?:\.cn)?$/;
 
 /**
  * Canonical endpoint host and bucket: one physical bucket serves one company
- * per instance. Best effort: a trailing dot is dropped and every AWS S3
- * regional, dualstack and legacy host maps to one name. Custom aliases of the
- * same service (two DNS names for one MinIO) are not detected.
+ * per instance. The host is lowercased, a trailing dot is dropped, default
+ * ports are folded and every AWS S3 regional, dualstack and legacy host maps
+ * to one name. Custom aliases of one service (two DNS names for one MinIO)
+ * give different keys; the ownership marker in the bucket catches those.
  */
 export function storagePhysicalKey(location: Pick<StorageS3Location, "endpoint" | "bucket">): string {
   const url = new URL(location.endpoint);
@@ -120,16 +127,31 @@ export function storageObjectUrl(location: StorageS3Location, objectKey: string)
   return `${url.protocol}//${location.bucket}.${url.host}/${path}`;
 }
 
+const KNOWN_ENCRYPTION = new Set(["AES256", "aws:kms", "aws:kms:dsse"]);
+
+/** The configured KMS key is the reported key: the same value, or the key id at the end of the reported key ARN. */
+function sameKmsKey(configured: string, reported: string): boolean {
+  return configured === reported || (!configured.includes(":") && reported.endsWith(`:key/${configured}`));
+}
+
 /**
- * Whether the provider confirmed the encryption the destination asked for.
- * `bucket_default` sends no header, so silence there is only "unverified".
+ * Whether the provider confirmed exactly the encryption the destination asked
+ * for: `AES256` for `s3_managed`, `aws:kms` with the configured key (when the
+ * provider names one) for `kms`. `bucket_default` sends no header, so silence
+ * there is only "unverified"; a value it does not know fails.
  */
 export function encryptionVerdict(
   encryption: StorageEncryption,
   reported: string | undefined,
+  reportedKeyId?: string,
 ): StorageProbeResult["encryption"] {
-  if (!reported) return encryption.mode === "bucket_default" ? "unverified" : "failed";
-  if (encryption.mode === "kms" && !reported.startsWith("aws:kms")) return "failed";
+  if (encryption.mode === "bucket_default") {
+    if (!reported) return "unverified";
+    return KNOWN_ENCRYPTION.has(reported) ? "verified" : "failed";
+  }
+  if (encryption.mode === "s3_managed") return reported === "AES256" ? "verified" : "failed";
+  if (reported !== "aws:kms") return "failed";
+  if (reportedKeyId && !sameKmsKey(encryption.kmsKeyId ?? "", reportedKeyId)) return "failed";
   return "verified";
 }
 
@@ -236,17 +258,103 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
     }
   }
 
-  /** Another company's destination for the same bucket that already passed a probe. */
+  /**
+   * Another company's destination for the same bucket that ever passed a
+   * probe. Retired destinations keep their claim: retiring deletes nothing,
+   * so the bucket may still hold that company's objects.
+   */
   async function provenClaimByOtherCompany(connection: Pick<Db, "select">, companyId: string, physicalKey: string) {
-    const rows = await connection
-      .select({ id: storageDestinations.id, lastProbeJson: storageDestinations.lastProbeJson, credentialRevision: storageDestinations.credentialRevision })
+    const [row] = await connection
+      .select({ id: storageDestinations.id })
       .from(storageDestinations)
       .where(and(
         eq(storageDestinations.physicalKey, physicalKey),
         ne(storageDestinations.companyId, companyId),
-        isNull(storageDestinations.retiredAt),
-      ));
-    return rows.some((row) => row.lastProbeJson?.status === "passed");
+        isNotNull(storageDestinations.claimedAt),
+      ))
+      .limit(1);
+    return Boolean(row);
+  }
+
+  /**
+   * Reads the bucket's ownership marker. A key that may not read it cannot
+   * prove the bucket is free, so the probe fails closed.
+   */
+  async function readOwnerMarker(root: StorageProvider, signal: AbortSignal): Promise<{ destinationId: string; nonce: string } | null> {
+    let object;
+    try {
+      object = await root.getObject({ objectKey: STORAGE_OWNER_MARKER_KEY, range: { start: 0, end: OWNER_MARKER_MAX_BYTES - 1 }, signal });
+    } catch (error) {
+      const name = (error as { name?: string } | null)?.name;
+      if ((error instanceof HttpError && error.status === 404) || name === "NoSuchKey" || name === "NotFound") return null;
+      if (name === "AccessDenied" || name === "Forbidden") throw new ProbeFailure("ownership_unverified");
+      throw error;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of object.stream) {
+      size += (chunk as Buffer).length;
+      if (size > OWNER_MARKER_MAX_BYTES) {
+        object.stream.destroy();
+        break;
+      }
+      chunks.push(chunk as Buffer);
+    }
+    let parsed: { format?: unknown; destinationId?: unknown; nonce?: unknown } | null = null;
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      parsed = null;
+    }
+    // Anything that is not our well-formed marker is someone else's claim.
+    if (!parsed || parsed.format !== OWNER_MARKER_FORMAT || typeof parsed.destinationId !== "string" || typeof parsed.nonce !== "string") {
+      return { destinationId: "", nonce: "" };
+    }
+    return { destinationId: parsed.destinationId, nonce: parsed.nonce };
+  }
+
+  /** The marker names a destination of this company with the marker's nonce (retired ones too). */
+  async function markerIsOwn(companyId: string, marker: { destinationId: string; nonce: string }): Promise<boolean> {
+    if (!marker.destinationId || !marker.nonce) return false;
+    const [owner] = await db
+      .select({ ownerNonce: storageDestinations.ownerNonce })
+      .from(storageDestinations)
+      .where(and(eq(storageDestinations.companyId, companyId), eq(storageDestinations.id, marker.destinationId)));
+    return owner?.ownerNonce === marker.nonce;
+  }
+
+  /**
+   * Writes the marker only if none exists, then reads it back: of two
+   * destinations racing for one bucket under different host names, only one
+   * sees its own marker. Providers without conditional writes get a plain
+   * write; the read-back still catches a lost race.
+   */
+  async function claimOwnerMarker(root: StorageProvider, companyId: string, row: DestinationRow, nonce: string, signal: AbortSignal) {
+    const body = Buffer.from(`${JSON.stringify({
+      format: OWNER_MARKER_FORMAT,
+      v: 1,
+      destinationId: row.id,
+      nonce,
+      claimedAt: new Date().toISOString(),
+    }, null, 2)}\n`);
+    const put = (ifNoneMatch?: "*") => root.putObject({
+      objectKey: STORAGE_OWNER_MARKER_KEY,
+      body,
+      contentType: "application/json",
+      contentLength: body.length,
+      ifNoneMatch,
+      signal,
+    });
+    try {
+      await put("*");
+    } catch (error) {
+      const name = (error as { name?: string } | null)?.name;
+      if (name === "AccessDenied" || name === "Forbidden") throw new ProbeFailure("ownership_unverified");
+      if (name === "NotImplemented" || name === "InvalidArgument") await put();
+      else if (name !== "PreconditionFailed" && name !== "ConditionalRequestConflict") throw error;
+    }
+    const marker = await readOwnerMarker(root, signal);
+    if (!marker || !(await markerIsOwn(companyId, marker))) throw new ProbeFailure("location_unavailable");
   }
 
   /**
@@ -336,6 +444,8 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
     try {
       await outside.putObject({ objectKey, body: Buffer.from("x"), contentType: "application/octet-stream", contentLength: 1, signal });
     } catch (error) {
+      // The write may have landed even though it failed: remove it if it did.
+      await outside.deleteObject({ objectKey, signal: AbortSignal.timeout(CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
       const name = (error as { name?: string } | null)?.name;
       return name === "AccessDenied" || name === "Forbidden" ? "prefix_scoped" : "unknown";
     }
@@ -376,6 +486,15 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
      * existing destination; a different payload under that id is a conflict.
      */
     async create(companyId: string, input: CreateStorageDestination, actor: StorageDestinationActor) {
+      // A retry returns what the first call created, even when a referenced
+      // secret changed since; only a different payload under the id conflicts.
+      const [prior] = await db.select().from(storageDestinations).where(eq(storageDestinations.id, input.id));
+      if (prior) {
+        if (prior.companyId !== companyId || !sameCreatePayload(prior, input)) {
+          throw conflict("This destination id is already used with different settings");
+        }
+        return { destination: view(prior), created: false };
+      }
       await assertEndpointAllowed(input.location);
       const physicalKey = storagePhysicalKey(input.location);
       const pins = await pinCredentials(companyId, input.credentials);
@@ -395,7 +514,7 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
           // another's bucket with keys that do not work. Say only that the
           // location is unavailable, never which company uses it.
           if (await provenClaimByOtherCompany(tx, companyId, physicalKey)) {
-            throw conflict(PROBE_ERRORS.location_unavailable);
+            throw conflict(PROBE_ERRORS.location_unavailable, { code: "location_unavailable" });
           }
           const [row] = await tx
             .insert(storageDestinations)
@@ -481,7 +600,10 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
      * GET that must be refused, an optional out-of-prefix write, and DELETE,
      * all under one deadline. The intent is stored before any network call;
      * cleanup has its own deadline, and a failed probe never blocks retire.
-     * A passing probe is what reserves the bucket for this company.
+     * It reads the bucket's ownership marker first and refuses a bucket that
+     * another company claimed (409). A passing probe writes the marker when
+     * there is none and reserves the bucket for this company for good:
+     * retiring a destination keeps the claim.
      */
     async probe(companyId: string, id: string, actor: StorageDestinationActor): Promise<StorageProbeResult> {
       const row = await get(companyId, id);
@@ -509,6 +631,15 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
         ? { ...previous, pending: { probeId, startedAt: result.startedAt } }
         : { ...result, pending: { probeId, startedAt: result.startedAt } });
 
+      // The marker's nonce is stored before the marker can be written, so a
+      // crash in between never leaves a marker this destination cannot recognise.
+      const [nonceRow] = await db
+        .update(storageDestinations)
+        .set({ ownerNonce: sql`coalesce(${storageDestinations.ownerNonce}, ${randomBytes(16).toString("hex")})` })
+        .where(and(eq(storageDestinations.companyId, companyId), eq(storageDestinations.id, id)))
+        .returning({ ownerNonce: storageDestinations.ownerNonce });
+      const ownerNonce = nonceRow!.ownerNonce!;
+
       const objectKey = `${PROBE_PREFIX}/${probeId}`;
       const signal = AbortSignal.timeout(probeTimeoutMs);
       let client: StorageProvider | null = null;
@@ -517,6 +648,16 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
         storageEndpointPolicy(location);
         const credentials = await resolveCredentials(row, actor);
         client = await providerFactory({ location, credentials });
+        const root = location.prefix ? await providerFactory({ location: { ...location, prefix: "" }, credentials }) : client;
+
+        // Ownership first: a bucket that another company (or installation)
+        // claimed is refused under any host name, before anything is written.
+        const marker = await readOwnerMarker(root, signal);
+        if (marker && !(await markerIsOwn(companyId, marker))) throw new ProbeFailure("location_unavailable");
+        // A claim this instance already knows, with its marker gone: refuse
+        // before writing anything, so this probe never plants its own marker.
+        if (await provenClaimByOtherCompany(db, companyId, row.physicalKey)) throw new ProbeFailure("location_unavailable");
+
         const body = randomBytes(32);
         const expectedSha = createHash("sha256").update(body).digest("hex");
         try {
@@ -533,25 +674,39 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
           result.checks.read = "failed";
           throw new ProbeFailure("read_mismatch");
         }
-        result.encryption = encryptionVerdict(location.encryption, head.serverSideEncryption);
+        result.encryption = encryptionVerdict(location.encryption, head.serverSideEncryption, head.serverSideEncryptionKeyId);
         if (result.encryption === "failed") {
           throw new ProbeFailure(head.serverSideEncryption ? "encryption_mismatch" : "encryption_unverified");
         }
 
-        const object = await client.getObject({ objectKey, signal });
+        // Read at most one byte more than was written: a large body is a
+        // mismatch, not a download, also from a server that ignores the range.
+        const object = await client.getObject({ objectKey, range: { start: 0, end: body.length }, signal });
         const hash = createHash("sha256");
-        for await (const chunk of object.stream) hash.update(chunk as Buffer);
+        let read = 0;
+        for await (const chunk of object.stream) {
+          read += (chunk as Buffer).length;
+          if (read > body.length) {
+            object.stream.destroy();
+            break;
+          }
+          hash.update(chunk as Buffer);
+        }
         result.checks.read = "passed";
-        result.checks.checksum = hash.digest("hex") === expectedSha ? "passed" : "failed";
+        result.checks.checksum = read === body.length && hash.digest("hex") === expectedSha ? "passed" : "failed";
         if (result.checks.checksum === "failed") throw new ProbeFailure("read_mismatch");
 
-        // Fail closed: a check that could not run proves nothing about privacy.
+        // Fail closed: only an explicit refusal (401 or 403) proves the bucket
+        // is private. A redirect, another status or a failed request proves nothing.
         const anonymousStatus = await anonymousGet(storageObjectUrl(location, objectKey), location, signal).catch(() => null);
-        result.publicRead = anonymousStatus === null ? "unknown" : anonymousStatus >= 200 && anonymousStatus < 300 ? "allowed" : "denied";
+        result.publicRead = anonymousStatus === 401 || anonymousStatus === 403
+          ? "denied"
+          : anonymousStatus !== null && anonymousStatus >= 200 && anonymousStatus < 300 ? "allowed" : "unknown";
         if (result.publicRead === "allowed") throw new ProbeFailure("public_read");
         if (result.publicRead === "unknown") throw new ProbeFailure("public_read_unverified");
 
         if (location.prefix) result.isolation = await checkIsolation(row, credentials, probeId, signal);
+        if (!marker) await claimOwnerMarker(root, companyId, row, ownerNonce, signal);
         result.status = "passed";
       } catch (error) {
         const code = signal.aborted && !(error instanceof ProbeFailure) ? "timeout" : probeErrorCode(error);
@@ -559,16 +714,21 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
         result.errorCode = code;
         result.error = PROBE_ERRORS[code];
       } finally {
-        if (wrote && client) {
+        // Also after a write whose outcome is unknown: it may have landed.
+        if (client) {
           try {
             await client.deleteObject({ objectKey, signal: AbortSignal.timeout(CLEANUP_TIMEOUT_MS) });
-            result.checks.delete = "passed";
-          } catch {
-            result.checks.delete = "failed";
-            if (result.status === "passed") {
-              result.status = "failed";
-              result.errorCode = "cleanup_failed";
-              result.error = PROBE_ERRORS.cleanup_failed;
+            if (wrote) result.checks.delete = "passed";
+          } catch (error) {
+            if (wrote) {
+              result.checks.delete = "failed";
+              if (result.status === "passed") {
+                result.status = "failed";
+                result.errorCode = "cleanup_failed";
+                result.error = PROBE_ERRORS.cleanup_failed;
+              }
+            } else {
+              logger.warn({ err: error, companyId, destinationId: id, probeId }, "storage probe could not remove the object of a failed write");
             }
           }
         }
@@ -586,6 +746,12 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
           result.error = PROBE_ERRORS.location_unavailable;
         }
         await writeProbe(tx, row, result);
+        if (result.status === "passed") {
+          await tx
+            .update(storageDestinations)
+            .set({ claimedAt: sql`coalesce(${storageDestinations.claimedAt}, now())` })
+            .where(and(eq(storageDestinations.companyId, companyId), eq(storageDestinations.id, id)));
+        }
         await audit(connection, companyId, id, "probed", actor, {
           probeId,
           status: result.status,
@@ -595,6 +761,10 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
           isolation: result.isolation,
         });
       });
+      // Somebody else's bucket is a conflict on every surface, as on create.
+      if (result.errorCode === "location_unavailable") {
+        throw conflict(PROBE_ERRORS.location_unavailable, { code: "location_unavailable" });
+      }
       return result;
     },
   };

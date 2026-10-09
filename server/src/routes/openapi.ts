@@ -6736,7 +6736,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/storage/destinations",
   tags: ["companies"],
   summary: "Create an S3-compatible storage destination with company secret references (board only)",
-  description: "Idempotent on the client-generated id: the same id and payload return the existing destination (200); a different payload under that id is 409. A bucket already used by another company on this instance is 409.",
+  description: "Idempotent on the client-generated id: the same id and payload return the existing destination (200), checked before the secrets are read; a different payload under that id is 409. A bucket another company on this instance has claimed (a passing probe, kept after retire) is 409 with code location_unavailable.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(z.object({
@@ -6756,7 +6756,8 @@ registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/storage/destinations/{destinationId}/probe",
   tags: ["companies"],
-  summary: "Probe a storage destination: write, read, checksum, encryption, public read, prefix isolation, delete",
+  summary: "Probe a storage destination: ownership marker, write, read, checksum, encryption, public read, prefix isolation, delete",
+  description: "Returns the probe result (status passed or failed with a fixed errorCode, including ownership_unverified when the key cannot read and write .paperclip/owner.json at the bucket root). A bucket another company claimed, shown by its ownership marker under any host name or by the instance's claim, records a failed probe and answers 409 with code location_unavailable. A passing probe writes the marker when there is none and claims the bucket for the company. See doc/company-storage.md.",
   request: { params: storageDestinationParams },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });

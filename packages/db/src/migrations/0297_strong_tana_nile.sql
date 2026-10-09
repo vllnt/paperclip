@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS "storage_destinations" (
 	"revision" integer DEFAULT 0 NOT NULL,
 	"credential_revision" integer DEFAULT 0 NOT NULL,
 	"last_probe_json" jsonb,
+	"owner_nonce" text,
+	"claimed_at" timestamp with time zone,
 	"retired_at" timestamp with time zone,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
@@ -24,4 +26,4 @@ DO $$ BEGIN
 	END IF;
 END $$;--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "storage_destinations_company_created_idx" ON "storage_destinations" USING btree ("company_id","created_at");--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS "storage_destinations_active_physical_key_idx" ON "storage_destinations" USING btree ("physical_key") WHERE "storage_destinations"."retired_at" is null;
+CREATE INDEX IF NOT EXISTS "storage_destinations_physical_key_idx" ON "storage_destinations" USING btree ("physical_key");

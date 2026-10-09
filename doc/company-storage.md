@@ -25,19 +25,37 @@ manage destinations. On cloud-managed instances every storage route answers
 
 Paperclip never creates buckets, bucket policies, ACLs or lifecycle rules, and
 never deletes objects except its own probe objects. Retiring a destination
-stops its use and deletes nothing.
+stops its use and deletes nothing. Besides the prefix, Paperclip writes one
+object: the ownership marker `.paperclip/owner.json` at the bucket root.
 
 ## Rules
 
 - **One bucket per organization on an instance.** The first organization
-  whose probe passes for a bucket reserves it. After that, another
-  organization cannot create a destination for the same endpoint host and
-  bucket (any prefix), and an older unproven one fails its probe with
-  `location_unavailable`. An unproven destination reserves nothing, so a
-  bucket cannot be squatted with keys that do not work. The error does not say
-  which organization uses it. Host names are compared after dropping a
-  trailing dot, and every AWS S3 regional, dualstack and legacy host counts as
-  one; other aliases of one service are not detected.
+  whose probe passes for a bucket claims it, in two ways:
+  - **In the database:** another organization cannot create a destination for
+    the same endpoint host and bucket (any prefix): 409 `location_unavailable`.
+    Hosts are compared lowercased, without a trailing dot and with default
+    ports folded, and every AWS S3 regional, dualstack and legacy host counts
+    as one.
+  - **In the bucket:** the probe writes the ownership marker
+    `.paperclip/owner.json` at the bucket root (destination id and a random
+    value kept in the database), with a conditional write, and reads it back.
+    Every probe reads the marker first. A marker of another organization, of
+    a destination this instance does not know, or one that is not a Paperclip
+    marker makes the probe answer 409 `location_unavailable`, whatever host
+    name was used, so two DNS names for one service cannot share a bucket.
+  - An unproven destination claims nothing, so a bucket cannot be squatted with
+    keys that do not work; an older unproven one fails its probe once another
+    organization claims the bucket. The error does not say which organization
+    uses it.
+  - **The claim outlives retirement.** Retiring deletes nothing, so the bucket
+    may still hold the organization's objects, and its claim and marker stay.
+    There is no release yet; to reuse a bucket for another organization, empty
+    it and delete the marker outside Paperclip.
+- **Marker access.** The access key must be able to read and write
+  `.paperclip/owner.json` at the bucket root. A key limited to the prefix
+  needs that one object added to its policy; without it the probe fails with
+  `ownership_unverified`.
 - **Use needs a current probe.** Consumers (the company archive) get a client
   only when the latest probe passed with the current keys and found the bucket
   private (`storage_destination_unverified` otherwise). Rotating keys clears
@@ -52,11 +70,15 @@ stops its use and deletes nothing.
   metadata addresses stay refused even then. A company cannot change this
   list.
 - **Encryption modes.** `s3_managed` (default) sends `AES256`. `kms` sends
-  `aws:kms` with the key id. For both, the probe fails unless the provider
-  confirms the encryption on the object (`encryption_unverified`), because a
-  provider that ignores the header stores plaintext. `bucket_default` sends
-  nothing, for providers that reject the header but encrypt at rest; the probe
-  then reports the encryption as `unverified` unless the provider reports it.
+  `aws:kms` with the key id. The probe requires exactly what was asked for on
+  the stored object: `AES256` for `s3_managed`, `aws:kms` for `kms` and, when
+  the provider names the key, that key (give the key id or ARN; an alias
+  cannot be compared). Nothing reported is `encryption_unverified`; anything
+  else is `encryption_mismatch`. A provider that ignores the header stores
+  plaintext. `bucket_default` sends nothing, for providers that reject the
+  header but encrypt at rest; the probe reports `unverified` when the provider
+  reports nothing, `verified` for `AES256` or `aws:kms`, and fails on any
+  other value.
 - **Idempotent create.** The client generates the destination id. The same id
   and payload return the existing destination (200); a different payload under
   that id is 409.
@@ -65,20 +87,29 @@ stops its use and deletes nothing.
 
 `POST …/destinations/:id/probe` runs, with a 30-second limit:
 
-1. PUT 32 random bytes to `<prefix>/paperclip-probe/<probeId>` with the
+1. GET of the ownership marker at the bucket root (see Rules); another
+   organization's marker stops the probe with 409 before anything is written;
+2. PUT 32 random bytes to `<prefix>/paperclip-probe/<probeId>` with the
    destination's encryption mode;
-2. HEAD: the size must match, and the reported encryption is recorded;
-3. GET: the SHA-256 must match;
-4. an unauthenticated GET of the same object, addressed the way the S3 client
-   addresses the bucket (path style for dotted bucket names and IP hosts):
-   success means the bucket is public and the probe **fails**; if the check
-   cannot run, the probe fails too (`public_read_unverified`);
-5. when there is a prefix, a one-byte PUT outside it
+3. HEAD: the size must match, and the encryption must be exactly the one asked
+   for;
+4. GET of at most 33 bytes: the SHA-256 must match, and a longer body is a
+   mismatch;
+5. an unauthenticated GET of the same object, addressed the way the S3 client
+   addresses the bucket (path style for dotted bucket names and IP hosts). It
+   is never redirected. Only 401 or 403 proves the bucket private; a 2xx means
+   it is public and the probe **fails** (`public_read`); a redirect, any other
+   status or a failed request fails it too (`public_read_unverified`);
+6. when there is a prefix, a one-byte PUT outside it
    (`<parent>/paperclip-isolation-probe/<probeId>`): success is recorded as
    `bucket_wide` (the key is not limited to the prefix) and the object is
    deleted (the probe fails if it cannot be deleted); a refusal is
    `prefix_scoped`. This check does not otherwise fail the probe;
-6. DELETE of the probe object, with its own 10-second limit.
+7. when the bucket has no marker yet, the conditional write of this
+   organization's marker and a read-back (`location_unavailable` if another
+   claim won);
+8. DELETE of the probe object, with its own 10-second limit. It also runs
+   after a PUT that failed without saying whether the object was stored.
 
 The result says `passed` or `failed`, with one of these error codes and a fixed
 message (provider error text is never returned): `credentials_unavailable`,
@@ -87,7 +118,9 @@ endpoints, so the probe cannot map internal names), `invalid_credentials`,
 `access_denied`, `bucket_not_found`, `encryption_unsupported`,
 `encryption_mismatch`, `encryption_unverified`, `read_mismatch`,
 `public_read`, `public_read_unverified`, `location_unavailable`,
-`cleanup_failed`, `timeout`, `probe_failed`.
+`ownership_unverified`, `cleanup_failed`, `timeout`, `probe_failed`.
+`location_unavailable` is also the probe's HTTP status: 409, as on create,
+on the web page, in the API and in the CLI (which exits 1).
 
 ## Audit
 

@@ -11,7 +11,7 @@ function captureSends() {
   vi.spyOn(S3Client.prototype, "send").mockImplementation(async (command: unknown) => {
     commands.push(command);
     if (command instanceof CreateMultipartUploadCommand) throw new Error("stop after create");
-    if (command instanceof HeadObjectCommand) return { ContentLength: 1, ServerSideEncryption: "aws:kms" } as never;
+    if (command instanceof HeadObjectCommand) return { ContentLength: 1, ServerSideEncryption: "aws:kms", SSEKMSKeyId: "arn:aws:kms:us-east-1:111122223333:key/k1" } as never;
     return {} as never;
   });
   return commands;
@@ -44,6 +44,16 @@ describe("S3 provider encryption", () => {
     expect(put.input).toMatchObject({ ServerSideEncryption: "aws:kms", SSEKMSKeyId: "alias/archive" });
     expect(create.input).toMatchObject({ ServerSideEncryption: "aws:kms", SSEKMSKeyId: "alias/archive" });
     expect(head.serverSideEncryption).toBe("aws:kms");
+    expect(head.serverSideEncryptionKeyId).toBe("arn:aws:kms:us-east-1:111122223333:key/k1");
+  });
+
+  it("sends a conditional write only when asked", async () => {
+    const commands = captureSends();
+    const provider = createS3StorageProvider({ bucket: "instance-bucket", region: "us-east-1" });
+    await provider.putObject({ objectKey: "marker", body: Buffer.from("{}"), contentType: "application/json", contentLength: 2, ifNoneMatch: "*" });
+    await provider.putObject({ objectKey: "plain", body: Buffer.from("x"), contentType: "text/plain", contentLength: 1 });
+    const puts = commands.filter((command) => command instanceof PutObjectCommand) as PutObjectCommand[];
+    expect(puts.map((put) => put.input.IfNoneMatch)).toEqual(["*", undefined]);
   });
 
   it("refuses a company client without its endpoint and network handler", () => {

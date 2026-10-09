@@ -1,5 +1,5 @@
 {
-  "id": "6296c6f6-bdbc-472d-8ac4-253050801b2d",
+  "id": "93373aa0-94c9-45eb-b805-c234979b07d0",
   "prevId": "9b3dc3f3-423e-40ff-a8fd-7dce65c42711",
   "version": "7",
   "dialect": "postgresql",
@@ -42590,6 +42590,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "owner_nonce": {
+          "name": "owner_nonce",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "claimed_at": {
+          "name": "claimed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "retired_at": {
           "name": "retired_at",
           "type": "timestamp with time zone",
@@ -42633,8 +42645,8 @@
           "method": "btree",
           "with": {}
         },
-        "storage_destinations_active_physical_key_idx": {
-          "name": "storage_destinations_active_physical_key_idx",
+        "storage_destinations_physical_key_idx": {
+          "name": "storage_destinations_physical_key_idx",
           "columns": [
             {
               "expression": "physical_key",
@@ -42644,7 +42656,6 @@
             }
           ],
           "isUnique": false,
-          "where": "\"storage_destinations\".\"retired_at\" is null",
           "concurrently": false,
           "method": "btree",
           "with": {}

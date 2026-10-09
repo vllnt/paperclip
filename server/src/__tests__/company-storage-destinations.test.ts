@@ -24,6 +24,7 @@ import { errorHandler } from "../middleware/error-handler.js";
 import { companyStorageRoutes } from "../routes/company-storage.js";
 import { secretService } from "../services/secrets.js";
 import {
+  encryptionVerdict,
   storageDestinationService,
   storageObjectUrl,
   storagePhysicalKey,
@@ -42,18 +43,32 @@ const BOARD = { actorType: "user" as const, actorId: "board-user-1" };
 
 interface FakeBucketOptions {
   failPut?: string;
+  /** Stores the object, then throws: an upload whose outcome the client never learned. */
+  failPutAfterStore?: string;
   failDelete?: boolean;
   serverSideEncryption?: string;
+  serverSideEncryptionKeyId?: string;
   /** Deny writes whose prefix differs from the destination's prefix. */
   scopedTo?: string;
+  /** The key may not read or write the bucket-root ownership marker. */
+  markerDenied?: boolean;
   /** Runs inside every PUT, while a probe is in flight. */
   onPut?: () => Promise<void>;
+  /** Runs before every GET. */
+  onGet?: (key: string) => Promise<void>;
+  /** GET streams this body (in 64 KiB chunks) instead of the stored object. */
+  getBody?: Buffer;
+  /** GET ignores the requested range, like a non-compliant server. */
+  ignoreRange?: boolean;
 }
 
-/** In-memory S3 stand-in keyed by the full object key, prefix included. */
+const MARKER_KEY = ".paperclip/owner.json";
+
+/** In-memory S3 stand-in keyed by the full object key, prefix included (one bucket). */
 function fakeBucket(options: FakeBucketOptions = {}) {
   const objects = new Map<string, Buffer>();
   const seenCredentials: Array<{ accessKeyId: string; secretAccessKey: string }> = [];
+  const pulled = { bytes: 0 };
   const factory: NonNullable<StorageDestinationDeps["providerFactory"]> = async ({ location, credentials }) => {
     seenCredentials.push(credentials);
     const full = (key: string) => [location.prefix, key].filter(Boolean).join("/");
@@ -61,22 +76,38 @@ function fakeBucket(options: FakeBucketOptions = {}) {
     const provider: StorageProvider = {
       id: "s3",
       async putObject(input) {
+        const key = full(input.objectKey);
+        const marker = key === MARKER_KEY;
+        if (marker && options.markerDenied) throw fail("AccessDenied");
         await options.onPut?.();
         if (options.failPut) throw fail(options.failPut);
-        if (options.scopedTo !== undefined && location.prefix !== options.scopedTo) throw fail("AccessDenied");
+        if (options.scopedTo !== undefined && location.prefix !== options.scopedTo && !marker) throw fail("AccessDenied");
+        if (input.ifNoneMatch === "*" && objects.has(key)) throw fail("PreconditionFailed");
         const body = Buffer.isBuffer(input.body) ? input.body : Buffer.alloc(0);
-        objects.set(full(input.objectKey), body);
+        objects.set(key, body);
+        if (options.failPutAfterStore) throw fail(options.failPutAfterStore);
       },
       async headObject(input) {
         const body = objects.get(full(input.objectKey));
         return body
-          ? { exists: true, contentLength: body.length, serverSideEncryption: options.serverSideEncryption }
+          ? { exists: true, contentLength: body.length, serverSideEncryption: options.serverSideEncryption, serverSideEncryptionKeyId: options.serverSideEncryptionKeyId }
           : { exists: false };
       },
       async getObject(input) {
-        const body = objects.get(full(input.objectKey));
-        if (!body) throw fail("NoSuchKey");
-        return { stream: Readable.from([body]), contentLength: body.length };
+        const key = full(input.objectKey);
+        if (key === MARKER_KEY && options.markerDenied) throw fail("AccessDenied");
+        await options.onGet?.(key);
+        const stored = options.getBody && key !== MARKER_KEY ? options.getBody : objects.get(key);
+        if (!stored) throw fail("NoSuchKey");
+        const body = input.range && !options.ignoreRange ? stored.subarray(input.range.start, input.range.end + 1) : stored;
+        const chunks = function* () {
+          for (let offset = 0; offset < body.length; offset += 64 * 1024) {
+            const chunk = body.subarray(offset, offset + 64 * 1024);
+            pulled.bytes += chunk.length;
+            yield chunk;
+          }
+        };
+        return { stream: Readable.from(chunks()), contentLength: body.length };
       },
       async deleteObject(input) {
         if (options.failDelete) throw fail("AccessDenied");
@@ -85,7 +116,7 @@ function fakeBucket(options: FakeBucketOptions = {}) {
     };
     return provider;
   };
-  return { objects, seenCredentials, factory };
+  return { objects, seenCredentials, factory, pulled };
 }
 
 describeEmbeddedPostgres("company storage destinations", () => {
@@ -235,16 +266,147 @@ describeEmbeddedPostgres("company storage destinations", () => {
     await expect(claim).rejects.not.toThrow(owner.companyId);
     // The earlier unproven claim cannot pass a probe any more.
     await expect(service.probe(other.companyId, squat.destination.id, BOARD))
-      .resolves.toMatchObject({ status: "failed", errorCode: "location_unavailable" });
+      .rejects.toMatchObject({ status: 409, details: { code: "location_unavailable" } });
+    const [squatRow] = await db.select().from(storageDestinations).where(eq(storageDestinations.id, squat.destination.id));
+    expect(squatRow?.lastProbeJson).toMatchObject({ status: "failed", errorCode: "location_unavailable" });
     // The owner may use the bucket again under another prefix.
     await expect(service.create(owner.companyId, createInput(owner, { location: location({ prefix: "second" }) }), BOARD))
       .resolves.toMatchObject({ created: true });
+  });
 
-    // Once the owner retires its destinations, the bucket is free.
-    for (const row of await service.list(owner.companyId)) {
-      await service.retire(owner.companyId, row.id, { expectedRevision: row.revision }, BOARD);
+  it("keeps a bucket claimed after its owner retires every destination there", async () => {
+    const owner = await seedCompany("retire-owner");
+    const other = await seedCompany("retire-other");
+    const service = storageDestinationService(db, { providerFactory: fakeBucket({ serverSideEncryption: "AES256" }).factory, anonymousGet: async () => 403 });
+    const { destination } = await service.create(owner.companyId, createInput(owner), BOARD);
+    await service.probe(owner.companyId, destination.id, BOARD);
+    // Retiring deletes nothing, so the bucket and what the owner left in it stay the owner's.
+    await service.retire(owner.companyId, destination.id, { expectedRevision: 0 }, BOARD);
+    await expect(service.create(other.companyId, createInput(other), BOARD))
+      .rejects.toMatchObject({ status: 409, details: { code: "location_unavailable" } });
+  });
+
+  it("proves bucket ownership with a marker, so a host alias cannot share a claimed bucket", async () => {
+    const owner = await seedCompany("alias-owner");
+    const other = await seedCompany("alias-other");
+    const bucket = fakeBucket({ serverSideEncryption: "AES256" });
+    const service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => 403 });
+    const aliasA = location({ endpoint: "https://minio-a.example.com/", bucket: "shared", prefix: "a" });
+    const aliasB = location({ endpoint: "https://minio-b.example.com/", bucket: "shared", prefix: "b" });
+
+    const { destination } = await service.create(owner.companyId, createInput(owner, { location: aliasA }), BOARD);
+    await expect(service.probe(owner.companyId, destination.id, BOARD)).resolves.toMatchObject({ status: "passed" });
+    expect(JSON.parse(bucket.objects.get(MARKER_KEY)!.toString("utf8"))).toMatchObject({ destinationId: destination.id, nonce: expect.any(String) });
+
+    // The other host name gives another database key, so only the marker can tell.
+    const intruder = await service.create(other.companyId, createInput(other, { location: aliasB }), BOARD);
+    await expect(service.probe(other.companyId, intruder.destination.id, BOARD))
+      .rejects.toMatchObject({ status: 409, details: { code: "location_unavailable" } });
+    await expect(service.providerFor(other.companyId, intruder.destination.id)).rejects.toMatchObject({ status: 409 });
+
+    // The owner's own second destination through the alias is fine.
+    const second = await service.create(owner.companyId, createInput(owner, { location: { ...aliasB, prefix: "a2" } }), BOARD);
+    await expect(service.probe(owner.companyId, second.destination.id, BOARD)).resolves.toMatchObject({ status: "passed" });
+  });
+
+  it("never plants a marker in a bucket another company claimed, even when its marker is gone", async () => {
+    const owner = await seedCompany("marker-gone-owner");
+    const other = await seedCompany("marker-gone-other");
+    const bucket = fakeBucket({ serverSideEncryption: "AES256" });
+    const service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => 403 });
+    const squat = await service.create(other.companyId, createInput(other, { location: location({ prefix: "theirs" }) }), BOARD);
+    const { destination } = await service.create(owner.companyId, createInput(owner), BOARD);
+    await service.probe(owner.companyId, destination.id, BOARD);
+    bucket.objects.delete(MARKER_KEY);
+    await expect(service.probe(other.companyId, squat.destination.id, BOARD)).rejects.toMatchObject({ status: 409 });
+    expect(bucket.objects.has(MARKER_KEY)).toBe(false);
+  });
+
+  it("lets a lone alias of an unclaimed bucket pass, and refuses a key that cannot check the marker", async () => {
+    const company = await seedCompany("alias-lone");
+    const service = storageDestinationService(db, { providerFactory: fakeBucket({ serverSideEncryption: "AES256" }).factory, anonymousGet: async () => 403 });
+    const { destination } = await service.create(company.companyId, createInput(company, { location: location({ endpoint: "https://minio-b.example.com/", bucket: "shared" }) }), BOARD);
+    await expect(service.probe(company.companyId, destination.id, BOARD)).resolves.toMatchObject({ status: "passed" });
+
+    const denied = storageDestinationService(db, { providerFactory: fakeBucket({ serverSideEncryption: "AES256", markerDenied: true }).factory, anonymousGet: async () => 403 });
+    const scoped = await denied.create(company.companyId, createInput(company, { location: location({ bucket: "scoped-only" }) }), BOARD);
+    await expect(denied.probe(company.companyId, scoped.destination.id, BOARD)).resolves.toMatchObject({ status: "failed", errorCode: "ownership_unverified" });
+  });
+
+  it("loses a marker race to a claim written between its read and its write", async () => {
+    const company = await seedCompany("alias-race");
+    const options: FakeBucketOptions = { serverSideEncryption: "AES256" };
+    const bucket = fakeBucket(options);
+    options.onGet = async (key) => {
+      if (key !== MARKER_KEY) return;
+      options.onGet = undefined;
+      // Another installation or company claims the bucket right after our first read.
+      bucket.objects.set(MARKER_KEY, Buffer.from(JSON.stringify({ format: "paperclip.storage-owner", v: 1, destinationId: randomUUID(), nonce: "theirs" })));
+    };
+    const service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => 403 });
+    const { destination } = await service.create(company.companyId, createInput(company), BOARD);
+    await expect(service.probe(company.companyId, destination.id, BOARD))
+      .rejects.toMatchObject({ status: 409, details: { code: "location_unavailable" } });
+  });
+
+  it("requires the exact encryption the destination asked for", async () => {
+    const s3 = { mode: "s3_managed" as const };
+    const kms = { mode: "kms" as const, kmsKeyId: "1234abcd-12ab-34cd-56ef-1234567890ab" };
+    const keyArn = "arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+    expect(encryptionVerdict(s3, "AES256")).toBe("verified");
+    expect(encryptionVerdict(s3, "NONE")).toBe("failed");
+    expect(encryptionVerdict(s3, "aws:kms")).toBe("failed");
+    expect(encryptionVerdict(kms, "aws:kms", keyArn)).toBe("verified");
+    expect(encryptionVerdict(kms, "aws:kms")).toBe("verified");
+    expect(encryptionVerdict(kms, "aws:kms-fake", keyArn)).toBe("failed");
+    expect(encryptionVerdict(kms, "aws:kms", "arn:aws:kms:us-east-1:111122223333:key/other")).toBe("failed");
+    expect(encryptionVerdict({ mode: "kms", kmsKeyId: keyArn }, "aws:kms", keyArn)).toBe("verified");
+    expect(encryptionVerdict({ mode: "bucket_default" }, undefined)).toBe("unverified");
+    expect(encryptionVerdict({ mode: "bucket_default" }, "AES256")).toBe("verified");
+    expect(encryptionVerdict({ mode: "bucket_default" }, "NONE")).toBe("failed");
+
+    const company = await seedCompany("kms-fake");
+    const service = storageDestinationService(db, { providerFactory: fakeBucket({ serverSideEncryption: "aws:kms-fake" }).factory, anonymousGet: async () => 403 });
+    const { destination } = await service.create(company.companyId, createInput(company, { location: location({ encryption: kms }) }), BOARD);
+    await expect(service.probe(company.companyId, destination.id, BOARD)).resolves.toMatchObject({ status: "failed", errorCode: "encryption_mismatch" });
+  });
+
+  it("counts only 401 and 403 as a private bucket: a redirect proves nothing", async () => {
+    const company = await seedCompany("redirect");
+    for (const [index, status] of [302, 301, 404, 500].entries()) {
+      const service = storageDestinationService(db, { providerFactory: fakeBucket({ serverSideEncryption: "AES256" }).factory, anonymousGet: async () => status });
+      const { destination } = await service.create(company.companyId, createInput(company, { location: location({ bucket: `redirect-${index}` }) }), BOARD);
+      await expect(service.probe(company.companyId, destination.id, BOARD), String(status))
+        .resolves.toMatchObject({ status: "failed", publicRead: "unknown", errorCode: "public_read_unverified" });
     }
-    await expect(service.create(other.companyId, createInput(other), BOARD)).resolves.toMatchObject({ created: true });
+    const service = storageDestinationService(db, { providerFactory: fakeBucket({ serverSideEncryption: "AES256" }).factory, anonymousGet: async () => 401 });
+    const { destination } = await service.create(company.companyId, createInput(company, { location: location({ bucket: "redirect-401" }) }), BOARD);
+    await expect(service.probe(company.companyId, destination.id, BOARD)).resolves.toMatchObject({ status: "passed", publicRead: "denied" });
+  });
+
+  it("deletes the probe object after an upload whose outcome was unknown, and caps the read", async () => {
+    const company = await seedCompany("probe-cleanup");
+    const ambiguous = fakeBucket({ serverSideEncryption: "AES256", failPutAfterStore: "RequestTimeout" });
+    const service = storageDestinationService(db, { providerFactory: ambiguous.factory, anonymousGet: async () => 403 });
+    const { destination } = await service.create(company.companyId, createInput(company), BOARD);
+    await expect(service.probe(company.companyId, destination.id, BOARD)).resolves.toMatchObject({ status: "failed" });
+    expect([...ambiguous.objects.keys()].filter((key) => key.includes("paperclip-probe"))).toEqual([]);
+
+    // HEAD says 32 bytes, GET streams 8 MiB and ignores the range.
+    const flood = fakeBucket({ serverSideEncryption: "AES256", getBody: Buffer.alloc(8 * 1024 * 1024, 1), ignoreRange: true });
+    const capped = storageDestinationService(db, { providerFactory: flood.factory, anonymousGet: async () => 403 });
+    const big = await capped.create(company.companyId, createInput(company, { location: location({ bucket: "flood" }) }), BOARD);
+    await expect(capped.probe(company.companyId, big.destination.id, BOARD)).resolves.toMatchObject({ status: "failed", errorCode: "read_mismatch" });
+    expect(flood.pulled.bytes).toBeLessThan(1024 * 1024);
+  });
+
+  it("returns the original destination on a retried create after a referenced secret changed", async () => {
+    const company = await seedCompany("idempotent-rotated");
+    const service = storageDestinationService(db);
+    const input = createInput(company);
+    await service.create(company.companyId, input, BOARD);
+    await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, company.secretKeyId));
+    await expect(service.create(company.companyId, input, BOARD)).resolves.toMatchObject({ created: false, destination: { id: input.id } });
   });
 
   it("canonicalizes AWS host aliases and builds the probe URL the way the S3 client addresses the bucket", () => {
@@ -321,7 +483,8 @@ describeEmbeddedPostgres("company storage destinations", () => {
       errorCode: null,
     });
     expect(anonymousUrls).toEqual([`https://acme-archive.s3.example.com/paperclip/paperclip-probe/${result.probeId}`]);
-    expect(bucket.objects.size).toBe(0);
+    // Only the ownership marker stays, at the bucket root.
+    expect([...bucket.objects.keys()]).toEqual([MARKER_KEY]);
     const [row] = await db.select().from(storageDestinations).where(eq(storageDestinations.id, destination.id));
     expect(row?.lastProbeJson).toMatchObject({ probeId: result.probeId, status: "passed" });
     const audit = await db.select().from(activityLog).where(and(eq(activityLog.action, "storage.destination_probed")));

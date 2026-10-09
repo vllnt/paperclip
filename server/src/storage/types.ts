@@ -8,6 +8,8 @@ export interface PutObjectInput {
   body: Buffer | Readable;
   contentType: string;
   contentLength: number;
+  /** `*`: write only if no object exists under the key (S3 conditional write). */
+  ifNoneMatch?: "*";
   /** Cancels a single-request upload (S3). */
   signal?: AbortSignal;
 }
@@ -38,6 +40,8 @@ export interface HeadObjectResult {
   lastModified?: Date;
   /** S3 only: the encryption the provider reports for the object, when it reports one. */
   serverSideEncryption?: string;
+  /** S3 only: the KMS key the provider reports for the object (usually its ARN). */
+  serverSideEncryptionKeyId?: string;
 }
 
 export interface StorageProvider {
