@@ -137,17 +137,20 @@ export function ActiveAgentsPanel({
       </h3>
       {liveRunsPending ? (
         // The server returns at least `minRunCount` runs, so a company with run
-        // history shows a full row of cards. Reserving that space keeps the
-        // content below from jumping down when the runs arrive.
-        <div
-          data-testid="active-agents-loading"
-          aria-busy="true"
-          className={cn("grid grid-cols-1 items-start gap-2 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4", gridClassName)}
-        >
-          {Array.from({ length: Math.min(cardLimit, DASHBOARD_RUN_CARD_LIMIT) }, (_, index) => (
-            <Skeleton key={index} className="h-32 w-full" />
-          ))}
-        </div>
+        // history shows a full row of cards and the link under them. Reserving
+        // that space keeps the content below from jumping down when they arrive.
+        <>
+          <div
+            data-testid="active-agents-loading"
+            aria-busy="true"
+            className={cn("grid grid-cols-1 items-start gap-2 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4", gridClassName)}
+          >
+            {Array.from({ length: Math.min(cardLimit, DASHBOARD_RUN_CARD_LIMIT) }, (_, index) => (
+              <Skeleton key={index} className="h-32 w-full" />
+            ))}
+          </div>
+          {showMoreLink ? <div data-testid="active-agents-loading-link" aria-hidden="true" className="mt-3 h-4" /> : null}
+        </>
       ) : runs.length === 0 ? (
         <div className="rounded-xl border border-border p-4">
           <p className="text-sm text-muted-foreground">{emptyMessage}</p>

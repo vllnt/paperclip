@@ -129,7 +129,7 @@ describe("ActiveAgentsPanel", () => {
   });
 
   describe("while the runs load", () => {
-    async function renderPanel(props: { cardLimit?: number } = {}) {
+    async function renderPanel(props: { cardLimit?: number; showMoreLink?: boolean } = {}) {
       const root = createRoot(container);
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       await act(async () => {
@@ -143,6 +143,19 @@ describe("ActiveAgentsPanel", () => {
       return root;
     }
     const placeholder = () => container.querySelector('[data-testid="active-agents-loading"]');
+    const linkPlaceholder = () => container.querySelector('[data-testid="active-agents-loading-link"]');
+
+    it("does not reserve the link row when the panel has no link", async () => {
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
+      const root = await renderPanel({ showMoreLink: false });
+
+      expect(placeholder()).not.toBeNull();
+      expect(linkPlaceholder()).toBeNull();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
 
     it("reserves a row of cards instead of the empty message, then swaps in the runs", async () => {
       let resolveRuns: (runs: ReturnType<typeof createRun>[]) => void = () => {};
@@ -153,6 +166,7 @@ describe("ActiveAgentsPanel", () => {
 
       expect(placeholder()?.getAttribute("aria-busy")).toBe("true");
       expect(placeholder()?.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(4);
+      expect(linkPlaceholder()).not.toBeNull();
       expect(container.textContent).not.toContain("No recent agent runs.");
 
       await act(async () => {
@@ -160,6 +174,7 @@ describe("ActiveAgentsPanel", () => {
       });
       await waitForMicrotaskAssertion(() => {
         expect(placeholder()).toBeNull();
+        expect(linkPlaceholder()).toBeNull();
         expect(container.textContent).toContain("more active/recent");
       });
 
