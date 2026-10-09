@@ -567,6 +567,32 @@ describe("agent routes adapter validation", () => {
     );
   });
 
+  it.each([
+    { name: "no model", adapterConfig: {} },
+    { name: "the grok-build placeholder", adapterConfig: { model: "grok-build" } },
+    { name: "a non-Grok model", adapterConfig: { model: "claude-3-5-haiku" } },
+  ])("fails the grok_local environment test with a fix hint for $name behind a gateway", async ({ adapterConfig }) => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/adapters/grok_local/test-environment")
+        .send({
+          adapterConfig: {
+            cwd: os.tmpdir(),
+            ...adapterConfig,
+            env: { GROK_XAI_API_BASE_URL: "https://gateway.example/v1" },
+          },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("fail");
+    const check = res.body.checks.find((entry: { code: string }) => entry.code === "grok_gateway_model_required");
+    expect(check).toMatchObject({ level: "error" });
+    expect(check.hint).toContain("grok-4.7");
+    expect(JSON.stringify(res.body)).not.toContain("gateway.example");
+  });
+
   it("rejects redacted-value restoration from an incompatible saved agent", async () => {
     const { registerServerAdapter } = await import("../adapters/index.js");
     registerServerAdapter(externalAdapter);

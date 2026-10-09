@@ -194,6 +194,69 @@ describe("grok_local execute", () => {
     expect(args[args.indexOf("--reasoning-effort") + 1]).toBe("xhigh");
   });
 
+  describe("gateway model guard", () => {
+    const gatewayEnv = { GROK_XAI_API_BASE_URL: "https://gateway.example/v1", XAI_API_KEY: "test-key" };
+
+    it.each([undefined, "", "grok-build", "claude-3-5-haiku"])(
+      "refuses to start Grok for model %j behind a gateway and says how to fix it",
+      async (model) => {
+        const ctx = await makeCtx("gateway-guard", await makeTempRoot());
+        ctx.config = { ...ctx.config, env: gatewayEnv, ...(model === undefined ? {} : { model }) };
+        runProcessMock.mockClear();
+
+        const result = await execute(ctx);
+
+        expect(runProcessMock).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          exitCode: 1,
+          timedOut: false,
+          errorCode: "grok_gateway_model_required",
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        });
+        expect(result.errorFamily).toBeUndefined();
+        expect(result.errorMessage).toContain("GROK_XAI_API_BASE_URL");
+        expect(result.errorMessage).toContain("grok-4.7");
+        expect(result.errorMessage).not.toContain("gateway.example");
+      },
+    );
+
+    it("refuses when the gateway URL comes from the host environment", async () => {
+      const previous = process.env.GROK_XAI_API_BASE_URL;
+      process.env.GROK_XAI_API_BASE_URL = "https://gateway.example/v1";
+      try {
+        runProcessMock.mockClear();
+        const result = await execute(await makeCtx("gateway-guard-host", await makeTempRoot()));
+        expect(result.errorCode).toBe("grok_gateway_model_required");
+        expect(runProcessMock).not.toHaveBeenCalled();
+      } finally {
+        if (previous === undefined) delete process.env.GROK_XAI_API_BASE_URL;
+        else process.env.GROK_XAI_API_BASE_URL = previous;
+      }
+    });
+
+    it("runs a pinned grok-* model behind a gateway", async () => {
+      const ctx = await makeCtx("gateway-pinned", await makeTempRoot());
+      ctx.config = { ...ctx.config, env: gatewayEnv, model: "grok-4.7" };
+      runProcessMock.mockResolvedValue(makeSuccessfulRunResult());
+
+      const result = await execute(ctx);
+
+      expect(result.errorCode ?? null).toBeNull();
+      const args = runProcessMock.mock.calls.at(-1)?.[3] as string[];
+      expect(args[args.indexOf("--model") + 1]).toBe("grok-4.7");
+    });
+
+    it("still runs an unset model when no gateway is configured", async () => {
+      const ctx = await makeCtx("no-gateway", await makeTempRoot());
+      ctx.config = { ...ctx.config, env: { XAI_API_KEY: "test-key" } };
+      runProcessMock.mockResolvedValue(makeSuccessfulRunResult());
+
+      const result = await execute(ctx);
+
+      expect(result.errorCode ?? null).toBeNull();
+    });
+  });
+
   describe("failure classification", () => {
     const fixture = (name: string) =>
       fs.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), "__fixtures__", name), "utf8");

@@ -77,17 +77,28 @@ Pick one per agent. A run with none fails with `grok_auth_required` (the CLI say
 Through a gateway, the CLI's own default model is **not** a Grok model. In the
 operator's CLIProxy deployment, `grok` with no `--model` runs `claude-3-5-haiku`.
 
-The adapter does not guard against this yet. When an agent's `model` is empty or
-`grok-build` (the adapter's placeholder default), the adapter passes no `--model`
-flag and the gateway's default applies. So until a guard ships:
+When an agent's `model` is empty or `grok-build` (the adapter's placeholder
+default), the adapter passes no `--model` flag, so the gateway's default would
+run. A guard stops that. When `GROK_XAI_API_BASE_URL` is set (in the agent's env,
+the environment's env vars, or the worker's own environment) and the agent's
+model is empty, `grok-build`, or not a Grok model:
 
-- set an explicit `grok-*` model on every `grok_local` agent (the canary uses
-  `grok-4.7`);
-- check the model in the run log after the first run.
+- **Environment test:** fails with check `grok_gateway_model_required` (level
+  `error`) and a hint, and runs no `grok` probe. It shows on the agent page's
+  test card, in the `POST /api/companies/:companyId/adapters/grok_local/test-environment`
+  response, and in `paperclipai adapter test-environment grok_local`.
+- **Run:** fails before `grok` starts, with `errorCode: "grok_gateway_model_required"`
+  and the same message and hint in `errorMessage`. It sets no `errorFamily`, so
+  the run is not retried and no target cools down. Fix the model and wake the
+  agent again.
+
+The fix is to set the agent's model to a Grok model, for example `grok-4.7` (the
+canary model), or to remove `GROK_XAI_API_BASE_URL` to use the CLI's own default.
+Without a gateway base URL nothing is checked, because the CLI default is then a
+Grok model.
 
 `paperclipai agent set-adapter` already refuses an agent whose model is not an
-xAI model, so a switched agent keeps its `grok-*` model. The gap is an agent
-created directly on `grok_local` without one.
+xAI model, so a switched agent keeps its `grok-*` model.
 
 ## Instance prerequisite
 
@@ -109,6 +120,7 @@ curl -fsS -X PATCH -H "Authorization: Bearer $TOKEN" -H 'content-type: applicati
 | Situation | `errorCode` | Effect |
 |---|---|---|
 | Not signed in, invalid or revoked key | `grok_auth_required` | Auth repair path; no cooldown |
+| Gateway base URL set, but the model is empty, `grok-build` or not a Grok model | `grok_gateway_model_required` | Fails before `grok` starts; no retry, no cooldown. Set a `grok-*` model |
 | Gateway cooldown ("All credentials for model … are cooling down"), xAI team out of credits or at its spending limit | `provider_quota` | Target cools down; the wake retries once on the next fallback (#31) or profile target (#63) |
 | Overloaded, at capacity, 502/503/504, "too many requests" | `grok_transient_upstream` | Bounded retries; capacity cooldown only after they are spent |
 
@@ -160,8 +172,9 @@ back its configuration revision (`paperclipai agent config-revisions <agent-id>`
 3. Bind `XAI_API_KEY` (and `GROK_XAI_API_BASE_URL` if a gateway is used) as company
    secrets. Run the agent's environment test.
 4. Pick one agent that already runs a `grok-*` model (the canary uses `grok-4.7`).
-   Switch it with `--dry-run`, read the plan, apply. Check the first run used that
-   model and not the gateway default.
+   Switch it with `--dry-run`, read the plan, apply. Run the environment test: it
+   must not report `grok_gateway_model_required`. Check the first run used that
+   model.
 5. Compare its `grok_local` runs against its earlier `codex_local` runs for a
    working day: success rate, duration and cost in the run log (and, once #63
    lands, `/api/companies/:companyId/run-target-stats`).

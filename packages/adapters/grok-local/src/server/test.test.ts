@@ -358,4 +358,51 @@ describe("grok_local testEnvironment", () => {
       false,
     );
   });
+
+  describe("gateway model guard", () => {
+    const gatewayEnv = { GROK_XAI_API_BASE_URL: "https://gateway.example/v1", XAI_API_KEY: "test-key" };
+
+    it.each([undefined, "", "grok-build", "claude-3-5-haiku"])(
+      "fails with grok_gateway_model_required and a fix hint for model %j behind a gateway",
+      async (model) => {
+        const result = await testEnvironment({
+          companyId: "company-1",
+          adapterType: "grok_local",
+          config: { command: "grok", cwd: "/tmp/project", env: gatewayEnv, ...(model === undefined ? {} : { model }) },
+        });
+
+        expect(result.status).toBe("fail");
+        const check = result.checks.find((entry: { code: string }) => entry.code === "grok_gateway_model_required");
+        expect(check).toMatchObject({ level: "error" });
+        expect(check?.hint).toContain("grok-4.7");
+        expect(check?.hint).toContain("model");
+        expect(runProcessMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it("does not add the check for a pinned grok-* model behind a gateway", async () => {
+      runProcessMock.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" });
+
+      const result = await testEnvironment({
+        companyId: "company-1",
+        adapterType: "grok_local",
+        config: { command: "grok", cwd: "/tmp/project", env: gatewayEnv, model: "grok-4.7" },
+      });
+
+      expect(result.checks.some((entry: { code: string }) => entry.code === "grok_gateway_model_required")).toBe(false);
+      expect(runProcessMock).toHaveBeenCalled();
+    });
+
+    it("does not add the check for an unset model when no gateway is configured", async () => {
+      runProcessMock.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" });
+
+      const result = await testEnvironment({
+        companyId: "company-1",
+        adapterType: "grok_local",
+        config: { command: "grok", cwd: "/tmp/project", env: { XAI_API_KEY: "test-key" } },
+      });
+
+      expect(result.checks.some((entry: { code: string }) => entry.code === "grok_gateway_model_required")).toBe(false);
+    });
+  });
 });

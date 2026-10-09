@@ -48,6 +48,7 @@ import {
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { grokHomeHasUsableAuth, resolveManagedGrokHomeDir, stageGrokHomeForSync } from "./grok-home.js";
+import { findGrokGatewayModelProblem, GROK_GATEWAY_MODEL_REQUIRED } from "./gateway-model-guard.js";
 import { classifyGrokFailure, isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -359,6 +360,17 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
       executionTargetIsRemote,
       executionCwd: effectiveExecutionCwd,
     });
+    const gatewayModelProblem = findGrokGatewayModelProblem({ model, env: { ...process.env, ...env } });
+    if (gatewayModelProblem) {
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: GROK_GATEWAY_MODEL_REQUIRED,
+        errorMessage: `${gatewayModelProblem.message} ${gatewayModelProblem.hint}`,
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      };
+    }
     if (authToken) {
       env.PAPERCLIP_API_KEY = authToken;
     }
