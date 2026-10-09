@@ -5,7 +5,7 @@ import {
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
   type AgentProtectedConfigState,
-} from "../routes/agent-self-config-authz.js";
+} from "../services/agent-self-config-authz.js";
 
 const aiConnection = { provider: "anthropic", method: "api_key", mode: "responsible_user" };
 

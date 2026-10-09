@@ -19,6 +19,14 @@ import { conflict, forbidden, notFound } from "../errors.js";
 import { agentService } from "./agents.js";
 import { approvalService } from "./approvals.js";
 import { logActivity } from "./activity-log.js";
+import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import { authorizationService } from "./authorization.js";
+import { normalizeAgentPermissions } from "./agent-permissions.js";
+import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
+import {
+  collectAgentPermissionChanges,
+  collectAgentProtectedConfigChanges,
+} from "./agent-self-config-authz.js";
 import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
 
@@ -646,10 +654,66 @@ export function pluginManagedAgentService(
       return createManagedAgent(companyId, declaration);
   }
 
+  /**
+   * A reset rewrites the agent's adapter, runtime caps, budget, role, and
+   * permissions to the plugin's declared defaults. When an agent started the
+   * plugin call, the reset may not change a protected field unless that agent
+   * holds `agents:configure` for the target. Board, user, and system calls keep
+   * their access. Runs before any write.
+   */
+  async function assertAgentCallerMayResetProtectedFields(
+    companyId: string,
+    agent: Agent,
+    managedResourceKey: string,
+    defaults: ReturnType<typeof declarationPatch>,
+  ) {
+    const caller = currentPluginHostCallAgent();
+    if (!caller) return;
+    const fields = [
+      ...collectAgentProtectedConfigChanges(agent, {
+        adapterType: defaults.adapterType,
+        adapterConfig: defaults.adapterConfig,
+        runtimeConfig: defaults.runtimeConfig,
+        budgetMonthlyCents: defaults.budgetMonthlyCents,
+        role: defaults.role,
+        status: agent.status,
+      }),
+      ...collectAgentPermissionChanges(agent.permissions, normalizeAgentPermissions(defaults.permissions)),
+    ];
+    const actor = { type: "agent" as const, agentId: caller.agentId, companyId: caller.companyId, runId: caller.runId, source: "agent_jwt" as const };
+    await assertAgentProtectedChangeGranted({
+      actor,
+      decide: (request) => authorizationService(db).decide(request),
+      recordDenial: async (details) => {
+        await logActivity(db, {
+          companyId,
+          actorType: "agent",
+          actorId: caller.agentId,
+          agentId: caller.agentId,
+          runId: caller.runId,
+          action: "agent.self_config_update_denied",
+          entityType: "agent",
+          entityId: agent.id,
+          details: { ...details, managedResourceKey },
+        });
+      },
+      target: { id: agent.id, companyId },
+      fields,
+      surface: "plugin_managed_reset",
+      details: { sourcePluginKey: options.pluginKey },
+    });
+  }
+
   async function reset(agentKey: string, companyId: string) {
       const declaration = declarationFor(agentKey);
       const reconciled = await reconcile(agentKey, companyId);
       if (!reconciled.agent) return reconciled;
+      await assertAgentCallerMayResetProtectedFields(
+        companyId,
+        reconciled.agent,
+        declaration.agentKey,
+        declarationPatch(declaration, { adapterType: await resolveManagedAdapterType(companyId, declaration) }),
+      );
       const currentMetadata = reconciled.agent.metadata && typeof reconciled.agent.metadata === "object"
         ? reconciled.agent.metadata
         : {};

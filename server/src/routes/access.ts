@@ -94,7 +94,7 @@ import {
   resolveHumanInviteRole,
 } from "../services/company-member-roles.js";
 import { humanJoinGrantsFromDefaults } from "../services/invite-grants.js";
-import { collectAgentProtectedConfigChanges } from "./agent-self-config-authz.js";
+import { collectAgentProtectedConfigChanges } from "../services/agent-self-config-authz.js";
 import {
   assertAgentProtectedChangeGranted,
   type AgentProtectedChangeActivityActor,

@@ -111,7 +111,7 @@ import {
   collectAgentConfigRollbackChanges,
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
-} from "./agent-self-config-authz.js";
+} from "../services/agent-self-config-authz.js";
 import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
 import { configPatchFromSnapshot } from "../services/agents.js";
 import { normalizeAgentPermissions } from "../services/agent-permissions.js";
