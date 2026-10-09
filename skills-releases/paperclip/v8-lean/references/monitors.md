@@ -10,7 +10,7 @@ An issue is eligible only when it is assigned to an agent (`assigneeAgentId` set
 
 End your turn with `issue wait` and never leave a background process running. Run `npx paperclipai issue wait <issueId> --in 10m --reason "CI on PR #4320 head abc123"`, or `POST /api/issues/{id}/wait` with `{"in":"10m","reason":"..."}`. The wait is 1 minute to 24 hours and works only on an issue assigned to you in `in_progress` or `in_review`. Then finish your turn. The issue keeps its status, and Paperclip wakes you with `PAPERCLIP_WAKE_REASON=issue_monitor_due` and your reason as the wait note.
 
-Do not run `gh pr checks --watch`, `sleep` loops, port waits or any other background wait. Paperclip stops a process that is still running after your final result, and then schedules a re-check for you (5, 10, then 20 minutes, at most three times) with the note "re-check after background task stop".
+Do not run `gh pr checks --watch`, `sleep` loops, port waits or any other background wait. On Claude local runs, Paperclip stops a process that is still running after your final result, and then schedules a re-check for you (5, 10, then 20 minutes, at most three times) with the note "re-check after background task stop". Other adapters do not get that re-check, so always end your turn with `issue wait`.
 
 ## Rules
 
