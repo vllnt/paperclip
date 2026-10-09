@@ -123,6 +123,7 @@ import {
 import { registerGitHubWriteIdentityWorkers } from "./services/github-write-identity.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { managedAgentProfileRoutes } from "./routes/managed-agent-profiles.js";
+import { companyStorageRoutes } from "./routes/company-storage.js";
 import { remoteAgentProfileRoutes } from "./routes/remote-agent-profiles.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
@@ -776,6 +777,7 @@ export async function createApp(
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(secretRoutes(db));
   api.use(managedAgentProfileRoutes(db));
+  api.use(companyStorageRoutes(db));
   api.use(remoteAgentProfileRoutes(db));
   api.use(
     chatChannelRoutes(db, {

@@ -631,6 +631,7 @@ export const queryKeys = {
   cloud: {
     stacks: ["cloud", "stacks"] as const,
   },
+  storageDestinations: (companyId: string) => ["storage-destinations", companyId] as const,
   secrets: {
     list: (companyId: string) => ["secrets", companyId] as const,
     providers: (companyId: string) => ["secret-providers", companyId] as const,

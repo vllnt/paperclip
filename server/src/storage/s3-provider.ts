@@ -1,5 +1,6 @@
 import {
   S3Client,
+  type S3ClientConfig,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -7,6 +8,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { putS3Multipart } from "./s3-multipart.js";
 import { addAbortSignal, Readable } from "node:stream";
+import type { StorageEncryption } from "@paperclipai/shared";
 import type { StorageProvider, GetObjectResult, HeadObjectResult } from "./types.js";
 import { notFound, unprocessable } from "../errors.js";
 
@@ -16,6 +18,21 @@ interface S3ProviderConfig {
   endpoint?: string;
   prefix?: string;
   forcePathStyle?: boolean;
+  /**
+   * Company destinations pass these three. Instance storage passes none and
+   * keeps the SDK default credential chain and client behaviour.
+   */
+  credentials?: { accessKeyId: string; secretAccessKey: string };
+  /** Connect-time network policy (company-s3-network.ts). */
+  requestHandler?: S3ClientConfig["requestHandler"];
+  serverSideEncryption?: StorageEncryption;
+}
+
+/** PutObject and CreateMultipartUpload parameters for a destination's encryption mode. */
+export function s3EncryptionParams(encryption: StorageEncryption | undefined) {
+  if (!encryption || encryption.mode === "bucket_default") return {};
+  if (encryption.mode === "kms") return { ServerSideEncryption: "aws:kms" as const, SSEKMSKeyId: encryption.kmsKeyId };
+  return { ServerSideEncryption: "AES256" as const };
 }
 
 function normalizePrefix(prefix: string | undefined): string {
@@ -71,11 +88,30 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
   if (!region) throw unprocessable("S3 storage region is required");
 
   const prefix = normalizePrefix(config.prefix);
+  const companyClient = Boolean(config.credentials);
+  // A company client without the guarded handler would dial any address the
+  // endpoint resolves to; refuse rather than build one.
+  if (companyClient && (!config.requestHandler || !config.endpoint)) {
+    throw unprocessable("A company S3 client needs its endpoint and network policy handler");
+  }
   const client = new S3Client({
     region,
     endpoint: config.endpoint,
     forcePathStyle: Boolean(config.forcePathStyle),
+    ...(companyClient
+      ? {
+          credentials: config.credentials,
+          requestHandler: config.requestHandler,
+          // Many S3-compatible services (MinIO, OVH and others) reject the
+          // SDK's default trailing checksums on streamed uploads. Send them
+          // only when an operation requires them; the probe and the archive
+          // verify content with their own SHA-256.
+          requestChecksumCalculation: "WHEN_REQUIRED" as const,
+          responseChecksumValidation: "WHEN_REQUIRED" as const,
+        }
+      : {}),
   });
+  const encryption = s3EncryptionParams(config.serverSideEncryption);
 
   return {
     id: "s3",
@@ -83,7 +119,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
     async putObject(input) {
       const key = buildKey(prefix, input.objectKey);
       if (input.contentLength > 16 * 1024 * 1024) {
-        await putS3Multipart(client, bucket, key, input);
+        await putS3Multipart(client, bucket, key, input, encryption);
         return;
       }
       await client.send(
@@ -93,7 +129,10 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           Body: input.body,
           ContentType: input.contentType,
           ContentLength: input.contentLength,
+          IfNoneMatch: input.ifNoneMatch,
+          ...encryption,
         }),
+        { abortSignal: input.signal },
       );
     },
 
@@ -142,6 +181,8 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           contentLength: output.ContentLength,
           etag: output.ETag,
           lastModified: toDate(output.LastModified),
+          serverSideEncryption: output.ServerSideEncryption,
+          serverSideEncryptionKeyId: output.SSEKMSKeyId,
         };
       } catch (err) {
         const code = (err as { name?: string }).name;
@@ -157,6 +198,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           Bucket: bucket,
           Key: key,
         }),
+        { abortSignal: input.signal },
       );
     },
   };
