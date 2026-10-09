@@ -9,6 +9,7 @@ import { issuesApi } from "../api/issues";
 import { queryKeys } from "../lib/queryKeys";
 import { cn, relativeTime } from "../lib/utils";
 import { Clock3 } from "lucide-react";
+import { Skeleton } from "@/components/ui/skeleton";
 import { StatusGlyph } from "./StatusGlyph";
 import { RunChatSurface } from "./RunChatSurface";
 import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
@@ -70,7 +71,7 @@ export function ActiveAgentsPanel({
     enabled: !!companyId,
     leaderOnly: true,
   });
-  const { data: liveRuns, dataUpdatedAt: liveRunsUpdatedAt } = useQuery({
+  const { data: liveRuns, dataUpdatedAt: liveRunsUpdatedAt, isPending: liveRunsPending } = useQuery({
     queryKey: liveRunsQueryKey,
     queryFn: () => heartbeatsApi.liveRunsForCompany(companyId, {
       minCount: minRunCount,
@@ -134,7 +135,20 @@ export function ActiveAgentsPanel({
       <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
         {title}
       </h3>
-      {runs.length === 0 ? (
+      {liveRunsPending ? (
+        // The server returns at least `minRunCount` runs, so a company with run
+        // history shows a full row of cards. Reserving that space keeps the
+        // content below from jumping down when the runs arrive.
+        <div
+          data-testid="active-agents-loading"
+          aria-busy="true"
+          className={cn("grid grid-cols-1 items-start gap-2 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4", gridClassName)}
+        >
+          {Array.from({ length: Math.min(cardLimit, DASHBOARD_RUN_CARD_LIMIT) }, (_, index) => (
+            <Skeleton key={index} className="h-32 w-full" />
+          ))}
+        </div>
+      ) : runs.length === 0 ? (
         <div className="rounded-xl border border-border p-4">
           <p className="text-sm text-muted-foreground">{emptyMessage}</p>
         </div>

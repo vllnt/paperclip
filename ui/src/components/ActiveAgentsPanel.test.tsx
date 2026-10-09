@@ -128,6 +128,90 @@ describe("ActiveAgentsPanel", () => {
     vi.clearAllMocks();
   });
 
+  describe("while the runs load", () => {
+    async function renderPanel(props: { cardLimit?: number } = {}) {
+      const root = createRoot(container);
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      await act(async () => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <ActiveAgentsPanel companyId="company-1" {...props} />
+          </QueryClientProvider>,
+        );
+      });
+      await flushReact();
+      return root;
+    }
+    const placeholder = () => container.querySelector('[data-testid="active-agents-loading"]');
+
+    it("reserves a row of cards instead of the empty message, then swaps in the runs", async () => {
+      let resolveRuns: (runs: ReturnType<typeof createRun>[]) => void = () => {};
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(
+        new Promise((resolve) => { resolveRuns = resolve; }),
+      );
+      const root = await renderPanel();
+
+      expect(placeholder()?.getAttribute("aria-busy")).toBe("true");
+      expect(placeholder()?.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(4);
+      expect(container.textContent).not.toContain("No recent agent runs.");
+
+      await act(async () => {
+        resolveRuns([1, 2, 3, 4, 5].map(createRun));
+      });
+      await waitForMicrotaskAssertion(() => {
+        expect(placeholder()).toBeNull();
+        expect(container.textContent).toContain("more active/recent");
+      });
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("shows the empty message once the list loads empty", async () => {
+      mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
+      const root = await renderPanel();
+
+      await waitForMicrotaskAssertion(() => {
+        expect(placeholder()).toBeNull();
+        expect(container.textContent).toContain("No recent agent runs.");
+      });
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("falls back to the empty message when the runs fail to load", async () => {
+      mockHeartbeatsApi.liveRunsForCompany.mockRejectedValue(new Error("boom"));
+      const root = await renderPanel();
+
+      await waitForMicrotaskAssertion(() => {
+        expect(placeholder()).toBeNull();
+        expect(container.textContent).toContain("No recent agent runs.");
+      });
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it.each([
+      [2, 2],
+      [4, 4],
+      [20, 4],
+    ])("reserves at most the dashboard row: cardLimit %i gives %i placeholders", async (cardLimit, expected) => {
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
+      const root = await renderPanel({ cardLimit });
+
+      expect(placeholder()?.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(expected);
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+  });
+
   it("links hidden active/recent runs to the full live dashboard", async () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({
