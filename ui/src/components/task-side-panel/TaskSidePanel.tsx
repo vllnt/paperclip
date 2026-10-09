@@ -351,7 +351,7 @@ export function TaskSidePanel({
     });
   }, [accountScope, issue.companyId, issue.id, launcherOpen]);
   const controller = useSidePanelTabs<TaskSidePanelTabPayload>({ initialState, onStateChange: persist });
-  const browsersQuery = useTaskBrowsers(issue.id);
+  const browsersQuery = useTaskBrowsers(issue.id, hasActiveRun);
   const newestLiveBrowser = browsersQuery.data?.findLast((browser) => browser.status === "running" || browser.status === "idle");
   useEffect(() => {
     if (!openBrowserId) return;
