@@ -64,6 +64,7 @@ import {
   sandboxConfigFromLeaseMetadataLoose,
 } from "./sandbox-provider-runtime.js";
 import { pluginRegistryService } from "./plugin-registry.js";
+import { resourceCapacityService } from "./resource-capacity.js";
 import type {
   ExecuteLogSink,
   PluginWorkerManager,
@@ -1238,6 +1239,7 @@ async function removeReleasedSshRunDirectory(db: Db, environment: Environment, l
 
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
+  const resourceCapacity = resourceCapacityService(db);
 
   return {
     driver: "ssh",
@@ -1252,8 +1254,9 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
       }
 
-      const { remoteCwd } = await ensureSshWorkspaceReady(parsed.config);
-      return await environmentsSvc.acquireLease({
+      const { remoteCwd, resourceProbe } = await ensureSshWorkspaceReady(parsed.config, { probeResources: true });
+      const probedAt = new Date();
+      const lease = await environmentsSvc.acquireLease({
         companyId: input.companyId,
         environmentId: input.environment.id,
         executionWorkspaceId: input.executionWorkspaceId,
@@ -1273,6 +1276,9 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           remoteCwd,
         },
       });
+      // Never awaited: it cannot throw, and recording must not delay the run.
+      void resourceCapacity.recordLeaseAcquireProbe(input.environment.id, resourceProbe ?? null, probedAt);
+      return lease;
     },
 
     async releaseRunLease(input) {
