@@ -4,6 +4,7 @@ import {
   Cpu,
   Download,
   FlaskConical,
+  Gauge,
   KeyRound,
   MonitorCog,
   Puzzle,
@@ -139,6 +140,14 @@ export function CompanySettingsSidebar() {
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/environments`}
               label="Environments"
               icon={MonitorCog}
+              end
+            />
+          )}
+          {showPage("instance.resource-capacity") && (
+            <SidebarNavItem
+              to={`${INSTANCE_SETTINGS_PATH_PREFIX}/resource-capacity`}
+              label="Resource capacity"
+              icon={Gauge}
               end
             />
           )}
