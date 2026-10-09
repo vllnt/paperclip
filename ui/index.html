@@ -21,23 +21,24 @@
         const key = "paperclip.theme";
         const darkThemeColor = "#000000";
         const lightThemeColor = "#ffffff";
+        // Each read has its own guard: blocked storage must still follow the OS,
+        // the way ThemeContext resolves an unset preference.
+        let stored = null;
         try {
-          const stored = window.localStorage.getItem(key);
-          const prefersDark =
+          stored = window.localStorage.getItem(key);
+        } catch {}
+        let prefersDark = false;
+        try {
+          prefersDark =
             typeof window.matchMedia === "function" &&
             window.matchMedia("(prefers-color-scheme: dark)").matches;
-          const fallback = prefersDark ? "dark" : "light";
-          const theme = stored === "light" || stored === "dark" ? stored : fallback;
-          const isDark = theme === "dark";
-          document.documentElement.classList.toggle("dark", isDark);
-          document.documentElement.style.colorScheme = isDark ? "dark" : "light";
-          const themeColorMeta = document.querySelector('meta[name="theme-color"]');
-          if (themeColorMeta) {
-            themeColorMeta.setAttribute("content", isDark ? darkThemeColor : lightThemeColor);
-          }
-        } catch {
-          document.documentElement.classList.add("dark");
-          document.documentElement.style.colorScheme = "dark";
+        } catch {}
+        const isDark = stored === "dark" || (stored !== "light" && prefersDark);
+        document.documentElement.classList.toggle("dark", isDark);
+        document.documentElement.style.colorScheme = isDark ? "dark" : "light";
+        const themeColorMeta = document.querySelector('meta[name="theme-color"]');
+        if (themeColorMeta) {
+          themeColorMeta.setAttribute("content", isDark ? darkThemeColor : lightThemeColor);
         }
       })();
     </script>
