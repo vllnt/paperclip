@@ -14,6 +14,25 @@ export type {
   CatalogValidationResult,
 } from "./types.js";
 
+export {
+  checkSkillQuality,
+  checkSkillSetQuality,
+  DEFAULT_SKILL_QUALITY_THRESHOLDS,
+  SKILL_QUALITY_CHECK_IDS,
+} from "./skill-quality.js";
+export type {
+  SkillQualityCheckId,
+  SkillQualityFile,
+  SkillQualityFinding,
+  SkillQualityInput,
+  SkillQualityMetrics,
+  SkillQualityOptions,
+  SkillQualityReport,
+  SkillQualitySeverity,
+  SkillQualityThresholds,
+  SkillSetEntry,
+} from "./skill-quality.js";
+
 export const catalogManifest = catalogManifestJson as CatalogManifest;
 
 export const catalogSkills: CatalogSkill[] = catalogManifest.skills;
