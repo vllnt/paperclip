@@ -24,6 +24,7 @@ import {
   type GovernanceSelectValue,
 } from "../components/InteractionGovernancePanel";
 import { CompanyPatternIcon } from "../components/CompanyPatternIcon";
+import { CompanyStorageDestinationsPanel } from "../components/CompanyStorageDestinationsPanel";
 import {
   Field,
   ToggleField,
@@ -367,6 +368,8 @@ export function CompanySettings() {
             : null
         }
       />
+
+      {!isCloudManaged && <CompanyStorageDestinationsPanel companyId={selectedCompany.id} />}
 
       <InstanceGeneralSettings embedded />
 
