@@ -1,6 +1,6 @@
 ---
 name: slack
-description: Use the assigned Slack bot from Slack conversations, Paperclip tasks, and routines to read shared discussions and collaborate.
+description: Reads and collaborates in Slack through the bot assigned to this agent and its slack_* tools. Use when a task or routine comes from Slack, or asks to read, search, or post in Slack.
 ---
 
 # Slack task tools
