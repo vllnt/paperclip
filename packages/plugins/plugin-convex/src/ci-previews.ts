@@ -19,6 +19,11 @@ export function compileTemplate(template: string): RegExp {
   let optional = false;
   let optionalLength = 0;
   const seen = new Set<string>();
+  // What can come right before the next element: a number (a placeholder or a digit) or anything else. Two numbers next to each other
+  // cannot be told apart ("12345" is pr 1234 and run 5, or pr 12 and run 345), so that is rejected, also across an optional part that may be empty.
+  let before = new Set<"number" | "other">(["other"]);
+  let beforeOptional = new Set<"number" | "other">(["other"]);
+  let letters = false;
   for (let i = 0; i < template.length; i++) {
     const char = template[i];
     if (char === "{") {
@@ -27,28 +32,36 @@ export function compileTemplate(template: string): RegExp {
       if (!PLACEHOLDERS.has(name)) throw new Error("may only use {pr}, {run}, {shard} and {attempt}");
       if (seen.has(name)) throw new Error(`uses {${name}} more than once`);
       if (optional && name === "pr") throw new Error("{pr} cannot be in an optional [ ] part");
+      if (before.has("number")) throw new Error("puts two numbers next to each other; put a letter or punctuation between {pr}, {run}, {shard} and {attempt}");
       seen.add(name);
       source += `(?<${name}>\\d{1,15})`;
       if (optional) optionalLength += 1;
+      before = new Set(["number"]);
       i = end;
     } else if (char === "[") {
       if (optional) throw new Error("allows only one flat optional [ ] part");
       optional = true;
       optionalLength = 0;
+      beforeOptional = new Set(before);
       source += "(?:";
     } else if (char === "]") {
       if (!optional || optionalLength === 0) throw new Error("has a ] without a matching [ or an empty optional part");
       optional = false;
+      before = new Set([...before, ...beforeOptional]); // the optional part may be absent
       source += ")?";
     } else if (char === "}") {
       throw new Error("has a } without a matching {");
     } else {
       source += escape(char);
       if (optional) optionalLength += 1;
+      before = new Set([/[0-9]/.test(char) ? "number" : "other"]);
+      if (/[A-Za-z]/.test(char)) letters = true;
     }
   }
   if (optional) throw new Error("has a [ without a matching ]");
   if (!seen.has("pr")) throw new Error("must contain {pr}");
+  // Without a letter in the literal text, every all-digit name would read as a pull request.
+  if (!letters) throw new Error("must contain some literal text with a letter, such as pr");
   const pattern = new RegExp(`^${source}$`);
   compiled.set(template, pattern);
   return pattern;

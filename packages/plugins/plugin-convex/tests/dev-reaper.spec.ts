@@ -312,6 +312,7 @@ describe("configuration", () => {
       { reaper: { dev: { protect: ["*alice*"] } } }, { reaper: { dev: { onlyPatterns: ["dev/*-pinned"] } } }, { reaper: { dev: { protect: ["a**"] } } },
       // the allow list may not be so wide that it names everyone's deployments
       { reaper: { dev: { onlyPatterns: ["*"] } } }, { reaper: { dev: { onlyPatterns: ["dev/*"] } } }, { reaper: { dev: { onlyPatterns: ["dev/a*"] } } }, { reaper: { dev: { onlyPatterns: ["dev/ab*"] } } },
+      { reaper: { dev: { onlyPatterns: ["dev*"] } } }, { reaper: { dev: { onlyPatterns: ["DEV*"] } } }, { reaper: { dev: { onlyPatterns: ["fin*"] } } }, { reaper: { dev: { onlyPatterns: ["dev//x*"] } } }, { reaper: { dev: { onlyPatterns: ["/ab*"] } } },
     ]) expect(() => parseConfig(bad as Record<string, unknown>), JSON.stringify(bad)).toThrow();
     // the protect list may be as wide as it likes: that only keeps more
     expect(parseConfig({ reaper: { dev: { protect: ["*", "dev/*"] } } }).reaper.dev.protect).toEqual(["*", "dev/*"]);

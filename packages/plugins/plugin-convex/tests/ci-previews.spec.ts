@@ -16,8 +16,22 @@ describe("compileTemplate", () => {
     ["pr{pr", /may only use/],
     ["", /1 to 200 characters/],
     ["x".repeat(201), /1 to 200 characters/],
+    // two numbers next to each other cannot be told apart: "12345" could be pr 1234 and run 5
+    ["pr{pr}{run}", /next to each other/],
+    ["pr{pr}0{run}", /next to each other/],
+    ["[-run{run}]{pr}", /next to each other/],
+    ["pr{pr}[{run}]", /next to each other/],
+    ["pr{pr}-{run}{shard}", /next to each other/],
+    // a template of digits only would turn any all-digit name into a pull request
+    ["{pr}", /letter/],
+    ["-{pr}", /letter/],
+    ["12{pr}", /letter/],
   ])("rejects %j", (template, message) => {
     expect(() => compileTemplate(template)).toThrow(message);
+  });
+
+  it.each(["pr{pr}", "pr-{pr}", "pr{pr}-run{run}", "pr{pr}[-run{run}]-s{shard}-a{attempt}", "preview-{pr}-r{run}"])("accepts %j", template => {
+    expect(() => compileTemplate(template)).not.toThrow();
   });
 
   it("compiles to literals and bounded digit groups, so it cannot backtrack badly", () => {

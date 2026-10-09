@@ -38,6 +38,10 @@ describe("hardDeleteBlock", () => {
     expect(block({ name: "ok-name", reference: `dev/${value}`, previewIdentifier: null }), value).toMatch(/production, staging, main or release/);
   });
 
+  it.each(["prOD", "pRoD", "PrOd", "uat", "UAT", "live", "Live-Site", "stAGing"])("blocks %s, mixed case and the synonyms uat and live", value => {
+    expect(block({ name: "ok-name", reference: `dev/${value}`, previewIdentifier: null }), value).toMatch(/production, staging, main or release/);
+  });
+
   it("blocks a name with letters outside a to z, because look-alike letters can hide a production word", () => {
     expect(block({ name: "ok-name", reference: "dev/pr\u043Ed", previewIdentifier: null })).toMatch(/characters outside/);
   });

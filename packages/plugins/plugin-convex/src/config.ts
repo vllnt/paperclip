@@ -105,7 +105,9 @@ function patterns(value: unknown, path: string, narrow = false): string[] {
   const list = [...new Set((value as string[]).map(item => item.trim()))];
   if (narrow) {
     for (const item of list) {
-      if (item.endsWith("*") && item.slice(item.lastIndexOf("/") + 1, -1).length < 3) throw new ConfigError(`${path}: "${item}" is too wide. Put at least three characters before the * (for example dev/ship-*).`);
+      if (item.endsWith("*") && !(item.includes("/") && item.slice(item.lastIndexOf("/") + 1, -1).length >= 3)) {
+        throw new ConfigError(`${path}: "${item}" is too wide. Use a prefix with a / and at least three characters after it before the * (for example dev/ship-*).`);
+      }
     }
   }
   return list;
