@@ -67,3 +67,46 @@ function hasPostgresCode(error: unknown, code: string): boolean {
   }
   return false;
 }
+
+/** The constraint and the referencing table of a foreign-key violation. A name is null when the driver did not surface it. */
+export interface ForeignKeyViolationDetails {
+  constraint: string | null;
+  table: string | null;
+}
+
+const FOREIGN_KEY_MESSAGE = /violates foreign key constraint "([^"]+)" on table "([^"]+)"/;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function readName(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Reads the constraint name and the referencing table from a foreign-key
+ * violation (SQLSTATE 23503), or returns null for any other error.
+ *
+ * The names land on `constraint_name` and `table_name` under postgres.js and on
+ * `constraint` and `table` under node-postgres. When the driver surfaces
+ * neither, the names are read from the driver message. The walk follows `cause`
+ * the same way `isForeignKeyViolation` does.
+ *
+ * @param error - The error thrown by a query, possibly wrapped by Drizzle.
+ * @returns The names the driver reported, or null when the error is not a foreign-key violation.
+ */
+export function readForeignKeyViolation(error: unknown): ForeignKeyViolationDetails | null {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && isRecord(current); depth += 1) {
+    if (current.code === FOREIGN_KEY_VIOLATION) {
+      const fromMessage = typeof current.message === "string" ? FOREIGN_KEY_MESSAGE.exec(current.message) : null;
+      return {
+        constraint: readName(current.constraint_name) ?? readName(current.constraint) ?? fromMessage?.[1] ?? null,
+        table: readName(current.table_name) ?? readName(current.table) ?? fromMessage?.[2] ?? null,
+      };
+    }
+    current = current.cause;
+  }
+  return null;
+}

@@ -25,6 +25,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
+import { HttpError } from "../errors.ts";
 import { companyService } from "../services/companies.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -237,8 +238,8 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
   });
 
-  it("removes heartbeat events by run id before deleting company-owned runs", async () => {
-    const { agentId, companyId, runId } = await seedFixture();
+  it("refuses to delete a company whose runs another company's rows reference, and changes nothing", async () => {
+    const { agentId, companyId, issueId, runId } = await seedFixture();
     const otherCompanyId = randomUUID();
 
     await db.insert(companies).values({
@@ -247,7 +248,6 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       issuePrefix: `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
-
     await db.insert(heartbeatRunEvents).values({
       companyId: otherCompanyId,
       runId,
@@ -257,12 +257,54 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       message: "event with mismatched company scope",
     });
 
+    const failure = await companyService(db)
+      .remove(companyId)
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(failure).toBeInstanceOf(HttpError);
+    expect(failure).toMatchObject({
+      status: 409,
+      details: { table: "heartbeat_run_events", blockingRows: 1 },
+    });
+    expect(failure).toHaveProperty("message", expect.stringContaining("heartbeat_run_events"));
+    await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(1);
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(1);
+    await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toHaveLength(1);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(1);
+    await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
+    await expect(
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, otherCompanyId)),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("deletes the company's own run events and leaves another company's events alone", async () => {
+    const { agentId, companyId, runId } = await seedFixture();
+    const other = await seedFixture();
+
+    await db.insert(heartbeatRunEvents).values([
+      { companyId, runId, agentId, seq: 1, eventType: "output", message: "own event" },
+      {
+        companyId: other.companyId,
+        runId: other.runId,
+        agentId: other.agentId,
+        seq: 1,
+        eventType: "output",
+        message: "other company event",
+      },
+    ]);
+
     const removed = await companyService(db).remove(companyId);
 
     expect(removed?.id).toBe(companyId);
-    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
-    await expect(db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).resolves.toHaveLength(0);
-    await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
+    await expect(
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId)),
+    ).resolves.toHaveLength(0);
+    await expect(
+      db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, other.companyId)),
+    ).resolves.toHaveLength(1);
   });
 
   it("removes routines before deleting company agents", async () => {
@@ -284,32 +326,39 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
   });
 
-  it("removes cost and finance events before deleting the runs they reference", async () => {
-    const { agentId, companyId, issueId, runId } = await seedFixture();
+  async function seedSpend(fixture: { agentId: string; companyId: string; issueId: string; runId: string }) {
     const costEventId = randomUUID();
     const now = new Date();
 
     await db.insert(costEvents).values({
       id: costEventId,
-      companyId,
-      agentId,
-      issueId,
-      heartbeatRunId: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      issueId: fixture.issueId,
+      heartbeatRunId: fixture.runId,
       provider: "anthropic",
       model: "claude-test",
       costCents: 12,
       occurredAt: now,
     });
     await db.insert(financeEvents).values({
-      companyId,
-      agentId,
-      heartbeatRunId: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      heartbeatRunId: fixture.runId,
       costEventId,
       eventKind: "inference_charge",
       biller: "anthropic",
       amountCents: 12,
       occurredAt: now,
     });
+  }
+
+  it("removes cost and finance events before deleting the runs they reference", async () => {
+    const fixture = await seedFixture();
+    const { companyId, runId } = fixture;
+    const other = await seedFixture();
+    await seedSpend(fixture);
+    await seedSpend(other);
 
     const removed = await companyService(db).remove(companyId);
 
@@ -318,5 +367,8 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(financeEvents).where(eq(financeEvents.companyId, companyId))).resolves.toHaveLength(0);
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(costEvents).where(eq(costEvents.companyId, other.companyId))).resolves.toHaveLength(1);
+    await expect(db.select().from(financeEvents).where(eq(financeEvents.companyId, other.companyId))).resolves.toHaveLength(1);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, other.runId))).resolves.toHaveLength(1);
   });
 });
