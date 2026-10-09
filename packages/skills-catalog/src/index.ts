@@ -20,6 +20,7 @@ export {
   DEFAULT_SKILL_QUALITY_THRESHOLDS,
   SKILL_QUALITY_CHECK_IDS,
 } from "./skill-quality.js";
+export { estimateTokens } from "./skill-quality-text.js";
 export type {
   SkillQualityCheckId,
   SkillQualityFile,

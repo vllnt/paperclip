@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { estimateTokens } from "./index.js";
 import {
   checkSkillQuality,
   checkSkillSetQuality,
@@ -326,5 +327,19 @@ describe("checkSkillSetQuality", () => {
     }));
     expect(checkSkillSetQuality(skills).findings.map((f) => f.id)).toContain("C2");
     expect(checkSkillSetQuality(skills.slice(0, 3)).findings).toEqual([]);
+  });
+});
+
+describe("estimateTokens", () => {
+  it("is exported from the package index as UTF-8 bytes divided by four, rounded", () => {
+    expect(estimateTokens("")).toBe(0);
+    expect(estimateTokens("abcd")).toBe(1);
+    expect(estimateTokens("a".repeat(10))).toBe(3);
+    expect(estimateTokens("é".repeat(4))).toBe(2);
+  });
+
+  it("is the counter behind metrics.estimatedTokens, which counts the whole SKILL.md", () => {
+    const skillMd = buildSkill();
+    expect(check({ skillMd }).metrics.estimatedTokens).toBe(estimateTokens(skillMd));
   });
 });
