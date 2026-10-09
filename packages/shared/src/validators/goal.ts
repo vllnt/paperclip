@@ -1,6 +1,14 @@
 import { z } from "zod";
-import { GOAL_LEVELS, GOAL_STATUSES } from "../constants.js";
+import { GOAL_HORIZONS, GOAL_KINDS, GOAL_LEVELS, GOAL_STATUSES } from "../constants.js";
 import { objectWithoutDefaults } from "./partial.js";
+
+const goalTargetDateSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Use a YYYY-MM-DD date")
+  .refine((value) => {
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().startsWith(value);
+  }, "Use a real calendar date");
 
 export const createGoalSchema = z.object({
   title: z.string().min(1),
@@ -9,6 +17,12 @@ export const createGoalSchema = z.object({
   status: z.enum(GOAL_STATUSES).optional().default("planned"),
   parentId: z.string().guid().optional().nullable(),
   ownerAgentId: z.string().guid().optional().nullable(),
+  kind: z.enum(GOAL_KINDS).optional().default("goal"),
+  horizon: z.enum(GOAL_HORIZONS).optional().nullable(),
+  /** Calendar date, `YYYY-MM-DD`. */
+  targetDate: goalTargetDateSchema.optional().nullable(),
+  /** How to tell the goal is reached, for example "open pull requests = 0". */
+  successCriteria: z.string().trim().max(2000).optional().nullable(),
 });
 
 export type CreateGoal = z.infer<typeof createGoalSchema>;
