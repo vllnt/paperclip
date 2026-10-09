@@ -150,6 +150,21 @@ npx paperclipai instance settings:experimental:update --payload-json '{...}'
 
 Experimental features are opt-in and are provided without compatibility guarantees. They may break, change, or be removed at any time. Use them at your own risk.
 
+## Run Commands
+
+```sh
+# Filter runs: status and error code take comma-separated values; times are ISO 8601 or a duration back from now
+npx paperclipai run list --status failed,timed_out --since 6h
+npx paperclipai run list --agent-id <agent-id> --error-code adapter_failed --since 2026-10-08T00:00:00Z --limit 50
+
+# Health: counts by status, top error codes, and each agent's runs today against its daily cap
+npx paperclipai run stats
+npx paperclipai run stats --since 7d --agent-id <agent-id> --json
+```
+
+`runsToday` counts what `runtimeConfig.heartbeat.maxDailyRuns` counts: runs started in the current UTC day that
+are not queued or waiting to retry.
+
 ## Heartbeat
 
 ```sh
