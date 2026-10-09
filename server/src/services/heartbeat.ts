@@ -613,6 +613,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createPemStreamRedactor, type PemStreamRedactor } from "@paperclipai/adapter-utils/log-value-redaction";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -3775,8 +3776,12 @@ function redactInlineBase64ImageData(chunk: string) {
 export function compactRunLogChunk(
   chunk: string,
   maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
+  pemStream?: PemStreamRedactor,
 ) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
+  const withoutImages = redactInlineBase64ImageData(chunk);
+  const normalized = redactSensitiveText(
+    pemStream ? pemStream.redact(withoutImages) : withoutImages,
+  );
   if (normalized.length <= maxChars) return normalized;
 
   const headChars = Math.max(0, Math.floor(maxChars * 0.6));
@@ -3784,6 +3789,24 @@ export function compactRunLogChunk(
   const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
   const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
   return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
+}
+
+/**
+ * Creates the chunk compactor of one run. It keeps one PEM redactor for each stream, so a PEM block
+ * that arrives in several chunks of one stream is redacted from its BEGIN marker to its END marker.
+ *
+ * @returns A function that compacts and redacts the next chunk of a stream of this run.
+ */
+export function createRunLogChunkCompactor(): (
+  stream: "stdout" | "stderr",
+  chunk: string,
+) => string {
+  const pemStreams = {
+    stdout: createPemStreamRedactor(),
+    stderr: createPemStreamRedactor(),
+  };
+  return (stream, chunk) =>
+    compactRunLogChunk(chunk, MAX_PERSISTED_LOG_CHUNK_CHARS, pemStreams[stream]);
 }
 
 function normalizeMaxConcurrentRuns(value: unknown) {
@@ -23859,8 +23882,10 @@ export function heartbeatService(
 
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
+        const compactLogChunk = createRunLogChunkCompactor();
         const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          const sanitizedChunk = compactRunLogChunk(
+          const sanitizedChunk = compactLogChunk(
+            stream,
             redactCurrentUserText(chunk, currentUserRedactionOptions),
           );
           if (stream === "stdout")
