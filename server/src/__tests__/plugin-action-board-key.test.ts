@@ -83,11 +83,42 @@ async function seed(db: Db) {
   return { company: company!, plugin: plugin!, agent: agent!, adminKey, memberKey, agentToken };
 }
 
-function createApp(db: Db, call: ReturnType<typeof vi.fn>) {
+type AuthOutcome = { actor: Express.Request["actor"] } | { error: unknown };
+
+/**
+ * Runs the real `actorMiddleware` against the real database for one bearer
+ * token and returns what it produced: the actor, or the error it passed to
+ * `next`. It is called directly instead of being mounted on the test app, so
+ * the test app registers no authorizing route handler of its own.
+ */
+async function authenticate(db: Db, path: string, token: string): Promise<AuthOutcome> {
+  const headers: Record<string, string> = { authorization: `Bearer ${token}` };
+  const req = {
+    method: "POST",
+    path,
+    originalUrl: path,
+    actor: undefined as Express.Request["actor"] | undefined,
+    header: (name: string) => headers[name.toLowerCase()],
+  };
+  return new Promise<AuthOutcome>((resolve) => {
+    void actorMiddleware(db, { deploymentMode: "authenticated" })(req as never, {} as never, (error?: unknown) => {
+      resolve(error ? { error } : { actor: req.actor as Express.Request["actor"] });
+    });
+  });
+}
+
+/** The real plugin routes, called as the actor (or failing with the error) that `authenticate` produced. */
+function createApp(db: Db, call: ReturnType<typeof vi.fn>, auth: AuthOutcome) {
   const app = express();
   app.use(express.json());
-  // The real auth middleware: a bearer token becomes a board-key or agent actor.
-  app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+  app.use((req, _res, next) => {
+    if ("error" in auth) {
+      next(auth.error);
+      return;
+    }
+    req.actor = auth.actor;
+    next();
+  });
   app.use(
     "/api",
     pluginRoutes(db, { installPlugin: vi.fn() } as never, undefined, undefined, undefined, {
@@ -96,6 +127,19 @@ function createApp(db: Db, call: ReturnType<typeof vi.fn>) {
   );
   app.use(errorHandler);
   return app;
+}
+
+/** POSTs a plugin action authenticated by `token`, through the real middleware and routes. */
+async function postAction(
+  db: Db,
+  call: ReturnType<typeof vi.fn>,
+  token: string,
+  key: string,
+  body: Record<string, unknown>,
+) {
+  const path = `/api/plugins/${PLUGIN_KEY}/actions/${key}`;
+  const app = createApp(db, call, await authenticate(db, path, token));
+  return request(app).post(path).set("Authorization", `Bearer ${token}`).send(body);
 }
 
 describeEmbeddedPostgres("plugin actions called with a board API key", () => {
@@ -127,10 +171,10 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     const { company, adminKey } = await seed(db);
     const call = vi.fn().mockResolvedValue({ ok: true });
 
-    const res = await request(createApp(db, call))
-      .post(`/api/plugins/${PLUGIN_KEY}/actions/write-identity.get`)
-      .set("Authorization", `Bearer ${adminKey.token}`)
-      .send({ companyId: company.id, params: { companyId: "spoofed" } });
+    const res = await postAction(db, call, adminKey.token, "write-identity.get", {
+      companyId: company.id,
+      params: { companyId: "spoofed" },
+    });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(call).toHaveBeenCalledWith(expect.any(String), "performAction", {
@@ -152,10 +196,7 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     const { company, memberKey } = await seed(db);
     const call = vi.fn().mockResolvedValue({ ok: true });
 
-    const res = await request(createApp(db, call))
-      .post(`/api/plugins/${PLUGIN_KEY}/actions/repositories.list`)
-      .set("Authorization", `Bearer ${memberKey.token}`)
-      .send({ companyId: company.id, params: {} });
+    const res = await postAction(db, call, memberKey.token, "repositories.list", { companyId: company.id, params: {} });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(call.mock.calls[0]?.[2]?.actorContext).toEqual({
@@ -171,10 +212,7 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     const { memberKey } = await seed(db);
     const call = vi.fn();
 
-    const res = await request(createApp(db, call))
-      .post(`/api/plugins/${PLUGIN_KEY}/actions/sync.trigger`)
-      .set("Authorization", `Bearer ${memberKey.token}`)
-      .send({ params: {} });
+    const res = await postAction(db, call, memberKey.token, "sync.trigger", { params: {} });
 
     expect(res.status).toBe(403);
     expect(call).not.toHaveBeenCalled();
@@ -184,10 +222,7 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     const { company, agent, agentToken } = await seed(db);
     const call = vi.fn().mockResolvedValue({ ok: true });
 
-    const res = await request(createApp(db, call))
-      .post(`/api/plugins/${PLUGIN_KEY}/actions/write-identity.get`)
-      .set("Authorization", `Bearer ${agentToken}`)
-      .send({ companyId: company.id, params: {} });
+    const res = await postAction(db, call, agentToken, "write-identity.get", { companyId: company.id, params: {} });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(call.mock.calls[0]?.[2]?.actorContext).toMatchObject({ type: "agent", agentId: agent.id, userId: null });
@@ -198,10 +233,7 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     await boardAuthService(db).revokeBoardApiKey(adminKey.id);
     const call = vi.fn();
 
-    const res = await request(createApp(db, call))
-      .post(`/api/plugins/${PLUGIN_KEY}/actions/write-identity.get`)
-      .set("Authorization", `Bearer ${adminKey.token}`)
-      .send({ companyId: company.id, params: {} });
+    const res = await postAction(db, call, adminKey.token, "write-identity.get", { companyId: company.id, params: {} });
 
     expect(res.status).toBe(401);
     expect(call).not.toHaveBeenCalled();
