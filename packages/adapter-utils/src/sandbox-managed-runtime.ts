@@ -1925,6 +1925,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   baseline: mergeBaseline,
                   sourceDir: extractedDir,
                   targetDir: input.workspaceLocalDir,
+                  workspaceRestore: { onProgress: restoreSink },
                   beforeApply: gitHeadToIntegrate
                     ? async () => {
                         await integrateImportedGitHead({

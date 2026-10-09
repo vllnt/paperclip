@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
 import { shouldExcludePath } from "./exclude-patterns.js";
+import type { RuntimeProgressSink } from "./runtime-progress.js";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 
 export type SnapshotEntry =
@@ -202,6 +203,15 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
 }
 
 const LOCK_WAIT_MS = 30_000;
+/**
+ * A workspace restore copies one run's changes back under the target's lock.
+ * On a busy host, one restore of a large monorepo held that lock for about
+ * 130 s, so concurrent teardowns of one project queue behind several holders.
+ * The agent work is already done, and the lock is released by the OS on a
+ * crash, so a restore waits much longer than other lock users.
+ */
+export const WORKSPACE_RESTORE_LOCK_WAIT_MS = 10 * 60_000;
+const LOCK_WAIT_PROGRESS_INTERVAL_MS = 30_000;
 const LOCK_DIAGNOSTIC_READ_TIMEOUT_MS = 100;
 const activeDirectoryMergeLocks = new Set<string>();
 const MAX_LOCK_DIAGNOSTIC_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -341,12 +351,38 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
   }
 }
 
-async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryMergeLockOperation, waitMs: number = LOCK_WAIT_MS): Promise<() => Promise<void>> {
+/** One progress report while a caller waits for a held directory merge lock. */
+export interface DirectoryMergeLockWait {
+  waitedMs: number;
+  waitMs: number;
+  /** How long the current holder has held the lock, when its record is readable. */
+  holderAgeMs?: number;
+}
+
+async function acquireDirectoryMergeLock(
+  lockDir: string,
+  operation?: DirectoryMergeLockOperation,
+  waitMs: number = LOCK_WAIT_MS,
+  onWait?: (wait: DirectoryMergeLockWait) => void | Promise<void>,
+): Promise<() => Promise<void>> {
   const startedAt = performance.now();
-  const deadline = Date.now() + waitMs;
+  const waitStartedAt = Date.now();
+  const deadline = waitStartedAt + waitMs;
+  let nextProgressAt = waitStartedAt + LOCK_WAIT_PROGRESS_INTERVAL_MS;
   const databasePath = `${lockDir}.sqlite`;
   const ownerPath = `${lockDir}.owner.json`;
   async function waitForLock(diagnosticOwnerPath: string) {
+    if (onWait && Date.now() >= nextProgressAt && Date.now() < deadline) {
+      nextProgressAt = Date.now() + LOCK_WAIT_PROGRESS_INTERVAL_MS;
+      const diagnostics = await directoryMergeLockDiagnostics(lockDir, 0, diagnosticOwnerPath).catch(() => undefined);
+      const holderAgeMs = diagnostics?.ownerAgeMs;
+      // Progress is advisory: a failing sink must not end the wait.
+      await Promise.resolve(onWait({
+        waitedMs: Date.now() - waitStartedAt,
+        waitMs,
+        ...(typeof holderAgeMs === "number" ? { holderAgeMs } : {}),
+      })).catch(() => undefined);
+    }
     if (Date.now() >= deadline) {
       const timeoutError: NodeJS.ErrnoException & { workspaceRestoreLock?: Record<string, string | number | boolean> } = new Error(
         `Timed out waiting for workspace restore lock at ${lockDir}`,
@@ -496,16 +532,18 @@ export async function withDirectoryMergeLock<T>(
   fn: (canonicalTargetDir: string) => Promise<T>,
   env: NodeJS.ProcessEnv = process.env,
   diagnosticOperation?: DirectoryMergeLockOperation,
-  // Test seam only: overrides how long acquisition waits before it reports a
-  // timeout. Production callers must omit this and keep the real budget.
+  // How long acquisition waits before it reports a timeout. Only workspace
+  // restores (WORKSPACE_RESTORE_LOCK_WAIT_MS) and tests override the default.
   waitMs: number = LOCK_WAIT_MS,
+  // Called about every 30 s while another holder keeps the lock.
+  onWait?: (wait: DirectoryMergeLockWait) => void | Promise<void>,
 ): Promise<T> {
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
   // lock protect one directory while the caller mutates another.
   const canonicalTargetDir = await fs.realpath(targetDir);
   const lockRoot = await resolveDirectoryMergeLockRoot(env);
   const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
-  const releaseLock = await acquireDirectoryMergeLock(path.join(lockRoot, `${lockKey}.lock`), diagnosticOperation, waitMs);
+  const releaseLock = await acquireDirectoryMergeLock(path.join(lockRoot, `${lockKey}.lock`), diagnosticOperation, waitMs, onWait);
   try {
     return await fn(canonicalTargetDir);
   } finally {
@@ -702,11 +740,22 @@ export async function mergeDirectoryWithBaseline(input: {
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
   snapshots?: { source: DirectorySnapshot; current: DirectorySnapshot };
+  /** Set for a run's workspace copy-back. The merge waits up to
+   * {@link WORKSPACE_RESTORE_LOCK_WAIT_MS} for the target's lock, reports the
+   * wait to `onProgress` about every 30 s, and retries the wait once after a
+   * timeout. Nothing has been applied when acquisition times out. */
+  workspaceRestore?: { onProgress?: RuntimeProgressSink };
 }): Promise<void> {
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
   const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
-  try {
-    await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+  const restore = input.workspaceRestore;
+  const reportLockWait = restore?.onProgress
+    ? (wait: DirectoryMergeLockWait) => restore.onProgress?.(describeDirectoryMergeLockWait(wait))
+    : undefined;
+  let entered = false;
+  const mergeUnderLock = () =>
+    withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+      entered = true;
       await input.beforeApply?.();
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
@@ -736,8 +785,26 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
-    });
+    }, undefined, undefined, restore ? WORKSPACE_RESTORE_LOCK_WAIT_MS : LOCK_WAIT_MS, reportLockWait);
+  try {
+    try {
+      await mergeUnderLock();
+    } catch (error) {
+      // Retry only a wait that never entered the lock: no step has run yet.
+      if (!restore || entered || classifyWorkspaceRestoreFailure(error) !== "restore_lock_timeout") throw error;
+      await Promise.resolve(restore.onProgress?.(
+        `[paperclip] Warning: ${describeWorkspaceRestoreFailure("restore_lock_timeout")}; retrying the restore once.\n`,
+      )).catch(() => undefined);
+      await mergeUnderLock();
+    }
   } finally { await disposeDirectorySnapshot(source); }
+}
+
+/** A run-log line: wait times only, never the lock path or the holder's PID. */
+function describeDirectoryMergeLockWait(wait: DirectoryMergeLockWait): string {
+  const seconds = (ms: number) => `${Math.round(ms / 1000)}s`;
+  const holder = wait.holderAgeMs === undefined ? "another run holds it" : `another run has held it for ${seconds(wait.holderAgeMs)}`;
+  return `[paperclip] Waiting for the workspace merge lock: ${holder} (waited ${seconds(wait.waitedMs)} of ${seconds(wait.waitMs)}).\n`;
 }
 
 export async function directoryEntryMatchesBaseline(

@@ -18,6 +18,7 @@ import {
   serializeDirectorySnapshot,
   withDirectoryMergeLock,
   WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
+  WORKSPACE_RESTORE_LOCK_WAIT_MS,
 } from "./workspace-restore-merge.js";
 
 describe("workspace restore merge", () => {
@@ -618,6 +619,130 @@ describe("workspace restore merge", () => {
         expect(completedCount).toBe(2);
       },
     );
+
+    describe("concurrent workspace restores of one target", () => {
+      // One restore holds the target's lock while a second one waits. A
+      // shifted Date.now() stands in for a long hold, so the tests need no
+      // real minutes. Polling uses real timers, never the shifted clock.
+      async function concurrentRestores() {
+        const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-wait-"));
+        cleanupDirs.push(rootDir);
+        useTempPaperclipHome(path.join(rootDir, "home"), "test-instance");
+        const targetDir = path.join(rootDir, "target");
+        const sourceA = path.join(rootDir, "source-a");
+        const sourceB = path.join(rootDir, "source-b");
+        await Promise.all([mkdir(targetDir), mkdir(sourceA), mkdir(sourceB)]);
+        const baseline = await captureDirectorySnapshot(targetDir, { exclude: [] });
+        await writeFile(path.join(sourceA, "a.txt"), "run a\n");
+        await writeFile(path.join(sourceB, "b.txt"), "run b\n");
+
+        const realNow = Date.now.bind(Date);
+        let offsetMs = 0;
+        const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + offsetMs);
+        let releaseHolder!: () => void;
+        const held = new Promise<void>((resolve) => { releaseHolder = resolve; });
+        let markLocked!: () => void;
+        const locked = new Promise<void>((resolve) => { markLocked = resolve; });
+        const holder = mergeDirectoryWithBaseline({
+          baseline, sourceDir: sourceA, targetDir, workspaceRestore: {},
+          beforeApply: async () => { markLocked(); await held; },
+        });
+        await locked;
+        clock.mockClear();
+        const progress: string[] = [];
+        const contenderSteps = vi.fn(async () => undefined);
+        const contender = mergeDirectoryWithBaseline({
+          baseline, sourceDir: sourceB, targetDir, beforeApply: contenderSteps,
+          workspaceRestore: { onProgress: (line) => { progress.push(line); } },
+        });
+        let settled = false;
+        contender.then(() => { settled = true; }, () => { settled = true; });
+        const until = async (condition: () => boolean) => {
+          for (let i = 0; i < 500 && !condition(); i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+          expect(condition()).toBe(true);
+        };
+        // The contender reads the clock first when it starts waiting for the lock.
+        await until(() => clock.mock.calls.length > 0);
+        return {
+          targetDir, holder, contender, contenderSteps, progress, releaseHolder, until,
+          isSettled: () => settled,
+          advance: (ms: number) => { offsetMs += ms; },
+          cleanup: async () => {
+            releaseHolder();
+            await holder.catch(() => undefined);
+            await contender.catch(() => undefined);
+            clock.mockRestore();
+            await disposeDirectorySnapshot(baseline);
+          },
+        };
+      }
+
+      it("waits for a holder that keeps the lock longer than the old 30 s budget and reports the wait", async () => {
+        const restores = await concurrentRestores();
+        try {
+          restores.advance(31_000);
+          await restores.until(() => restores.isSettled() || restores.progress.length > 0);
+          restores.releaseHolder();
+          await restores.holder;
+          await expect(restores.contender).resolves.toBeUndefined();
+          expect(restores.progress[0]).toMatch(
+            /^\[paperclip\] Waiting for the workspace merge lock: another run has held it for 3\ds \(waited 3\ds of 600s\)\.\n$/,
+          );
+          await expect(readFile(path.join(restores.targetDir, "a.txt"), "utf8")).resolves.toBe("run a\n");
+          await expect(readFile(path.join(restores.targetDir, "b.txt"), "utf8")).resolves.toBe("run b\n");
+        } finally { await restores.cleanup(); }
+      });
+
+      it("retries once after a restore wait times out, then applies the restore", async () => {
+        const restores = await concurrentRestores();
+        try {
+          restores.advance(WORKSPACE_RESTORE_LOCK_WAIT_MS + 1_000);
+          await restores.until(() => restores.isSettled() || restores.progress.some((line) => line.includes("retrying")));
+          expect(restores.progress).toContain(
+            "[paperclip] Warning: the restore timed out waiting for the workspace merge lock; retrying the restore once.\n",
+          );
+          expect(restores.contenderSteps).not.toHaveBeenCalled();
+          restores.releaseHolder();
+          await expect(restores.contender).resolves.toBeUndefined();
+          expect(restores.contenderSteps).toHaveBeenCalledTimes(1);
+          await expect(readFile(path.join(restores.targetDir, "b.txt"), "utf8")).resolves.toBe("run b\n");
+        } finally { await restores.cleanup(); }
+      });
+
+      it("fails with the lock timeout when the retry also times out, without applying anything", async () => {
+        const restores = await concurrentRestores();
+        try {
+          restores.advance(WORKSPACE_RESTORE_LOCK_WAIT_MS + 1_000);
+          await restores.until(() => restores.progress.some((line) => line.includes("retrying")));
+          restores.advance(WORKSPACE_RESTORE_LOCK_WAIT_MS + 1_000);
+          await restores.until(restores.isSettled);
+          const error = await restores.contender.catch((caught: unknown) => caught);
+          expect(classifyWorkspaceRestoreFailure(error)).toBe("restore_lock_timeout");
+          expect(restores.contenderSteps).not.toHaveBeenCalled();
+          await expect(stat(path.join(restores.targetDir, "b.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+        } finally { await restores.cleanup(); }
+      });
+    });
+
+    it("does not retry a lock-timeout error raised after the restore entered the lock", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-entered-"));
+      cleanupDirs.push(rootDir);
+      useTempPaperclipHome(path.join(rootDir, "home"), "test-instance");
+      const targetDir = path.join(rootDir, "target");
+      const sourceDir = path.join(rootDir, "source");
+      await Promise.all([mkdir(targetDir), mkdir(sourceDir)]);
+      const baseline = await captureDirectorySnapshot(targetDir, { exclude: [] });
+      const progress: string[] = [];
+      const beforeApply = vi.fn(async () => {
+        throw Object.assign(new Error("nested lock timeout"), { code: WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE });
+      });
+      await expect(mergeDirectoryWithBaseline({
+        baseline, sourceDir, targetDir, beforeApply,
+        workspaceRestore: { onProgress: (line) => { progress.push(line); } },
+      })).rejects.toThrow("nested lock timeout");
+      expect(beforeApply).toHaveBeenCalledTimes(1);
+      expect(progress).toEqual([]);
+    });
   });
 
   describe("caller-provided env for the lock root", () => {
