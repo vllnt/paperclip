@@ -1633,6 +1633,21 @@ describe("workflow changes that arrive by merging the base branch", () => {
     f.refused(await f.push({ ...laundered, tip: evilSha, files: listed({ "ci.yml": edit, "deploy.yml": deploy }), commits: [laundered.commits[1]] }), new RegExp(`Commit ${evilSha.slice(0, 8)}`));
   });
 
+  it("judges a new branch on an existing commit by where it joins GitHub: the base branch's own history passes, another branch's does not (regression)", async () => {
+    const f = await pushFixture();
+    f.state.destination = false;
+    // The launcher reports a ref created on a commit GitHub has (nothing is new) as a push whose history joins GitHub at that commit.
+    const onto = (commit: string, files: Record<string, Entry>) => ({ branch: "feature/x", tip: commit, files: listed(files), commits: [], entries: [commit] });
+    // The base branch's tip, and an older commit of it: its own workflow files, so the toggle can stay off.
+    expect(await f.push(onto(f.tip("main"), f.state.branches.main!))).toMatchObject({ credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: { base: "main", commits: [], paths: [] } } });
+    expect(await f.push(onto(mainOld, f.state.branches.main!))).toMatchObject({ credential: { login: "agent-owner" } });
+    // A commit that only another branch has (wip, never reviewed), whatever its files: refused, with the board's grant to ask for.
+    f.refused(await f.push(onto(f.tip("wip"), f.state.branches.wip!)), /builds on commit .*not part of main.*editWorkflows is turned off/s);
+    // A commit GitHub does not have at all.
+    f.refused(await f.push(onto(unknown, { "ci.yml": edit })), /builds on commit .*not part of main/);
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+  });
+
   it("refuses moving the branch to a commit GitHub has when its workflow files differ from the branch's and are not the base branch's (regression)", async () => {
     const f = await pushFixture();
     // The branch is clean now; behind it is a commit with an edit, which GitHub has as part of the branch's history.

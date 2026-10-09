@@ -289,15 +289,15 @@ the refs of the destination do not reach. The remote-tracking refs of a checkout
 or a fetch refspec, and a commit that edits a workflow behind one of them looks
 like old history. So a push that the checkout reports as free of workflow
 changes is read once more before it runs with a credential. The launcher lists
-the branches and tags of the push's destination from GitHub itself
-(`git ls-remote --heads --tags`, with the credential the broker has just given
-this command, over the same verified connection), leaves out only the commits
-those refs reach, and works out again what the push adds. If that is free of
-workflow changes too, the push runs on the first answer. If it is not, the broker
-is asked again about the push as GitHub's refs describe it (with its new commits,
-and where they join GitHub), and its answer replaces the first. Anything that
-cannot be settled counts as a change that may touch workflow files, so
-`editWorkflows` decides: the refs cannot be read in full (a network or
+the branches and tags of the push's destination, and its default branch, from
+GitHub itself (`git ls-remote --symref`, with the credential the broker has just
+given this command, over the same verified connection), leaves out only the
+commits those refs reach, and works out again what the push adds. If that is
+free of workflow changes too, the push runs on the first answer. If it is not,
+the broker is asked again about the push as GitHub's refs describe it (with its
+new commits, and where they join GitHub), and its answer replaces the first.
+Anything that cannot be settled counts as a change that may touch workflow
+files, so `editWorkflows` decides: the refs cannot be read in full (a network or
 credential failure, a list of more than 2,000 lines, more than one push URL),
 or the branch being pushed to exists on GitHub at a commit that the checkout does
 not have (a replacement it cannot compare). This costs one more read of GitHub
@@ -306,6 +306,35 @@ branches (`refs/heads/*`) were never part of what already exists, and
 `packed-refs` are read like loose refs. Pushes that the checkout already reports
 as changing workflow files go to the plugin as before, which checks where their
 history joins GitHub.
+
+**A ref that moves onto an existing commit.** A commit that GitHub already has
+(on another branch, say) is not new, but a ref that is created or moved onto it
+holds its workflow files. So a push is also judged by what its refs would hold,
+whichever commits are new: a push to a branch that GitHub has must carry that
+branch's workflow files (as GitHub lists the branch, not as the checkout last
+saw it), and a new branch, or a push of several refs, must carry the workflow
+files of GitHub's default branch. Where they differ, or the default branch's
+commit is one the checkout does not have (the default branch has moved on since
+the last fetch), the push is reported as changing workflow files, with the
+pushed commit as the place where it joins GitHub, and the plugin decides as for
+any other workflow change: a branch cut from an older commit of the base branch
+passes, and a branch that inherits workflow files from another branch's commit
+does not. The common cases cost nothing more: a push to a branch that GitHub has,
+and a new branch cut from a default branch the checkout has fetched, carry
+workflow files equal to what they are compared with.
+
+**What the history is read from.** Every launcher git command reads the real
+objects: `GIT_NO_REPLACE_OBJECTS` is set for all of them and for the command
+that runs, because `git replace` refs are the agent's to write and make every
+read show another commit than the one the push sends. Just before a network
+command runs with a credential, its remote (the push URLs it resolves to now,
+rewrites included), its refs and its commits are read again, and it does not run
+if they differ from what the broker was told (another process, or a change made
+while the broker answered, moved them). A change that happens inside git's own
+startup of the child is not caught: closing that would mean pushing to a URL
+instead of a remote, which loses the remote's tracking refs and upstream
+settings, and a process of the same user that can race it can also read the
+credential from the child's environment (see the limits below).
 
 The base is the base of the same-repository open pull request whose head is the
 pushed branch, else the repository's default branch. Whoever opens a pull

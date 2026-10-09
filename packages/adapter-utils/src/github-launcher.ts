@@ -260,14 +260,24 @@ function pushReport(env, globalArgs, pushArgs, known) {
     const files = gitOutput(env, globalArgs, ['log', '--format=', '--name-only', '-z', '--no-renames', '--diff-merges=first-parent', ...shas, ...boundary.args], boundary.input);
     if (files !== null) {
       touchesWorkflows = files.split('\0').some(isWorkflowPath);
+      // A commit that GitHub already has (on another branch, say) is not new, but a ref that is created or moved onto it is:
+      // what the ref then holds is judged by its workflow files, not by which commits are new. The branch it replaces on
+      // GitHub, or else GitHub's default branch, is what they are compared with (both as GitHub lists them, never as this
+      // checkout's refs say). Anything that cannot be compared counts as a change.
+      const defaultFiles = known && known.defaultTip ? workflowTree(env, globalArgs, known.defaultTip) : null;
+      if (known && touchesWorkflows === false && shas.length > 1) {
+        // Several refs at once cannot each be tied to a branch: every commit must carry the default branch's workflow files.
+        touchesWorkflows = !defaultFiles || shas.some(sha => { const own = workflowTree(env, globalArgs, sha); return !own || !sameWorkflowFiles(own, defaultFiles); });
+      }
       if (shas.length === 1) {
         const tipFiles = workflowTree(env, globalArgs, shas[0]);
         // A push that only moves a branch to a commit the remote already has (nothing is new) still changes the branch's
         // workflow files when they differ from the branch it replaces: as GitHub lists it, else as this checkout last saw it.
         const pushed = implicitPush ? null : pushedBranch(specs, current, refs);
-        let seen = '';
+        let seen = '', replaces = false;
         if (pushed && known) {
           const listed = known.heads.get(pushed) || '';
+          replaces = !!listed;
           seen = listed ? (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', listed + '^{commit}']) || '').trim() : '';
           // The branch GitHub has is a commit this checkout does not have, so what it holds cannot be compared: a replacement.
           if (listed && !seen && touchesWorkflows === false) touchesWorkflows = null;
@@ -276,6 +286,8 @@ function pushReport(env, globalArgs, pushArgs, known) {
         }
         const seenFiles = /^[0-9a-f]{40,64}$/.test(seen) ? workflowTree(env, globalArgs, seen) : null;
         if (tipFiles && seenFiles && !sameWorkflowFiles(tipFiles, seenFiles)) touchesWorkflows = true;
+        // A new branch (or a push that cannot be tied to a branch GitHub has) must carry the default branch's workflow files.
+        if (known && touchesWorkflows === false && !replaces) touchesWorkflows = !tipFiles || !defaultFiles || !sameWorkflowFiles(tipFiles, defaultFiles);
         if (touchesWorkflows && tipFiles) workflow = workflowHistory(env, globalArgs, shas[0], tipFiles, boundary);
       }
     }
@@ -284,7 +296,8 @@ function pushReport(env, globalArgs, pushArgs, known) {
     ...(recursion === 'no' || recursion === 'check' ? {} : { recurseSubmodules: recursion === null ? 'unknown' : recursion.slice(0, 100) }), ...(cut ? { truncated: true } : {}) };
 }
 // The branches and tags GitHub itself lists for a push's destination, read with the credential the broker just gave this
-// command: { tips: the ones this checkout has, heads: branch name -> commit }. null when they cannot be read in full.
+// command: { tips: the ones this checkout has, heads: branch name -> commit, defaultTip: the default branch's commit }.
+// null when they cannot be read in full.
 // This is what a push may call "already on GitHub"; the remote-tracking refs in a checkout say nothing of the sort.
 const MAX_REMOTE_REFS = 2000;
 function remoteRefs(env, globalArgs, url) {
@@ -293,23 +306,29 @@ function remoteRefs(env, globalArgs, url) {
   const { spawnSync } = require('node:child_process');
   const options = { env: { ...env, GIT_NO_LAZY_FETCH: '1' }, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
   try {
-    const listed = spawnSync(git, [...globalArgs, 'ls-remote', '--heads', '--tags', url], { ...options, timeout: 30000, stdio: ['ignore', 'pipe', 'ignore'] });
+    // Branches, tags and HEAD (with the branch it names): the patterns keep the many refs/pull/* of a busy repository out of the list.
+    const listed = spawnSync(git, [...globalArgs, 'ls-remote', '--symref', url, 'HEAD', 'refs/heads/*', 'refs/tags/*'], { ...options, timeout: 30000, stdio: ['ignore', 'pipe', 'ignore'] });
     if (listed.error || listed.status !== 0) return null;
     const lines = listed.stdout.split('\n').filter(Boolean);
     if (lines.length > MAX_REMOTE_REFS) return null;
     const shas = new Set(), heads = new Map();
+    let defaultBranch = null;
     for (const line of lines) {
-      const match = /^([0-9a-f]{40,64})\trefs\/(heads|tags)\/(\S+?)(\^\{\})?$/.exec(line);
+      const symref = /^ref: refs\/heads\/(\S+)\tHEAD$/.exec(line);
+      if (symref) { defaultBranch = symref[1]; continue; }
+      const match = /^([0-9a-f]{40,64})\t(?:HEAD|refs\/(heads|tags)\/(\S+?)(?:\^\{\})?)$/.exec(line);
       if (!match) return null;
       shas.add(match[1]);
       if (match[2] === 'heads') heads.set(match[3], match[1]);
     }
-    if (!shas.size) return { tips: [], heads };
+    // The default branch's commit, whether or not this checkout has it.
+    const defaultTip = defaultBranch ? heads.get(defaultBranch) || '' : '';
+    if (!shas.size) return { tips: [], heads, defaultTip };
     // Only objects this checkout has can be left out of what a push sends; git reads the others as missing.
     const present = spawnSync(git, [...globalArgs, 'cat-file', '--batch-check'], { ...options, timeout: 10000, input: [...shas].join('\n') + '\n', stdio: ['pipe', 'pipe', 'ignore'] });
     if (present.error || present.status !== 0) return null;
     const tips = present.stdout.split('\n').map(line => line.split(' ')).filter(parts => parts[1] === 'commit' || parts[1] === 'tag').map(parts => parts[0]);
-    return { tips, heads };
+    return { tips, heads, defaultTip };
   } catch { return null; }
 }
 // known: the refs GitHub lists for a push's destination, once read (see pushReport).
@@ -548,7 +567,8 @@ async function main() {
     configReady = true;
     process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
   } catch { diagnostic('configuration_directory_unavailable'); }
-  let attribution = null, credentialed = false, report = null;
+  // authorized: the report of the command that the broker last answered with a credential.
+  let attribution = null, credentialed = false, report = null, authorized = null;
   {
     for (const key of Object.keys(env)) {
       // CODESPACES makes gh send GITHUB_TOKEN to non-github.com hosts. A bare GIT_CONFIG redirects
@@ -569,6 +589,9 @@ async function main() {
       GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf', GIT_CONFIG_VALUE_2: 'ssh://git@github.com/',
       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
+      // What a command reports of the history (its commits, their parents and files) is read from the real objects: the
+      // replace refs of a checkout are the agent's to write, and would show other history than the push sends.
+      GIT_NO_REPLACE_OBJECTS: '1',
     });
     const takeCredentials = result => {
       for (const [key, value] of Object.entries(result.env || {})) {
@@ -633,6 +656,7 @@ async function main() {
     // write: a commit that edits a workflow can be hidden behind one that GitHub never had. Before the push runs with a
     // credential, the refs GitHub itself lists decide. If they say it carries workflow changes, or cannot be read, the
     // broker is asked again about the push as they describe it, and its answer replaces the first.
+    authorized = credentialed ? report : null;
     if (credentialed && program === 'git' && report && Array.isArray(report.shas) && report.shas.length && report.touchesWorkflows === false) {
       let at = 0;
       while (at < argv.length && argv[at].startsWith('-')) at += GIT_GLOBAL_WITH_VALUE.includes(argv[at]) ? 2 : 1;
@@ -649,6 +673,7 @@ async function main() {
           process.exit(1);
         }
         takeCredentials(again);
+        authorized = checked;
       }
     }
     if (program === 'gh' && !credentialed && ghNamesOtherHost(argv)) {
@@ -658,6 +683,20 @@ async function main() {
     if (program === 'gh' && !credentialed && ghMayWrite(argv)) {
       process.stderr.write('Paperclip: no managed GitHub credential for this gh command, which may write; it does not run with any other GitHub credential.\n');
       process.exit(1);
+    }
+  }
+  // A network command goes where, and sends what, the broker was told. The checkout can change meanwhile (another process,
+  // or a config change made while the broker answered), so its remote, refs and commits are read again right before it
+  // runs, and it does not run with the credential if they changed.
+  if (credentialed && program === 'git' && authorized) {
+    let at = 0;
+    while (at < argv.length && argv[at].startsWith('-')) at += GIT_GLOBAL_WITH_VALUE.includes(argv[at]) ? 2 : 1;
+    if (['push', 'fetch', 'pull', 'ls-remote'].includes(argv[at])) {
+      const now = operation(env, 'unknown');
+      if (!['remote', 'pushUrls', 'shas', 'refs', 'currentBranch'].every(key => JSON.stringify(now[key] === undefined ? null : now[key]) === JSON.stringify(authorized[key] === undefined ? null : authorized[key]))) {
+        process.stderr.write('Paperclip: the remote or the commits of this command changed while Paperclip checked it, so it does not run with a GitHub credential. Run it again.\n');
+        process.exit(1);
+      }
     }
   }
   // Only this invocation and its children inherit the captured credential.
