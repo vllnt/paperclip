@@ -101,6 +101,7 @@
 - [ ] My branch name describes the change (e.g. `docs/...`, `fix/...`) and contains no internal Paperclip ticket id or instance-derived details
 - [ ] I have run tests locally and they pass
 - [ ] I have added or updated tests where applicable
+- [ ] Web, API (OpenAPI) and CLI all expose this change, or the gap is linked as a follow-up.
 - [ ] I have updated relevant documentation to reflect my changes
 - [ ] I have considered and documented any risks above
 - [ ] All Paperclip CI gates are green
