@@ -738,8 +738,12 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     if (!paperclipSkill) throw new Error("Expected bundled Paperclip skill");
 
     const versions = await svc.listVersions(companyId, paperclipSkill.id);
-    expect(versions.map((version) => version.releaseId).sort()).toEqual(["v0", "v7-roster"]);
-    expect(versions).toHaveLength(2);
+    const registryReleaseIds = (
+      JSON.parse(await fs.readFile(new URL("../../../skills-releases/paperclip/releases.json", import.meta.url), "utf8")) as { id: string }[]
+    ).map((release) => release.id).sort();
+    expect(registryReleaseIds).toEqual(expect.arrayContaining(["v0", "v7-roster"]));
+    expect(versions.map((version) => version.releaseId).sort()).toEqual(registryReleaseIds);
+    expect(versions).toHaveLength(registryReleaseIds.length);
     const storedSkill = await db
       .select({ currentVersionId: companySkills.currentVersionId })
       .from(companySkills)
@@ -787,6 +791,47 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await walk(materialized.source);
     expect(materializedHashes).toEqual(championHashes);
     expect(materializedHashes).not.toHaveProperty("EDITS.md");
+  });
+
+  it("seeds the lean release as an opt-in version and materializes it with its references", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const listed = await svc.list(companyId);
+    const paperclipSkill = listed.find((skill) => skill.key === "paperclipai/paperclip/paperclip");
+    if (!paperclipSkill) throw new Error("Expected bundled Paperclip skill");
+    const lean = (await svc.listVersions(companyId, paperclipSkill.id)).find((version) => version.releaseId === "v8-lean");
+    if (!lean) throw new Error("Expected seeded v8-lean release");
+    expect(lean).toMatchObject({ releaseName: "V8 — Lean", releasedAt: new Date("2026-10-09T00:00:00.000Z") });
+
+    const stored = await db
+      .select({ currentVersionId: companySkills.currentVersionId })
+      .from(companySkills)
+      .where(eq(companySkills.id, paperclipSkill.id))
+      .then((rows) => rows[0]);
+    expect(stored?.currentVersionId).toBeNull();
+
+    const releaseSkill = await fs.readFile(new URL("../../../skills-releases/paperclip/v8-lean/SKILL.md", import.meta.url));
+    const seeded = lean.fileInventory.find((entry) => entry.path === "SKILL.md");
+    expect(seeded && createHash("sha256").update(seeded.content).digest("hex")).toBe(
+      createHash("sha256").update(releaseSkill).digest("hex"),
+    );
+    const seededPaths = lean.fileInventory.map((entry) => entry.path);
+    expect(seededPaths).toEqual(expect.arrayContaining(["references/interactions.md", "references/secrets.md", "references/api-reference.md"]));
+
+    const runtimeEntries = await svc.listRuntimeSkillEntries(companyId, {
+      versionSelections: new Map([[paperclipSkill.key, lean.id]]),
+    });
+    const materialized = runtimeEntries.find((entry) => entry.key === paperclipSkill.key);
+    expect(materialized).toMatchObject({ versionId: lean.id, sourceStatus: "available" });
+    if (!materialized) throw new Error("Expected materialized lean release entry");
+    expect(await fs.readFile(path.join(materialized.source, "SKILL.md"))).toEqual(releaseSkill);
+    await expect(fs.stat(path.join(materialized.source, "references/interactions.md"))).resolves.toBeTruthy();
   });
 
   it("repairs a squatted bundled root during bundled-skill list refresh", async () => {
