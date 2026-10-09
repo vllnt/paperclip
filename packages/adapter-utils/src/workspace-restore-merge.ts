@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -143,22 +143,47 @@ async function hashFile(filePath: string): Promise<string> {
   });
 }
 
+// copySnapshotEntry stages each incoming file beside its target as
+// `.paperclip-merge-<uuid>`, then renames it into place. Another run can walk
+// or archive the same tree while a merge runs, so snapshot walks and sync tars
+// skip exactly these names.
+const MERGE_STAGING_PREFIX = ".paperclip-merge-";
+const UUID_GROUP_LENGTHS = [8, 4, 4, 4, 12];
+const UUID_SOURCE = UUID_GROUP_LENGTHS.map((length) => `[0-9a-f]{${length}}`).join("-");
+const MERGE_STAGING_NAME = new RegExp(`^${MERGE_STAGING_PREFIX.replaceAll(".", "\\.")}${UUID_SOURCE}$`);
+/** The tar `--exclude` glob for the merge staging names a snapshot walk skips. */
+export const MERGE_STAGING_TAR_EXCLUDE = `${MERGE_STAGING_PREFIX}${UUID_GROUP_LENGTHS.map((length) => "[0-9a-f]".repeat(length)).join("-")}`;
+
+// Another run's restore can delete or rename an entry after the walk lists it,
+// or replace its parent directory with a file. Such an entry is absent; every
+// other error still fails the walk.
+function absentIfVanished(error: unknown): null {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  if (code === "ENOENT" || code === "ENOTDIR") return null;
+  throw error;
+}
+
 async function* walkDirectory(
   root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, relative = "",
 ): AsyncGenerator<[string, SnapshotEntry]> {
-  const current = relative ? path.join(root, relative) : root;
-  for await (const entry of await fs.opendir(current)) {
+  // The root must exist. Only a directory below it may vanish mid-walk.
+  const directory = relative ? await fs.opendir(path.join(root, relative)).catch(absentIfVanished) : await fs.opendir(root);
+  if (!directory) return;
+  for await (const entry of directory) {
+    if (MERGE_STAGING_NAME.test(entry.name)) continue;
     const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
     if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
     const fullPath = path.join(root, nextRelative);
-    const stats = await fs.lstat(fullPath);
-    if (stats.isDirectory()) {
+    const stats = await fs.lstat(fullPath).catch(absentIfVanished);
+    if (stats?.isDirectory()) {
       yield [nextRelative, { kind: "dir" }];
       yield* walkDirectory(root, exclude, ignored, nextRelative);
-    } else if (stats.isSymbolicLink()) {
-      yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
-    } else if (stats.isFile()) {
-      yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath) }];
+    } else if (stats?.isSymbolicLink()) {
+      const target = await fs.readlink(fullPath).catch(absentIfVanished);
+      if (target !== null) yield [nextRelative, { kind: "symlink", target }];
+    } else if (stats?.isFile()) {
+      const hash = await hashFile(fullPath).catch(absentIfVanished);
+      if (hash !== null) yield [nextRelative, { kind: "file", mode: stats.mode, hash }];
     }
   }
 }
@@ -202,6 +227,11 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
 }
 
 const LOCK_WAIT_MS = 30_000;
+// Parallel runs on one project workspace restore into it one at a time, and
+// one merge of a large tree can hold the lock for more than 30 s. A restore
+// therefore waits for the whole queue ahead of it, within this bound.
+// Operators can set PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS to 1 s to 1 h.
+const WORKSPACE_RESTORE_LOCK_WAIT_MS = 10 * 60_000;
 const LOCK_DIAGNOSTIC_READ_TIMEOUT_MS = 100;
 const activeDirectoryMergeLocks = new Set<string>();
 const MAX_LOCK_DIAGNOSTIC_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -341,13 +371,166 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
   }
 }
 
+function isSqliteBusy(error: unknown): boolean {
+  const code = (error as { errcode?: number } | null)?.errcode;
+  return typeof code === "number" && (code & 0xff) === 5;
+}
+
+// Let SQLite create and manage every descriptor for these inodes. On POSIX,
+// closing a raw fs.open descriptor could release another connection's locks.
+// The parent is private (0700), including while a new file is chmodded.
+async function openLockRootDatabase(filePath: string): Promise<DatabaseSync> {
+  const stats = await fs.lstat(filePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (stats && (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1)) {
+    throw new Error("Directory merge lock database is not a plain, unshared file.");
+  }
+  const database = new DatabaseSync(filePath, { allowExtension: false });
+  try {
+    await fs.chmod(filePath, 0o600);
+    // Never block the event loop while another async operation holds a lock.
+    database.exec("PRAGMA busy_timeout=0;");
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}
+
+// First-come admission. Contenders that each retry the lock every 50 ms win in
+// random order, so newer restores could keep overtaking an older one until its
+// wait expired. Each contender instead takes a ticket in `<lock>.queue.sqlite`,
+// and only the oldest live ticket tries the lock. Tickets order attempts only:
+// the lock database stays the sole authority for mutual exclusion, so a lost
+// or stale ticket can delay a contender but never admit two.
+//
+// A contender holds the SQLite lock of its own `<lock>.waiter-<uuid>.sqlite`
+// before it takes a ticket and until it gives the ticket up. The OS releases
+// that lock if the contender crashes, so others prove a ticket dead by
+// locking its file, never from PIDs, ages, or clocks.
+const ADMISSION_PROBE_INTERVAL_MS = 1_000;
+const WAITER_TOKEN = new RegExp(`^${UUID_SOURCE}$`);
+
+function waiterFilePath(lockDir: string, token: string): string {
+  return `${lockDir}.waiter-${token}.sqlite`;
+}
+
+// Opening creates a missing file, which is then unlocked: missing and unlocked
+// both mean the ticket's contender left or died.
+async function waiterIsLive(lockDir: string, token: string): Promise<boolean> {
+  const probe = await openLockRootDatabase(waiterFilePath(lockDir, token));
+  try {
+    probe.exec("BEGIN IMMEDIATE;");
+    probe.exec("ROLLBACK;");
+    return false;
+  } catch (error) {
+    if (isSqliteBusy(error)) return true;
+    throw error;
+  } finally { probe.close(); }
+}
+
+// Best effort: the next contender removes a ticket whose waiter file is
+// unlocked, so a busy or failing queue only delays that cleanup.
+async function removeOwnTicket(queue: DatabaseSync, seq: number): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      queue.prepare("DELETE FROM tickets WHERE seq = ?").run(seq);
+      return;
+    } catch (error) {
+      if (!isSqliteBusy(error)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+interface DirectoryMergeAdmission {
+  /** Tickets older than this contender's, as of the last `isNext()` call. */
+  readonly ahead: number;
+  /** True once no live contender holds an older ticket. A busy queue answers false. */
+  isNext(): Promise<boolean>;
+  /** Gives up the ticket. Never throws. */
+  leave(): Promise<void>;
+}
+
+function joinDirectoryMergeAdmission(lockDir: string): DirectoryMergeAdmission {
+  const token = randomUUID();
+  let waiter: DatabaseSync | null = null;
+  let queue: DatabaseSync | null = null;
+  let seq: number | null = null;
+  let left = false;
+  let watched = { token: "", since: 0 };
+  let ahead = Number.POSITIVE_INFINITY;
+  return {
+    get ahead() { return ahead; },
+    async isNext() {
+      try {
+        waiter ??= await openLockRootDatabase(waiterFilePath(lockDir, token));
+        if (!waiter.isTransaction) waiter.exec("BEGIN IMMEDIATE;");
+        queue ??= await openLockRootDatabase(`${lockDir}.queue.sqlite`);
+        if (seq === null) {
+          queue.exec("CREATE TABLE IF NOT EXISTS tickets (seq INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL UNIQUE);");
+          const ticket = queue.prepare("INSERT INTO tickets (token) VALUES (?) RETURNING seq").get(token);
+          if (!ticket) throw new Error("Directory merge admission ticket was not created.");
+          seq = Number(ticket.seq);
+        }
+        ahead = Number(queue.prepare("SELECT COUNT(*) AS n FROM tickets WHERE seq < ?").get(seq)?.n ?? 0);
+        // Probe a ticket only after it has stayed oldest for a while, except
+        // right after removing a dead one: crashes are rare, handoffs are not.
+        let probeNow = false;
+        while (true) {
+          const older = queue.prepare("SELECT seq, token FROM tickets WHERE seq < ? ORDER BY seq LIMIT 1").get(seq);
+          if (!older) return true;
+          const olderToken = String(older.token);
+          const now = performance.now();
+          if (!probeNow) {
+            if (watched.token !== olderToken) {
+              watched = { token: olderToken, since: now };
+              return false;
+            }
+            if (now - watched.since < ADMISSION_PROBE_INTERVAL_MS) return false;
+          }
+          watched = { token: olderToken, since: now };
+          const valid = WAITER_TOKEN.test(olderToken);
+          if (valid && await waiterIsLive(lockDir, olderToken)) return false;
+          queue.prepare("DELETE FROM tickets WHERE seq = ? AND token = ?").run(Number(older.seq), olderToken);
+          if (valid) await fs.rm(waiterFilePath(lockDir, olderToken), { force: true });
+          probeNow = true;
+        }
+      } catch (error) {
+        if (isSqliteBusy(error)) return false;
+        throw error;
+      }
+    },
+    async leave() {
+      if (left) return;
+      left = true;
+      try {
+        if (queue && seq !== null) await removeOwnTicket(queue, seq);
+      } finally {
+        queue?.close();
+        // Closing ends the waiter file's lock; the file is no longer needed.
+        waiter?.close();
+        await fs.rm(waiterFilePath(lockDir, token), { force: true }).catch(() => undefined);
+      }
+    },
+  };
+}
+
 async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryMergeLockOperation, waitMs: number = LOCK_WAIT_MS): Promise<() => Promise<void>> {
   const startedAt = performance.now();
-  const deadline = Date.now() + waitMs;
+  // `waitMs` bounds the time without queue progress, not the whole wait: FIFO
+  // admission means a contender only waits for the finite set of tickets ahead
+  // of it, so a queue of healthy holders never times it out, while a stuck
+  // holder or head still does. Each ticket that leaves restarts the budget.
+  let deadline = Date.now() + waitMs;
   const databasePath = `${lockDir}.sqlite`;
   const ownerPath = `${lockDir}.owner.json`;
-  async function waitForLock(diagnosticOwnerPath: string) {
-    if (Date.now() >= deadline) {
+  async function waitForLock(diagnosticOwnerPath: string, progressed = false) {
+    const now = Date.now();
+    if (progressed) deadline = now + waitMs;
+    if (now >= deadline) {
       const timeoutError: NodeJS.ErrnoException & { workspaceRestoreLock?: Record<string, string | number | boolean> } = new Error(
         `Timed out waiting for workspace restore lock at ${lockDir}`,
       );
@@ -365,31 +548,24 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
   // is permanent: unlinking it would let contenders lock different inodes.
   // node:sqlite is already required for workspace manifests; no native add-on
   // or external flock command is needed on macOS, Linux, or Windows.
-  const databaseStat = await fs.lstat(databasePath).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  });
-  if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink() || databaseStat.nlink !== 1)) {
-    throw new Error("Directory merge lock database is not a plain, unshared file.");
-  }
-  // Let SQLite create and manage every descriptor for this inode. On POSIX,
-  // closing a raw fs.open descriptor could release another connection's locks.
-  // The parent is private (0700), including while a new file is chmodded.
-  const database = new DatabaseSync(databasePath, { allowExtension: false });
+  const database = await openLockRootDatabase(databasePath);
+  const admission = joinDirectoryMergeAdmission(lockDir);
   try {
-    await fs.chmod(databasePath, 0o600);
-    // Never block the event loop while another async operation holds the lock.
-    database.exec("PRAGMA busy_timeout=0;");
+    let lastAhead: number | null = null;
     while (true) {
-      try {
-        database.exec("BEGIN IMMEDIATE;");
-        break;
-      } catch (error) {
-        const code = (error as { errcode?: number }).errcode;
-        if (typeof code !== "number" || (code & 0xff) !== 5) throw error; // SQLITE_BUSY
-        await waitForLock(ownerPath);
+      if (await admission.isNext()) {
+        try {
+          database.exec("BEGIN IMMEDIATE;");
+          break;
+        } catch (error) {
+          if (!isSqliteBusy(error)) throw error;
+        }
       }
+      const progressed = lastAhead !== null && admission.ahead < lastAhead;
+      lastAhead = admission.ahead;
+      await waitForLock(ownerPath, progressed);
     }
+    await admission.leave();
 
     // Old processes do not participate in the SQLite protocol. Never infer
     // that a legacy owner is dead from PID existence, age, or missing metadata.
@@ -419,6 +595,7 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       }
     };
   } catch (error) {
+    await admission.leave();
     database.close();
     throw error;
   }
@@ -496,8 +673,8 @@ export async function withDirectoryMergeLock<T>(
   fn: (canonicalTargetDir: string) => Promise<T>,
   env: NodeJS.ProcessEnv = process.env,
   diagnosticOperation?: DirectoryMergeLockOperation,
-  // Test seam only: overrides how long acquisition waits before it reports a
-  // timeout. Production callers must omit this and keep the real budget.
+  // How long acquisition waits before it reports a timeout. Short critical
+  // sections keep the 30 s default; workspace restores pass their own budget.
   waitMs: number = LOCK_WAIT_MS,
 ): Promise<T> {
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
@@ -513,52 +690,272 @@ export async function withDirectoryMergeLock<T>(
   }
 }
 
+/**
+ * Refuses a mutation of `targetDir/relative` unless every ancestor of it is a
+ * real directory inside the target. Each component is checked with `lstat`,
+ * which does not follow a link, and the parent's `realpath` must stay under
+ * the target. Node has no `openat`, so a path handed to `rename`, `rm`, or
+ * `mkdir` is resolved again by the system; call this immediately before each
+ * mutation, not only in a preflight, so a link swapped in after the preflight
+ * is refused. With `create`, missing ancestors are made one level at a time,
+ * never with a following `mkdir -p`. Throws {@link DirectoryMergeConflict}
+ * naming the first ancestor that is a link, or is not a directory. A removal
+ * passes `absentBelowFile`: a plain file in the way means the entry to remove
+ * is not there, and `false` is returned, as `ENOTDIR` once meant. A link is
+ * always refused. Returns `false` when nothing can exist at `relative`.
+ */
+async function assertRealAncestors(
+  targetDir: string, relative: string, options: { create?: boolean; absentBelowFile?: boolean } = {},
+): Promise<boolean> {
+  const create = options.create ?? false;
+  if (!isSafeSnapshotRelativePath(relative)) throw new DirectoryMergeConflict([relative]);
+  const segments = relative.split("/").slice(0, -1);
+  let current = targetDir;
+  let walked = "";
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    walked = walked ? `${walked}/${segment}` : segment;
+    let stats = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      if (error.code === "ENOTDIR") throw new DirectoryMergeConflict([walked]);
+      throw error;
+    });
+    if (!stats) {
+      // Nothing exists below a missing ancestor, so there is nothing to change.
+      if (!create) return false;
+      await fs.mkdir(current).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
+      stats = await fs.lstat(current);
+    }
+    if (!stats.isDirectory()) {
+      if (options.absentBelowFile && !stats.isSymbolicLink()) return false;
+      throw new DirectoryMergeConflict([walked]);
+    }
+  }
+  if (segments.length === 0) return true;
+  const [realTarget, realParent] = await Promise.all([fs.realpath(targetDir), fs.realpath(current)]);
+  const inside = path.relative(realTarget, realParent);
+  if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+    throw new DirectoryMergeConflict([walked]);
+  }
+  return true;
+}
+
+type DirectoryHandle = Awaited<ReturnType<typeof fs.open>>;
+
+const FD_PATH_ROOT = "/proc/self/fd";
+const DIRECTORY_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+let descriptorPinning: boolean | undefined;
+
+/**
+ * Whether an open directory can serve as the base of a path on this system.
+ * Linux resolves `/proc/self/fd/<n>/name` through the descriptor itself, so the
+ * path keeps meaning the directory that was opened even if its old path is
+ * swapped for a link afterwards. Node has no `openat`; macOS has no such path.
+ * Elsewhere the merge falls back to checking the path again before each
+ * operation, which narrows the window but cannot close it.
+ */
+export function descriptorPinningSupported(): boolean {
+  descriptorPinning ??= process.platform === "linux" && existsSync(FD_PATH_ROOT);
+  return descriptorPinning;
+}
+
+/** A directory the merge validated. Operate on `path.join(dir, name)`, then `close()`. */
+interface PinnedDirectory {
+  readonly dir: string;
+  /** True when `dir` is bound to the validated directory, whatever happens to its old path. */
+  readonly pinned: boolean;
+  close(): Promise<void>;
+}
+
+const unpinned = (dir: string): PinnedDirectory => ({ dir, pinned: false, close: async () => undefined });
+
+/**
+ * Validates the directory that holds `targetDir/relative` and returns it for
+ * the caller's one operation. Where descriptors can be path bases, each
+ * component is opened from the previous descriptor with `O_DIRECTORY` and
+ * `O_NOFOLLOW`, so no component is resolved through a path another writer can
+ * swap; missing directories are made one level at a time the same way. Elsewhere
+ * the ancestors are checked with {@link assertRealAncestors}. Returns `null`
+ * when nothing can exist there (a missing ancestor without `create`, or a plain
+ * file in the way with `absentBelowFile`). Throws {@link DirectoryMergeConflict}
+ * for a link, or a file the caller did not tolerate.
+ */
+async function pinParentDirectory(
+  targetDir: string, relative: string, options: { create?: boolean; absentBelowFile?: boolean } = {},
+): Promise<PinnedDirectory | null> {
+  if (!isSafeSnapshotRelativePath(relative)) throw new DirectoryMergeConflict([relative]);
+  const segments = relative.split("/").slice(0, -1);
+  if (!descriptorPinningSupported()) {
+    if (!await assertRealAncestors(targetDir, relative, options)) return null;
+    return unpinned(path.join(targetDir, ...segments));
+  }
+  let handle: DirectoryHandle | null = await fs.open(targetDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+  let walked = "";
+  try {
+    for (const segment of segments) {
+      walked = walked ? `${walked}/${segment}` : segment;
+      const child = `${FD_PATH_ROOT}/${handle!.fd}/${segment}`;
+      let next: DirectoryHandle | null = null;
+      for (let attempt = 0; next === null; attempt += 1) {
+        try {
+          next = await fs.open(child, DIRECTORY_OPEN_FLAGS);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT") {
+            if (!options.create) return null;
+            if (attempt > 0) throw error;
+            await fs.mkdir(child).catch((mkdirError: NodeJS.ErrnoException) => {
+              if (mkdirError.code !== "EEXIST") throw mkdirError;
+            });
+            continue;
+          }
+          if (code === "ELOOP" || code === "ENOTDIR") {
+            const stats = await fs.lstat(child).catch(() => null);
+            if (stats && !stats.isSymbolicLink() && options.absentBelowFile) return null;
+            throw new DirectoryMergeConflict([walked]);
+          }
+          throw error;
+        }
+      }
+      await handle!.close();
+      handle = next;
+    }
+    const kept: DirectoryHandle = handle!;
+    handle = null;
+    return { dir: `${FD_PATH_ROOT}/${kept.fd}`, pinned: true, close: () => kept.close() };
+  } finally {
+    if (handle) await handle.close().catch(() => undefined);
+  }
+}
+
+/** The directory `targetDir/relative` itself, validated the same way; `""` is the target. */
+async function pinDirectory(
+  targetDir: string, relative: string, options: { absentBelowFile?: boolean } = {},
+): Promise<PinnedDirectory | null> {
+  return relative ? await pinParentDirectory(targetDir, `${relative}/_`, options) : unpinned(targetDir);
+}
+
 async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry): Promise<void> {
   const sourcePath = path.join(sourceDir, relative);
-  const targetPath = path.join(targetDir, relative);
-
-  if (entry.kind === "dir") {
-    const existing = await fs.lstat(targetPath).catch(() => null);
-    if (existing?.isDirectory()) {
+  const name = path.posix.basename(relative);
+  const parent = await pinParentDirectory(targetDir, relative, { create: true });
+  if (!parent) throw new DirectoryMergeConflict([relative]);
+  try {
+    const targetPath = path.join(parent.dir, name);
+    if (entry.kind === "dir") {
+      const existing = await fs.lstat(targetPath).catch(() => null);
+      if (existing?.isDirectory()) {
+        return;
+      }
+      if (existing) {
+        await fs.rm(targetPath, { force: true }).catch(() => undefined);
+      }
+      await fs.mkdir(targetPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
       return;
     }
-    if (existing) {
-      await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
+
+    if (entry.kind === "symlink") {
+      await removeReplacedEntry(parent, targetDir, relative);
+      await fs.symlink(entry.target, targetPath);
+      return;
     }
-    await fs.mkdir(targetPath, { recursive: true });
-    return;
-  }
+    // An interrupted restore must not leave a truncated current file. Keep the
+    // incoming tree until its owner records success; exact retries deduplicate.
+    // The copy is staged in the pinned directory. Without pinning it is staged
+    // in the target root, whose path has no ancestor to swap, so a copy that
+    // takes a long time can never write through a link.
+    const temporary = path.join(parent.pinned ? parent.dir : targetDir, `${MERGE_STAGING_PREFIX}${randomUUID()}`);
+    try {
+      await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
+        await fs.copyFile(sourcePath, temporary);
+      });
+      await fs.chmod(temporary, entry.mode);
+      const file = await fs.open(temporary, "r");
+      try { await file.sync(); } finally { await file.close(); }
+      if (!parent.pinned) await assertRealAncestors(targetDir, relative);
+      const existing = await fs.lstat(targetPath).catch(() => null);
+      if (existing?.isDirectory()) await removeReplacedEntry(parent, targetDir, relative);
+      if (!parent.pinned) await assertRealAncestors(targetDir, relative);
+      try {
+        await fs.rename(temporary, targetPath);
+      } catch (error) {
+        // The root and the destination are on different filesystems.
+        if ((error as NodeJS.ErrnoException).code !== "EXDEV" || parent.pinned) throw error;
+        const local = path.join(parent.dir, `${MERGE_STAGING_PREFIX}${randomUUID()}`);
+        try {
+          await fs.copyFile(temporary, local);
+          await fs.chmod(local, entry.mode);
+          await assertRealAncestors(targetDir, relative);
+          await fs.rename(local, targetPath);
+        } finally { await fs.rm(local, { force: true }); }
+      }
+    } finally { await fs.rm(temporary, { force: true }); }
+  } finally { await parent.close(); }
+}
 
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  if (entry.kind === "symlink") {
-    await removeReplacedEntry(targetPath);
-    await fs.symlink(entry.target, targetPath);
-    return;
-  }
-  // An interrupted restore must not leave a truncated current file. Keep the
-  // incoming tree until its owner records success; exact retries deduplicate.
-  const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
+// A merge killed between staging a copy and renaming it leaves its
+// `.paperclip-merge-<uuid>` file behind. Snapshot walks hide these names, so a
+// leftover is invisible to the baseline, yet it keeps its directory non-empty.
+// Only the caller holding the target's merge lock may call this. The age floor
+// keeps a file that another lock's merge is still copying, such as one inside
+// a nested repository this merge does not own.
+const STALE_STAGING_MIN_AGE_MS = 15 * 60_000;
+
+/** Removes stale staging files directly inside `root/relative`; returns how
+ * many. It refuses a path with a link in it, and removes only a regular file
+ * owned by this user, so it never follows or removes a link, and never
+ * recurses. */
+async function removeStaleStagingFiles(root: string, relative: string): Promise<number> {
+  const directory = await pinDirectory(root, relative, { absentBelowFile: true }).catch((error: unknown) => {
+    if (error instanceof DirectoryMergeConflict) return null;
+    throw error;
+  });
+  if (!directory) return 0;
   try {
-    await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
-      await fs.copyFile(sourcePath, temporary);
-    });
-    await fs.chmod(temporary, entry.mode);
-    const file = await fs.open(temporary, "r");
-    try { await file.sync(); } finally { await file.close(); }
-    const existing = await fs.lstat(targetPath).catch(() => null);
-    if (existing?.isDirectory()) await removeReplacedEntry(targetPath);
-    await fs.rename(temporary, targetPath);
-  } finally { await fs.rm(temporary, { force: true }); }
+    const uid = process.getuid?.();
+    let removed = 0;
+    for (const name of await fs.readdir(directory.dir).catch(() => [])) {
+      if (!MERGE_STAGING_NAME.test(name)) continue;
+      const candidate = path.join(directory.dir, name);
+      const stats = await fs.lstat(candidate).catch(() => null);
+      if (!stats?.isFile() || (uid !== undefined && stats.uid !== uid)) continue;
+      if (Date.now() - stats.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue;
+      await fs.rm(candidate, { force: true });
+      removed += 1;
+    }
+    return removed;
+  } finally { await directory.close(); }
+}
 
+// Removes an empty directory. When stale staging files kept it non-empty it
+// removes them and retries once; a directory that still holds anything else is
+// reported as ENOTEMPTY, never emptied.
+async function removeDirectoryDroppingStaleStaging(root: string, relative: string): Promise<void> {
+  const parent = await pinParentDirectory(root, relative, { absentBelowFile: true });
+  if (!parent) return;
+  try {
+    const directory = path.join(parent.dir, path.posix.basename(relative));
+    try {
+      await fs.rmdir(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || await removeStaleStagingFiles(root, relative) === 0) throw error;
+      await fs.rmdir(directory);
+    }
+  } finally { await parent.close(); }
 }
 
 // A file or symlink replacing a directory removes it non-recursively. The
 // merge has already deleted the unchanged entries it owns there, and
 // `blockedDirectoryReplacements` refused anything else, so a non-empty
 // directory here means content appeared concurrently and must not be lost.
-async function removeReplacedEntry(targetPath: string): Promise<void> {
+async function removeReplacedEntry(parent: PinnedDirectory, targetDir: string, relative: string): Promise<void> {
+  const targetPath = path.join(parent.dir, path.posix.basename(relative));
   const existing = await fs.lstat(targetPath).catch(() => null);
-  if (existing?.isDirectory()) await fs.rmdir(targetPath);
+  if (existing?.isDirectory()) await removeDirectoryDroppingStaleStaging(targetDir, relative);
   else await fs.rm(targetPath, { force: true });
 }
 
@@ -571,7 +968,15 @@ async function blockedDirectoryReplacements(
 ): Promise<string[]> {
   const ignored = workspacePathMatcher(baseline.ignoredPaths);
   const holdsUnownedEntry = async (relative: string): Promise<boolean> => {
-    for (const name of await fs.readdir(path.join(targetDir, relative))) {
+    await removeStaleStagingFiles(targetDir, relative);
+    // A link in the path means the directory is not the one the run saw.
+    const directory = await pinDirectory(targetDir, relative).catch((error: unknown) => {
+      if (error instanceof DirectoryMergeConflict) return null;
+      throw error;
+    });
+    if (!directory) return true;
+    const names = await fs.readdir(directory.dir).finally(() => directory.close());
+    for (const name of names) {
       const child = path.posix.join(relative, name);
       const owned = baseline.entries.get(child);
       if (!owned || shouldExcludePath(child, baseline.exclude) || ignored.matches(child)) return true;
@@ -590,6 +995,43 @@ async function blockedDirectoryReplacements(
     }
     return blocked;
   } finally { ignored.close(); }
+}
+
+/** Directories the merge would write below that are no longer the real
+ * directories the run saw, because another restore left a link or a file there.
+ * A directory the merge itself replaces first is not one of them. Nothing is
+ * written until this is empty. */
+async function linkedAncestorConflicts(
+  targetDir: string, baseline: DirectorySnapshot, source: DirectorySnapshot,
+  isApplied: (relative: string, entry: SnapshotEntry) => boolean,
+): Promise<string[]> {
+  const verdicts = new Map<string, boolean>();
+  const usable = async (ancestor: string): Promise<boolean> => {
+    const known = verdicts.get(ancestor);
+    if (known !== undefined) return known;
+    const stats = await fs.lstat(path.join(targetDir, ancestor)).catch(() => null);
+    const incoming = source.entries.get(ancestor);
+    const replaced = incoming?.kind === "dir" && !entriesMatch(baseline.entries.get(ancestor), incoming);
+    const verdict = !stats || stats.isDirectory() || replaced;
+    verdicts.set(ancestor, verdict);
+    return verdict;
+  };
+  const bad = new Set<string>();
+  for (const [relative, entry] of orderedEntries(source)) {
+    if (!isApplied(relative, entry)) continue;
+    const ancestors: string[] = [];
+    for (let parent = path.posix.dirname(relative); parent !== "."; parent = path.posix.dirname(parent)) ancestors.unshift(parent);
+    for (const ancestor of ancestors) {
+      // A run's own tree cannot hold an entry below a link or a file.
+      const incoming = source.entries.get(ancestor);
+      if (incoming && incoming.kind !== "dir") { bad.add(ancestor); break; }
+      if (!await usable(ancestor)) { bad.add(ancestor); break; }
+      // Below a missing or replaced directory nothing exists yet to follow.
+      const stats = await fs.lstat(path.join(targetDir, ancestor)).catch(() => null);
+      if (!stats?.isDirectory()) break;
+    }
+  }
+  return [...bad].sort();
 }
 
 export async function captureDirectorySnapshot(
@@ -692,6 +1134,21 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   return [...conflicts].sort();
 }
 
+/** How long a workspace restore waits without queue progress before its lock
+ * times out: 10 minutes, or `PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS` (1 s to 1 h). */
+export function workspaceRestoreLockWaitMs(): number {
+  const configured = Number(process.env.PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS);
+  return Number.isFinite(configured) && configured >= 1000 ? Math.min(configured, 60 * 60_000) : WORKSPACE_RESTORE_LOCK_WAIT_MS;
+}
+
+function snapshotsMatch(left: DirectorySnapshot, right: DirectorySnapshot): boolean {
+  if (left.entries.size !== right.entries.size) return false;
+  for (const [relative, entry] of left.entries) {
+    if (!entriesMatch(entry, right.entries.get(relative))) return false;
+  }
+  return true;
+}
+
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
@@ -699,6 +1156,8 @@ export async function mergeDirectoryWithBaseline(input: {
   conflictPolicy?: "reject";
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
+  /** Test seam only: runs after every preflight check and before the first write. */
+  afterPreflight?: () => Promise<void>;
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
   snapshots?: { source: DirectorySnapshot; current: DirectorySnapshot };
@@ -706,6 +1165,13 @@ export async function mergeDirectoryWithBaseline(input: {
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
   const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
   try {
+    // A source equal to its baseline deletes and copies nothing and cannot
+    // conflict. With no hooks to run, it skips the lock, so read-only runs do
+    // not queue behind other restores into the same workspace.
+    if (!input.beforeApply && !input.afterApply && snapshotsMatch(input.baseline, source)) {
+      await disposeDirectorySnapshot(input.snapshots?.current ?? null);
+      return;
+    }
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
       await input.beforeApply?.();
       // Strict preflight must see excluded children before a directory is
@@ -719,24 +1185,35 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         const blocked = await blockedDirectoryReplacements(canonicalTargetDir, input.baseline, source);
         if (blocked.length) throw new DirectoryMergeConflict(blocked);
+        const isApplied = (relative: string, entry: SnapshotEntry) =>
+          !entriesMatch(input.baseline.entries.get(relative), entry) &&
+          !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry));
+        const linked = await linkedAncestorConflicts(canonicalTargetDir, input.baseline, source, isApplied);
+        if (linked.length) throw new DirectoryMergeConflict(linked);
+        await input.afterPreflight?.();
+        // A copy that was staged in the target root and then interrupted.
+        await removeStaleStagingFiles(canonicalTargetDir, "");
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
-          await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
+          const parent = await pinParentDirectory(canonicalTargetDir, relative, { absentBelowFile: true });
+          if (!parent) continue;
+          try {
+            await fs.rm(path.join(parent.dir, path.posix.basename(relative)), { force: true });
+          } finally { await parent.close(); }
         }
         // Reverse path order visits descendants before their parent directory.
         for (const [relative, entry] of orderedEntries(input.baseline, true)) {
-          if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
+          if (entry.kind === "dir" && !source.entries.has(relative)) await removeDirectoryDroppingStaleStaging(canonicalTargetDir, relative).catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
           });
         }
         for (const [relative, entry] of orderedEntries(source)) {
-          if (!entriesMatch(input.baseline.entries.get(relative), entry) &&
-              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+          if (isApplied(relative, entry)) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
         }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
-    });
+    }, process.env, undefined, workspaceRestoreLockWaitMs());
   } finally { await disposeDirectorySnapshot(source); }
 }
 

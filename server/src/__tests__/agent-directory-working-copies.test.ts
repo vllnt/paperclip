@@ -766,6 +766,30 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(root, "note.txt"), "utf8")).toBe("one write");
   });
 
+  // The agent-wide lifecycle lock is shared by every concurrent run of one
+  // agent, so it waits like a workspace restore (10 minutes without queue
+  // progress by default), not the 30 s a short credential write gets.
+  const RESTORE_WAIT_ENV = "PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS";
+  async function withRestoreWait<T>(waitMs: string, fn: () => Promise<T>): Promise<T> {
+    const previous = process.env[RESTORE_WAIT_ENV];
+    process.env[RESTORE_WAIT_ENV] = waitMs;
+    try { return await fn(); } finally {
+      if (previous === undefined) delete process.env[RESTORE_WAIT_ENV]; else process.env[RESTORE_WAIT_ENV] = previous;
+    }
+  }
+
+  it("waits for a held agent directory lock for the configured restore budget, not the 30 s default", async () => {
+    const copy = await run();
+    await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date() })
+      .where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    await withRestoreWait("1000", () => withDirectoryMergeLock(path.resolve(copy.localRoot, "../../.."), async () => {
+      const started = performance.now();
+      await expect(copies.release(companyId, copy.runId)).rejects.toMatchObject({ code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" });
+      expect(performance.now() - started).toBeGreaterThanOrEqual(900);
+      expect(performance.now() - started).toBeLessThan(5_000);
+    }));
+  }, 40_000);
+
   it.each(["prepared", "unavailable", "warm_saved", "superseded", "saved", "unchanged", "resolved"])(
     "does not acquire a held directory lock for a no-op %s release", async state => {
       const copy = await run();
@@ -778,7 +802,7 @@ describe("persistent agent directories", () => {
         // Any attempted nested acquisition fails promptly instead of hanging the test.
         let now = Date.now();
         const clock = vi.spyOn(Date, "now").mockImplementation(() => now += 31_000);
-        try { await copies.release(companyId, copy.runId); } finally { clock.mockRestore(); }
+        try { await withRestoreWait("1000", () => copies.release(companyId, copy.runId)); } finally { clock.mockRestore(); }
         expect(await copies.get(companyId, copy.runId)).toEqual(before);
         expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe(initial);
       });
@@ -908,8 +932,10 @@ describe("persistent agent directories", () => {
       let now = Date.now();
       const clock = vi.spyOn(Date, "now").mockImplementation(() => now += 31_000);
       try {
-        await expect(copies.release(companyId, blocked.runId)).rejects.toMatchObject({ code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" });
-        await copies.recoverCaptured();
+        await withRestoreWait("1000", async () => {
+          await expect(copies.release(companyId, blocked.runId)).rejects.toMatchObject({ code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" });
+          await copies.recoverCaptured();
+        });
       } finally { clock.mockRestore(); }
       expect((await copies.get(companyId, blocked.runId))?.nextAttemptAt).toBeInstanceOf(Date);
       expect(await fs.readFile(path.join(blocked.localRoot, entryFile), "utf8")).toBe(initial);

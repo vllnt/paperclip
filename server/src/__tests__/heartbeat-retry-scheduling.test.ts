@@ -70,6 +70,8 @@ const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const LOCK_TIMEOUT_TEST_ADAPTER = "restore_lock_timeout_test";
+const ORDINARY_FAILURE_TEST_ADAPTER = "ordinary_throw_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -124,6 +126,16 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    for (const [type, fail] of [
+      [LOCK_TIMEOUT_TEST_ADAPTER, () => Object.assign(new Error("Timed out waiting for workspace restore lock at /locks/directory-merge/abc.lock"), { code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" })],
+      [ORDINARY_FAILURE_TEST_ADAPTER, () => new Error("The adapter crashed")],
+    ] as const) {
+      registerServerAdapter({
+        type,
+        execute: async () => { throw fail(); },
+        testEnvironment: async () => ({ adapterType: type, status: "pass", checks: [], testedAt: new Date().toISOString() }),
+      });
+    }
   }, 20_000);
 
   afterEach(async () => {
@@ -140,6 +152,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(LOCK_TIMEOUT_TEST_ADAPTER);
+    unregisterServerAdapter(ORDINARY_FAILURE_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -250,6 +264,64 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   }
 
+
+  async function failedThrownRun(adapterType: string) {
+    const companyId = randomUUID(), agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId, name: "Paperclip", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Thrown Test", role: "engineer", status: "idle", adapterType, adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+    });
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    const failed = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failed?.status).toBe("failed");
+    return failed!;
+  }
+
+  const retryChildren = (runId: string) =>
+    db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, scheduledRetryReason: heartbeatRuns.scheduledRetryReason })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+
+  it("names a thrown workspace restore lock timeout, but does not re-run a run whose adapter had started", async () => {
+    const failed = await failedThrownRun(LOCK_TIMEOUT_TEST_ADAPTER);
+
+    expect(failed.errorCode).toBe("workspace_restore_lock_timeout");
+    expect((failed.resultJson as Record<string, unknown> | null)?.workspaceRestoreFailure).toBe("restore_lock_timeout");
+    // Provider work may have happened, so the existing reconciliation guard
+    // keeps a blind second run from being queued.
+    expect(await heartbeat.scheduleBoundedRetry(failed.id, { random: () => 0 }))
+      .toMatchObject({ outcome: "not_scheduled", errorCode: "legacy_execution_requires_reconciliation" });
+    expect(await retryChildren(failed.id)).toHaveLength(0);
+  });
+
+  it("re-queues a restore lock timeout that happened before any provider work, within the bounded retry budget", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "workspace_restore_lock_timeout",
+      resultJson: { workspaceRestoreFailure: "restore_lock_timeout", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Lock timeout fixture", status: "in_progress", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, wakeReason: "issue_assigned" } }).where(eq(heartbeatRuns.id, runId));
+
+    const first = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 });
+
+    expect(first).toMatchObject({ outcome: "scheduled", run: { scheduledRetryAttempt: 1, scheduledRetryReason: "transient_failure" } });
+    if (first.outcome !== "scheduled" || !first.run) throw new Error("Expected a bounded retry");
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "workspace_restore_lock_timeout", scheduledRetryAttempt: 2,
+      resultJson: { workspaceRestoreFailure: "restore_lock_timeout", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    }).where(eq(heartbeatRuns.id, first.run.id));
+    expect(await heartbeat.scheduleBoundedRetry(first.run.id, { now, random: () => 0 })).toMatchObject({ outcome: "retry_exhausted" });
+  });
+
+  it("keeps an ordinary thrown adapter error as adapter_failed", async () => {
+    const failed = await failedThrownRun(ORDINARY_FAILURE_TEST_ADAPTER);
+
+    expect(failed.errorCode).toBe("adapter_failed");
+    expect((failed.resultJson as Record<string, unknown> | null)?.workspaceRestoreFailure).toBeUndefined();
+  });
 
   it("never schedules invalid provider definitions even when a caller supplies a retry policy", async () => {
     const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
