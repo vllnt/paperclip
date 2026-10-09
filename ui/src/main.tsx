@@ -22,7 +22,6 @@ import { startPerfMeasureReaper } from "./lib/perf-measure-reaper";
 import { getOrCreatePaperclipReactRoot } from "./lib/react-root";
 import { startServiceWorkerUpdates } from "./lib/service-worker-updates";
 import { installStaleChunkReload } from "./lib/stale-chunk-reload";
-import { installRoutePrefetchOnIntent, preloadRouteChunk } from "./lib/route-preload";
 import "@mdxeditor/editor/style.css";
 import "./index.css";
 
@@ -34,8 +33,6 @@ initPluginBridge(React, ReactDOM);
 startPerfMeasureReaper();
 
 installStaleChunkReload();
-preloadRouteChunk(window.location.pathname);
-installRoutePrefetchOnIntent();
 
 // Parked SPA tabs never navigate, so beyond registering the worker this also
 // re-checks /sw.js on tab focus and hourly, and applies a discovered update

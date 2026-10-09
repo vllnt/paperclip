@@ -12,25 +12,6 @@ interface ReloadTarget {
   navigator?: { onLine: boolean };
 }
 
-let suppressedTasks = 0;
-
-/**
- * Runs a task whose chunk-load failures must not reload the page. Use it for
- * background prefetching: a failed prefetch is not a reason to reload a page
- * that the user is working in.
- *
- * @param task - The work to run, for example a dynamic `import()`.
- * @returns The task's result.
- */
-export async function runWithoutStaleChunkReload<T>(task: () => Promise<T>): Promise<T> {
-  suppressedTasks += 1;
-  try {
-    return await task();
-  } finally {
-    suppressedTasks -= 1;
-  }
-}
-
 /**
  * Decides whether a missing-chunk error may reload the page now.
  *
@@ -62,7 +43,7 @@ export function installStaleChunkReload(
   now: () => number = Date.now,
 ): () => void {
   const onPreloadError = (event: Event): void => {
-    if (suppressedTasks > 0 || target.navigator?.onLine === false) return;
+    if (target.navigator?.onLine === false) return;
     let lastReloadAt: string | null = null;
     try {
       lastReloadAt = target.sessionStorage.getItem(STALE_CHUNK_RELOAD_KEY);

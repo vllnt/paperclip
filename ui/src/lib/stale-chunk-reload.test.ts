@@ -4,7 +4,6 @@ import {
   STALE_CHUNK_RELOAD_KEY,
   canReloadForStaleChunk,
   installStaleChunkReload,
-  runWithoutStaleChunkReload,
 } from "./stale-chunk-reload";
 
 function createTarget(initialStored: string | null = null) {
@@ -111,42 +110,6 @@ describe("installStaleChunkReload", () => {
     const { target, reload, fire } = createTarget();
     installStaleChunkReload({ ...target, navigator: { onLine: true } });
 
-    fire();
-
-    expect(reload).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not reload for a failure inside a background prefetch", async () => {
-    const { target, reload, fire } = createTarget();
-    installStaleChunkReload(target);
-    const events: Event[] = [];
-
-    await runWithoutStaleChunkReload(async () => {
-      events.push(fire());
-    });
-
-    expect(reload).not.toHaveBeenCalled();
-    expect(events).toHaveLength(1);
-    expect(events[0]?.defaultPrevented).toBe(false);
-  });
-
-  it("reloads again once the background prefetch has finished", async () => {
-    const { target, reload, fire } = createTarget();
-    installStaleChunkReload(target);
-
-    await runWithoutStaleChunkReload(async () => undefined);
-    fire();
-
-    expect(reload).toHaveBeenCalledTimes(1);
-  });
-
-  it("releases the suppression even when the prefetch throws", async () => {
-    const { target, reload, fire } = createTarget();
-    installStaleChunkReload(target);
-
-    await runWithoutStaleChunkReload(async () => {
-      throw new Error("prefetch failed");
-    }).catch(() => undefined);
     fire();
 
     expect(reload).toHaveBeenCalledTimes(1);
