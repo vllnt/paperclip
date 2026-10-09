@@ -3571,6 +3571,20 @@ export function issueRoutes(
     opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
+  const loadCompanyRunTiers = async (companyId: string) =>
+    (await instanceSettings.getGeneral()).companyRunTiers?.[companyId] ?? null;
+  const loadRunProfileAssignee = async (agentId: string) => {
+    const agent = await agentsSvc.getById(agentId);
+    return agent
+      ? {
+          companyId: agent.companyId,
+          adapterType: agent.adapterType,
+          adapterConfig: agent.adapterConfig,
+          runtimeConfig: agent.runtimeConfig,
+          fallbacks: agent.fallbacks,
+        }
+      : null;
+  };
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
@@ -11641,6 +11655,8 @@ export function issueRoutes(
       const runProfileChange = await assertCanSetIssueRunProfile({
         db,
         access,
+        loadTiers: loadCompanyRunTiers,
+        loadAssignee: loadRunProfileAssignee,
         req,
         companyId,
         existing: null,
@@ -12138,6 +12154,8 @@ export function issueRoutes(
       const runProfileChange = await assertCanSetIssueRunProfile({
         db,
         access,
+        loadTiers: loadCompanyRunTiers,
+        loadAssignee: loadRunProfileAssignee,
         req,
         companyId: parent.companyId,
         existing: null,
@@ -12430,6 +12448,8 @@ export function issueRoutes(
         const childRunProfileChange = await assertCanSetIssueRunProfile({
           db,
           access,
+          loadTiers: loadCompanyRunTiers,
+          loadAssignee: loadRunProfileAssignee,
           req,
           companyId: sourceIssue.companyId,
           existing: null,
@@ -12890,6 +12910,8 @@ export function issueRoutes(
       const runProfileChange = await assertCanSetIssueRunProfile({
         db,
         access,
+        loadTiers: loadCompanyRunTiers,
+        loadAssignee: loadRunProfileAssignee,
         req,
         companyId: existing.companyId,
         existing,

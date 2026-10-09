@@ -281,7 +281,6 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
   const importTransferSpoolRoot =
     options?.importTransferSpoolRoot ?? resolveDefaultImportTransferSpoolRoot();
   const svc = companyService(db);
-  const instanceSettings = instanceSettingsService(db);
   const agents = agentService(db);
   const portability = companyPortabilityService(db, storage);
   const access = accessService(db);
@@ -1247,7 +1246,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
   router.get("/:companyId/run-tiers", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const tiers = (await instanceSettings.getGeneral()).companyRunTiers?.[companyId];
+    const tiers = (await instanceSettingsService(db).getGeneral()).companyRunTiers?.[companyId];
     res.json(tiers ?? { tiers: {}, agentAllowlist: [] });
   });
 
@@ -1256,6 +1255,9 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     assertBoard(req);
     assertCompanyAccess(req, companyId);
     const next = companyRunTiersSchema.parse(req.body);
+    // Built per request: the service reads the managed-config environment on
+    // construction, which must not happen while the router is being built.
+    const instanceSettings = instanceSettingsService(db);
     const current = (await instanceSettings.getGeneral()).companyRunTiers ?? {};
     const before = current[companyId] ?? null;
     const isEmpty = Object.keys(next.tiers).length === 0 && next.agentAllowlist.length === 0;

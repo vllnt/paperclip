@@ -1,7 +1,5 @@
 import type { Request } from "express";
-import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents } from "@paperclipai/db";
 import {
   DEFAULT_RUN_TIER,
   HARNESS_FALLBACK_ADAPTER_TYPES,
@@ -14,7 +12,6 @@ import {
 } from "@paperclipai/shared";
 import { badRequest, forbidden, unprocessable } from "../errors.js";
 import { profileUnavailableReason } from "../services/harness-fallback.js";
-import { instanceSettingsService } from "../services/instance-settings.js";
 import { logActivity, type accessService } from "../services/index.js";
 
 export type RunProfileDenialReason =
@@ -99,9 +96,21 @@ const DENIAL_MESSAGE: Record<RunProfileDenialReason, string> = {
   not_creator_or_dispatcher: "Agents may set a run profile only on issues they create or dispatch.",
 };
 
+/** The assignee fields the compatibility checks read. */
+export interface RunProfileAssignee {
+  companyId: string;
+  adapterType: string;
+  adapterConfig: Record<string, unknown> | null;
+  runtimeConfig: Record<string, unknown> | null;
+  fallbacks?: unknown;
+}
+
 export interface IssueRunProfileGuardInput {
   db: Db;
   access: Pick<ReturnType<typeof accessService>, "decide">;
+  /** Reads the company's run tiers; called only when the decision needs them. */
+  loadTiers: (companyId: string) => Promise<CompanyRunTiers | null>;
+  loadAssignee: (agentId: string) => Promise<RunProfileAssignee | null>;
   req: Request;
   companyId: string;
   existing: { id: string; createdByAgentId: string | null; assigneeAgentId: string | null; assigneeAdapterOverrides: unknown } | null;
@@ -130,8 +139,14 @@ export interface IssueRunProfileChange {
 export async function assertCanSetIssueRunProfile(input: IssueRunProfileGuardInput): Promise<IssueRunProfileChange> {
   const unchanged: IssueRunProfileChange = { changed: false, before: null, after: null };
   if (input.nextOverrides === undefined) return unchanged;
-  const tiers = (await instanceSettingsService(input.db).getGeneral()).companyRunTiers?.[input.companyId] ?? null;
+  // No database work for the common case: the request leaves the profile as it is.
+  if (sameProfile(profileOf(input.existing?.assigneeAdapterOverrides ?? null), profileOf(input.nextOverrides))) return unchanged;
   const actorAgentId = input.req.actor.type === "agent" ? input.req.actor.agentId ?? null : null;
+  const changedProfile = profileOf(input.nextOverrides);
+  const namesTier = Boolean(changedProfile?.tier);
+  // Tiers decide what an agent may set and what a tier name means; a board user
+  // setting an explicit or legacy profile needs neither.
+  const tiers = actorAgentId || namesTier ? await input.loadTiers(input.companyId) : null;
   const base = {
     tiers,
     existing: input.existing,
@@ -171,12 +186,12 @@ export async function assertCanSetIssueRunProfile(input: IssueRunProfileGuardInp
     });
   }
   if (!decision.changed) return unchanged;
-  await assertProfileRunsOnAssignee(input.db, input.companyId, input.assigneeAgentId ?? null, decision.after, tiers);
+  await assertProfileRunsOnAssignee(input.loadAssignee, input.companyId, input.assigneeAgentId ?? null, decision.after, tiers);
   return { changed: true, before: decision.before, after: decision.after };
 }
 
 async function assertProfileRunsOnAssignee(
-  db: Db,
+  loadAssignee: IssueRunProfileGuardInput["loadAssignee"],
   companyId: string,
   assigneeAgentId: string | null,
   profile: RunProfile | null,
@@ -186,7 +201,7 @@ async function assertProfileRunsOnAssignee(
   const resolved = resolveRunProfile(profile, tiers);
   if (!resolved.ok) throw badRequest(`Unknown run tier "${resolved.tier}"`, { code: "unknown_run_tier" });
   if (!resolved.target || !assigneeAgentId) return;
-  const [agent] = await db.select().from(agents).where(eq(agents.id, assigneeAgentId));
+  const agent = await loadAssignee(assigneeAgentId);
   if (!agent || agent.companyId !== companyId) return;
   if (!(HARNESS_FALLBACK_ADAPTER_TYPES as readonly string[]).includes(agent.adapterType)) {
     if (profile.tier || profile.adapterType) {
