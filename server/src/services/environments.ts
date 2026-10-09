@@ -1375,9 +1375,17 @@ export function environmentService(db: Db) {
       environmentId: string,
       filters: {
         status?: string | readonly string[];
+        /**
+         * Only leases that belong to these companies. Omit for the unscoped
+         * internal reads (runtime, reaper); API callers pass the caller's
+         * companies so one company never reads another's lease rows.
+         */
+        companyIds?: readonly string[];
       } = {},
     ): Promise<EnvironmentLease[]> => {
+      if (filters.companyIds && filters.companyIds.length === 0) return [];
       const conditions = [eq(environmentLeases.environmentId, environmentId)];
+      if (filters.companyIds) conditions.push(inArray(environmentLeases.companyId, [...filters.companyIds]));
       if (typeof filters.status === "string") {
         if (filters.status) conditions.push(eq(environmentLeases.status, filters.status));
       } else if (filters.status && filters.status.length > 0) {

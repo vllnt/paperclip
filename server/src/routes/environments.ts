@@ -365,6 +365,23 @@ export function environmentRoutes(
     assertBoardOrgAccess(req);
   }
 
+  /**
+   * The companies whose lease rows the caller may read: `null` for the local
+   * board and instance admins (every company), otherwise the caller's own
+   * companies. `assertBoardOrgAccess` only proves the caller belongs to some
+   * company, so lease reads must also scope the rows.
+   */
+  function leaseReadCompanyScope(req: Request): readonly string[] | null {
+    if (req.actor.type !== "board") return [];
+    if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return null;
+    return req.actor.companyIds ?? [];
+  }
+
+  /** Lease metadata can echo provider config, so every lease read passes it through the shared redactor. */
+  function redactLease<T extends { metadata: Record<string, unknown> | null }>(lease: T): T {
+    return { ...lease, metadata: redactEventPayload(lease.metadata) };
+  }
+
   function assertCustomImageCompanyAccess(req: Request, companyId: string) {
     if (req.actor.type !== "board") {
       throw forbidden("Board access required");
@@ -1110,8 +1127,12 @@ export function environmentRoutes(
       return;
     }
     const query = listEnvironmentLeasesQuerySchema.parse(req.query);
-    const leases = await svc.listLeases(environment.id, { status: query.status });
-    res.json(leases);
+    const companyScope = leaseReadCompanyScope(req);
+    const leases = await svc.listLeases(environment.id, {
+      status: query.status,
+      ...(companyScope ? { companyIds: companyScope } : {}),
+    });
+    res.json(leases.map(redactLease));
   });
 
   // Company-wide lease list. Same gate as the per-environment lease list (board
@@ -1126,17 +1147,20 @@ export function environmentRoutes(
     const leases = await svc.listCompanyLeases(companyId, {
       statuses: query.status ?? COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
     });
-    res.json(leases.map((lease) => ({ ...lease, metadata: redactEventPayload(lease.metadata) })));
+    res.json(leases.map(redactLease));
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {
     assertCanReadInstanceEnvironments(req);
     const lease = await svc.getLeaseById(req.params.leaseId as string);
-    if (!lease) {
+    const companyScope = leaseReadCompanyScope(req);
+    // Another company's lease answers exactly like a missing one, so the route
+    // is not an oracle for which lease IDs exist.
+    if (!lease || (companyScope && !companyScope.includes(lease.companyId))) {
       res.status(404).json({ error: "Environment lease not found" });
       return;
     }
-    res.json(lease);
+    res.json(redactLease(lease));
   });
 
   router.patch("/environments/:id", validate(updateEnvironmentSchema), async (req, res) => {

@@ -53,6 +53,10 @@ function boardActor(companyIds: string[], source: "local_implicit" | "session" =
   };
 }
 
+function instanceAdminActor(companyIds: string[]): Express.Request["actor"] {
+  return { ...boardActor(companyIds), isInstanceAdmin: true };
+}
+
 async function seedCompany(db: Db, label: string) {
   const nonce = randomUUID().slice(0, 8);
   const [company] = await db.insert(companies).values({
@@ -252,6 +256,109 @@ describeEmbeddedPostgres("environment lease list routes", () => {
       const noCompanies = await request(createApp(db, boardActor([])))
         .get(`/api/companies/${companyA.id}/environment-leases`);
       expect(noCompanies.status, JSON.stringify(noCompanies.body)).toBe(403);
+    });
+  });
+
+  // Environments can be shared across companies, but every lease row belongs to
+  // one company. A board member of company A must never read company B's leases
+  // (rows, provider IDs or metadata) through the per-environment or by-ID route.
+  describe("company scoping of the per-environment and by-ID lease reads", () => {
+    async function seedTwoCompanies() {
+      const companyA = await seedCompany(db, "Company A");
+      const companyB = await seedCompany(db, "Company B");
+      const shared = await seedEnvironment(db, "Shared box");
+      const secretValue = `sk-live-${randomUUID()}`;
+      const leaseA = await seedLease(db, {
+        companyId: companyA.id,
+        environmentId: shared.id,
+        status: "active",
+        metadata: { apiKey: secretValue, note: "a" },
+      });
+      const leaseB = await seedLease(db, {
+        companyId: companyB.id,
+        environmentId: shared.id,
+        status: "active",
+        metadata: { apiKey: secretValue, note: "b" },
+      });
+      return { companyA, companyB, shared, leaseA, leaseB, secretValue };
+    }
+
+    it("lists only the caller's own company's leases of a shared environment", async () => {
+      const { companyA, shared, leaseA, leaseB } = await seedTwoCompanies();
+
+      const res = await request(createApp(db, boardActor([companyA.id])))
+        .get(`/api/environments/${shared.id}/leases`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.map((lease: { id: string }) => lease.id)).toEqual([leaseA.id]);
+      const serialized = JSON.stringify(res.body);
+      expect(serialized).not.toContain(leaseB.id);
+      expect(serialized).not.toContain(leaseB.providerLeaseId as string);
+    });
+
+    it("lists the leases of every company the caller belongs to", async () => {
+      const { companyA, companyB, shared, leaseA, leaseB } = await seedTwoCompanies();
+
+      const res = await request(createApp(db, boardActor([companyA.id, companyB.id])))
+        .get(`/api/environments/${shared.id}/leases`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.map((lease: { id: string }) => lease.id).sort()).toEqual([leaseA.id, leaseB.id].sort());
+    });
+
+    it("lets instance admins and the local board see every company's leases", async () => {
+      const { companyA, shared, leaseA, leaseB } = await seedTwoCompanies();
+
+      for (const actor of [instanceAdminActor([companyA.id]), boardActor([companyA.id], "local_implicit")]) {
+        const res = await request(createApp(db, actor)).get(`/api/environments/${shared.id}/leases`);
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(res.body.map((lease: { id: string }) => lease.id).sort()).toEqual([leaseA.id, leaseB.id].sort());
+        const byId = await request(createApp(db, actor)).get(`/api/environment-leases/${leaseB.id}`);
+        expect(byId.status, JSON.stringify(byId.body)).toBe(200);
+        expect(byId.body.id).toBe(leaseB.id);
+      }
+    });
+
+    it("returns 404 for another company's lease by ID, indistinguishable from a missing lease", async () => {
+      const { companyA, leaseA, leaseB } = await seedTwoCompanies();
+      const app = createApp(db, boardActor([companyA.id]));
+
+      const own = await request(app).get(`/api/environment-leases/${leaseA.id}`);
+      expect(own.status, JSON.stringify(own.body)).toBe(200);
+      expect(own.body.id).toBe(leaseA.id);
+
+      const foreign = await request(app).get(`/api/environment-leases/${leaseB.id}`);
+      const missing = await request(app).get(`/api/environment-leases/${randomUUID()}`);
+      expect(foreign.status, JSON.stringify(foreign.body)).toBe(404);
+      expect(missing.status).toBe(404);
+      expect(foreign.body).toEqual(missing.body);
+      expect(JSON.stringify(foreign.body)).not.toContain(leaseB.providerLeaseId as string);
+    });
+
+    it("redacts provider metadata on the per-environment and by-ID reads", async () => {
+      const { companyA, shared, leaseA, secretValue } = await seedTwoCompanies();
+      const app = createApp(db, boardActor([companyA.id]));
+
+      const list = await request(app).get(`/api/environments/${shared.id}/leases`);
+      expect(list.status, JSON.stringify(list.body)).toBe(200);
+      expect(JSON.stringify(list.body)).not.toContain(secretValue);
+      expect(list.body[0].metadata).toMatchObject({ note: "a" });
+
+      const byId = await request(app).get(`/api/environment-leases/${leaseA.id}`);
+      expect(byId.status, JSON.stringify(byId.body)).toBe(200);
+      expect(JSON.stringify(byId.body)).not.toContain(secretValue);
+      expect(byId.body.metadata).toMatchObject({ note: "a" });
+    });
+
+    it("keeps the other company's leases out of the company-wide list, even for a multi-company member", async () => {
+      const { companyA, companyB, leaseA, leaseB } = await seedTwoCompanies();
+      const app = createApp(db, boardActor([companyA.id, companyB.id]));
+
+      const res = await request(app).get(`/api/companies/${companyA.id}/environment-leases`);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.map((lease: { id: string }) => lease.id)).toEqual([leaseA.id]);
+      expect(JSON.stringify(res.body)).not.toContain(leaseB.id);
     });
   });
 });

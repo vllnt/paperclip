@@ -88,8 +88,14 @@ Archives a company. Archived companies are hidden from default listings.
 
 A lease records a run's hold on an execution environment (an SSH host or a
 sandbox). Statuses: `active`, `released`, `expired`, `failed`, `retained`,
-`pending_cleanup`. Both routes below are read-only and board-only (agents get
+`pending_cleanup`. All lease reads are read-only and board-only (agents get
 `403`).
+
+**Company scoping.** Every lease belongs to one company, and an environment can be
+shared by several. A board user reads only the leases of the companies they belong
+to. The local board and instance admins read every company's leases. Lease
+`metadata` can echo provider configuration, so every lease read passes it through
+the secret redactor, and secret-looking values are masked.
 
 ### List Leases Of One Environment
 
@@ -98,7 +104,18 @@ GET /api/environments/{environmentId}/leases?status=active,failed
 ```
 
 `status` is an optional comma-separated list of lease statuses; without it every
-status is returned. An unknown status returns `400`.
+status is returned. An unknown status returns `400`. Only the caller's companies'
+leases are returned, so the same environment can return different rows to
+different callers.
+
+### Get One Lease
+
+```
+GET /api/environment-leases/{leaseId}
+```
+
+A lease that belongs to a company the caller is not in returns `404`, with the same
+body as a lease that does not exist.
 
 ### List Leases Across A Company
 
@@ -116,8 +133,7 @@ lease carries `environment: { id, name, driver }`, or `null` for an orphan
 
 Authorization: the per-environment gate (board user with company membership or
 instance admin) plus access to `{companyId}`, because the rows are the company's
-own leases. A board user of another company gets `403`. Lease `metadata` is
-passed through the secret redactor, so secret-looking values are masked.
+own leases. A board user of another company gets `403`.
 
 ## Company Fields
 
