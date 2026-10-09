@@ -12,9 +12,11 @@ const PAGE_SEARCH_SHORTCUT_SELECTOR = "[data-page-search-target='true']";
 
 // Open dialog content. Radix (shadcn `dialog`, `sheet`, `alert-dialog`, and raw
 // `DialogPrimitive.Content` such as the image gallery) marks it with
-// `data-state` but not `aria-modal`.
+// `data-state` but not `aria-modal`. A closing dialog keeps
+// `data-state="closed"` until its exit animation ends, so it no longer counts.
 const OPEN_DIALOG_SELECTOR = [
-  "[role='dialog'][aria-modal='true']",
+  "[role='dialog'][aria-modal='true']:not([data-state='closed'])",
+  "[role='alertdialog'][aria-modal='true']:not([data-state='closed'])",
   "[role='dialog'][data-state='open']",
   "[role='alertdialog'][data-state='open']",
 ].join(", ");
