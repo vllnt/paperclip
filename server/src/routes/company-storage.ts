@@ -23,7 +23,7 @@ function parse<T>(schema: z.ZodType<T>, input: unknown): T {
  * Choosing where company keys are sent (create, key rotation) and retiring
  * need a company owner or admin, like secret definitions.
  */
-function authorize(req: Request, options: { admin?: boolean } = {}): { companyId: string; actor: StorageDestinationActor } {
+function requireStorageAccess(req: Request, options: { admin?: boolean } = {}): { companyId: string; actor: StorageDestinationActor } {
   assertBoard(req);
   const companyId = req.params.companyId as string;
   assertCompanyAccess(req, companyId);
@@ -47,30 +47,30 @@ export function companyStorageRoutes(db: Db) {
   const destinations = storageDestinationService(db);
 
   router.get("/companies/:companyId/storage/destinations", async (req, res) => {
-    const { companyId } = authorize(req);
+    const { companyId } = requireStorageAccess(req);
     res.json(await destinations.list(companyId));
   });
 
   router.post("/companies/:companyId/storage/destinations", async (req, res) => {
-    const { companyId, actor } = authorize(req, { admin: true });
+    const { companyId, actor } = requireStorageAccess(req, { admin: true });
     const input = parse(createStorageDestinationSchema, req.body);
     const { destination, created } = await destinations.create(companyId, input, actor);
     res.status(created ? 201 : 200).json(destination);
   });
 
   router.post("/companies/:companyId/storage/destinations/:destinationId/probe", async (req, res) => {
-    const { companyId, actor } = authorize(req);
+    const { companyId, actor } = requireStorageAccess(req);
     res.json(await destinations.probe(companyId, destinationId(req), actor));
   });
 
   router.patch("/companies/:companyId/storage/destinations/:destinationId/credentials", async (req, res) => {
-    const { companyId, actor } = authorize(req, { admin: true });
+    const { companyId, actor } = requireStorageAccess(req, { admin: true });
     const input = parse(rotateStorageCredentialsSchema, req.body);
     res.json(await destinations.rotateCredentials(companyId, destinationId(req), input, actor));
   });
 
   router.post("/companies/:companyId/storage/destinations/:destinationId/retire", async (req, res) => {
-    const { companyId, actor } = authorize(req, { admin: true });
+    const { companyId, actor } = requireStorageAccess(req, { admin: true });
     const input = parse(retireStorageDestinationSchema, req.body);
     res.json(await destinations.retire(companyId, destinationId(req), input, actor));
   });
