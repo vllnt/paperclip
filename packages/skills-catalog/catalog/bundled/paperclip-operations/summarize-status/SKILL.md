@@ -1,6 +1,6 @@
 ---
 name: summarize-status
-description: Write a short, colloquial summary for a Paperclip summary slot: open with the 1–3 specific, concrete actions the reader needs to take right now to unblock the work, then a brief plain-language status, streaming progress as it works.
+description: Writes a short, colloquial summary for a Paperclip summary slot, opening with the 1–3 concrete actions the reader must take to unblock the work, followed by a plain-language status. Use when a summary-generation issue names a scope and slot, or a board user refreshes a summary card.
 key: paperclipai/bundled/paperclip-operations/summarize-status
 recommendedForRoles:
   - general

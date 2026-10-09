@@ -1,6 +1,6 @@
 ---
 name: agentmail
-description: Use your assigned AgentMail inbox to read email tasks, explicitly send or reply, and check delivery. Provided automatically by your inbox assignment.
+description: Reads email tasks, sends or replies, and checks delivery through the agent's assigned AgentMail inbox. Use when a task has email context or asks to send or reply to email. Provided automatically by the inbox assignment.
 ---
 
 # AgentMail
