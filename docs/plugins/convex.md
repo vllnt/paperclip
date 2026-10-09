@@ -250,7 +250,7 @@ Hourly job `convex-reaper` (also `reaper.run` and the `convex_reap_previews` too
 1. keeps anything classified staging or production, anything with an open PR or a recently active branch, and anything it cannot check;
 2. deletes previews whose PR is closed or merged, or whose branch is gone and whose last deploy is older than `guards.activityHours`;
 3. sets `expiresAt = lastDeployTime + ttlHours` on kept previews. It shortens an expiry, and it moves an expiry later after a redeploy only when that expiry is one the reaper set
-   itself (it remembers them); an expiry a person chose is never extended. When the new moment is less than an hour away (a guarded preview idle for almost `ttlHours`), the reaper does
+   itself (it remembers them); an expiry a person chose is never extended. When the new moment is less than two hours away (a guarded preview idle for almost `ttlHours`), the reaper does
    not schedule it (two hours leaves one hourly pass to see a redeploy); it only gives a preview without any expiry `now + ttlHours`. Convex measures its own default expiry from creation and its docs do not say that a redeploy resets it, so the
    reaper does not rely on that. **Policy note:** as specified, a preview with an open pull request that is not redeployed for `ttlHours` expires and the next push recreates it;
    `guards.activityHours` keeps branches with recent commits from being deleted by the reaper, not from expiring;
