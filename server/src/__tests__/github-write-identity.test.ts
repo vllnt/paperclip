@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { withProtectedBranchFacts } from "../services/github-protected-branches.js";
 import {
   classifyGitHubOperation,
   parseGitHubOperation,
@@ -380,17 +381,31 @@ describe("security review round 5 (attack regressions)", () => {
     });
     const expected = { branch: "feature/x", tip: sha, files: workflowFiles, commits: workflowCommits, entries: workflowEntries };
 
-    it("keeps editWorkflows on the push and hands the plugin its one branch, the commits and the files", () => {
-      for (const args of [["push", "origin", "feature/x"], ["push"], ["push", "origin", "HEAD"], ["push", "-u", "origin", "HEAD:refs/heads/feature/x"], ["push", "origin", "refs/heads/feature/x"],
-        ["push", "--force-with-lease", "origin", "+feature/x"], ["push", "origin", "heads/feature/x"]]) {
-        const classified = push(args);
-        expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: expected });
-        expect(classified.denied, args.join(" ")).toBeUndefined();
-      }
+    const githubSaysFeatureXIsNeitherDefaultNorProtected = { repository: "acme/site", defaultBranch: "main", protection: new Map([["feature/x", false]]) };
+
+    it("keeps editWorkflows on the push and hands the plugin its one branch, the commits and the files", async () => {
+      await withProtectedBranchFacts(githubSaysFeatureXIsNeitherDefaultNorProtected, async () => {
+        for (const args of [["push", "origin", "feature/x"], ["push"], ["push", "origin", "HEAD"], ["push", "-u", "origin", "HEAD:refs/heads/feature/x"], ["push", "origin", "refs/heads/feature/x"],
+          ["push", "--force-with-lease", "origin", "+feature/x"], ["push", "origin", "heads/feature/x"]]) {
+          const classified = push(args);
+          expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: expected });
+          expect(classified.denied, args.join(" ")).toBeUndefined();
+        }
+      });
       // A push to another branch name is that branch.
       expect(push(["push", "origin", "HEAD:refs/heads/release/1.2"])).toMatchObject({ workflowPush: { ...expected, branch: "release/1.2" } });
       // A push that only moves the branch to an existing commit has no new commit to list.
       expect(push(["push", "--force", "origin", "feature/x"], { workflowCommits: [], workflowEntries: [sha] })).toMatchObject({ workflowPush: { ...expected, commits: [], entries: [sha] } });
+    });
+
+    it("keeps the workflow branch of a forced push, which is refused until GitHub's answer on that branch is read", async () => {
+      const args = ["push", "--force-with-lease", "origin", "+feature/x"];
+      const unread = push(args);
+      expect(unread).toMatchObject({ privileged: ["editWorkflows"], workflowPush: expected, branchRewrites: ["feature/x"] });
+      expect(unread.denied).toMatch(/could not read from GitHub whether feature\/x is the default or a protected branch of acme\/site/);
+      const protectedOne = { ...githubSaysFeatureXIsNeitherDefaultNorProtected, protection: new Map([["feature/x", true]]) };
+      const protectedPush = await withProtectedBranchFacts(protectedOne, async () => push(args));
+      expect(protectedPush.denied).toMatch(/feature\/x is a protected branch of acme\/site/);
     });
 
     it("offers nothing the plugin could check when the push is not exactly one commit to one named branch, or the report is partial", () => {
