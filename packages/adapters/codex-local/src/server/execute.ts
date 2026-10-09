@@ -31,6 +31,7 @@ import {
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
+import { resolveCodexHomeSeedSelection } from "@paperclipai/adapter-utils/codex-home-seed";
 import {
   asString,
   asNumber,
@@ -699,6 +700,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (configuredCodexHome == null || (connectorSkillDigest && connectorSourceHome == null)) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
+      codexHomeSeed: config.codexHomeSeed,
     });
   }
   if (configuredHomeIsManaged && configuredCodexHome) {
@@ -707,6 +709,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } : process.env;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
+      codexHomeSeed: config.codexHomeSeed,
     });
   }
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
@@ -814,7 +817,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // the single-use `auth.json`) are dereferenced to bytes. This drops the
           // large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
-          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
+            runId,
+            extraEntries: resolveCodexHomeSeedSelection(config.codexHomeSeed, process.env).names,
+          });
           return await prepareAdapterExecutionTargetRuntime({
             runId,
             target: executionTarget,
