@@ -32,6 +32,9 @@ export const instanceGeneralSettingsSchema = z.object({
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
   companyEnvironmentDefaults: z.record(z.string().guid(), z.string().guid()).optional(),
+  // Pull requests always link to tasks. This switch lets that link also move a task's
+  // status (open → in_review, merged → done). Absent = off.
+  gitStatusAutomation: z.boolean().optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z
