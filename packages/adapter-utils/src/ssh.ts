@@ -8,7 +8,7 @@ import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
-  GIT_SYNC_COMMIT_IDENTITY_ARGS,
+  commitTreeWithSyncIdentity,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -1066,11 +1066,9 @@ async function integrateImportedGitHead(input: {
       throw new Error("Failed to compute a merged git tree for SSH workspace restore.");
     }
 
-    const mergeCommit = await runLocalGit(
+    const mergeCommit = await commitTreeWithSyncIdentity(
       input.localDir,
       [
-        ...GIT_SYNC_COMMIT_IDENTITY_ARGS,
-        "commit-tree",
         mergedTreeId,
         "-p",
         currentHead,
