@@ -1,7 +1,7 @@
 # Full observability: usage, cost, waste, bottlenecks and closed feedback loops
 
 Date: 2026-10-09
-Status: Phase 1 (data inventory and slice plan) plus Track C (context visibility, section 7.9, slices C1-C5). No code written yet.
+Status: Phase 1 (data inventory and slice plan) plus Track C (context visibility, section 7.9, slices C1-C5). This pull request is the plan only; the code ships in the slices below.
 Branch: `feat/full-observability`
 
 ## 1. Goal and constraints
@@ -527,7 +527,7 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 | **Decisions-engine track** | judgement on top of this data | Export contract in 7.6; ids, numbers and enums only. |
 | **Migrations** | `0296` is claimed twice (#40 `0296_clear_lord_tyger`, #31 `0296_tricky_unicorn`) | Mine take the next free number at rebase and are regenerated then; the SQL is additive and uses `IF NOT EXISTS`, so reordering is safe. |
 | **Adding MCP tools** | fails the production image check (capability contract needs the external corpus) | No MCP tools; agents use the REST API and CLI. |
-| **Lean-default-skills, PR #51 (Track C)** | the token counter: `estimateTokens` (UTF-8 bytes / 4, rounded) lives in `packages/skills-catalog/src/skill-quality-text.ts` and is now exported from that package's index on #51 (head `ea7067aed`, **draft**, held behind #27, #29 and #58 and an eval-credit block, so no merge date) | One counter, one owner, available on `main` now: see decision D12. They confirmed the semantics will not change silently; a real tokenizer would be a new function or the `countTokens` option. I edit none of their files. |
+| **Lean-default-skills, PR #51 (Track C)** | the token counter: `estimateTokens` (UTF-8 bytes / 4, rounded) is defined once in `packages/shared` (PR #62). Their draft #51 (head `ea7067aed`, **draft**, held behind #27, #29 and #58 and an eval-credit block, so no merge date) holds a copy in `packages/skills-catalog/src/skill-quality-text.ts` | One counter, one owner, available on `main` as soon as #62 merges: see decision D12. They agreed to delete their copy and import the shared function before #51 merges, and to keep the semantics from changing silently; a real tokenizer would be a new function or the `countTokens` option. I edit none of their files. |
 | **Session-warehouse track (Track C)** | the prune guard in the row above | Track C also consumes run events and NDJSON (the `adapter.invoke` composition key, per-turn usage, `context.compacted`). Add a second constant `RUN_CONTEXT_RECORD_EVENTS_CONSUMED_VERSION` (exported with the first). A run finished after C1 ships may be pruned only when its `run_context_records` row exists at that version; **there is no exception for runs without a composition event**, because those can still hold per-turn usage. The worker writes a record for every terminal run (availability `none` when nothing is derivable), and `--backfill` creates records for older runs from their logs, so an operator runs it before enabling pruning. After pruning, the per-turn **timeline** answers `log_pruned` by design while the per-run summary (peak, compactions, composition) survives; the timeline can be rebuilt from the archived NDJSON in the company's own bucket. `run_context_records` can join the archive as a second entity file (`kind: "observability.context_record"`) through `listContextRecordsAfter`, shipped in C1; their choice. |
 | **Runner protocol (`packages/paperclip-runner`)** | the normalized usage event lacks last-turn usage and window | Only C5 touches it, with the schema, validators and Rust side together. Not in C1-C4. |
 
@@ -544,7 +544,7 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
   - Per-adapter `parseContextSamples` from captured real fixtures: dedupe by `message.id`, compaction rows, window, and the `availability` degrade path when per-message usage is absent.
   - `contextComposition` is bounded, numeric, fail-open and passes the canary (a prompt-only string never reaches the payload key or either table). With `buildContextComposition` forced to throw, the `adapter.invoke` payload equals today's byte for byte, and the number of appends per run is unchanged (asserted).
   - The worker pass writes `run_context_records` idempotently; version replace and `--rederive` behave as for the usage record.
-  - Estimator identity: the server imports the skills-catalog function and a test asserts one implementation (no `/ 4` byte counter elsewhere).
+  - Estimator identity: the server imports `estimateTokens` from `@paperclipai/shared` and a test asserts one implementation (no `/ 4` byte counter elsewhere).
   - Each of the four Track C routes: two-company isolation, agent-within-permission read, and CLI mocked-fetch tests for URL and flags.
   - Audit deltas: for each listed action, before and after tokens match a hand-computed fixture, including a delete and a model change.
   - UI: desktop and mobile, zero console errors, `pnpm check:token-gates`, empty, unavailable (`none`, `log_pruned`) and loading states each have a visible message.
