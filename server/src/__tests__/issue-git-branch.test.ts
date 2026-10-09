@@ -1,5 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { buildIssueBranchName } from "../services/issue-git-branch.js";
+import { sanitizeBranchName } from "../services/workspace-runtime.js";
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", identifier: "PAP-123", title: "Fix login redirect" };
 
@@ -75,4 +77,73 @@ describe("buildIssueBranchName", () => {
     });
     expect(result.name).toBe("PAP-123");
   });
+
+  describe("git ref safety", () => {
+    function gitAccepts(name: string): boolean {
+      try {
+        execFileSync("git", ["check-ref-format", "--branch", name], { stdio: "pipe" });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    const hostileTitles = [
+      "release.lock",
+      "a..b..c",
+      "fix ../../etc/passwd",
+      "@{upstream}",
+      "-leading dash",
+      ".hidden",
+      "trailing dot.",
+      "control\u0001chars\u007f",
+      "tilde~caret^colon:question?star*bracket[backslash\\",
+      "emoji 🚀 title",
+      "x".repeat(400),
+      "...",
+      "",
+    ];
+
+    it.each(hostileTitles)("makes a valid branch from the title %j", (title) => {
+      const name = buildIssueBranchName({ issue: { ...issue, title } }).name;
+      expect(gitAccepts(name)).toBe(true);
+      expect(name.length).toBeLessThanOrEqual(120);
+    });
+
+    const hostileTemplates = [
+      "{{issue.identifier}}.lock",
+      "a//b/{{slug}}",
+      "feat/.{{slug}}",
+      "{{slug}}.lock/x",
+      "x..{{slug}}",
+      "{{slug}}/",
+      "./{{slug}}",
+      `${"a/".repeat(80)}{{slug}}.lock`,
+    ];
+
+    it.each(hostileTemplates)("makes a valid branch from the template %j", (branchTemplate) => {
+      const name = buildIssueBranchName({
+        issue,
+        projectPolicy: { workspaceStrategy: { type: "git_worktree", branchTemplate } },
+      }).name;
+      expect(gitAccepts(name)).toBe(true);
+      expect(name.length).toBeLessThanOrEqual(120);
+    });
+
+    it("keeps names that are already valid exactly as they were", () => {
+      for (const name of ["PAP-123-fix-login-redirect", "paperclip/PAP-1-x", "release/2026.10", "a.b/c_d-e"]) {
+        expect(sanitizeBranchName(name)).toBe(name);
+      }
+    });
+
+    const invalidPins = ["a..b", "release.lock", "-x", "a//b", "a b", "x@{1}", "a/.b", "a.lock/b", "a/", "y".repeat(300)];
+
+    it.each(invalidPins)("falls back to the template when the pinned branch %j is not a valid branch", (existingBranch) => {
+      const result = buildIssueBranchName({
+        issue: { ...issue, executionWorkspaceSettings: { workspaceStrategy: { type: "git_worktree", existingBranch } } },
+      });
+      expect(result).toEqual({ name: "PAP-123-fix-login-redirect", template: "{{issue.identifier}}-{{slug}}", source: "default" });
+    });
+  });
 });
+
