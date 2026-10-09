@@ -986,6 +986,45 @@ describe("parallel restores into one shared project workspace", () => {
     expect(await readFile(path.join(target, "src", "b.ts"), "utf8")).toBe("b1\n");
   }, 15_000);
 
+  it("does not let a run log sink that never answers stall the contender that reports to it", async () => {
+    const { root, target } = await sharedWorkspace();
+    const baselineA = await captureDirectorySnapshot(target);
+    const baselineB = await captureDirectorySnapshot(target);
+    const sourceA = await runWorkspace(root, target, "run-a", { file: "src/a.ts", text: "a1\n" });
+    const sourceB = await runWorkspace(root, target, "run-b", { file: "src/b.ts", text: "b1\n" });
+    const realNow = Date.now.bind(Date);
+    let skewMs = 0;
+    let lockPolls = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      if (new Error().stack?.includes("waitForLock")) lockPolls += 1;
+      return realNow() + skewMs;
+    });
+    let reported = 0;
+    let markHolding!: () => void;
+    const holding = new Promise<void>((resolve) => { markHolding = resolve; });
+    const mergeA = mergeDirectoryWithBaseline({
+      baseline: baselineA, sourceDir: sourceA, targetDir: target,
+      beforeApply: async () => {
+        markHolding();
+        await until(() => lockPolls >= 1);
+        skewMs = 31_000;
+        await until(() => reported >= 1);
+      },
+    });
+    await holding;
+    // Contender B is the head of the queue. Its sink never settles.
+    const mergeB = mergeDirectoryWithBaseline({
+      baseline: baselineB, sourceDir: sourceB, targetDir: target,
+      onLockWaitProgress: () => { reported += 1; return new Promise<void>(() => undefined); },
+    });
+
+    const results = await Promise.allSettled([mergeA, mergeB]);
+
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(reported).toBe(1);
+    expect(await readFile(path.join(target, "src", "b.ts"), "utf8")).toBe("b1\n");
+  }, 15_000);
+
   it("bounds the wait by PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS and keeps the timeout diagnostics", async () => {
     const { root, target } = await sharedWorkspace();
     // Time scaled down 30x: the old 30 s budget becomes 1 s, and run A's merge

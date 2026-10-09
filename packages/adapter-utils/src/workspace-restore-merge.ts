@@ -561,14 +561,15 @@ async function acquireDirectoryMergeLock(
     if (onWait && now >= nextProgressAt) {
       nextProgressAt = now + LOCK_WAIT_PROGRESS_INTERVAL_MS;
       const holderAgeMs = (await directoryMergeLockDiagnostics(lockDir, 0, diagnosticOwnerPath).catch(() => undefined))?.ownerAgeMs;
-      // Progress is advisory: a failing sink, sync or async, must not end the wait.
-      try {
-        await onWait({
-          waitedMs: now - waitStartedAt,
-          ...(ahead !== undefined && Number.isFinite(ahead) ? { ahead } : {}),
-          ...(typeof holderAgeMs === "number" ? { holderAgeMs } : {}),
-        });
-      } catch { /* the wait continues */ }
+      // Progress is advisory. A sink that throws, sync or async, must not end
+      // the wait, and one that is slow or never answers must not stall it: this
+      // contender may be the head of the queue, and only the head tries the lock.
+      const wait: DirectoryMergeLockWait = {
+        waitedMs: now - waitStartedAt,
+        ...(ahead !== undefined && Number.isFinite(ahead) ? { ahead } : {}),
+        ...(typeof holderAgeMs === "number" ? { holderAgeMs } : {}),
+      };
+      void Promise.resolve().then(() => onWait(wait)).catch(() => undefined);
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
