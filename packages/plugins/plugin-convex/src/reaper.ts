@@ -57,6 +57,7 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
       const previews = await service.d.convex.listProjectDeployments(token, project.convexProjectId, "preview");
       listed = true;
       entry.previews = previews.length;
+      if (config.reaper.ciPreviewTemplate) entry.ciMatched = previews.filter(deployment => parseCiPreview(config.reaper.ciPreviewTemplate, deployment.previewIdentifier)).length;
       for (const preview of previews) seen.add(preview.name);
       let githubProblem: string | null = null;
       const superseded = planSuperseded(previews, project, config, now);
@@ -178,19 +179,19 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
  */
 function planSuperseded(previews: ConvexDeployment[], project: ProjectMapping, config: ConnectionConfig, now: number): Map<string, { name: string; pr: number }> {
   const out = new Map<string, { name: string; pr: number }>();
-  const pattern = config.reaper.pullRequestPattern;
-  if (!pattern) return out;
+  const template = config.reaper.ciPreviewTemplate;
+  if (!template) return out;
   const minAge = config.reaper.supersededMinAgeMinutes * 60_000;
   const entries: Array<CiEntry & { name: string }> = [];
   for (const deployment of previews) {
     if (deployment.projectId !== project.convexProjectId || classifyDeployment(deployment, project).environment !== "preview" || hardDeleteBlock(deployment)) continue;
-    const parsed = parseCiPreview(pattern, deployment.previewIdentifier);
+    const parsed = parseCiPreview(template, deployment.previewIdentifier);
     if (parsed) entries.push({ name: deployment.name, ...parsed, at: deployment.lastDeployTime ?? deployment.createTime ?? now });
   }
-  const latest = (a: CiEntry & { name: string }, b: CiEntry & { name: string }) => ((a.run !== null && b.run !== null ? a.run - b.run || a.attempt - b.attempt : 0) || a.at - b.at || a.name.localeCompare(b.name)) > 0 ? a : b;
+  const latest = (a: CiEntry & { name: string }, b: CiEntry & { name: string }) => ((a.run ?? -1) - (b.run ?? -1) || (a.attempt ?? -1) - (b.attempt ?? -1) || a.name.localeCompare(b.name)) > 0 ? a : b;
   for (const mine of entries) {
     if (now - mine.at < minAge) continue;
-    const replacements = entries.filter(other => other.name !== mine.name && supersedes(other, mine, minAge));
+    const replacements = entries.filter(other => other.name !== mine.name && supersedes(other, mine));
     if (replacements.length) out.set(mine.name, { name: replacements.reduce(latest).name, pr: mine.pr });
   }
   return out;

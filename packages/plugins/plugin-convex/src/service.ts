@@ -353,7 +353,7 @@ export class ConvexService {
     return assessPreview({
       github: this.d.github, token: await this.githubToken(target.config, companyId), project: target.project,
       deployment: target.deployment, activityHours: target.config.guards.activityHours, now: this.d.now(), cache,
-      prNumber: parseCiPreview(target.config.reaper.pullRequestPattern, target.deployment.previewIdentifier)?.pr ?? null,
+      prNumber: parseCiPreview(target.config.reaper.ciPreviewTemplate, target.deployment.previewIdentifier)?.pr ?? null,
     });
   }
 
@@ -416,12 +416,12 @@ export class ConvexService {
     const now = this.d.now();
     const minAge = config.reaper.supersededMinAgeMinutes * 60_000;
     const entry = (deployment: ConvexDeployment): CiEntry | null => {
-      const parsed = parseCiPreview(config.reaper.pullRequestPattern, deployment.previewIdentifier);
+      const parsed = parseCiPreview(config.reaper.ciPreviewTemplate, deployment.previewIdentifier);
       return parsed ? { ...parsed, at: deployment.lastDeployTime ?? deployment.createTime ?? now } : null;
     };
     const mine = entry(target.deployment);
     const theirs = entry(sibling.deployment);
-    if (!mine || !theirs || mine.pr !== newer.pr || !supersedes(theirs, mine, minAge)) throw gone();
+    if (!mine || !theirs || mine.pr !== newer.pr || !supersedes(theirs, mine)) throw gone();
     if (now - mine.at < minAge) throw new Refusal("This preview was deployed recently and may be in use, so it was kept.");
   }
 

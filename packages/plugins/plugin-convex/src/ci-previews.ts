@@ -1,34 +1,79 @@
 /**
- * Preview identifiers made by CI carry the pull request and often the run, shard and attempt (for example `pr4320-run101-s2-a1`).
- * The company supplies a regular expression with a named group `pr` and optional `run`, `shard` and `attempt` groups.
+ * Preview names made by CI carry the pull request and often the run, shard and attempt (for example `pr4320-run101-s2-a1`). A company describes that
+ * naming with a template, not a regular expression: literal text, `{pr}` (required, once), `{run}`, `{shard}`, `{attempt}` (each at most once), and at most
+ * one flat optional part in square brackets, for example `pr{pr}[-run{run}]-s{shard}-a{attempt}`. A template compiles to literals and bounded digit groups
+ * only, anchored to the whole name, so matching a long hostile branch name cannot take more than a few steps.
  */
-export interface CiPreview { pr: number; run: number | null; attempt: number }
+export interface CiPreview { pr: number; run: number | null; shard: number | null; attempt: number | null }
 
+const PLACEHOLDERS = new Set(["pr", "run", "shard", "attempt"]);
 const compiled = new Map<string, RegExp>();
-export function compilePattern(source: string): RegExp {
-  let pattern = compiled.get(source);
-  if (!pattern) { pattern = new RegExp(source); compiled.set(source, pattern); }
+const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Throws an Error whose message names the problem; the config parser shows it to the operator. */
+export function compileTemplate(template: string): RegExp {
+  const known = compiled.get(template);
+  if (known) return known;
+  if (!template || template.length > 200) throw new Error("must be 1 to 200 characters");
+  let source = "";
+  let optional = false;
+  let optionalLength = 0;
+  const seen = new Set<string>();
+  for (let i = 0; i < template.length; i++) {
+    const char = template[i];
+    if (char === "{") {
+      const end = template.indexOf("}", i);
+      const name = end < 0 ? "" : template.slice(i + 1, end);
+      if (!PLACEHOLDERS.has(name)) throw new Error("may only use {pr}, {run}, {shard} and {attempt}");
+      if (seen.has(name)) throw new Error(`uses {${name}} more than once`);
+      if (optional && name === "pr") throw new Error("{pr} cannot be in an optional [ ] part");
+      seen.add(name);
+      source += `(?<${name}>\\d{1,15})`;
+      if (optional) optionalLength += 1;
+      i = end;
+    } else if (char === "[") {
+      if (optional) throw new Error("allows only one flat optional [ ] part");
+      optional = true;
+      optionalLength = 0;
+      source += "(?:";
+    } else if (char === "]") {
+      if (!optional || optionalLength === 0) throw new Error("has a ] without a matching [ or an empty optional part");
+      optional = false;
+      source += ")?";
+    } else if (char === "}") {
+      throw new Error("has a } without a matching {");
+    } else {
+      source += escape(char);
+      if (optional) optionalLength += 1;
+    }
+  }
+  if (optional) throw new Error("has a [ without a matching ]");
+  if (!seen.has("pr")) throw new Error("must contain {pr}");
+  const pattern = new RegExp(`^${source}$`);
+  compiled.set(template, pattern);
   return pattern;
 }
 
-/** The pull request (and run) a preview identifier belongs to, or null when no pattern is set or the identifier does not match. */
-export function parseCiPreview(source: string | null, identifier: string | null): CiPreview | null {
-  if (!source || !identifier || identifier.length > 200) return null;
-  const groups = compilePattern(source).exec(identifier)?.groups;
-  const number = (value: string | undefined) => (value !== undefined && /^[0-9]{1,15}$/.test(value) ? Number(value) : null);
+/** The pull request (and run, shard, attempt) a preview name belongs to, or null when no template is set or the name does not match it. */
+export function parseCiPreview(template: string | null, identifier: string | null): CiPreview | null {
+  if (!template || !identifier || identifier.length > 200) return null;
+  let groups: Record<string, string | undefined> | undefined;
+  try { groups = compileTemplate(template).exec(identifier)?.groups; } catch { return null; }
+  const number = (value: string | undefined) => (value !== undefined ? Number(value) : null);
   const pr = number(groups?.pr);
-  return pr === null ? null : { pr, run: number(groups?.run), attempt: number(groups?.attempt) ?? 0 };
+  return pr === null ? null : { pr, run: number(groups?.run), shard: number(groups?.shard), attempt: number(groups?.attempt) };
 }
 
 export interface CiEntry extends CiPreview { /** Last deploy (or creation) time in ms. */ at: number }
 
 /**
- * Whether `newer` replaces `older` for the same pull request. With run numbers on both, the later run (or the later attempt of the same run)
- * replaces; with none on either, a preview made at least `minAgeMs` later replaces. Mixed numbered and unnumbered previews are never compared.
+ * Whether `newer` replaces `older`: same pull request and same shard, and a later run (or a later attempt of the same run). Without run numbers, a later
+ * attempt replaces. Previews that cannot be ordered this way (numbered next to unnumbered, no attempt numbers) are never compared, and a shard that was
+ * not re-run is never replaced by another shard.
  */
-export function supersedes(newer: CiEntry, older: CiEntry, minAgeMs: number): boolean {
-  if (newer.pr !== older.pr) return false;
-  if (newer.run !== null && older.run !== null) return newer.run > older.run || (newer.run === older.run && newer.attempt > older.attempt);
-  if (newer.run === null && older.run === null) return newer.at - older.at >= minAgeMs;
+export function supersedes(newer: CiEntry, older: CiEntry): boolean {
+  if (newer.pr !== older.pr || newer.shard !== older.shard) return false;
+  if (newer.run !== null && older.run !== null) return newer.run > older.run || (newer.run === older.run && (newer.attempt ?? 0) > (older.attempt ?? 0));
+  if (newer.run === null && older.run === null && newer.attempt !== null && older.attempt !== null) return newer.attempt > older.attempt;
   return false;
 }

@@ -65,7 +65,7 @@ const manifest: PaperclipPluginManifestV1 = {
               protect: { type: "array", items: { type: "string", maxLength: 200 }, maxItems: 100 }, onlyPatterns: { type: "array", items: { type: "string", maxLength: 200 }, maxItems: 100 },
             },
           },
-          pullRequestPattern: { type: "string", maxLength: 200 },
+          ciPreviewTemplate: { type: "string", maxLength: 200 },
           supersededMinAgeMinutes: { type: "integer", minimum: 15, maximum: 1440 },
         },
       },

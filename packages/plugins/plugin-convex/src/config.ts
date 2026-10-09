@@ -1,4 +1,4 @@
-import { compilePattern } from "./ci-previews.js";
+import { compileTemplate } from "./ci-previews.js";
 import {
   CAPABILITIES, ENVIRONMENT_CLASSES, PRESETS, PRODUCTION_WRITE_CAPABILITIES,
   type Capability, type ConnectionConfig, type EnvironmentClass, type Grant, type ProjectMapping, type SecretRef,
@@ -92,21 +92,28 @@ function grant(raw: unknown, index: number): Grant {
   return { agentId, role, environments, capabilities: [...capabilities], approval };
 }
 
-function patterns(value: unknown, path: string): string[] {
+/**
+ * Name patterns: exact names, or a prefix ending in one `*`. An allow list (`wide: false`) must also be narrow: at least three characters between the last
+ * `/` and the `*`, so `*` and `dev/*` cannot name everyone's deployments. A protect list may be as wide as it likes; that only keeps more.
+ */
+function patterns(value: unknown, path: string, narrow = false): string[] {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 100 || value.some(item => typeof item !== "string" || !item.trim() || item.length > 200 || /\*(?!$)/.test(item.trim()))) {
+  const bad = (item: unknown) => typeof item !== "string" || !item.trim() || item.length > 200 || /\*(?!$)/.test(item.trim());
+  if (!Array.isArray(value) || value.length > 100 || value.some(bad)) {
     throw new ConfigError(`${path} must be a list of at most 100 reference patterns: exact names, or a prefix ending in * (a * anywhere else is not allowed).`);
   }
-  return [...new Set((value as string[]).map(item => item.trim()))];
+  const list = [...new Set((value as string[]).map(item => item.trim()))];
+  if (narrow) {
+    for (const item of list) {
+      if (item.endsWith("*") && item.slice(item.lastIndexOf("/") + 1, -1).length < 3) throw new ConfigError(`${path}: "${item}" is too wide. Put at least three characters before the * (for example dev/ship-*).`);
+    }
+  }
+  return list;
 }
-function prPattern(value: unknown): string | null {
+function template(value: unknown): string | null {
   if (value === undefined || value === null) return null;
-  if (typeof value !== "string" || value.length > 200 || !value.includes("(?<pr>")) throw new ConfigError('reaper.pullRequestPattern must be a regular expression of at most 200 characters with a named group (?<pr>...).');
-  // It must describe the whole identifier, so a number inside an unrelated branch name is never read as a pull request.
-  if (!value.startsWith("^") || !value.endsWith("$") || value.endsWith("\\$")) throw new ConfigError("reaper.pullRequestPattern must start with ^ and end with $.");
-  // A repeated group can make a regular expression take exponential time on a long name. Use simple classes such as \\d+ instead.
-  if (/\)[*+]|\)\{/.test(value)) throw new ConfigError("reaper.pullRequestPattern must not repeat a group; use simple classes such as \\d+.");
-  try { compilePattern(value); } catch { throw new ConfigError("reaper.pullRequestPattern is not a valid regular expression."); }
+  if (typeof value !== "string") throw new ConfigError("reaper.ciPreviewTemplate must be text such as pr{pr}-run{run}-s{shard}-a{attempt}.");
+  try { compileTemplate(value); } catch (error) { throw new ConfigError(`reaper.ciPreviewTemplate ${error instanceof Error ? error.message : "is not valid"}.`); }
   return value;
 }
 
@@ -145,10 +152,10 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Co
         enabled: flag(dev.enabled, "reaper.dev.enabled", false),
         maxAgeDays: bounded(dev.maxAgeDays, "reaper.dev.maxAgeDays", 7, 1, 90),
         protect: patterns(dev.protect, "reaper.dev.protect"),
-        onlyPatterns: patterns(dev.onlyPatterns, "reaper.dev.onlyPatterns"),
+        onlyPatterns: patterns(dev.onlyPatterns, "reaper.dev.onlyPatterns", true),
         maxDeletes: bounded(dev.maxDeletes, "reaper.dev.maxDeletes", 20, 1, 100),
       },
-      pullRequestPattern: prPattern(reaper.pullRequestPattern),
+      ciPreviewTemplate: template(reaper.ciPreviewTemplate),
       supersededMinAgeMinutes: bounded(reaper.supersededMinAgeMinutes, "reaper.supersededMinAgeMinutes", 60, 15, 1440),
     },
   };

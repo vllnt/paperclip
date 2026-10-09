@@ -40,7 +40,7 @@ describe("config", () => {
     expect(config.projects).toEqual([]);
     expect(config.guards).toEqual({ activityHours: 24, maxDeletesPerRun: 20, callsPerMinute: 60, dryRunOnly: false });
     expect(config.reaper).toEqual({
-      enabled: false, ttlHours: 36, quota: 300, alertPercent: 80, pullRequestPattern: null, supersededMinAgeMinutes: 60,
+      enabled: false, ttlHours: 36, quota: 300, alertPercent: 80, ciPreviewTemplate: null, supersededMinAgeMinutes: 60,
       dev: { enabled: false, maxAgeDays: 7, protect: [], onlyPatterns: [], maxDeletes: 20 },
     });
     expect(config.grants).toEqual([]);

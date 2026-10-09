@@ -57,8 +57,8 @@ export interface ConnectionConfig {
     enabled: boolean; ttlHours: number; quota: number; alertPercent: number;
     /** Dev deployments older than `maxAgeDays` are deleted by the reaper once `enabled`; until then they are only planned. */
     dev: { enabled: boolean; maxAgeDays: number; protect: string[]; onlyPatterns: string[]; maxDeletes: number };
-    /** Regular expression with a named group `pr` (and optionally `run`, `shard`, `attempt`) that reads the pull request from a CI preview identifier. */
-    pullRequestPattern: string | null;
+    /** Template such as `pr{pr}-run{run}-s{shard}-a{attempt}` that reads the pull request from a CI preview name. */
+    ciPreviewTemplate: string | null;
     supersededMinAgeMinutes: number;
   };
 }
@@ -106,6 +106,8 @@ export interface ReaperProjectReport {
   expirySet: string[];
   failed: Array<{ name: string; error: string }>;
   skipped: ReaperItem[];
+  /** How many previews the CI template matched; shown so a template that never matches is visible. Absent without a template. */
+  ciMatched?: number;
   dev?: ReaperDevReport;
   error?: string;
 }
