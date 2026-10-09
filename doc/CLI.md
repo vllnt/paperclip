@@ -618,6 +618,26 @@ npx paperclipai run workspace-log <operation-id> [--offset 0] [--limit-bytes 163
 npx paperclipai run watchdog-decision <run-id> --decision continue [--reason "..."]
 ```
 
+## Storage Commands
+
+Company storage destinations: the organization's own S3-compatible buckets,
+with keys stored as company secrets. Board credentials only. See
+[company-storage.md](company-storage.md).
+
+```sh
+npx paperclipai storage destinations list --company-id <company-id>
+npx paperclipai storage destinations create --company-id <company-id> --label "Archive" \
+  --endpoint https://s3.eu-west-1.amazonaws.com --region eu-west-1 --bucket <bucket> [--prefix paperclip] \
+  [--path-style] [--encryption s3_managed|kms|bucket_default] [--kms-key-id <id>] \
+  --access-key-secret <secret-id> --secret-key-secret <secret-id> [--id <uuid>]
+npx paperclipai storage destinations probe <destination-id> --company-id <company-id>
+npx paperclipai storage destinations rotate-credentials <destination-id> --company-id <company-id> \
+  --access-key-secret <secret-id> --secret-key-secret <secret-id> --expected-credential-revision <n>
+npx paperclipai storage destinations retire <destination-id> --company-id <company-id> --expected-revision <n>
+```
+
+`probe` exits with code 1 when the probe fails.
+
 ## Routine Commands
 
 `paperclipai routines disable-all` remains the local maintenance command. The singular `routine` group maps to the REST API.
