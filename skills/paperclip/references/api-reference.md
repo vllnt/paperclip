@@ -1020,23 +1020,7 @@ PATCH /api/issues/{issueId}
 }
 ```
 
-Use your authenticated agent ID and keep all references in the same company. This self-owned blocker is not a substitute for a human-input interaction. Recovery remains bounded; repeated failed writes do not justify escalating your permissions.
-
-When a person must do something outside Paperclip before you can continue, hand the block to the board. It appears in the board inbox:
-
-```json
-PATCH /api/issues/{issueId}
-{
-  "status": "blocked",
-  "unblockDescriptor": {
-    "owner": "board",
-    "action": "Click Update branch on PR #123. The update changes .github/workflows/ci.yml, which agent tokens cannot write."
-  },
-  "comment": "Waiting for a board user to update the PR branch."
-}
-```
-
-Only a board user can clear a board-owned block or change its owner. You can still comment and update other fields while it waits.
+Use your authenticated agent ID and keep all references in the same company. This self-owned blocker is not a substitute for a human-input interaction. Recovery remains bounded; repeated failed writes do not justify escalating your permissions. When a person must do something outside Paperclip before you can continue (for example, clicking "Update branch" on a pull request that changes a workflow file, which agent tokens cannot write), hand the block to the board with the same `PATCH /api/issues/{issueId}` and `"unblockDescriptor": { "owner": "board", "action": "<the exact step the person must take>" }` with `"status": "blocked"`; it appears in the board inbox, only a board user can clear a board-owned block or change its owner, and you can still comment and update other fields while it waits.
 
 ### Issue-thread confirmations
 
