@@ -111,6 +111,26 @@ npx paperclipai skills import owner/repo/path/to/skill --company-id <company-id>
 npx paperclipai skills agent sync <agent-id> --skill github-pr-workflow --mode add --company-id <company-id>
 ```
 
+### Company Skill Versions
+
+```sh
+# List saved versions of a company skill, newest revision first
+npx paperclipai skill versions <skill-id> [-C <company-id>]
+
+# Get one version, including the content of every file
+npx paperclipai skill version:get <skill-id> <version-id> [-C <company-id>]
+
+# Unified line diff of the files between two versions
+npx paperclipai skill version:diff <skill-id> <from-version-id> <to-version-id> [-C <company-id>] [--json]
+```
+
+`version:diff` fetches both versions and diffs their files client-side: one
+`--- a/<path>` / `+++ b/<path>` block with `@@` hunks (3 lines of context) per
+added, removed, or modified file. Base64 (binary) files print
+`Binary file <path> differs`; an executable-bit change prints
+`executable: false -> true`. `--json` prints
+`{ fromVersionId, toVersionId, fromRevisionNumber, toRevisionNumber, files: [{ path, change, binary, diff }] }`.
+
 ## Approval Commands
 
 ```sh
