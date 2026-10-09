@@ -289,7 +289,10 @@ describe("credentials never leave the worker", () => {
     f.convex.add(deployment("feat-x", { deploymentUrl: "https://evil.example.com" }));
     const result = await f.h.executeTool<{ data?: any; error?: string }>("convex_deployment_health", { name: "feat-x" }, run("observer"));
     expect(JSON.stringify(result)).not.toContain(TEAM_TOKEN);
-    expect(f.convex.calls.some(call => call.url.includes("evil.example.com"))).toBe(false);
+    // Compare parsed hostnames, never substrings of the URL: every request went to Convex itself or to a *.convex.cloud deployment host.
+    const hosts = new Set(f.convex.calls.map(call => new URL(call.url).hostname));
+    expect(hosts.has("evil.example.com")).toBe(false);
+    for (const host of hosts) expect(host === "api.convex.dev" || /^[a-z0-9-]+(\.[a-z0-9-]+)*\.convex\.cloud$/.test(host), host).toBe(true);
   });
 
   it("rejects a plaintext token in the config", async () => {
