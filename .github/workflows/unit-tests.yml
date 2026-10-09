@@ -90,7 +90,8 @@ jobs:
           log="$RUNNER_TEMP/unit.log"
           failed=""
           if [ -f "$log" ]; then
-            failed=$(grep -E '^ *FAIL ' "$log" | sed -E 's/^ +//' | sort -u || true)
+            # Vitest colours its output even when piped; strip the codes before matching.
+            failed=$(perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g' "$log" | grep -E '^ *FAIL ' | sed -E 's/^ +//; s/ [0-9]+ms$//' | sort -u || true)
           fi
           {
             echo "### Unit tests: $LANE"
