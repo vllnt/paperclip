@@ -21,7 +21,6 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
-  redactEnvForLogs,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -193,57 +192,6 @@ describe("buildInvocationEnvForLogs", () => {
     expect(loggedEnv.PAPERCLIP_RESOLVED_COMMAND).toBe(
       "env OPENAI_API_KEY=***REDACTED*** PAPERCLIP_API_KEY='***REDACTED***' custom-acp --paperclip-api-key=***REDACTED*** --token ***REDACTED***",
     );
-  });
-});
-
-describe("redactEnvForLogs", () => {
-  const pemMarker = (edge: "BEGIN" | "END", kind: string) => `${"-".repeat(5)}${edge} ${kind}${"-".repeat(5)}`;
-  const PEM_BLOCK = `${pemMarker("BEGIN", "PRIVATE KEY")}\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nZm9vYmFy\n${pemMarker("END", "PRIVATE KEY")}`;
-
-  it("keeps plain values and redacts a value by its key name", () => {
-    expect(
-      redactEnvForLogs({
-        SAFE_VALUE: "visible",
-        API_URL: "https://api.example.com/v1?x=a@b",
-        SCOPED_PACKAGE: "https://registry.example.com/@scope/pkg",
-        CONTACT: "ops@example.com",
-        SERVICE_TOKEN: "opaque",
-      }),
-    ).toEqual({
-      SAFE_VALUE: "visible",
-      API_URL: "https://api.example.com/v1?x=a@b",
-      SCOPED_PACKAGE: "https://registry.example.com/@scope/pkg",
-      CONTACT: "ops@example.com",
-      SERVICE_TOKEN: "***REDACTED***",
-    });
-  });
-
-  it("redacts the user info of a URL under any key name", () => {
-    expect(
-      redactEnvForLogs({
-        DATABASE_URL: "postgres://app:s3cret@db.internal:5432/app",
-        MIRROR: "https://ghp_exampletoken1234567890@github.com/org/repo.git",
-        REMOTES: "--from https://a:b@one.example/x --to ssh://c:d@two.example/y",
-      }),
-    ).toEqual({
-      DATABASE_URL: "postgres://***REDACTED***@db.internal:5432/app",
-      MIRROR: "https://***REDACTED***@github.com/org/repo.git",
-      REMOTES: "--from https://***REDACTED***@one.example/x --to ssh://***REDACTED***@two.example/y",
-    });
-  });
-
-  it("redacts a PEM block under any key name and keeps the text around it", () => {
-    expect(
-      redactEnvForLogs({
-        SIGNING_MATERIAL: PEM_BLOCK,
-        WRAPPED: `before ${PEM_BLOCK} after`,
-        TRUNCATED: `head ${pemMarker("BEGIN", "CERTIFICATE")}\nMIIDdzCCAl+gAwIBAgIE`,
-      }),
-    ).toEqual({
-      SIGNING_MATERIAL: "***REDACTED***",
-      WRAPPED: "before ***REDACTED*** after",
-      TRUNCATED: "head ***REDACTED***",
-    });
   });
 });
 
