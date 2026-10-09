@@ -30,6 +30,32 @@ npx paperclipai issue checkout <issue-id> --agent-id <agent-id>
 npx paperclipai issue release <issue-id>
 ```
 
+### Issue Recovery Actions
+
+```sh
+# Open recovery actions across a company, newest first
+npx paperclipai issue recovery-actions:list [-C <company-id>] [--status active,escalated] [--limit 50] [--json]
+
+# The open recovery action of one issue
+npx paperclipai issue recovery-actions <issue-id>
+
+# Resolve a recovery action
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  [--action-id <id>] [--resolution-note "..."]
+
+# Resolve an execution recovery with a reconciliation (board only)
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  --reconciliation-run-id <run-id> --provider-stopped --action-outcome completed \
+  --outcome-evidence "..." [--workspace-repair-evidence "..."]
+```
+
+`recovery-actions:list` statuses are `active`, `escalated`, `resolved`, and
+`cancelled`; the default is the open ones (`active,escalated`). The limit is
+1-200 (default 50). The list is read-only and does not re-check stale actions.
+For `recovery:resolve`, any reconciliation flag sends an `executionReconciliation`
+object; `--provider-stopped` is required in that case, and evidence texts need
+20-12000 characters.
+
 ## Company Commands
 
 ```sh
