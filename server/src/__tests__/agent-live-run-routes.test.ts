@@ -17,6 +17,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
+  getDeferredWakeStats: vi.fn(),
 }));
 
 const mockIssueService = vi.hoisted(() => ({
@@ -633,6 +634,7 @@ describe("agent live run routes", () => {
       const paths = [
         "/api/companies/company-1/heartbeat-runs",
         "/api/companies/company-1/live-runs",
+        "/api/companies/company-1/deferred-wakes",
         "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/events",
         "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/log",
@@ -647,6 +649,7 @@ describe("agent live run routes", () => {
       }
 
       expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.getDeferredWakeStats).not.toHaveBeenCalled();
       expect(mockWorkspaceOperationService.readLog).not.toHaveBeenCalled();
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
         action: "company_scope:read",
@@ -654,6 +657,65 @@ describe("agent live run routes", () => {
       }));
     },
   );
+
+  it("reports the deferred-wake queue with the age of each agent's oldest parked wake", async () => {
+    const generatedAt = new Date("2026-10-09T16:30:00.000Z");
+    const oldestDeferredAt = new Date("2026-10-09T15:52:00.000Z");
+    mockHeartbeatService.getDeferredWakeStats.mockResolvedValue({
+      generatedAt,
+      deferredTotal: 2,
+      promotedLast24h: 5,
+      oldestDeferredAt,
+      oldestDeferredAgeSeconds: 2280,
+      agents: [
+        {
+          agentId: "agent-1",
+          agentName: "Reviewer",
+          deferredCount: 2,
+          oldestDeferredAt,
+          oldestDeferredAgeSeconds: 2280,
+          promotedLast24h: 5,
+        },
+      ],
+      sweep: {
+        passes: 3,
+        completionPasses: 1,
+        examined: 2,
+        promoted: 0,
+        retired: 0,
+        stillDeferred: 0,
+        skippedHeld: 2,
+        skippedNotInvokable: 0,
+        failed: 0,
+        lastPassAt: generatedAt,
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/deferred-wakes"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.getDeferredWakeStats).toHaveBeenCalledWith("company-1");
+    expect(res.body).toMatchObject({
+      deferredTotal: 2,
+      oldestDeferredAgeSeconds: 2280,
+      agents: [{ agentId: "agent-1", deferredCount: 2, oldestDeferredAgeSeconds: 2280, promotedLast24h: 5 }],
+      sweep: { skippedHeld: 2 },
+    });
+    expect(res.headers["cache-control"]).toContain("no-store");
+  });
+
+  it("does not report another company's deferred wakes to an agent key", async () => {
+    const actor = { type: "agent", agentId: routeAgentId, companyId: "company-2", source: "agent_key" };
+
+    const res = await requestApp(await createApp({}, actor), (baseUrl) =>
+      request(baseUrl).get("/api/companies/company-1/deferred-wakes"),
+    );
+
+    expect(res.status).toBe(403);
+    expect(mockHeartbeatService.getDeferredWakeStats).not.toHaveBeenCalled();
+  });
 
   it("caps company live run polling by default", async () => {
     const rows = Array.from({ length: 75 }, (_, index) => ({

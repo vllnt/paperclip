@@ -359,6 +359,52 @@ export interface AgentWakeupRequest {
   updatedAt: Date;
 }
 
+/** One agent's deferred-wake queue: wakes parked behind an issue's execution lock. */
+export interface DeferredWakeAgentStats {
+  agentId: string;
+  agentName: string;
+  /** Wakes currently parked as `deferred_issue_execution`. */
+  deferredCount: number;
+  /** When the oldest parked wake was requested; `null` when nothing is parked. */
+  oldestDeferredAt: Date | null;
+  /** How long the oldest parked wake has waited. A growing value is a stall. */
+  oldestDeferredAgeSeconds: number | null;
+  /** Wakes requested in the last 24 hours that were promoted into a run. */
+  promotedLast24h: number;
+}
+
+/**
+ * Counters for the deferred-wake redelivery sweep since the server last
+ * started. They are process-wide, not durable.
+ */
+export interface DeferredWakeSweepCounters {
+  passes: number;
+  /** Passes triggered by a run completing, a subset of `passes`. */
+  completionPasses: number;
+  /** Orphaned wakes read: parked with no run left to promote them. */
+  examined: number;
+  promoted: number;
+  /** Cancelled or failed by the drain's rules instead of started. */
+  retired: number;
+  /** Left parked after the drain declined to promote them. */
+  stillDeferred: number;
+  /** Not woken: a pause hold, an execution blocker or an operator Stop. */
+  skippedHeld: number;
+  skippedNotInvokable: number;
+  failed: number;
+  lastPassAt: Date | null;
+}
+
+export interface DeferredWakeStats {
+  generatedAt: Date;
+  deferredTotal: number;
+  promotedLast24h: number;
+  oldestDeferredAt: Date | null;
+  oldestDeferredAgeSeconds: number | null;
+  agents: DeferredWakeAgentStats[];
+  sweep: DeferredWakeSweepCounters;
+}
+
 export interface InstanceSchedulerHeartbeatAgent {
   id: string;
   companyId: string;
