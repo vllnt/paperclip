@@ -1,3 +1,5 @@
+import { companyRunTiersSchema } from "@paperclipai/shared";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { createHash, randomUUID } from "node:crypto";
 import express, { Router, type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
@@ -1237,6 +1239,44 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       );
     }
     res.status(201).json(company);
+  });
+
+  // Named run tiers: which harness and model each tier means, and which tiers
+  // agents may set on issues they create or dispatch. Agents may read them.
+  router.get("/:companyId/run-tiers", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const tiers = (await instanceSettingsService(db).getGeneral()).companyRunTiers?.[companyId];
+    res.json(tiers ?? { tiers: {}, agentAllowlist: [] });
+  });
+
+  router.put("/:companyId/run-tiers", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    assertCompanyAccess(req, companyId);
+    const next = companyRunTiersSchema.parse(req.body);
+    // Built per request: the service reads the managed-config environment on
+    // construction, which must not happen while the router is being built.
+    const instanceSettings = instanceSettingsService(db);
+    const current = (await instanceSettings.getGeneral()).companyRunTiers ?? {};
+    const before = current[companyId] ?? null;
+    const isEmpty = Object.keys(next.tiers).length === 0 && next.agentAllowlist.length === 0;
+    const { [companyId]: _removed, ...others } = current;
+    await instanceSettings.updateGeneral({ companyRunTiers: isEmpty ? others : { ...others, [companyId]: next } });
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "company.run_tiers_updated",
+      entityType: "company",
+      entityId: companyId,
+      details: { before, after: next },
+    });
+    res.json(next);
   });
 
   router.patch("/:companyId", async (req, res) => {

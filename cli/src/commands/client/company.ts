@@ -1,3 +1,4 @@
+import { companyRunTiersSchema } from "@paperclipai/shared";
 import { Command } from "commander";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -1391,6 +1392,38 @@ export function registerCompanyCommands(program: Command): void {
           const ctx = resolveCommandContext(opts);
           const row = await ctx.api.get<Company>(apiPath`/api/companies/${companyId}`);
           printOutput(row, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    company
+      .command("run-tiers")
+      .description("Show a company's run tiers and the tiers agents may set")
+      .argument("<companyId>", "Company ID")
+      .action(async (companyId: string, opts: CompanyCommandOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          printOutput(await ctx.api.get(apiPath`/api/companies/${companyId}/run-tiers`), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    company
+      .command("run-tiers:set")
+      .description("Set a company's run tiers. Use --tiers-json '{\"tiers\":{\"fast\":{\"adapterType\":\"codex_local\",\"model\":\"grok-4.7\"}},\"agentAllowlist\":[\"fast\"]}'")
+      .argument("<companyId>", "Company ID")
+      .requiredOption("--tiers-json <json>", "Tiers and the agent allowlist")
+      .action(async (companyId: string, opts: CompanyCommandOptions & { tiersJson: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body = companyRunTiersSchema.parse(JSON.parse(opts.tiersJson));
+          printOutput(await ctx.api.put(apiPath`/api/companies/${companyId}/run-tiers`, body), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

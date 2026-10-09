@@ -1,3 +1,4 @@
+import { buildRunProfileOverrides, hasRunProfileOptions, type RunProfileOptions } from "./run-profile-options.js";
 import { Command } from "commander";
 import { readFile, writeFile } from "node:fs/promises";
 import {
@@ -50,7 +51,7 @@ interface IssueBaseOptions extends BaseClientOptions {
   match?: string;
 }
 
-interface IssueCreateOptions extends BaseClientOptions {
+interface IssueCreateOptions extends BaseClientOptions, RunProfileOptions {
   title: string;
   description?: string;
   status?: string;
@@ -63,7 +64,7 @@ interface IssueCreateOptions extends BaseClientOptions {
   billingCode?: string;
 }
 
-interface IssueUpdateOptions extends BaseClientOptions {
+interface IssueUpdateOptions extends BaseClientOptions, RunProfileOptions {
   title?: string;
   description?: string;
   status?: string;
@@ -288,6 +289,10 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option("--run-profile <tier>", "Run this issue on a company tier (for example fast, standard or deep)")
+      .option("--adapter-type <type>", "Run this issue on another harness: claude_local, codex_local or grok_local")
+      .option("--model <model>", "Run this issue on this model")
+      .option("--effort <effort>", "Reasoning effort for the run")
       .action(async (opts: IssueCreateOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
@@ -302,6 +307,7 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
+            assigneeAdapterOverrides: buildRunProfileOverrides(opts, null) ?? undefined,
           });
 
           const created = await ctx.api.post<Issue>(apiPath`/api/companies/${ctx.companyId}/issues`, payload);
@@ -330,9 +336,21 @@ export function registerIssueCommands(program: Command): void {
       .option("--billing-code <code>", "Billing code")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
+      .option("--run-profile <tier>", "Run this issue on a company tier (for example fast, standard or deep)")
+      .option("--adapter-type <type>", "Run this issue on another harness: claude_local, codex_local or grok_local")
+      .option("--model <model>", "Run this issue on this model")
+      .option("--effort <effort>", "Reasoning effort for the run")
+      .option("--clear-run-profile", "Remove the run profile so the issue runs on the agent's default")
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const current = hasRunProfileOptions(opts)
+            ? await ctx.api.get<Issue>(apiPath`/api/issues/${issueId}`)
+            : null;
+          const assigneeAdapterOverrides = buildRunProfileOverrides(
+            opts,
+            current?.assigneeAdapterOverrides as Record<string, unknown> | null | undefined,
+          );
           const payload = updateIssueSchema.parse({
             title: opts.title,
             description: opts.description,
@@ -346,6 +364,7 @@ export function registerIssueCommands(program: Command): void {
             billingCode: opts.billingCode,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
+            ...(assigneeAdapterOverrides !== undefined ? { assigneeAdapterOverrides } : {}),
           });
 
           const updated = await ctx.api.patch<Issue & { comment?: IssueComment | null }>(apiPath`/api/issues/${issueId}`, payload);

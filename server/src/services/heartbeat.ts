@@ -15,7 +15,9 @@ import {
   primaryHarnessDispatch,
   readClaimedHarnessDispatch,
   reclassifyProviderQuotaResult,
+  profileUnavailableReason,
   type HarnessDispatch,
+  type ProfileTargetInput,
 } from "./harness-fallback.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -53,7 +55,14 @@ import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  aiConnectionBindingSchema,
+  issueRunProfileFromOverrides,
+  resolveRunProfile,
+  runProfileSchema,
+  type RunProfile,
+} from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
@@ -3400,6 +3409,7 @@ const heartbeatRunListColumns = {
   executedAdapterType: heartbeatRuns.executedAdapterType,
   executedModel: heartbeatRuns.executedModel,
   fallbackReason: heartbeatRuns.fallbackReason,
+  targetSource: sql<string | null>`${heartbeatRuns.runnerProfileJson} -> 'adapterDispatch' ->> 'source'`,
   externalRunId: heartbeatRuns.externalRunId,
   processPid: heartbeatRuns.processPid,
   processGroupId: heartbeatRunProcessGroupIdColumn,
@@ -3863,6 +3873,7 @@ type SessionCompactionDecision = {
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
+  runProfile: RunProfile | null;
 }
 
 /**
@@ -5742,10 +5753,13 @@ function parseIssueAssigneeAdapterOverrides(
     typeof parsed.useProjectWorkspace === "boolean"
       ? parsed.useProjectWorkspace
       : null;
-  if (!adapterConfig && useProjectWorkspace === null) return null;
+  const parsedProfile = runProfileSchema.safeParse(parsed.runProfile);
+  const runProfile = parsedProfile.success ? parsedProfile.data : null;
+  if (!adapterConfig && useProjectWorkspace === null && !runProfile) return null;
   return {
     adapterConfig,
     useProjectWorkspace,
+    runProfile,
   };
 }
 
@@ -15634,7 +15648,7 @@ export function heartbeatService(
     // harness/model of the agent is cooling down from a quota failure.
     const storedAgentForQuota = run.runtimeMode === "native" ? null : await getAgent(run.agentId).catch(() => null);
     const quotaHeldUntil = storedAgentForQuota
-      ? await harnessFallback.heldUntil(storedAgentForQuota, now)
+      ? await harnessFallback.heldUntil(storedAgentForQuota, now, await resolveRunProfileForRun(run, storedAgentForQuota))
       : null;
     const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
       .filter((value): value is Date => value !== null)
@@ -16929,6 +16943,36 @@ export function heartbeatService(
     return { start, end };
   }
 
+  /**
+   * The run profile an issue gives its assignee's run: the issue's own profile
+   * (or the model and effort of its legacy adapter override) resolved against
+   * the company's tiers. Only legacy runs of the local Claude, Codex and Grok
+   * harnesses take a profile. An unknown tier runs on the agent's default and
+   * is noted on the run.
+   */
+  async function resolveRunProfileForRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">,
+  ): Promise<ProfileTargetInput | null> {
+    if (run.runtimeMode === "native") return null;
+    if (!(HARNESS_FALLBACK_ADAPTER_TYPES as readonly string[]).includes(agent.adapterType)) return null;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return null;
+    const issue = await getIssueExecutionContext(agent.companyId, issueId);
+    if (!issue || issue.assigneeAgentId !== agent.id) return null;
+    const overrides = parseIssueAssigneeAdapterOverrides(issue.assigneeAdapterOverrides);
+    const issueProfile = issueRunProfileFromOverrides(overrides);
+    if (!issueProfile) return null;
+    const tiers = (await instanceSettings.getGeneral()).companyRunTiers?.[agent.companyId] ?? null;
+    const resolved = resolveRunProfile(issueProfile.profile, tiers);
+    if (!resolved.ok) {
+      logger.warn({ runId: run.id, tier: resolved.tier }, "run profile names an unknown tier; running on the agent default");
+      return null;
+    }
+    if (!resolved.target) return null;
+    return { ...resolved.target, source: "issue_profile" };
+  }
+
   /** Notes on a held queued run when it can start; written once per cooldown end. */
   async function recordProviderQuotaWait(run: typeof heartbeatRuns.$inferSelect, heldUntil: Date) {
     const waitUntil = heldUntil.toISOString();
@@ -17008,6 +17052,7 @@ export function heartbeatService(
       reason,
       resetAt: decision.resetAt,
       sourceRunId: run.id,
+      profile: dispatch.profile ?? null,
     }).catch((err) => {
       // Fail closed: without a recorded cooldown the normal 30 second retry
       // would send this wake straight back at the exhausted target.
@@ -17630,7 +17675,14 @@ export function heartbeatService(
       return null;
     }
 
-    const harnessDecision = await harnessFallback.resolveDispatch(agent);
+    const runProfile = await resolveRunProfileForRun(run, agent);
+    const harnessDecision = await harnessFallback.resolveDispatch(agent, new Date(), runProfile);
+    if (runProfile && profileUnavailableReason(agent, runProfile)) {
+      logger.warn(
+        { runId: run.id, agentId: agent.id, profile: runProfile },
+        "run profile needs credentials this agent does not have for that harness; running on the agent default",
+      );
+    }
     if (harnessDecision.heldUntil && run.runtimeMode !== "native") {
       // Every harness/model of this agent is out of provider quota. Leave the
       // run queued: the scheduler tick claims it once a target recovers, and
@@ -22222,7 +22274,7 @@ export function heartbeatService(
       const harnessCompatibility = checkRunHarnessCompatibility({
         adapterType: agent.adapterType,
         config: runtimeConfig,
-        fallback: claimedHarnessDispatch?.target === "fallback",
+        fallback: claimedHarnessDispatch?.target === "fallback" || claimedHarnessDispatch?.crossHarness === true,
       });
       if (!harnessCompatibility.ok) {
         throw unprocessable(harnessCompatibility.message, { code: harnessCompatibility.code });

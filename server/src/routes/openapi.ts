@@ -6,6 +6,7 @@ import {
 import { Router } from "express";
 import { z } from "zod";
 import {
+  companyRunTiersSchema,
   createAiConnectionSchema,
   testAiGatewaySchema,
   aiConnectionLoginIntentSchema,
@@ -1983,6 +1984,33 @@ registry.registerPath({
   tags: ["companies"],
   summary: "Company stats",
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Get a company's run tiers and the tiers agents may set",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Replace a company's run tiers (board only)",
+  request: { params: z.object({ companyId: z.string() }), body: jsonBody(companyRunTiersSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-target-stats",
+  tags: ["companies"],
+  summary: "In-flight runs per provider pool and finished runs by run target source and tier",
+  request: { params: z.object({ companyId: z.string() }), query: z.object({ hours: z.string().optional() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
