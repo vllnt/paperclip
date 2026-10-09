@@ -100,7 +100,7 @@ describe("dev policy", () => {
   it("protects defaults, personal developers, shared pools and the company's own list", async () => {
     const f = await setup({ configs: { [COMPANY_A]: config({ protect: ["dev/keep-*", "dev/pinned"] }) } });
     f.convex.add(
-      dev("human-1", "dev/bntvllnt", 90, { isDefault: true }), dev("human-2", "dev/julien-a", 90, { isDefault: true }),
+      dev("human-1", "dev/alice", 90, { isDefault: true }), dev("human-2", "dev/sam-k", 90, { isDefault: true }),
       dev("pool-1", "dev/paperclip-agents", 90), dev("pool-2", "dev/local-abc", 90), dev("pool-3", "dev/qa-songtrivia", 90),
       dev("mine-1", "dev/keep-this-one", 90), dev("mine-2", "dev/pinned", 90), dev("mine-3", "DEV/Keep-Upper", 90),
       dev("agent-made", "dev/songtrivia-3444-feature", 90),
