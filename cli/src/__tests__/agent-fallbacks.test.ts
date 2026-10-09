@@ -52,6 +52,15 @@ describe("agent fallbacks commands", () => {
     ]);
   });
 
+  it("clears an agent's cooldowns through POST /api/agents/:id/harness-cooldowns/clear", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({ cleared: 1 })));
+    vi.stubGlobal("fetch", fetchMock);
+    await run(["agent", "cooldowns:clear", AGENT_ID]);
+    expect(fetchMock.mock.calls.map((call) => [call[1]?.method, call[0]])).toEqual([
+      ["POST", `http://localhost:3100/api/agents/${AGENT_ID}/harness-cooldowns/clear`],
+    ]);
+  });
+
   it("rejects an Anthropic model on Codex before calling the API", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

@@ -3218,6 +3218,7 @@ export function agentRoutes(
    * and each harness gets the same adapter defaults a primary would.
    */
   async function normalizeAgentFallbacksForPersistence(input: {
+    req: Request;
     companyId: string;
     agentId: string;
     primaryAdapterType: string;
@@ -3236,6 +3237,9 @@ export function agentRoutes(
     const stored = readAgentFallbacks(input.existing);
     const normalized: AgentFallbackTarget[] = [];
     for (const [index, entry] of input.requested.entries()) {
+      // A fallback's adapterConfig reaches the host like a primary's does, so
+      // agent keys get the same refusal for instruction paths and host commands.
+      assertNoAgentAdapterConfigMutation(input.req, entry.adapterConfig ?? {}, `fallbacks[${index}].adapterConfig`);
       const key = harnessTargetKey(entry);
       if (key === primaryKey) {
         throw unprocessable(`fallbacks[${index}] repeats the primary harness and model (${key}).`);
@@ -5040,6 +5044,7 @@ export function agentRoutes(
     });
     assertPrimaryHarnessModelCompatible(createInput.adapterType, normalizedAdapterConfig);
     const normalizedFallbacks = await normalizeAgentFallbacksForPersistence({
+      req,
       companyId,
       agentId,
       primaryAdapterType: createInput.adapterType,
@@ -5739,6 +5744,7 @@ export function agentRoutes(
     }
     if (hasOwn(patchData, "fallbacks") || touchesAdapterConfiguration) {
       const normalizedFallbacks = await normalizeAgentFallbacksForPersistence({
+        req,
         companyId: existing.companyId,
         agentId: existing.id,
         primaryAdapterType: requestedAdapterType,
@@ -5887,6 +5893,33 @@ export function agentRoutes(
     });
 
     res.json(redactAgentRowForResponse(agent));
+  });
+
+  // A board user's escape hatch: forget every quota cooldown of an agent, for
+  // example after a provider reset earlier than its error announced.
+  router.post("/agents/:id/harness-cooldowns/clear", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const existing = await getAccessibleAgent(req, res, id);
+    if (!existing) return;
+    await assertCanUpdateAgent(req, existing);
+    const targets = await harnessFallbackSvc.clearCooldowns(existing);
+    if (targets.length > 0) {
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "agent.harness_cooldowns_cleared",
+        entityType: "agent",
+        entityId: existing.id,
+        details: { targets },
+      });
+    }
+    res.json({ cleared: targets.length });
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {

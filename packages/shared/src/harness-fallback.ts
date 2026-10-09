@@ -44,7 +44,7 @@ export function classifyModelVendor(model: string): ModelVendor {
 }
 
 function readConfigModelAssignment(value: string): string | null {
-  const match = /^model\s*=\s*["']?([^"']+)["']?$/.exec(value.trim());
+  const match = /^(?:[\w.-]+\.)?model\s*=\s*["']?([^"']+)["']?$/.exec(value.trim());
   return match ? match[1].trim() : null;
 }
 
@@ -71,8 +71,15 @@ export function readModelOverridesFromArgs(args: unknown): string[] {
       const model = readConfigModelAssignment(next);
       if (model) models.push(model);
       index += 1;
-    } else if (arg.startsWith("--config=") || arg.startsWith("-c=")) {
-      const model = readConfigModelAssignment(arg.slice(arg.indexOf("=") + 1));
+    } else if (arg.startsWith("--config=")) {
+      const model = readConfigModelAssignment(arg.slice("--config=".length));
+      if (model) models.push(model);
+    } else if (arg.startsWith("-m=")) {
+      models.push(arg.slice(3).trim());
+    } else if (arg.startsWith("-m") && !arg.startsWith("--")) {
+      models.push(arg.slice(2).trim());
+    } else if (arg.startsWith("-c") && !arg.startsWith("--")) {
+      const model = readConfigModelAssignment(arg.slice(2).replace(/^=/, ""));
       if (model) models.push(model);
     }
   }
@@ -166,6 +173,18 @@ export function harnessTargetKey(target: { adapterType: string; model?: string |
   return `${target.adapterType}:${(target.model ?? "").trim()}`;
 }
 
+/** Plain (non-secret) env values a fallback may carry: paths, endpoints and model names. */
+const PLAIN_FALLBACK_ENV_KEY_RE = /^(?:[A-Z0-9]+_)*(?:HOME|DIR|PATH|URL|MODEL|EFFORT)$|^(?:HTTPS?_PROXY|NO_PROXY|TZ|LANG)$/;
+
+function plainFallbackEnvValue(binding: unknown): string | null {
+  if (typeof binding === "string") return binding;
+  if (typeof binding === "object" && binding !== null && (binding as { type?: unknown }).type === "plain") {
+    const value = (binding as { value?: unknown }).value;
+    return typeof value === "string" ? value : null;
+  }
+  return null;
+}
+
 const RESERVED_FALLBACK_ADAPTER_CONFIG_KEYS = ["env", "model", "effort", "modelReasoningEffort", "reasoningEffort"];
 
 export const agentFallbackTargetSchema = z
@@ -185,6 +204,20 @@ export const agentFallbackTargetSchema = z
           path: ["adapterConfig", key],
           message: `Set ${key === "env" ? "env" : key === "model" ? "model" : "effort"} on the fallback entry, not in adapterConfig`,
         });
+      }
+    }
+    for (const [key, binding] of Object.entries(entry.env ?? {})) {
+      const plain = plainFallbackEnvValue(binding);
+      if (plain === null) continue;
+      if (!PLAIN_FALLBACK_ENV_KEY_RE.test(key) || /\/\/[^/\s@]*@/.test(plain)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["env", key],
+          message: `${key} must be a secret reference: fallback env accepts plain values only for paths, endpoints without credentials and model names`,
+        });
+      } else if (/(?:^|_)MODEL$/.test(key)) {
+        const modelCheck = checkHarnessModelCompatibility({ adapterType: entry.adapterType, model: plain }, { requireKnownVendor: true });
+        if (!modelCheck.ok) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["env", key], message: modelCheck.message });
       }
     }
     const compatibility = checkHarnessModelCompatibility(

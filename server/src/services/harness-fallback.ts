@@ -630,6 +630,15 @@ export function harnessFallbackService(db: Db) {
     });
   }
 
+  /** Deletes every cooldown of an agent so its next run can use any target. */
+  async function clearCooldowns(agent: { id: string; companyId: string }): Promise<string[]> {
+    const removed = await db
+      .delete(agentHarnessCooldowns)
+      .where(and(eq(agentHarnessCooldowns.companyId, agent.companyId), eq(agentHarnessCooldowns.agentId, agent.id)))
+      .returning({ targetKey: agentHarnessCooldowns.targetKey });
+    return removed.map((row) => row.targetKey);
+  }
+
   /** The "on fallback until …" state shown on the agent. */
   async function getAgentState(agent: HarnessFallbackAgent, now: Date = new Date()): Promise<AgentHarnessFallbackState | null> {
     const targets = listHarnessTargets(agent);
@@ -667,5 +676,5 @@ export function harnessFallbackService(db: Db) {
     return previous?.adapterType ?? null;
   }
 
-  return { listCooldowns, resolveDispatch, heldUntil, coolDown, notePrimaryDispatched, getAgentState, previousIssueHarness };
+  return { listCooldowns, clearCooldowns, resolveDispatch, heldUntil, coolDown, notePrimaryDispatched, getAgentState, previousIssueHarness };
 }

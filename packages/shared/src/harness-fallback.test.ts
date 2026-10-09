@@ -69,6 +69,16 @@ describe("readModelOverridesFromArgs", () => {
   });
 });
 
+describe("readModelOverridesFromArgs attached spellings", () => {
+  it("reads attached short options, = forms and profile model keys", () => {
+    expect(readModelOverridesFromArgs(["-mclaude-opus-4"])).toEqual(["claude-opus-4"]);
+    expect(readModelOverridesFromArgs(["-m=claude-opus-4"])).toEqual(["claude-opus-4"]);
+    expect(readModelOverridesFromArgs(["-cmodel=claude-opus-4"])).toEqual(["claude-opus-4"]);
+    expect(readModelOverridesFromArgs(["-c", "profiles.x.model=claude-opus-4"])).toEqual(["claude-opus-4"]);
+    expect(readModelOverridesFromArgs(["--config", 'model_provider="anthropic"'])).toEqual([]);
+  });
+});
+
 describe("harness ↔ model compatibility matrix", () => {
   it("keeps the documented matrix", () => {
     expect(HARNESS_ALLOWED_MODEL_VENDORS).toEqual({
@@ -191,6 +201,16 @@ describe("agentFallbacksSchema", () => {
         { ...codexEntry, adapterConfig: { extraArgs: ["--model", "claude-sonnet-5"] } },
       ]).success,
     ).toBe(false);
+  });
+
+  it("refuses plaintext credentials and model selectors that cannot be classified in fallback env", () => {
+    const withEnv = (env: Record<string, unknown>) => agentFallbacksSchema.safeParse([{ adapterType: "codex_local", model: "gpt-5.5", env }]);
+    expect(withEnv({ HF_TOKEN: "hf_live" }).success).toBe(false);
+    expect(withEnv({ OPENAI_KEY: { type: "plain", value: "sk-live" } }).success).toBe(false);
+    expect(withEnv({ OPENAI_BASE_URL: "https://user:pass@proxy.invalid/v1" }).success).toBe(false);
+    expect(withEnv({ OPENAI_MODEL: "claude-opus-5-5" }).success).toBe(false);
+    expect(withEnv({ CODEX_HOME: "/srv/codex-home", OPENAI_BASE_URL: "https://proxy.invalid/v1", OPENAI_MODEL: "gpt-5.5" }).success).toBe(true);
+    expect(withEnv({ HF_TOKEN: { type: "secret_ref", secretId: SECRET_ID } }).success).toBe(true);
   });
 
   it("bounds the chain length and rejects duplicate targets", () => {

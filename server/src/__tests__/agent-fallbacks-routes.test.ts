@@ -182,13 +182,38 @@ describeEmbeddedPostgres("agent fallbacks routes", () => {
     expect(res.body).toMatchObject({ details: { code: "harness_model_incompatible" } });
   });
 
+  it("refuses an agent key setting host-affecting adapterConfig inside another agent's fallback", async () => {
+    const { companyId, agentId } = await seed();
+    const [other] = await db.insert(agents).values({
+      companyId, name: `Manager ${randomUUID().slice(0, 8)}`, role: "ceo", status: "idle", adapterType: "process",
+      adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    }).returning();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "agent", principalId: other!.id, status: "active", membershipRole: "member",
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: other!.id, permissionKey: "agents:configure", scope: null, grantedByUserId: null,
+    });
+    const app = createApp(db, agentActor(companyId, other!.id));
+    for (const adapterConfig of [
+      { instructionsFilePath: "/etc/passwd" },
+      { workspaceStrategy: { type: "git_worktree", provisionCommand: "touch /tmp/provisioned" } },
+    ]) {
+      const res = await request(app)
+        .patch(`/api/agents/${agentId}`)
+        .send({ fallbacks: [{ adapterType: "codex_local", model: "gpt-5.5", adapterConfig }] });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+    }
+    expect((await readAgent(agentId)).fallbacks).toEqual([]);
+  });
+
   it("refuses plaintext credentials in fallback env", async () => {
     const { companyId, agentId } = await seed();
     const res = await request(createApp(db, boardActor(companyId)))
       .patch(`/api/agents/${agentId}`)
       .send({ fallbacks: [{ adapterType: "codex_local", model: "gpt-5.5", env: { OPENAI_API_KEY: "sk-live-plaintext" } }] });
-    expect(res.status).toBe(422);
-    expect(JSON.stringify(res.body)).toContain("OPENAI_API_KEY");
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("OPENAI_API_KEY must be a secret reference");
     expect((await readAgent(agentId)).fallbacks).toEqual([]);
   });
 
@@ -304,6 +329,29 @@ describeEmbeddedPostgres("agent fallbacks routes", () => {
       primaryCooldownUntil: until.toISOString(),
       heldUntil: null,
     });
+  });
+
+  it("lets a board user clear an agent's cooldowns, and refuses an agent doing it", async () => {
+    const { companyId, agentId } = await seed();
+    await db.insert(agentHarnessCooldowns).values({
+      companyId, agentId, targetKey: "claude_local:claude-opus-5-5", adapterType: "claude_local",
+      model: "claude-opus-5-5", reason: "provider_usage_limit", cooldownUntil: new Date(Date.now() + 90 * 60_000),
+    });
+
+    const byAgent = await request(createApp(db, agentActor(companyId, agentId))).post(`/api/agents/${agentId}/harness-cooldowns/clear`);
+    expect(byAgent.status).toBe(403);
+    expect(await db.select().from(agentHarnessCooldowns).where(eq(agentHarnessCooldowns.agentId, agentId))).toHaveLength(1);
+
+    const board = createApp(db, boardActor(companyId));
+    const res = await request(board).post(`/api/agents/${agentId}/harness-cooldowns/clear`);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual({ cleared: 1 });
+    expect(await db.select().from(agentHarnessCooldowns).where(eq(agentHarnessCooldowns.agentId, agentId))).toHaveLength(0);
+    const [logged] = await db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId), eq(activityLog.action, "agent.harness_cooldowns_cleared"),
+    ));
+    expect(logged.details).toMatchObject({ targets: ["claude_local:claude-opus-5-5"] });
+    expect((await request(board).get(`/api/agents/${agentId}`)).body.harnessFallback).toBeNull();
   });
 
   it("refuses fallbacks on a harness outside the fallback matrix", async () => {
