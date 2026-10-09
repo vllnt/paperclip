@@ -1017,11 +1017,8 @@ select:where(:not([multiple]):not(.appearance-none)):where(:not([size]), [size="
 /* Sidebar actions cover the trailing live label without moving row content,
    fading into the row surface like the task-detail tab close control. */
 .primary-sidebar-surface {
-  --sidebar-action-rest-surface: color-mix(in srgb, var(--border) 50%, var(--background));
+  --sidebar-action-rest-surface: var(--sidebar);
   background-color: var(--sidebar-action-rest-surface);
-}
-.dark .primary-sidebar-surface {
-  --sidebar-action-rest-surface: var(--muted);
 }
 .sidebar-action-row {
   --sidebar-action-surface: var(--sidebar-action-rest-surface, var(--background));
