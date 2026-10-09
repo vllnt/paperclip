@@ -40,6 +40,7 @@ interface ReaperProject {
   kept: number;
   failed: Array<{ name: string; error: string }>;
   skipped: Array<{ name: string; reason: string }>;
+  dev?: { listed: number; delete: Array<{ name: string; reason: string }>; deleted: string[]; kept: number; failed: Array<{ name: string; error: string }>; skipped: Array<{ name: string; reason: string }>; executed: boolean; error?: string };
   error?: string;
 }
 interface ReaperReport {
@@ -75,6 +76,15 @@ function printReport(report: ReaperReport) {
     for (const item of project.failed) console.log(pc.red(`  failed ${item.name}: ${item.error}`));
     for (const item of project.skipped) console.log(pc.dim(`  skipped ${item.name}: ${item.reason}`));
     if (project.error) console.log(pc.red(`  error: ${project.error}`));
+    const devPolicy = project.dev;
+    if (devPolicy) {
+      const verb = devPolicy.executed ? "deleted" : "would delete";
+      console.log(`  dev: ${devPolicy.listed} listed, ${verb} ${devPolicy.executed ? devPolicy.deleted.length : devPolicy.delete.length}, kept ${devPolicy.kept}${devPolicy.executed ? "" : pc.dim(" (plan only)")}`);
+      for (const item of devPolicy.delete) console.log(`    ${devPolicy.executed ? "delete" : "would delete"} ${item.name}: ${item.reason}`);
+      for (const item of devPolicy.failed) console.log(pc.red(`    failed ${item.name}: ${item.error}`));
+      for (const item of devPolicy.skipped) console.log(pc.dim(`    skipped ${item.name}: ${item.reason}`));
+      if (devPolicy.error) console.log(pc.red(`    dev error: ${devPolicy.error}`));
+    }
   }
   if (report.quota) console.log(`Deployments: ${report.quota.count} of ${report.quota.quota} (${report.quota.percent}%)${report.quota.partial ? " (mapped projects only)" : ""}${report.quota.alert ? pc.red(" ALERT") : ""}`);
   for (const error of report.errors) console.log(pc.red(error));

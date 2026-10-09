@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { COMPANY_A, PREVIEW_KEY, PROJECT_TOKEN, admin, baseConfig, member, ref, run, setup, type Fixture } from "./fixture.js";
 import { HOUR, NOW, deployment } from "./fakes.js";
@@ -303,5 +304,15 @@ describe("configuration", () => {
       { reaper: { pullRequestPattern: "no named group" } }, { reaper: { pullRequestPattern: "(?<pr>[" } }, { reaper: { pullRequestPattern: "x".repeat(300) } },
       { reaper: { supersededMinAgeMinutes: 5 } },
     ]) expect(() => parseConfig(bad as Record<string, unknown>), JSON.stringify(bad)).toThrow();
+  });
+
+  it("parses the example config printed in the design doc", async () => {
+    const { parseConfig } = await import("../src/config.js");
+    const doc = readFileSync(new URL("../../../../docs/plugins/convex.md", import.meta.url), "utf8");
+    const example = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(doc)![1]);
+    const parsed = parseConfig(example);
+    expect(parsed.reaper.dev.maxAgeDays).toBe(7);
+    expect(parsed.reaper.pullRequestPattern).toContain("(?<pr>");
+    expect(parsed.projects[0].repository).toBe("org/app");
   });
 });
