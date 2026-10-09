@@ -24,6 +24,8 @@ import {
 } from "../adapters/index.ts";
 import { buildIssueAssignmentIdempotencyKey } from "../services/issue-assignment-wakeup.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { agentService } from "../services/agents.js";
+import { secretService } from "../services/secrets.js";
 
 vi.mock("../telemetry.js", () => ({
   getTelemetryClient: () => ({ track: vi.fn(), hashPrivateRef: (value: string) => value }),
@@ -61,6 +63,7 @@ interface Invocation {
   adapterType: string;
   model: unknown;
   envKeys: string[];
+  env: Record<string, unknown>;
   sessionId: string | null;
 }
 
@@ -88,6 +91,7 @@ describeEmbeddedPostgres("agent harness fallback", () => {
         adapterType,
         model: ctx.config.model,
         envKeys: Object.keys((ctx.config.env ?? {}) as Record<string, unknown>).sort(),
+        env: (ctx.config.env ?? {}) as Record<string, unknown>,
         sessionId: ctx.runtime.sessionId ?? null,
       });
       const outcome = scripts[adapterType].shift() ?? { kind: "success" };
@@ -302,6 +306,26 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     const detail = await db.select({ fallbacks: agents.fallbacks, adapterType: agents.adapterType })
       .from(agents).where(eq(agents.id, agentId));
     expect(detail[0].adapterType).toBe("claude_local");
+  });
+
+  it("starts a fallback whose credential is a secret reference, binding it to the agent", async () => {
+    const { companyId, agentId, issueId } = await seed({ fallbacks: [] });
+    const secret = await secretService(db).create(companyId, {
+      name: "openai-fallback-key", provider: "local_encrypted", value: "sk-fallback-test-value",
+    });
+    await agentService(db).update(agentId, {
+      fallbacks: [{
+        adapterType: "codex_local", model: "gpt-5.5",
+        env: { OPENAI_API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" } },
+      }],
+    });
+    scripts.claude_local = [{ kind: "usage_limit" }];
+
+    await assign(agentId, issueId);
+    const fallbackRun = await runPending(companyId, "harness_fallback");
+
+    expect(fallbackRun).toMatchObject({ status: "succeeded", executedAdapterType: "codex_local" });
+    expect(invocations.at(-1)).toMatchObject({ adapterType: "codex_local", env: { OPENAI_API_KEY: "sk-fallback-test-value" } });
   });
 
   it("re-dispatches only once per wake: a fallback that also hits its limit gets no second fallback", async () => {

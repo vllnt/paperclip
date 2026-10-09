@@ -145,23 +145,48 @@ export function collectUserSecretRefs(adapterConfig: unknown): Array<{
   return refs;
 }
 
+/**
+ * The configs whose env bindings an agent needs: its adapterConfig and the env
+ * of each fallback target. A fallback run resolves its env at `env.<KEY>` for
+ * the same agent, so its references share the agent's binding paths.
+ *
+ * @param adapterConfig - The agent's primary adapterConfig.
+ * @param fallbacks - The agent's stored fallback targets.
+ * @returns Configs to collect secret references from.
+ */
+export function agentBindingSourceConfigs(adapterConfig: unknown, fallbacks: unknown): unknown[] {
+  const fallbackEnvConfigs = Array.isArray(fallbacks)
+    ? fallbacks.flatMap((entry) => {
+        const env = asRecord(entry)?.env;
+        return env ? [{ env }] : [];
+      })
+    : [];
+  return [adapterConfig, ...fallbackEnvConfigs];
+}
+
+function uniqueBy<T>(items: T[], key: (item: T) => string): T[] {
+  return [...new Map(items.map((item) => [key(item), item])).values()];
+}
+
 export async function syncAgentAdapterEnvBindings(input: {
   secretsSvc: AgentSecretBindingSyncService;
   companyId: string;
   agentId: string;
   adapterConfig: unknown;
+  fallbacks?: unknown;
 }) {
   if (input.secretsSvc.syncSecretRefsForTarget) {
+    const sources = agentBindingSourceConfigs(input.adapterConfig, input.fallbacks);
     await input.secretsSvc.syncSecretRefsForTarget(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
-      collectSecretRefs(input.adapterConfig),
+      uniqueBy(sources.flatMap(collectSecretRefs), (ref) => `${ref.secretId}:${ref.configPath}`),
       { replaceAll: true },
     );
     await input.secretsSvc.syncUserSecretDeclarationsForTarget?.(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
-      collectUserSecretRefs(input.adapterConfig),
+      uniqueBy(sources.flatMap(collectUserSecretRefs), (ref) => `${ref.definitionKey}:${ref.configPath}`),
       { replaceAll: true },
     );
     return;

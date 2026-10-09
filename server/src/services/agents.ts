@@ -34,6 +34,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import {
+  agentBindingSourceConfigs,
   collectSecretRefs,
   collectUserSecretRefs,
   syncAgentAdapterEnvBindings,
@@ -508,9 +509,9 @@ export function agentService(db: Db) {
   }
 
   async function syncAgentSecretBindings(
-    agent: { id: string; companyId: string; adapterConfig: unknown },
+    agent: { id: string; companyId: string; adapterConfig: unknown; fallbacks?: unknown },
     dbClient: Db = db,
-    previousAdapterConfig: unknown = null,
+    previous: { adapterConfig: unknown; fallbacks?: unknown } | null = null,
     actor: RevisionMetadata = {},
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
@@ -519,20 +520,23 @@ export function agentService(db: Db) {
       companyId: agent.companyId,
       agentId: agent.id,
       adapterConfig: agent.adapterConfig,
+      fallbacks: agent.fallbacks,
     });
+    const previousSources = agentBindingSourceConfigs(previous?.adapterConfig ?? null, previous?.fallbacks);
+    const currentSources = agentBindingSourceConfigs(agent.adapterConfig, agent.fallbacks);
     const previousRefs = new Set([
-      ...collectSecretRefs(previousAdapterConfig).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
-      ...collectUserSecretRefs(previousAdapterConfig).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
+      ...previousSources.flatMap(collectSecretRefs).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
+      ...previousSources.flatMap(collectUserSecretRefs).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
     ]);
     const createdRefs = [
-      ...collectSecretRefs(agent.adapterConfig).map((ref) => ({
+      ...currentSources.flatMap(collectSecretRefs).map((ref) => ({
         key: `secret:${ref.secretId}:${ref.configPath}`,
         configPath: ref.configPath,
         bindingType: "secret_ref",
         secretId: ref.secretId,
         definitionKey: null,
       })),
-      ...collectUserSecretRefs(agent.adapterConfig).map((ref) => ({
+      ...currentSources.flatMap(collectUserSecretRefs).map((ref) => ({
         key: `user:${ref.definitionKey}:${ref.configPath}`,
         configPath: ref.configPath,
         bindingType: "user_secret_ref",
@@ -818,7 +822,10 @@ export function agentService(db: Db) {
           .where(and(eq(agentRuntimeState.companyId, existing.companyId), eq(agentRuntimeState.agentId, id)));
       }
 
-      if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
+      if (
+        Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") ||
+        Object.prototype.hasOwnProperty.call(normalizedPatch, "fallbacks")
+      ) {
         if (bindingDecision) {
           await enforceClaudeOAuthBindingClaim(txDb, {
             companyId: existing.companyId,
@@ -831,7 +838,7 @@ export function agentService(db: Db) {
         await syncAgentSecretBindings(
           updated,
           txDb,
-          existing.adapterConfig,
+          { adapterConfig: existing.adapterConfig, fallbacks: existing.fallbacks },
           options?.recordRevision,
         );
       }
@@ -1159,7 +1166,7 @@ export function agentService(db: Db) {
             environmentId: null,
           });
         }
-        await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+        await syncAgentSecretBindings(updated, txDb, { adapterConfig: existing.adapterConfig, fallbacks: existing.fallbacks });
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {
           throw notFound("Agent not found");
