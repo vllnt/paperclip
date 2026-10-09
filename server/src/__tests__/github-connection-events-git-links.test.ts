@@ -167,6 +167,26 @@ describeEmbeddedPostgres.sequential("GitHub connection events link pull requests
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("todo");
   });
 
+  it("does not complete a task when the merge event's head repository can no longer be read", async () => {
+    const { companyId, grantId, prefix } = await seedCompany("GLH");
+    const issueId = await seedIssue(companyId, prefix, 12);
+    const heads = ["acme/app", null];
+    const gitLinks = issueGitLinkService(db, {
+      statusAutomationEnabled: async () => true,
+      enrich: async () => ({ headRepository: heads.shift() ?? null, defaultBranch: "main", title: "Fix login", draft: false }),
+    });
+    const opened = leasedEvent([`${grantId}_101`], { headRef: "glh-12-fix" });
+    const merged = leasedEvent([`${grantId}_101`], { headRef: "glh-12-fix", state: "closed", merged: true, updatedAt: "2026-10-09T11:00:00.000Z" }, "closed");
+
+    await githubConnectionEventService(db, { connector: connectorFor([opened]), gitLinks }).pollOnce();
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("in_review");
+    await githubConnectionEventService(db, { connector: connectorFor([merged]), gitLinks }).pollOnce();
+
+    const [product] = await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    expect(product!.metadata).toMatchObject({ git: { verified: false } });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("in_review");
+  });
+
   it("links but leaves status alone while the switch is off", async () => {
     const { companyId, grantId, prefix } = await seedCompany("GLB");
     const issueId = await seedIssue(companyId, prefix, 12);

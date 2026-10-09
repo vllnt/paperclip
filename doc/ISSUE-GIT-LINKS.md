@@ -50,9 +50,9 @@ linked: by branch name, by an agent workspace branch name, by text, or by hand. 
 panel labels it, but status automation ignores it. Anyone can open a fork pull request with any
 branch name or text, so none of those prove where it came from.
 
-While the head repository is unknown, Paperclip reads it from GitHub. If it still cannot tell,
-the link stays unverified, except a link a person or agent made by hand, which is trusted until
-GitHub shows the head is a fork.
+Every event is checked on its own. While the head repository is unknown, Paperclip reads it from
+GitHub. If it still cannot tell, for example because the fork was deleted, the link is unverified
+for that event, even if an earlier event verified it, and status does not change.
 
 ## Status automation
 

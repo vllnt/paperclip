@@ -52,6 +52,8 @@ describeEmbeddedPostgres("issue git routes", () => {
         workProductState: "open" as const,
         draft: false,
         baseRef: "main",
+        headRepository: "acme/app",
+        defaultBranch: "main",
       }),
     });
     const app = express();

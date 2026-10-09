@@ -297,6 +297,65 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
       expect((await issueRow(issueId)).status).toBe("todo");
     });
 
+    it("does not let a later event with an unknown head repository complete a task verified earlier", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 12);
+      const svc = service();
+
+      const opened = await svc.recordPullRequestSignal(company.id, signal(company.prefix));
+      expect(opened.automation[0]).toMatchObject({ applied: { from: "todo", to: "in_review" } });
+
+      const merged = await svc.recordPullRequestSignal(
+        company.id,
+        signal(company.prefix, { headRepository: null, state: "closed", merged: true, updatedAt: "2026-10-09T12:00:00.000Z", source: "cloud_event" }),
+      );
+
+      expect(merged.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect((await productsFor(issueId))[0]!.metadata).toMatchObject({ git: { verified: false } });
+      expect((await issueRow(issueId)).status).toBe("in_review");
+    });
+
+    it("does not complete a task through its workspace branch when the merge event no longer knows the head repository", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 3);
+      await seedWorkspace(company, issueId, "agent/retry-fix");
+      const svc = service();
+
+      await svc.recordPullRequestSignal(company.id, signal(company.prefix, { headRef: "agent/retry-fix", headRepository: "acme/app" }));
+      expect((await issueRow(issueId)).status).toBe("in_review");
+
+      const merged = await svc.recordPullRequestSignal(
+        company.id,
+        signal(company.prefix, { headRef: "agent/retry-fix", headRepository: null, state: "closed", merged: true, updatedAt: "2026-10-09T12:00:00.000Z", source: "cloud_event" }),
+      );
+
+      expect(merged.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect((await issueRow(issueId)).status).toBe("in_review");
+    });
+
+    it("never verifies a pull request whose head repository is unknown or deleted from the start", async () => {
+      const company = await seedCompany();
+      const unknownId = await seedIssue(company, 12);
+      const deletedId = await seedIssue(company, 13);
+
+      const unknown = await service().recordPullRequestSignal(
+        company.id,
+        signal(company.prefix, { headRepository: null, state: "closed", merged: true }),
+      );
+      const deleted = await issueGitLinkService(db, {
+        statusAutomationEnabled: async () => true,
+        enrich: async () => ({ headRepository: null, defaultBranch: "main" }),
+      }).recordPullRequestSignal(
+        company.id,
+        signal(company.prefix, { headRef: `${company.prefix.toLowerCase()}-13-x`, number: 8, url: "https://github.com/acme/app/pull/8", headRepository: null, state: "closed", merged: true }),
+      );
+
+      expect(unknown.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect(deleted.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect((await issueRow(unknownId)).status).toBe("todo");
+      expect((await issueRow(deletedId)).status).toBe("todo");
+    });
+
     it("treats a workspace branch match as unverified until the head repository is known", async () => {
       const company = await seedCompany();
       const issueId = await seedIssue(company, 3);
@@ -634,6 +693,8 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
       workProductState: "open" as const,
       draft: false,
       baseRef: "main",
+      headRepository: "acme/app",
+      defaultBranch: "main",
       ...overrides,
     });
 
