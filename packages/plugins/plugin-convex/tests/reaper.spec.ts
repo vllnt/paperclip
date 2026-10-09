@@ -138,4 +138,20 @@ describe("reaper", () => {
     expect(f.convex.mutations()).toHaveLength(0);
     expect((await f.h.executeTool<{ error?: string }>("convex_reap_previews", {}, run("nogrant"))).error).toMatch(/grant/i);
   });
+
+  it("counts reaper deletions by an agent against the same per-run cap, across calls and tools", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled({ guards: { maxDeletesPerRun: 3 } }) } });
+    for (let i = 0; i < 8; i++) {
+      f.convex.add(deployment(`old-${i}`));
+      f.github.pulls.push({ number: 100 + i, ref: `old-${i}`, state: "closed", merged: true });
+    }
+    const reap = () => f.h.executeTool<{ data?: any; error?: string }>("convex_reap_previews", { dryRun: false }, run("janitor", COMPANY_A, "run-9"));
+    expect((await reap()).data.projects[0].deleted).toHaveLength(3);
+    expect((await reap()).data.projects[0].deleted).toHaveLength(0);
+    const single = await f.h.executeTool<{ error?: string }>("convex_delete_preview", { name: "old-7" }, run("janitor", COMPANY_A, "run-9"));
+    expect(single.error).toMatch(/limit of 3 deletions/i);
+    expect(f.convex.deletes()).toHaveLength(3);
+    // A new run gets a new allowance.
+    expect((await f.h.executeTool<{ data?: any }>("convex_reap_previews", { dryRun: false }, run("janitor", COMPANY_A, "run-10"))).data.projects[0].deleted).toHaveLength(3);
+  });
 });

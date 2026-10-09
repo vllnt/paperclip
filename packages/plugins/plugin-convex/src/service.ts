@@ -275,10 +275,12 @@ export class ConvexService {
       await this.audit(actor, "Convex preview delete dry run", { ...record, outcome: "dry-run" }, name);
       return { dryRun: true, wouldDelete: true, deleted: false, environment: target.environment, deployment: this.summary(target.deployment, target.environment), evidence: assessment.evidence, reason: assessment.reapReason };
     }
+    // An agent's allowance is per run across every tool call (persisted); the reaper's budget caps one pass on top of that.
+    if (actor.kind === "agent") await this.reserveRunDeletion(actor, config.guards.maxDeletesPerRun);
     if (options.budget) {
       if (options.budget.left <= 0) throw new Refusal(`Deletion limit of ${options.budget.max} reached for this run.`);
       options.budget.left -= 1;
-    } else if (actor.kind === "agent") await this.reserveRunDeletion(actor, config.guards.maxDeletesPerRun);
+    }
     const [token] = await this.nameCredentials(config, actor.companyId, target.project, target.projectIndex, true);
     if (!token) throw new Refusal("No credential is configured for this Convex project.");
     await this.audit(actor, "Convex preview deletion requested", { ...record, outcome: "requested" }, name);
