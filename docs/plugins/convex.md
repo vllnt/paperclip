@@ -198,8 +198,8 @@ A call for a project that another company reserved, or one not in the registry f
   on the mapped repository. Names are compared exactly and with separators normalized (`feat/login` = `feat-login`). "Branch gone" is concluded only from the full branch list, never from
   one missing name. Open pull requests and branches are re-read at delete time. Lists above 1000 entries, an unreadable repository, a missing token or repository, and a preview without
   an identifier all fail closed.
-- **An expiry is a delayed delete.** An agent's expiry earlier than the largest of the preview's current deadline, the reaper's own deadline (`lastDeployTime + ttlHours`) and
-  `now + activityHours` follows the deletion guards and counts against the run's deletion cap. Extending a deadline (up to 7 days) is free. The reaper applies its own policy (below).
+- **An expiry is a delayed delete.** An agent's expiry earlier than the largest of the preview's current deadline, the deadline the reaper would give it (`lastDeployTime + ttlHours`, or `now + ttlHours`
+  for a stale preview) and `now + activityHours` (at most 168) follows the deletion guards and counts against the run's deletion cap. Extending a deadline (up to 7 days) is free. The reaper applies its own policy (below).
 - **Cheap refusals first**: a run that has used its deletion allowance is refused before any network call.
 - **Delete outcome**: a delete that fails or goes unanswered is checked against Convex; if the deployment is gone it is reported as deleted, otherwise as unconfirmed, never as a clean failure.
 - **Lookups**: "does not exist", "not reachable" and "belongs to another company or an unmapped project" return the same message, so deployment names cannot be probed.
@@ -250,7 +250,7 @@ Hourly job `convex-reaper` (also `reaper.run` and the `convex_reap_previews` too
 1. keeps anything classified staging or production, anything with an open PR or a recently active branch, and anything it cannot check;
 2. deletes previews whose PR is closed or merged, or whose branch is gone and whose last deploy is older than `guards.activityHours`;
 3. sets `expiresAt = lastDeployTime + ttlHours` on kept previews. It shortens an expiry, and it moves an expiry later after a redeploy only when that expiry is one the reaper set
-   itself (it remembers them); an expiry a person chose is never extended. When the new moment is less than two hours away (a guarded preview idle for almost `ttlHours`), the reaper does
+   itself or that an agent set through the tool (it remembers them); an expiry a person chose is never extended. A move to a later deadline needs no GitHub, so it continues during a GitHub outage. When the new moment is less than two hours away (a guarded preview idle for almost `ttlHours`), the reaper does
    not schedule it (two hours leaves one hourly pass to see a redeploy); it only gives a preview without any expiry `now + ttlHours`. Convex measures its own default expiry from creation and its docs do not say that a redeploy resets it, so the
    reaper does not rely on that. **Policy note:** as specified, a preview with an open pull request that is not redeployed for `ttlHours` expires and the next push recreates it;
    `guards.activityHours` keeps branches with recent commits from being deleted by the reaper, not from expiring;
