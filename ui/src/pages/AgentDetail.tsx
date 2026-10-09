@@ -3681,6 +3681,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                   {runAdapterType && (
                     <span className="bg-muted rounded px-1.5 py-0.5 text-(length:--text-nano) font-medium uppercase tracking-wide">{runAdapterType.replace(/_/g, " ")}</span>
                   )}
+                  {run.targetSource && run.targetSource !== "agent_default" && (
+                    <span data-testid="run-detail-target-source">{run.targetSource.replace(/_/g, " ")}</span>
+                  )}
                   {run.fallbackReason && (
                     <span data-testid="run-detail-fallback-reason">fallback · {run.fallbackReason.replace(/_/g, " ")}</span>
                   )}

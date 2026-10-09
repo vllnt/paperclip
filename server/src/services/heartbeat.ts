@@ -3409,6 +3409,7 @@ const heartbeatRunListColumns = {
   executedAdapterType: heartbeatRuns.executedAdapterType,
   executedModel: heartbeatRuns.executedModel,
   fallbackReason: heartbeatRuns.fallbackReason,
+  targetSource: sql<string | null>`${heartbeatRuns.runnerProfileJson} -> 'adapterDispatch' ->> 'source'`,
   externalRunId: heartbeatRuns.externalRunId,
   processPid: heartbeatRuns.processPid,
   processGroupId: heartbeatRunProcessGroupIdColumn,

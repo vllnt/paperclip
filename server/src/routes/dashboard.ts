@@ -6,6 +6,7 @@ import {
   MAX_WINDOW_WEEKS,
   recoveryObservabilityService,
 } from "../services/recovery-observability.js";
+import { runTargetStatsService } from "../services/run-target-stats.js";
 import { assertCompanyAccess } from "./authz.js";
 
 function parsePositiveNumber(
@@ -23,12 +24,20 @@ export function dashboardRoutes(db: Db) {
   const router = Router();
   const svc = dashboardService(db);
   const recoveryObservability = recoveryObservabilityService(db);
+  const runTargetStats = runTargetStatsService(db);
 
   router.get("/companies/:companyId/dashboard", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const summary = await svc.summary(companyId);
     res.json(summary);
+  });
+
+  router.get("/companies/:companyId/run-target-stats", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const hours = parsePositiveNumber(req.query.hours, 24, 24 * 30);
+    res.json(await runTargetStats.report(companyId, { hours }));
   });
 
   router.get("/companies/:companyId/recovery-observability", async (req, res) => {
