@@ -67,6 +67,20 @@ export const DEFAULT_GITHUB_WRITE_THROTTLE: Readonly<GitHubWriteThrottle> = Obje
 
 /** Branch names treated as a repository's default branch for `pushToMain`. */
 export const GITHUB_DEFAULT_BRANCH_NAMES: readonly string[] = ["main", "master"];
+/**
+ * Branch names agents never delete, force-push, rename or hard-reset, even
+ * when GitHub does not report them as the default or as protected. Compared
+ * case-insensitively. `main` and `master` are the usual defaults; `staging`
+ * and `production` are release branches (never delete SongTrivia `staging` or
+ * `Production`). GitHub's own answer still protects every other branch.
+ */
+export const GITHUB_PROTECTED_BRANCH_FLOOR: readonly string[] = ["main", "master", "staging", "production"];
+
+/** True when `name` is on {@link GITHUB_PROTECTED_BRANCH_FLOOR}. Accepts `refs/heads/NAME` or the bare name. */
+export function isProtectedBranchFloor(name: string): boolean {
+  const branch = name.replace(/^refs\/heads\//i, "");
+  return GITHUB_PROTECTED_BRANCH_FLOOR.includes(branch.toLowerCase());
+}
 
 export type GitHubUserSource = "run" | "app";
 export type GitHubPermissionLevel = "read" | "write" | "admin";
@@ -538,7 +552,7 @@ export function gitHubAgentsNeverDenial(what: GitHubAgentsNever, route: string):
 const neverByAgents = (base: GitHubCommandClass, what: AgentsNever, route: string): GitHubCommandClass =>
   ({ ...base, denied: gitHubAgentsNeverDenial(what, route), integrity: true });
 /** A branch name that is, or may be, a default branch: gh fills `{branch}` and `:branch` from the checkout. */
-const mayBeDefaultBranch = (name: string) => /\{branch\}|:branch\b/.test(name) || GITHUB_DEFAULT_BRANCH_NAMES.includes(name.replace(/^refs\/heads\//, ""));
+const mayBeDefaultBranch = (name: string) => /\{branch\}|:branch\b/.test(name) || isProtectedBranchFloor(name);
 
 /** git's global options that take the next argument as their value. */
 const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"]);
@@ -840,7 +854,7 @@ function classifyGit(args: readonly string[], context: GitHubCommandContext): Gi
       // A deletion adds no commits; otherwise an unknown answer counts as a workflow change.
       ...(!deletes && context.touchesWorkflows !== false ? ["editWorkflows" as const] : []),
       ...wiki);
-    const destructive = updates.find(update => (update.force || update.delete) && isDefaultBranchRef(update.ref));
+    const destructive = updates.find(update => (update.force || update.delete) && (isDefaultBranchRef(update.ref) || isProtectedBranchFloor(update.ref)));
     if (destructive) {
       return neverByAgents(result, "defaultBranch", destructive.configured
         ? "git push with the checkout's push config, which may force or prune every branch; push branches by name"

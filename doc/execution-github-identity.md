@@ -273,7 +273,7 @@ recorded as `github.write_identity_resolved` with the agent and run:
 | Operation | Refused routes |
 |---|---|
 | Archive, unarchive, delete, rename, transfer or change the settings of a repository | `gh repo archive\|unarchive\|delete\|rename\|edit\|transfer`; any `gh api` write to `repos/OWNER/REPO` (or `repositories/ID`) itself or to `…/transfer`; GraphQL `archiveRepository`, `unarchiveRepository`, `updateRepository`, `transferRepository` |
-| Delete or force-push a default or protected branch | `main` and `master` always: `git push` with `--delete`/`-d`, `:main`, `+…:main`, `-f`/`--force`/`--force-with-lease` reaching `main`, `--mirror`, `--prune` or `--force` with branch patterns, `+:`, and a push without refspecs whose repository config may force or prune; `gh repo sync --force` without a branch; `DELETE …/git/refs/heads/main`, `PATCH` there with `force` not `false` or a body Paperclip cannot read; `POST …/branches/main/rename`. Any other branch the same forms name (and `gh repo sync --force --branch BRANCH`) when GitHub reports it as the default or a protected branch, or cannot be read (below). GraphQL `deleteRef`, `updateRef`, `updateRefs` (they name the ref by node ID, so every branch: use `git push`) |
+| Delete or force-push a default or protected branch | `main`, `master`, `staging` and `production` always (any casing: `Production` too): `git push` with `--delete`/`-d`, `:main`, `+…:main`, `-f`/`--force`/`--force-with-lease` reaching `main`, `--mirror`, `--prune` or `--force` with branch patterns, `+:`, and a push without refspecs whose repository config may force or prune; `gh repo sync --force` without a branch; `DELETE …/git/refs/heads/main`, `PATCH` there with `force` not `false` or a body Paperclip cannot read; `POST …/branches/main/rename`. Any other branch the same forms name (and `gh repo sync --force --branch BRANCH`) when GitHub reports it as the default or a protected branch, or cannot be read (below). GraphQL `deleteRef`, `updateRef`, `updateRefs` (they name the ref by node ID, so every branch: use `git push`) |
 | Change branch protection or rulesets | writes to `…/branches/BRANCH/protection/**`, `…/tags/protection/**`, `…/rulesets/**`, `orgs/ORG/rulesets/**`; GraphQL `create`/`update`/`deleteBranchProtectionRule` and `…RepositoryRuleset` |
 | Change webhooks | writes to `…/hooks/**`, `orgs/ORG/hooks/**` |
 | Change secrets, variables or deploy keys | `gh secret`/`gh variable` writes, `gh repo deploy-key` writes; writes to `…/actions/secrets/**` and `…/actions/variables/**`, `…/dependabot/secrets/**`, `…/codespaces/secrets/**` (repository and organization), `…/keys/**` |
@@ -291,6 +291,8 @@ may be named `heads/main` or `hooks/1`), and a gh option before the verb. A
 unknown, and only a literal `force=false` is not forced. Routes are matched
 case-insensitively, after decoding, and a branch name may hold slashes.
 Deployment statuses other than `inactive` stay `deploymentApproval`.
+
+**The name floor does not ask GitHub.** `main`, `master`, `staging` and `production` (any casing) are refused for a delete, force-push, rename or hard-reset even when GitHub says the branch is neither the default nor protected. A fast-forward push to one of them is still an ordinary write.
 
 **Default and protected branches are GitHub's.** For any other branch a write
 forces, deletes, renames or hard-resets, Paperclip reads from GitHub, with the

@@ -43,6 +43,10 @@ describe("protected branches read from GitHub", () => {
     }
     // Rules about commit contents or history shape do not guard a branch; a branch that does not exist has no classic protection.
     expect(protectedBranchRefusal("acme/a", ["feature", "signed", "missing"])).toBeNull();
+    // Name floor: staging and production stay refused even when GitHub says they are neither the default nor protected.
+    for (const name of ["staging", "production", "Production", "MAIN"]) {
+      expect(protectedBranchRefusal("acme/a", ["feature", name]), name).toMatch(new RegExp(`${name} is a protected branch name`));
+    }
     // Only authenticated GETs to api.github.com.
     expect(github.requests.every(request => request.method === "GET" && request.url.startsWith("https://api.github.com/repos/acme/a") && request.authorization === "Bearer read-token")).toBe(true);
   });

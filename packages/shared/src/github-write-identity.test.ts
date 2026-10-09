@@ -1105,4 +1105,24 @@ describe("security review of the agents-never deny (round 2)", () => {
     // Refused writes carry nothing to check.
     expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/main")).not.toHaveProperty("branchRewrites");
   });
+
+  it("denies deletes, force-pushes and rewrites of staging and production by name, whatever GitHub reports", () => {
+    const git = (args: string[]) => classifyGitHubCommand("git", args, { touchesWorkflows: false });
+    const floor = /delete or force-push a default or protected branch/;
+    for (const branch of ["staging", "production", "Production", "STAGING", "Main"]) {
+      expect(git(["push", "--force", "origin", branch]).denied, branch).toMatch(floor);
+      expect(git(["push", "origin", "--delete", branch]).denied, `delete ${branch}`).toMatch(floor);
+      expect(git(["push", "origin", `:${branch}`]).denied, `:${branch}`).toMatch(floor);
+      expect(git(["push", "origin", `+HEAD:${branch}`]).denied, `+HEAD:${branch}`).toMatch(floor);
+      expect(gh("api", "-X", "DELETE", `repos/o/r/git/refs/heads/${encodeURIComponent(branch)}`).denied, `DELETE ${branch}`).toMatch(floor);
+      expect(gh("api", "--method", "DELETE", `https://api.github.com/repos/o/r/git/refs/heads/${branch}`).denied, `url ${branch}`).toMatch(floor);
+      expect(gh("api", "-X", "PATCH", `repos/o/r/git/refs/heads/${branch}`, "-f", `sha=${sha}`, "-f", "force=true").denied, `force ${branch}`).toMatch(floor);
+      expect(gh("api", "-X", "POST", `repos/o/r/branches/${branch}/rename`, "-f", "new_name=dev").denied, `rename ${branch}`).toMatch(floor);
+      expect(gh("repo", "sync", "--force", "--branch", branch).denied, `sync ${branch}`).toMatch(floor);
+    }
+    // A fast-forward push to those branches is still an ordinary write. Only the rewrite is refused.
+    expect(git(["push", "origin", "staging"])).toEqual(write("push"));
+    expect(git(["push", "origin", "production"])).toEqual(write("push"));
+    expect(gh("repo", "sync", "--branch", "staging")).toEqual(write("push", "pushToMain"));
+  });
 });

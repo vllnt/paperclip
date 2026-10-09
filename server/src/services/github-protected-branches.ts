@@ -1,4 +1,4 @@
-import { gitHubAgentsNeverDenial } from "@paperclipai/shared";
+import { gitHubAgentsNeverDenial, isProtectedBranchFloor } from "@paperclipai/shared";
 
 /**
  * What GitHub says about a repository's branches, for the classifier's
@@ -49,6 +49,8 @@ function remember<T extends { at: number }>(facts: Map<string, T>, key: string, 
 export function protectedBranchRefusal(repository: string, branches: readonly string[], now = Date.now()): string | null {
   const defaultBranch = defaultBranches.get(repository);
   for (const branch of branches) {
+    // The name floor is not something a "not protected" answer from GitHub can clear.
+    if (isProtectedBranchFloor(branch)) return gitHubAgentsNeverDenial("defaultBranch", `${branch} is a protected branch name (main, master, staging or production) of ${repository}`);
     const unknown = `Denied: Paperclip could not read from GitHub whether ${branch} is the default or a protected branch of ${repository}, and agents never delete or force-push one. Try again; if this persists, check the run's GitHub read access.`;
     if (!defaultBranch || now - defaultBranch.at >= FACT_TTL_MS) return unknown;
     if (branch.toLowerCase() === defaultBranch.name.toLowerCase()) return gitHubAgentsNeverDenial("defaultBranch", `${branch} is the default branch of ${repository}`);
