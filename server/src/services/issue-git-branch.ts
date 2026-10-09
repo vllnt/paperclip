@@ -1,3 +1,4 @@
+import { isValidExistingBranchName } from "@paperclipai/shared";
 import { parseObject } from "../adapters/utils.js";
 import { renderWorkspaceTemplate, sanitizeBranchName } from "./workspace-runtime.js";
 
@@ -26,6 +27,14 @@ export interface BuildIssueBranchNameInput {
   projectId?: string | null;
 }
 
+/**
+ * A pinned branch is shown as it is, so it must already be a valid git branch name; an
+ * invalid one (stored before validation, for example) falls back to the template.
+ */
+function isGitBranchName(name: string): boolean {
+  return isValidExistingBranchName(name) && name.split("/").every((component) => !component.endsWith(".lock"));
+}
+
 function strategyOf(config: Record<string, unknown> | null | undefined): Record<string, unknown> {
   return parseObject(config?.workspaceStrategy);
 }
@@ -43,8 +52,10 @@ function nonBlank(value: unknown): string | null {
  */
 export function buildIssueBranchName(input: BuildIssueBranchNameInput): IssueBranchName {
   const issueStrategy = strategyOf(input.issue.executionWorkspaceSettings);
-  const existingBranch = nonBlank(issueStrategy.existingBranch);
-  if (existingBranch) return { name: existingBranch.trim(), template: null, source: "existing_branch" };
+  const existingBranch = nonBlank(issueStrategy.existingBranch)?.trim();
+  if (existingBranch && isGitBranchName(existingBranch)) {
+    return { name: existingBranch, template: null, source: "existing_branch" };
+  }
 
   const issueTemplate = nonBlank(issueStrategy.branchTemplate);
   const projectTemplate = nonBlank(strategyOf(input.projectPolicy).branchTemplate);

@@ -1952,6 +1952,7 @@ export {
   type CompanySearchExtractQuery,
   type CompanySearchQuery,
   createIssueSchema,
+  isValidExistingBranchName,
   setIssueTitleSchema,
   type SetIssueTitle,
   createIssueInputSchema,
