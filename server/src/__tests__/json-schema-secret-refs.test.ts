@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  SecretRefRedactionLimitError,
   collectSecretRefPaths,
+  haveSameSecretRefValues,
   parseSecretRefBindingObject,
+  redactProviderMetadata,
   redactSecretRefValues,
 } from "../services/json-schema-secret-refs.ts";
 
@@ -227,5 +230,117 @@ describe("redactSecretRefValues", () => {
     expect(input).toEqual({ apiKey: SECRET, region: "us" });
     expect(redactSecretRefValues(input, null)).toEqual(input);
     expect(redactSecretRefValues(input, undefined)).toEqual(input);
+  });
+});
+
+describe("redactSecretRefValues limits", () => {
+  const schema = {
+    type: "object",
+    properties: { apiKey: { type: "string", format: "secret-ref" } },
+  };
+
+  function nestedObject(depth: number): unknown {
+    let value: unknown = "leaf";
+    for (let level = 0; level < depth; level += 1) value = { child: value };
+    return value;
+  }
+
+  function nestedArray(depth: number): unknown {
+    let value: unknown = "leaf";
+    for (let level = 0; level < depth; level += 1) value = [value];
+    return value;
+  }
+
+  it("throws a limit error, not a RangeError, for values nested far past the depth limit", () => {
+    for (const depth of [65, 5_000, 10_000]) {
+      expect(() => redactSecretRefValues(nestedObject(depth), schema)).toThrow(SecretRefRedactionLimitError);
+      expect(() => redactSecretRefValues(nestedArray(depth), schema)).toThrow(SecretRefRedactionLimitError);
+    }
+  });
+
+  it("accepts a value nested exactly at the depth limit", () => {
+    expect(() => redactSecretRefValues(nestedObject(64), schema)).not.toThrow();
+  });
+
+  it("throws a limit error for a cyclic value", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => redactSecretRefValues(cyclic, schema)).toThrow(SecretRefRedactionLimitError);
+  });
+
+  it("throws a limit error for a value with too many nodes, and still handles a large flat one", () => {
+    expect(() => redactSecretRefValues(new Array(100_001).fill(1), schema)).toThrow(SecretRefRedactionLimitError);
+    const flat: Record<string, unknown> = { apiKey: "resolved-secret-value" };
+    for (let index = 0; index < 20_000; index += 1) flat[`key${index}`] = "x";
+    const result = redactSecretRefValues(flat, schema) as Record<string, unknown>;
+    expect(result).not.toHaveProperty("apiKey");
+    expect(Object.keys(result)).toHaveLength(20_000);
+  });
+
+  it("redactProviderMetadata withholds an over-limit value behind a constant marker and redacts the rest", () => {
+    const marker = redactProviderMetadata({ deep: nestedObject(10_000), apiKey: "resolved-secret-value" }, schema);
+    expect(marker).toEqual({ withheld: expect.any(String) });
+    expect(JSON.stringify(marker)).not.toContain("resolved-secret-value");
+    expect(redactProviderMetadata({ region: "us", apiKey: "resolved-secret-value" }, schema)).toEqual({ region: "us" });
+    expect(redactProviderMetadata(null, schema)).toEqual({});
+    expect(redactProviderMetadata({ apiKey: "resolved-secret-value" }, schema)).toEqual({});
+  });
+});
+
+describe("haveSameSecretRefValues", () => {
+  const secretString = { type: "string", format: "secret-ref" };
+  const schema = {
+    type: "object",
+    $defs: { credential: { type: "object", properties: { host: { type: "string" }, token: secretString } } },
+    properties: {
+      template: { type: "string" },
+      apiKey: secretString,
+      tokens: { type: "array", items: secretString },
+      replicas: { type: "array", items: { $ref: "#/$defs/credential" } },
+    },
+  };
+  const before = {
+    template: "Base",
+    apiKey: "id-1",
+    tokens: ["id-2", "id-3"],
+    replicas: [{ host: "a", token: "id-4" }],
+  };
+
+  it("ignores non-secret changes, key order and the order of secret array items", () => {
+    expect(
+      haveSameSecretRefValues(
+        before,
+        {
+          replicas: [{ token: "id-4", host: "renamed" }],
+          tokens: ["id-3", "id-2"],
+          apiKey: "id-1",
+          template: "base",
+          extra: "added",
+        },
+        schema,
+      ),
+    ).toBe(true);
+  });
+
+  it("detects a changed, added, removed or reordered-into-another-field secret value", () => {
+    expect(haveSameSecretRefValues(before, { ...before, apiKey: "resolved-secret-value" }, schema)).toBe(false);
+    expect(haveSameSecretRefValues(before, { ...before, tokens: ["id-2", "id-3", "resolved-secret-value"] }, schema)).toBe(false);
+    expect(haveSameSecretRefValues(before, { ...before, tokens: ["id-2"] }, schema)).toBe(false);
+    expect(
+      haveSameSecretRefValues(before, { ...before, replicas: [{ host: "a", token: "resolved-secret-value" }] }, schema),
+    ).toBe(false);
+    expect(haveSameSecretRefValues({ template: "x" }, { template: "x", apiKey: "resolved-secret-value" }, schema)).toBe(false);
+  });
+
+  it("treats everything as equal when the schema declares no secret-ref field", () => {
+    expect(haveSameSecretRefValues({ a: 1 }, { a: 2 }, { type: "object", properties: { a: { type: "number" } } })).toBe(true);
+    expect(haveSameSecretRefValues({ a: 1 }, { a: 2 }, null)).toBe(true);
+  });
+
+  it("throws the limit error for an over-limit value on either side", () => {
+    let deep: unknown = "leaf";
+    for (let level = 0; level < 10_000; level += 1) deep = { child: deep };
+    expect(() => haveSameSecretRefValues(before, { deep }, schema)).toThrow(SecretRefRedactionLimitError);
+    expect(() => haveSameSecretRefValues({ deep }, before, schema)).toThrow(SecretRefRedactionLimitError);
   });
 });

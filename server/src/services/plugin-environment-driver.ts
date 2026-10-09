@@ -24,8 +24,10 @@ import { unprocessable } from "../errors.js";
 import {
   collectSecretRefPaths,
   parseSecretRefBindingObject,
+  SecretRefRedactionLimitError,
+  haveSameSecretRefValues,
   readConfigValueAtPath,
-  redactSecretRefValues,
+  redactProviderMetadata,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { pluginRegistryService } from "./plugin-registry.js";
@@ -53,7 +55,7 @@ function safeProbeOutput(
       severity: DIAGNOSTIC_SEVERITIES.has(diagnostic?.severity as string) ? diagnostic?.severity : "info",
       message: WITHHELD_PROVIDER_TEXT,
     })),
-    metadata: (redactSecretRefValues(result.metadata ?? {}, configSchema) ?? {}) as Record<string, unknown>,
+    metadata: redactProviderMetadata(result.metadata, configSchema),
   };
 }
 
@@ -381,12 +383,30 @@ export async function validatePluginSandboxProviderConfig(input: {
   };
 }
 
+// The host owns the values at declared secret-ref positions: they are the caller's
+// secret ids. A provider may normalize any other field, but a different value at
+// one of those positions could be a resolved secret that it echoes, and the
+// normalized config is stored and returned as is. A value over the redaction
+// limits cannot be checked, so it counts as changed.
+function keepsCallerSecretRefs(
+  caller: Record<string, unknown>,
+  normalized: Record<string, unknown>,
+  schema: Record<string, unknown> | null,
+): boolean {
+  try {
+    return haveSameSecretRefValues(caller, normalized, schema);
+  } catch (error) {
+    if (error instanceof SecretRefRedactionLimitError) return false;
+    throw error;
+  }
+}
+
 export async function validatePluginEnvironmentDriverConfig(input: {
   db: Db;
   workerManager: PluginWorkerManager;
   config: PluginEnvironmentConfig;
 }): Promise<PluginEnvironmentConfig> {
-  const { plugin } = await resolvePluginEnvironmentDriver(input);
+  const { plugin, driver } = await resolvePluginEnvironmentDriver(input);
   const result = await input.workerManager.call(plugin.id, "environmentValidateConfig", {
     driverKey: input.config.driverKey,
     config: input.config.driverConfig,
@@ -396,9 +416,16 @@ export async function validatePluginEnvironmentDriverConfig(input: {
     throw providerRejectedConfig(`Plugin environment driver "${pluginDriverProviderKey(input.config)}"`, result);
   }
 
+  const driverConfig = result.normalizedConfig ?? input.config.driverConfig;
+  if (!keepsCallerSecretRefs(input.config.driverConfig, driverConfig, declaredConfigSchema(driver))) {
+    throw unprocessable(
+      `Plugin environment driver "${pluginDriverProviderKey(input.config)}" returned a config that changes a secret-ref field. The config was not saved.`,
+    );
+  }
+
   return {
     ...input.config,
-    driverConfig: result.normalizedConfig ?? input.config.driverConfig,
+    driverConfig,
   };
 }
 

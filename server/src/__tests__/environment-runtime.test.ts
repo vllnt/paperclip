@@ -7864,26 +7864,15 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  it("does not store a declared secret-ref value that a generic plugin driver returns in its lease metadata", async () => {
+  // Acquires a run lease from a generic plugin driver whose `environmentAcquireLease`
+  // returns `providerMetadata`, and returns the lease and its stored row.
+  async function acquireGenericPluginLease(providerMetadata: Record<string, unknown>) {
     const pluginId = randomUUID();
-    const resolvedApiKey = "resolved-provider-api-key";
-    const resolvedToken = "resolved-connection-token";
-    const resolvedListToken = "resolved-list-token";
-    const resolvedReplicaToken = "resolved-replica-token";
     const workerManager = {
       isRunning: vi.fn(() => true),
       call: vi.fn(async (_pluginId: string, method: string) => {
         if (method === "environmentAcquireLease") {
-          return {
-            providerLeaseId: "plugin-lease-secret-echo",
-            metadata: {
-              remoteCwd: "/workspace",
-              apiKey: resolvedApiKey,
-              connection: { host: "sandbox.example.test", token: resolvedToken },
-              tokens: [resolvedListToken],
-              replicas: [{ host: "replica.example.test", token: resolvedReplicaToken }],
-            },
-          };
+          return { providerLeaseId: "plugin-lease-secret-echo", metadata: providerMetadata };
         }
         return undefined;
       }),
@@ -7956,6 +7945,22 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
 
     const [stored] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+    return { acquired, stored };
+  }
+
+  it("does not store a declared secret-ref value that a generic plugin driver returns in its lease metadata", async () => {
+    const resolvedApiKey = "resolved-provider-api-key";
+    const resolvedToken = "resolved-connection-token";
+    const resolvedListToken = "resolved-list-token";
+    const resolvedReplicaToken = "resolved-replica-token";
+    const { acquired, stored } = await acquireGenericPluginLease({
+      remoteCwd: "/workspace",
+      apiKey: resolvedApiKey,
+      connection: { host: "sandbox.example.test", token: resolvedToken },
+      tokens: [resolvedListToken],
+      replicas: [{ host: "replica.example.test", token: resolvedReplicaToken }],
+    });
+
     expect(stored?.metadata).toMatchObject({
       pluginKey: "acme.environments",
       driverKey: "secret-echo-plugin",
@@ -7974,6 +7979,20 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedApiKey);
     expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedListToken);
     expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedReplicaToken);
+  });
+
+  it("stores a withheld marker, and still acquires, when provider lease metadata is nested too deeply to check", async () => {
+    let deep: unknown = "leaf";
+    for (let level = 0; level < 10_000; level += 1) deep = { child: deep };
+
+    const { stored } = await acquireGenericPluginLease({ remoteCwd: "/workspace", deep });
+
+    expect(stored?.metadata).toMatchObject({
+      pluginKey: "acme.environments",
+      driverKey: "secret-echo-plugin",
+      providerMetadata: { withheld: expect.any(String) },
+    });
+    expect(JSON.stringify(stored?.metadata).length).toBeLessThan(2_000);
   });
 
   it("releases with the driver captured on the lease even if the environment driver changes later", async () => {

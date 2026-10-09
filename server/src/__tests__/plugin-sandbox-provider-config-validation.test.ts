@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.ts";
+import { normalizeEnvironmentConfigForPersistence } from "../services/environment-config.ts";
 import {
   probePluginEnvironmentDriver,
   probePluginSandboxProviderDriver,
@@ -223,6 +224,34 @@ describe("provider-controlled output is not returned to the caller", () => {
     expect(result.summary).toBe('Sandbox provider "secure-plugin" probe passed.');
   });
 
+  function deeplyNested(depth: number): unknown {
+    let value: unknown = "leaf";
+    for (let level = 0; level < depth; level += 1) value = { child: value };
+    return value;
+  }
+
+  it("withholds probe metadata that is nested too deeply to check, without throwing", async () => {
+    const result = await probePluginSandboxProviderDriver({
+      db: {} as Db,
+      workerManager: workerManagerReturning({ ok: true, metadata: { deep: deeplyNested(10_000) } }),
+      companyId: "company-1",
+      environmentId: "environment-1",
+      provider: "secure-plugin",
+      config: { provider: "secure-plugin" },
+    });
+    expect(result.ok).toBe(true);
+    expect((result.details as { metadata: unknown }).metadata).toEqual({ withheld: expect.any(String) });
+
+    const generic = await probePluginEnvironmentDriver({
+      db: {} as Db,
+      workerManager: workerManagerReturning({ ok: true, metadata: { deep: deeplyNested(10_000) } }),
+      companyId: "company-1",
+      environmentId: "environment-1",
+      config: pluginConfig,
+    });
+    expect((generic.details as { metadata: unknown }).metadata).toEqual({ withheld: expect.any(String) });
+  });
+
   it("redacts probe summary, diagnostics and metadata for a plugin environment driver", async () => {
     const result = await probePluginEnvironmentDriver({
       db: {} as Db,
@@ -233,5 +262,107 @@ describe("provider-controlled output is not returned to the caller", () => {
     });
     expectSafeProbeDetails(result);
     expect(result.summary).toMatch(/probe passed\./);
+  });
+});
+
+describe("a provider's normalizedConfig keeps the caller's secret references", () => {
+  // `driver: "plugin"` stores the provider's normalizedConfig as the environment
+  // config, and the API returns it. A declared secret-ref field holds the caller's
+  // secret id, so the provider may normalize other fields but not those values.
+  const RESOLVED = "resolved-provider-token-9f3a";
+  const ID_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const ID_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const callerDriverConfig = { template: "Base", apiKey: SECRET_ID, tokens: [ID_A, ID_B] };
+  const pluginConfig = {
+    pluginKey: "acme.secure-sandbox-provider",
+    driverKey: "secure-plugin",
+    driverConfig: callerDriverConfig,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    seedProviderPlugin();
+  });
+
+  function workerManagerReturning(result: unknown) {
+    return {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async () => result),
+    } as unknown as PluginWorkerManager & { call: ReturnType<typeof vi.fn> };
+  }
+
+  function validate(result: unknown, config = pluginConfig) {
+    return validatePluginEnvironmentDriverConfig({ db: {} as Db, workerManager: workerManagerReturning(result), config });
+  }
+
+  async function expectRejectedWithoutEcho(attempt: Promise<unknown>) {
+    const error = await attempt.then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(HttpError);
+    expect((error as HttpError).status).toBe(422);
+    expect(JSON.stringify({ message: (error as HttpError).message, details: (error as HttpError).details })).not.toContain(
+      RESOLVED,
+    );
+  }
+
+  it("keeps a normalization of non-secret fields and the same secret references in any order", async () => {
+    const normalizedConfig = { template: "base", apiKey: SECRET_ID, tokens: [ID_B, ID_A], timeoutMs: 30_000 };
+    const result = await validate({ ok: true, normalizedConfig });
+    expect(result.driverConfig).toEqual(normalizedConfig);
+  });
+
+  it("falls back to the caller's config when the provider returns no normalizedConfig", async () => {
+    const result = await validate({ ok: true });
+    expect(result.driverConfig).toEqual(callerDriverConfig);
+  });
+
+  it("rejects a resolved value in place of a secret reference", async () => {
+    await expectRejectedWithoutEcho(
+      validate({ ok: true, normalizedConfig: { ...callerDriverConfig, apiKey: RESOLVED } }),
+    );
+  });
+
+  it("rejects a resolved value added to a declared secret array", async () => {
+    await expectRejectedWithoutEcho(
+      validate({ ok: true, normalizedConfig: { ...callerDriverConfig, tokens: [ID_A, ID_B, RESOLVED] } }),
+    );
+  });
+
+  it("rejects a resolved value in a declared field that the caller left empty", async () => {
+    await expectRejectedWithoutEcho(
+      validate(
+        { ok: true, normalizedConfig: { template: "Base", apiKey: RESOLVED } },
+        { ...pluginConfig, driverConfig: { template: "Base" } },
+      ),
+    );
+  });
+
+  it("rejects a normalizedConfig nested too deeply to check, without throwing a RangeError", async () => {
+    let deep: unknown = "leaf";
+    for (let level = 0; level < 10_000; level += 1) deep = { child: deep };
+    await expectRejectedWithoutEcho(validate({ ok: true, normalizedConfig: { ...callerDriverConfig, deep } }));
+  });
+
+  it("does not persist or return a resolved value through the environment persistence entry", async () => {
+    const persist = (result: unknown) =>
+      normalizeEnvironmentConfigForPersistence({
+        db: {} as Db,
+        companyId: "company-1",
+        environmentName: "Plugin environment",
+        driver: "plugin",
+        secretProvider: "local_encrypted",
+        config: pluginConfig,
+        pluginWorkerManager: workerManagerReturning(result),
+      });
+
+    await expectRejectedWithoutEcho(
+      persist({ ok: true, normalizedConfig: { ...callerDriverConfig, apiKey: RESOLVED } }),
+    );
+    await expect(persist({ ok: true, normalizedConfig: callerDriverConfig })).resolves.toEqual({
+      ...pluginConfig,
+      driverConfig: callerDriverConfig,
+    });
   });
 });

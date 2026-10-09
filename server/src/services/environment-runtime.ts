@@ -80,7 +80,7 @@ import {
   resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
-import { redactSecretRefValues } from "./json-schema-secret-refs.js";
+import { redactProviderMetadata } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import {
   createSandboxOrphanCleanupSpool,
@@ -386,7 +386,7 @@ function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  return (redactSecretRefValues(input.metadata ?? {}, input.schema) ?? {}) as Record<string, unknown>;
+  return redactProviderMetadata(input.metadata, input.schema);
 }
 
 export interface EnvironmentDriverAcquireInput {
