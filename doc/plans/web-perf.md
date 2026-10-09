@@ -20,7 +20,7 @@ The app is fast once it is loaded and quiet when idle. It is slow to start and w
 
 Everything below is reproducible with the scripts in `tests/perf/web-app/`.
 
-**Fixture** (`seed-fixture.mjs`, deterministic): one company, 32 agents, 8 projects, 1,000 issues (20% backlog, 25% todo, 12% in progress, 13% in review, 25% done, 5% cancelled; 15% are sub-issues), 912 comments including one 400-comment thread, 10,000 heartbeat runs over 10.5 days, 10,000 cost events, about 22,000 activity rows, 28 runs with real log files (one of 8,000 lines). It approximates the shape of a large real company; it is not a copy of one.
+**Fixture** (`make-fixture.mjs`, deterministic): one company, 32 agents, 8 projects, 1,000 issues (20% backlog, 25% todo, 12% in progress, 13% in review, 25% done, 5% cancelled; 15% are sub-issues), 912 comments including one 400-comment thread, 10,000 heartbeat runs over 10.5 days, 10,000 cost events, about 22,000 activity rows, 28 runs with real log files (one of 8,000 lines). It approximates the shape of a large real company; it is not a copy of one.
 
 **Browser runs** (`measure.mjs`): Playwright + Chromium, a fresh context per run (cold HTTP cache), CDP throttling, PerformanceObservers for FCP, LCP, layout shift, long tasks and Event Timing. TTI and TBT use a Lighthouse-style calculation (first 5 s window with no long task and at most 2 requests in flight; TBT is long-task time over 50 ms between FCP and TTI). "Settled" is the last fetch/XHR completion or DOM mutation. The Lighthouse CLI was not used: it is not installed and the disk has no room for it, and the observers give the same metrics.
 
@@ -234,7 +234,7 @@ node cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts worktree init --no-seed 
 pnpm --filter @paperclipai/ui build --outDir ../server/ui-dist --emptyOutDir
 (cd server && PORT=3192 PAPERCLIP_UI_DEV_MIDDLEWARE=false PAPERCLIP_MIGRATION_AUTO_APPLY=true npx tsx src/index.ts)
 # set PERF_BASE / PERF_DB_URL if `worktree init` chose other ports
-node tests/perf/web-app/seed-fixture.mjs
+node tests/perf/web-app/make-fixture.mjs
 tests/perf/web-app/run-all.sh baseline          # full suite, about 35 minutes
 node tests/perf/web-app/measure.mjs --label baseline-desktop --runs 5 --profiles desktop
 node tests/perf/web-app/report.mjs baseline-desktop after-desktop   # before -> after table

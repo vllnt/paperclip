@@ -1,7 +1,7 @@
 /**
  * Board UI performance baseline: Core Web Vitals, TTI/TBT, requests and API latency per page.
  *
- * Usage (server on :3192 seeded by seed-fixture.mjs):
+ * Usage (server on :3192 seeded by make-fixture.mjs):
  *   node tests/perf/web-app/measure.mjs --label baseline --runs 5 --profiles desktop,slow
  *   node tests/perf/web-app/measure.mjs --pages tasks-board --profiles slow --runs 3
  *
