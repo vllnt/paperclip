@@ -27,6 +27,7 @@ const apiPrefixes: Record<string, string> = {
   "assets.ts": "/api",
   "auth.ts": "/api/auth",
   "board-chat.ts": "/api",
+  "browser-profiles.ts": "/api",
   "browser-use.ts": "/api",
   "built-in-agents.ts": "/api",
   "chat-channels.ts": "/api",
@@ -752,6 +753,50 @@ describe("openapi routes", () => {
     }
     expect(replacement.requestBody.content["application/json"].schema.required).toContain("repositoryIds");
     expect(replacement.responses["422"]).toBeDefined();
+  });
+
+  it("documents the shared browser as board-managed with agent-only actions", () => {
+    const { spec } = loadSpecRoutes();
+    const base = "/api/companies/{companyId}/browser";
+    const profile = `${base}/profiles/{profileId}`;
+    const boardOperations = [
+      ["get", `${base}/overview`],
+      ["put", `${base}/settings`],
+      ["post", `${base}/profiles`],
+      ["patch", profile],
+      ["delete", profile],
+      ["post", `${profile}/suspend`],
+      ["post", `${profile}/resume`],
+      ["post", `${profile}/signin`],
+      ["get", `${profile}/signin/state`],
+      ["get", `${profile}/signin/frame`],
+      ["post", `${profile}/signin/input`],
+      ["post", `${profile}/signin/end`],
+    ];
+    for (const [method, routePath] of boardOperations) {
+      const operation = spec.paths[routePath][method];
+      expect(operation["x-paperclip-authorization"], `${method} ${routePath}`).toEqual({ actor: "board" });
+      expect(operation.security, `${method} ${routePath}`).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    }
+
+    const agentOperations = [
+      ["get", `${base}/agent-profiles`],
+      ["post", `${profile}/actions`],
+    ];
+    for (const [method, routePath] of agentOperations) {
+      const operation = spec.paths[routePath][method];
+      expect(operation["x-paperclip-authorization"], `${method} ${routePath}`).toEqual({ actor: "agent" });
+      expect(operation.security, `${method} ${routePath}`).toEqual([{ AgentBearerAuth: [] }]);
+      expect(operation.responses["403"], `${method} ${routePath}`).toBeDefined();
+    }
+
+    expect(spec.paths[`${base}/profiles`].post.responses["201"]).toBeDefined();
+    expect(spec.paths[`${profile}/signin/frame`].get.responses["200"].content["image/jpeg"]).toBeDefined();
+
+    const actionSchema = spec.paths[`${profile}/actions`].post.requestBody.content["application/json"].schema;
+    expect(actionSchema.oneOf.map((variant: any) => variant.properties.action.enum[0]).sort()).toEqual([
+      "click", "close", "fill", "navigate", "press", "scroll", "snapshot", "wait",
+    ]);
   });
 
   it("documents auth and reviewed response-code invariants", () => {
