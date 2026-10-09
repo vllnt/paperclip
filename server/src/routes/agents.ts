@@ -6881,6 +6881,17 @@ export function agentRoutes(
     res.json(await runRedactions.redactForRuns(companyId, runs));
   });
 
+  // Deferred-wake queue health: wakes parked behind an issue's execution lock,
+  // the age of each agent's oldest one, and the redelivery sweep's counters.
+  // A growing age with a free agent is a stall. Read-only, scoped like run telemetry.
+  router.get("/companies/:companyId/deferred-wakes", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
+    res.set("Cache-Control", "no-cache, no-store");
+    res.json(await heartbeat.getDeferredWakeStats(companyId));
+  });
+
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
     assertInstanceAdmin(req);
     const companyId = req.params.companyId as string;
