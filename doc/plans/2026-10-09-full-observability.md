@@ -368,13 +368,15 @@ context, in the web UI, through the API and through the CLI.
 - *Context fill*: tokens in the model's window at one API turn, that turn's `input + cache_read + cache_write`. Per turn; it peaks, and compaction lowers it.
 - *Composition*: what the always-loaded part of the context is made of at invoke time (instructions, skill listing, wake and task prompt, session handoff). Measured by estimate.
 
-**One counter, named and flagged.** The only counter is `estimateTokens` in
-`packages/skills-catalog/src/skill-quality-text.ts` (lean-skills PR #51): UTF-8 bytes
-divided by 4, rounded. It is an **estimate, not a tokenizer**. Every number from it is
-stored and returned with `basis: "estimated"` and `tokenizer: "bytes_div_4"`; every number
-a provider reported is `basis: "reported"`. The two are never summed into one field. The
-lean-skills session exports `estimateTokens` from the package index on #51 and pins its
-behavior in a test (`"abcd"` is 1, four `"é"` are 2, `""` is 0); its
+**One counter, named and flagged.** The only counter is `estimateTokens`: UTF-8 bytes
+divided by 4, rounded. **Ownership: it is defined once in `packages/shared`** (PR #62, which
+every Track C slice depends on); the lean-skills PR #51 currently holds a draft copy in
+`packages/skills-catalog/src/skill-quality-text.ts` and has agreed to delete it and import
+the shared one before it merges (decision D12). It is an **estimate, not a tokenizer**.
+Every number from it is stored and returned with `basis: "estimated"` and
+`tokenizer: "bytes_div_4"`; every number a provider reported is `basis: "reported"`. The two
+are never summed into one field. Both copies pin the same behavior in a test (`"abcd"` is 1,
+four `"é"` are 2, `""` is 0); the skill check's
 `metrics.estimatedTokens` counts the whole SKILL.md including frontmatter, so
 description-only and per-file counts call `estimateTokens` directly. Where the function
 lives is decision D12. **The estimate is biased low for some models.** On the same v8-lean
@@ -428,7 +430,8 @@ The activity-row-to-revision mapping, checked against the writers (no guessing b
 | `company.skill_version_created` | `entityId` is the version id (`routes/company-skills.ts:894-896`) | none needed |
 | `agent.instructions_bundle_updated`, `agent.instructions_file_updated`, `agent.instructions_file_deleted`, `agent.instructions_path_updated` | none (`details` hold mode, path, size; `routes/agents.ts:5182-5187`, `:5294-5298`) | add `details.revisionId` at these four call sites; additive JSON key, existing readers ignore it |
 | `agent.updated`, `agent.skills_synced` | none (`summarizeAgentUpdateDetails`; desired-skill lists) | add `details.configRevisionId` at the two call sites |
-| `company.skill_updated`, `company.skill_file_updated` | to be read in C4 | same additive rule |
+| `company.skill_file_updated` | `details.versionId`, the new version id (`routes/company-skills.ts:1263-1267`); the before value is that skill's previous version | none needed |
+| `company.skill_updated` | none, and none needed: `details` hold only slug, categories and sharing scope (`:1217-1221`), which change no content or description | no delta; the entry answers `contextDelta.unavailable = "not_applicable"` |
 
 Rows written before C4 carry no reference, so their activity entry answers
 `contextDelta.unavailable = "no_revision_ref"`. They are never matched by timestamp. The
@@ -480,10 +483,10 @@ no run-path change**.
 | **3c / 5b** | Bottlenecks, Efficiency panels, each in the PR that adds its API | 3a / 3b | M each |
 | **6** | **Changes view + impact on read + analysis export + anomaly flags;** `server_boot_events` and the AGENTS.md exception | 2 (3a/3b for outcome metrics) | L |
 | **7 (optional)** | Worker free-bytes sampling at the existing `statfsSync` point and workspace bytes; tokens-per-tool-result approximation | operator go-ahead (D5), #44 | M |
-| **C1** | **Run context (Track C, 7.9):** first step is to capture real fixtures (Appendix B) and settle the UNVERIFIED rows; `run_context_records` (migration), the `contextComposition` key on the existing `adapter.invoke` payload (no new row), the worker pass, `parseContextSamples` for Claude, ACP/ACPX and runner events, `GET /heartbeat-runs/:runId/context`, `paperclipai run context <runId>`, and the Context section on run detail (timeline chart, compactions, peak against window, composition). All three surfaces in this PR. | 1a, 2 (guard, parity test) | L |
-| **C2** | **Agent context budget:** `GET /agents/:agentId/context-budget`, `paperclipai agent context-budget <agentId>`, an AgentDetail card (baseline budget, share of first-turn context, cost allocation, estimator calibration, trend). | C1 | M |
-| **C3** | **Skill impact:** `GET /companies/:companyId/skills/:skillId/impact`, `paperclipai skill impact <skillId>`, a skill-page panel (always-on, on-demand, loads, version-change delta). | C1, the shared token estimate (D12) | M |
-| **C4** | **Audit token deltas:** `contextDelta` on activity entries and on `GET /changes` rows for instruction, skill-version, skill-sync and model or adapter changes, with the deterministic row-to-revision mapping of 7.9 (adds `revisionId` to the `details` of six writers; additive); Audit hub badge; the CLI prints it. The before/after impact join stays in 6. | C2, C3 (shared estimator helper) | M |
+| **C1** | **Run context (Track C, 7.9):** first step is to capture real fixtures (Appendix B) and settle the UNVERIFIED rows; `run_context_records` (migration), the `contextComposition` key on the existing `adapter.invoke` payload (no new row), the worker pass, `parseContextSamples` for Claude, ACP/ACPX and runner events, `GET /heartbeat-runs/:runId/context`, `paperclipai run context <runId>`, and the Context section on run detail (timeline chart, compactions, peak against window, composition). All three surfaces in this PR. | 1a, 2 (guard, parity test), #62 (shared estimate) | L |
+| **C2** | **Agent context budget:** `GET /agents/:agentId/context-budget`, `paperclipai agent context-budget <agentId>`, an AgentDetail card (baseline budget, share of first-turn context, cost allocation, estimator calibration, trend). | C1, #62 | M |
+| **C3** | **Skill impact:** `GET /companies/:companyId/skills/:skillId/impact`, `paperclipai skill impact <skillId>`, a skill-page panel (always-on, on-demand, loads, version-change delta). | C1, #62 (shared estimate, D12) | M |
+| **C4** | **Audit token deltas:** `contextDelta` on activity entries and on `GET /changes` rows for instruction, skill-version, skill-sync and model or adapter changes, with the deterministic row-to-revision mapping of 7.9 (adds `revisionId` to the `details` of six writers; additive); Audit hub badge; the CLI prints it. The before/after impact join stays in 6. | C2, C3 (shared estimator helper), #62 | M |
 | **C5 (linked follow-up)** | Codex per-turn context fill (last-turn usage and window in the runner's usage event, schema and validators); Claude `/context` probe if D10 is accepted. | C1, D10, D11 | M |
 
 Parity contract per panel (API is the source; CLI and UI are thin):
@@ -562,7 +565,7 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 | D9 | Token counter for Track C: keep the shared bytes / 4 estimate (flagged `estimated`, with a calibration metric against provider-reported tokens), or add a real tokenizer dependency? | Keep the estimate. No new dependency, and the calibration metric shows its error from real data. Revisit only if calibration is poor. |
 | D10 | Claude exact `/context` probe (per-category and per-skill tokens from the provider): add an opt-in, sampled probe per agent? | Defer. It adds a step to sampled runs and exists only on request; ship the estimate and calibration first (C5 if wanted). |
 | D11 | Codex per-turn context fill needs last-turn usage and window in the runner's usage event (a protocol change across Rust and TypeScript). | Separate follow-up (C5) after C1 shows the gap on real data; do not widen C1. |
-| D12 | Where does the single token estimate live? Today only in `skills-catalog`, on lean-skills draft PR #51, which has no merge date. C1, C2 and C4 need it on `main`. | Put `estimateTokens` (same behavior, same test) in `packages/shared` in its own small first PR; `skills-catalog` already depends on `@paperclipai/shared`, so #51 replaces its body with an import on rebase. One counter, owned by the package everyone already depends on, no wait on a draft. If lean-skills prefers, the alternative is to stack C-track PRs on #51 and wait for it. Needs agreement with lean-skills, not the user. |
+| D12 | Where does the single token estimate live? Today only in `skills-catalog`, on lean-skills draft PR #51, which has no merge date. C1, C2 and C4 need it on `main`. | Put `estimateTokens` (same behavior, same test) in `packages/shared` in its own small first PR; `skills-catalog` already depends on `@paperclipai/shared`, so #51 replaces its body with an import on rebase. One counter, owned by the package everyone already depends on, no wait on a draft. If lean-skills prefers, the alternative is to stack C-track PRs on #51 and wait for it. **Settled 2026-10-09:** lean-skills accepted and will import the shared function on #51; PR #62 is open. Not a user decision. |
 | F1 | Follow-up (not in this feature): retention for `heartbeat_run_events` and NDJSON logs, which grow without bound | **Handed to the session-warehouse track** as an opt-in "prune after verified archive" step, with the guard in section 9. Not pruning on the strength of "a record exists": 1b and 1d read `adapter.invoke`, `usage.reported` and `run.performance.span` events, so only a record at the event-consuming schema version makes them safe to delete. |
 | F2 | Follow-up: `adapter.invoke` persists prompt and context in the run log | Separate privacy issue; this feature does not depend on it. |
 
