@@ -301,7 +301,7 @@ describe("configuration", () => {
     for (const bad of [
       { reaper: { dev: { maxAgeDays: 0 } } }, { reaper: { dev: { maxAgeDays: 91 } } }, { reaper: { dev: { protect: "dev/a" } } },
       { reaper: { dev: { onlyPatterns: [5] } } }, { reaper: { dev: { maxDeletes: 0 } } }, { reaper: { dev: { enabled: "yes" } } },
-      { reaper: { pullRequestPattern: "no named group" } }, { reaper: { pullRequestPattern: "(?<pr>\\d+)" } }, { reaper: { pullRequestPattern: "^(?<pr>\\d+)-x" } },
+      { reaper: { pullRequestPattern: "no named group" } }, { reaper: { pullRequestPattern: "(?<pr>\\d+)" } }, { reaper: { pullRequestPattern: "^(?<pr>\\d+)-x" } }, { reaper: { pullRequestPattern: "(?<pr>\\d+)-x$" } },
       { reaper: { pullRequestPattern: "^(?<pr>\\d+)(a+)+$" } }, { reaper: { pullRequestPattern: "^(?<pr>\\d+)(?:-(\\w+){2,})$" } },
       { reaper: { dev: { protect: ["*alice*"] } } }, { reaper: { dev: { onlyPatterns: ["dev/*-pinned"] } } }, { reaper: { dev: { protect: ["a**"] } } }, { reaper: { pullRequestPattern: "(?<pr>[" } }, { reaper: { pullRequestPattern: "x".repeat(300) } },
       { reaper: { supersededMinAgeMinutes: 5 } },

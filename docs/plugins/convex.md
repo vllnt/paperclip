@@ -199,7 +199,7 @@ A call for a project that another company reserved, or one not in the registry f
   one missing name. Open pull requests and branches are re-read at delete time. Lists above 1000 entries, an unreadable repository, a missing token or repository, and a preview without
   an identifier all fail closed.
 - **Hard delete guard** (`src/hard-guard.ts`, inside every delete and expiry path, after and independent of grants and company config): only cloud `preview` and `dev` deployments can be deleted. Production, custom, unknown-type, local and default
-  deployments never can, and neither can anything whose name, reference or preview identifier (branch) contains the whole word `prod`, `production`, `staging`, `main`, `master`, `release` or `releases`. No grant, preset, protect list or allow list loosens it.
+  deployments never can, and neither can anything whose name, reference or preview identifier (branch) contains one of the words `prod`, `prd`, `production`, `preprod`, `preproduction`, `staging`, `stage`, `stg`, `main`, `master`, `release` or `releases`, as a whole word (split on punctuation, capitals and digits, so `staging2` and `releaseCandidate` count; `maintenance` and `domain` do not). No grant, preset, protect list or allow list loosens it.
 - **An expiry is a delayed delete.** An agent's expiry earlier than the largest of the preview's current deadline, the deadline the reaper would give it (`lastDeployTime + ttlHours`, or `now + ttlHours`
   for a stale preview) and `now + activityHours` (at most 168) follows the deletion guards and counts against the run's deletion cap. Extending a deadline (up to 7 days) is free. The reaper applies its own policy (below).
 - **Cheap refusals first**: a run that has used its deletion allowance is refused before any network call.
@@ -234,7 +234,7 @@ Company plugin config (instance administrator writes it; every secret field is a
   "guards": { "activityHours": 24, "maxDeletesPerRun": 20, "callsPerMinute": 60, "dryRunOnly": false },
   "reaper": {
     "enabled": false, "ttlHours": 36, "quota": 300, "alertPercent": 80,
-    "dev": { "enabled": false, "maxAgeDays": 7, "protect": ["dev/pinned-*"], "onlyPatterns": [], "maxDeletes": 20 },
+    "dev": { "enabled": false, "maxAgeDays": 7, "protect": ["dev/pinned-*"], "onlyPatterns": ["dev/ship-*", "dev/issue-*"], "maxDeletes": 20 },
     "pullRequestPattern": "^pr(?<pr>\\d+)-run(?<run>\\d+)-s(?<shard>\\d+)-a(?<attempt>\\d+)$",
     "supersededMinAgeMinutes": 60
   }
@@ -262,19 +262,21 @@ Hourly job `convex-reaper` (also `reaper.run` and the `convex_reap_previews` too
    reaper does not rely on that. **Policy note:** as specified, a preview with an open pull request that is not redeployed for `ttlHours` expires and the next push recreates it;
    `guards.activityHours` keeps branches with recent commits from being deleted by the reaper, not from expiring;
 4. counts all team deployments against `reaper.quota` and raises an issue (once a day) and an activity entry at `reaper.alertPercent`;
-5. **superseded previews of open pull requests.** CI makes one preview per run, shard and attempt, so one pull request can hold dozens. With `reaper.pullRequestPattern` (a regular expression with a named group `pr`, and optionally
-   `run`, `shard`, `attempt`) the reaper reads the pull request from each preview identifier. For an open pull request it keeps the newest run (and its newest attempt, every shard) and deletes older runs and attempts,
-   if each has been idle for `supersededMinAgeMinutes` (default 60) and the newer preview still exists at the moment of deletion. Without a `run` group, a preview is replaced only by one made at least that long after it.
+5. **superseded previews of open pull requests.** CI makes one preview per run, shard and attempt, so one pull request can hold dozens. With `reaper.pullRequestPattern` (a regular expression that must start with `^`, end with `$`, have a named group `pr`, optionally `run`, `shard`, `attempt`, and repeat no group) the reaper reads the pull request from each preview identifier. For an open pull request it keeps the newest run (and its newest attempt, every shard) and deletes older runs and attempts,
+   if each has been idle for `supersededMinAgeMinutes` (default 60) and the newer preview still exists at the moment of deletion. Without a `run` group, a preview is replaced only by one made at least that long after it; numbered and unnumbered previews are never compared. The pattern's pull request number is authoritative: a closed pull request is only evidence for a preview when its number matches. The order and the idle time are checked again on the fresh records at delete time.
    Without a pattern, nothing about open pull requests is deleted. The pattern also lets the open-PR guard and the closed-PR rule recognise CI-named previews. An agent deleting one preview by hand never gets this exception;
 6. **dev policy** (below).
 
 #### Dev policy
 
-Dev deployments whose `lastDeployTime` (or `createTime` if never deployed) is older than `reaper.dev.maxAgeDays` (default 7, 1 to 90) are deleted by the reaper. It never deletes a default deployment (each member's own `dev/<member>`),
-a deployment the hard guard blocks, the shared pools `dev/paperclip-agents`, `dev/local-*` and `dev/qa-*`, anything matching `reaper.dev.protect`, or one of unknown age. `reaper.dev.onlyPatterns`, when set, limits deletion to matching
-references. Patterns are exact names, or a prefix ending in `*`, matched without case. It is **plan only** until `reaper.enabled` and `reaper.dev.enabled` are both true; a dry run, `guards.dryRunOnly`, or a pass an agent started
-(`convex_reap_previews`) never delete dev deployments. At most `reaper.dev.maxDeletes` (default 20) per run, apart from the preview cap. Each deletion is re-fetched first, checked again, audited with its before-state, and
-confirmed gone with a follow-up read. Listing and deleting dev deployments needs a Team Access Token (a project token that can list also works); a preview deploy key cannot, so the plugin never uses one for dev deployments.
+Dev deployments whose `lastDeployTime` (or `createTime` if never deployed) is older than `reaper.dev.maxAgeDays` (default 7, 1 to 90) are deleted by the reaper, **if they match the company's allow list
+`reaper.dev.onlyPatterns`**. Convex does not say who made a dev deployment, so the plugin never guesses: with no allow list it deletes nothing and lists the candidates in the report
+(for example `["dev/ship-*", "dev/issue-*"]` for agent-made names). It never deletes a default deployment (each member's own `dev/<member>`), a deployment the hard guard blocks, the shared pools
+`dev/paperclip-agents`, `dev/local-*` and `dev/qa-*`, anything matching `reaper.dev.protect` (which wins over the allow list), or one of unknown age. Patterns are exact names, or a prefix ending in a
+single `*` (a `*` anywhere else is rejected), matched without case. It is **plan only** until `reaper.enabled` and `reaper.dev.enabled` are both true; a dry run, `guards.dryRunOnly`, or a pass an agent started
+(`convex_reap_previews`) never delete dev deployments. At most `reaper.dev.maxDeletes` (default 20) per run across all projects, apart from the preview cap. Each deletion is re-fetched first, checked again, audited
+with its before-state, and confirmed with a follow-up read (an unreadable follow-up is recorded as `deleted-unverified`). Listing and deleting dev deployments needs a Team Access Token (a project token that can
+list also works); a preview deploy key cannot, so the plugin never uses one for dev deployments, not even for the first read.
 The plan appears in the report even while the policy is off, so read it before enabling.
 
 `ttlHours` is 3 to 168, because the reaper keeps a two hour lead and runs hourly. Tracked-expiry bookkeeping is pruned on every pass, including dry runs. It is a dry run until `reaper.enabled` is true. When GitHub cannot be read for a project, it changes nothing in that project.
