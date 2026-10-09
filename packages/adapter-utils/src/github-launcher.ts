@@ -69,13 +69,13 @@ function gitNetworkArgs(subcommand, args) {
   return { positional, repoOption, deleting };
 }
 const gitBinary = () => program === 'git' ? executable : findExecutable('git');
-// status is null when git could not run, timed out or wrote more than 4 MiB.
-function gitRun(env, globalArgs, args) {
+// status is null when git could not run, timed out or wrote more than 4 MiB. An input is written to git's standard input.
+function gitRun(env, globalArgs, args, input) {
   const git = gitBinary();
   if (!git) return { status: null, stdout: '' };
   try {
     const result = require('node:child_process').spawnSync(git, [...globalArgs, ...args],
-      { env, encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+      { env, encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'], ...(input === undefined ? {} : { input }) });
     return { status: result.error ? null : result.status, stdout: result.stdout || '' };
   } catch { return { status: null, stdout: '' }; }
 }
@@ -84,8 +84,8 @@ function appendGitConfig(env, key, value) {
   env['GIT_CONFIG_KEY_' + count] = key; env['GIT_CONFIG_VALUE_' + count] = value;
   env.GIT_CONFIG_COUNT = String(count + 1);
 }
-function gitOutput(env, globalArgs, args) {
-  const result = gitRun(env, globalArgs, args);
+function gitOutput(env, globalArgs, args, input) {
+  const result = gitRun(env, globalArgs, args, input);
   return result.status === 0 ? result.stdout : null;
 }
 // A configured remote name (git looks remote names up before treating an argument as a path).
@@ -168,10 +168,11 @@ function pushedBranch(specs, current, refs) {
   return name && !name.includes('..') && !/[\x00-\x20\x7f~^:\\]/.test(name) ? name : null;
 }
 // The pushed commit's workflow files, the new commits that change them and where new history joins old; null when too much to report.
-function workflowHistory(env, globalArgs, tip, tipFiles) {
+// The boundary says what already exists: { args, input } for git's revision options (see pushReport).
+function workflowHistory(env, globalArgs, tip, tipFiles, boundary) {
   const files = [...tipFiles].map(([file, entry]) => ({ path: file, ...entry })).sort((a, b) => byText(a.path, b.path));
   if (files.length > MAX_WORKFLOW_FILES || files.some(file => file.path.length > MAX_WORKFLOW_PATH)) return null;
-  const listed = gitOutput(env, globalArgs, ['rev-list', '--parents', tip, '--not', '--remotes']);
+  const listed = gitOutput(env, globalArgs, ['rev-list', '--parents', tip, ...boundary.args], boundary.input);
   if (listed === null) return null;
   const fresh = new Map();
   for (const line of listed.split('\n')) {
@@ -200,8 +201,11 @@ function sameWorkflowFiles(a, b) {
   return a.size === b.size && [...a].every(([file, entry]) => b.get(file) && b.get(file).mode === entry.mode && b.get(file).oid === entry.oid);
 }
 // What a push sends: the checked-out branch, full names of bare refspec names,
-// the commits, and whether the push changes workflow files.
-function pushReport(env, globalArgs, pushArgs) {
+// the commits, and whether the push changes workflow files. What already exists is, at first, whatever the remote-tracking
+// refs of this checkout say, and those refs are the agent's to write. Once the refs GitHub lists have been read (see
+// remoteRefs), they replace them: known is { tips, heads }, or 'unknown' when they could not be read, and then nothing
+// is reported as free of workflow changes.
+function pushReport(env, globalArgs, pushArgs, known) {
   const { positional, repoOption, deleting } = gitNetworkArgs('push', pushArgs);
   const branch = gitOutput(env, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
   const current = branch ? branch.trim() : '';
@@ -246,28 +250,70 @@ function pushReport(env, globalArgs, pushArgs) {
     .filter(sha => /^[0-9a-f]{40,64}$/.test(sha)).slice(0, 64);
   let touchesWorkflows = commits.length ? null : false;
   let workflow = null;
-  if (commits.length && shas.length === commits.length) {
+  // What already exists: the refs GitHub lists (stdin lines "^<sha>"), or else this checkout's remote-tracking refs.
+  const boundary = known && known.tips
+    ? { args: ['--stdin'], input: known.tips.map(tip => '^' + tip + '\n').join('') }
+    : { args: ['--not', '--remotes'] };
+  if (commits.length && shas.length === commits.length && known !== 'unknown') {
     // NUL-separated names (never quoted), merge commits' own changes against their first parent, and no rename pairing:
     // a workflow renamed or moved out of the directory shows as a deletion there.
-    const files = gitOutput(env, globalArgs, ['log', '--format=', '--name-only', '-z', '--no-renames', '--diff-merges=first-parent', ...shas, '--not', '--remotes']);
+    const files = gitOutput(env, globalArgs, ['log', '--format=', '--name-only', '-z', '--no-renames', '--diff-merges=first-parent', ...shas, ...boundary.args], boundary.input);
     if (files !== null) {
       touchesWorkflows = files.split('\0').some(isWorkflowPath);
       if (shas.length === 1) {
         const tipFiles = workflowTree(env, globalArgs, shas[0]);
         // A push that only moves a branch to a commit the remote already has (nothing is new) still changes the branch's
-        // workflow files when they differ from the branch it replaces, as this checkout last saw it.
+        // workflow files when they differ from the branch it replaces: as GitHub lists it, else as this checkout last saw it.
         const pushed = implicitPush ? null : pushedBranch(specs, current, refs);
-        const seen = pushed && configured.length ? (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', 'refs/remotes/' + target + '/' + pushed + '^{commit}']) || '').trim() : '';
+        let seen = '';
+        if (pushed && known) {
+          const listed = known.heads.get(pushed) || '';
+          seen = listed ? (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', listed + '^{commit}']) || '').trim() : '';
+          // The branch GitHub has is a commit this checkout does not have, so what it holds cannot be compared: a replacement.
+          if (listed && !seen && touchesWorkflows === false) touchesWorkflows = null;
+        } else if (pushed && configured.length) {
+          seen = (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', 'refs/remotes/' + target + '/' + pushed + '^{commit}']) || '').trim();
+        }
         const seenFiles = /^[0-9a-f]{40,64}$/.test(seen) ? workflowTree(env, globalArgs, seen) : null;
         if (tipFiles && seenFiles && !sameWorkflowFiles(tipFiles, seenFiles)) touchesWorkflows = true;
-        if (touchesWorkflows && tipFiles) workflow = workflowHistory(env, globalArgs, shas[0], tipFiles);
+        if (touchesWorkflows && tipFiles) workflow = workflowHistory(env, globalArgs, shas[0], tipFiles, boundary);
       }
     }
   }
   return { currentBranch: current || null, refs, shas, touchesWorkflows, ...(workflow || {}), pushUrls, ...(implicitPush ? { implicitPush: true } : {}), ...(followTags || unknown ? { followTags: true } : {}),
     ...(recursion === 'no' || recursion === 'check' ? {} : { recurseSubmodules: recursion === null ? 'unknown' : recursion.slice(0, 100) }), ...(cut ? { truncated: true } : {}) };
 }
-function operation(env) {
+// The branches and tags GitHub itself lists for a push's destination, read with the credential the broker just gave this
+// command: { tips: the ones this checkout has, heads: branch name -> commit }. null when they cannot be read in full.
+// This is what a push may call "already on GitHub"; the remote-tracking refs in a checkout say nothing of the sort.
+const MAX_REMOTE_REFS = 2000;
+function remoteRefs(env, globalArgs, url) {
+  const git = gitBinary();
+  if (!git) return null;
+  const { spawnSync } = require('node:child_process');
+  const options = { env: { ...env, GIT_NO_LAZY_FETCH: '1' }, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
+  try {
+    const listed = spawnSync(git, [...globalArgs, 'ls-remote', '--heads', '--tags', url], { ...options, timeout: 30000, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (listed.error || listed.status !== 0) return null;
+    const lines = listed.stdout.split('\n').filter(Boolean);
+    if (lines.length > MAX_REMOTE_REFS) return null;
+    const shas = new Set(), heads = new Map();
+    for (const line of lines) {
+      const match = /^([0-9a-f]{40,64})\trefs\/(heads|tags)\/(\S+?)(\^\{\})?$/.exec(line);
+      if (!match) return null;
+      shas.add(match[1]);
+      if (match[2] === 'heads') heads.set(match[3], match[1]);
+    }
+    if (!shas.size) return { tips: [], heads };
+    // Only objects this checkout has can be left out of what a push sends; git reads the others as missing.
+    const present = spawnSync(git, [...globalArgs, 'cat-file', '--batch-check'], { ...options, timeout: 10000, input: [...shas].join('\n') + '\n', stdio: ['pipe', 'pipe', 'ignore'] });
+    if (present.error || present.status !== 0) return null;
+    const tips = present.stdout.split('\n').map(line => line.split(' ')).filter(parts => parts[1] === 'commit' || parts[1] === 'tag').map(parts => parts[0]);
+    return { tips, heads };
+  } catch { return null; }
+}
+// known: the refs GitHub lists for a push's destination, once read (see pushReport).
+function operation(env, known) {
   let remote = null, extra = {};
   if (program === 'git') {
     let index = 0;
@@ -279,7 +325,7 @@ function operation(env) {
       // A remote name is resolved; a URL (it has a colon) or a path that names no remote is reported as given.
       remote = target && target.includes(':') ? null : remoteUrl(env, globalArgs, target || 'origin', argv[index] === 'push' || !network);
     }
-    if (argv[index] === 'push') extra = pushReport(env, globalArgs, argv.slice(index + 1));
+    if (argv[index] === 'push') extra = pushReport(env, globalArgs, argv.slice(index + 1), known);
     if (['push', 'fetch', 'pull', 'ls-remote', 'clone'].includes(argv[index]) && foreignRewrites(env, globalArgs)) extra = { ...extra, urlRewrites: true };
   } else if (!argv.some(arg => arg === '-R' || arg === '--repo' || /^(--repo=|-R.)/.test(arg))) {
     // GH_REPO is reported as named. The checkout's remotes and saved default are reported too, GH_REPO or not:
@@ -524,6 +570,11 @@ async function main() {
       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
+    const takeCredentials = result => {
+      for (const [key, value] of Object.entries(result.env || {})) {
+        if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
+      }
+    };
     let answered = null;
     try {
       report = operation(env);
@@ -547,9 +598,7 @@ async function main() {
         process.stderr.write('Paperclip: GitHub access unavailable: ' + reason + '. Continuing without GitHub credentials.\n');
       }
       if (result.status === 'available' && configReady) {
-        for (const [key, value] of Object.entries(result.env || {})) {
-          if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
-        }
+        takeCredentials(result);
         credentialed = true;
         // gh acts on the repository Paperclip checked, never on a saved default (gh-resolved) or another remote.
         if (program === 'gh' && !env.GH_REPO && typeof result.repository === 'string' && /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(result.repository)
@@ -578,6 +627,28 @@ async function main() {
       if (program === 'git' && gitTrustProblem(env, report)) {
         process.stderr.write('Paperclip: this repository sends GitHub traffic through a proxy or with other TLS trust (http.proxy, http.sslVerify, http.sslCAInfo, http.sslCAPath or http.curloptResolve); it does not run with a GitHub credential.\n');
         process.exit(1);
+      }
+    }
+    // A push the checkout reports as free of workflow changes rests on its remote-tracking refs, which the agent can
+    // write: a commit that edits a workflow can be hidden behind one that GitHub never had. Before the push runs with a
+    // credential, the refs GitHub itself lists decide. If they say it carries workflow changes, or cannot be read, the
+    // broker is asked again about the push as they describe it, and its answer replaces the first.
+    if (credentialed && program === 'git' && report && Array.isArray(report.shas) && report.shas.length && report.touchesWorkflows === false) {
+      let at = 0;
+      while (at < argv.length && argv[at].startsWith('-')) at += GIT_GLOBAL_WITH_VALUE.includes(argv[at]) ? 2 : 1;
+      const known = report.pushUrls && report.pushUrls.length === 1 ? remoteRefs(env, argv.slice(0, at), report.pushUrls[0]) : null;
+      const checked = operation(env, known || 'unknown');
+      if (checked.touchesWorkflows !== false) {
+        if (!known) process.stderr.write('Paperclip: the branches GitHub has could not be read, so this push is treated as one that may change workflow files.\n');
+        let second = null;
+        try { second = await brokerPost(env, '/runtime-tools/github/credentials', JSON.stringify({ operation: checked })); } catch {}
+        const again = second && second.response.ok ? second.result : null;
+        if (!again || again.status !== 'available') {
+          const reason = clean(again && again.reason, 500) || 'Paperclip could not check this push against GitHub';
+          process.stderr.write('Paperclip: GitHub refused this command: ' + reason + '. It does not run with any other GitHub credential.\n');
+          process.exit(1);
+        }
+        takeCredentials(again);
       }
     }
     if (program === 'gh' && !credentialed && ghNamesOtherHost(argv)) {

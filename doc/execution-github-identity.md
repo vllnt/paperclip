@@ -282,6 +282,31 @@ token, and not against the checkout alone:
   as touching workflow files when the files differ from the branch tip it last
   saw, so it is not skipped for having no new commit.
 
+**What counts as already on GitHub.** The launcher works out which commits a
+push adds, and whether any of them changes a workflow file, as the commits that
+the refs of the destination do not reach. The remote-tracking refs of a checkout
+(`refs/remotes/*`) are not that: the agent can write them with `git update-ref`
+or a fetch refspec, and a commit that edits a workflow behind one of them looks
+like old history. So a push that the checkout reports as free of workflow
+changes is read once more before it runs with a credential. The launcher lists
+the branches and tags of the push's destination from GitHub itself
+(`git ls-remote --heads --tags`, with the credential the broker has just given
+this command, over the same verified connection), leaves out only the commits
+those refs reach, and works out again what the push adds. If that is free of
+workflow changes too, the push runs on the first answer. If it is not, the broker
+is asked again about the push as GitHub's refs describe it (with its new commits,
+and where they join GitHub), and its answer replaces the first. Anything that
+cannot be settled counts as a change that may touch workflow files, so
+`editWorkflows` decides: the refs cannot be read in full (a network or
+credential failure, a list of more than 2,000 lines, more than one push URL),
+or the branch being pushed to exists on GitHub at a commit that the checkout does
+not have (a replacement it cannot compare). This costs one more read of GitHub
+per such push, and one more broker question only when the answer changes. Local
+branches (`refs/heads/*`) were never part of what already exists, and
+`packed-refs` are read like loose refs. Pushes that the checkout already reports
+as changing workflow files go to the plugin as before, which checks where their
+history joins GitHub.
+
 The base is the base of the same-repository open pull request whose head is the
 pushed branch, else the repository's default branch. Whoever opens a pull
 request chooses its base, so the base counts only when it is the default branch
@@ -534,13 +559,17 @@ program named `gh` later in `PATH`, or a gh extension, which all run with the
 token in their environment) can skip them for at most 8 hours; the hard limits are GitHub's: the App
 installation's repositories and permissions (keep Workflows write off so
 workflow files cannot change), and the repositories' rulesets. The
-`editWorkflows` check reads the checkout's history, which an agent controls. The
-base-branch check trusts the checkout for what the push contains (its commits and
-their parents, and the pushed commit's files) and takes the base branch, the
-pushed branch and the ancestry from GitHub. A checkout that hides a commit behind
-a remote ref of its own is caught when the commit is not on GitHub; one that
-makes a push look like it changes nothing (a forged copy of the branch tip, so
-the push looks like a no-op) is not.
+`editWorkflows` check reads the checkout's objects, which an agent controls. It
+trusts the checkout for what the push contains (its commits and their parents,
+and the pushed commit's files: git objects, which cannot change without changing
+their IDs) and takes what already exists from GitHub: the base branch, the pushed
+branch and the ancestry for the base-branch check, and the branches and tags of
+the destination for a push that the checkout calls free of workflow changes (see
+"What counts as already on GitHub"). A remote-tracking ref that the checkout
+wrote hides nothing. The launcher itself runs as the agent, with the run's broker
+capability in its environment, so an agent that does not use it, and sends the
+broker a report of its own, is not stopped by this check: the hard limits are
+GitHub's.
 `pushToMain` knows `main` and `master` only.
 
 With `userSource: "run"`, the kill switch withholds the run's token entirely

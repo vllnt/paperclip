@@ -433,7 +433,11 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     await f.run("git", ["push"]);
     await f.run("git", ["fetch", "origin"]);
     await f.run("gh", ["pr", "view", "1"]);
-    const ops = f.requests.map(request => request.body.operation);
+    // A push reported free of workflow changes is read against the refs GitHub lists before it runs. GitHub cannot be read
+    // here (a made-up token), so each such push is asked about a second time, as one that may change them.
+    const asked = f.requests.map(request => request.body.operation);
+    const ops = asked.filter(op => !(op.args[0] === "push" && op.touchesWorkflows === null));
+    expect(asked.filter(op => op.touchesWorkflows === null).map(op => op.args)).toEqual([["push", "origin", "feature/x"], ["push", "origin", "engine@1.4.0"]]);
     const head = (ref: string) => git("rev-parse", ref).toString().trim();
     expect(ops[0]).toMatchObject({ args: ["push", "origin", "feature/x"], remote: "https://github.com/Anthm-FR/songtrivia.git", currentBranch: "feature/x",
       refs: { "feature/x": "refs/heads/feature/x" }, shas: [head("HEAD~1")], touchesWorkflows: false });
@@ -668,6 +672,167 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
       expect(bulk).toMatchObject({ touchesWorkflows: true });
       expect(bulk.workflowFiles).toBeUndefined();
     }, 180_000);
+  });
+
+  // The remote-tracking refs of a checkout are the agent's to write. A push that the checkout calls free of workflow changes
+  // is therefore read once more, against the refs GitHub lists, before it runs with a credential. A local bare repository
+  // stands in for GitHub here: `git ls-remote` against it is the same read.
+  describe("a push reported free of workflow changes is read against the refs GitHub lists", () => {
+    const W = ".github/workflows";
+    const ci = `${W}/ci.yml`;
+    const refusal = { body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } };
+    /** origin is the bare repository (main and feature/x are on it, and this checkout has both); the broker allows the first question and answers a second one with `second`. */
+    async function githubLike(second: { body: unknown } = refusal) {
+      let asked = 0;
+      const f = await brokered(() => asked++ === 0 ? { body: { status: "available", env: { GH_TOKEN: "t", ...identity } } } : second);
+      const sys = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "file" } }).toString().trim();
+      const bare = path.join(f.root, "github.git");
+      await mkdir(bare);
+      sys(bare, "init", "--bare", "-b", "main");
+      const git = (...args: string[]) => sys(f.repo, ...args);
+      const write = async (file: string, text: string) => { await mkdir(path.dirname(path.join(f.repo, file)), { recursive: true }); await writeFile(path.join(f.repo, file), text); };
+      git("init", "-b", "main");
+      git("remote", "add", "origin", bare);
+      await write(ci, "on: push\n");
+      await write("app.ts", "x\n");
+      git("add", "."); git("commit", "-m", "base");
+      git("push", "origin", "main");
+      git("checkout", "-b", "feature/x");
+      await write("app.ts", "y\n");
+      git("commit", "-a", "-m", "app");
+      git("push", "origin", "feature/x");
+      const onGitHub = (branch: string) => sys(bare, "rev-parse", `refs/heads/${branch}`);
+      const push = (...args: string[]) => f.run("git", ["push", ...args]);
+      return { ...f, git, sys, write, bare, onGitHub, push, tip: () => git("rev-parse", "HEAD") };
+    }
+    type GithubLike = Awaited<ReturnType<typeof githubLike>>;
+
+    /** A commit that edits a workflow, on the branch, that GitHub does not have. */
+    async function editWorkflow(r: GithubLike) {
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      return r.tip();
+    }
+
+    // The branch is the one pushed. For feature/x, GitHub has it, and the forged ref is the one this checkout last saw it at;
+    // for feature/z it is a new branch, and any remote-tracking ref hides what it reaches.
+    it.each([
+      ["a remote-tracking ref of origin for the branch pushed", "feature/x", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/origin/feature/x", edit); }],
+      ["a packed remote-tracking ref for the branch pushed", "feature/x", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/origin/feature/x", edit); r.git("pack-refs", "--all"); }],
+      ["a remote-tracking ref that a fetch from this checkout writes", "feature/x", (r: GithubLike) => { r.git("fetch", ".", "HEAD:refs/remotes/origin/feature/x"); }],
+      ["a remote-tracking ref that a fetch refspec of another remote writes", "feature/x", (r: GithubLike) => {
+        r.git("remote", "add", "mirror", ".");
+        r.git("config", "remote.mirror.fetch", "+HEAD:refs/remotes/origin/feature/x");
+        r.git("fetch", "mirror");
+      }],
+      ["a remote-tracking ref of another remote, for a new branch", "feature/z", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/fork/anything", edit); }],
+      ["a remote-tracking ref of origin's main, for a new branch", "feature/z", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/origin/main", edit); }],
+      ["a packed remote-tracking ref of another remote, for a new branch", "feature/z", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/fork/anything", edit); r.git("pack-refs", "--all"); }],
+    ])("does not take %s for what GitHub has: the push is asked about again, as one that edits a workflow", async (_label, branch, forge) => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      if (branch !== "feature/x") r.git("checkout", "-q", "-b", branch);
+      forge(r, edit);
+      const result = await r.push("origin", branch);
+      // The checkout, trusting the forged ref, called the push clean; GitHub's refs say otherwise, and the broker was asked again.
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [edit] });
+      expect(r.requests[1].body.operation).toMatchObject({
+        touchesWorkflows: true, shas: [edit], workflowFiles: [{ path: ci }],
+        workflowCommits: [{ sha: edit, changes: [{ path: ci }] }], workflowEntries: [before],
+      });
+      // The second answer was a refusal, and the push never ran.
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("refused in this test");
+      expect(r.onGitHub("feature/x")).toBe(before);
+      expect(() => r.onGitHub(branch === "feature/x" ? "nothing" : branch)).toThrow();
+    }, 60_000);
+
+    it("keeps a local branch from hiding anything: it is no remote ref, so the first report already says so", async () => {
+      const r = await githubLike();
+      const edit = await editWorkflow(r);
+      r.git("update-ref", "refs/heads/mirror", edit);
+      r.git("update-ref", "refs/heads/feature/y", edit);
+      await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, workflowCommits: [{ sha: edit }] });
+    }, 60_000);
+
+    it("hides a workflow edit behind a made-up remote ref even when a later commit undoes it", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "undo");
+      const tip = r.tip();
+      // The made-up ref is at the tip, so neither commit looks new, and the tip's workflow files are GitHub's own.
+      r.git("update-ref", "refs/remotes/origin/feature/x", tip);
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [tip] });
+      // Both commits are new to GitHub: the edit and the undo are each reported, and the history joins GitHub's at its branch.
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true, workflowEntries: [before] });
+      expect(r.requests[1].body.operation.workflowCommits.map((commit: { sha: string }) => commit.sha).sort()).toEqual([edit, tip].sort());
+      expect(result.code).toBe(1);
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("runs a push that GitHub's refs confirm carries no workflow change, after one question", async () => {
+      const r = await githubLike();
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      const result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [tip] });
+      expect(r.onGitHub("feature/x")).toBe(tip);
+    }, 60_000);
+
+    it("uses the answer to the second question for the push, when the broker allows it", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "second", ...identity } } });
+      const edit = await editWorkflow(r);
+      r.git("update-ref", "refs/remotes/origin/feature/x", edit);
+      const result = await r.push("origin", "feature/x");
+      // A company that grants the agent editWorkflows lets it through: the push runs on the second answer.
+      expect(r.requests).toHaveLength(2);
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(edit);
+    }, 60_000);
+
+    it("treats a push as one that may change workflows when GitHub's refs cannot be read, and says so", async () => {
+      const r = await githubLike();
+      r.git("remote", "set-url", "--push", "origin", path.join(r.root, "missing.git"));
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false });
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: null });
+      expect(r.requests[1].body.operation).not.toHaveProperty("workflowCommits");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("could not be read");
+    }, 60_000);
+
+    it("cannot compare a branch GitHub has with a commit this checkout lacks, so the push is asked about again", async () => {
+      const r = await githubLike();
+      // Someone else moves feature/x on GitHub; this checkout never fetches it.
+      const other = path.join(r.root, "other");
+      await mkdir(other);
+      r.sys(other, "clone", "-q", r.bare, ".");
+      r.sys(other, "checkout", "-q", "feature/x");
+      await writeFile(path.join(other, "other.ts"), "o\n");
+      r.sys(other, "add", ".");
+      r.sys(other, "commit", "-q", "-m", "someone else");
+      r.sys(other, "push", "-q", "origin", "feature/x");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      await r.push("--force", "origin", "feature/x");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false });
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: null });
+    }, 60_000);
   });
 
   it("reports where a push really goes and what could make it go elsewhere", async () => {
