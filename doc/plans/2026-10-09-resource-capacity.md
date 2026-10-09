@@ -22,6 +22,11 @@ Observed on 2026-10-09 (one self-hosted deployment, numbers rounded):
   `process_lost` and `orphaned_running_run`.
 - PR #44 measured the main disk consumer on workers: run directories, about
   35 runs and 17 GB per hour on one worker.
+- On a production instance host (measured read-only by its operator), the
+  two steady disk consumers are run logs and deploy backups. Run logs
+  (`data/run-logs`, NDJSON) grow about 142 MB a day: 853 MB in 6 days,
+  2,218 files, median 259 KB, largest 10 MB. Nothing prunes them. Each
+  deploy writes a pre-deploy database backup of about 4.6 GB, in one step.
 
 What `main` has today (verified at `4fefdc432`):
 
@@ -78,7 +83,7 @@ Two kinds of target:
 
 | Target | Where it runs | Disk roots | Memory, load, CPUs |
 |---|---|---|---|
-| `instance` (one per server host, keyed by hostname) | in-process | `data` (instance root), `runLogs` (`RUN_LOG_BASE_PATH` or `<root>/data/run-logs`), `workspaces` (`<root>/workspaces` and `<root>/projects`) | host |
+| `instance` (one per server host, keyed by hostname) | in-process | `data` (instance root), `runLogs` (`RUN_LOG_BASE_PATH` or `<root>/data/run-logs`), `workspaces` (`<root>/workspaces` and `<root>/projects`), `backups` (slice 2: `PAPERCLIP_DB_BACKUP_DIR` or `<root>/data/backups`, the server's `databaseBackupDir`) | host |
 | `environment`, driver `local` | same host as the instance | `workspaces` of the instance sample | instance sample |
 | `environment`, driver `ssh` | remote, through the driver's existing SSH command | the environment's `remoteWorkspacePath` | remote host |
 | `environment`, driver `sandbox` or `plugin` | not sampled | none | none |
@@ -89,6 +94,19 @@ follow-up if a provider exposes quota through its plugin.
 
 Roots on the same filesystem (same `st_dev`) are reported once, with all
 their labels.
+
+`runLogs` and `backups` are named roots because they are the instance's
+steady disk consumers (section 1). Usually they share the `data`
+filesystem and appear as labels of that one disk; a separate mount shows
+on its own. With `backups` the closed label set has 4 entries, which
+is the samples table's limit of 4 disks (section 5.2). Unverified: the
+deploy tooling is not in this repo, so it is not known that the pre-deploy
+backup is written to `databaseBackupDir`. If the operator confirms another
+location, slice 2 adds that path to the `backups` root; until then no new
+setting is added.
+
+This track reports and projects disk use. It never deletes run logs,
+backups or run directories (section 14).
 
 Per sample:
 
@@ -122,7 +140,11 @@ df -Pk . 2>/dev/null | tail -n 1 | sed 's/^/rc:df /'
 - **At lease acquire:** `ensureSshWorkspaceReady` already runs
   `mkdir -p <root> && cd <root> && pwd` once per run. It gains an option
   that appends
-  `&& { printf '\n__paperclip_rc__\n'; { { <probe>; } 2>/dev/null | head -c 16384; } 2>/dev/null; true; }`.
+  `&& { printf '\n<marker>\n'; { { <probe>; } 2>/dev/null | head -c 16384; } 2>/dev/null; true; }`.
+  The marker is `__paperclip_rc_<16 hex>__`, random per command
+  (`node:crypto`), so a workspace path that contains a marker-like line
+  cannot cut `remoteCwd`; anything that is not that shape is refused before
+  it reaches shell text.
   `head -c` bounds the probe's output to the parser cap on the worker, so a
   hostile or broken host cannot push the command past `runSshCommand`'s
   128 KB `maxBuffer` (which would reject the acquire). `remoteCwd` is the
@@ -149,8 +171,13 @@ df -Pk . 2>/dev/null | tail -n 1 | sed 's/^/rc:df /'
   run rate.
 - **Slow sweep:** each sweep pass runs the probe as one `runSshCommand`
   (`cd <root> && <probe>`, timeout 10 s) for an SSH environment only when
-  it has an active lease, or its level is not `ok`, or it has runs held for
-  capacity (slice 3). Interval per environment: 5 minutes, or 60 seconds
+  it has an active lease, or its effective level is not `ok` (read with
+  freshness, so a stale `ok` counts as `unknown` and is swept again), or it
+  has runs held for capacity (slice 3). The probe resolves the
+  environment's secrets under the company of its latest lease, active or
+  released. An environment that was never leased has no such company: it is
+  claimed but not probed, and stays `unknown` until its first run's
+  lease-acquire probe. Interval per environment: 5 minutes, or 60 seconds
   while the level is `critical` (so held runs resume quickly). Before
   probing, a process claims the environment with a compare-and-set on
   `resource_capacity_targets.next_sweep_at` (section 5.1); only the process
@@ -347,6 +374,14 @@ Examples: a 460 GiB disk is `low` under 20 GiB free and `critical` under
 5 GiB free. A 50 GiB disk is `low` under 7.5 GiB and `critical` under
 2.5 GiB.
 
+Against a 4.6 GB deploy backup (section 1): on a disk of 134 GiB or more,
+`low` (20 GiB) leaves room for about four backups and `critical` (5 GiB)
+for about one. On a smaller disk the percentage wins and `critical` can
+sit below one backup, so a deploy can hit `ENOSPC` while the root still
+reads `low`. No new mechanism: the instance page and CLI show free bytes
+on the root, and an operator with a small instance disk raises
+`diskCriticalPercent` (section 8.3).
+
 Hysteresis: a metric leaves `critical` only when free is at least 1.25
 times the critical threshold, and leaves `low` at 1.1 times the low
 threshold. This stops flapping around the line.
@@ -362,10 +397,32 @@ makes the critical thresholds configurable (section 8.3).
 
 For each disk root, a least-squares slope of free bytes over the last 6 hours
 of `ok` samples, if there are at least 6 samples spanning at least 30
-minutes. If the slope is negative, `hoursToFull = freeBytes / -slope`. The
-read model returns `{ label, hoursToFull, basisMinutes }`. It is computed on
-read from at most 72 rows per root, so it is never stale. A projection under
-24 hours raises an event (6.3); the event re-arms when the projection is
+minutes. If the slope is negative, `hoursToFull = freeBytes / -slope`.
+
+Steps are left out of the fit. A deploy backup takes about 4.6 GB between
+two history rows (section 1). A 6-hour least-squares fit across such a step
+in mid-window reads it as about 1.5 times the step per window, about
+1.15 GB an hour, so a root with 25 GB free would project full in under
+24 hours after every deploy. So the fit uses only the samples after the last step. A step is a
+change between two consecutive rows larger than both `max(1 GiB, 1% of
+total)` and 10 times the median absolute change between consecutive rows
+in the window. The second condition keeps a steady fast fill (a worker
+filling 17 GB an hour, about 1.4 GB per 5-minute row) from being read as
+steps. After a step the projection is absent until the minimums above hold
+again (about 30 minutes).
+
+A 6-hour basis cannot see slow growth: run logs at 142 MB a day are about
+35 MB per 6 hours. So the read model also returns a trend: a least-squares
+slope over the daily minimum free bytes of the last 7 days, steps
+included (backups that are never pruned are real growth), when at least
+2 days of history exist. It gives `trendDaysToFull`, shown on the instance
+page and in the CLI, with no event.
+
+The read model returns
+`{ label, hoursToFull, basisMinutes, trendDaysToFull, trendBasisDays }`.
+Both are computed on read (at most 72 rows per root for the 6-hour fit,
+one grouped query for the 7 daily minimums), so they are never stale. A
+projection under 24 hours raises an event (6.3); the event re-arms when the projection is
 over 48 hours or the root is `ok` again. The alarm state is kept per disk
 root in `disk_full_alarms` and changed with a per-label compare-and-set
 (`... where target_key = $k and coalesce(disk_full_alarms->>$label, 'armed') = 'armed' returning`),
@@ -644,7 +701,7 @@ Each slice ships web, API, OpenAPI and CLI together with tests.
 | Slice | Scope | Size |
 |---|---|---|
 | **1** | Both tables and the migration, shared types and constants, the recording path with its compare-and-set (5.3), levels with hysteresis, instance sampler, SSH probe at lease acquire and sweep, retention; the read-only environment resolver (needed for "can use"); the three read routes (latest only, no history yet), OpenAPI, CLI `capacity` and `environment capacity`, instance page and environment capacity line; `/api/health` level for admins. | L |
-| **2** | History (`since`, bucketing), sparklines, disk-full projection, the three `resource_capacity.*` activity events with affected-company fan-out. | M |
+| **2** | History (`since`, bucketing), sparklines, the `backups` disk root, disk-full projection (step-aware 6-hour fit and 7-day trend, section 6.2), the three `resource_capacity.*` activity events with affected-company fan-out. | M |
 | **3** | Admission hold before claim, `admission_hold` column, run and activity events, instance setting with `warn` default, the hold reason in run lists, the issue run ledger and run detail; warn-entry counts per environment for the last 24 and 48 hours (D1) on API, CLI and web. | M |
 | 4 | Placement: not built (section 9). | none |
 
@@ -666,7 +723,11 @@ Each item is a test that fails before its slice and passes after.
   both directions, worst-metric level, metrics a `partial` reading lacks
   keep their level, a `failed` reading changes nothing, stale gives `unknown`.
 - **Projection (pure):** steady fill, refill (positive slope gives none),
-  too few samples, too short a span.
+  too few samples, too short a span; a 4.6 GB drop inside an otherwise flat
+  6-hour window gives no projection under 24 hours; a steady fill of
+  1.4 GB per row is not read as steps; the 7-day trend of 142 MB a day
+  plus a 4.6 GB step every second day gives the expected
+  `trendDaysToFull`; under 2 days of history gives no trend.
 - **SSH probe:** with the real-sshd fixture (`ssh-fixture.test.ts`,
   `PAPERCLIP_ENABLE_DARWIN_SSH_ENV_LAB=1` on macOS): `ensureSshWorkspaceReady`
   with the probe returns the same `remoteCwd` as without; on a worker with
@@ -674,15 +735,19 @@ Each item is a test that fails before its slice and passes after.
   disk; a root that cannot be created still fails the acquire. Local
   `sh` tests (no sshd needed): a probe printing 1 MB is cut to 16 KB and the
   command still succeeds; a marker printed by the probe does not change
-  `remoteCwd`; a failing `mkdir` or `cd` keeps its non-zero status.
+  `remoteCwd`; a workspace path that contains a marker-like line keeps its
+  `remoteCwd` (also through the real-sshd fixture); a failing `mkdir` or
+  `cd` keeps its non-zero status.
 - **Service (embedded Postgres):** a history row at most every 5 minutes
   or on a level change, whatever the number of lease-acquire readings; a
   reading older than the recorded one changes nothing; a disk-only reading
   classifies the disk; `critical` followed by failed readings stays
   `critical` for 15 minutes, then reads `unknown`;
-  retention deletes in batches; the sweep picks only active, non-ok or held
-  environments; a sweep failure stores `failed`, keeps the level, and does
-  not throw. **Two service instances on one database:** concurrent
+  retention deletes in batches; the sweep probes environments that are
+  leased or whose effective level is not `ok` (a released lease with no
+  reading is probed, a fresh `ok` is not, a never-leased environment is
+  claimed but not probed); a sweep failure stores `failed`, keeps the
+  level, and does not throw. **Two service instances on one database:** concurrent
   recordings of the same transition write one level change and one set of
   events; concurrent sweeps probe an environment once per interval.
 - **Routes:** instance route 403 for non-admins; company route and
@@ -719,6 +784,9 @@ Each item is a test that fails before its slice and passes after.
 
 ## 14. Coordination
 
+- **Run-log and backup retention:** owned by the observability track
+  (slice 1e) and the session warehouse track (archive, then prune). This
+  track reports and projects those roots; it never deletes files.
 - **Observability track:** owns run failure causes (including a disk-full
   cause from `ENOSPC`) and usage records. This track owns host sampling. Its
   optional "PR 7: worker free-bytes sampling at the `statfsSync` point" is
