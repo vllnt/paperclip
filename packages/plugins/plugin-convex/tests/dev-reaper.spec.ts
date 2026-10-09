@@ -26,6 +26,9 @@ describe("hard delete guard (regardless of grants or config)", () => {
     f.convex.add(deployment("xyz789", { reference: "preview/staging" }));
     f.github.pulls.push({ number: 98, ref: "xyz789", state: "closed", merged: true });
     closed(f, "feat-ok", 50);
+    const plan = await f.h.performAction<any>("reaper.run", { dryRun: true }, member(COMPANY_A));
+    expect(plan.projects[0].delete.map((item: any) => item.name)).toEqual(["feat-ok"]);
+    expect(plan.projects[0].setExpiry.map((item: any) => item.name)).not.toEqual(expect.arrayContaining(["release-1-2"]));
     await f.h.runJob("convex-reaper");
     expect(deleted(f)).toEqual(["feat-ok"]);
   });
@@ -68,6 +71,7 @@ describe("hard delete guard (regardless of grants or config)", () => {
     const result = await f.h.executeTool<{ data?: any }>("convex_reap_previews", { dryRun: false }, run("janitor"));
     expect(result.data.projects[0].dev.delete.map((item: any) => item.name)).toEqual(["old-dev"]);
     expect(result.data.projects[0].dev.deleted).toEqual([]);
+    expect(result.data.projects[0].dev.executed).toBe(false);
     expect(f.convex.deletes()).toHaveLength(0);
   });
 });
@@ -268,6 +272,20 @@ describe("superseded previews of open pull requests", () => {
     await expect(service.deletePreview({ kind: "reaper", companyId: COMPANY_A }, cfg, reserved, "pr4320-run100-s1-a1", {
       dryRun: false, supersededBy: { name: "pr4320-run101-s1-a1", pr: 4320 },
     })).rejects.toThrow(/newer preview/i);
+    expect(f.convex.deletes()).toHaveLength(0);
+  });
+});
+
+describe("superseded override stays tied to the blocking pull request", () => {
+  it("does not let a newer preview of one pull request clear the open-PR block of another", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config({}, { pullRequestPattern: "^pr(?<pr>\\d+)-run(?<run>\\d+)-s(?<shard>\\d+)-a(?<attempt>\\d+)$" }) } });
+    f.convex.add(deployment("pr4320-run100-s1-a1", { previewIdentifier: "pr4320-run100-s1-a1", lastDeployTime: NOW - 5 * HOUR }), deployment("pr9999-run200-s1-a1", { previewIdentifier: "pr9999-run200-s1-a1", lastDeployTime: NOW - 1 * HOUR }));
+    f.github.pulls.push({ number: 4320, ref: "feature/x" }, { number: 9999, ref: "feature/y" });
+    const { service } = f.runtime;
+    const { config: cfg, reserved } = await service.requireConnected(COMPANY_A);
+    await expect(service.deletePreview({ kind: "reaper", companyId: COMPANY_A }, cfg, reserved, "pr4320-run100-s1-a1", {
+      dryRun: false, supersededBy: { name: "pr9999-run200-s1-a1", pr: 9999 },
+    })).rejects.toThrow(/open pull request #4320/i);
     expect(f.convex.deletes()).toHaveLength(0);
   });
 });

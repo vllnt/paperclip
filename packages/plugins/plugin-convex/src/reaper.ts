@@ -188,7 +188,8 @@ function planSuperseded(previews: ConvexDeployment[], project: ProjectMapping, c
   const order = (a: CiEntry, b: CiEntry) => (a.run !== null && b.run !== null ? a.run - b.run || a.attempt - b.attempt : a.at - b.at);
   for (const mine of entries) {
     const newest = entries.filter(other => other.pr === mine.pr).reduce((best, other) => (order(other, best) > 0 ? other : best), mine);
-    if (newest.name === mine.name || order(mine, newest) >= 0) continue;
+    // `newest` starts as `mine` and only moves to a strictly newer entry, so equal shards of the newest run are never replaced.
+    if (newest.name === mine.name) continue;
     if (!(mine.run !== null && newest.run !== null) && newest.at - mine.at < minAge) continue;
     if (now - mine.at < minAge) continue;
     out.set(mine.name, { name: newest.name, pr: mine.pr });
