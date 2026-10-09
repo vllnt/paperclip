@@ -45,7 +45,9 @@ Planning fields, all optional:
 | `targetDate` | `YYYY-MM-DD` or null | When the goal should be reached |
 | `successCriteria` | text or null | How to tell it is reached, for example "open pull requests = 0" |
 
-`parentId` and `ownerAgentId` must belong to the same company. A parent that would put the goal below itself returns `422`. Fields outside this list are ignored on update, and an invalid value returns `422` from every caller, including plugins.
+`parentId` and `ownerAgentId` must belong to the same company. A parent that would put the goal below itself returns `422`. Fields outside this list are ignored on update, and an invalid value returns `422` from every caller, including plugins. `title` is at most 2,000 characters.
+
+Only the board sets `kind: "milestone"`, `horizon`, `targetDate` or `successCriteria`, and only the board updates or deletes a goal with the `short` horizon or a milestone, because the company focus shows them to every agent. This holds for a short term goal in any status. An agent or a plugin gets `403` for these; clearing a planning field to null on a goal outside the focus is allowed.
 
 ### Update Goal
 
@@ -59,13 +61,23 @@ PATCH /api/goals/{goalId}
 
 Valid status values: `planned`, `active`, `achieved`, `cancelled`.
 
+### Delete Goal
+
+```
+DELETE /api/goals/{goalId}
+```
+
+Only the board deletes a goal with the `short` horizon or a milestone; anyone else gets `403`.
+
 ### Company Focus
 
 ```
 GET /api/companies/{companyId}/goals/focus
 ```
 
-Returns `{ goals, guidance }`. `goals` lists the active goals with the `short` horizon, nearest target date first, at most 10. Each has `progress` (`total`, `done`, `open` tasks, counted over the goal and every goal below it), `daysLeft`, `successCriteria` (cut to 280 characters), and up to 5 open milestones. `guidance` is the instruction agents follow. Agents also get this as `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`, with `issueFocusGoalId` saying which focus goal the task serves. The agent inbox (`GET /api/agents/me/inbox-lite`) lists critical tasks first, then tasks that serve the focus.
+Returns `{ goals, guidance }`. `goals` lists the active goals with the `short` horizon, nearest target date first, at most 10. Each has `progress` (`total`, `done`, `open` tasks, counted over the goal and every goal below it), `daysLeft`, `successCriteria`, and up to 5 open milestones; titles and `successCriteria` are cut to 280 characters. `guidance` is the instruction agents follow. Agents also get this as `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`, with `issueFocusGoalId` saying which focus goal the task serves. The agent inbox (`GET /api/agents/me/inbox-lite`) lists critical tasks first, then tasks that serve the focus, each with `focusGoalId`.
+
+When the company has no focus, or the focus cannot be read within 500 ms, the heartbeat context has no `companyFocus` key and the inbox keeps its normal order with no `focusGoalId`.
 
 ### Goal Progress
 

@@ -207,7 +207,7 @@ Invariant: at least one root `company` level goal per company.
 
 Invariant: a goal's parent and owner belong to the goal's company, and a parent is never the goal itself or a goal below it.
 
-Company focus: active goals with the `short` horizon are the company's current focus. Agents receive it as `companyFocus` in the heartbeat context, and their inbox lists tasks under a focus goal first. See `doc/GOALS.md`.
+Company focus: active goals with the `short` horizon are the company's current focus. Agents receive it as `companyFocus` in the heartbeat context, and their inbox lists tasks under a focus goal first. Only the board writes the focus; with no focus, or when it cannot be read within 500 ms, the context and inbox are unchanged. See `doc/GOALS.md`.
 
 ## 7.5 `projects`
 
