@@ -441,6 +441,25 @@ describe("CommandPalette", () => {
     });
   });
 
+  it("lists Goals even when the sidebar hides its Goals link", async () => {
+    // The sidebar-link flag only places a link; the /goals route always
+    // exists, and the previous palette always listed Goals.
+    const settings = { enableStreamlinedUi: true, enableGoalsSidebarLink: false };
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue(settings);
+    const { root } = renderWithQueryClient(<CommandPalette />, container, (queryClient) => {
+      queryClient.setQueryData(queryKeys.instance.experimentalSettings, settings);
+    });
+
+    openPalette();
+    await waitForAssertion(() => {
+      expect(container.querySelector('section[aria-label="Navigate"]')?.textContent).toContain("Goals");
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("remembers used actions and lists them under Recent", async () => {
     const { root } = renderWithQueryClient(<CommandPalette />, container);
 
