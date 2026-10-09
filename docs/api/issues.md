@@ -326,6 +326,36 @@ GET /api/attachments/{attachmentId}/content
 DELETE /api/attachments/{attachmentId}
 ```
 
+## Issue Tree
+
+```
+GET /api/issues/{issueId}/diagnostics/subtree
+```
+
+Read-only view of an issue and its sub-issues (depth 8, 100 nodes) with the
+blockers, wake requests, and activity that explain a stall. The root and every
+returned node must pass issue-read authorization; hidden nodes are omitted and
+counted in `omittedUnauthorizedNodeCount`.
+
+Each entry of `nodes` has `issue` (status, priority, assignee ids), `parentId`,
+`depth`, `diagnosis`, `blockers`, `wakeEvents`, and `lastRun`:
+
+```json
+"lastRun": {
+  "id": "run-uuid",
+  "status": "failed",
+  "agentId": "agent-uuid",
+  "startedAt": "2026-10-09T10:00:00.000Z",
+  "finishedAt": "2026-10-09T10:04:12.000Z",
+  "createdAt": "2026-10-09T09:59:58.000Z",
+  "errorCode": "process_exit"
+}
+```
+
+`lastRun` is the latest heartbeat run whose context issue is that node, or
+`null` when it never ran. `id` and `agentId` are `null` for actors without
+company-scope read, the same rule as the wake-request run and agent ids.
+
 ## Issue Lifecycle
 
 ```
