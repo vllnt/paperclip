@@ -4,6 +4,8 @@
  * `paperclipai` CLI commands that reach it.
  *
  * Run: `pnpm --filter @paperclipai/server api:coverage`
+ * Create the parity baseline, or drop baselined gaps that now have a CLI command (it never adds a gap):
+ * `pnpm --filter @paperclipai/server api:coverage -- --write-baseline`
  *
  * UI and CLI callers are found by static scanning of `ui/src/api/*.ts` and
  * `cli/src/commands/**`. Calls whose path is built at runtime are reported as
@@ -12,6 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { z } from "zod";
 import { readObject } from "../src/lib/objects.js";
 
 const HTTP_METHODS = ["get", "put", "post", "delete", "patch"] as const;
@@ -1161,17 +1164,71 @@ function cliCoverage(
   return { kind: "none" };
 }
 
-/** Renders the matrix document. */
-export function renderCoverageMarkdown(result: CoverageResult): string {
-  const { operations, uiByOperation, cliByOperation } = result;
-  const keyUsable = (operation: SpecOperation) => !["agent-run-jwt", "runtime-token"].includes(operation.access);
+/** How the CLI reaches each operation, keyed by `operationId`. */
+function buildCliCoverage(result: CoverageResult): Map<string, CliCoverage> {
   const genericCliCalls = result.dynamicCalls.filter((call) => call.file.startsWith("cli/"));
-  const coverage = new Map(
-    operations.map((operation) => [
+  return new Map(
+    result.operations.map((operation) => [
       operationId(operation),
-      cliCoverage(operation, cliByOperation, genericCliCalls, operations),
+      cliCoverage(operation, result.cliByOperation, genericCliCalls, result.operations),
     ]),
   );
+}
+
+/**
+ * Operations that no dedicated `paperclipai` command calls, sorted. Shared
+ * helper code and generic dynamic-path calls do not count: a catch-all
+ * command must not make every route look covered.
+ */
+export function findCliGaps(result: CoverageResult): string[] {
+  const coverage = buildCliCoverage(result);
+  return result.operations
+    .map(operationId)
+    .filter((id) => coverage.get(id)?.kind !== "command")
+    .sort();
+}
+
+/** The parity gaps that existed when the ratchet started: the backlog, not a license for new gaps. */
+export const PARITY_BASELINE_FILE = "doc/api-cli-parity-baseline.json";
+/** Operations that intentionally have no CLI command, each with a reason. */
+export const PARITY_EXEMPTIONS_FILE = "doc/api-cli-parity-exemptions.json";
+
+const parityBaselineSchema = z.object({ operations: z.array(z.string()) });
+const parityExemptionsSchema = z.object({
+  exemptions: z.array(z.object({ operation: z.string(), reason: z.string() })),
+});
+
+/** Reads the baselined gaps. */
+export function readParityBaseline(repoRoot: string): string[] {
+  const raw: unknown = JSON.parse(fs.readFileSync(path.join(repoRoot, PARITY_BASELINE_FILE), "utf8"));
+  return parityBaselineSchema.parse(raw).operations;
+}
+
+/** Reads the exemptions as `operation -> reason`. */
+export function readParityExemptions(repoRoot: string): Record<string, string> {
+  const raw: unknown = JSON.parse(fs.readFileSync(path.join(repoRoot, PARITY_EXEMPTIONS_FILE), "utf8"));
+  return Object.fromEntries(parityExemptionsSchema.parse(raw).exemptions.map((entry) => [entry.operation, entry.reason]));
+}
+
+/** Renders the baseline with one operation per line, so a diff shows exactly which gaps changed. */
+export function renderParityBaseline(gaps: readonly string[]): string {
+  return `{\n  "operations": [\n${gaps.map((id) => `    ${JSON.stringify(id)}`).join(",\n")}\n  ]\n}\n`;
+}
+
+/** The gaps a pull request must close or justify: not baselined and not exempted. */
+export function unreviewedCliGaps(
+  gaps: readonly string[],
+  baseline: ReadonlySet<string>,
+  exemptions: Readonly<Record<string, string>>,
+): string[] {
+  return gaps.filter((id) => !baseline.has(id) && !Object.hasOwn(exemptions, id));
+}
+
+/** Renders the matrix document. */
+export function renderCoverageMarkdown(result: CoverageResult): string {
+  const { operations, uiByOperation } = result;
+  const keyUsable = (operation: SpecOperation) => !["agent-run-jwt", "runtime-token"].includes(operation.access);
+  const coverage = buildCliCoverage(result);
   const cliKind = (operation: SpecOperation) => coverage.get(operationId(operation))?.kind ?? "none";
   const uiOps = operations.filter((operation) => uiByOperation.has(operationId(operation)));
   const uiOpsWithoutCli = uiOps.filter(
@@ -1215,6 +1272,11 @@ export function renderCoverageMarkdown(result: CoverageResult): string {
     "- **CLI:** the `paperclipai` command whose handler calls the operation. `**missing**` means the UI calls it and no " +
       "command does; `helper only` means only shared CLI code calls it; `unknown` means a generic command (one that " +
       "builds the path from its arguments) may reach it.",
+  );
+  lines.push(
+    "- **Parity ratchet:** `server/src/__tests__/api-coverage-matrix.test.ts` fails when an operation has no `paperclipai` " +
+      `command and is in neither \`${PARITY_BASELINE_FILE}\` (the backlog; it only shrinks) nor ` +
+      `\`${PARITY_EXEMPTIONS_FILE}\` (intentional gaps, each with a reason). Add the command; do not add to the baseline.`,
   );
   lines.push("");
   lines.push("## Summary");
@@ -1331,6 +1393,22 @@ async function main() {
   const outFile = path.join(repoRoot, "doc/api-coverage-matrix.md");
   fs.writeFileSync(outFile, renderCoverageMarkdown(result));
   console.log(`Wrote ${path.relative(repoRoot, outFile)} (${operations.length} operations)`);
+  const gaps = findCliGaps(result);
+  const baselineFile = path.join(repoRoot, PARITY_BASELINE_FILE);
+  if (process.argv.includes("--write-baseline")) {
+    const current = new Set(gaps);
+    const kept = fs.existsSync(baselineFile) ? readParityBaseline(repoRoot).filter((id) => current.has(id)) : gaps;
+    fs.writeFileSync(baselineFile, renderParityBaseline(kept));
+    console.log(`Wrote ${PARITY_BASELINE_FILE} (${kept.length} operations without a CLI command)`);
+  } else if (fs.existsSync(baselineFile)) {
+    const stale = readParityBaseline(repoRoot).filter((id) => !gaps.includes(id));
+    if (stale.length > 0) {
+      console.log(
+        `${stale.length} baselined operations now have a CLI command or no longer exist. ` +
+          "Run with --write-baseline to drop them from the baseline.",
+      );
+    }
+  }
   if (result.uiUndocumented.length || result.cliUndocumented.length) {
     console.warn("Calls without a documented operation:");
     for (const call of [...result.uiUndocumented, ...result.cliUndocumented]) {

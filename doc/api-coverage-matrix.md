@@ -11,6 +11,7 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 - **API key:** the credential the document declares (`x-paperclip-authorization`). `board key` means a board API key (`Authorization: Bearer <key>`) is accepted, not only a browser session. Route handlers can add stricter checks; known runtime exceptions are listed in the plan doc.
 - **UI caller:** the board UI client function (`ui/src/api/*.ts`) that calls the operation.
 - **CLI:** the `paperclipai` command whose handler calls the operation. `**missing**` means the UI calls it and no command does; `helper only` means only shared CLI code calls it; `unknown` means a generic command (one that builds the path from its arguments) may reach it.
+- **Parity ratchet:** `server/src/__tests__/api-coverage-matrix.test.ts` fails when an operation has no `paperclipai` command and is in neither `doc/api-cli-parity-baseline.json` (the backlog; it only shrinks) nor `doc/api-cli-parity-exemptions.json` (intentional gaps, each with a reason). Add the command; do not add to the baseline.
 
 ## Summary
 
