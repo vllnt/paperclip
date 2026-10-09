@@ -297,3 +297,31 @@ export interface EnvironmentResourceCapacityDetail {
   generatedAt: string;
   environment: EnvironmentResourceCapacity;
 }
+
+function formatGib(bytes: number): string {
+  return `${(bytes / GIB).toFixed(1)} GiB`;
+}
+
+/**
+ * One human-readable line of numbers for a snapshot. The web and the CLI
+ * both print it, so they show the same text.
+ *
+ * @param now - Epoch milliseconds used for the sample age.
+ * @example "disk workspaces 3.0 GiB free (3%) · memory 8.0 GiB of 16.0 GiB available · load 0.25/core · sampled 2m ago"
+ */
+export function formatResourceCapacitySnapshot(snapshot: ResourceCapacitySnapshot, now: number = Date.now()): string {
+  const parts = snapshot.disks.map(
+    (disk) => `disk ${disk.labels.join("+")} ${formatGib(disk.freeBytes)} free (${disk.freePercent}%)`,
+  );
+  if (snapshot.memAvailableBytes !== null && snapshot.memTotalBytes !== null) {
+    parts.push(`memory ${formatGib(snapshot.memAvailableBytes)} of ${formatGib(snapshot.memTotalBytes)} available`);
+  }
+  if (snapshot.loadPerCore !== null) parts.push(`load ${snapshot.loadPerCore}/core`);
+  if (!snapshot.sampledAt) {
+    parts.push("never sampled");
+  } else {
+    const minutes = Math.max(0, Math.round((now - Date.parse(snapshot.sampledAt)) / 60_000));
+    parts.push(minutes < 1 ? "sampled just now" : `sampled ${minutes}m ago`);
+  }
+  return parts.join(" · ");
+}

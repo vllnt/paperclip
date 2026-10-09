@@ -5,12 +5,14 @@ import {
   classifyResourceCapacityReading,
   criticalResourceCapacityMetrics,
   effectiveResourceCapacityLevel,
+  formatResourceCapacitySnapshot,
   freshResourceCapacityMetricLevels,
   measuredResourceCapacityMetrics,
   resourceCapacityReadingStatus,
   resourceCapacityThresholdBytes,
   worstResourceCapacityLevel,
   type ResourceCapacityReading,
+  type ResourceCapacitySnapshot,
 } from "./resource-capacity.js";
 
 const GIB = 1024 ** 3;
@@ -152,5 +154,42 @@ describe("reading status and effective level", () => {
     expect(measuredResourceCapacityMetrics(reading({ memTotalBytes: null, memAvailableBytes: null, load5: null }))).toEqual([
       "disk:workspaces",
     ]);
+  });
+});
+
+describe("formatResourceCapacitySnapshot", () => {
+  const snapshot: ResourceCapacitySnapshot = {
+    level: "critical",
+    metricLevels: { "disk:workspaces": "critical", memory: "ok", load: "ok" },
+    sampledAt: "2026-10-09T11:58:00.000Z",
+    lastSuccessAt: "2026-10-09T11:58:00.000Z",
+    readingStatus: "ok",
+    cpuCount: 8,
+    load1: 1,
+    load5: 2,
+    load15: 3,
+    loadPerCore: 0.25,
+    memTotalBytes: 16 * GIB,
+    memAvailableBytes: 8 * GIB,
+    disks: [{ labels: ["workspaces"], totalBytes: 100 * GIB, freeBytes: 3 * GIB, freePercent: 3 }],
+  };
+
+  it("prints one line of numbers", () => {
+    expect(formatResourceCapacitySnapshot(snapshot, Date.parse("2026-10-09T12:00:00.000Z"))).toBe(
+      "disk workspaces 3.0 GiB free (3%) · memory 8.0 GiB of 16.0 GiB available · load 0.25/core · sampled 2m ago",
+    );
+  });
+
+  it("prints only what was measured", () => {
+    expect(
+      formatResourceCapacitySnapshot({
+        ...snapshot,
+        disks: [],
+        memTotalBytes: null,
+        memAvailableBytes: null,
+        loadPerCore: null,
+        sampledAt: null,
+      }),
+    ).toBe("never sampled");
   });
 });

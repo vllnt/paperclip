@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EnvironmentResourceCapacity } from "@paperclipai/shared";
-import { formatResourceCapacitySnapshot, registerCapacityCommands } from "../commands/client/capacity.js";
+import { registerCapacityCommands } from "../commands/client/capacity.js";
 import { registerWorkspaceCommands } from "../commands/client/workspace.js";
 
 const COMPANY_ID = "22222222-2222-4222-8222-222222222222";
@@ -89,11 +89,8 @@ describe("resource capacity commands", () => {
     ]);
     expect(lines.filter((line) => line.includes("worker-a"))).toHaveLength(3);
     expect(lines.find((line) => line.includes("worker-a"))).toContain("CRITICAL");
-  });
-
-  it("formats a snapshot as one line of numbers", () => {
-    expect(formatResourceCapacitySnapshot(ENVIRONMENT, Date.parse("2026-10-09T12:00:00.000Z"))).toBe(
-      "disk workspaces 3.0 GiB free (3%) · memory 8.0 GiB of 16.0 GiB available · load 0.25/core · sampled 2m ago",
+    expect(lines.find((line) => line.includes("worker-a"))).toContain(
+      "disk workspaces 3.0 GiB free (3%) · memory 8.0 GiB of 16.0 GiB available · load 0.25/core",
     );
   });
 });
