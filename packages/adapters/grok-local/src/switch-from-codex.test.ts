@@ -11,8 +11,8 @@ function codexAgent(config: Record<string, unknown>, runtimeConfig: Record<strin
 const GROK_ON_CODEX = {
   model: "grok-4.7",
   modelReasoningEffort: "xhigh",
-  cwd: "/work/anthm",
-  instructionsFilePath: "/work/anthm/AGENTS.md",
+  cwd: "/work/app",
+  instructionsFilePath: "/work/app/AGENTS.md",
   promptTemplate: "Do the work",
   timeoutSec: 3600,
   graceSec: 30,
@@ -40,8 +40,8 @@ describe("planCodexToGrokSwitch", () => {
       adapterConfig: {
         model: "grok-4.7",
         reasoningEffort: "xhigh",
-        cwd: "/work/anthm",
-        instructionsFilePath: "/work/anthm/AGENTS.md",
+        cwd: "/work/app",
+        instructionsFilePath: "/work/app/AGENTS.md",
         promptTemplate: "Do the work",
         timeoutSec: 3600,
         graceSec: 30,

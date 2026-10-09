@@ -31,8 +31,8 @@ const codexAgent = (config: Record<string, unknown>, runtimeConfig: Record<strin
 const GROK_CONFIG = {
   model: "grok-4.7",
   modelReasoningEffort: "high",
-  cwd: "/work/anthm",
-  instructionsFilePath: "/work/anthm/AGENTS.md",
+  cwd: "/work/app",
+  instructionsFilePath: "/work/app/AGENTS.md",
   env: {
     OPENAI_API_KEY: { type: "secret_ref", secretId: SECRET_ID, version: "latest" },
     OPENAI_BASE_URL: { type: "plain", value: "https://proxy.example/v1" },
@@ -72,8 +72,8 @@ describe("agent set-adapter", () => {
         adapterConfig: {
           model: "grok-4.7",
           reasoningEffort: "high",
-          cwd: "/work/anthm",
-          instructionsFilePath: "/work/anthm/AGENTS.md",
+          cwd: "/work/app",
+          instructionsFilePath: "/work/app/AGENTS.md",
           env: {
             XAI_API_KEY: { type: "secret_ref", secretId: SECRET_ID, version: "latest" },
             GROK_XAI_API_BASE_URL: { type: "plain", value: "https://proxy.example/v1" },

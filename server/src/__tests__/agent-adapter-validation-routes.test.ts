@@ -771,8 +771,8 @@ describe("agent routes adapter validation", () => {
       adapterConfig: {
         model: "grok-4.7",
         modelReasoningEffort: "xhigh",
-        cwd: "/work/anthm",
-        instructionsFilePath: "/work/anthm/AGENTS.md",
+        cwd: "/work/app",
+        instructionsFilePath: "/work/app/AGENTS.md",
         paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/paperclip"] },
         env: {
           OPENAI_API_KEY: secret,
@@ -797,8 +797,8 @@ describe("agent routes adapter validation", () => {
     expect(patch.adapterConfig).toMatchObject({
       model: "grok-4.7",
       reasoningEffort: "xhigh",
-      cwd: "/work/anthm",
-      instructionsFilePath: "/work/anthm/AGENTS.md",
+      cwd: "/work/app",
+      instructionsFilePath: "/work/app/AGENTS.md",
       paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/paperclip"] },
       env: { XAI_API_KEY: secret, GROK_XAI_API_BASE_URL: { type: "plain", value: "https://proxy.example/v1" } },
     });
