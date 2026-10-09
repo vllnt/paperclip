@@ -1067,6 +1067,18 @@ npx paperclipai environment probe <environment-id>
 npx paperclipai environment probe-config --company-id <company-id> --payload-json '{...}'
 ```
 
+Resource capacity: free disk, available memory and load per CPU core, with a
+level (`ok`, `low`, `critical`, or `unknown` when nothing was measured in the
+last 15 minutes). Members and agents of a company see the environments its
+agents run on; `--instance` (every server host and environment) is for instance
+admins.
+
+```sh
+npx paperclipai capacity --company-id <company-id>
+npx paperclipai capacity --instance
+npx paperclipai environment capacity <environment-id>
+```
+
 ```sh
 npx paperclipai project-workspace list <project-id>
 npx paperclipai project-workspace create <project-id> --payload-json '{...}'
