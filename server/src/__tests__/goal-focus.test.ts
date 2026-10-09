@@ -329,7 +329,7 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       const res = await request(app(agentActor(company.id, agentId))).get("/api/agents/me/inbox-lite");
 
       expect(res.body.map((row: { id: string }) => row.id)).toEqual([critical.id, low.id]);
-      expect(res.body.every((row: { focusGoalId: string | null }) => row.focusGoalId === null)).toBe(true);
+      for (const row of res.body) expect(row).not.toHaveProperty("focusGoalId");
     });
 
     it("see the company focus and whether their task serves it in the heartbeat context", async () => {
@@ -349,7 +349,8 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
         issueFocusGoalId: focusGoal.id,
         goals: [{ id: focusGoal.id, title: "Land PRs", successCriteria: "Open PRs = 0", progress: { total: 1, done: 0, open: 1 } }],
       });
-      expect(servingRes.body.goal).toMatchObject({ id: focusGoal.id, horizon: "short", kind: "goal", targetDate: "2026-10-16" });
+      expect(servingRes.body.goal).toMatchObject({ id: focusGoal.id, horizon: "short", targetDate: "2026-10-16", successCriteria: "Open PRs = 0" });
+      expect(servingRes.body.goal).not.toHaveProperty("kind");
       expect(otherRes.body.companyFocus).toMatchObject({ issueFocusGoalId: null });
     });
   });
@@ -419,9 +420,10 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       expect(res.status).toBe(200);
       expect(res.body.goal).toBeNull();
       expect(JSON.stringify(res.body)).not.toContain("Secret plan");
-      expect(res.body.companyFocus).toMatchObject({ goals: [], issueFocusGoalId: null });
+      expect(res.body).not.toHaveProperty("companyFocus");
     });
   });
+
   describe("board-only company focus", () => {
     it("refuses an agent that sets a planning field on a new goal, and lets the board", async () => {
       const company = await seedCompany();
@@ -519,6 +521,104 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       expect(await host.goals.update({ goalId: plain.id, companyId: company.id, patch: { title: "Renamed" } }))
         .toMatchObject({ title: "Renamed" });
       expect((await goalFocusService(db as Db).getFocus(company.id)).goals.map((goal) => goal.title)).toEqual(["Land PRs"]);
+    });
+  });
+
+  describe("focus size bound", () => {
+    it("bounds the whole company focus with the longest titles and criteria the API accepts", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      for (let day = 10; day <= 20; day += 1) {
+        const goal = await seedGoal(company.id, {
+          title: "t".repeat(2000),
+          horizon: "short",
+          targetDate: `2026-10-${day}`,
+          successCriteria: "c".repeat(2000),
+        });
+        await db.insert(goals).values(Array.from({ length: 6 }, () => ({
+          companyId: company.id,
+          title: "m".repeat(2000),
+          kind: "milestone" as const,
+          status: "planned",
+          parentId: goal.id,
+        })));
+      }
+      const issue = await seedIssue(company, { assigneeAgentId: agentId });
+
+      const res = await request(app(agentActor(company.id, agentId))).get(`/api/issues/${issue.id}/heartbeat-context`);
+
+      expect(res.status).toBe(200);
+      const focus = res.body.companyFocus;
+      expect(focus.goals).toHaveLength(10);
+      for (const goal of focus.goals) {
+        expect(goal.title.length).toBeLessThanOrEqual(280);
+        expect(goal.successCriteria.length).toBeLessThanOrEqual(280);
+        expect(goal.milestones).toHaveLength(5);
+        for (const milestone of goal.milestones) expect(milestone.title.length).toBeLessThanOrEqual(280);
+      }
+      expect(JSON.stringify(focus).length).toBeLessThanOrEqual(32_000);
+    });
+
+    it("cuts the success criteria of the task's own goal in the heartbeat context", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      const goal = await seedGoal(company.id, { horizon: "long", successCriteria: "x".repeat(2000) });
+      const issue = await seedIssue(company, { assigneeAgentId: agentId, goalId: goal.id });
+
+      const res = await request(app(agentActor(company.id, agentId))).get(`/api/issues/${issue.id}/heartbeat-context`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.goal.successCriteria.length).toBeLessThanOrEqual(280);
+    });
+
+    it("refuses a goal title longer than a mission", async () => {
+      const company = await seedCompany();
+      const client = request(app(board(company.id)));
+
+      const tooLong = await client.post(`/api/companies/${company.id}/goals`).send({ title: "x".repeat(2001) });
+      const longest = await client.post(`/api/companies/${company.id}/goals`).send({ title: "x".repeat(2000) });
+      const renamedTooLong = await client.patch(`/api/goals/${longest.body.id}`).send({ title: "y".repeat(2001) });
+
+      expect(tooLong.status).toBe(400);
+      expect(longest.status).toBe(201);
+      expect(renamedTooLong.status).toBe(400);
+    });
+  });
+
+  describe("no focus set", () => {
+    it("leaves the heartbeat context as it was before goals had planning fields", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      await seedGoal(company.id, { title: "Later", horizon: "medium" });
+      const goal = await seedGoal(company.id, { title: "Plain" });
+      const issue = await seedIssue(company, { assigneeAgentId: agentId, goalId: goal.id });
+
+      const res = await request(app(agentActor(company.id, agentId))).get(`/api/issues/${issue.id}/heartbeat-context`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).not.toHaveProperty("companyFocus");
+      expect(Object.keys(res.body.goal)).toEqual(["id", "title", "status", "level", "parentId"]);
+    });
+
+    it("shows a goal's planning fields only when they are set", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      const parent = await seedGoal(company.id, { title: "Ship v2", horizon: "long" });
+      const milestone = await seedGoal(company.id, { title: "Beta", kind: "milestone", parentId: parent.id, targetDate: "2026-11-01" });
+      const issue = await seedIssue(company, { assigneeAgentId: agentId, goalId: milestone.id });
+
+      const res = await request(app(agentActor(company.id, agentId))).get(`/api/issues/${issue.id}/heartbeat-context`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.goal).toEqual({
+        id: milestone.id,
+        title: "Beta",
+        status: "active",
+        level: "task",
+        parentId: parent.id,
+        kind: "milestone",
+        targetDate: "2026-11-01",
+      });
     });
   });
 });
