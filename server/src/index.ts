@@ -1,5 +1,6 @@
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
+import { sshRunDirectoryReaperService } from "./services/ssh-run-directory-reaper.js";
 /// <reference path="./types/express.d.ts" />
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
@@ -1255,6 +1256,27 @@ async function startServerWithDatabaseTeardown(
     if (heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
   };
+  // Finished SSH runs leave a directory on the worker that fills its disk. The
+  // lease release removes it; this sweep removes the ones that removal missed
+  // and shortens its age threshold when the worker's disk is nearly full. The
+  // scheduler tick is much shorter than a sweep needs, so this one runs at most
+  // every ten minutes, starting with the first tick.
+  const SSH_RUN_DIRECTORY_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+  const sshRunDirectoryReaper = sshRunDirectoryReaperService(db as any);
+  let lastSshRunDirectorySweepAt = 0;
+  const scheduleSshRunDirectorySweep = () => {
+    if (heartbeatSchedulerStopped) return;
+    if (Date.now() - lastSshRunDirectorySweepAt < SSH_RUN_DIRECTORY_SWEEP_INTERVAL_MS) return;
+    lastSshRunDirectorySweepAt = Date.now();
+    trackHeartbeatSchedulerWork(sshRunDirectoryReaper
+      .sweep()
+      .then((summary) => {
+        if (summary.examined > 0) logger.info(summary, "SSH run directory sweep completed");
+      })
+      .catch((err) => {
+        logger.error({ err }, "SSH run directory sweep failed");
+      }));
+  };
   const githubConnectionEvents = githubConnectionEventService(db as any, {
     wakeup: environmentLeaseCleanupHeartbeat.wakeup,
   });
@@ -1681,6 +1703,7 @@ async function startServerWithDatabaseTeardown(
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
+        scheduleSshRunDirectorySweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
@@ -1836,6 +1859,7 @@ async function startServerWithDatabaseTeardown(
     startHeartbeatSchedulerInterval(() => {
       scheduleExternalObjectRefreshSweep(new Date());
       scheduleEnvironmentLeaseCleanupSweep();
+      scheduleSshRunDirectorySweep();
       scheduleGitHubConnectionEventPoll();
       scheduleGitHubConnectionContinuitySweep();
     });

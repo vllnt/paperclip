@@ -117,6 +117,188 @@ export async function removeRestoredSshRunDirectory(input: {
   throw new Error("SSH run directory removal returned an unexpected result.");
 }
 
+export type SshRunDirectoryKeepReason =
+  | "not_git_backed"
+  | "worktree_dirty"
+  | "preserve_failed"
+  | "rm_failed";
+
+export type SshRunDirectoryReapResult =
+  | { outcome: "removed"; bytesFreed: number; preserved: string[] }
+  | { outcome: "absent" }
+  | { outcome: "symlink" }
+  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number };
+
+/** Where a reaped run's preserved git state is kept, outside every `runs/<runId>`. */
+export function sshPreservedBundlePath(remoteRoot: string, runId: string): string {
+  return path.posix.join(remoteRoot, ".paperclip-runtime", "preserved", `${runId}.bundle`);
+}
+
+const PRESERVED_BUNDLE_MAX_KB = 1024 * 1024;
+const PRESERVED_BUNDLE_RETENTION_DAYS = 30;
+
+/**
+ * Deletes one run's `runs/<runId>` directory on an SSH host for any finished
+ * run, and reports the bytes it freed. It has the same path confinement as
+ * {@link removeRestoredSshRunDirectory}. A directory with the restored marker
+ * holds no unsynced work and goes at once. Without the marker the host may
+ * hold the only copy of the run's work, so the directory goes only after its
+ * local-only git state is safe. That state is: commits on HEAD past the commit
+ * the run started from, branch tips outside HEAD, stash entries, a detached
+ * head of an extra worktree, and uncommitted work (a snapshot commit of the
+ * tracked and untracked files that git does not ignore). It is written to
+ * `refs/paperclip/preserved/<runId>/*` and bundled into
+ * `<root>/.paperclip-runtime/preserved/<runId>.bundle`, with the run's start
+ * commit as the bundle's prerequisite, so only new objects are stored. The
+ * directory is kept, with a reason, when the work is not a git repository,
+ * when an extra worktree holds uncommitted work, or when the bundle cannot be
+ * written and verified. Git runs with the repository's `core.fsmonitor` and
+ * hooks switched off. Bundles older than 30 days are removed.
+ */
+export async function reapSshRunDirectory(input: {
+  spec: SshConnectionConfig;
+  remoteRoot: string;
+  runId: string;
+  timeoutMs?: number;
+}): Promise<SshRunDirectoryReapResult> {
+  if (!RUN_ID_PATTERN.test(input.runId)) {
+    throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
+  }
+  const root = input.remoteRoot;
+  if (!path.posix.isAbsolute(root) || root === "/" || path.posix.normalize(root) !== root || root.endsWith("/")) {
+    throw new Error("Refusing to reap an SSH run directory under a root that is not a normalized absolute path.");
+  }
+  const runtimeDir = path.posix.join(root, ".paperclip-runtime");
+  const runsDir = path.posix.join(runtimeDir, "runs");
+  const runDir = sshRunDirectory(root, input.runId);
+  const preservedDir = path.posix.join(runtimeDir, "preserved");
+  const bundle = sshPreservedBundlePath(root, input.runId);
+  const marker = path.posix.join(runDir, SSH_RUN_RESTORED_MARKER);
+  const q = shellQuote;
+  const script = [
+    `for dir in ${[runtimeDir, runsDir, runDir].map(q).join(" ")}; do`,
+    '  if [ -L "$dir" ]; then echo symlink; exit 0; fi',
+    '  if [ ! -d "$dir" ]; then echo absent; exit 0; fi',
+    "done",
+    `run=${q(runDir)}; ws="$run/workspace"; preserved=${q(preservedDir)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
+    `list="$run/.paperclip-reap-refs"; bundle=${q(bundle)}`,
+    `if [ -d "$preserved" ] && [ ! -L "$preserved" ]; then find "$preserved" -maxdepth 1 -type f -name '*.bundle' -mtime +${PRESERVED_BUNDLE_RETENTION_DAYS} -exec rm -f -- {} + 2>/dev/null || true; fi`,
+    'kb=$(du -sk "$run" 2>/dev/null | cut -f1); kb=${kb:-0}',
+    'keep() { echo "kept $1 $kb"; exit 0; }',
+    // A repository config the agent planted must not run commands here.
+    'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
+    'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
+    `if [ -f ${q(marker)} ] && [ ! -L ${q(marker)} ]; then`,
+    "  :",
+    "else",
+    '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then keep not_git_backed; fi',
+    '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
+    '  if [ ! -d "$ws/.git" ]; then keep not_git_backed; fi',
+    '  G rev-parse --git-dir >/dev/null 2>&1 || keep preserve_failed',
+    // The run started from the oldest commit HEAD ever pointed at.
+    '  head=$(G rev-parse -q --verify HEAD 2>/dev/null || true)',
+    '  seed=$(G reflog show --format=%H HEAD 2>/dev/null | tail -n 1)',
+    '  if [ -n "$head" ] && [ -z "$seed" ]; then keep preserve_failed; fi',
+    '  : > "$list"',
+    '  stale=$(G for-each-ref --format="%(refname)" "$ns" 2>/dev/null)',
+    '  for r in $stale; do G update-ref -d "$r" || keep preserve_failed; done',
+    '  add_ref() { [ "$2" = "$seed" ] && return 0; G update-ref "$ns/$1" "$2" || keep preserve_failed; echo "$ns/$1" >> "$list"; }',
+    '  [ -n "$head" ] && add_ref head "$head"',
+    '  G for-each-ref --format="%(refname)" refs/heads > "$list.heads" || keep preserve_failed',
+    '  while IFS= read -r ref; do',
+    '    obj=$(G rev-parse -q --verify "$ref") || keep preserve_failed',
+    '    if [ -n "$head" ] && G merge-base --is-ancestor "$obj" "$head"; then continue; fi',
+    '    add_ref "${ref#refs/heads/}" "$obj"',
+    '  done < "$list.heads"',
+    '  index=0',
+    '  G stash list --format=%H > "$list.stash" 2>/dev/null || true',
+    '  while IFS= read -r obj; do [ -n "$obj" ] && add_ref "stash-$index" "$obj"; index=$((index + 1)); done < "$list.stash"',
+    '  G worktree list --porcelain > "$list.trees" 2>/dev/null || true',
+    '  index=0; main=1; tree=""; detached=""; prunable=""; treehead=""',
+    '  while IFS= read -r line || [ -n "$line" ]; do',
+    '    case "$line" in',
+    '      "worktree "*) tree="${line#worktree }"; detached=""; prunable=""; treehead="" ;;',
+    '      "HEAD "*) treehead="${line#HEAD }" ;;',
+    '      detached) detached=1 ;;',
+    '      prunable*) prunable=1 ;;',
+    '      "")',
+    '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
+    '          changes=$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$tree" status --porcelain 2>/dev/null)',
+    '          if [ -n "$changes" ]; then keep worktree_dirty; fi',
+    '          if [ -n "$detached" ] && [ -n "$treehead" ] && { [ -z "$head" ] || ! G merge-base --is-ancestor "$treehead" "$head"; }; then add_ref "worktree-head-$index" "$treehead"; fi',
+    '          index=$((index + 1))',
+    '        fi',
+    '        main=0; tree="" ;;',
+    '    esac',
+    '  done < "$list.trees"',
+    // Uncommitted work: a snapshot commit of what git tracks or would track.
+    '  if [ -n "$(G status --porcelain 2>/dev/null)" ]; then',
+    '    idx="$run/.paperclip-reap-index"; rm -f "$idx"',
+    '    if [ -n "$head" ]; then GIT_INDEX_FILE="$idx" G read-tree HEAD || keep preserve_failed; fi',
+    '    GIT_INDEX_FILE="$idx" G add -A || keep preserve_failed',
+    '    tree_id=$(GIT_INDEX_FILE="$idx" G write-tree) || keep preserve_failed',
+    '    if [ -n "$head" ]; then snap=$(G commit-tree "$tree_id" -p "$head" -m "Paperclip preserved worktree") || keep preserve_failed; else snap=$(G commit-tree "$tree_id" -m "Paperclip preserved worktree") || keep preserve_failed; fi',
+    '    rm -f "$idx"',
+    '    add_ref worktree "$snap"',
+    '  fi',
+    '  if [ -s "$list" ]; then',
+    '    mkdir -p "$preserved" 2>/dev/null || keep preserve_failed',
+    '    if [ -L "$preserved" ] || [ ! -d "$preserved" ]; then keep preserve_failed; fi',
+    '    tmp="$preserved/.$$.tmp.bundle"; rm -f "$tmp"',
+    '    set --; while IFS= read -r r; do set -- "$@" "$r"; done < "$list"',
+    '    if [ -n "$seed" ]; then set -- "$@" "^$seed"; fi',
+    '    G bundle create "$tmp" "$@" >/dev/null 2>&1 || { rm -f "$tmp"; keep preserve_failed; }',
+    '    size=$(du -k "$tmp" 2>/dev/null | cut -f1); size=${size:-0}',
+    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f "$tmp"; keep preserve_failed; fi`,
+    '    G bundle verify "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; keep preserve_failed; }',
+    '    mv -f "$tmp" "$bundle" || { rm -f "$tmp"; keep preserve_failed; }',
+    '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
+    "  fi",
+    "fi",
+    // Directories without owner rwx (a Go module cache, say) would stop rm -rf.
+    `find "$run" -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null || true`,
+    'if find "$run" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null && rmdir -- "$run" 2>/dev/null; then',
+    '  echo "removed $kb"',
+    "else",
+    '  keep rm_failed',
+    "fi",
+  ].join("\n");
+  const result = await runSshCommand(input.spec, script, {
+    timeoutMs: input.timeoutMs ?? 10 * 60 * 1000,
+    maxBuffer: 256 * 1024,
+  });
+  const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  const preserved = lines.filter((line) => line.startsWith("preserved ")).map((line) => line.slice("preserved ".length));
+  const last = lines[lines.length - 1] ?? "";
+  if (last === "absent" || last === "symlink") return { outcome: last };
+  const removed = /^removed (\d+)$/.exec(last);
+  if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed) (\d+)$/.exec(last);
+  if (kept) return { outcome: "kept", reason: kept[1] as SshRunDirectoryKeepReason, bytes: Number(kept[2]) * 1024 };
+  throw new Error("SSH run directory reap returned an unexpected result.");
+}
+
+/**
+ * The share of the worker's disk in use for the filesystem holding
+ * `remoteRoot`, from 0 to 100.
+ */
+export async function readSshDiskUsagePercent(input: {
+  spec: SshConnectionConfig;
+  remoteRoot: string;
+  timeoutMs?: number;
+}): Promise<number> {
+  const result = await runSshCommand(
+    input.spec,
+    `df -Pk ${shellQuote(input.remoteRoot)} | awk 'NR==2 { gsub("%", "", $5); print $5 }'`,
+    { timeoutMs: input.timeoutMs ?? 30_000, maxBuffer: 4 * 1024 },
+  );
+  const percent = Number(result.stdout.trim());
+  if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
+    throw new Error("The worker's disk usage could not be read.");
+  }
+  return percent;
+}
+
 export interface RemoteManagedRuntimeAsset {
   key: string;
   localDir: string;
