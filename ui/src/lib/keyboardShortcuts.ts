@@ -10,17 +10,31 @@ export const KEYBOARD_SHORTCUT_TEXT_INPUT_SELECTOR = [
 
 const PAGE_SEARCH_SHORTCUT_SELECTOR = "[data-page-search-target='true']";
 
-/**
- * An open modal dialog. Radix (shadcn `dialog`, `sheet`, `alert-dialog`)
- * marks modal content with `data-state` but not `aria-modal`, so both forms
- * are listed. Popover content also has `role="dialog"` but is not modal.
- */
-export const OPEN_MODAL_DIALOG_SELECTOR = [
+// Open dialog content. Radix (shadcn `dialog`, `sheet`, `alert-dialog`, and raw
+// `DialogPrimitive.Content` such as the image gallery) marks it with
+// `data-state` but not `aria-modal`.
+const OPEN_DIALOG_SELECTOR = [
   "[role='dialog'][aria-modal='true']",
-  "[data-slot='dialog-content'][data-state='open']",
-  "[data-slot='sheet-content'][data-state='open']",
-  "[data-slot='alert-dialog-content'][data-state='open']",
+  "[role='dialog'][data-state='open']",
+  "[role='alertdialog'][data-state='open']",
 ].join(", ");
+// Popover content also has role=dialog, but Radix renders it inside a popper
+// wrapper and it is not modal.
+const POPPER_CONTENT_SELECTOR = "[data-radix-popper-content-wrapper]";
+
+function isModalDialog(dialog: Element): boolean {
+  return dialog.getAttribute("aria-modal") === "true" || !dialog.closest(POPPER_CONTENT_SELECTOR);
+}
+
+/** True when `element` sits inside an open modal dialog (a popover inside one counts). */
+export function isInsideOpenModalDialog(element: Element): boolean {
+  let dialog = element.closest(OPEN_DIALOG_SELECTOR);
+  while (dialog) {
+    if (isModalDialog(dialog)) return true;
+    dialog = dialog.parentElement?.closest(OPEN_DIALOG_SELECTOR) ?? null;
+  }
+  return false;
+}
 const MODIFIER_ONLY_KEYS = new Set(["Shift", "Meta", "Control", "Alt"]);
 
 export type InboxQuickArchiveKeyAction = "ignore" | "archive" | "disarm";
@@ -46,14 +60,14 @@ export function isKeyboardShortcutTextInputTarget(target: EventTarget | null): b
 }
 
 export function hasBlockingShortcutDialog(root: ParentNode = document): boolean {
-  return !!root.querySelector(OPEN_MODAL_DIALOG_SELECTOR);
+  return Array.from(root.querySelectorAll(OPEN_DIALOG_SELECTOR)).some(isModalDialog);
 }
 
 function isVisibleShortcutTarget(element: HTMLElement): boolean {
   if (!element.isConnected) return false;
   if ("disabled" in element && typeof element.disabled === "boolean" && element.disabled) return false;
   if (element.closest("[hidden], [aria-hidden='true'], [inert]")) return false;
-  if (element.closest(OPEN_MODAL_DIALOG_SELECTOR)) return false;
+  if (isInsideOpenModalDialog(element)) return false;
 
   const style = window.getComputedStyle(element);
   if (style.display === "none" || style.visibility === "hidden") return false;

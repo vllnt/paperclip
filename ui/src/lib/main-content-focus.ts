@@ -1,4 +1,4 @@
-import { OPEN_MODAL_DIALOG_SELECTOR } from "./keyboardShortcuts";
+import { isInsideOpenModalDialog } from "./keyboardShortcuts";
 
 export function shouldFocusMainContentAfterNavigation(
   mainElement: HTMLElement | null,
@@ -11,7 +11,7 @@ export function shouldFocusMainContentAfterNavigation(
   // An open modal (e.g. the command launcher reopened right after it
   // navigated) owns focus. Taking it would make the dialog's focus trap pull
   // focus back and select the input, so the next keystroke replaces the query.
-  if (activeElement.closest(OPEN_MODAL_DIALOG_SELECTOR)) return false;
+  if (isInsideOpenModalDialog(activeElement)) return false;
   return !mainElement.contains(activeElement);
 }
 

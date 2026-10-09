@@ -218,8 +218,10 @@ against the catalog.
 - Two older focus bugs that the launcher exposed, fixed in slice 1:
   - `hasBlockingShortcutDialog` matched only `[aria-modal='true']`, which
     Radix dialogs do not set, so bare shortcuts fired over the app's own
-    dialogs. `OPEN_MODAL_DIALOG_SELECTOR` (`ui/src/lib/keyboardShortcuts.ts`)
-    also matches open `dialog`/`sheet`/`alert-dialog` contents.
+    dialogs. `isInsideOpenModalDialog` (`ui/src/lib/keyboardShortcuts.ts`)
+    also matches open Radix dialog and alert-dialog content (shadcn
+    `dialog`, `sheet`, `alert-dialog`, and raw primitives such as the image
+    gallery), and skips popovers, which Radix renders in a popper wrapper.
   - The layout's post-navigation focus on `<main>` took focus from an open
     dialog. Reopening the launcher right after it navigated, then typing,
     lost the first characters: the dialog's trap pulled focus back and
