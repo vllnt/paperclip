@@ -73,6 +73,11 @@ describe("parseProviderQuotaResetAt", () => {
     expect(parseProviderQuotaResetAt("try again in 3 days", NOW)).toEqual(new Date(NOW.getTime() + 3 * 86_400_000));
   });
 
+  it("tries Retry-After when an earlier reset in the text is already in the past", () => {
+    expect(parseProviderQuotaResetAt("limit resets at 2026-10-08T00:00:00Z. HTTP 429 Retry-After: 120", NOW))
+      .toEqual(new Date(NOW.getTime() + 120_000));
+  });
+
   it("returns null when no reset is named or it is in the past", () => {
     expect(parseProviderQuotaResetAt(PROXY_CLI_LINE, NOW)).toBeNull();
     expect(parseProviderQuotaResetAt('{"error":{"code":"model_cooldown","reset_seconds":0}}', NOW)).toBeNull();

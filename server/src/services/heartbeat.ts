@@ -8,6 +8,7 @@ import {
   checkRunHarnessCompatibility,
   classifyQuotaFailure,
   harnessFallbackService,
+  isLlmHarnessAdapterType,
   overridesForHarnessTarget,
   primaryHarnessDispatch,
   readClaimedHarnessDispatch,
@@ -16926,12 +16927,19 @@ export function heartbeatService(
   /** Notes on a held queued run when it can start; written once per cooldown end. */
   async function recordProviderQuotaWait(run: typeof heartbeatRuns.$inferSelect, heldUntil: Date) {
     const waitUntil = heldUntil.toISOString();
-    const context = parseObject(run.contextSnapshot);
-    if (context.providerQuotaWaitUntil === waitUntil) return;
+    // A merge in SQL: a comment wake can coalesce into this queued run while
+    // we hold it, and a read-modify-write of the snapshot would drop it.
     const [held] = await db
       .update(heartbeatRuns)
-      .set({ contextSnapshot: { ...context, providerQuotaWaitUntil: waitUntil }, updatedAt: new Date() })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ providerQuotaWaitUntil: waitUntil })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "queued"),
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'providerQuotaWaitUntil', '') <> ${waitUntil}`,
+      ))
       .returning();
     if (!held) return;
     await appendRunEvent(held, {
@@ -16961,6 +16969,7 @@ export function heartbeatService(
     const { run, executedAgent, storedAgent } = input;
     if (run.runtimeMode === "native") return none;
     const dispatch = readClaimedHarnessDispatch(run.runnerProfileJson) ?? primaryHarnessDispatch(storedAgent);
+    if (!isLlmHarnessAdapterType(dispatch.adapterType)) return none;
     const outputTokens = asNumber(parseObject(run.usageJson).outputTokens, 0);
     let usefulWork = outputTokens > 0;
     if (!usefulWork) {
@@ -25398,7 +25407,7 @@ export function heartbeatService(
           }
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
-          if (run.runtimeMode !== "native") adapterResult = reclassifyProviderQuotaResult(adapterResult);
+          if (run.runtimeMode !== "native") adapterResult = reclassifyProviderQuotaResult(adapterResult, new Date(), agent.adapterType);
           // A returned result can include a failed restore. Keep the workspace
           // barrier closed until required files have been restored.
           // If recording the barrier itself fails, propagate as a run failure

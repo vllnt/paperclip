@@ -109,6 +109,9 @@ export const heartbeatRuns = pgTable(
     nativeReplacementPredecessorUq: uniqueIndex("heartbeat_runs_native_replacement_predecessor_uq")
       .on(table.companyId, table.retryOfRunId)
       .where(sql`${table.scheduledRetryReason} = 'native_safe_replacement'`),
+    fallbackSuccessorIdx: index("heartbeat_runs_harness_fallback_successor_idx")
+      .on(table.companyId, table.retryOfRunId)
+      .where(sql`${table.scheduledRetryReason} = 'harness_fallback'`),
     companyNativeIssueRunUq: unique("heartbeat_runs_company_native_issue_id_uq").on(
       table.companyId,
       table.nativeIssueId,

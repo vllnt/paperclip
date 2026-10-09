@@ -112,10 +112,16 @@ interface QuotaReclassifiableResult {
  *
  * @param result - The adapter's execution result.
  * @param now - Reference time for relative reset values.
+ * @param adapterType - The executing adapter; non-LLM adapters are left alone.
  * @returns The result, reclassified when its error text reports a quota.
  */
-export function reclassifyProviderQuotaResult<T extends QuotaReclassifiableResult>(result: T, now: Date = new Date()): T {
+export function reclassifyProviderQuotaResult<T extends QuotaReclassifiableResult>(
+  result: T,
+  now: Date = new Date(),
+  adapterType?: string,
+): T {
   if (result.timedOut || (result.exitCode ?? 0) === 0 && !result.errorMessage) return result;
+  if (adapterType !== undefined && !isLlmHarnessAdapterType(adapterType)) return result;
   if (isAiAuthenticationFailure(result.errorCode) || isAiAuthenticationFailure(result.errorFamily)) return result;
   if (result.errorCode && !RECLASSIFIABLE_QUOTA_CODES.has(result.errorCode)) return result;
   const resultJson = result.resultJson ?? {};
@@ -398,7 +404,7 @@ export function applyClaimedHarnessDispatch<T extends HarnessAgentLike>(agent: T
 }
 
 /** Local coding harnesses whose `model`, `extraArgs` and `args` select a provider model. */
-const MODEL_CHECKED_ADAPTER_TYPES = new Set([
+const LLM_HARNESS_ADAPTER_TYPES = new Set([
   "claude_local",
   "codex_local",
   "grok_local",
@@ -409,6 +415,18 @@ const MODEL_CHECKED_ADAPTER_TYPES = new Set([
   "kimi_local",
   "hermes_local",
 ]);
+
+/**
+ * Whether an adapter runs an LLM coding harness. Quota cooldowns apply to
+ * these only: a `process` or `http` agent that prints "usage limit reached"
+ * is not out of provider quota.
+ *
+ * @param adapterType - The adapter type.
+ * @returns True for the local LLM harnesses.
+ */
+export function isLlmHarnessAdapterType(adapterType: string): boolean {
+  return LLM_HARNESS_ADAPTER_TYPES.has(adapterType);
+}
 
 /**
  * The run-time harness/model check. Fallback targets must use a recognised
@@ -423,7 +441,7 @@ export function checkRunHarnessCompatibility(input: {
   config: Record<string, unknown>;
   fallback: boolean;
 }): HarnessModelCompatibilityResult {
-  if (!MODEL_CHECKED_ADAPTER_TYPES.has(input.adapterType)) return { ok: true };
+  if (!isLlmHarnessAdapterType(input.adapterType)) return { ok: true };
   return checkHarnessModelCompatibility(
     {
       adapterType: input.adapterType,
@@ -512,6 +530,9 @@ export function harnessFallbackService(db: Db) {
     const target = targets.find((candidate) => candidate.key === input.targetKey);
     if (!target) return { until: null, nextTarget: null };
     const { wasActive, until } = await db.transaction(async (tx) => {
+      // FOR UPDATE locks nothing when the row does not exist yet, so two
+      // concurrent failures of one target would both read "no cooldown".
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${input.agent.id}:${target.key}`}, 0))`);
       const [existing] = await tx
         .select()
         .from(agentHarnessCooldowns)

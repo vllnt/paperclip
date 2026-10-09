@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issues,
@@ -25,6 +26,7 @@ import {
 import { buildIssueAssignmentIdempotencyKey } from "../services/issue-assignment-wakeup.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { agentService } from "../services/agents.js";
+import { harnessFallbackService } from "../services/harness-fallback.js";
 import { secretService } from "../services/secrets.js";
 
 vi.mock("../telemetry.js", () => ({
@@ -326,6 +328,49 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     const [cooldown] = await db.select().from(agentHarnessCooldowns).where(eq(agentHarnessCooldowns.targetKey, "claude_local:claude-opus-5-5"));
     expect(cooldown.cooldownUntil.getTime()).toBeGreaterThan(Date.now());
     expect(await pending(companyId, "harness_fallback")).not.toBeNull();
+  });
+
+  it("holds a queued wake while every target cools down, keeping its context", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const future = new Date(Date.now() + 30 * 60_000);
+    await db.insert(agentHarnessCooldowns).values([
+      { companyId, agentId, targetKey: "claude_local:claude-opus-5-5", adapterType: "claude_local", model: "claude-opus-5-5", reason: "provider_usage_limit", cooldownUntil: future },
+      { companyId, agentId, targetKey: "codex_local:gpt-5.5", adapterType: "codex_local", model: "gpt-5.5", reason: "provider_usage_limit", cooldownUntil: future },
+    ]);
+
+    await comment(agentId, issueId);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.resumeQueuedRuns();
+
+    expect(invocations).toHaveLength(0);
+    const [held] = await runs(companyId);
+    expect(held).toMatchObject({ status: "queued" });
+    expect(held.contextSnapshot).toMatchObject({ issueId, wakeReason: "issue_commented", providerQuotaWaitUntil: future.toISOString() });
+    const waitEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, held.id));
+    expect(waitEvents.filter((event) => String(event.message).startsWith("Waiting for the provider quota"))).toHaveLength(1);
+
+    await db.update(agentHarnessCooldowns).set({ cooldownUntil: new Date(Date.now() - 1_000) });
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(invocations).toHaveLength(1);
+  });
+
+  it("serializes concurrent failures of one target: one activation, one cooldown row", async () => {
+    const { companyId, agentId } = await seed();
+    const [agentRow] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const service = harnessFallbackService(db);
+    const sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, status: "failed", invocationSource: "automation" });
+
+    await Promise.all(Array.from({ length: 12 }, () => service.coolDown({
+      agent: agentRow, targetKey: "claude_local:claude-opus-5-5", reason: "provider_usage_limit", resetAt: null, sourceRunId,
+    })));
+
+    expect(await db.select().from(agentHarnessCooldowns)).toHaveLength(1);
+    expect(await activities(companyId, "agent.harness_fallback_activated")).toHaveLength(1);
+    const [cooldown] = await db.select().from(agentHarnessCooldowns);
+    // Concurrent failures of one outage do not double the backoff.
+    expect(Math.round((cooldown.cooldownUntil.getTime() - Date.now()) / 60_000)).toBeLessThanOrEqual(5);
   });
 
   it("does not apply an issue's primary model override to a fallback run", async () => {

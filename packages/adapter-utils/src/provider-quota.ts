@@ -79,17 +79,37 @@ export function isProviderQuotaMessage(text: string | null | undefined): boolean
  */
 export function parseProviderQuotaResetAt(text: string | null | undefined, now: Date): Date | null {
   if (!text) return null;
-  const resetSeconds = /"reset_seconds"\s*:\s*(\d+)/.exec(text);
-  if (resetSeconds) return futureOrNull(new Date(now.getTime() + Number(resetSeconds[1]) * 1000), now);
-  const resetTime = /"reset_time"\s*:\s*"([^"]+)"/.exec(text);
-  const resetTimeMs = resetTime ? parseGoDurationMs(resetTime[1]) : null;
-  if (resetTimeMs !== null) return futureOrNull(new Date(now.getTime() + resetTimeMs), now);
-  const epoch = /(?:\||unified-reset\s*:\s*)(\d{10})\b/i.exec(text);
-  if (epoch) return futureOrNull(new Date(Number(epoch[1]) * 1000), now);
-  const iso = /\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/.exec(text);
-  if (iso) return futureOrNull(new Date(iso[1]), now);
-  const retryAfter = /retry-after\s*:\s*(\d+)\b/i.exec(text);
-  if (retryAfter) return futureOrNull(new Date(now.getTime() + Number(retryAfter[1]) * 1000), now);
-  const relativeMs = parseRelativeDurationMs(text);
-  return relativeMs !== null ? new Date(now.getTime() + relativeMs) : null;
+  const candidates: Array<() => Date | null> = [
+    () => {
+      const match = /"reset_seconds"\s*:\s*(\d+)/.exec(text);
+      return match ? new Date(now.getTime() + Number(match[1]) * 1000) : null;
+    },
+    () => {
+      const match = /"reset_time"\s*:\s*"([^"]+)"/.exec(text);
+      const ms = match ? parseGoDurationMs(match[1]) : null;
+      return ms !== null ? new Date(now.getTime() + ms) : null;
+    },
+    () => {
+      const match = /(?:\||unified-reset\s*:\s*)(\d{10})\b/i.exec(text);
+      return match ? new Date(Number(match[1]) * 1000) : null;
+    },
+    () => {
+      const match = /\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/.exec(text);
+      return match ? new Date(match[1]) : null;
+    },
+    () => {
+      const match = /retry-after\s*:\s*(\d+)\b/i.exec(text);
+      return match ? new Date(now.getTime() + Number(match[1]) * 1000) : null;
+    },
+    () => {
+      const ms = parseRelativeDurationMs(text);
+      return ms !== null ? new Date(now.getTime() + ms) : null;
+    },
+  ];
+  for (const candidate of candidates) {
+    const reset = candidate();
+    const future = reset ? futureOrNull(reset, now) : null;
+    if (future) return future;
+  }
+  return null;
 }

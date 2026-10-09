@@ -4,6 +4,7 @@ import {
   MAX_COOLDOWN_MS,
   buildHarnessTargetAgentView,
   classifyQuotaFailure,
+  isLlmHarnessAdapterType,
   listHarnessTargets,
   overridesForHarnessTarget,
   readQuotaBackoffMaxMinutes,
@@ -82,6 +83,14 @@ describe("reclassifyProviderQuotaResult", () => {
       errorFamily: "provider_quota",
       retryNotBefore: new Date(NOW.getTime() + 600_000).toISOString(),
     });
+  });
+
+  it("leaves process and http adapters alone: a script that prints a usage limit is not provider quota", () => {
+    expect(isLlmHarnessAdapterType("claude_local")).toBe(true);
+    expect(isLlmHarnessAdapterType("process")).toBe(false);
+    const result = { exitCode: 1, timedOut: false, errorCode: "adapter_failed", errorMessage: "usage limit reached" };
+    expect(reclassifyProviderQuotaResult(result, NOW, "process")).toBe(result);
+    expect(reclassifyProviderQuotaResult(result, NOW, "codex_local")).toMatchObject({ errorCode: "provider_quota" });
   });
 
   it("leaves auth failures, other error codes, timeouts and non-quota failures alone", () => {

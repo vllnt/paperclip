@@ -21,4 +21,5 @@ ALTER TABLE "agent_harness_cooldowns" ADD CONSTRAINT "agent_harness_cooldowns_co
 ALTER TABLE "agent_harness_cooldowns" ADD CONSTRAINT "agent_harness_cooldowns_agent_id_agents_id_fk" FOREIGN KEY ("agent_id") REFERENCES "public"."agents"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "agent_harness_cooldowns" ADD CONSTRAINT "agent_harness_cooldowns_source_run_id_heartbeat_runs_id_fk" FOREIGN KEY ("source_run_id") REFERENCES "public"."heartbeat_runs"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "agent_harness_cooldowns_agent_target_uq" ON "agent_harness_cooldowns" USING btree ("agent_id","target_key");--> statement-breakpoint
-CREATE INDEX "agent_harness_cooldowns_company_agent_idx" ON "agent_harness_cooldowns" USING btree ("company_id","agent_id");
+CREATE INDEX "agent_harness_cooldowns_company_agent_idx" ON "agent_harness_cooldowns" USING btree ("company_id","agent_id");--> statement-breakpoint
+CREATE INDEX "heartbeat_runs_harness_fallback_successor_idx" ON "heartbeat_runs" USING btree ("company_id","retry_of_run_id") WHERE "heartbeat_runs"."scheduled_retry_reason" = 'harness_fallback';
