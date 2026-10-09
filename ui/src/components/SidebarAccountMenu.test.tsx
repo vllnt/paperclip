@@ -21,7 +21,7 @@ const mockInstanceSettingsApi = vi.hoisted(() => ({
 }));
 const mockHealthApi = vi.hoisted(() => ({ get: vi.fn() }));
 const mockGetCurrentBoardAccess = vi.hoisted(() => vi.fn());
-const mockToggleTheme = vi.hoisted(() => vi.fn());
+const mockSetPreference = vi.hoisted(() => vi.fn());
 const mockSetSidebarOpen = vi.hoisted(() => vi.fn());
 const mockNavigateTopLevel = vi.hoisted(() => vi.fn());
 
@@ -71,7 +71,8 @@ vi.mock("../context/SidebarContext", () => ({
 vi.mock("../context/ThemeContext", () => ({
   useTheme: () => ({
     theme: "dark",
-    toggleTheme: mockToggleTheme,
+    preference: "system",
+    setPreference: mockSetPreference,
   }),
 }));
 
@@ -436,7 +437,7 @@ describe("SidebarAccountMenu", () => {
     // Documentation still appears before the theme toggle.
     const menuText = popover?.textContent ?? "";
     const docsPos = menuText.indexOf("Documentation");
-    const themePos = menuText.indexOf("Switch to");
+    const themePos = menuText.indexOf("Appearance");
     expect(docsPos).toBeLessThan(themePos);
 
     // The popover header stays down to name + email: no "Account" badge, no version line.
