@@ -1,12 +1,17 @@
+// @vitest-environment jsdom
+
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const html = readFileSync(fileURLToPath(new URL("../index.html", import.meta.url)), "utf8");
+// Not `new URL(..., import.meta.url)`: under jsdom the global URL is jsdom's, which fileURLToPath rejects.
+const html = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../index.html"), "utf8");
 
+/** Reads the inline script that ships in `index.html`, using a real HTML parser. Parsing does not run it. */
 function readBootScript(): string {
-  const source = Array.from(html.matchAll(/<script>([\s\S]*?)<\/script>/g))
-    .map((match) => match[1])
+  const source = Array.from(new DOMParser().parseFromString(html, "text/html").querySelectorAll("script"))
+    .map((script) => script.textContent ?? "")
     .find((inline) => inline.includes("paperclip.theme"));
   if (!source) throw new Error("ui/index.html has no theme boot script");
   return source;
