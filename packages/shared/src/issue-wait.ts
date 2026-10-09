@@ -4,6 +4,12 @@ import { z } from "zod";
 export const ISSUE_WAIT_MIN_DELAY_MS = 60_000;
 /** Longest delay an agent may wait before its issue is re-checked. */
 export const ISSUE_WAIT_MAX_DELAY_MS = 24 * 60 * 60_000;
+/**
+ * Most monitor wakes an issue gets from waits over its lifetime. A wait is one
+ * shot, so an agent that re-waits at every wake would otherwise run once per
+ * delay without end. The monitor's attempt count carries over between waits.
+ */
+export const ISSUE_WAIT_MONITOR_MAX_ATTEMPTS = 50;
 /** Longest wait reason; the reason is shown on the issue and in the wake. */
 export const ISSUE_WAIT_REASON_MAX_LENGTH = 400;
 

@@ -16,6 +16,7 @@ function issue(overrides: Partial<Parameters<typeof decideBackgroundTaskRecheck>
     assigneeAgentId: agentId,
     assigneeUserId: null,
     monitorNextCheckAt: null,
+    monitorAttemptCount: 0,
     ...overrides,
   };
 }
@@ -104,6 +105,15 @@ describe("background task re-check decision", () => {
       policy,
       now,
     })).toEqual({ kind: "skip", reason: "wait_already_scheduled" });
+  });
+
+  it("stops scheduling once the issue's wait chain used its attempts", () => {
+    expect(decideBackgroundTaskRecheck({
+      issue: issue({ monitorAttemptCount: 49 }), runAgentId: agentId, streak: 1, policy, now,
+    }).kind).toBe("schedule");
+    expect(decideBackgroundTaskRecheck({
+      issue: issue({ monitorAttemptCount: 50 }), runAgentId: agentId, streak: 1, policy, now,
+    })).toEqual({ kind: "skip", reason: "wait_chain_exhausted" });
   });
 
   it("does nothing when the policy is disabled", () => {

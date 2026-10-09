@@ -1,7 +1,7 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues } from "@paperclipai/db";
-import { BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
+import { BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME, ISSUE_WAIT_MONITOR_MAX_ATTEMPTS } from "@paperclipai/shared";
 import { parseObject } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
 import { scheduleIssueWaitMonitor, type IssueWaitMonitorIssuesService } from "./issue-waits.js";
@@ -33,6 +33,7 @@ export interface BackgroundTaskRecheckIssue {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
   monitorNextCheckAt: Date | null;
+  monitorAttemptCount?: number | null;
 }
 
 export type BackgroundTaskRecheckDecision =
@@ -44,6 +45,7 @@ export type BackgroundTaskRecheckDecision =
         | "issue_not_waitable"
         | "not_assigned_to_run_agent"
         | "wait_already_scheduled"
+        | "wait_chain_exhausted"
         | "max_attempts_exhausted";
     };
 
@@ -112,6 +114,9 @@ export function decideBackgroundTaskRecheck(input: {
   }
   if (issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > input.now.getTime()) {
     return { kind: "skip", reason: "wait_already_scheduled" };
+  }
+  if ((issue.monitorAttemptCount ?? 0) >= ISSUE_WAIT_MONITOR_MAX_ATTEMPTS) {
+    return { kind: "skip", reason: "wait_chain_exhausted" };
   }
   const attempt = Math.max(1, input.streak);
   if (attempt > policy.maxAttempts) return { kind: "skip", reason: "max_attempts_exhausted" };

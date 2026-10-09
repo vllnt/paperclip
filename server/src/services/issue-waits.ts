@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import type { issues } from "@paperclipai/db";
+import { ISSUE_WAIT_MONITOR_MAX_ATTEMPTS } from "@paperclipai/shared";
 import { logActivity } from "./activity-log.js";
 import { applyIssueMonitorPolicyTransition, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import type { issueService } from "./issues.js";
@@ -53,7 +54,7 @@ export async function scheduleIssueWaitMonitor(
       serviceName: input.serviceName,
       externalRef: input.externalRef,
       timeoutAt: null,
-      maxAttempts: null,
+      maxAttempts: ISSUE_WAIT_MONITOR_MAX_ATTEMPTS,
       recoveryPolicy: "wake_owner" as const,
     },
   };

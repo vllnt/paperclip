@@ -457,6 +457,7 @@ import {
 } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRescheduledPatch,
   buildIssueMonitorTriggeredPatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -852,6 +853,8 @@ export {
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+// A monitor whose wake the queue dropped is retried after this delay.
+const MONITOR_WAKE_RETRY_DELAY_MS = 5 * 60_000;
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30_000, 30_000,
 ] as const;
@@ -11837,6 +11840,9 @@ export function heartbeatService(
       });
     }
 
+    const monitorWakeKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
+    let monitorWake: Awaited<ReturnType<typeof enqueueWakeup>> | undefined;
+    const monitorWakeStartedAt = new Date();
     try {
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
@@ -11895,11 +11901,11 @@ export function heartbeatService(
             throw conflict(scheduled.reason);
         }
       } else
-        await enqueueWakeup(targetAgentId, {
+        monitorWake = await enqueueWakeup(targetAgentId, {
           source: input.source,
           triggerDetail: input.triggerDetail,
           reason: wakeReason,
-          idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
+          idempotencyKey: monitorWakeKey,
           payload: {
             issueId: claimed.id,
             nextCheckAt: scheduledAtIso,
@@ -11925,6 +11931,57 @@ export function heartbeatService(
             manualTrigger: input.activitySource === "manual",
           },
         });
+
+      // enqueueWakeup returns null for a wake it admitted behind a live run, and
+      // also for one it dropped (wake on demand off, tree hold, pause). Only a
+      // skipped receipt written or touched by this dispatch means the agent
+      // will not run, so the monitor stays armed.
+      if (monitorWake === null) {
+        const skipped = await db
+          .select({ reason: agentWakeupRequests.reason })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, claimed.companyId),
+              eq(agentWakeupRequests.agentId, targetAgentId),
+              eq(agentWakeupRequests.status, "skipped"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${claimed.id}`,
+              gte(agentWakeupRequests.updatedAt, monitorWakeStartedAt),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (skipped) {
+          const retryAt = new Date(input.now.getTime() + MONITOR_WAKE_RETRY_DELAY_MS);
+          const rescheduled = buildIssueMonitorRescheduledPatch({ issue: claimed, policy, nextCheckAt: retryAt });
+          await db
+            .update(issues)
+            .set(
+              rescheduled
+                ? { ...rescheduled, updatedAt: new Date() }
+                : { monitorWakeRequestedAt: null, updatedAt: new Date() },
+            )
+            .where(eq(issues.id, claimed.id));
+          await logActivity(db, {
+            companyId: claimed.companyId,
+            actorType: input.actorType,
+            actorId: input.actorId,
+            agentId: input.agentId,
+            runId: input.runId,
+            action: "issue.monitor_wake_skipped",
+            entityType: "issue",
+            entityId: claimed.id,
+            details: {
+              identifier: claimed.identifier,
+              nextCheckAt: scheduledAtIso,
+              retryAt: retryAt.toISOString(),
+              skipReason: skipped.reason,
+              source: input.activitySource,
+            },
+          });
+          return { outcome: "skipped" as const, reason: `Monitor wake skipped (${skipped.reason})` };
+        }
+      }
 
       await db
         .update(issues)

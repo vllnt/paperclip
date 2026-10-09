@@ -1066,8 +1066,16 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     stagePatch.executionState !== undefined
       ? parseIssueExecutionState(stagePatch.executionState)
       : existingState;
+  // A monitor belongs to the agent that scheduled it: its note and wake target
+  // that agent. Moving the issue to another agent clears it, unless the same
+  // request schedules a monitor for the new assignee.
+  const assigneeAgentChanged =
+    !input.monitorExplicitlyUpdated &&
+    Boolean(input.issue.assigneeAgentId) &&
+    assigneeAgentId !== input.issue.assigneeAgentId;
   const invalidReason = input.policy?.monitor
-    ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId)
+    ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ??
+      (assigneeAgentChanged ? "reassigned" : null)
     : null;
 
   let targetMonitorState = currentMonitorState;
@@ -1185,6 +1193,36 @@ export function buildIssueMonitorTriggeredPatch(input: {
     monitorAttemptCount: nextMonitorState.attemptCount,
     monitorNotes: nextMonitorState.notes,
     monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
+/**
+ * Moves a scheduled monitor to a later check without counting an attempt, for a
+ * wake that the queue dropped. The policy and state carry the new time too, so a
+ * later issue update does not restore the old one. Null when no monitor is set.
+ */
+export function buildIssueMonitorRescheduledPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  nextCheckAt: Date;
+}) {
+  const monitor = input.policy?.monitor;
+  if (!input.policy || !monitor) return null;
+  const nextMonitor = { ...monitor, nextCheckAt: input.nextCheckAt.toISOString() };
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  return {
+    executionPolicy: { ...input.policy, monitor: nextMonitor } as Record<string, unknown>,
+    executionState: executionStateWithMonitor(
+      existingState,
+      buildScheduledMonitorState(currentMonitorState, nextMonitor),
+    ) as Record<string, unknown> | null,
+    monitorNextCheckAt: input.nextCheckAt,
+    monitorWakeRequestedAt: null,
   };
 }
 
