@@ -2,7 +2,7 @@ import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { addAbortSignal } from "node:stream";
+import { addAbortSignal, type Readable } from "node:stream";
 import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
@@ -43,6 +43,11 @@ export interface RunLogStore {
   ): Promise<number>;
   finalize(handle: RunLogHandle): Promise<RunLogFinalizeSummary>;
   read(handle: RunLogHandle, opts?: RunLogReadOptions): Promise<RunLogReadResult>;
+  // Optional so existing fakes/fixtures keep compiling: the whole log as raw
+  // bytes (local file first, then the S3 mirror). Paged read() decodes each
+  // page on its own and can split a line or a multi-byte character, which a
+  // full export must not do.
+  openReadStream?(handle: RunLogHandle, opts?: { signal?: AbortSignal }): Promise<Readable>;
   // Optional so existing fakes/fixtures keep compiling: uploads every dirty
   // in-flight mirror immediately (graceful-shutdown path). No-op when the
   // in-flight mirror is not enabled.
@@ -430,6 +435,20 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       if (local) return local;
       // Local file gone (pod rolled) -> serve from the S3 mirror if configured.
       return readS3Range(handle.logRef, offset, limitBytes, opts?.signal);
+    },
+
+    async openReadStream(handle, opts) {
+      opts?.signal?.throwIfAborted();
+      if (handle.store !== "local_file") throw notFound("Run log not found");
+      const absPath = resolveWithin(basePath, handle.logRef);
+      const local = await fs.open(absPath, "r").catch((err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return null;
+        throw err;
+      });
+      if (local) return local.createReadStream({ signal: opts?.signal });
+      if (!s3) throw notFound("Run log not found");
+      const object = await s3.provider.getObject({ objectKey: s3Key(handle.logRef), signal: opts?.signal });
+      return object.stream;
     },
 
     async flushInflightMirrors() {

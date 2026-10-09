@@ -42,6 +42,9 @@ const mockRunSecretRedactionRegistry = vi.hoisted(() => ({
   redactForRun: vi.fn(
     async (_companyId: string, _runId: string, value: unknown) => value,
   ),
+  prepareForRun: vi.fn(
+    async (_companyId: string, _runId: string) => <T>(value: T) => value,
+  ),
 }));
 
 const mockProviderTraceStore = vi.hoisted(() => ({

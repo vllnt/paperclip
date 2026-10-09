@@ -40,4 +40,5 @@ export { accessRoutes } from "./access.js";
 export { instanceSettingsRoutes } from "./instance-settings.js";
 export { instanceDatabaseBackupRoutes } from "./instance-database-backups.js";
 export { managedAgentProfileRoutes } from "./managed-agent-profiles.js";
+export { companyArchiveRoutes } from "./company-archive.js";
 export { remoteAgentProfileRoutes } from "./remote-agent-profiles.js";

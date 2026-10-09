@@ -141,6 +141,13 @@ export function createRunSecretRedactionRegistry(db: Db) {
     },
     redactForRun: async <T>(companyId: string, runId: string, value: T): Promise<T> =>
       redactRegisteredSecretValues(value, await valuesForRun(companyId, runId)),
+    // Resolve a run's registered values once for callers that redact many
+    // records of the same run (streaming export). Keep the returned function
+    // only as long as that one run is being read.
+    prepareForRun: async (companyId: string, runId: string): Promise<<T>(value: T) => T> => {
+      const values = await valuesForRun(companyId, runId);
+      return <T>(value: T) => redactRegisteredSecretValues(value, values);
+    },
     redactForIssue: async <T>(companyId: string, issueId: string, value: T): Promise<T> =>
       redactRegisteredSecretValues(value, await valuesForIssue(companyId, issueId)),
   };

@@ -928,6 +928,15 @@ export const HEARTBEAT_RUN_STATUSES = [
 ] as const;
 export type HeartbeatRunStatus = (typeof HEARTBEAT_RUN_STATUSES)[number];
 
+export const HEARTBEAT_RUN_TERMINAL_STATUSES = [
+  "succeeded",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const satisfies readonly HeartbeatRunStatus[];
+export type HeartbeatRunTerminalStatus = (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number];
+
 export const RUN_LIVENESS_STATES = [
   "completed",
   "advanced",
