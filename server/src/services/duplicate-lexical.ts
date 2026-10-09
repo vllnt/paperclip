@@ -34,21 +34,45 @@ export function contentTokenCount(issue: IssueText): number {
   return joined ? joined.split(" ").length : 0;
 }
 
-/** Hash of the normalized title and description. Equal hashes mean the same content, no model needed. */
+/** Titles longer than this are cut before any comparison or request. */
+export const DUPLICATE_TITLE_MAX_CHARS = 500;
+const DESCRIPTION_PRE_REDACTION_CHARS = 20_000;
+/** Pairs need at least this many words before identical text counts as an exact duplicate. */
+const MIN_TOKENS_FOR_EXACT = 5;
+
+function foldIssueText(text: string): string {
+  return text.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/** Hash of the case-folded title and description with whitespace collapsed. Symbols still count. */
 export function exactContentHash(issue: IssueText): string {
   return createHash("sha256")
-    .update(`${normalizeIssueText(issue.title)}\n${normalizeIssueText(issue.description)}`)
+    .update(`${foldIssueText(issue.title)}\n${foldIssueText(issue.description)}`)
     .digest("hex");
 }
 
 /**
- * Prepares issue text for lexical comparison and for the model: redacts secrets, then truncates the
- * description. Titles are never truncated.
+ * True when both issues are textually identical and nothing was cut off. Truncated descriptions
+ * never qualify, because templated text can match for 1,500 characters and then differ. Short
+ * generic titles ("Review pull request") never qualify either.
+ */
+export function isExactDuplicate(a: IssueText, b: IssueText): boolean {
+  const truncated =
+    a.description.length >= DUPLICATE_DESCRIPTION_MAX_CHARS || b.description.length >= DUPLICATE_DESCRIPTION_MAX_CHARS;
+  return !truncated && contentTokenCount(a) >= MIN_TOKENS_FOR_EXACT && exactContentHash(a) === exactContentHash(b);
+}
+
+/**
+ * Prepares issue text for lexical comparison and for the model: cuts oversized input, redacts
+ * secrets, then truncates the description.
  */
 export function prepareIssueText(input: { title: string; description?: string | null }): IssueText {
   return {
-    title: redactSensitiveText(input.title.trim()),
-    description: redactSensitiveText((input.description ?? "").trim()).slice(0, DUPLICATE_DESCRIPTION_MAX_CHARS),
+    title: redactSensitiveText(input.title.trim().slice(0, DUPLICATE_TITLE_MAX_CHARS)),
+    description: redactSensitiveText((input.description ?? "").trim().slice(0, DESCRIPTION_PRE_REDACTION_CHARS)).slice(
+      0,
+      DUPLICATE_DESCRIPTION_MAX_CHARS,
+    ),
   };
 }
 

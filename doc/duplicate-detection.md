@@ -13,11 +13,12 @@ It only **suggests**. It never cancels, merges, reassigns or edits an issue.
  draft or new issue
         │
         ▼
- tier 0  exact normalized title + description match ───────────► "exact", no model call
+ tier 0  identical text (case and spacing aside, 5+ words, nothing cut) ─► "exact", no model call
         │
         ▼
  tier 1  Postgres pg_trgm, this company only, top 5 candidates (free)
-        │   excludes: cancelled, hidden, done > 90 days, same routine
+        │   excludes: cancelled, hidden, done > 90 days, same routine,
+        │   and (after create) issues created later than the new one
         │   down-weights: parent, children, siblings (kept eligible)
         ▼
  tier 2  Jev "same_outcome" predicate, one request per pair
@@ -88,7 +89,7 @@ input sent, and any later label. It stores **no issue text and no provider respo
 
 In `comment` mode, pairs that are `exact` or `likely_duplicate` and whose candidate is **older** get one
 system comment on the new issue, listing the candidates and their ids for labelling. The comment is
-claimed under a row lock, so re-running the check never posts a second one. An `issue.duplicate_suspected`
+claimed under a lock on the issue, and an issue gets at most one such comment ever, even if the check re-runs or the candidate changes in between. An `issue.duplicate_suspected`
 activity entry is written with it. Labelling writes `issue.duplicate_labeled`.
 
 ## Calibration
@@ -146,7 +147,9 @@ content sent to an external model provider** (Vercel AI Gateway, then TypeSafe).
 - `pg_trgm` treats letters by the database locale. On a UTF-8 locale accented letters count as letters; on a
   `C` locale they split words. Compare `SELECT datctype FROM pg_database WHERE datname = current_database()`
   with your expectations for non-English titles. The offline calibration mirrors UTF-8 behavior.
-- Titles under three words in total are never sent to the model, since "Fix bug" is shared by unrelated work.
+- Titles under three words in total are never sent to the model, since "Fix bug" is shared by unrelated work. Identical text counts as `exact` only with five or more words and when no description was cut at 1,500 characters; everything else identical still goes to the model.
+- The after-create check runs through a small bounded queue (3 at a time, 100 waiting). If a bulk import overflows it, extra checks are skipped, not delayed. Re-run them with the `similar` API if needed.
+- Existing issues are redacted and truncated the same way as the new one before they are sent.
 - Only `same_outcome` is asked. Subset, superset and overlap relations are a later increment.
 - Watchdog follow-ups of the same source are not excluded yet (routine-origin issues are).
 - No UI yet: use the API, the CLI or the issue activity feed.

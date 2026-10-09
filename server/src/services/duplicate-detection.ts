@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { companies, issueDuplicatePairs, issues } from "@paperclipai/db";
@@ -38,6 +38,7 @@ const candidateRowSchema = z.object({
   created_at: z.coerce.date(),
   title_sim: z.coerce.number(),
   desc_sim: z.coerce.number(),
+  both_described: z.boolean(),
 });
 
 export interface SimilarityQuery {
@@ -76,7 +77,7 @@ export interface DuplicateDetectionDeps {
 }
 
 function oneLine(text: string, max: number): string {
-  const flat = text.replace(/\s+/g, " ").replace(/[`[\]]/g, "").trim();
+  const flat = text.replace(/\s+/g, " ").replace(/[`[\]]/g, "").replace(/@/g, "\uFF20").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
@@ -110,6 +111,37 @@ export function buildDuplicateComment(
   ].join("\n");
 }
 
+const AFTER_CREATE_CONCURRENCY = 3;
+const AFTER_CREATE_MAX_PENDING = 100;
+
+/**
+ * Runs jobs with limited concurrency and a bounded wait list. A job that finds the list full is
+ * dropped and its promise resolves at once. Jobs must not throw.
+ */
+export function createBoundedRunner(concurrency: number, maxPending: number): (job: () => Promise<void>) => Promise<void> {
+  let active = 0;
+  const pending: Array<() => void> = [];
+  return (job) =>
+    new Promise<void>((resolve) => {
+      const start = () => {
+        active += 1;
+        void job()
+          .catch(() => {})
+          .finally(() => {
+            active -= 1;
+            resolve();
+            pending.shift()?.();
+          });
+      };
+      if (active < concurrency) start();
+      else if (pending.length < maxPending) pending.push(start);
+      else {
+        logger.warn({ maxPending }, "duplicate check queue full; skipping check");
+        resolve();
+      }
+    });
+}
+
 /**
  * Duplicate detection for issues: a free trigram tier, an exact-hash tier and one Jev predicate per
  * candidate pair. Every query here is scoped by `company_id`.
@@ -126,7 +158,9 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
   }
 
   async function fetchCandidates(query: SimilarityQuery, text: IssueText): Promise<CascadeCandidate[]> {
-    const excludeSelf = query.issueId ? sql`AND i.id <> ${query.issueId}` : sql``;
+    const onlyOlder = query.issueId
+      ? sql`AND (i.created_at, i.id) < (SELECT s.created_at, s.id FROM issues s WHERE s.id = ${query.issueId} AND s.company_id = ${query.companyId})`
+      : sql``;
     const excludeRoutine =
       query.origin?.kind === ROUTINE_ORIGIN_KIND && query.origin.id
         ? sql`AND NOT (i.origin_kind = ${ROUTINE_ORIGIN_KIND} AND i.origin_id = ${query.origin.id})`
@@ -135,18 +169,19 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
       WITH scored AS (
         SELECT i.id, i.identifier, i.title, i.description, i.status, i.parent_id, i.created_at,
                similarity(i.title, ${text.title}) AS title_sim,
-               similarity(left(coalesce(i.description, ''), ${DUPLICATE_DESCRIPTION_MAX_CHARS}), ${text.description}) AS desc_sim
+               similarity(left(coalesce(i.description, ''), ${DUPLICATE_DESCRIPTION_MAX_CHARS}), ${text.description}) AS desc_sim,
+               (${text.description} <> '' AND coalesce(i.description, '') <> '') AS both_described
         FROM issues i
         WHERE i.company_id = ${query.companyId}
           AND i.hidden_at IS NULL
           AND i.status <> 'cancelled'
-          AND (i.status <> 'done' OR i.completed_at > now() - interval '90 days')
-          ${excludeSelf}
+          AND (i.status <> 'done' OR coalesce(i.completed_at, i.updated_at) > now() - interval '90 days')
+          ${onlyOlder}
           ${excludeRoutine}
           AND (i.title % ${text.title} OR (${text.description} <> '' AND i.description % ${text.description}))
       )
       SELECT * FROM scored
-      ORDER BY (0.6 * title_sim + 0.4 * desc_sim) DESC
+      ORDER BY (CASE WHEN both_described THEN 0.6 * title_sim + 0.4 * desc_sim ELSE title_sim END) DESC
       LIMIT ${CANDIDATE_POOL_SIZE}
     `);
     return Array.from(rows).map((row) => {
@@ -157,10 +192,7 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
         status: parsed.status,
         parentId: parsed.parent_id,
         createdAt: parsed.created_at,
-        text: {
-          title: parsed.title,
-          description: (parsed.description ?? "").slice(0, DUPLICATE_DESCRIPTION_MAX_CHARS),
-        },
+        text: prepareIssueText({ title: parsed.title, description: parsed.description }),
         titleSimilarity: parsed.title_sim,
         descriptionSimilarity: parsed.desc_sim,
       };
@@ -210,6 +242,7 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
           modelId: sql`excluded.model_id`,
           updatedAt: now,
         },
+        setWhere: isNull(issueDuplicatePairs.commentId),
       })
       .returning({ id: issueDuplicatePairs.id, candidateIssueId: issueDuplicatePairs.candidateIssueId });
   }
@@ -219,6 +252,23 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
     entries: ReadonlyArray<{ pairId: string; pair: ScoredPair }>,
   ): Promise<string | null> {
     return db.transaction(async (tx) => {
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)))
+        .for("update");
+      const [alreadyCommented] = await tx
+        .select({ id: issueDuplicatePairs.id })
+        .from(issueDuplicatePairs)
+        .where(
+          and(
+            eq(issueDuplicatePairs.companyId, issue.companyId),
+            eq(issueDuplicatePairs.issueId, issue.id),
+            isNotNull(issueDuplicatePairs.commentId),
+          ),
+        )
+        .limit(1);
+      if (alreadyCommented) return null;
       const pending = await tx
         .select({ id: issueDuplicatePairs.id })
         .from(issueDuplicatePairs)
@@ -248,6 +298,65 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
     });
   }
 
+  async function checkNow(issue: CreatedIssueForCheck): Promise<void> {
+    try {
+      const mode = await getMode(issue.companyId);
+      if (mode === "off") return;
+      const result = await score(
+        {
+          companyId: issue.companyId,
+          title: issue.title,
+          description: issue.description,
+          parentId: issue.parentId,
+          issueId: issue.id,
+          origin: { kind: issue.originKind, id: issue.originId },
+        },
+        mode,
+      );
+      const recorded = await recordPairs(issue.companyId, issue.id, result.pairs);
+      if (mode !== "comment") return;
+
+      const idByCandidate = new Map(recorded.map((row) => [row.candidateIssueId, row.id]));
+      const entries = result.pairs.flatMap((pair) => {
+        const pairId = idByCandidate.get(pair.candidate.id);
+        const alerting = pair.verdict === "exact" || pair.verdict === "likely_duplicate";
+        return pairId && alerting ? [{ pairId, pair }] : [];
+      });
+      if (entries.length === 0) return;
+
+      const commentId = await commentOnce(issue, entries);
+      if (!commentId) return;
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: DETECTOR_ACTOR_ID,
+        action: "issue.duplicate_suspected",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          commentId,
+          pairs: entries.map(({ pairId, pair }) => ({
+            pairId,
+            candidateIssueId: pair.candidate.id,
+            candidateIdentifier: pair.candidate.identifier,
+            verdict: pair.verdict,
+            sameOutcomeProbability: pair.sameOutcomeProbability,
+            lexicalScore: pair.lexicalScore,
+            modelId: pair.modelId,
+          })),
+        },
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error instanceof Error ? error.message : String(error), issueId: issue.id, companyId: issue.companyId },
+        "duplicate check after create failed",
+      );
+    }
+  }
+
+  const runBounded = createBoundedRunner(AFTER_CREATE_CONCURRENCY, AFTER_CREATE_MAX_PENDING);
+
   return {
     getMode,
 
@@ -256,8 +365,18 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
      * off only the free lexical tier runs and no issue text leaves the instance.
      */
     async findSimilar(query: SimilarityQuery): Promise<FindSimilarIssuesResult> {
-      const mode = await getMode(query.companyId);
-      const result = await score(query, mode);
+      let mode: DuplicateDetectionMode = "off";
+      let result: CascadeResult;
+      try {
+        mode = await getMode(query.companyId);
+        result = await score(query, mode);
+      } catch (error) {
+        logger.warn(
+          { err: error instanceof Error ? error.message : String(error), companyId: query.companyId },
+          "similar-issues check failed; advising to create",
+        );
+        return { mode, modelUsed: false, degradedReason: "error", recommendation: "create", candidates: [] };
+      }
       return {
         mode,
         modelUsed: result.modelUsed,
@@ -276,66 +395,14 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
     },
 
     /**
-     * Runs after an issue is created, off the request path. Records every scored pair in the ledger
-     * and, in `comment` mode, posts one idempotent comment for pairs that clear the alert threshold.
-     * Only the newer issue of a pair is commented on. Never throws into the caller.
+     * Runs after an issue is created, off the request path, through a small bounded queue so bulk
+     * creates cannot flood the database or the gateway. Excess work is dropped, never queued without
+     * bound. Records every scored pair in the ledger and, in `comment` mode, posts one idempotent
+     * comment per issue for pairs that clear the alert threshold. Only older candidates are
+     * considered, so only the newer issue of a pair is commented on. Never throws into the caller.
      */
-    async checkAfterCreate(issue: CreatedIssueForCheck): Promise<void> {
-      try {
-        const mode = await getMode(issue.companyId);
-        if (mode === "off") return;
-        const result = await score(
-          {
-            companyId: issue.companyId,
-            title: issue.title,
-            description: issue.description,
-            parentId: issue.parentId,
-            issueId: issue.id,
-            origin: { kind: issue.originKind, id: issue.originId },
-          },
-          mode,
-        );
-        const recorded = await recordPairs(issue.companyId, issue.id, result.pairs);
-        if (mode !== "comment") return;
-
-        const idByCandidate = new Map(recorded.map((row) => [row.candidateIssueId, row.id]));
-        const entries = result.pairs.flatMap((pair) => {
-          const pairId = idByCandidate.get(pair.candidate.id);
-          const alerting = pair.verdict === "exact" || pair.verdict === "likely_duplicate";
-          const older = pair.candidate.createdAt !== null && pair.candidate.createdAt <= issue.createdAt;
-          return pairId && alerting && older ? [{ pairId, pair }] : [];
-        });
-        if (entries.length === 0) return;
-
-        const commentId = await commentOnce(issue, entries);
-        if (!commentId) return;
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: "system",
-          actorId: DETECTOR_ACTOR_ID,
-          action: "issue.duplicate_suspected",
-          entityType: "issue",
-          entityId: issue.id,
-          details: {
-            identifier: issue.identifier,
-            commentId,
-            pairs: entries.map(({ pairId, pair }) => ({
-              pairId,
-              candidateIssueId: pair.candidate.id,
-              candidateIdentifier: pair.candidate.identifier,
-              verdict: pair.verdict,
-              sameOutcomeProbability: pair.sameOutcomeProbability,
-              lexicalScore: pair.lexicalScore,
-              modelId: pair.modelId,
-            })),
-          },
-        });
-      } catch (error) {
-        logger.warn(
-          { err: error instanceof Error ? error.message : String(error), issueId: issue.id, companyId: issue.companyId },
-          "duplicate check after create failed",
-        );
-      }
+    checkAfterCreate(issue: CreatedIssueForCheck): Promise<void> {
+      return runBounded(() => checkNow(issue));
     },
 
     /** Ledger rows for one issue, newest first, with the candidate's identifier and title. */

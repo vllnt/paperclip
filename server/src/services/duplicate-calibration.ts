@@ -7,7 +7,7 @@ import {
 } from "./duplicate-cascade.js";
 import {
   DUPLICATE_DESCRIPTION_MAX_CHARS,
-  exactContentHash,
+  isExactDuplicate,
   lexicalScore,
   normalizeIssueText,
   prepareIssueText,
@@ -83,7 +83,7 @@ export function lexicalFeatures(pair: Pick<LabelledPair, "a" | "b">): LexicalFea
     titleSimilarity,
     descriptionSimilarity,
     lexical: lexicalScore({ titleSimilarity, descriptionSimilarity, bothHaveDescriptions }),
-    exact: exactContentHash(pair.a) === exactContentHash(pair.b),
+    exact: isExactDuplicate(pair.a, pair.b),
     retrievable:
       titleSimilarity >= TRIGRAM_RETRIEVAL_FLOOR ||
       (bothHaveDescriptions && descriptionSimilarity >= TRIGRAM_RETRIEVAL_FLOOR),

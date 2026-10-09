@@ -64,7 +64,9 @@ export function issueDuplicateRoutes(db: Db, detection: DuplicateDetectionServic
       assertCompanyAccess(req, companyId);
       assertNotSkillTestScoped(req);
       const actor = getActorInfo(req);
-      const pair = await detection.labelPair(companyId, req.params.pairId as string, req.body.label, {
+      const pairId = req.params.pairId as string;
+      if (!isUuidLike(pairId)) throw notFound("Duplicate pair not found");
+      const pair = await detection.labelPair(companyId, pairId, req.body.label, {
         type: actor.actorType,
         id: actor.actorId,
       });

@@ -54,7 +54,7 @@ describe("parseLabelledPairs", () => {
 
 describe("lexicalFeatures", () => {
   it("flags identical text as exact and unrelated text as not retrievable", () => {
-    const same = { a: { title: "Remove client barrels", description: "" }, b: { title: "remove client barrels!", description: "" } };
+    const same = { a: { title: "Remove client barrels from songtrivia", description: "" }, b: { title: "remove  CLIENT barrels from songtrivia", description: "" } };
     expect(lexicalFeatures(same)).toMatchObject({ exact: true, retrievable: true, lexical: 1 });
     const unrelated = { a: { title: "Remove client barrels", description: "" }, b: { title: "Dark mode billing page", description: "" } };
     expect(lexicalFeatures(unrelated)).toMatchObject({ exact: false, retrievable: false });

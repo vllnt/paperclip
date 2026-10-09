@@ -146,6 +146,18 @@ class JudgeTimeoutError extends Error {
   }
 }
 
+async function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new JudgeTimeoutError()), timeoutMs);
+  });
+  try {
+    return await Promise.race([work, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function nonNegativeInteger(raw: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(raw ?? "", 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
@@ -409,10 +421,12 @@ export function createJudgeClient(options: {
       if (hit) return { ok: true, answers: hit.answers, modelId: hit.modelId, inputHash, cached: true };
 
       try {
-        if (!(await usage.reserve(request.companyId))) return { ok: false, reason: "cap_exceeded", inputHash };
+        if (!(await withTimeout(usage.reserve(request.companyId), config.timeoutMs))) {
+          return { ok: false, reason: "cap_exceeded", inputHash };
+        }
       } catch (error) {
         logger.warn({ companyId: request.companyId, ...describeFailure(error) }, "judge usage reservation failed");
-        return { ok: false, reason: "error", inputHash };
+        return { ok: false, reason: error instanceof JudgeTimeoutError ? "timeout" : "error", inputHash };
       }
 
       const startedAt = Date.now();

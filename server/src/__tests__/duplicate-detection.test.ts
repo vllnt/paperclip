@@ -283,7 +283,55 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       const newer = await seedPair(other.companyId, new Date("2026-10-03T00:00:00Z"));
       await serviceFor(pg.db, judgeAnswering(0.99)).checkAfterCreate(asCreated(newer.created));
       expect(await pg.db.select().from(issueComments).where(eq(issueComments.issueId, newer.created.id))).toHaveLength(0);
-      expect((await pg.db.select().from(issueDuplicatePairs).where(eq(issueDuplicatePairs.issueId, newer.created.id))).length).toBeGreaterThan(0);
+      expect(await pg.db.select().from(issueDuplicatePairs).where(eq(issueDuplicatePairs.issueId, newer.created.id))).toHaveLength(0);
+    });
+
+    it("posts one comment per issue even when the candidate changes between runs", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Idempotent");
+      await setMode(pg.db, companyId, "comment");
+      const { older, created } = await seedPair(companyId, new Date("2026-10-01T00:00:00Z"));
+      const svc = serviceFor(pg.db, judgeAnswering(0.97));
+      await svc.checkAfterCreate(asCreated(created));
+      await pg.db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, older));
+      await Promise.all([svc.checkAfterCreate(asCreated(created)), svc.checkAfterCreate(asCreated(created))]);
+
+      expect(await pg.db.select().from(issueComments).where(eq(issueComments.issueId, created.id))).toHaveLength(1);
+      const pairs = await pg.db.select().from(issueDuplicatePairs).where(eq(issueDuplicatePairs.issueId, created.id));
+      expect(pairs.filter((pair) => pair.commentId !== null)).toHaveLength(1);
+    });
+
+    it("comments on exactly one of two issues created in the same instant", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Tie");
+      await setMode(pg.db, companyId, "comment");
+      const sameInstant = new Date("2026-10-02T00:00:00.000Z");
+      const a = await seedIssue(pg.db, companyId, { createdAt: sameInstant });
+      const b = await seedIssue(pg.db, companyId, { createdAt: sameInstant });
+      const svc = serviceFor(pg.db, judgeAnswering(0.97));
+      for (const id of [a, b]) {
+        const [row] = await pg.db.select().from(issues).where(eq(issues.id, id));
+        if (!row) throw new Error("seed failed");
+        await svc.checkAfterCreate(asCreated(row));
+      }
+      expect(await pg.db.select().from(issueComments)).toHaveLength(1);
+    });
+
+    it("redacts secrets in existing issues before they are sent to the model", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Redact");
+      await setMode(pg.db, companyId, "suggest");
+      const token = "abcdefghijklmnopqrstuvwxyz0123456789";
+      await seedIssue(pg.db, companyId, {
+        title: "Rotate the database credentials for staging",
+        description: `Authorization: Bearer ${token}`,
+      });
+      const judge = judgeAnswering(0.1);
+      await serviceFor(pg.db, judge).findSimilar({ companyId, title: "Rotate the database credentials for staging today" });
+      expect(judge.ask).toHaveBeenCalled();
+      expect(JSON.stringify(judge.ask.mock.calls)).not.toContain(token);
+    });
+
+    it("advises creating, instead of failing, when the check itself cannot run", async () => {
+      const result = await serviceFor(pg.db, judgeAnswering(0.5)).findSimilar({ companyId: "not-a-uuid", title: TITLE });
+      expect(result).toMatchObject({ recommendation: "create", degradedReason: "error", candidates: [] });
     });
 
     it("fails open: a failing model leaves lexical-only ledger rows and never throws", async () => {
@@ -441,6 +489,7 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       expect((await request(theirApp).get(`/api/issues/${created}/duplicate-pairs`)).status).toBe(403);
 
       expect((await request(mineApp).post(`/api/companies/${mine.companyId}/issue-duplicate-pairs/${pair.id}/label`).send({ label: "maybe" })).status).toBe(400);
+      expect((await request(mineApp).post(`/api/companies/${mine.companyId}/issue-duplicate-pairs/not-a-uuid/label`).send({ label: "duplicate" })).status).toBe(404);
       expect((await request(theirApp).post(`/api/companies/${theirs.companyId}/issue-duplicate-pairs/${pair.id}/label`).send({ label: "duplicate" })).status).toBe(404);
       const labeled = await request(mineApp).post(`/api/companies/${mine.companyId}/issue-duplicate-pairs/${pair.id}/label`).send({ label: "duplicate" });
       expect(labeled.status).toBe(200);

@@ -8,8 +8,10 @@ import {
   type CascadeSubject,
 } from "../services/duplicate-cascade.js";
 import {
+  DUPLICATE_TITLE_MAX_CHARS,
   RELATED_ISSUE_WEIGHT,
   exactContentHash,
+  isExactDuplicate,
   isTooShortForModel,
   lexicalScore,
   normalizeIssueText,
@@ -17,6 +19,7 @@ import {
   relationWeight,
   trigramSimilarity,
 } from "../services/duplicate-lexical.js";
+import { createBoundedRunner } from "../services/duplicate-detection.js";
 import type { JudgeClient, JudgeOutcome } from "../services/judge-client.js";
 
 const COMPANY = "00000000-0000-0000-0000-00000000000a";
@@ -65,8 +68,11 @@ function judgeFailing(reason: "no_key" | "cap_exceeded" | "timeout" | "error"): 
 describe("lexical helpers", () => {
   it("normalizes case, punctuation and spacing", () => {
     expect(normalizeIssueText("  [Chore]  Remove   @songtrivia/client! ")).toBe("chore remove songtrivia client");
-    expect(exactContentHash({ title: "Fix  Login", description: "A." })).toBe(
+    expect(exactContentHash({ title: "Fix  Login", description: "A" })).toBe(
       exactContentHash({ title: "fix login", description: "a" }),
+    );
+    expect(exactContentHash({ title: "Fix login", description: "A." })).not.toBe(
+      exactContentHash({ title: "Fix login", description: "A" }),
     );
     expect(exactContentHash({ title: "Fix login", description: "" })).not.toBe(
       exactContentHash({ title: "Fix logout", description: "" }),
@@ -106,6 +112,62 @@ describe("lexical helpers", () => {
   });
 });
 
+describe("exact duplicates", () => {
+  it("does not treat symbol-only differences as identical", () => {
+    expect(
+      isExactDuplicate({ title: "Migrate C++ build pipeline today", description: "" }, { title: "Migrate C# build pipeline today", description: "" }),
+    ).toBe(false);
+  });
+
+  it("never counts truncated descriptions or short generic titles", () => {
+    const long = "x".repeat(1_500);
+    expect(isExactDuplicate({ title: "Rotate the staging database credentials", description: long }, { title: "Rotate the staging database credentials", description: long })).toBe(false);
+    expect(isExactDuplicate({ title: "Review pull request", description: "" }, { title: "Review pull request", description: "" })).toBe(false);
+    expect(isExactDuplicate({ title: "Rotate the staging database credentials", description: "" }, { title: "rotate the staging  database credentials", description: "" })).toBe(true);
+  });
+
+  it("bounds oversized titles and redacts before sending", () => {
+    const prepared = prepareIssueText({ title: "t".repeat(100_000), description: "d".repeat(1_000_000) });
+    expect(prepared.title).toHaveLength(DUPLICATE_TITLE_MAX_CHARS);
+    expect(prepared.description).toHaveLength(1_500);
+  });
+});
+
+describe("bounded runner", () => {
+  it("limits concurrency, drops work past the wait list, and never throws", async () => {
+    const run = createBoundedRunner(2, 1);
+    let active = 0;
+    let peak = 0;
+    let completed = 0;
+    const release: Array<() => void> = [];
+    const job = () =>
+      new Promise<void>((resolve) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        release.push(() => {
+          active -= 1;
+          completed += 1;
+          resolve();
+        });
+      });
+    const first = run(job);
+    const second = run(job);
+    const third = run(job);
+    const dropped = run(job);
+    await dropped;
+    expect(release).toHaveLength(2);
+    release[0]?.();
+    await first;
+    expect(release).toHaveLength(3);
+    release[1]?.();
+    release[2]?.();
+    await Promise.all([second, third]);
+    expect(peak).toBe(2);
+    expect(completed).toBe(3);
+    await expect(createBoundedRunner(1, 1)(async () => { throw new Error("boom"); })).resolves.toBeUndefined();
+  });
+});
+
 describe("scoreCandidates", () => {
   it("resolves exact content matches without a model call", async () => {
     const judge = judgeAnswering(0.1);
@@ -114,7 +176,7 @@ describe("scoreCandidates", () => {
       judge,
       companyId: COMPANY,
       subject: subject(),
-      candidates: [candidate({ title: "remove @songtrivia/client compatibility barrels!" })],
+      candidates: [candidate({ title: "remove  @songtrivia/client compatibility   barrels" })],
     });
     expect(judge.ask).not.toHaveBeenCalled();
     expect(result.pairs[0]).toMatchObject({ verdict: "exact", sameOutcomeProbability: 1, modelId: null });

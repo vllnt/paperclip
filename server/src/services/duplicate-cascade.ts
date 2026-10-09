@@ -13,7 +13,7 @@ import {
   type JudgeState,
 } from "./judge-client.js";
 import {
-  exactContentHash,
+  isExactDuplicate,
   isTooShortForModel,
   lexicalScore,
   normalizeIssueText,
@@ -143,7 +143,6 @@ export async function scoreCandidates(input: {
   candidates: readonly CascadeCandidate[];
 }): Promise<CascadeResult> {
   const { mode, judge, companyId, subject } = input;
-  const subjectHash = exactContentHash(subject.text);
   const failures: JudgeFailureReason[] = [];
   let modelUsed = false;
 
@@ -166,7 +165,7 @@ export async function scoreCandidates(input: {
         inputHash,
       };
 
-      if (!tooShort && subjectHash === exactContentHash(candidate.text)) {
+      if (isExactDuplicate(subject.text, candidate.text)) {
         return { ...lexicalOnly, sameOutcomeProbability: 1, verdict: "exact" };
       }
       if (mode === "off" || tooShort) return lexicalOnly;

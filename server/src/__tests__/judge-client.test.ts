@@ -170,6 +170,13 @@ describe("judge client", () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
+  it("fails open when the cap reservation hangs", async () => {
+    const transport = transportReturning(0.5);
+    const client = createJudgeClient({ config, usage: { reserve: () => new Promise<boolean>(() => {}) }, transport });
+    expect(await client.ask(request())).toMatchObject({ ok: false, reason: "timeout" });
+    expect(transport).not.toHaveBeenCalled();
+  });
+
   it("fails open when the gateway throws or the usage store is down", async () => {
     const failing = createJudgeClient({
       config,
