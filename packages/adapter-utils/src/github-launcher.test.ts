@@ -443,176 +443,232 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     expect(ops[4]).toEqual({ program: "gh", args: ["pr", "view", "1"], remote: "https://github.com/Anthm-FR/songtrivia.git" });
   }, 30_000); // many launcher runs, each spawning git
 
-  it("reports each workflow path a push changes with its mode and blob at the pushed tip, so the broker can compare them with the base branch", async () => {
-    // The broker refuses every command here, so git never pushes anything.
-    const f = await brokered(() => ({ body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } }));
-    const git = (...args: string[]) => execFileSync("git", args, { cwd: f.repo, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).toString().trim();
-    const write = async (file: string, text: string) => { await mkdir(path.dirname(path.join(f.repo, file)), { recursive: true }); await writeFile(path.join(f.repo, file), text); };
-    const push = async (...refspecs: string[]) => { await f.run("git", ["push", "origin", ...refspecs]); return f.requests.at(-1)!.body.operation; };
-    const blob = (ref: string, file: string) => git("rev-parse", `${ref}:${file}`);
-    const workflows = ".github/workflows";
-    const sorted = (changes: Array<{ path: string }>) => [...changes].sort((a, b) => a.path.localeCompare(b.path));
-    /** The remote already has everything up to here. */
-    const synced = () => git("update-ref", "refs/remotes/origin/feature/x", "HEAD");
-    git("init", "-b", "main");
-    git("remote", "add", "origin", "https://github.com/Anthm-FR/songtrivia.git");
-    await write(`${workflows}/ci.yml`, "on: push\n");
-    await write(`${workflows}/release.yml`, "on: release\n");
-    await write("app.ts", "x\n");
-    git("add", "."); git("commit", "-m", "base");
-    git("update-ref", "refs/remotes/origin/main", "HEAD");
-    git("checkout", "-b", "feature/x");
-    await write("app.ts", "y\n");
-    git("add", "."); git("commit", "-m", "app");
-    synced();
-    // A push without workflow changes reports none.
-    await write("app.ts", "z\n");
-    git("commit", "-a", "-m", "more app");
-    expect(await push("feature/x")).toMatchObject({ touchesWorkflows: false });
-    expect((await push("feature/x")).workflowChanges).toBeUndefined();
-    synced();
+  describe("workflow changes in a push", () => {
+    const W = ".github/workflows";
+    const ci = `${W}/ci.yml`;
+    /** A checkout whose remote has main (two workflow files) and feature/x. The broker refuses every command, so nothing is pushed. */
+    async function workflowRepo() {
+      const f = await brokered(() => ({ body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } }));
+      const git = (...args: string[]) => execFileSync("git", args, { cwd: f.repo, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).toString().trim();
+      const write = async (file: string, text: string) => { await mkdir(path.dirname(path.join(f.repo, file)), { recursive: true }); await writeFile(path.join(f.repo, file), text); };
+      const push = async (cwd: string, ...args: string[]) => { await f.run("git", ["push", ...args], cwd); return f.requests.at(-1)!.body.operation; };
+      const sha = (ref: string) => git("rev-parse", ref);
+      const blob = (ref: string, file: string) => git("rev-parse", `${ref}:${file}`);
+      /** The remote branch now has everything up to this ref (as after a fetch or an accepted push). */
+      const remote = (ref: string, branch: string) => git("update-ref", `refs/remotes/origin/${branch}`, sha(ref));
+      git("init", "-b", "main");
+      git("remote", "add", "origin", "https://github.com/Anthm-FR/songtrivia.git");
+      await write(ci, "on: push\n");
+      await write(`${W}/release.yml`, "on: release\n");
+      await write("app.ts", "x\n");
+      git("add", "."); git("commit", "-m", "base");
+      const base = sha("HEAD");
+      remote("HEAD", "main");
+      git("checkout", "-b", "feature/x");
+      await write("app.ts", "y\n");
+      git("add", "."); git("commit", "-m", "app");
+      remote("HEAD", "feature/x");
+      /** main edits ci.yml, adds deploy.yml and deletes release.yml. */
+      const mainMovesOn = async () => {
+        git("checkout", "-q", "main");
+        await write(ci, "on: [push, pull_request]\n");
+        await write(`${W}/deploy.yml`, "on: workflow_dispatch\n");
+        git("rm", "-q", `${W}/release.yml`);
+        git("add", "."); git("commit", "-m", "main workflows");
+        remote("HEAD", "main");
+        git("checkout", "-q", "feature/x");
+        return sha("origin/main");
+      };
+      return { ...f, git, write, push: (...args: string[]) => push(f.repo, ...args), pushFrom: push, sha, blob, remote, base, mainMovesOn };
+    }
 
-    // main moves on: it edits ci.yml, adds deploy.yml and deletes release.yml. Merging it brings those in.
-    git("checkout", "-q", "main");
-    await write(`${workflows}/ci.yml`, "on: [push, pull_request]\n");
-    await write(`${workflows}/deploy.yml`, "on: workflow_dispatch\n");
-    git("rm", "-q", `${workflows}/release.yml`);
-    git("add", "."); git("commit", "-m", "main workflows");
-    git("update-ref", "refs/remotes/origin/main", "HEAD");
-    git("checkout", "-q", "feature/x");
-    git("merge", "--no-edit", "origin/main");
-    const merged = await push("feature/x");
-    expect(merged).toMatchObject({ touchesWorkflows: true, shas: [git("rev-parse", "HEAD")] });
-    expect(sorted(merged.workflowChanges)).toEqual([
-      { path: `${workflows}/ci.yml`, mode: "100644", oid: blob("origin/main", `${workflows}/ci.yml`) },
-      { path: `${workflows}/deploy.yml`, mode: "100644", oid: blob("origin/main", `${workflows}/deploy.yml`) },
-      { path: `${workflows}/release.yml`, mode: null, oid: null },
-    ]);
-    synced();
+    it("reports a merge of the base branch as one commit with its parents and the paths it brings in, and where its history joins the remote", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      const main = await r.mainMovesOn();
+      r.git("merge", "--no-edit", "origin/main");
+      const report = await r.push("origin", "feature/x");
+      expect(report).toMatchObject({ touchesWorkflows: true, shas: [r.sha("HEAD")] });
+      expect(report.workflowCommits).toEqual([{ sha: r.sha("HEAD"), parents: [feature, main], changes: [
+        { path: ci, mode: "100644", oid: r.blob("origin/main", ci) },
+        { path: `${W}/deploy.yml`, mode: "100644", oid: r.blob("origin/main", `${W}/deploy.yml`) },
+        { path: `${W}/release.yml`, mode: null, oid: null },
+      ] }]);
+      expect([...report.workflowEntries].sort()).toEqual([feature, main].sort());
+      // Every workflow file the pushed commit has.
+      expect(report.workflowFiles).toEqual([
+        { path: ci, mode: "100644", oid: r.blob("HEAD", ci) },
+        { path: `${W}/deploy.yml`, mode: "100644", oid: r.blob("HEAD", `${W}/deploy.yml`) },
+      ]);
+    }, 60_000);
 
-    // An edit by the agent reports its own blob, which is not the base's.
-    await write(`${workflows}/ci.yml`, "on: push\nenv:\n  A: 1\n");
-    git("commit", "-a", "-m", "edit ci");
-    const edited = await push("feature/x");
-    expect(edited.workflowChanges).toEqual([{ path: `${workflows}/ci.yml`, mode: "100644", oid: blob("HEAD", `${workflows}/ci.yml`) }]);
-    expect(edited.workflowChanges[0].oid).not.toBe(blob("origin/main", `${workflows}/ci.yml`));
-    synced();
+    it("reports every new commit that changes a workflow, so a clean tip cannot hide an earlier edit", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const edit = r.sha("HEAD");
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "restore ci");
+      const restore = r.sha("HEAD");
+      const report = await r.push("origin", "feature/x");
+      expect(report).toMatchObject({ touchesWorkflows: true, shas: [restore] });
+      expect(report.workflowCommits.map((commit: any) => commit.sha).sort()).toEqual([edit, restore].sort());
+      expect(report.workflowCommits.find((commit: any) => commit.sha === edit)).toEqual({ sha: edit, parents: [feature], changes: [{ path: ci, mode: "100644", oid: r.blob(edit, ci) }] });
+      expect(report.workflowEntries).toEqual([feature]);
+      // The tip alone looks clean: it has the file as main does.
+      expect(report.workflowFiles).toContainEqual({ path: ci, mode: "100644", oid: r.blob("origin/main", ci) });
+    }, 60_000);
 
-    // A rename reports both names: the old one gone, the new one present.
-    git("mv", `${workflows}/deploy.yml`, `${workflows}/ship.yml`);
-    git("commit", "-m", "rename deploy");
-    expect(sorted((await push("feature/x")).workflowChanges)).toEqual([
-      { path: `${workflows}/deploy.yml`, mode: null, oid: null },
-      { path: `${workflows}/ship.yml`, mode: "100644", oid: blob("HEAD", `${workflows}/ship.yml`) },
-    ]);
-    synced();
+    it("counts a push that moves the branch to a commit the remote already has as a workflow change when the files differ from the branch it replaces", async () => {
+      const r = await workflowRepo();
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const edit = r.sha("HEAD");
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "restore ci");
+      // The remote branch holds both commits now; one is pushed back over the other.
+      r.remote("HEAD", "feature/x");
+      r.git("branch", "rewind", edit);
+      const rewind = await r.push("--force", "origin", "rewind:feature/x");
+      expect(rewind).toMatchObject({ touchesWorkflows: true, shas: [edit], workflowCommits: [], workflowEntries: [edit] });
+      expect(rewind.workflowFiles).toContainEqual({ path: ci, mode: "100644", oid: r.blob(edit, ci) });
+      // Pushing what the remote branch already is changes nothing.
+      const same = await r.push("origin", "feature/x");
+      expect(same).toMatchObject({ touchesWorkflows: false });
+      expect(same.workflowFiles).toBeUndefined();
+      expect(same.workflowCommits).toBeUndefined();
+    }, 60_000);
 
-    // Moving a workflow out of the directory is still a workflow change (git does not pair the rename in this report).
-    git("mv", `${workflows}/ship.yml`, "scripts-ship.yml");
-    git("commit", "-m", "move out");
-    expect(await push("feature/x")).toMatchObject({ touchesWorkflows: true, workflowChanges: [{ path: `${workflows}/ship.yml`, mode: null, oid: null }] });
-    synced();
+    it("reports an octopus merge with all its parents", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      const main = await r.mainMovesOn();
+      r.git("checkout", "-q", "-b", "side", r.base);
+      await r.write("side.txt", "side\n");
+      r.git("add", "."); r.git("commit", "-m", "side");
+      r.remote("HEAD", "side");
+      const side = r.sha("HEAD");
+      r.git("checkout", "-q", "feature/x");
+      r.git("branch", "-q", "-D", "side");
+      r.git("merge", "--no-edit", "origin/main", "origin/side");
+      expect(r.git("rev-list", "--parents", "-n", "1", "HEAD").split(" ")).toHaveLength(4);
+      const report = await r.push("origin", "feature/x");
+      expect(report.workflowCommits).toHaveLength(1);
+      expect(report.workflowCommits[0].parents).toEqual([feature, main, side]);
+      expect(report.workflowCommits[0].changes.map((change: any) => change.path)).toContain(ci);
+      expect([...report.workflowEntries].sort()).toEqual([feature, main, side].sort());
+    }, 60_000);
 
-    // A mode change and a symlink show in the mode.
-    await symlink("../../outside.yml", path.join(f.repo, workflows, "link.yml"));
-    git("add", ".");
-    git("update-index", "--chmod=+x", `${workflows}/ci.yml`);
-    git("commit", "-m", "mode and link");
-    expect(sorted((await push("feature/x")).workflowChanges)).toEqual([
-      { path: `${workflows}/ci.yml`, mode: "100755", oid: blob("HEAD", `${workflows}/ci.yml`) },
-      { path: `${workflows}/link.yml`, mode: "120000", oid: blob("HEAD", `${workflows}/link.yml`) },
-    ]);
-    synced();
+    it("reports a merge whose second parent is not the base branch's, with that parent as an entry", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      await r.mainMovesOn();
+      // Another remote branch has the same ci.yml as main now, but is not part of main.
+      r.git("checkout", "-q", "-b", "wip", r.base);
+      await r.write(ci, "on: [push, pull_request]\n");
+      r.git("commit", "-a", "-m", "wip ci");
+      r.remote("HEAD", "wip");
+      const wip = r.sha("HEAD");
+      r.git("checkout", "-q", "feature/x");
+      r.git("branch", "-q", "-D", "wip");
+      r.git("merge", "--no-edit", "origin/wip");
+      expect(r.blob("HEAD", ci)).toBe(r.blob("origin/main", ci));
+      const report = await r.push("origin", "feature/x");
+      expect(report.workflowCommits).toEqual([{ sha: r.sha("HEAD"), parents: [feature, wip], changes: [{ path: ci, mode: "100644", oid: r.blob("origin/main", ci) }] }]);
+      expect([...report.workflowEntries].sort()).toEqual([feature, wip].sort());
+    }, 60_000);
 
-    // More than one pushed commit: the report cannot tie a path to a branch, so it carries no changes (the broker then asks for editWorkflows).
-    await write(`${workflows}/again.yml`, "on: push\n");
-    git("add", "."); git("commit", "-m", "again");
-    const two = await push("HEAD:refs/heads/one", "HEAD~1:refs/heads/two");
-    expect(two).toMatchObject({ touchesWorkflows: true });
-    expect(two.workflowChanges).toBeUndefined();
-    synced();
+    it("reports a commit whose parent is a remote ref the checkout only claims to have, as an entry for the broker to check", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      // A commit with an edit sits behind a made-up remote ref, so it is "already on the remote" for this checkout.
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const hidden = r.sha("HEAD");
+      r.remote("HEAD", "made-up");
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "restore ci");
+      const report = await r.push("origin", "feature/x");
+      expect(report.workflowEntries).toEqual([hidden]);
+      expect(report.workflowEntries).not.toContain(feature);
+    }, 60_000);
 
-    // Too many paths to report: none are reported.
-    const before = git("rev-parse", "HEAD");
-    for (let index = 0; index < 101; index += 1) await write(`${workflows}/bulk-${index}.yml`, `on: push # ${index}\n`);
-    git("add", "."); git("commit", "-m", "bulk");
-    const bulk = await push("feature/x");
-    expect(bulk).toMatchObject({ touchesWorkflows: true });
-    expect(bulk.workflowChanges).toBeUndefined();
-    git("reset", "-q", "--hard", before);
+    it("reads names whole from a subdirectory, and reports no paths when there are too many commits, files or characters", async () => {
+      const r = await workflowRepo();
+      const names = [`${W}/büild.yml`, `${W}/two words.yml`, `${W}/new\nline.yml`];
+      for (const name of names) await r.write(name, `on: push # ${name.length}\n`);
+      r.git("add", "."); r.git("commit", "-m", "odd names");
+      await mkdir(path.join(r.repo, "src"), { recursive: true });
+      const sub = await r.pushFrom(path.join(r.repo, "src"), "origin", "feature/x");
+      expect(sub.workflowCommits).toHaveLength(1);
+      expect(sub.workflowCommits[0].changes.map((change: any) => change.path)).toEqual([...names].sort());
+      expect(sub.workflowFiles.map((file: any) => file.path)).toEqual([ci, ...names, `${W}/release.yml`].sort());
+      r.remote("HEAD", "feature/x");
 
-    // Replacing the directory with a symlink names the directory itself.
-    git("rm", "-r", "-q", workflows);
-    await mkdir(path.join(f.repo, ".github"), { recursive: true });
-    await symlink("../elsewhere", path.join(f.repo, workflows));
-    git("add", "."); git("commit", "-m", "symlinked workflows");
-    const replaced = await push("feature/x");
-    expect(replaced.workflowChanges).toContainEqual({ path: workflows, mode: "120000", oid: blob("HEAD", workflows) });
-  }, 120_000); // many launcher runs, each spawning git
+      // A commit that touches nothing in .github/workflows reports nothing.
+      await r.write("src/more.ts", "y\n");
+      r.git("add", "."); r.git("commit", "-m", "app only");
+      const plain = await r.push("origin", "feature/x");
+      expect(plain).toMatchObject({ touchesWorkflows: false });
+      expect(plain.workflowCommits).toBeUndefined();
+      r.remote("HEAD", "feature/x");
 
-  it("reports workflow paths from a subdirectory and with unusual names, and none when a path is too long to report", async () => {
-    const f = await brokered(() => ({ body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } }));
-    const git = (...args: string[]) => execFileSync("git", args, { cwd: f.repo, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).toString().trim();
-    const write = async (file: string, text: string) => { await mkdir(path.dirname(path.join(f.repo, file)), { recursive: true }); await writeFile(path.join(f.repo, file), text); };
-    const pushFrom = async (cwd: string) => { await f.run("git", ["push", "origin", "feature/x"], cwd); return f.requests.at(-1)!.body.operation; };
-    const workflows = ".github/workflows";
-    git("init", "-b", "main");
-    git("remote", "add", "origin", "https://github.com/Anthm-FR/songtrivia.git");
-    await write("src/app.ts", "x\n");
-    git("add", "."); git("commit", "-m", "base");
-    git("update-ref", "refs/remotes/origin/main", "HEAD");
-    git("checkout", "-b", "feature/x");
-    git("update-ref", "refs/remotes/origin/feature/x", "HEAD");
+      // .github replaced by a symlink: every workflow file is gone from the tip, and each deletion is reported.
+      const before = r.sha("HEAD");
+      r.git("rm", "-r", "-q", ".github");
+      await symlink("elsewhere", path.join(r.repo, ".github"));
+      r.git("add", "."); r.git("commit", "-m", "symlinked .github");
+      const replaced = await r.push("origin", "feature/x");
+      expect(replaced.touchesWorkflows).toBe(true);
+      expect(replaced.workflowFiles).toEqual([]);
+      expect(replaced.workflowCommits[0].changes.every((change: any) => change.mode === null && change.oid === null)).toBe(true);
+      expect(replaced.workflowCommits[0].changes.map((change: any) => change.path)).toEqual([ci, ...names, `${W}/release.yml`].sort());
+      r.git("reset", "-q", "--hard", before);
 
-    // The push runs in a subdirectory, and the names have non-ASCII letters, a space and a newline: paths stay whole and from the repository root.
-    const names = [`${workflows}/büild.yml`, `${workflows}/two words.yml`, `${workflows}/new\nline.yml`];
-    for (const name of names) await write(name, `on: push # ${name.length}\n`);
-    git("add", "."); git("commit", "-m", "odd names");
-    const odd = await pushFrom(path.join(f.repo, "src"));
-    expect(odd).toMatchObject({ touchesWorkflows: true });
-    expect([...odd.workflowChanges].sort((a: any, b: any) => a.path.localeCompare(b.path))).toEqual(
-      [...names].sort().map(name => ({ path: name, mode: "100644", oid: git("rev-parse", `HEAD:${name}`) })).sort((a, b) => a.path.localeCompare(b.path)));
-    git("update-ref", "refs/remotes/origin/feature/x", "HEAD");
+      // A file replaced by a directory of the same name: the file is gone, the new files are there.
+      await r.write(`${W}/sub`, "on: push\n");
+      r.git("add", "."); r.git("commit", "-m", "sub is a file");
+      r.remote("HEAD", "feature/x");
+      r.git("rm", "-q", `${W}/sub`);
+      await r.write(`${W}/sub/inner.yml`, "on: push\n");
+      r.git("add", "."); r.git("commit", "-m", "sub is a directory");
+      const swapped = await r.push("origin", "feature/x");
+      expect(swapped.workflowCommits[0].changes).toEqual([
+        { path: `${W}/sub`, mode: null, oid: null },
+        { path: `${W}/sub/inner.yml`, mode: "100644", oid: r.blob("HEAD", `${W}/sub/inner.yml`) },
+      ]);
+      r.remote("HEAD", "feature/x");
 
-    // The git tree reads the same from the root, and a new commit touching only the subdirectory reports nothing.
-    await write("src/more.ts", "y\n");
-    git("add", "."); git("commit", "-m", "app only");
-    const plain = await pushFrom(path.join(f.repo, "src"));
-    expect(plain).toMatchObject({ touchesWorkflows: false });
-    expect(plain.workflowChanges).toBeUndefined();
-    git("update-ref", "refs/remotes/origin/feature/x", "HEAD");
+      // A path longer than the broker reads.
+      await r.write(`${W}/${"d".repeat(100)}/${"e".repeat(100)}/${"f".repeat(100)}/ci.yml`, "on: push\n");
+      r.git("add", "."); r.git("commit", "-m", "deep");
+      const deep = await r.push("origin", "feature/x");
+      expect(deep).toMatchObject({ touchesWorkflows: true });
+      expect(deep.workflowCommits).toBeUndefined();
+      expect(deep.workflowFiles).toBeUndefined();
+      r.git("reset", "-q", "--hard", "HEAD~1");
 
-    // `.github` replaced by a symlink: the workflow files are gone from the tip, and the report says so for each.
-    git("rm", "-r", "-q", ".github");
-    await symlink("elsewhere", path.join(f.repo, ".github"));
-    git("add", "."); git("commit", "-m", "symlinked .github");
-    const replaced = await pushFrom(f.repo);
-    expect(replaced.touchesWorkflows).toBe(true);
-    expect([...replaced.workflowChanges].map((change: any) => change.path).sort()).toEqual([...names].sort());
-    expect(replaced.workflowChanges.every((change: any) => change.mode === null && change.oid === null)).toBe(true);
-    git("reset", "-q", "--hard", "HEAD~1");
-    git("update-ref", "refs/remotes/origin/feature/x", "HEAD");
+      // More new commits than the broker reads, one of them with a workflow edit.
+      for (let index = 0; index < 101; index += 1) r.git("commit", "--allow-empty", "-m", `empty ${index}`);
+      await r.write(ci, "on: push\nenv:\n  A: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const many = await r.push("origin", "feature/x");
+      expect(many).toMatchObject({ touchesWorkflows: true });
+      expect(many.workflowCommits).toBeUndefined();
+      r.remote("HEAD", "feature/x");
 
-    // A file replaced by a directory of the same name is not "gone": nothing is reported, so the toggle decides.
-    await write(`${workflows}/sub`, "on: push\n");
-    git("add", "."); git("commit", "-m", "sub is a file");
-    git("update-ref", "refs/remotes/origin/feature/x", "HEAD");
-    git("rm", "-q", `${workflows}/sub`);
-    await write(`${workflows}/sub/inner.yml`, "on: push\n");
-    git("add", "."); git("commit", "-m", "sub is a directory");
-    const swapped = await pushFrom(f.repo);
-    expect(swapped).toMatchObject({ touchesWorkflows: true });
-    expect(swapped.workflowChanges).toBeUndefined();
-    git("update-ref", "refs/remotes/origin/feature/x", "HEAD");
-
-    // A path longer than the broker reads: no paths are reported, so the report stays readable and the toggle decides.
-    const deep = `${workflows}/${"d".repeat(100)}/${"e".repeat(100)}/${"f".repeat(100)}/ci.yml`;
-    await write(deep, "on: push\n");
-    git("add", "."); git("commit", "-m", "deep");
-    const long = await pushFrom(f.repo);
-    expect(long).toMatchObject({ touchesWorkflows: true });
-    expect(long.workflowChanges).toBeUndefined();
-  }, 120_000); // many launcher runs, each spawning git
+      // More workflow files than the broker reads.
+      for (let index = 0; index < 101; index += 1) await r.write(`${W}/bulk-${index}.yml`, `on: push # ${index}\n`);
+      r.git("add", "."); r.git("commit", "-m", "bulk files");
+      r.remote("HEAD", "feature/x");
+      await r.write(ci, "on: push\nenv:\n  B: 1\n");
+      r.git("commit", "-a", "-m", "edit ci again");
+      const bulk = await r.push("origin", "feature/x");
+      expect(bulk).toMatchObject({ touchesWorkflows: true });
+      expect(bulk.workflowFiles).toBeUndefined();
+    }, 180_000);
+  });
 
   it("reports where a push really goes and what could make it go elsewhere", async () => {
     const f = await brokered(() => ({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } }));

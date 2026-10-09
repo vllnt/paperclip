@@ -46,12 +46,23 @@ export const gitHubOperationSchema = z.object({
     .refine(value => !value || Object.keys(value).length <= 64, "Too many refs"),
   /** git push: whether the new commits change `.github/workflows/**`; null when unknown. */
   touchesWorkflows: z.boolean().nullable().optional(),
-  /** git push of one commit: the workflow paths the new commits change, as that commit has them (git mode and blob id; null when gone). Absent when unknown or too many. */
-  workflowChanges: z.array(z.object({
-    path: z.string().max(300),
-    mode: z.string().regex(/^\d{6}$/).nullable(),
-    oid: z.string().regex(/^[0-9a-f]{40,64}$/).nullable(),
-  })).max(100).optional(),
+  /**
+   * git push of one commit that changes workflow files: every file under `.github/workflows` at the pushed commit, the new
+   * commits that change workflow paths (with their parents and those paths as they have them: git mode and blob id, null
+   * when gone), and the parents where new history joins commits that already exist. Absent when unknown or too much.
+   */
+  workflowFiles: z.array(z.object({ path: z.string().max(300), mode: z.string().regex(/^\d{6}$/), oid: z.string().regex(/^[0-9a-f]{40,64}$/) })).max(100).optional(),
+  workflowCommits: z.array(z.object({
+    sha: z.string().regex(/^[0-9a-f]{40,64}$/),
+    parents: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(16),
+    changes: z.array(z.object({
+      path: z.string().max(300),
+      mode: z.string().regex(/^\d{6}$/).nullable(),
+      oid: z.string().regex(/^[0-9a-f]{40,64}$/).nullable(),
+    })).min(1).max(100),
+  })).max(100).optional()
+    .refine(value => !value || value.reduce((total, commit) => total + commit.changes.length, 0) <= 400, "Too many workflow changes"),
+  workflowEntries: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(8).optional(),
   /** git push: the commit SHAs being pushed (for the audit record). */
   shas: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(64).optional(),
   /** git push: every push URL of the remote (git pushes to all of them). */
@@ -353,16 +364,19 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     retarget = operation.args.slice(1).some(arg => arg === "--base" || arg.startsWith("--base=") || arg.startsWith("-B"));
   }
   if (operation.program === "git" && subcommand === "push" && operation.shas?.length) target.shas = operation.shas;
-  // One commit to one named branch is the only push whose workflow paths can be tied to a branch for the plugin's base comparison.
+  // One commit to one named branch, reported whole, is the only push whose workflow history the plugin can check against GitHub.
   let workflowPush: GitHubWorkflowPush | undefined;
   if (operation.program === "git" && subcommand === "push" && privileged.includes("editWorkflows") && operation.touchesWorkflows === true
-    && operation.shas?.length === 1 && operation.workflowChanges?.length) {
+    && operation.shas?.length === 1 && operation.workflowFiles && operation.workflowCommits && operation.workflowEntries?.length) {
     const destinations = gitPushDestinations(operation.args.slice(index + 1), {
       currentBranch: operation.currentBranch ?? null, refs: operation.refs, followTags: operation.followTags, implicitPush: operation.implicitPush,
     });
     const [only] = destinations;
     if (destinations.length === 1 && only!.startsWith("refs/heads/") && !only!.includes("*")) {
-      workflowPush = { branch: only!.slice("refs/heads/".length), changes: operation.workflowChanges };
+      workflowPush = {
+        branch: only!.slice("refs/heads/".length), tip: operation.shas[0]!,
+        files: operation.workflowFiles, commits: operation.workflowCommits, entries: operation.workflowEntries,
+      };
     }
   }
   if (operation.program === "gh" && operation.args[0] === "pr" && ghVerb === "merge") {
