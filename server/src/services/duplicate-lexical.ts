@@ -36,6 +36,7 @@ export function contentTokenCount(issue: IssueText): number {
 
 /** Titles longer than this are cut before any comparison or request. */
 export const DUPLICATE_TITLE_MAX_CHARS = 500;
+const TITLE_PRE_REDACTION_CHARS = 2_000;
 const DESCRIPTION_PRE_REDACTION_CHARS = 20_000;
 /** Pairs need at least this many words before identical text counts as an exact duplicate. */
 const MIN_TOKENS_FOR_EXACT = 5;
@@ -58,7 +59,10 @@ export function exactContentHash(issue: IssueText): string {
  */
 export function isExactDuplicate(a: IssueText, b: IssueText): boolean {
   const truncated =
-    a.description.length >= DUPLICATE_DESCRIPTION_MAX_CHARS || b.description.length >= DUPLICATE_DESCRIPTION_MAX_CHARS;
+    a.description.length >= DUPLICATE_DESCRIPTION_MAX_CHARS ||
+    b.description.length >= DUPLICATE_DESCRIPTION_MAX_CHARS ||
+    a.title.length >= DUPLICATE_TITLE_MAX_CHARS ||
+    b.title.length >= DUPLICATE_TITLE_MAX_CHARS;
   return !truncated && contentTokenCount(a) >= MIN_TOKENS_FOR_EXACT && exactContentHash(a) === exactContentHash(b);
 }
 
@@ -68,7 +72,7 @@ export function isExactDuplicate(a: IssueText, b: IssueText): boolean {
  */
 export function prepareIssueText(input: { title: string; description?: string | null }): IssueText {
   return {
-    title: redactSensitiveText(input.title.trim().slice(0, DUPLICATE_TITLE_MAX_CHARS)),
+    title: redactSensitiveText(input.title.trim().slice(0, TITLE_PRE_REDACTION_CHARS)).slice(0, DUPLICATE_TITLE_MAX_CHARS),
     description: redactSensitiveText((input.description ?? "").trim().slice(0, DESCRIPTION_PRE_REDACTION_CHARS)).slice(
       0,
       DUPLICATE_DESCRIPTION_MAX_CHARS,

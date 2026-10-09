@@ -150,6 +150,9 @@ content sent to an external model provider** (Vercel AI Gateway, then TypeSafe).
 - Titles under three words in total are never sent to the model, since "Fix bug" is shared by unrelated work. Identical text counts as `exact` only with five or more words and when no description was cut at 1,500 characters; everything else identical still goes to the model.
 - The after-create check runs through a small bounded queue (3 at a time, 100 waiting). If a bulk import overflows it, extra checks are skipped, not delayed. Re-run them with the `similar` API if needed.
 - Existing issues are redacted and truncated the same way as the new one before they are sent.
+- Two near-simultaneous creates can miss each other. A check only sees committed rows older than its own issue, so if issue A commits after issue B was checked, neither is flagged. The `similar` API before creation closes most of this gap.
+- A model refusal is treated as "no answer": the pair stays on the lexical tier.
+- Candidate descriptions are matched with `pg_trgm` on the full text (to use the GIN index) but scored on the first 1,500 characters, so very long descriptions can rank slightly differently from how they matched.
 - Only `same_outcome` is asked. Subset, superset and overlap relations are a later increment.
 - Watchdog follow-ups of the same source are not excluded yet (routine-origin issues are).
 - No UI yet: use the API, the CLI or the issue activity feed.

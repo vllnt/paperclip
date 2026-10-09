@@ -137,7 +137,7 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       await seedIssue(pg.db, mine.companyId, { title: "Add dark mode to the billing settings page" });
       await seedIssue(pg.db, mine.companyId, { originKind: "routine_execution", originId: routineId });
       const foreign = await seedIssue(pg.db, theirs.companyId);
-      const self = await seedIssue(pg.db, mine.companyId);
+      const self = await seedIssue(pg.db, mine.companyId, { createdAt: new Date("2026-10-05T00:00:00Z") });
 
       const svc = serviceFor(pg.db, judgeAnswering(0.5));
       const result = await svc.findSimilar({ companyId: mine.companyId, title: TITLE, issueId: self, origin: { kind: "routine_execution", id: routineId } });

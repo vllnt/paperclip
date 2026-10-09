@@ -121,9 +121,8 @@ function verdictFromAnswer(answer: JudgeAnswer | undefined): {
   verdict: DuplicatePairVerdict;
 } {
   if (!answer || answer.type !== "predicate") return { probability: null, verdict: "uncertain" };
-  if (answer.abstained || answer.probability === null) {
-    return { probability: answer.probability, verdict: "uncertain" };
-  }
+  if (answer.probability === null) return { probability: null, verdict: "lexical_only" };
+  if (answer.abstained) return { probability: answer.probability, verdict: "uncertain" };
   return {
     probability: answer.probability,
     verdict: answer.probability >= DUPLICATE_ALERT_THRESHOLD ? "likely_duplicate" : "distinct",

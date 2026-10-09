@@ -113,25 +113,40 @@ export function buildDuplicateComment(
 
 const AFTER_CREATE_CONCURRENCY = 3;
 const AFTER_CREATE_MAX_PENDING = 100;
+const AFTER_CREATE_DEADLINE_MS = 30_000;
 
 /**
  * Runs jobs with limited concurrency and a bounded wait list. A job that finds the list full is
  * dropped and its promise resolves at once. Jobs must not throw.
  */
-export function createBoundedRunner(concurrency: number, maxPending: number): (job: () => Promise<void>) => Promise<void> {
+export function createBoundedRunner(
+  concurrency: number,
+  maxPending: number,
+  deadlineMs: number = AFTER_CREATE_DEADLINE_MS,
+): (job: () => Promise<void>) => Promise<void> {
   let active = 0;
   const pending: Array<() => void> = [];
   return (job) =>
     new Promise<void>((resolve) => {
       const start = () => {
         active += 1;
-        void job()
+        let released = false;
+        const release = () => {
+          if (released) return;
+          released = true;
+          clearTimeout(deadline);
+          active -= 1;
+          resolve();
+          pending.shift()?.();
+        };
+        const deadline = setTimeout(() => {
+          logger.warn({ deadlineMs }, "duplicate check exceeded its deadline; freeing its slot");
+          release();
+        }, deadlineMs);
+        void Promise.resolve()
+          .then(job)
           .catch(() => {})
-          .finally(() => {
-            active -= 1;
-            resolve();
-            pending.shift()?.();
-          });
+          .finally(release);
       };
       if (active < concurrency) start();
       else if (pending.length < maxPending) pending.push(start);
@@ -170,7 +185,7 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
         SELECT i.id, i.identifier, i.title, i.description, i.status, i.parent_id, i.created_at,
                similarity(i.title, ${text.title}) AS title_sim,
                similarity(left(coalesce(i.description, ''), ${DUPLICATE_DESCRIPTION_MAX_CHARS}), ${text.description}) AS desc_sim,
-               (${text.description} <> '' AND coalesce(i.description, '') <> '') AS both_described
+               (${text.description} ~ '[[:alnum:]]' AND coalesce(i.description, '') ~ '[[:alnum:]]') AS both_described
         FROM issues i
         WHERE i.company_id = ${query.companyId}
           AND i.hidden_at IS NULL

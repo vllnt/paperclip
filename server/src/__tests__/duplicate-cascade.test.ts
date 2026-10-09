@@ -129,6 +129,11 @@ describe("exact duplicates", () => {
   it("bounds oversized titles and redacts before sending", () => {
     const prepared = prepareIssueText({ title: "t".repeat(100_000), description: "d".repeat(1_000_000) });
     expect(prepared.title).toHaveLength(DUPLICATE_TITLE_MAX_CHARS);
+    const longTitle = "same words ".repeat(40);
+    const cutTitle = "same words ".repeat(60);
+    expect(isExactDuplicate({ title: longTitle, description: "" }, { title: longTitle, description: "" })).toBe(true);
+    const cut = prepareIssueText({ title: cutTitle, description: "" });
+    expect(isExactDuplicate(cut, { ...cut })).toBe(false);
     expect(prepared.description).toHaveLength(1_500);
   });
 });
@@ -155,9 +160,11 @@ describe("bounded runner", () => {
     const third = run(job);
     const dropped = run(job);
     await dropped;
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(release).toHaveLength(2);
     release[0]?.();
     await first;
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(release).toHaveLength(3);
     release[1]?.();
     release[2]?.();
@@ -165,6 +172,24 @@ describe("bounded runner", () => {
     expect(peak).toBe(2);
     expect(completed).toBe(3);
     await expect(createBoundedRunner(1, 1)(async () => { throw new Error("boom"); })).resolves.toBeUndefined();
+  });
+
+  it("survives a job that throws synchronously and keeps serving later jobs", async () => {
+    const run = createBoundedRunner(1, 5);
+    const syncThrow = (() => { throw new Error("sync"); }) as () => Promise<void>;
+    await expect(run(syncThrow)).resolves.toBeUndefined();
+    let ran = false;
+    await run(async () => { ran = true; });
+    expect(ran).toBe(true);
+  });
+
+  it("frees the slot of a job that hangs past its deadline", async () => {
+    const run = createBoundedRunner(1, 5, 20);
+    const hung = run(() => new Promise<void>(() => {}));
+    let ran = false;
+    const next = run(async () => { ran = true; });
+    await Promise.all([hung, next]);
+    expect(ran).toBe(true);
   });
 });
 
@@ -215,7 +240,7 @@ describe("scoreCandidates", () => {
     expect(await run(0.6, true)).toMatchObject({ verdict: "uncertain", sameOutcomeProbability: 0.6 });
   });
 
-  it("treats a model refusal as uncertain and records no probability", async () => {
+  it("treats a model refusal as no answer: lexical tier only, nothing flagged on its own", async () => {
     const result = await scoreCandidates({
       mode: "suggest",
       judge: judgeAnswering(null, true),
@@ -223,8 +248,8 @@ describe("scoreCandidates", () => {
       subject: subject(),
       candidates: [candidate({ title: "Remove client barrels from songtrivia" })],
     });
-    expect(result.pairs[0]).toMatchObject({ verdict: "uncertain", sameOutcomeProbability: null });
-    expect(recommend(result.pairs)).toBe("review_candidates");
+    expect(result.pairs[0]).toMatchObject({ verdict: "lexical_only", sameOutcomeProbability: null });
+    expect(recommend(result.pairs)).toBe("create");
   });
 
   it.each(["no_key", "cap_exceeded", "timeout", "error"] as const)(
