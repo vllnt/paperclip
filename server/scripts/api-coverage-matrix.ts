@@ -464,9 +464,14 @@ function isInScope(source: string, declarationIndex: number, useIndex: number): 
   return !innermost || (innermost[0] < useIndex && innermost[1] > useIndex);
 }
 
+/** Escapes `value` so a `RegExp` built from scanned source text matches it literally. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** Returns the initializer of the nearest in-scope `const|let name = ...;` before `beforeIndex`. */
 function findLocalInitializer(source: string, name: string, beforeIndex: number): string | undefined {
-  const pattern = new RegExp(`\\b(?:const|let)\\s+${name.replace(/\$/g, "\\$")}\\s*(?::[^=;]+)?=\\s*`, "g");
+  const pattern = new RegExp(`\\b(?:const|let)\\s+${escapeRegExp(name)}\\s*(?::[^=;]+)?=\\s*`, "g");
   const match = [...source.slice(0, beforeIndex).matchAll(pattern)]
     .filter((candidate) => isInScope(source, candidate.index ?? 0, beforeIndex))
     .pop();
@@ -529,7 +534,7 @@ export function extractUiCalls(
 ): ClientCall[] {
   const calls: ClientCall[] = [];
   const context = fileContext(source, sharedConstants);
-  for (const match of source.matchAll(/\bapi\.(get|post|postForm|put|putRaw|patch|delete|deleteWithBody)\s*(?:<[^>(]*(?:<[^>]*>[^>(]*)*>)?\s*\(/g)) {
+  for (const match of source.matchAll(/\bapi\.(get|post|postForm|put|putRaw|patch|delete|deleteWithBody)\s*(?:<[^<>(]*(?:<[^<>]*>[^<>(]*)*>)?\s*\(/g)) {
     const openParen = (match.index ?? 0) + match[0].length - 1;
     const [first = ""] = callArgumentsAt(source, openParen);
     const resolved = literalToPath(first, {
@@ -705,7 +710,7 @@ export function findCliRegistrationPrefixes(indexSource: string, indexFile: stri
   return prefixes;
 }
 
-const CLI_CALL_PATTERN = /\bapi\.(get|post|put|putRaw|patch|delete)\s*(?:<[^>(]*(?:<[^>]*>[^>(]*)*>)?\s*\(/g;
+const CLI_CALL_PATTERN = /\bapi\.(get|post|put|putRaw|patch|delete)\s*(?:<[^<>(]*(?:<[^<>]*>[^<>(]*)*>)?\s*\(/g;
 
 /** An API call in CLI source: `api.<method>(path, ...)` or `fetch(buildApiUrl(base, path), init)`. */
 interface CliCallSite {
@@ -797,10 +802,10 @@ function findExpandableBlocks(source: string): ExpandableBlock[] {
     if (!hasApiCall(body)) continue;
     const commandParamMatch = /\.command\(\s*([A-Za-z_$][\w$]*)\s*\)/.exec(body)?.[1];
     const commandParam = commandParamMatch && params.includes(commandParamMatch) ? commandParamMatch : undefined;
-    const pathParams = params.filter((param) => new RegExp(`\\$\\{[^}]*\\b${param}\\b`).test(body));
+    const pathParams = params.filter((param) => new RegExp(`\\$\\{[^}]*\\b${escapeRegExp(param)}\\b`).test(body));
     if (!commandParam && pathParams.length === 0) continue;
     const expansions: ExpandableBlock["expansions"] = [];
-    for (const site of source.matchAll(new RegExp(`(?<!function\\s+)\\b${match[1]}\\s*\\(`, "g"))) {
+    for (const site of source.matchAll(new RegExp(`(?<!function\\s+)\\b${escapeRegExp(match[1])}\\s*\\(`, "g"))) {
       const siteIndex = site.index ?? 0;
       const siteParen = siteIndex + site[0].length - 1;
       if (siteParen === openParen) continue;
@@ -1121,7 +1126,7 @@ const ACCESS_LABELS: Record<ApiKeyAccess, string> = {
   "runtime-token": "no (runtime token)",
 };
 
-const escapeCell = (value: string) => value.replace(/\|/g, "\\|").replace(/\n/g, " ");
+export const escapeCell = (value: string) => value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, " ");
 
 const codeList = (values: Iterable<string>) => [...new Set(values)].map((value) => `\`${value}\``).join(", ");
 

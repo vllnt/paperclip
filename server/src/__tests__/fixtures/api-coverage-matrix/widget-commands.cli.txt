@@ -1,0 +1,27 @@
+
+export function registerWidgetCommands(program: Command): void {
+  const widget = program.command("widget").description("Widgets");
+  widget
+    .command("get")
+    .argument("<id>")
+    .action(async (id: string, opts: Options) => {
+      await ctx.api.get(apiPath`/api/widgets/${id}`);
+    });
+  for (const [name, path] of [
+    ["pause", "pause"],
+    ["heartbeat:invoke", "heartbeat/invoke"],
+  ] as const) {
+    widget.command(name).action(async (id: string) => {
+      await ctx.api.post(`${apiPath`/api/widgets/${id}`}/${path}`, {});
+    });
+  }
+  addIdGet(widget, "runs", "List runs", "widgets", "runs");
+}
+function addIdGet(parent: Command, name: string, description: string, resource: string, suffix?: string): void {
+  parent.command(name).action(async (id: string) => {
+    await ctx.api.get(`/api/${resource}/${encodeURIComponent(id)}${suffix ? `/${suffix}` : ""}`);
+  });
+}
+async function resolveWidget(ref: string) {
+  return ctx.api.get(apiPath`/api/widgets/${ref}`);
+}

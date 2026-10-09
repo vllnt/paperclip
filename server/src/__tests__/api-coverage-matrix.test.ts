@@ -1,9 +1,11 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { buildOpenApiSpec } from "../routes/openapi.js";
 import {
   collectCoverage,
+  escapeCell,
   extractCliCalls,
   extractUiCalls,
   findCliRegistrationPrefixes,
@@ -13,8 +15,13 @@ import {
   renderCoverageMarkdown,
 } from "../../scripts/api-coverage-matrix.js";
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(TEST_DIR, "../../..");
 const sharedConstants = await loadSharedConstants(REPO_ROOT);
+
+/** CLI source the scanner reads, kept as real files so its backticks and `${}` need no escaping. */
+const cliFixture = (name: string): string =>
+  readFileSync(path.join(TEST_DIR, "fixtures/api-coverage-matrix", `${name}.cli.txt`), "utf8");
 
 /**
  * API calls whose path the scanner can't resolve statically, or that dispatch
@@ -78,33 +85,7 @@ export const widgetsApi = {
   });
 
   it("labels CLI calls by their command and expands command-registering helpers and tuple loops", () => {
-    const source = `
-export function registerWidgetCommands(program: Command): void {
-  const widget = program.command("widget").description("Widgets");
-  widget
-    .command("get")
-    .argument("<id>")
-    .action(async (id: string, opts: Options) => {
-      await ctx.api.get(apiPath\`/api/widgets/\${id}\`);
-    });
-  for (const [name, path] of [
-    ["pause", "pause"],
-    ["heartbeat:invoke", "heartbeat/invoke"],
-  ] as const) {
-    widget.command(name).action(async (id: string) => {
-      await ctx.api.post(\`\${apiPath\`/api/widgets/\${id}\`}/\${path}\`, {});
-    });
-  }
-  addIdGet(widget, "runs", "List runs", "widgets", "runs");
-}
-function addIdGet(parent: Command, name: string, description: string, resource: string, suffix?: string): void {
-  parent.command(name).action(async (id: string) => {
-    await ctx.api.get(\`/api/\${resource}/\${encodeURIComponent(id)}\${suffix ? \`/\${suffix}\` : ""}\`);
-  });
-}
-async function resolveWidget(ref: string) {
-  return ctx.api.get(apiPath\`/api/widgets/\${ref}\`);
-}`;
+    const source = cliFixture("widget-commands");
     const calls = extractCliCalls("cli/src/commands/client/widget.ts", source);
     expect(calls.map((call) => [call.label, call.method, call.path])).toEqual([
       ["paperclipai widget get", "GET", "/api/widgets/{}"],
@@ -130,21 +111,7 @@ async function resolveWidget(ref: string) {
 
     const cli = extractCliCalls(
       "cli/src/commands/client/cost.ts",
-      `export function registerCostCommands(program: Command): void {
-  const cost = program.command("cost").description("Costs");
-  for (const [name, path] of [["summary", "costs/summary"], ["by-agent", "costs/by-agent"]] as const) {
-    addCompanyGet(cost, name, "Read costs", path);
-  }
-  cost.command("upload").action(async () => {
-    await fetch(buildApiUrl(ctx.api.apiBase, apiPath\`/api/companies/\${id}/attachments\`), { method: "POST", body });
-    await api.putRaw(apiPath\`/api/transfers/\${id}/parts/\${index}\`, bytes);
-  });
-}
-function addCompanyGet(parent: Command, name: string, description: string, path: string): void {
-  parent.command(name).action(async () => {
-    await ctx.api.get(\`\${apiPath\`/api/companies/\${ctx.companyId}\`}/\${path}\`);
-  });
-}`,
+      cliFixture("cost-commands"),
     );
     expect(cli.map((call) => [call.label, call.method, call.path])).toEqual([
       ["paperclipai cost upload", "POST", "/api/companies/{}/attachments"],
@@ -179,12 +146,31 @@ registerAgentCommands(program);`;
     expect([...prefixes]).toEqual([["cli/src/commands/client/run.ts", ["run"]]]);
     const calls = extractCliCalls(
       "cli/src/commands/client/run.ts",
-      `export function registerRunCommands(command: Command): void {
-  command.command("list").action(async () => { await ctx.api.get(apiPath\`/api/companies/\${id}/heartbeat-runs\`); });
-}`,
+      cliFixture("run-commands"),
       { registrationPrefix: prefixes.get("cli/src/commands/client/run.ts") },
     );
     expect(calls.map((call) => call.label)).toEqual(["paperclipai run list"]);
+  });
+
+  it("expands a command-registering helper whose name contains a dollar sign", () => {
+    const calls = extractCliCalls("cli/src/commands/client/note.ts", cliFixture("dollar-named-helper"));
+    expect(calls.map((call) => [call.label, call.method, call.path])).toEqual([
+      ["paperclipai note list", "GET", "/api/notes"],
+      ["paperclipai note archive", "GET", "/api/notes/archive"],
+    ]);
+  });
+
+  it("scans a long run of unbalanced generics in linear time", () => {
+    const hostile = `api.get${"<<>".repeat(28)}`;
+    const started = performance.now();
+    extractUiCalls("ui/src/api/hostile.ts", hostile);
+    extractCliCalls("cli/src/commands/client/hostile.ts", hostile);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  it("escapes backslashes before pipes and newlines in table cells", () => {
+    expect(escapeCell("a|b\nc")).toBe("a\\|b c");
+    expect(escapeCell("a\\|b")).toBe("a\\\\\\|b");
   });
 
   it("prefers the most literal operation when matching a call path", () => {

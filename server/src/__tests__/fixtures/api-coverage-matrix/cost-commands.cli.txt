@@ -1,0 +1,15 @@
+export function registerCostCommands(program: Command): void {
+  const cost = program.command("cost").description("Costs");
+  for (const [name, path] of [["summary", "costs/summary"], ["by-agent", "costs/by-agent"]] as const) {
+    addCompanyGet(cost, name, "Read costs", path);
+  }
+  cost.command("upload").action(async () => {
+    await fetch(buildApiUrl(ctx.api.apiBase, apiPath`/api/companies/${id}/attachments`), { method: "POST", body });
+    await api.putRaw(apiPath`/api/transfers/${id}/parts/${index}`, bytes);
+  });
+}
+function addCompanyGet(parent: Command, name: string, description: string, path: string): void {
+  parent.command(name).action(async () => {
+    await ctx.api.get(`${apiPath`/api/companies/${ctx.companyId}`}/${path}`);
+  });
+}
