@@ -67,22 +67,27 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
   const origin = "https://github.com/Acme/Site.git";
-  const changes = [{ path: ".github/workflows/ci.yml", mode: "100644", oid: "b".repeat(40) }, { path: ".github/workflows/old.yml", mode: null, oid: null }];
+  const tip = "a".repeat(40), parent = "b".repeat(40), side = "c".repeat(40), oid = "d".repeat(40);
+  const report = {
+    workflowFiles: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }],
+    workflowCommits: [{ sha: tip, parents: [parent, side], changes: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }, { path: ".github/workflows/old.yml", mode: null, oid: null }] }],
+    workflowEntries: [parent, side],
+  };
   const push = (extra: Record<string, unknown> = {}) => ({
     program: "git" as const, args: ["push", "origin", "feature/x"], remote: origin, pushUrls: [origin], currentBranch: "feature/x",
-    refs: { "feature/x": "refs/heads/feature/x" }, shas: ["a".repeat(40)], touchesWorkflows: true, workflowChanges: changes, ...extra,
+    refs: { "feature/x": "refs/heads/feature/x" }, shas: [tip], touchesWorkflows: true, ...report, ...extra,
   });
 
-  it("asks the plugin with the one branch and the changed paths, and with neither when the launcher reported none", async () => {
+  it("asks the plugin with the one branch, the commit, its workflow files and where its history joins, and with none of it when the launcher reported none", async () => {
     const run = await seed();
     const refused = await resolveGitHubOperationCredentials(db, run, push());
     expect(refused).toMatchObject({ status: "unavailable" });
     expect(asked).toHaveLength(1);
     expect(asked[0]).toMatchObject({
       companyId: run.companyId, repository: "acme/site", access: "write", action: "push", privileged: ["editWorkflows"],
-      workflowPush: { branch: "feature/x", changes },
+      workflowPush: { branch: "feature/x", tip, files: report.workflowFiles, commits: report.workflowCommits, entries: report.workflowEntries },
     });
-    await resolveGitHubOperationCredentials(db, run, push({ workflowChanges: undefined }));
+    await resolveGitHubOperationCredentials(db, run, push({ workflowFiles: undefined }));
     expect(asked).toHaveLength(2);
     expect(asked[1]).toMatchObject({ privileged: ["editWorkflows"] });
     expect(asked[1]).not.toHaveProperty("workflowPush");

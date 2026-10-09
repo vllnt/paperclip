@@ -368,27 +368,34 @@ describe("security review round 5 (attack regressions)", () => {
 
   describe("workflow changes of a push", () => {
     const origin = "https://github.com/Acme/Site.git";
-    const sha = "a".repeat(40);
-    const changes = [{ path: ".github/workflows/ci.yml", mode: "100644", oid: "b".repeat(40) }, { path: ".github/workflows/old.yml", mode: null, oid: null }];
+    const sha = "a".repeat(40), parent = "b".repeat(40), side = "c".repeat(40);
+    const oid = "d".repeat(40);
+    const workflowFiles = [{ path: ".github/workflows/ci.yml", mode: "100644", oid }];
+    const workflowCommits = [{ sha, parents: [parent, side], changes: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }, { path: ".github/workflows/old.yml", mode: null, oid: null }] }];
+    const workflowEntries = [parent, side];
+    const report = { workflowFiles, workflowCommits, workflowEntries };
     const push = (args: string[], extra: Record<string, unknown> = {}) => classifyGitHubOperation({
       program: "git", args, remote: origin, pushUrls: [origin], currentBranch: "feature/x", refs: { "feature/x": "refs/heads/feature/x" },
-      shas: [sha], touchesWorkflows: true, workflowChanges: changes, ...extra,
+      shas: [sha], touchesWorkflows: true, ...report, ...extra,
     });
+    const expected = { branch: "feature/x", tip: sha, files: workflowFiles, commits: workflowCommits, entries: workflowEntries };
 
-    it("keeps editWorkflows on the push and hands the plugin its one branch and the changed paths", () => {
+    it("keeps editWorkflows on the push and hands the plugin its one branch, the commits and the files", () => {
       for (const args of [["push", "origin", "feature/x"], ["push"], ["push", "origin", "HEAD"], ["push", "-u", "origin", "HEAD:refs/heads/feature/x"], ["push", "origin", "refs/heads/feature/x"],
         ["push", "--force-with-lease", "origin", "+feature/x"], ["push", "origin", "heads/feature/x"]]) {
         const classified = push(args);
-        expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: { branch: "feature/x", changes } });
+        expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: expected });
         expect(classified.denied, args.join(" ")).toBeUndefined();
       }
       // A push to another branch name is that branch.
-      expect(push(["push", "origin", "HEAD:refs/heads/release/1.2"])).toMatchObject({ workflowPush: { branch: "release/1.2", changes } });
+      expect(push(["push", "origin", "HEAD:refs/heads/release/1.2"])).toMatchObject({ workflowPush: { ...expected, branch: "release/1.2" } });
+      // A push that only moves the branch to an existing commit has no new commit to list.
+      expect(push(["push", "--force", "origin", "feature/x"], { workflowCommits: [], workflowEntries: [sha] })).toMatchObject({ workflowPush: { ...expected, commits: [], entries: [sha] } });
     });
 
-    it("offers nothing the plugin could compare when the push is not exactly one commit to one named branch", () => {
+    it("offers nothing the plugin could check when the push is not exactly one commit to one named branch, or the report is partial", () => {
       const cases: Array<[string, ReturnType<typeof push>]> = [
-        ["two commits", push(["push", "origin", "feature/x"], { shas: [sha, "c".repeat(40)] })],
+        ["two commits", push(["push", "origin", "feature/x"], { shas: [sha, "e".repeat(40)] })],
         ["two branches", push(["push", "origin", "feature/x", "other"], { refs: { "feature/x": "refs/heads/feature/x", other: "refs/heads/other" } })],
         ["a tag", push(["push", "origin", "HEAD:refs/tags/v1"])],
         ["every branch", push(["push", "--all", "origin"])],
@@ -396,13 +403,15 @@ describe("security review round 5 (attack regressions)", () => {
         ["config that can push more", push(["push"], { implicitPush: true })],
         ["a deletion", push(["push", "origin", "--delete", "feature/x"])],
         ["a detached HEAD (no branch name)", push(["push", "origin", "HEAD"], { currentBranch: null })],
-        ["no reported changes", push(["push", "origin", "feature/x"], { workflowChanges: undefined })],
-        ["an empty list", push(["push", "origin", "feature/x"], { workflowChanges: [] })],
+        ["no files", push(["push", "origin", "feature/x"], { workflowFiles: undefined })],
+        ["no commits", push(["push", "origin", "feature/x"], { workflowCommits: undefined })],
+        ["no entries", push(["push", "origin", "feature/x"], { workflowEntries: undefined })],
+        ["an empty list of entries", push(["push", "origin", "feature/x"], { workflowEntries: [] })],
         ["a push the launcher says has no workflow changes", push(["push", "origin", "feature/x"], { touchesWorkflows: false })],
       ];
       for (const [label, classified] of cases) expect(classified, label).not.toHaveProperty("workflowPush");
-      // Without the paths the toggle alone decides, as before.
-      expect(push(["push", "origin", "feature/x"], { workflowChanges: undefined })).toMatchObject({ privileged: ["editWorkflows"] });
+      // Without the report the toggle alone decides, as before.
+      expect(push(["push", "origin", "feature/x"], { workflowFiles: undefined })).toMatchObject({ privileged: ["editWorkflows"] });
     });
 
     it("still refuses what the toggles never allow, whatever the push reports", () => {
@@ -412,24 +421,39 @@ describe("security review round 5 (attack regressions)", () => {
       expect(push(["push", "origin", "feature/x"], { urlRewrites: true }).denied).toMatch(/url\.\*\.insteadOf/);
     });
 
-    it("accepts the reported changes only in the launcher's exact shape", () => {
+    it("accepts the report only in the launcher's exact shape and within its bounds", () => {
       const operation = { program: "git", args: ["push", "origin", "feature/x"], remote: origin, shas: [sha], touchesWorkflows: true };
-      expect(parseGitHubOperation({ operation: { ...operation, workflowChanges: changes } })).toMatchObject({ workflowChanges: changes });
-      for (const bad of [[{ path: ".github/workflows/ci.yml", mode: "100644" }], [{ path: ".github/workflows/ci.yml", mode: "644", oid: "b".repeat(40) }],
-        [{ path: ".github/workflows/ci.yml", mode: "100644", oid: "xyz" }], [{ path: 1, mode: null, oid: null }], "x", Array.from({ length: 101 }, () => changes[0]),
-        [{ path: `.github/workflows/${"x".repeat(300)}.yml`, mode: null, oid: null }]]) {
-        expect(readGitHubOperation({ operation: { ...operation, workflowChanges: bad } }), JSON.stringify(bad).slice(0, 60)).toBe("unreadable");
+      expect(parseGitHubOperation({ operation: { ...operation, ...report } })).toMatchObject(report);
+      const file = workflowFiles[0]!, commit = workflowCommits[0]!;
+      for (const [label, bad] of [
+        ["a file without a blob", { workflowFiles: [{ path: file.path, mode: "100644" }] }],
+        ["a gone file among the files", { workflowFiles: [{ path: file.path, mode: null, oid: null }] }],
+        ["a short mode", { workflowFiles: [{ path: file.path, mode: "644", oid }] }],
+        ["a bad blob", { workflowFiles: [{ path: file.path, mode: "100644", oid: "xyz" }] }],
+        ["a long path", { workflowFiles: [{ path: `.github/workflows/${"x".repeat(300)}.yml`, mode: "100644", oid }] }],
+        ["more than 100 files", { workflowFiles: Array.from({ length: 101 }, () => file) }],
+        ["a commit without changes", { workflowCommits: [{ ...commit, changes: [] }] }],
+        ["a commit with a bad parent", { workflowCommits: [{ ...commit, parents: ["xyz"] }] }],
+        ["a commit with too many parents", { workflowCommits: [{ ...commit, parents: Array.from({ length: 17 }, () => parent) }] }],
+        ["a commit that is not a hash", { workflowCommits: [{ ...commit, sha: "xyz" }] }],
+        ["more than 100 commits", { workflowCommits: Array.from({ length: 101 }, () => commit) }],
+        ["more than 400 changes", { workflowCommits: Array.from({ length: 5 }, () => ({ ...commit, changes: Array.from({ length: 100 }, () => commit.changes[0]!) })) }],
+        ["more than 8 entries", { workflowEntries: Array.from({ length: 9 }, () => parent) }],
+        ["an entry that is not a hash", { workflowEntries: ["xyz"] }],
+        ["commits that are not a list", { workflowCommits: "x" }],
+      ] as const) {
+        expect(readGitHubOperation({ operation: { ...operation, ...report, ...bad } }), label).toBe("unreadable");
       }
     });
 
-    it("sends the plugin the branch and paths with the other write-identity parameters", async () => {
+    it("sends the plugin the branch, the commit, the files and the entries with the other write-identity parameters", async () => {
       const calls: Array<Record<string, any>> = [];
       registerGitHubWriteIdentityWorkers({ call: async (_plugin: string, _method: string, input: any) => { calls.push(input.params); return { identity: "user", unavailable: "stop here" }; } } as any);
       try {
         const record = { pluginId: "plugin-github", ready: true, policy: "invalid", manifest: { projectRepositories: { writeIdentityAction: "repository-write-identity" } } } as any;
         await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: push(["push", "origin", "feature/x"]) }, record);
-        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: push(["push", "origin", "feature/x"], { workflowChanges: undefined }) }, record);
-        expect(calls[0]).toMatchObject({ companyId: "company-1", repository: "acme/site", privileged: ["editWorkflows"], workflowPush: { branch: "feature/x", changes } });
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: push(["push", "origin", "feature/x"], { workflowFiles: undefined }) }, record);
+        expect(calls[0]).toMatchObject({ companyId: "company-1", repository: "acme/site", privileged: ["editWorkflows"], workflowPush: expected });
         expect(calls[1]).not.toHaveProperty("workflowPush");
       } finally { registerGitHubWriteIdentityWorkers(null); }
     });

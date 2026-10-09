@@ -118,12 +118,89 @@ function foreignRewrites(env, globalArgs) {
     return !match || match[1] !== 'https://github.com/' || !OWN_REWRITES.includes(match[2]);
   });
 }
-// What a push sends: the checked-out branch, full names of bare refspec names,
-// the commits, and whether new commits change workflow files (which ones, when few).
+// Workflow files in a push. For a push of one commit that changes them the broker is told what it needs to check
+// that history: every workflow file at the pushed commit, each new commit that changes workflow files (with its
+// parents and those files), and the parents where new history joins commits that already exist. More than the
+// broker reads, or anything git cannot tell, is not reported (the report stays readable and the toggle decides).
 const WORKFLOWS = '.github/workflows';
-// More paths, or longer ones, than the broker reads: none are reported (the report stays readable and the toggle decides).
-const MAX_WORKFLOW_CHANGES = 100;
-const MAX_WORKFLOW_PATH = 300;
+const MAX_WORKFLOW_FILES = 100, MAX_WORKFLOW_COMMITS = 100, MAX_WORKFLOW_ENTRIES = 8, MAX_WORKFLOW_CHANGES = 400, MAX_WORKFLOW_PARENTS = 16, MAX_WORKFLOW_PATH = 300;
+const isWorkflowPath = file => file === WORKFLOWS || file.startsWith(WORKFLOWS + '/');
+const byText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+// Every file under .github/workflows at a commit, by path (mode and blob); null when git could not tell.
+function workflowTree(env, globalArgs, commit) {
+  const listing = gitOutput(env, globalArgs, ['ls-tree', '-z', '-r', '--full-tree', commit, '--', WORKFLOWS]);
+  if (listing === null) return null;
+  const files = new Map();
+  for (const entry of listing.split('\0')) {
+    const parsed = /^(\d{6}) \w+ ([0-9a-f]{40,64})\t([\s\S]+)$/.exec(entry);
+    if (parsed) files.set(parsed[3], { mode: parsed[1], oid: parsed[2] });
+  }
+  return files;
+}
+// The workflow paths a commit changes against its first parent, as the commit has them (mode and blob; null when
+// gone). Renames are not paired, so a moved workflow shows its old name as gone. Null when git could not tell.
+function workflowChangesOf(env, globalArgs, commit, parent) {
+  const raw = gitOutput(env, globalArgs, ['diff-tree', '-z', '-r', '--no-renames', '--raw', '--abbrev=64', '--no-commit-id', ...(parent ? [parent, commit] : ['--root', commit]), '--', ':(top)' + WORKFLOWS]);
+  if (raw === null) return null;
+  const tokens = raw.split('\0'), changes = [];
+  for (let at = 0; at < tokens.length; at++) {
+    if (!tokens[at].startsWith(':')) continue;
+    const [, mode, , oid, status] = tokens[at].slice(1).split(' ');
+    const gone = status === 'D' || /^0+$/.test(mode);
+    changes.push({ path: tokens[at + 1], mode: gone ? null : mode, oid: gone ? null : oid });
+    at += 1;
+  }
+  return changes.sort((a, b) => byText(a.path, b.path));
+}
+// The branch a push of one commit updates, when its refspec spells it plainly; null for tags, patterns and the rest.
+function pushedBranch(specs, current, refs) {
+  if (specs.length > 1) return null;
+  let name = current;
+  if (specs.length) {
+    const spec = specs[0], colon = spec.indexOf(':');
+    name = colon < 0 ? spec : spec.slice(colon + 1);
+    if (name === 'HEAD' || name === '@') name = current;
+    else if (refs[name]) name = refs[name].startsWith('refs/heads/') ? refs[name].slice(11) : '';
+    else if (name.startsWith('refs/heads/')) name = name.slice(11);
+    else if (name.startsWith('heads/')) name = name.slice(6);
+    else if (name.startsWith('refs/') || /[*?[]/.test(name)) name = '';
+  }
+  return name && !name.includes('..') && !/[\x00-\x20\x7f~^:\\]/.test(name) ? name : null;
+}
+// The pushed commit's workflow files, the new commits that change them and where new history joins old; null when too much to report.
+function workflowHistory(env, globalArgs, tip, tipFiles) {
+  const files = [...tipFiles].map(([file, entry]) => ({ path: file, ...entry })).sort((a, b) => byText(a.path, b.path));
+  if (files.length > MAX_WORKFLOW_FILES || files.some(file => file.path.length > MAX_WORKFLOW_PATH)) return null;
+  const listed = gitOutput(env, globalArgs, ['rev-list', '--parents', tip, '--not', '--remotes']);
+  if (listed === null) return null;
+  const fresh = new Map();
+  for (const line of listed.split('\n')) {
+    const parts = line.split(' ').filter(Boolean);
+    if (parts.length) fresh.set(parts[0], parts.slice(1));
+  }
+  if (fresh.size > MAX_WORKFLOW_COMMITS) return null;
+  const commits = [], entries = new Set();
+  let total = 0;
+  for (const [sha, parents] of fresh) {
+    if (parents.length > MAX_WORKFLOW_PARENTS) return null;
+    for (const parent of parents) if (!fresh.has(parent)) entries.add(parent);
+    const changes = workflowChangesOf(env, globalArgs, sha, parents[0]);
+    if (changes === null) return null;
+    if (!changes.length) continue;
+    total += changes.length;
+    if (changes.length > MAX_WORKFLOW_FILES || total > MAX_WORKFLOW_CHANGES || changes.some(change => change.path.length > MAX_WORKFLOW_PATH)) return null;
+    commits.push({ sha, parents, changes });
+  }
+  // Nothing new: the pushed commit is where the push joins what exists.
+  if (!fresh.size) entries.add(tip);
+  if (entries.size > MAX_WORKFLOW_ENTRIES) return null;
+  return { workflowFiles: files, workflowCommits: commits, workflowEntries: [...entries].sort() };
+}
+function sameWorkflowFiles(a, b) {
+  return a.size === b.size && [...a].every(([file, entry]) => b.get(file) && b.get(file).mode === entry.mode && b.get(file).oid === entry.oid);
+}
+// What a push sends: the checked-out branch, full names of bare refspec names,
+// the commits, and whether the push changes workflow files.
 function pushReport(env, globalArgs, pushArgs) {
   const { positional, repoOption, deleting } = gitNetworkArgs('push', pushArgs);
   const branch = gitOutput(env, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
@@ -168,32 +245,26 @@ function pushReport(env, globalArgs, pushArgs) {
   const shas = commits.map(source => (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', source + '^{commit}']) || '').trim())
     .filter(sha => /^[0-9a-f]{40,64}$/.test(sha)).slice(0, 64);
   let touchesWorkflows = commits.length ? null : false;
-  let workflowChanges;
+  let workflow = null;
   if (commits.length && shas.length === commits.length) {
     // NUL-separated names (never quoted), merge commits' own changes against their first parent, and no rename pairing:
     // a workflow renamed or moved out of the directory shows as a deletion there.
     const files = gitOutput(env, globalArgs, ['log', '--format=', '--name-only', '-z', '--no-renames', '--diff-merges=first-parent', ...shas, '--not', '--remotes']);
     if (files !== null) {
-      const paths = [...new Set(files.split('\0').filter(file => file === WORKFLOWS || file.startsWith(WORKFLOWS + '/')))].sort();
-      touchesWorkflows = paths.length > 0;
-      // One pushed commit: what each of those paths is at its tip (mode and blob; null when absent), for the broker to compare with the base branch.
-      if (paths.length && paths.length <= MAX_WORKFLOW_CHANGES && paths.every(file => file.length <= MAX_WORKFLOW_PATH) && shas.length === 1) {
-        const listing = gitOutput(env, globalArgs, ['ls-tree', '-z', '-r', '--full-tree', shas[0], '--', WORKFLOWS]);
-        if (listing !== null) {
-          const entries = new Map();
-          for (const entry of listing.split('\0')) {
-            const parsed = /^(\d{6}) \w+ ([0-9a-f]{40,64})\t([\s\S]+)$/.exec(entry);
-            if (parsed) entries.set(parsed[3], { mode: parsed[1], oid: parsed[2] });
-          }
-          // A path the listing lacks is reported as gone, so make sure the tip has nothing there (not even a directory).
-          const gone = paths.filter(file => !entries.has(file));
-          const there = gone.length ? gitOutput(env, globalArgs, ['ls-tree', '-z', '--full-tree', shas[0], '--', ...gone]) : '';
-          if (there === '') workflowChanges = paths.map(file => ({ path: file, ...(entries.get(file) || { mode: null, oid: null }) }));
-        }
+      touchesWorkflows = files.split('\0').some(isWorkflowPath);
+      if (shas.length === 1) {
+        const tipFiles = workflowTree(env, globalArgs, shas[0]);
+        // A push that only moves a branch to a commit the remote already has (nothing is new) still changes the branch's
+        // workflow files when they differ from the branch it replaces, as this checkout last saw it.
+        const pushed = implicitPush ? null : pushedBranch(specs, current, refs);
+        const seen = pushed && configured.length ? (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', 'refs/remotes/' + target + '/' + pushed + '^{commit}']) || '').trim() : '';
+        const seenFiles = /^[0-9a-f]{40,64}$/.test(seen) ? workflowTree(env, globalArgs, seen) : null;
+        if (tipFiles && seenFiles && !sameWorkflowFiles(tipFiles, seenFiles)) touchesWorkflows = true;
+        if (touchesWorkflows && tipFiles) workflow = workflowHistory(env, globalArgs, shas[0], tipFiles);
       }
     }
   }
-  return { currentBranch: current || null, refs, shas, touchesWorkflows, ...(workflowChanges ? { workflowChanges } : {}), pushUrls, ...(implicitPush ? { implicitPush: true } : {}), ...(followTags || unknown ? { followTags: true } : {}),
+  return { currentBranch: current || null, refs, shas, touchesWorkflows, ...(workflow || {}), pushUrls, ...(implicitPush ? { implicitPush: true } : {}), ...(followTags || unknown ? { followTags: true } : {}),
     ...(recursion === 'no' || recursion === 'check' ? {} : { recurseSubmodules: recursion === null ? 'unknown' : recursion.slice(0, 100) }), ...(cut ? { truncated: true } : {}) };
 }
 function operation(env) {

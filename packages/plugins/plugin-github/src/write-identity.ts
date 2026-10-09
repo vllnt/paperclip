@@ -13,6 +13,7 @@ import {
   type GitHubPrivilegedAction,
   type GitHubSignDecision,
   type GitHubWorkflowChange,
+  type GitHubWorkflowCommit,
   type GitHubWorkflowPush,
   type GitHubWriteAction,
   type GitHubWriteIdentityDecision,
@@ -45,36 +46,57 @@ const MAX_PULL_REQUEST_FILE_PAGES = 30;
 const MAX_PAGES = 10;
 
 const WORKFLOWS = ".github/workflows";
-/** The most workflow paths one push reports, and the longest path (the launcher reports none beyond these). */
-const MAX_WORKFLOW_CHANGES = 100;
-const MAX_WORKFLOW_PATH = 300;
+/** The most the launcher reports of a push's workflow history (it reports none of it beyond these). */
+const MAX_WORKFLOW_FILES = 100, MAX_WORKFLOW_COMMITS = 100, MAX_WORKFLOW_ENTRIES = 8, MAX_WORKFLOW_CHANGES = 400, MAX_WORKFLOW_PARENTS = 16, MAX_WORKFLOW_PATH = 300;
 /** A git object ID (SHA-1 or SHA-256 repositories). */
 const GIT_OID = /^[0-9a-f]{40,64}$/;
 /** The modes of regular files in git. Symlinks (120000) and submodules (160000) are never accepted as the base branch's own. */
 const REGULAR_FILE_MODES = ["100644", "100755"];
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 1)}…` : text;
+const short = (sha: string) => sha.slice(0, 8);
 /** The paths for a refusal message: a few, shortened, and how many more there are. */
 const listPaths = (paths: string[]) => paths.slice(0, 3).map(path => clip(path, 70)).join(", ") + (paths.length > 3 ? `, and ${paths.length - 3} more` : "");
+const workflowPath = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_WORKFLOW_PATH && (value === WORKFLOWS || value.startsWith(`${WORKFLOWS}/`));
+const gitOid = (value: unknown): value is string => typeof value === "string" && GIT_OID.test(value);
 
 /**
- * A push's workflow paths in exactly the shape the server forwards from the
+ * A push's workflow history in exactly the shape the server forwards from the
  * launcher; anything else is undefined, so the `editWorkflows` toggle decides.
  */
 function parseWorkflowPush(value: unknown): GitHubWorkflowPush | undefined {
-  if (!value || typeof value !== "object" || !("branch" in value) || !("changes" in value)) return undefined;
-  const { branch, changes } = value;
-  if (typeof branch !== "string" || !branch || branch.length > 250 || /[\x00-\x20\x7f]/.test(branch)) return undefined;
-  if (!Array.isArray(changes) || !changes.length || changes.length > MAX_WORKFLOW_CHANGES) return undefined;
-  const parsed: GitHubWorkflowChange[] = [];
-  for (const change of changes) {
-    if (!change || typeof change !== "object" || !("path" in change) || !("mode" in change) || !("oid" in change)) return undefined;
-    const { path, mode, oid } = change;
-    if (typeof path !== "string" || path.length > MAX_WORKFLOW_PATH || !(path === WORKFLOWS || path.startsWith(`${WORKFLOWS}/`))) return undefined;
-    if (mode === null && oid === null) parsed.push({ path, mode, oid });
-    else if (typeof mode === "string" && /^\d{6}$/.test(mode) && typeof oid === "string" && GIT_OID.test(oid)) parsed.push({ path, mode, oid });
-    else return undefined;
+  if (!value || typeof value !== "object" || !("branch" in value) || !("tip" in value) || !("files" in value) || !("commits" in value) || !("entries" in value)) return undefined;
+  const { branch, tip, files, commits, entries } = value;
+  if (typeof branch !== "string" || !branch || branch.length > 250 || /[\x00-\x20\x7f]/.test(branch) || !gitOid(tip)) return undefined;
+  if (!Array.isArray(files) || files.length > MAX_WORKFLOW_FILES || !Array.isArray(commits) || commits.length > MAX_WORKFLOW_COMMITS) return undefined;
+  if (!Array.isArray(entries) || !entries.length || entries.length > MAX_WORKFLOW_ENTRIES || !entries.every(gitOid)) return undefined;
+  const parsedFiles: GitHubWorkflowPush["files"] = [];
+  for (const file of files) {
+    if (!file || typeof file !== "object" || !("path" in file) || !("mode" in file) || !("oid" in file)) return undefined;
+    const { path, mode, oid } = file;
+    if (!workflowPath(path) || typeof mode !== "string" || !/^\d{6}$/.test(mode) || !gitOid(oid)) return undefined;
+    parsedFiles.push({ path, mode, oid });
   }
-  return { branch, changes: parsed };
+  const parsedCommits: GitHubWorkflowCommit[] = [];
+  let total = 0;
+  for (const commit of commits) {
+    if (!commit || typeof commit !== "object" || !("sha" in commit) || !("parents" in commit) || !("changes" in commit)) return undefined;
+    const { sha, parents, changes } = commit;
+    if (!gitOid(sha) || !Array.isArray(parents) || parents.length > MAX_WORKFLOW_PARENTS || !parents.every(gitOid)) return undefined;
+    if (!Array.isArray(changes) || !changes.length || changes.length > MAX_WORKFLOW_FILES) return undefined;
+    total += changes.length;
+    if (total > MAX_WORKFLOW_CHANGES) return undefined;
+    const parsedChanges: GitHubWorkflowChange[] = [];
+    for (const change of changes) {
+      if (!change || typeof change !== "object" || !("path" in change) || !("mode" in change) || !("oid" in change)) return undefined;
+      const { path, mode, oid } = change;
+      if (!workflowPath(path)) return undefined;
+      if (mode === null && oid === null) parsedChanges.push({ path, mode, oid });
+      else if (typeof mode === "string" && /^\d{6}$/.test(mode) && gitOid(oid)) parsedChanges.push({ path, mode, oid });
+      else return undefined;
+    }
+    parsedCommits.push({ sha, parents, changes: parsedChanges });
+  }
+  return { branch, tip, files: parsedFiles, commits: parsedCommits, entries };
 }
 
 /** Reads every page of a paginated GitHub list, or throws when it has more than {@link MAX_PAGES} pages. */
@@ -541,24 +563,30 @@ export function registerWriteIdentity(
   }
 
   /**
-   * A push of workflow changes goes ahead without `editWorkflows` only when every
-   * path it changes is, at the pushed tip, what the base branch has right now
-   * (same git mode and blob), or gone from both: workflow changes arrive by
-   * merging the base branch, never by an agent's own edit. The base is the base
-   * of the open pull request from the pushed branch, else the repository's
-   * default branch, read now with the App's read-only token. A base that cannot
-   * be told or read in full, and any path that is not a regular file, refuse.
+   * A push of workflow changes goes ahead without `editWorkflows` only when all
+   * the history it adds is the base branch's own, checked against GitHub now
+   * (read with the App's read-only token) and not against the checkout alone:
+   * - every new commit that changes workflow files is a merge of exactly two
+   *   parents whose changed files are what the base branch has, and whose second
+   *   parent is part of the base branch (a clean tip cannot hide an earlier edit);
+   * - every parent where the new history joins existing history is on the pushed
+   *   branch or on the base branch on GitHub (a made-up remote ref hides nothing);
+   * - the pushed commit's workflow files, where they differ from the branch it
+   *   replaces on GitHub, are the base branch's (a move to an older commit is a change).
+   * The base is the base of the open pull request from the pushed branch, else
+   * the default branch, and counts only when it is the default branch or
+   * protected. Anything not read in full, and any path that is not a regular
+   * file, refuses.
    */
   async function workflowBaseEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, push: GitHubWorkflowPush) {
-    const evidence: Record<string, unknown> = { branch: push.branch, paths: push.changes.map(change => change.path) };
+    const evidence: Record<string, unknown> = { branch: push.branch, tip: push.tip };
     const off = "editWorkflows is turned off for this company";
-    const irregular = push.changes.filter(change => change.mode !== null && !REGULAR_FILE_MODES.includes(change.mode)).map(change => change.path);
+    const irregular = push.commits.flatMap(commit => commit.changes).filter(change => change.mode !== null && !REGULAR_FILE_MODES.includes(change.mode)).map(change => change.path);
     if (irregular.length) throw new Denied(`This push changes workflow paths that are not regular files, symlinks or submodules (${listPaths(irregular)}); ${off}.`, { ...evidence, offending: irregular });
     const token = await readToken(companyId, current, repository);
     let base: string | null = null;
     let defaultBranch: string | null = null;
     const readDefaultBranch = async () => String((await github.request<any>(`/repos/${repository}`, token)).data?.default_branch ?? "");
-    const files = new Map<string, { mode: string; oid: string }>();
     try {
       // The owner as GitHub spells it, for the head filter.
       const owner = ((await repositoryFor(companyId, repository))?.fullName ?? repository).split("/")[0];
@@ -572,15 +600,14 @@ export function registerWriteIdentity(
       if (bases.length) base = bases[0]!;
       else { defaultBranch = await readDefaultBranch(); base = defaultBranch; }
       if (!base) throw new Error("GitHub did not name the base branch.");
-      const branch = (await github.request<any>(`/repos/${repository}/branches/${encodeURIComponent(base)}`, token)).data;
-      const commit = String(branch?.commit?.sha ?? ""), root = String(branch?.commit?.commit?.tree?.sha ?? "");
-      if (!FULL_SHA.test(commit) || !FULL_SHA.test(root)) throw new Error("GitHub did not report the base branch's commit.");
-      // Whoever opens the pull request chooses its base, so only the default branch or a protected branch counts as reviewed.
-      if (branch?.protected !== true && base !== (defaultBranch ??= await readDefaultBranch())) {
-        throw new Denied(`${clip(base, 40)} is neither the default branch nor protected, so Paperclip does not take its workflow files as reviewed; ${off}.`, { ...evidence, base });
-      }
-      evidence.base = base;
-      evidence.baseSha = commit;
+      const baseName = clip(base, 40);
+      // A branch as GitHub has it: its commit, tree and protection.
+      const readBranch = async (name: string) => {
+        const branch = (await github.request<any>(`/repos/${repository}/branches/${encodeURIComponent(name)}`, token)).data;
+        const commit = String(branch?.commit?.sha ?? ""), root = String(branch?.commit?.commit?.tree?.sha ?? "");
+        if (!FULL_SHA.test(commit) || !FULL_SHA.test(root)) throw new Error("GitHub did not report the branch's commit.");
+        return { commit, root, protected: branch?.protected === true };
+      };
       // A tree GitHub cut short does not show every file.
       const tree = async (sha: string, recursive = false) => {
         const { data } = await github.request<any>(`/repos/${repository}/git/trees/${sha}${recursive ? "?recursive=1" : ""}`, token);
@@ -588,29 +615,98 @@ export function registerWriteIdentity(
         const entries: any[] = data.tree;
         return entries;
       };
-      const dotGithub = (await tree(root)).find(entry => entry?.path === ".github");
-      if (dotGithub) {
-        if (dotGithub.type !== "tree" || !GIT_OID.test(String(dotGithub.sha))) throw new Error("The base branch's .github is not a directory.");
-        const workflows = (await tree(String(dotGithub.sha))).find(entry => entry?.path === "workflows");
-        if (workflows && workflows.type !== "tree") files.set(WORKFLOWS, { mode: String(workflows.mode), oid: String(workflows.sha) });
-        else if (workflows) {
-          for (const entry of await tree(String(workflows.sha), true)) {
-            if (entry?.type === "blob" || entry?.type === "commit") files.set(`${WORKFLOWS}/${String(entry.path)}`, { mode: String(entry.mode), oid: String(entry.sha) });
+      // Every file under .github/workflows of a commit's tree: path -> mode and blob.
+      const filesOf = async (root: string) => {
+        const files = new Map<string, { mode: string; oid: string }>();
+        const dotGithub = (await tree(root)).find(entry => entry?.path === ".github");
+        if (dotGithub) {
+          if (dotGithub.type !== "tree" || !GIT_OID.test(String(dotGithub.sha))) throw new Error("A .github is not a directory.");
+          const workflows = (await tree(String(dotGithub.sha))).find(entry => entry?.path === "workflows");
+          if (workflows && workflows.type !== "tree") files.set(WORKFLOWS, { mode: String(workflows.mode), oid: String(workflows.sha) });
+          else if (workflows) {
+            for (const entry of await tree(String(workflows.sha), true)) {
+              if (entry?.type === "blob" || entry?.type === "commit") files.set(`${WORKFLOWS}/${String(entry.path)}`, { mode: String(entry.mode), oid: String(entry.sha) });
+            }
           }
         }
+        return files;
+      };
+      const baseBranch = await readBranch(base);
+      // Whoever opens the pull request chooses its base, so only the default branch or a protected branch counts as reviewed.
+      if (!baseBranch.protected && base !== (defaultBranch ??= await readDefaultBranch())) {
+        throw new Denied(`${baseName} is neither the default branch nor protected, so Paperclip does not take its workflow files as reviewed; ${off}.`, { ...evidence, base });
       }
+      const baseFiles = await filesOf(baseBranch.root);
+      evidence.base = base;
+      evidence.baseSha = baseBranch.commit;
+      // The pushed branch as GitHub has it now; a branch GitHub does not have yet is a new one.
+      let destination: Awaited<ReturnType<typeof readBranch>> | null = null;
+      try { destination = await readBranch(push.branch); } catch (error) {
+        if (!(error instanceof GitHubError && error.status === 404)) throw error;
+      }
+      const destinationFiles = destination ? await filesOf(destination.root) : null;
+      evidence.destinationSha = destination?.commit ?? null;
+
+      const same = (a: { mode: string | null; oid: string | null } | undefined, b: { mode: string | null; oid: string | null } | undefined) => (a?.mode ?? null) === (b?.mode ?? null) && (a?.oid ?? null) === (b?.oid ?? null);
+      // Whether a commit is the tip of a branch on GitHub or part of its history (one compare, remembered).
+      const within = new Map<string, Promise<boolean>>();
+      const onBranch = (sha: string, tipSha: string | null): Promise<boolean> => {
+        if (!tipSha) return Promise.resolve(false);
+        if (sha === tipSha) return Promise.resolve(true);
+        const key = `${sha}...${tipSha}`;
+        if (!within.has(key)) {
+          within.set(key, github.request<any>(`/repos/${repository}/compare/${key}?per_page=1`, token).then(
+            response => response.data?.status === "ahead" || response.data?.status === "identical",
+            error => { if (error instanceof GitHubError && (error.status === 404 || error.status === 422)) return false; throw error; }));
+        }
+        return within.get(key)!;
+      };
+
+      // Every new commit that changes workflow files must be a merge of the base branch.
+      const offendingCommits: string[] = [];
+      const offending = new Set<string>();
+      let problem: string | null = null;
+      for (const commit of push.commits) {
+        const paths = commit.changes.map(change => change.path);
+        let found: string | null = null;
+        if (commit.parents.length > 2) found = `Commit ${short(commit.sha)} merges more than two parents and changes workflow files (${listPaths(paths)}); ${off}.`;
+        else if (commit.parents.length < 2) {
+          found = `Commit ${short(commit.sha)} changes workflow files (${listPaths(paths)}) and is not a merge of ${baseName}; ${off}. Workflow changes may only arrive by merging ${baseName}.`;
+        } else {
+          const differing = commit.changes.filter(change => !same(change, baseFiles.get(change.path))).map(change => change.path);
+          if (differing.length) {
+            for (const path of differing) offending.add(path);
+            found = `Commit ${short(commit.sha)} changes workflow files that differ from ${baseName} (${listPaths(differing)}); ${off}. Workflow changes may only arrive by merging ${baseName}.`;
+          } else if (!await onBranch(commit.parents[1]!, baseBranch.commit)) {
+            found = `Commit ${short(commit.sha)} changes workflow files and merges ${short(commit.parents[1]!)}, which is not part of ${baseName}; ${off}.`;
+          }
+        }
+        if (found) { offendingCommits.push(commit.sha); problem ??= found; if (commit.parents.length !== 2) for (const path of paths) offending.add(path); }
+      }
+      if (problem) throw new Denied(problem, { ...evidence, offendingCommits, offending: [...offending].sort() });
+
+      // Where the new history joins existing history, GitHub must have it on the branch or on the base.
+      for (const entry of push.entries) {
+        if (await onBranch(entry, baseBranch.commit) || await onBranch(entry, destination?.commit ?? null)) continue;
+        const where = destination ? `neither on ${clip(push.branch, 60)} nor on ${baseName}` : `not part of ${baseName}`;
+        throw new Denied(`This push builds on commit ${short(entry)}, which is ${where} on GitHub, so Paperclip cannot tell what its workflow files are; ${off}.`, { ...evidence, entry });
+      }
+
+      // The pushed commit against the branch it replaces: whatever differs must be the base branch's.
+      const tipFiles = new Map(push.files.map(file => [file.path, { mode: file.mode, oid: file.oid }]));
+      let paths = [...new Set(push.commits.flatMap(commit => commit.changes.map(change => change.path)))].sort();
+      if (destinationFiles) {
+        paths = [...new Set([...tipFiles.keys(), ...destinationFiles.keys()])].sort().filter(path => !same(tipFiles.get(path), destinationFiles.get(path)));
+        const differing = paths.filter(path => !same(tipFiles.get(path), baseFiles.get(path)) || (tipFiles.has(path) && !REGULAR_FILE_MODES.includes(tipFiles.get(path)!.mode)));
+        if (differing.length) {
+          throw new Denied(`This push changes workflow files of ${clip(push.branch, 60)} that differ from ${baseName} (${listPaths(differing)}), and ${off}. Workflow changes may only arrive by merging ${baseName}.`, { ...evidence, offending: differing });
+        }
+      }
+      return { ...evidence, commits: push.commits.map(commit => commit.sha), paths };
     } catch (error) {
       if (error instanceof Denied) throw error;
       throw new Denied(`Paperclip cannot read the workflow files of ${base ? clip(base, 40) : "the base branch"}, so it cannot check that this push only brings them in; ${off}.`, evidence);
     }
-    const offending = push.changes.filter(change => {
-      const found = files.get(change.path);
-      return change.mode === null ? found !== undefined : found?.mode !== change.mode || found.oid !== change.oid;
-    }).map(change => change.path);
-    if (offending.length) {
-      throw new Denied(`This push changes workflow files that differ from ${clip(base!, 40)} (${listPaths(offending)}), and ${off}. Workflow changes may only arrive by merging ${clip(base!, 40)}.`, { ...evidence, offending });
-    }
-    return evidence;
   }
 
   /** Every gate a user-identity write passes. Returns the person, token and any privileged-action evidence. */
