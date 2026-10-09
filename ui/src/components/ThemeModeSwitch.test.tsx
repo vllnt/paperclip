@@ -39,6 +39,7 @@ describe("ThemeModeSwitch", () => {
   afterEach(() => {
     act(() => root.unmount());
     document.body.innerHTML = "";
+    Reflect.deleteProperty(window, "matchMedia");
   });
 
   it("offers System, Light and Dark as one radio group with System selected by default", () => {
@@ -64,6 +65,35 @@ describe("ThemeModeSwitch", () => {
     expect(radio(container, "Light").checked).toBe(true);
     expect(document.documentElement.classList.contains("dark")).toBe(false);
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
+  });
+
+  it("still mounts, and lets System be chosen again, when matchMedia throws", () => {
+    act(() => root.unmount());
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: () => {
+        throw new Error("matchMedia failed");
+      },
+    });
+    root = createRoot(container);
+    act(() => {
+      root.render(
+        <ThemeProvider>
+          <ThemeModeSwitch />
+        </ThemeProvider>,
+      );
+    });
+    expect(radio(container, "System").checked).toBe(true);
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
+
+    act(() => radio(container, "Dark").click());
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+
+    act(() => radio(container, "System").click());
+    expect(radio(container, "System").checked).toBe(true);
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBeNull();
   });
 
   it("returns to System and forgets the stored choice", () => {

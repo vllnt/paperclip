@@ -50,6 +50,68 @@ function installMatchMedia(initialMatches: boolean): FakeMediaQueryList {
   return mql;
 }
 
+/** A webview where `matchMedia` exists but throws, as the boot script in index.html already tolerates. */
+function installThrowingMatchMedia(): void {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: () => {
+      throw new Error("matchMedia failed");
+    },
+  });
+}
+
+interface LegacyMediaQueryList {
+  matches: boolean;
+  addListener: (listener: MediaListener) => void;
+  removeListener: (listener: MediaListener) => void;
+  dispatch: (matches: boolean) => void;
+  listenerCount: () => number;
+}
+
+/** An older `MediaQueryList` that only has `addListener` and `removeListener`. */
+function installLegacyMatchMedia(initialMatches: boolean): LegacyMediaQueryList {
+  const listeners = new Set<MediaListener>();
+  const mql: LegacyMediaQueryList = {
+    matches: initialMatches,
+    addListener: (listener) => {
+      listeners.add(listener);
+    },
+    removeListener: (listener) => {
+      listeners.delete(listener);
+    },
+    dispatch: (matches) => {
+      mql.matches = matches;
+      listeners.forEach((listener) => listener({ matches } as MediaQueryListEvent));
+    },
+    listenerCount: () => listeners.size,
+  };
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: () => mql as unknown as MediaQueryList,
+  });
+  return mql;
+}
+
+/** A `MediaQueryList` whose subscribe and unsubscribe both throw. */
+function installUnsubscribableMatchMedia(initialMatches: boolean): void {
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: () =>
+      ({
+        matches: initialMatches,
+        addEventListener: () => {
+          throw new Error("addEventListener failed");
+        },
+        removeEventListener: () => {
+          throw new Error("removeEventListener failed");
+        },
+      }) as unknown as MediaQueryList,
+  });
+}
+
 describe("ThemeContext", () => {
   let container: HTMLDivElement;
   let observedTheme: "light" | "dark" | null = null;
@@ -287,6 +349,135 @@ describe("ThemeContext", () => {
 
     act(() => {
       root.unmount();
+    });
+  });
+
+  describe("when the OS preference cannot be read", () => {
+    let windowErrors: string[];
+    const recordWindowError = (event: ErrorEvent): void => {
+      windowErrors.push(event.message);
+      event.preventDefault();
+    };
+
+    beforeEach(() => {
+      windowErrors = [];
+      window.addEventListener("error", recordWindowError);
+    });
+
+    afterEach(() => {
+      window.removeEventListener("error", recordWindowError);
+      Reflect.deleteProperty(window, "matchMedia");
+    });
+
+    it("mounts and falls back to light, the same as the boot script, when matchMedia throws", () => {
+      installThrowingMatchMedia();
+      const root = renderProbe();
+
+      expect(observedPreference).toBe("system");
+      expect(observedTheme).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
+      expect(document.documentElement.style.colorScheme).toBe("light");
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("lets System be selected again without throwing, and resolves it to the fallback", () => {
+      installThrowingMatchMedia();
+      const root = renderProbe();
+
+      act(() => {
+        setPreference?.("dark");
+      });
+      expect(observedTheme).toBe("dark");
+      expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
+
+      act(() => {
+        setPreference?.("system");
+      });
+      expect(observedPreference).toBe("system");
+      expect(observedTheme).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
+      expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBeNull();
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("keeps selecting System working when matchMedia starts throwing after mount", () => {
+      installMatchMedia(true);
+      const root = renderProbe();
+      act(() => {
+        setPreference?.("light");
+      });
+      expect(observedTheme).toBe("light");
+
+      installThrowingMatchMedia();
+      act(() => {
+        setPreference?.("system");
+      });
+      expect(windowErrors).toEqual([]);
+      expect(observedPreference).toBe("system");
+      expect(observedTheme).toBe("light");
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("keeps following another tab's choice when matchMedia starts throwing after mount", () => {
+      installMatchMedia(true);
+      window.localStorage.setItem(THEME_STORAGE_KEY, "light");
+      const root = renderProbe();
+      expect(observedPreference).toBe("light");
+
+      installThrowingMatchMedia();
+      act(() => {
+        window.localStorage.removeItem(THEME_STORAGE_KEY);
+        window.dispatchEvent(new StorageEvent("storage", { key: THEME_STORAGE_KEY, newValue: null }));
+      });
+      expect(windowErrors).toEqual([]);
+      expect(observedPreference).toBe("system");
+      expect(observedTheme).toBe("light");
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("follows OS changes through addListener on a MediaQueryList without addEventListener", () => {
+      const mql = installLegacyMatchMedia(true);
+      const root = renderProbe();
+
+      expect(observedTheme).toBe("dark");
+      expect(mql.listenerCount()).toBe(1);
+
+      act(() => {
+        mql.dispatch(false);
+      });
+      expect(observedTheme).toBe("light");
+
+      act(() => {
+        setPreference?.("dark");
+      });
+      expect(mql.listenerCount()).toBe(0);
+
+      act(() => {
+        root.unmount();
+      });
+    });
+
+    it("mounts, reads the OS value and unmounts when subscribing and unsubscribing both throw", () => {
+      installUnsubscribableMatchMedia(true);
+      const root = renderProbe();
+      expect(observedTheme).toBe("dark");
+
+      act(() => {
+        root.unmount();
+      });
+      expect(windowErrors).toEqual([]);
     });
   });
 

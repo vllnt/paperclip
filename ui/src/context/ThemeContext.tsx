@@ -32,16 +32,64 @@ const DARK_THEME_COLOR = "#000000";
 const LIGHT_THEME_COLOR = "#ffffff";
 const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
 
-function readDocumentTheme(): Theme {
-  if (typeof document === "undefined") return "dark";
-  return document.documentElement.classList.contains("dark") ? "dark" : "light";
+/**
+ * What `system` resolves to when the OS preference cannot be read. It is the
+ * value the boot script in `index.html` paints in the same situation, so a
+ * reload and a live switch to `system` agree.
+ */
+const UNREADABLE_SYSTEM_THEME: Theme = "light";
+
+/**
+ * The OS color-scheme query, or null when `matchMedia` is missing or throws
+ * (some embedded webviews). Every `matchMedia` call in this module goes
+ * through here.
+ */
+function systemMediaQuery(): MediaQueryList | null {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return null;
+  try {
+    return window.matchMedia(DARK_QUERY);
+  } catch {
+    return null;
+  }
 }
 
 function readSystemTheme(): Theme {
-  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
-    return window.matchMedia(DARK_QUERY).matches ? "dark" : "light";
+  try {
+    const query = systemMediaQuery();
+    if (!query) return UNREADABLE_SYSTEM_THEME;
+    return query.matches ? "dark" : "light";
+  } catch {
+    return UNREADABLE_SYSTEM_THEME;
   }
-  return readDocumentTheme();
+}
+
+/**
+ * Calls `onChange` when the OS theme changes and returns the unsubscribe.
+ * Uses `addEventListener`, or `addListener` on older query lists. It does
+ * nothing, and its unsubscribe does nothing, when the query cannot be read or
+ * when subscribing or unsubscribing throws.
+ */
+function subscribeToSystemTheme(onChange: (theme: Theme) => void): () => void {
+  const query = systemMediaQuery();
+  if (!query) return () => undefined;
+  const handleChange = (event: MediaQueryListEvent): void => {
+    onChange(event.matches ? "dark" : "light");
+  };
+  const modern = typeof query.addEventListener === "function";
+  try {
+    if (modern) query.addEventListener("change", handleChange);
+    else query.addListener(handleChange);
+  } catch {
+    return () => undefined;
+  }
+  return () => {
+    try {
+      if (modern) query.removeEventListener("change", handleChange);
+      else query.removeListener(handleChange);
+    } catch {
+      return;
+    }
+  };
 }
 
 /**
@@ -116,13 +164,7 @@ export function ThemeProvider({ children }: { children: ReactNode }): ReactEleme
 
   useEffect(() => {
     if (preference !== "system") return;
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const media = window.matchMedia(DARK_QUERY);
-    const handleChange = (event: MediaQueryListEvent): void => {
-      setSystemTheme(event.matches ? "dark" : "light");
-    };
-    media.addEventListener("change", handleChange);
-    return () => media.removeEventListener("change", handleChange);
+    return subscribeToSystemTheme(setSystemTheme);
   }, [preference]);
 
   useEffect(() => {
