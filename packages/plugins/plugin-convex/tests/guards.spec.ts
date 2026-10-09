@@ -327,3 +327,41 @@ describe("inventory and health", () => {
     expect(result.data.percent).toBeCloseTo(43.3, 1);
   });
 });
+
+describe("inventory reads project only safe fields", () => {
+  it("lists custom domains and deploy key metadata, never key material", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"));
+    const domains = await f.h.executeTool<{ data?: any }>("convex_list_custom_domains", { name: "feat-x" }, run("observer"));
+    expect(domains.data.domains).toEqual([{ domain: "api.example.com", destination: "convexCloud", createdAt: NOW - 5 * HOUR, verifiedAt: null }]);
+    const keys = await f.h.executeTool<{ data?: any }>("convex_list_deploy_keys", { name: "feat-x" }, run("observer"));
+    expect(keys.data.keys).toEqual([{ id: "9", name: "ci", createdAt: NOW - 9 * HOUR, lastUsedAt: NOW - HOUR, expiresAt: null, creator: "7", allowedActions: ["deployment:deploy"] }]);
+    expect(JSON.stringify([domains, keys])).not.toMatch(/LEAK-ME/);
+  });
+
+  it("lists deployment classes and regions for the team", async () => {
+    const f = await setup();
+    const result = await f.h.executeTool<{ data?: any }>("convex_list_classes_regions", {}, run("observer"));
+    expect(result.data.classes).toEqual([{ type: "s16", available: true }, { type: "d1024", available: false }]);
+    expect(result.data.regions).toEqual([{ name: "aws-us-east-1", displayName: "US East", available: true }]);
+  });
+
+  it("hides audit event IP, user agent and metadata unless the agent also holds data-read-pii", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"));
+    const plain = await f.h.executeTool<{ data?: any }>("convex_list_audit_events", { name: "feat-x" }, run("auditor"));
+    expect(plain.data.events[0]).toEqual({ action: "push_config", createdAt: NOW - HOUR, actor: { kind: "member", memberId: "3" } });
+    expect(JSON.stringify(plain)).not.toMatch(/203\.0\.113|convex-cli|pushed/);
+    const full = await f.h.executeTool<{ data?: any }>("convex_list_audit_events", { name: "feat-x" }, run("pii-auditor"));
+    expect(full.data.events[0]).toMatchObject({ clientIp: "203.0.113.9", clientUserAgent: "convex-cli" });
+  });
+
+  it("needs logs-read for audit events and a grant for the environment", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"), deployment("happy-prod", { deploymentType: "prod", isDefault: true, previewIdentifier: null }));
+    expect((await f.h.executeTool<{ error?: string }>("convex_list_audit_events", { name: "feat-x" }, run("observer"))).error).toMatch(/no grant/i);
+    expect((await f.h.executeTool<{ error?: string }>("convex_list_audit_events", { name: "happy-prod" }, run("auditor"))).error).toMatch(/no grant/i);
+    expect((await f.h.executeTool<{ error?: string }>("convex_list_custom_domains", { name: "happy-prod" }, run("preview-reader"))).error).toMatch(/no grant/i);
+  });
+});
+

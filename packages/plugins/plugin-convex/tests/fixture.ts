@@ -23,6 +23,8 @@ export function baseConfig(overrides: Record<string, unknown> = {}): Record<stri
       { agentId: "janitor", preset: "janitor", environments: ["preview"] },
       { agentId: "observer", preset: "observer", environments: ["production", "staging", "preview", "dev", "custom"] },
       { agentId: "preview-reader", preset: "observer", environments: ["preview"] },
+      { agentId: "auditor", capabilities: ["meta-read", "logs-read"], environments: ["preview"] },
+      { agentId: "pii-auditor", capabilities: ["meta-read", "logs-read", "data-read-pii"], environments: ["preview"] },
     ],
     ...overrides,
   };
@@ -44,7 +46,7 @@ export async function setup(options: { configs?: Record<string, Record<string, u
   });
   const issue = vi.spyOn(h.ctx.issues, "create").mockResolvedValue({ id: "issue-1" } as never);
   const agent = (id: string, companyId: string, role = "engineer") => ({ id, companyId, name: id, role, status: "idle" });
-  h.seed({ agents: [agent("janitor", COMPANY_A, "devops"), agent("observer", COMPANY_A), agent("nogrant", COMPANY_A), agent("preview-reader", COMPANY_A), agent("b-agent", COMPANY_B)] as never });
+  h.seed({ agents: [agent("janitor", COMPANY_A, "devops"), agent("observer", COMPANY_A), agent("nogrant", COMPANY_A), agent("preview-reader", COMPANY_A), agent("auditor", COMPANY_A), agent("pii-auditor", COMPANY_A), agent("b-agent", COMPANY_B)] as never });
   const convex = new FakeConvex();
   convex.validTokens.add(TEAM_TOKEN).add(PROJECT_TOKEN);
   const github = new FakeGitHub();

@@ -47,6 +47,7 @@ export class FakeConvex {
     if (parsed.hostname.endsWith(".convex.cloud")) {
       if (path.endsWith("/get_current_usage")) return json(200, { metrics: { functionCalls: { unit: "calls", usage: { current_day: 10, current_month: 100 } } }, seedStatus: "complete" });
       if (path.endsWith("/list_usage_limits")) return json(200, { usageLimits: [] });
+      if (path.endsWith("/list_audit_log_events")) return json(200, { items: [{ actor: { kind: "member", member_id: 3 }, action: "push_config", createTime: NOW - HOUR, metadata: { note: "pushed" }, clientIp: "203.0.113.9", clientUserAgent: "convex-cli" }], pagination: { hasMore: false, nextCursor: null } });
       if (path.endsWith("/deployment_info")) return json(200, { kind: "cloud", teamId: 1, projectId: 100, id: 5, deploymentType: "preview" });
       return fail(404, "NotFound");
     }
@@ -81,6 +82,14 @@ export class FakeConvex {
       const more = start + 100 < all.length;
       return json(200, { items, pagination: { hasMore: more, nextCursor: more ? String(start + 100) : null } });
     }
+    match = /^\/deployments\/([^/]+)\/custom_domains$/.exec(v1);
+    if (match) return json(200, { domains: [{ domain: "api.example.com", requestDestination: "convexCloud", creationTime: NOW - 5 * HOUR, verificationTime: null, deploymentName: match[1], internal: "LEAK-ME-domain" }] });
+    match = /^\/deployments\/([^/]+)\/list_deploy_keys$/.exec(v1);
+    if (match) return json(200, { items: [{ id: 9, name: "ci", creationTime: NOW - 9 * HOUR, lastUsedTime: NOW - HOUR, expiresAt: null, creator: 7, allowedActions: ["deployment:deploy"], adminKey: "LEAK-ME-key-material", token: "LEAK-ME-token" }] });
+    match = /^\/teams\/([^/]+)\/list_deployment_classes$/.exec(v1);
+    if (match) return json(200, { items: [{ type: "s16", available: true }, { type: "d1024", available: false }] });
+    match = /^\/teams\/([^/]+)\/list_deployment_regions$/.exec(v1);
+    if (match) return json(200, { items: [{ name: "aws-us-east-1", displayName: "US East", available: true }] });
     match = /^\/teams\/([^/]+)\/projects$/.exec(v1);
     if (match) return json(200, { items: [{ id: 100, name: "app" }, { id: 200, name: "other" }], pagination: { hasMore: false, nextCursor: null } });
     return fail(404, "NotFound");

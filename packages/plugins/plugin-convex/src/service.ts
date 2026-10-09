@@ -131,6 +131,10 @@ export class ConvexService {
     await add(config.teamToken, "teamToken");
     return [...new Set(out)];
   }
+  async teamToken(config: ConnectionConfig, companyId: string): Promise<string> {
+    if (!config.teamToken) throw new Refusal("No team token is configured for this company.");
+    return this.resolveSecret(config.teamToken, companyId, "teamToken");
+  }
   async githubToken(config: ConnectionConfig, companyId: string): Promise<string | null> {
     if (!config.githubToken) return null;
     try { return await this.resolveSecret(config.githubToken, companyId, "github.token"); } catch { return null; }
