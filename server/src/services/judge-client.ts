@@ -385,8 +385,8 @@ export function createJudgeClient(options: {
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        controller.abort();
         reject(new JudgeTimeoutError());
+        controller.abort();
       }, config.timeoutMs);
     });
     const questions: Record<string, SdkQuestion> = {};
