@@ -2780,6 +2780,7 @@ export { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from
 
 export * from "./agent-appearance.js";
 export * from "./run-failure-cause.js";
+export * from "./run-usage-record.js";
 export * from "./ai-connections.js";
 export * from "./ai-connection-usage.js";
 export { questionSetToAskUserQuestionsPayload } from "./question-set.js";
