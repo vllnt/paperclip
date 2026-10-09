@@ -53,7 +53,14 @@ export interface ConnectionConfig {
   githubToken: SecretRef | null;
   grants: Grant[];
   guards: { activityHours: number; maxDeletesPerRun: number; callsPerMinute: number; dryRunOnly: boolean };
-  reaper: { enabled: boolean; ttlHours: number; quota: number; alertPercent: number };
+  reaper: {
+    enabled: boolean; ttlHours: number; quota: number; alertPercent: number;
+    /** Dev deployments older than `maxAgeDays` are deleted by the reaper once `enabled`; until then they are only planned. */
+    dev: { enabled: boolean; maxAgeDays: number; protect: string[]; onlyPatterns: string[]; maxDeletes: number };
+    /** Template such as `pr{pr}-run{run}-s{shard}-a{attempt}` that reads the pull request from a CI preview name. */
+    ciPreviewTemplate: string | null;
+    supersededMinAgeMinutes: number;
+  };
 }
 
 /** A Convex deployment as the plugin uses it. Unknown or malformed fields become null and classify as production. */
@@ -77,6 +84,17 @@ export interface ConvexDeployment {
 export type ConnectionState = "connected" | "disconnected" | "not-configured" | "not-connected";
 
 export interface ReaperItem { name: string; previewIdentifier: string | null; reason: string }
+export interface ReaperDevReport {
+  listed: number;
+  delete: ReaperItem[];
+  deleted: string[];
+  kept: number;
+  failed: Array<{ name: string; error: string }>;
+  skipped: ReaperItem[];
+  /** True when deletions were attempted; false for a plan only (dry run, dev policy off, or an agent started the pass). */
+  executed: boolean;
+  error?: string;
+}
 export interface ReaperProjectReport {
   convexProjectId: string;
   name: string;
@@ -88,6 +106,9 @@ export interface ReaperProjectReport {
   expirySet: string[];
   failed: Array<{ name: string; error: string }>;
   skipped: ReaperItem[];
+  /** How many previews the CI template matched; shown so a template that never matches is visible. Absent without a template. */
+  ciMatched?: number;
+  dev?: ReaperDevReport;
   error?: string;
 }
 export interface ReaperReport {

@@ -30,6 +30,15 @@ export class FakeConvex {
   failDeleteFor = new Set<string>();
   /** Deletes the deployment, then answers 502, as a proxy that drops the response could. */
   dropDeleteResponseFor = new Set<string>();
+  /** Answers 200 to a delete but keeps the deployment, as a backend that only queued the deletion could. */
+  keepAfterDelete = new Set<string>();
+  /** After one of these is deleted, reading it answers 500 instead of 404 (a check that cannot tell). */
+  flakyAfterDelete = new Set<string>();
+  /** After one of these is deleted, reading it answers 200 with a body that is not a deployment. */
+  junkAfterDelete = new Set<string>();
+  private deletedNames = new Set<string>();
+  /** Project list requests for these deployment types answer 403 (a token that may not list them). */
+  listDenied = new Set<string>();
   /** GET answers with this name instead of the requested one. */
   answerAs = new Map<string, string>();
 
@@ -60,6 +69,8 @@ export class FakeConvex {
     if (match && method === "GET") {
       const asked = decodeURIComponent(match[1]);
       const found = this.deployments.get(asked);
+      if (!found && this.flakyAfterDelete.has(asked) && this.deletedNames.has(asked)) return fail(500, "InternalError");
+      if (!found && this.junkAfterDelete.has(asked) && this.deletedNames.has(asked)) return json(200, { unexpected: true });
       if (found && this.answerAs.has(asked)) return json(200, { ...found, name: this.answerAs.get(asked) });
       return found ? json(200, found) : fail(404, "DeploymentNotFound");
     }
@@ -74,11 +85,14 @@ export class FakeConvex {
       const name = decodeURIComponent(match[1]);
       if (this.failDeleteFor.has(name)) return fail(500, "InternalError");
       if (this.dropDeleteResponseFor.has(name)) { this.deployments.delete(name); return fail(502, "BadGateway"); }
+      if (this.keepAfterDelete.has(name)) return bare(200);
+      this.deletedNames.add(name);
       return this.deployments.delete(name) ? bare(200) : fail(404, "DeploymentNotFound");
     }
     match = /^\/projects\/([^/]+)\/list_deployments$/.exec(v1);
     if (match) {
       const type = parsed.searchParams.get("deploymentType");
+      if (type && this.listDenied.has(type)) return fail(403, "Forbidden");
       return json(200, [...this.deployments.values()].filter(item => String(item.projectId) === match![1] && (!type || item.deploymentType === type)));
     }
     match = /^\/teams\/([^/]+)\/list_deployments$/.exec(v1);

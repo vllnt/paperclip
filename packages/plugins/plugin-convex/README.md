@@ -12,7 +12,9 @@ This package implements slice 1: connection, classification, grants, inventory a
 2. Write the company's plugin config (instance administrator): `teamId`, `teamToken`, `projects`, `github.token`, `grants`, `guards`, `reaper`.
    Every token is a `secret_ref`; a plaintext token is rejected. The example is in the design doc, section 5.
 3. `paperclipai convex connect -C <company>` verifies each mapped project and reserves it for that company only.
-4. `paperclipai convex deployments reap --dry-run -C <company>`, read the plan, then set `reaper.enabled`.
+4. `paperclipai convex deployments reap --dry-run -C <company>`, read the plan (previews and dev deployments), then set `reaper.enabled`.
+5. Optional: `reaper.dev.enabled` deletes dev deployments unused for `reaper.dev.maxAgeDays` (default 7) that match `reaper.dev.onlyPatterns` (required); `reaper.ciPreviewTemplate` deletes superseded CI previews of open pull requests.
+   Both are plan only until enabled. Dev deployments need a Team Access Token, not a preview deploy key.
 
 Agents use the `convex_*` tools. Every tool re-derives the company from the host run context, re-fetches the deployment from Convex,
 classifies it (anything unknown is production), checks the agent's grant for that class, and audits the call.

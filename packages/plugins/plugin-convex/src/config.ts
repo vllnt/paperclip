@@ -1,3 +1,4 @@
+import { compileTemplate } from "./ci-previews.js";
 import {
   CAPABILITIES, ENVIRONMENT_CLASSES, PRESETS, PRODUCTION_WRITE_CAPABILITIES,
   type Capability, type ConnectionConfig, type EnvironmentClass, type Grant, type ProjectMapping, type SecretRef,
@@ -91,6 +92,33 @@ function grant(raw: unknown, index: number): Grant {
   return { agentId, role, environments, capabilities: [...capabilities], approval };
 }
 
+/**
+ * Name patterns: exact names, or a prefix ending in one `*`. An allow list (`wide: false`) must also be narrow: at least three characters between the last
+ * `/` and the `*`, so `*` and `dev/*` cannot name everyone's deployments. A protect list may be as wide as it likes; that only keeps more.
+ */
+function patterns(value: unknown, path: string, narrow = false): string[] {
+  if (value === undefined) return [];
+  const bad = (item: unknown) => typeof item !== "string" || !item.trim() || item.length > 200 || /\*(?!$)/.test(item.trim());
+  if (!Array.isArray(value) || value.length > 100 || value.some(bad)) {
+    throw new ConfigError(`${path} must be a list of at most 100 reference patterns: exact names, or a prefix ending in * (a * anywhere else is not allowed).`);
+  }
+  const list = [...new Set((value as string[]).map(item => item.trim()))];
+  if (narrow) {
+    for (const item of list) {
+      if (item.endsWith("*") && !(item.includes("/") && item.slice(item.lastIndexOf("/") + 1, -1).length >= 3)) {
+        throw new ConfigError(`${path}: "${item}" is too wide. Use a prefix with a / and at least three characters after it before the * (for example dev/ship-*).`);
+      }
+    }
+  }
+  return list;
+}
+function template(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") throw new ConfigError("reaper.ciPreviewTemplate must be text such as pr{pr}-run{run}-s{shard}-a{attempt}.");
+  try { compileTemplate(value); } catch (error) { throw new ConfigError(`reaper.ciPreviewTemplate ${error instanceof Error ? error.message : "is not valid"}.`); }
+  return value;
+}
+
 /** Parses the company config strictly. Anything unexpected throws, so a typo can never widen access. */
 export function parseConfig(raw: Record<string, unknown> | null | undefined): ConnectionConfig {
   const source = raw ?? {};
@@ -104,6 +132,7 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Co
   if (!Array.isArray(grants) || grants.length > 200) throw new ConfigError("grants must be a list of at most 200 entries.");
   const guards = isRecord(source.guards) ? source.guards : {};
   const reaper = isRecord(source.reaper) ? source.reaper : {};
+  const dev = isRecord(reaper.dev) ? reaper.dev : {};
   return {
     teamId: source.teamId === undefined || source.teamId === null ? null : id(source.teamId, "teamId"),
     teamToken: secretRef(source.teamToken, "teamToken"),
@@ -121,6 +150,15 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Co
       ttlHours: bounded(reaper.ttlHours, "reaper.ttlHours", 36, 3, 168),
       quota: bounded(reaper.quota, "reaper.quota", 300, 1, 100_000),
       alertPercent: bounded(reaper.alertPercent, "reaper.alertPercent", 80, 1, 100),
+      dev: {
+        enabled: flag(dev.enabled, "reaper.dev.enabled", false),
+        maxAgeDays: bounded(dev.maxAgeDays, "reaper.dev.maxAgeDays", 7, 1, 90),
+        protect: patterns(dev.protect, "reaper.dev.protect"),
+        onlyPatterns: patterns(dev.onlyPatterns, "reaper.dev.onlyPatterns", true),
+        maxDeletes: bounded(dev.maxDeletes, "reaper.dev.maxDeletes", 20, 1, 100),
+      },
+      ciPreviewTemplate: template(reaper.ciPreviewTemplate),
+      supersededMinAgeMinutes: bounded(reaper.supersededMinAgeMinutes, "reaper.supersededMinAgeMinutes", 60, 15, 1440),
     },
   };
 }
