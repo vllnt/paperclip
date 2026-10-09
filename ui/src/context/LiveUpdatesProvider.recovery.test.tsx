@@ -57,13 +57,19 @@ describe("LiveUpdatesProvider connection recovery", () => {
     vi.useRealTimers();
   });
 
-  async function render() {
+  async function render(readInstance?: () => Promise<unknown>) {
     function Tasks() {
       const { data } = useQuery({ queryKey: ["company-1", "tasks"], queryFn: read });
       return <span>{data}</span>;
     }
+    function Instance() {
+      useQuery({ queryKey: queryKeys.instance.generalSettings, queryFn: readInstance ?? (async () => null) });
+      return null;
+    }
     await act(async () => root.render(
-      <QueryClientProvider client={client}><LiveUpdatesProvider><Tasks /></LiveUpdatesProvider></QueryClientProvider>,
+      <QueryClientProvider client={client}>
+        <LiveUpdatesProvider><Tasks />{readInstance ? <Instance /> : null}</LiveUpdatesProvider>
+      </QueryClientProvider>,
     ));
     await act(async () => vi.advanceTimersByTimeAsync(1));
   }
@@ -83,6 +89,21 @@ describe("LiveUpdatesProvider connection recovery", () => {
     const readsAfterConnect = read.mock.calls.length;
     await act(async () => vi.advanceTimersByTimeAsync(30_000));
     expect(read).toHaveBeenCalledTimes(readsAfterConnect);
+  });
+
+  it("does not refetch instance-level queries that live events never change when the socket opens", async () => {
+    vi.stubGlobal("WebSocket", Socket);
+    const readInstance = vi.fn(async () => "instance settings");
+    client.setQueryData(queryKeys.instance.generalSettings, "instance settings");
+    await render(readInstance);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(readInstance).not.toHaveBeenCalled();
+
+    await act(async () => Socket.instances[0].onopen?.());
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(readInstance).not.toHaveBeenCalled();
   });
 
   it.each(["missing", "throws"])("polls visible data and resumes realtime when the constructor %s", async (failure) => {

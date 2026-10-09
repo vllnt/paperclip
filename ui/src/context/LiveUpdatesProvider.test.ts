@@ -11,7 +11,7 @@ vi.mock("../api/issues", () => ({
 }));
 
 import { describe, expect, it, vi } from "vitest";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { __liveUpdatesTestUtils } from "./LiveUpdatesProvider";
 import { queryKeys } from "../lib/queryKeys";
 
@@ -1693,5 +1693,54 @@ describe("task subtree notification context", () => {
   });
   it("suppresses the run shown on its own run detail page", () => {
     expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/agents/alex/runs/child-run", { runId: "child-run" }, { isForegrounded: true })).toBe(true);
+  });
+});
+
+describe("LiveUpdatesProvider reconcile after a gap", () => {
+  it.each([
+    ["health", queryKeys.health, false],
+    ["session", queryKeys.auth.session, false],
+    ["general settings", queryKeys.instance.generalSettings, false],
+    ["experimental settings", queryKeys.instance.experimentalSettings, false],
+    ["adapters", queryKeys.adapters.all, false],
+    ["sidebar order", queryKeys.sidebarPreferences.companyOrder("user-1"), false],
+    ["board access", queryKeys.access.currentBoardAccess, false],
+    ["staging commit", queryKeys.stagingCommit, false],
+    ["cloud stacks", queryKeys.cloud.stacks, false],
+    ["issue detail", queryKeys.issues.detail("PAP-1"), true],
+    ["dashboard", queryKeys.dashboard("company-1"), true],
+    ["company live runs", queryKeys.liveRuns("company-1"), true],
+    ["company list", queryKeys.companies.all, true],
+    ["plugin contributions", queryKeys.plugins.uiContributions, true],
+    ["resource memberships", queryKeys.resourceMemberships.mine("company-1"), true],
+    ["sidebar badges", queryKeys.sidebarBadges("company-1"), true],
+    ["other access data", ["access", "invite", "token"], true],
+    ["a key nobody listed", ["a-new-feature", "x"], true],
+  ])("%s: reconciled = %s", (_name, queryKey, reconciled) => {
+    expect(__liveUpdatesTestUtils.shouldReconcileActiveQuery({ queryKey })).toBe(reconciled);
+  });
+
+  it("refetches live-affected active queries and skips instance-level ones", async () => {
+    const client = new QueryClient();
+    const readHealth = vi.fn(async () => "health");
+    const readIssue = vi.fn(async () => "issue");
+    const readBoardAccess = vi.fn(async () => "access");
+    const unsubscribe = [
+      new QueryObserver(client, { queryKey: queryKeys.health, queryFn: readHealth }),
+      new QueryObserver(client, { queryKey: queryKeys.issues.detail("PAP-1"), queryFn: readIssue }),
+      new QueryObserver(client, { queryKey: queryKeys.access.currentBoardAccess, queryFn: readBoardAccess }),
+    ].map((observer) => observer.subscribe(() => undefined));
+    await vi.waitFor(() => {
+      expect(readIssue).toHaveBeenCalledTimes(1);
+      expect(client.isFetching()).toBe(0);
+    });
+
+    await client.invalidateQueries(__liveUpdatesTestUtils.RECONCILE_ACTIVE_QUERIES, { cancelRefetch: false });
+
+    expect(readIssue).toHaveBeenCalledTimes(2);
+    expect(readHealth).toHaveBeenCalledTimes(1);
+    expect(readBoardAccess).toHaveBeenCalledTimes(1);
+    unsubscribe.forEach((stop) => stop());
+    client.clear();
   });
 });
