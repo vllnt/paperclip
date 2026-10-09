@@ -307,8 +307,9 @@ that only check commits, names or merges (`creation`, `required_signatures`,
 does not know protects it. The write is refused when the branch is the
 default (compared case-insensitively) or protected, and also when GitHub
 cannot be read or answers unclearly: the classifier refuses a branch it has no
-fresh answer for, so any caller that skips the read fails closed. Answers are
-kept for five minutes per repository and branch. A write that forces, deletes,
+answer for from this very operation, so any caller that skips the read fails
+closed. The read happens for every such write and nothing is kept: no cache
+across runs, companies or requests, so a change at GitHub applies at once. A write that forces, deletes,
 renames or hard-resets a branch is also refused when Paperclip cannot tell
 which repository it targets: a push report without its remote or push URLs, a
 gh placeholder path, a wiki, or a target that only looks like a local path

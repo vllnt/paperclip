@@ -82,15 +82,18 @@ const remote = "https://github.com/acme/site.git";
    * GitHub as the broker reads it: every repository's default branch is develop, `protected` has classic protection,
    * `locked` a ruleset that forbids deleting it, every other branch nothing. `down` makes GitHub unreachable.
    */
+  const github = { down: false, protectedBranch: "protected" };
   function fakeGitHub(mode: "up" | "down" = "up") {
+    github.down = mode === "down";
+    github.protectedBranch = "protected";
     const requests: Array<{ url: string; method: string; authorization: string | null }> = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       requests.push({ url, method: init?.method ?? "GET", authorization: new Headers(init?.headers).get("authorization") });
-      if (mode === "down") throw new TypeError("fetch failed");
+      if (github.down) throw new TypeError("fetch failed");
       const path = url.replace(/^https:\/\/api\.github\.com\/repos\/acme\/[^/]+/, "");
       const body = path === "" ? { default_branch: "develop" }
-        : path.startsWith("/branches/") ? { protected: path === "/branches/protected" }
+        : path.startsWith("/branches/") ? { protected: decodeURIComponent(path) === `/branches/${github.protectedBranch}` }
         : path.startsWith("/rules/branches/locked?") ? [{ type: "deletion" }]
         : path.startsWith("/rules/branches/") ? [] : null;
       return new Response(JSON.stringify(body), { status: body === null ? 404 : 200 });
@@ -198,6 +201,43 @@ const remote = "https://github.com/acme/site.git";
       action: "github.write_identity_resolved", actorType: "agent", agentId: run.agentId, runId: run.runId,
       details: expect.objectContaining({ reason: expect.stringMatching(/could not tell which repository/) }),
     })]);
+  });
+
+  const forcePush = (origin: string, branch: string): GitHubOperation => ({ program: "git", args: ["push", "--force-with-lease", "origin", branch], remote: origin, pushUrls: [origin], currentBranch: branch, touchesWorkflows: false });
+
+  it("reads GitHub again for every destructive rewrite: another company never reuses a decision, and a failed read refuses (review r3b)", async () => {
+    const origin = repositoryRemote();
+    const companyA = await seed();
+    const companyB = await seed();
+    const requests = fakeGitHub();
+    expect(await ask(companyA, forcePush(origin, "feature/x"))).toMatchObject({ status: "available" });
+    const afterA = requests.length;
+    // Company B's reader cannot obtain GitHub's answer: the unprotected answer company A just got is not reused.
+    github.down = true;
+    const refused = await ask(companyB, forcePush(origin, "feature/x"));
+    expect(refused).toMatchObject({ status: "unavailable", failClosed: true, env: {} });
+    expect(refused.reason).toMatch(/could not read from GitHub whether feature\/x/);
+    expect(requests.length).toBeGreaterThan(afterA);
+    expect(await denials(companyB.companyId)).toHaveLength(1);
+    // The same run is not served from its own earlier answer either.
+    expect(await ask(companyA, forcePush(origin, "feature/x"))).toMatchObject({ status: "unavailable", failClosed: true });
+  });
+
+  it("sees protection that changes within five minutes (review r3b)", async () => {
+    const run = await seed();
+    const origin = repositoryRemote();
+    fakeGitHub();
+    expect(await ask(run, forcePush(origin, "release/1"))).toMatchObject({ status: "available" });
+    github.protectedBranch = "release/1";
+    const refused = await ask(run, forcePush(origin, "release/1"));
+    expect(refused).toMatchObject({ status: "unavailable", failClosed: true, env: {} });
+    expect(refused.reason).toMatch(/\(release\/1 is a protected branch of acme\/site-/);
+  });
+
+  it("refuses a destructive rewrite on a cold start when the first read fails (review r3b)", async () => {
+    const run = await seed();
+    fakeGitHub("down");
+    expect(await ask(run, forcePush(repositoryRemote(), "feature/cold"))).toMatchObject({ status: "unavailable", failClosed: true, env: {} });
   });
 
   it("still hands a credential to a push with an incomplete report that rewrites nothing", async () => {
