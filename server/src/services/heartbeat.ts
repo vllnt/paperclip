@@ -19495,10 +19495,14 @@ export function heartbeatService(
           const detachedMessage = processPidAlive
             ? `Lost in-memory process handle, but child pid ${run.processPid} is still alive`
             : `Lost in-memory process handle, but persisted process group ${run.processGroupId} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
+          // Compare-and-set: the run may have finished after it was listed
+          // above. Writing by id alone would reopen a terminal run with its
+          // old finished_at.
+          const detached = await setRunStatusIfRunning(run.id, "running", {
             error: detachedMessage,
             errorCode: DETACHED_PROCESS_ERROR_CODE,
           });
+          const detachedRun = detached.updated ? detached.run : null;
           if (detachedRun) {
             await appendRunEvent(detachedRun, {
               eventType: "lifecycle",
