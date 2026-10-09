@@ -279,8 +279,10 @@ rulesets and classic branch protection, concluded `success` in its latest run
 (`GET /repos/{owner}/{repo}/branches/{branch}`) never includes `enforce_admins`;
 it reports administrators as bound with
 `protection.required_status_checks.enforcement_level: "everyone"`
-(`non_admins` when they are not). Paperclip reads that value, and also accepts
-`enforce_admins.enabled: true` if a response carries it. When administrators
+(`non_admins` when they are not). Paperclip reads that value, and an explicit
+value decides. If a response carries `enforce_admins` too, it counts only when
+`enforcement_level` is absent, and `enforce_admins.enabled: false` always
+refuses: contradictory data fails closed. When administrators
 are not bound, `--admin` skips every rule of the branch; a ruleset does not
 stand in for that, because the read-only token cannot see a ruleset's bypass
 actors. Paperclip checks the ruleset's required checks itself; its other rules

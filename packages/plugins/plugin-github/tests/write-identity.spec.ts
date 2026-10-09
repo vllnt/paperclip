@@ -426,6 +426,17 @@ describe("GitHub write identity: App user (anthm)", () => {
     }
   });
 
+  it("refuses an admin merge when enforce_admins says on but an explicit enforcement_level says administrators are exempt (regression)", async () => {
+    const f = await adminMergeFixture();
+    // Contradictory data fails closed: an explicit enforcement_level decides, enforce_admins counts only when the level is absent.
+    for (const level of ["non_admins", "off"]) {
+      f.github.protection = { enabled: true, enforce_admins: { enabled: true }, required_status_checks: { enforcement_level: level, contexts: ["lint"], checks: [] } };
+      const decision = await f.merge();
+      expect(decision, level).toMatchObject({ identity: "user", unavailable: expect.stringContaining(`enforcement_level ${level}`), evidence: { enforcementLevel: level, enforceAdmins: true } });
+      expect(decision, level).not.toHaveProperty("credential");
+    }
+  });
+
   it("refuses an admin merge when GitHub does not let Paperclip read the base branch protection", async () => {
     const f = await adminMergeFixture();
     const original = f.request.getMockImplementation()!;

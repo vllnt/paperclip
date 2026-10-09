@@ -443,12 +443,15 @@ export function registerWriteIdentity(
       throw new Denied("Paperclip cannot read the base branch protection, so it cannot tell whether --admin would bypass it; an admin merge is refused.", evidence);
     }
     const protection = branch?.protection;
-    // enforcement_level "everyone" is how the branch read reports enforce_admins; enforce_admins itself counts if a response ever carries it.
+    // enforcement_level "everyone" is how the branch read reports enforce_admins. An explicit level decides; enforce_admins counts
+    // only when the level is absent, and enforce_admins reported off always refuses: contradictory data fails closed.
     const level = protection?.required_status_checks?.enforcement_level, enforceAdmins = protection?.enforce_admins?.enabled;
     evidence.enforcementLevel = typeof level === "string" ? level : null;
     if (typeof enforceAdmins === "boolean") evidence.enforceAdmins = enforceAdmins;
-    if (protection?.enabled !== true || enforceAdmins === false || (level !== "everyone" && enforceAdmins !== true)) {
-      const state = [`branch protection ${protection?.enabled === true ? "on" : "off"}`, `enforcement_level ${evidence.enforcementLevel ?? "not reported"}`, ...(enforceAdmins === false ? ["enforce_admins off"] : [])].join(", ");
+    const bound = typeof level === "string" ? level === "everyone" : enforceAdmins === true;
+    if (protection?.enabled !== true || enforceAdmins === false || !bound) {
+      const state = [`branch protection ${protection?.enabled === true ? "on" : "off"}`, `enforcement_level ${evidence.enforcementLevel ?? "not reported"}`,
+        ...(typeof enforceAdmins === "boolean" ? [`enforce_admins ${enforceAdmins ? "on" : "off"}`] : [])].join(", ");
       throw new Denied(`The base branch lets administrators bypass its protection (${state}; Paperclip needs enforcement_level "everyone"), so --admin would skip its rules; an admin merge is refused. ${elsewhere}, or turn on "Do not allow bypassing the above settings" for the base branch.`, evidence);
     }
     // Every page of rules, check runs and statuses is read, or the merge is refused.
