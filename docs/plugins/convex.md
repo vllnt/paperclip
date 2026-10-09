@@ -177,9 +177,11 @@ Production rules, applied after the grant lookup and not overridable by config:
 
 ### 3.3 Credentials stay server-side
 
-Tokens are company secrets referenced by `secret_ref`; the worker resolves them per call and never returns, logs or stores them.
-Cheapest credential first: Preview Deploy Key (get, expiry, delete of that project's previews) -> project token -> per-deployment deploy key
-(slice 2, Deployment API) -> team token (management and listing only). Credential and `deploymentUrl` host are checked before any call.
+Tokens are company secrets referenced by `secret_ref`; the worker resolves each one at most once per operation (a tool call or a reaper pass,
+because the host limits secret resolution per minute) and never returns, logs or stores it. Cheapest credential first: Preview Deploy Key (get, expiry, delete
+of that project's previews) -> project token -> team token, falling back to the next on 401/403. The team token also reads the Deployment API
+(documented to accept team tokens) until slice 2 adds per-deployment keys scoped by `allowedActions`. A credential is sent only to `api.convex.dev`
+or `https://*.convex.cloud` (checked before the call), and to `api.github.com` for the GitHub token.
 
 ### 3.4 Company isolation
 
@@ -192,7 +194,13 @@ A call for a project that another company reserved, or one not in the registry f
 - **Rate limit**: per company and agent, configurable calls per minute (default 60), fail closed when exceeded.
 - **Blast radius**: at most 20 deletions per run (configurable), at most 200 deployments per list call, expiry at most 7 days.
 - **Dry run**: all destructive tools accept `dryRun`. The reaper is dry-run until `reaper.enabled`. `guards.dryRunOnly` forces dry-run for every destructive tool in a company.
-- **PR guard (previews)**: refuse delete when the `previewIdentifier` matches an open PR or a branch with commits in the last N hours (default 24) on the mapped repository; fail closed when GitHub cannot be read.
+- **PR guard (previews)**: a preview is kept when its identifier matches an open pull request (head branch, or `pr-<n>` style) or a branch with commits in the last N hours (default 24)
+  on the mapped repository. Names are compared exactly and with separators normalized (`feat/login` = `feat-login`). "Branch gone" is concluded only from the full branch list, never from
+  one missing name. Open pull requests and branches are re-read at delete time. Lists above 1000 entries, an unreadable repository, a missing token or repository, and a preview without
+  an identifier all fail closed.
+- **An expiry is a delayed delete.** An expiry sooner than the activity window follows the same guards and counts against the run's deletion cap. The reaper applies its own policy (below).
+- **Delete outcome**: a delete that fails or goes unanswered is checked against Convex; if the deployment is gone it is reported as deleted, otherwise as unconfirmed, never as a clean failure.
+- **Lookups**: "does not exist", "not reachable" and "belongs to another company or an unmapped project" return the same message, so deployment names cannot be probed.
 
 ## 4. Slice plan (stacked PRs)
 
@@ -239,8 +247,11 @@ Hourly job `convex-reaper` (also `reaper.run` and the `convex_reap_previews` too
 
 1. keeps anything classified staging or production, anything with an open PR or a recently active branch, and anything it cannot check;
 2. deletes previews whose PR is closed or merged, or whose branch is gone and whose last deploy is older than `guards.activityHours`;
-3. sets `expiresAt = lastDeployTime + ttlHours` on kept previews, shortening only. When that moment is less than an hour away (a guarded preview that has been idle),
-   the reaper does not schedule it, because Convex would delete a guarded preview. It only gives a preview without any expiry `now + ttlHours`;
+3. sets `expiresAt = lastDeployTime + ttlHours` on kept previews. It shortens an expiry, and it moves an expiry later after a redeploy only when that expiry is one the reaper set
+   itself (it remembers them); an expiry a person chose is never extended. When the new moment is less than an hour away (a guarded preview idle for almost `ttlHours`), the reaper does
+   not schedule it; it only gives a preview without any expiry `now + ttlHours`. Convex measures its own default expiry from creation and its docs do not say that a redeploy resets it, so the
+   reaper does not rely on that. **Policy note:** as specified, a preview with an open pull request that is not redeployed for `ttlHours` expires and the next push recreates it;
+   `guards.activityHours` keeps branches with recent commits from being deleted by the reaper, not from expiring;
 4. counts all team deployments against `reaper.quota` and raises an issue (once a day) and an activity entry at `reaper.alertPercent`.
 
 It is a dry run until `reaper.enabled` is true. When GitHub cannot be read for a project, it changes nothing in that project.
