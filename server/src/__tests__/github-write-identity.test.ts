@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  attachGitHubCaller,
   classifyGitHubOperation,
   parseGitHubOperation,
   readGitHubOperation,
@@ -359,6 +360,44 @@ describe("security review round 5 (attack regressions)", () => {
     }
     expect(classifyGitHubOperation({ program: "gh", args: ["api", "graphql", "-f", 'query=mutation{updatePullRequest(input:{pullRequestId:"x",baseRefName:"main"}){clientMutationId}}'], remote: origin }).denied)
       .toMatch(/cannot check the GraphQL mutation updatePullRequest/);
+  });
+
+  describe("the run that sent an operation", () => {
+    const origin = "https://github.com/Acme/Site.git";
+    const agentId = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01", runId = "7c2d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f", other = "00000000-0000-4000-8000-000000000000";
+    const body = { program: "git", args: ["push", "origin", "feature/x"], remote: origin, pushUrls: [origin], currentBranch: "feature/x", shas: ["a".repeat(40)], touchesWorkflows: true };
+    const run = { companyId: "company-1", agentId, runId, issueId: "issue-1" };
+
+    it("never reads the agent or the run from the launcher's report, whatever the report says", () => {
+      const parsed = parseGitHubOperation({ operation: { ...body, caller: { agentId: other, runId: other }, agentId: other, runId: other } })!;
+      expect(parsed).not.toHaveProperty("caller");
+      expect(parsed).not.toHaveProperty("agentId");
+      expect(parsed).not.toHaveProperty("runId");
+      expect(classifyGitHubOperation(parsed)).not.toHaveProperty("caller");
+    });
+
+    it("takes them from the run the server authenticated, and nothing else of the run", () => {
+      const reported = attachGitHubCaller(parseGitHubOperation({ operation: body }), run) as Exclude<ReturnType<typeof attachGitHubCaller>, string | null>;
+      expect(reported.caller).toEqual({ agentId, runId });
+      expect(classifyGitHubOperation(reported)).toMatchObject({ caller: { agentId, runId } });
+      // A report the server could not read, or none, has nothing to attach to.
+      expect(attachGitHubCaller(null, run)).toBeNull();
+      expect(attachGitHubCaller(readGitHubOperation({ operation: { args: 1 } }), run)).toBe("unreadable");
+    });
+
+    it("sends them to the plugin with the other write-identity parameters, and only when the server set them", async () => {
+      const calls: Array<Record<string, any>> = [];
+      registerGitHubWriteIdentityWorkers({ call: async (_plugin: string, _method: string, input: any) => { calls.push(input.params); return { identity: "user", unavailable: "stop here" }; } } as any);
+      try {
+        const record = { pluginId: "plugin-github", ready: true, policy: "invalid", manifest: { projectRepositories: { writeIdentityAction: "repository-write-identity" } } } as any;
+        const operation = parseGitHubOperation({ operation: { ...body, caller: { agentId: other, runId: other } } })!;
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: classifyGitHubOperation(attachGitHubCaller(operation, run) as typeof operation) }, record);
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: classifyGitHubOperation(operation) }, record);
+        expect(calls[0]).toMatchObject({ companyId: "company-1", repository: "acme/site", privileged: ["editWorkflows"], agentId, runId });
+        expect(calls[1]).not.toHaveProperty("agentId");
+        expect(calls[1]).not.toHaveProperty("runId");
+      } finally { registerGitHubWriteIdentityWorkers(null); }
+    });
   });
 
   describe("workflow changes of a push", () => {

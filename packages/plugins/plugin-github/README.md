@@ -305,6 +305,25 @@ turns writes off; fix it, then save the policy with `"enabled": true` again.
 The kill switch is the same save with `"enabled": false`: writes stop at the
 next command, reads continue.
 
+`editWorkflows` and `workflowDispatch` can be handed to chosen agents instead of
+the whole company. Only an instance administrator can change them (an agent
+never can), and each change and each allowed workflow push or dispatch is recorded
+in the activity feed. `editWorkflows` also covers the Git Data API (`gh api` writes
+to `git/blobs`, `git/trees`, `git/commits`, and creating or moving a branch ref):
+use `git push` where an agent has no grant. The write identity settings in the plugin page show the same
+choice as *Workflow permissions*.
+
+```sh
+# Grant one agent (it must belong to the company); the rest of the policy is untouched.
+# The scope replaces the whole list: to add an agent, send the agents already granted too.
+paperclipai plugin action "$PLUGIN" write-identity.grant -C "$ANTHM" \
+  --params-json '{"action":"editWorkflows","scope":{"agentIds":["'"$AGENT_ID"'"]}}' --json
+# Every agent of the company (the old value `true`), or nobody:
+#   "scope": true      "scope": false
+# The company's agents, to find an ID:
+paperclipai plugin action "$PLUGIN" write-identity.agents -C "$ANTHM" --params-json '{}' --json
+```
+
 ## Native tasks and synchronization
 ## Native tasks and synchronization
 

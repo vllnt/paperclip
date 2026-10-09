@@ -5,7 +5,7 @@ import { GITHUB_WRITE_IDENTITY_STATE, parseGitHubWriteIdentityPolicy } from "@pa
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
-import { registerGitHubWriteIdentityWorkers } from "../services/github-write-identity.js";
+import { attachGitHubCaller, readGitHubOperation, registerGitHubWriteIdentityWorkers } from "../services/github-write-identity.js";
 
 // The broker runs for real on real rows; only the credential store behind it and the GitHub plugin worker are doubles.
 // The plugin double records what the broker asks it, which is the point: the launcher's workflow paths must reach the plugin.
@@ -24,6 +24,7 @@ const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("a push's workflow paths reach the GitHub plugin through the broker", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
+  let pluginId: string | undefined;
   const asked: Array<Record<string, any>> = [];
 
   beforeAll(async () => {
@@ -51,13 +52,14 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", contextSnapshot: { issueId, projectId } });
     await initializeRunIdentity(db, { companyId, runId, responsibleUserId: "accepted-author", issueId, cause: "instruction" });
     // The company writes as its App user, through an installed GitHub plugin that declares the write identity action.
-    const [plugin] = await db.insert(plugins).values({
-      pluginKey: `github-${companyId}`, packageName: "@vllnt/paperclip-github", version: "0.0.0", status: "ready",
+    // One plugin owns the write identity for the instance (the server refuses more than one); companies differ by their saved policy.
+    pluginId ??= (await db.insert(plugins).values({
+      pluginKey: "github", packageName: "@vllnt/paperclip-github", version: "0.0.0", status: "ready",
       manifestJson: { projectRepositories: { writeIdentityAction: "repository-write-identity" } } as any,
-    }).returning();
+    }).returning())[0]!.id;
     const permissions = { contents: "write", metadata: "read", pull_requests: "write" };
     await db.insert(pluginState).values({
-      pluginId: plugin!.id, scopeKind: "company", scopeId: companyId, ...GITHUB_WRITE_IDENTITY_STATE,
+      pluginId, scopeKind: "company", scopeId: companyId, ...GITHUB_WRITE_IDENTITY_STATE,
       valueJson: parseGitHubWriteIdentityPolicy({
         default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "app", allowedRepositories: ["acme/site"],
         installationRepositories: ["acme/site"], userLogin: "agent-owner", installationPermissions: permissions,
@@ -91,6 +93,47 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(asked).toHaveLength(2);
     expect(asked[1]).toMatchObject({ privileged: ["editWorkflows"] });
     expect(asked[1]).not.toHaveProperty("workflowPush");
+  });
+
+  it("tells the plugin which agent and run sent the push, from the run's own token and not from the report", async () => {
+    const run = await seed();
+    const forged = readGitHubOperation({ operation: { ...push(), caller: { agentId: randomUUID(), runId: randomUUID() }, agentId: randomUUID(), runId: randomUUID() } });
+    await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(forged, run));
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ companyId: run.companyId, agentId: run.agentId, runId: run.runId, privileged: ["editWorkflows"] });
+    // Reported without the server's help, a push names no agent, so a scoped grant matches nobody.
+    await resolveGitHubOperationCredentials(db, run, readGitHubOperation({ operation: { ...push(), caller: { agentId: run.agentId, runId: run.runId }, agentId: run.agentId } }));
+    expect(asked).toHaveLength(2);
+    expect(asked[1]).not.toHaveProperty("agentId");
+    expect(asked[1]).not.toHaveProperty("runId");
+  });
+
+  it("asks the plugin for editWorkflows on each Git Data API call that builds a workflow file, with the run's agent and the endpoint it used", async () => {
+    const run = await seed();
+    const api = (...args: string[]) => ({ program: "gh" as const, args: ["api", ...args] });
+    const calls = [
+      api("-X", "POST", "repos/Acme/Site/git/blobs", "-f", "content=on: push"),
+      api("-X", "POST", "repos/Acme/Site/git/trees", "-f", "tree[][path]=.github/workflows/evil.yml", "-f", "tree[][mode]=120000", "-f", "tree[][sha]=abc"),
+      api("-X", "POST", "repos/Acme/Site/git/commits", "-f", "message=x", "-f", "tree=abc"),
+      api("-X", "PATCH", "repos/Acme/Site/git/refs/heads/feature", "-f", "sha=abc"),
+    ];
+    for (const call of calls) await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: call }), run));
+    expect(asked).toHaveLength(4);
+    expect(asked.map(question => question.route)).toEqual(["git/blobs", "git/trees", "git/commits", "git/refs/heads/feature"]);
+    expect(asked.map(question => question.action)).toEqual(["commit", "commit", "commit", "push"]);
+    for (const question of asked) {
+      expect(question).toMatchObject({ companyId: run.companyId, repository: "acme/site", access: "write", privileged: ["editWorkflows"], agentId: run.agentId, runId: run.runId });
+    }
+    // A route in the launcher's report is not read: only the one the server worked out reaches the plugin, and only for these writes.
+    asked.length = 0;
+    await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: { ...api("-X", "PUT", "repos/Acme/Site/contents/README.md", "-f", "message=x", "-f", "branch=docs"), route: "git/trees" } }), run));
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ action: "commit", privileged: [] });
+    expect(asked[0]).not.toHaveProperty("route");
+    // Deleting a ref and reading objects never ask for editWorkflows.
+    asked.length = 0;
+    await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: api("-X", "DELETE", "repos/Acme/Site/git/refs/heads/feature") }), run));
+    expect(asked[0]).toMatchObject({ action: "push", privileged: [] });
   });
 
   it("never asks the plugin about a push that is refused whatever the toggles, a release tag with workflow changes included", async () => {

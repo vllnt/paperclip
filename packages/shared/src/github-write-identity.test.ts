@@ -3,7 +3,9 @@ import {
   DEFAULT_GITHUB_PRIVILEGED_TOGGLES,
   DEFAULT_GITHUB_WRITE_IDENTITY_POLICY,
   classifyGitHubCommand,
+  describeGitHubPrivilegedScope,
   ghCommandMayWrite,
+  isGitHubPrivilegedAllowed,
   parseGhCommand,
   gitNetworkArguments,
   gitPushDestinations,
@@ -61,6 +63,69 @@ describe("parseGitHubWriteIdentityPolicy", () => {
       .toMatchObject({ tagPush: true, adminMerge: false, release: false });
     expect(() => parseGitHubWriteIdentityPolicy({ ...anthm, privileged: { deploy: true } })).toThrow(/deploy/);
     expect(() => parseGitHubWriteIdentityPolicy({ ...anthm, privileged: { release: "yes" } })).toThrow(/release/);
+  });
+
+  describe("per-agent grants of editWorkflows and workflowDispatch", () => {
+    const dx = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01", other = "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
+    const parsed = (privileged: unknown) => parseGitHubWriteIdentityPolicy({ ...anthm, privileged }).privileged;
+
+    it("accepts false, true or a list of agents for those two actions, and keeps the legacy values as they were", () => {
+      expect(parsed({ editWorkflows: true })).toMatchObject({ editWorkflows: true, workflowDispatch: true });
+      expect(parsed({ editWorkflows: false, workflowDispatch: false })).toMatchObject({ editWorkflows: false, workflowDispatch: false });
+      expect(parsed({ editWorkflows: { agentIds: [dx] }, workflowDispatch: { agentIds: [dx, other] } }))
+        .toMatchObject({ editWorkflows: { agentIds: [dx] }, workflowDispatch: { agentIds: [other, dx].sort() } });
+      // An unset action keeps its default, and an empty list grants nobody, which is the same as false.
+      expect(parsed({ editWorkflows: { agentIds: [] } })).toMatchObject({ editWorkflows: false, workflowDispatch: true });
+      expect(parsed({})).toMatchObject({ editWorkflows: false, workflowDispatch: true });
+    });
+
+    it("normalizes the agent IDs, so that saving a saved policy changes nothing", () => {
+      const once = parsed({ editWorkflows: { agentIds: [dx.toUpperCase(), dx, other] } });
+      expect(once.editWorkflows).toEqual({ agentIds: [other, dx].sort() });
+      expect(parseGitHubWriteIdentityPolicy({ ...anthm, privileged: once }).privileged).toEqual(once);
+    });
+
+    it("refuses a list on any other action, a list that is not exactly agent IDs, and anything else", () => {
+      for (const action of ["adminMerge", "deploymentApproval", "release", "tagPush", "pushToMain", "wiki"]) {
+        expect(() => parsed({ [action]: { agentIds: [dx] } }), action).toThrow(new RegExp(action));
+      }
+      for (const [label, scope] of [
+        ["a string", "agent"], ["null", null], ["a number", 1], ["an array", [dx]], ["an unknown key", { agentIds: [dx], companyWide: true }],
+        ["no list", {}], ["a list that is no list", { agentIds: dx }], ["an agent name", { agentIds: ["Anthm DX"] }], ["a short ID", { agentIds: ["5f0f6f1c"] }],
+        ["a non-string ID", { agentIds: [7] }], ["too many agents", { agentIds: Array.from({ length: 101 }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`) }],
+      ] as const) {
+        expect(() => parsed({ editWorkflows: scope }), label).toThrow(/editWorkflows/);
+      }
+    });
+
+    it("answers for one agent: company-wide values are the same for everyone, a list names its agents, and an unknown agent is never granted", () => {
+      const toggles = (editWorkflows: unknown, workflowDispatch: unknown = true) => parsed({ editWorkflows, workflowDispatch });
+      for (const agent of [dx, other, null, undefined]) {
+        expect(isGitHubPrivilegedAllowed(toggles(true), "editWorkflows", agent), String(agent)).toBe(true);
+        expect(isGitHubPrivilegedAllowed(toggles(false), "editWorkflows", agent), String(agent)).toBe(false);
+      }
+      const scoped = toggles({ agentIds: [dx] });
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", dx)).toBe(true);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", dx.toUpperCase())).toBe(true);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", other)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", null)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", undefined)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", "")).toBe(false);
+      // The grant is for that action only.
+      expect(isGitHubPrivilegedAllowed(scoped, "workflowDispatch", other)).toBe(true);
+      expect(isGitHubPrivilegedAllowed(toggles(false, { agentIds: [dx] }), "editWorkflows", dx)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(toggles(false, { agentIds: [dx] }), "workflowDispatch", other)).toBe(false);
+      // Every other action is a plain switch.
+      expect(isGitHubPrivilegedAllowed(scoped, "tagPush", dx)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "adminMerge", other)).toBe(true);
+    });
+
+    it("tells who holds a scope in words", () => {
+      expect(describeGitHubPrivilegedScope(true)).toBe("on for every agent");
+      expect(describeGitHubPrivilegedScope(false)).toBe("off");
+      expect(describeGitHubPrivilegedScope({ agentIds: [dx] })).toBe("granted to 1 agent");
+      expect(describeGitHubPrivilegedScope({ agentIds: [dx, other] })).toBe("granted to 2 agents");
+    });
   });
 
   it("normalizes the allowlist, folds wikis and defaults the throttle, kill switch and footer", () => {
@@ -237,7 +302,7 @@ describe("classifyGitHubCommand", () => {
     expect(classifyGitHubCommand("gh", ["api", "repos/o/r/git/refs", "-fref=refs/tags/pkg@1", "-fsha=abc"]).denied).toMatch(/release workflow/);
     expect(classifyGitHubCommand("gh", ["api", "repos/o/r/git/refs", "--input", "body.json"]).denied).toMatch(/Name this request's fields/);
     expect(classifyGitHubCommand("gh", ["api", "-X", "POST", "repos/o/r/releases", "--input", "release.json"]).denied).toMatch(/Name this request's fields/);
-    expect(classifyGitHubCommand("gh", ["api", "-X", "PATCH", "repos/o/r/git/refs/heads%2Fmain", "-f", "sha=abc"])).toEqual(write("push", "pushToMain"));
+    expect(classifyGitHubCommand("gh", ["api", "-X", "PATCH", "repos/o/r/git/refs/heads%2Fmain", "-f", "sha=abc"])).toEqual({ ...write("push", "editWorkflows", "pushToMain"), route: "git/refs/heads/main" });
     expect(classifyGitHubCommand("gh", ["api", "-X", "POST", "https://evil.example/repos/o/r/issues"]).denied).toMatch(/only to github\.com/);
     expect(classifyGitHubCommand("gh", ["api", "-X", "POST", "repos/o/r/check-runs/9/rerequest"])).toEqual(write("other", "workflowDispatch"));
     // Release tags behind value flags or --tag.
@@ -285,11 +350,11 @@ describe("classifyGitHubCommand", () => {
     [["api", "-X", "POST", "repos/o/r/actions/workflows/deploy.yml/dispatches", "-f", "ref=main"], write("other", "workflowDispatch")],
     [["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v1"], write("other", "release")],
     [["api", "repos/o/r/git/refs", "-f", "ref=refs/tags/v1", "-f", "sha=abc"], write("push", "tagPush")],
-    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc"], write("push", "pushToMain")],
+    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc"], { ...write("push", "editWorkflows", "pushToMain"), route: "git/refs/heads/main" }],
     [["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat"], write("push")],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "message=x", "-f", "content=eA=="], write("commit", "pushToMain")],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "branch=docs", "-f", "message=x"], write("commit")],
-    [["api", "-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs"], write("commit", "editWorkflows")],
+    [["api", "-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs"], { ...write("commit", "editWorkflows"), route: "contents/.github/workflows/ci.yml" }],
     [["api", "-H", "Accept: application/json", "repos/o/r/pulls"], read],
     [["api", "graphql", "-f", 'query=mutation{resolveReviewThread(input:{threadId:"T"}){clientMutationId}}'], write("comment")],
     [["api", "graphql", "-f", "query=query{viewer{login}}"], read],
@@ -764,6 +829,63 @@ describe("security review round 4 (attack regressions)", () => {
       expect(classifyGitHubCommand("gh", ["api", "graphql", "-f", `query=mutation{${mutation}(input:{pullRequestId:"x"}){clientMutationId}}`]).denied, mutation).toMatch(/cannot check the GraphQL mutation/);
     }
     expect(classifyGitHubCommand("git", ["push", "origin", "HEAD:main"]).privileged).toContain("pushToMain");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Git Data API: a workflow file can be built object by object and a ref pointed at it, with no `git push` to inspect.
+// ---------------------------------------------------------------------------
+
+describe("git data API writes need editWorkflows (a workflow edit without git push)", () => {
+  const api = (...args: string[]) => classifyGitHubCommand("gh", ["api", ...args]);
+  const needsWorkflows = (action: string, route: string, ...more: string[]) => ({ access: "write", action, privileged: ["editWorkflows", ...more], route });
+
+  it("holds each call of the four-call sequence, on a branch that is not the default branch", () => {
+    // 1. a blob, 2. a tree that puts a file (or a symlink, mode 120000) under .github/workflows, 3. a commit on that tree, 4. the ref that uses it.
+    expect(api("-X", "POST", "repos/o/r/git/blobs", "-f", "content=on: push", "-f", "encoding=utf-8")).toEqual(needsWorkflows("commit", "git/blobs"));
+    expect(api("-X", "POST", "repos/o/r/git/trees", "-f", "tree[][path]=.github/workflows/evil.yml", "-f", "tree[][mode]=100644", "-f", "tree[][type]=blob", "-f", "tree[][sha]=abc")).toEqual(needsWorkflows("commit", "git/trees"));
+    expect(api("-X", "POST", "repos/o/r/git/trees", "-f", "tree[][path]=.github/workflows/evil.yml", "-f", "tree[][mode]=120000", "-f", "tree[][type]=blob", "-f", "tree[][sha]=abc")).toEqual(needsWorkflows("commit", "git/trees"));
+    expect(api("-X", "POST", "repos/o/r/git/commits", "-f", "message=x", "-f", "tree=abc", "-f", "parents[]=def")).toEqual(needsWorkflows("commit", "git/commits"));
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/feature"));
+    expect(api("repos/o/r/git/refs", "-f", "ref=refs/heads/feature", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/feature"));
+  });
+
+  it("does not need the body to be readable: a tree sent from a file is held the same", () => {
+    expect(api("-X", "POST", "repos/o/r/git/trees", "--input", "tree.json")).toEqual(needsWorkflows("commit", "git/trees"));
+    expect(api("-X", "POST", "repos/o/r/git/commits", "-F", "message=@m.txt")).toEqual(needsWorkflows("commit", "git/commits"));
+  });
+
+  it("holds every spelling GitHub routes to the same endpoint", () => {
+    for (const path of ["repos/o/r/git/trees/", "repos/o/r//git/trees", "repos/o/r/./git/trees", "/repos/o/r/git/%74rees", "https://api.github.com/repos/o/r/git/trees"]) {
+      expect(api("-X", "POST", path), path).toMatchObject({ privileged: ["editWorkflows"], route: "git/trees" });
+    }
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/heads%2Ffeature", "-f", "sha=abc")).toMatchObject({ privileged: ["editWorkflows"], route: "git/refs/heads/feature" });
+  });
+
+  it("keeps the default branch's pushToMain next to it, and the other toggles as they were", () => {
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/main", "pushToMain"));
+    expect(api("-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/heads/main", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/main", "pushToMain"));
+    // A tag ref is held by tagPush (and refused for a release tag); an annotated tag object by tagPush too.
+    expect(api("-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v1", "-f", "sha=abc")).toEqual({ access: "write", action: "push", privileged: ["tagPush"] });
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/tags/v1", "-f", "sha=abc")).toEqual({ access: "write", action: "push", privileged: ["tagPush"] });
+    expect(api("-X", "POST", "repos/o/r/git/tags", "-f", "tag=v1", "-f", "object=abc")).toEqual({ access: "write", action: "commit", privileged: ["tagPush"] });
+  });
+
+  it("lets a ref be deleted and the objects be read: neither adds content", () => {
+    expect(api("-X", "DELETE", "repos/o/r/git/refs/heads/feature")).toEqual({ access: "write", action: "push", privileged: [] });
+    for (const path of ["repos/o/r/git/trees/abc?recursive=1", "repos/o/r/git/blobs/abc", "repos/o/r/git/commits/abc", "repos/o/r/git/refs/heads/feature", "repos/o/r/git/matching-refs/heads"]) {
+      expect(api(path), path).toEqual({ access: "read", action: null, privileged: [] });
+    }
+  });
+
+  it("still refuses a ref it cannot read, and a placeholder, whatever the toggles", () => {
+    expect(api("-X", "POST", "repos/o/r/git/refs", "-F", "ref=@ref.txt", "-f", "sha=abc").denied).toMatch(/Name the ref|fields with -f/);
+    expect(api("-X", "PATCH", "repos/{owner}/{repo}/git/refs/heads/{branch}", "-f", "sha=abc").denied).toMatch(/instead of gh placeholders/);
+  });
+
+  it("holds a workflow file written through the contents API with the same receipt", () => {
+    expect(api("-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs", "-f", "message=x")).toEqual(needsWorkflows("commit", "contents/.github/workflows/ci.yml"));
+    expect(api("-X", "PUT", "repos/o/r/contents/README.md", "-f", "branch=docs", "-f", "message=x")).toEqual({ access: "write", action: "commit", privileged: [] });
   });
 });
 

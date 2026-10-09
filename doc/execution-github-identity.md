@@ -248,12 +248,101 @@ admin-merge guard; and the throttle (`perMinute`, `perHour` per GitHub user).
 |---|---|---|
 | `adminMerge` | `gh pr merge --admin`, `PUT …/pulls/N/merge` | on |
 | `deploymentApproval` | `POST …/actions/runs/N/pending_deployments`, creating deployments or deployment statuses | on |
-| `workflowDispatch` | `gh workflow run/enable/disable`, `gh run rerun/cancel`, `…/dispatches`, run reruns | on |
+| `workflowDispatch` | `gh workflow run/enable/disable`, `gh run rerun/cancel`, `…/dispatches`, run reruns | on (can be granted to chosen agents) |
 | `wiki` | any command on a `.wiki` remote | on |
 | `release` | `gh release` writes, `…/releases` writes | off |
 | `tagPush` | pushes to `refs/tags/*`, tag refs through the API | off |
 | `pushToMain` | pushes or API writes to `main`/`master`, `gh repo sync`, `merge-upstream` | off |
-| `editWorkflows` | a push whose new commits change `.github/workflows/**`, contents API writes there | off |
+| `editWorkflows` | a push whose new commits change `.github/workflows/**`, contents API writes there, Git Data API writes (blobs, trees, commits, and creating or moving a branch ref) | off (can be granted to chosen agents) |
+
+**The Git Data API counts as a workflow edit.** `gh api` can build a commit
+object by object (`git/blobs`, `git/trees`, `git/commits`) and then point a
+branch at it (`git/refs`), and nothing ties the paths in a tree to the ref that
+later uses it. A tree can also be sent from a file, which Paperclip cannot
+read. So every write to `git/blobs`, `git/trees` and `git/commits`, and every
+`POST git/refs` or `PATCH git/refs/<ref>` that is not for a tag, needs
+`editWorkflows`, whichever paths it carries. A tag ref stays under `tagPush`.
+Deleting a ref, and every read, need nothing extra. A branch created or moved
+this way needs the grant even when the commit already exists. Use `git push`
+where the agent has no grant: the launcher reports what that push changes, so
+an ordinary push of other files needs no grant. Before this check a Git Data
+sequence could install a workflow with no grant (it was a plain commit and a plain
+push), on any branch.
+
+**Defaults.** `workflowDispatch` stays on by default, for every agent, and
+`true` keeps its old meaning. A company with no saved policy has no plugin check
+at all: its runs write as their own GitHub user, GitHub decides what that user
+may do, and the plugin never gives the App's credential for a write there (not
+for a workflow edit either, and the App's token is not granted Workflows write).
+
+**Per-agent grants.** `workflowDispatch` and `editWorkflows` are not only
+company-wide switches. In `privileged`, each takes `false` (nobody), `true`
+(every agent of the company, the value policies had before) or
+`{ "agentIds": ["<agent id>", …] }` (only those agents; at most 100, each an
+agent UUID, saved lowercased, sorted and without duplicates; an empty list is
+`false`). The other privileged actions stay plain switches.
+
+- **Who is calling comes from the server.** The server takes the agent and run
+  from the run's own signed token and sends them to the plugin with each
+  managed command. The launcher's report cannot name them: the report schema
+  has no such field and drops one. The plugin tools take the agent from the
+  run they execute in. A command that names no known agent, and a board
+  action in the plugin (no agent), is never in a list.
+- **Companies do not share grants.** A run is checked against its own
+  company's policy, so listing an agent of another company grants nothing.
+- **Only a board administrator changes a scope.** The plugin action
+  `write-identity.grant` (`{ "action": "editWorkflows" | "workflowDispatch",
+  "scope": false | true | { "agentIds": [...] } }`) needs an instance
+  administrator of the company, and checks that each listed agent belongs to
+  the company. The same call is the API and the CLI (`paperclipai plugin action
+  <plugin> write-identity.grant -C <company> --params-json '…'`); the plugin's
+  write identity settings show it as *Workflow permissions*. An agent cannot
+  call it, nor save the policy (`write-identity.set`), whatever it claims to be.
+  The change is recorded (`github.privileged_grant_changed`: the action, the
+  previous and the new scope, and who changed it). The policy is saved first and
+  the record follows: if the record cannot be written, the call fails and the
+  change is already in force. It changes that one value of a saved policy, and
+  nothing else in it.
+- **A refusal says how to get the permission.** It tells the agent that it has
+  no board grant, names the board action, and, when the permission is held by a
+  list of agents, carries the agent's ID to paste. A grant replaces the whole
+  list, so the refusal says to keep the agents that are already in it: pasting
+  only the one ID would take the others' grants away. The refusal is the same
+  for a board action in the plugin (a person, not an agent): it still says
+  "this agent", and a scoped permission is never held by a board action.
+- **Allowed workflow pushes and dispatches are recorded.** In a company with a
+  saved policy, every `editWorkflows` write that the policy allows writes
+  `github.workflow_push_allowed` (the agent, the run, the repository, and
+  whether an agent grant, a company-wide value, or the base-branch exception
+  allowed it), and every `workflowDispatch` that it allows writes
+  `github.workflow_dispatch_allowed` (the agent, the run, the repository and the
+  company), the default `true` included. This includes writes that a company-wide
+  value allowed before: if the activity log cannot take the record, such a write
+  is refused too. A board action in the plugin (a person, not an agent) is
+  recorded with no agent. The branch, pushed commit and workflow paths of a
+  push are the ones the checkout reported. A push it does not report (several
+  refs, a tag, more history than it reports) is recorded with those three fields
+  `null`. A `gh api` write (the contents API under `.github/workflows`, or the
+  Git Data API) has no checkout report, so its entry has `null` there and a
+  `route` instead: the endpoint it used, for example `git/trees` or
+  `git/refs/heads/feature`. For the App user the
+  record is written before the token is returned. For a company whose runs
+  write as their own user, it is written when the policy allows the command,
+  before the answer returns, and it says "allowed by the policy": the server can
+  still refuse that command afterwards, for example when the run has no user
+  connection. In both modes, an action that cannot be recorded is refused.
+- **A grant is Paperclip's check, not GitHub's.** It decides which agents the
+  managed `git` and `gh` path lets through. With the App user (`userSource:
+  "app"`), the token that path hands out belongs to the company's App user and
+  is the same for every agent, so an agent that captures it (see the limits
+  below) can edit workflow files whatever the list says; editing them at all
+  needs the App's Workflows write permission, so keep that off wherever no agent
+  should ever do it. When runs write as their own user, the token is the run
+  user's, and GitHub decides what it may do.
+- **Rolling back.** A policy that holds a list is not valid for an older build
+  of the plugin or the server. Such a build cannot read the policy, and it
+  refuses every managed GitHub operation of that company, reads included. Set
+  the value back to `true` or `false` first.
 
 **Workflow files and the base branch.** A push whose new commits change
 `.github/workflows/**` needs `editWorkflows`, with one exception: an agent keeps
