@@ -48,7 +48,7 @@ import {
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { grokHomeHasUsableAuth, resolveManagedGrokHomeDir, stageGrokHomeForSync } from "./grok-home.js";
-import { isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
+import { classifyGrokFailure, isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -653,6 +653,10 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         stderrLine ||
         `Grok exited with code ${attempt.proc.exitCode ?? -1}`;
 
+      const failure = failed && !attempt.proc.timedOut
+        ? classifyGrokFailure({ errorMessage: fallbackErrorMessage, stderr: attempt.proc.stderr })
+        : null;
+
       const canFallbackToRuntimeSession = !isRetry;
       const resolvedSessionId = attempt.parsed.sessionId
         ?? (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
@@ -676,6 +680,9 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         signal: attempt.proc.signal,
         timedOut: attempt.proc.timedOut,
         errorMessage: attempt.proc.timedOut ? `Timed out after ${timeoutSec}s` : failed ? fallbackErrorMessage : null,
+        ...(failure?.errorCode ? { errorCode: failure.errorCode } : {}),
+        ...(failure?.errorFamily ? { errorFamily: failure.errorFamily } : {}),
+        ...(failure?.retryNotBefore ? { retryNotBefore: failure.retryNotBefore } : {}),
         usage: {
           inputTokens: attempt.parsed.inputTokens,
           outputTokens: attempt.parsed.outputTokens,
@@ -700,6 +707,8 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
           finalResponseRecorded: attempt.parsed.stopReason === "EndTurn" && Boolean(attempt.parsed.summary?.trim()),
           requestId: attempt.parsed.requestId,
           ...(failed ? { stderr: attempt.proc.stderr } : {}),
+          ...(failure?.errorFamily ? { errorFamily: failure.errorFamily } : {}),
+          ...(failure?.retryNotBefore ? { retryNotBefore: failure.retryNotBefore } : {}),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !resolvedSessionId),
