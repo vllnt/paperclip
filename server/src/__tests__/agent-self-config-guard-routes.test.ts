@@ -24,6 +24,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { accessRoutes } from "../routes/access.js";
 import { agentRoutes } from "../routes/agents.js";
+import { builtInAgentService } from "../services/built-in-agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -591,12 +592,9 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     expect(await deniedActivity(db, agentId)).toHaveLength(0);
   });
 
-  it.each([
-    { label: "company-wide", scope: null },
-    { label: "scoped to itself", scope: "self" },
-  ])("keeps today's behaviour for an agent holding a $label agents:configure grant", async ({ scope }) => {
+  it("keeps today's behaviour for an agent holding an agents:configure grant that names itself", async () => {
     const { companyId, agentId } = await seedAgent(db);
-    await grantAgentConfigure(db, companyId, agentId, scope === "self" ? { agentIds: [agentId] } : null);
+    await grantAgentConfigure(db, companyId, agentId, { agentIds: [agentId] });
 
     const res = await request(createApp(db, agentActor(companyId, agentId)))
       .patch(`/api/agents/${agentId}`)
@@ -610,6 +608,125 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     expect(after.adapterConfig).toMatchObject({ model: "large-model" });
     expect(after.runtimeConfig).toMatchObject({ heartbeat: { maxDailyRuns: 50 } });
     expect(await deniedActivity(db, agentId)).toHaveLength(0);
+  });
+
+  describe("an agent holding the company-wide agents:configure grant", () => {
+    const SELF_EDITS = [
+      { label: "run caps", body: { runtimeConfig: { heartbeat: { ...STORED_RUNTIME_CONFIG.heartbeat, maxDailyRuns: 50_000, maxConcurrentRuns: 40 } } }, fields: ["runtimeConfig.heartbeat.maxConcurrentRuns", "runtimeConfig.heartbeat.maxDailyRuns"] },
+      { label: "model", body: { adapterConfig: { model: "large-model" } }, fields: ["adapterConfig.model"] },
+      { label: "budget", body: { budgetMonthlyCents: 9_999_999 }, fields: ["budgetMonthlyCents"] },
+    ];
+
+    /** Seeds the root CEO and gets its company-wide agents:configure grant from the code that applies it by default. */
+    async function seedRootCeoWithDefaultGrant() {
+      const { companyId, agentId } = await seedAgent(db, { role: "ceo" });
+      await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+      const [grant] = await db
+        .select()
+        .from(principalPermissionGrants)
+        .where(and(eq(principalPermissionGrants.principalId, agentId), eq(principalPermissionGrants.permissionKey, "agents:configure")));
+      expect(grant, "the default grant exists and is company-wide").toMatchObject({ scope: null });
+      return { companyId, agentId };
+    }
+
+    it.each(SELF_EDITS)("cannot change its own $label, and logs the denial", async ({ body, fields }) => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+      const before = await readAgent(db, agentId);
+
+      const res = await request(createApp(db, agentActor(companyId, agentId))).patch(`/api/agents/${agentId}`).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", reason: "deny_scope", fields });
+      const after = await readAgent(db, agentId);
+      expect(after).toMatchObject({
+        adapterConfig: before.adapterConfig,
+        runtimeConfig: before.runtimeConfig,
+        budgetMonthlyCents: before.budgetMonthlyCents,
+        permissions: before.permissions,
+      });
+      expect((await deniedActivity(db, agentId))[0]).toMatchObject({
+        actorId: agentId,
+        details: { surface: "patch", fields, reason: "deny_scope" },
+      });
+    });
+
+    it("cannot change its own permissions, and logs the denial", async () => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+
+      const res = await request(createApp(db, agentActor(companyId, agentId)))
+        .patch(`/api/agents/${agentId}/permissions`)
+        .send({ canCreateAgents: true, canAssignTasks: false });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields: expect.arrayContaining(["permissions.canCreateAgents"]) });
+      expect((await deniedActivity(db, agentId))[0]).toMatchObject({ details: { surface: "permissions", reason: "deny_scope" } });
+    });
+
+    it("cannot roll back its own config to a higher cap either", async () => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+      await request(createApp(db, boardActor(companyId)))
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { ...STORED_ADAPTER_CONFIG, model: "large-model" } })
+        .expect(200);
+      await request(createApp(db, boardActor(companyId)))
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: STORED_ADAPTER_CONFIG })
+        .expect(200);
+      const revisions = await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agentId));
+      const highModel = revisions.find((revision) => isDeepStrictEqual(revision.afterConfig.adapterConfig, { ...STORED_ADAPTER_CONFIG, model: "large-model" }));
+      expect(highModel).toBeDefined();
+
+      const res = await request(createApp(db, agentActor(companyId, agentId)))
+        .post(`/api/agents/${agentId}/config-revisions/${highModel!.id}/rollback`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect((await readAgent(db, agentId)).adapterConfig).toMatchObject({ model: "small-model" });
+    });
+
+    it("still configures a peer", async () => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+      const peerId = await seedPeer(db, companyId);
+
+      const res = await request(createApp(db, agentActor(companyId, agentId)))
+        .patch(`/api/agents/${peerId}`)
+        .send({ adapterConfig: { model: "large-model" }, budgetMonthlyCents: 5_000 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await readAgent(db, peerId)).toMatchObject({ adapterConfig: { model: "large-model" }, budgetMonthlyCents: 5_000 });
+      expect(await deniedActivity(db, peerId)).toHaveLength(0);
+    });
+
+    it("can still be configured by the board", async () => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+
+      const res = await request(createApp(db, boardActor(companyId)))
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { model: "large-model" }, budgetMonthlyCents: 5_000 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await readAgent(db, agentId)).toMatchObject({ adapterConfig: { model: "large-model" }, budgetMonthlyCents: 5_000 });
+    });
+
+    it("cannot resume itself after a budget pause", async () => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+      await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, agentId));
+
+      const res = await request(createApp(db, agentActor(companyId, agentId))).post(`/api/agents/${agentId}/resume`).send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect((await readAgent(db, agentId)).status).toBe("paused");
+    });
+
+    it("can resume a paused peer", async () => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+      const peerId = await seedPeer(db, companyId);
+      await db.update(agents).set({ status: "paused", pauseReason: "manual" }).where(eq(agents.id, peerId));
+
+      const res = await request(createApp(db, agentActor(companyId, agentId))).post(`/api/agents/${peerId}/resume`).send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
   });
 
   describe("OpenClaw invite replay on an approved agent", () => {

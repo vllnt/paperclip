@@ -3046,11 +3046,14 @@ export function agentRoutes(
   ) {
     if (req.actor.type !== "agent") return;
 
+    const editsItself = req.actor.agentId === targetAgent.id;
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
-      scope: { requiresChangeGrant: true },
+      scope: editsItself
+        ? { requiresChangeGrant: true, targetAgentId: targetAgent.id, requireExplicitTargetGrant: true }
+        : { requiresChangeGrant: true },
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));

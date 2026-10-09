@@ -25,8 +25,12 @@ export type AgentProtectedChangeSurface =
 
 /**
  * Refuses a change to an agent's protected fields unless the actor holds a
- * direct `agents:configure` grant that covers the agent. Callers decide when
- * the check applies and compute the changed field names. A refusal records the
+ * direct `agents:configure` grant that covers the agent. An agent changing
+ * itself needs a grant that names it (`agentIds`); a company-wide grant, such
+ * as the one the root CEO gets by default, covers other agents but not itself,
+ * so only the board or a grant that names the agent lifts an agent's own caps.
+ * Callers decide when the check applies and compute the changed field names. A
+ * refusal records the
  * field names, never their values, through `recordDenial`, then returns 403
  * with code `agent_self_protected_config_change`.
  */
@@ -45,11 +49,16 @@ export async function assertAgentProtectedChangeGranted(input: {
   details?: Record<string, unknown>;
 }): Promise<void> {
   if (input.fields.length === 0) return;
+  const editsItself = input.actor.type === "agent" && input.actor.agentId === input.target.id;
   const decision = await input.decide({
     actor: input.actor,
     action: "agent_config:update",
     resource: { type: "agent", companyId: input.target.companyId, agentId: input.target.id },
-    scope: { requiresChangeGrant: true, targetAgentId: input.target.id },
+    scope: {
+      requiresChangeGrant: true,
+      targetAgentId: input.target.id,
+      ...(editsItself ? { requireExplicitTargetGrant: true } : {}),
+    },
   });
   if (decision.allowed) return;
 

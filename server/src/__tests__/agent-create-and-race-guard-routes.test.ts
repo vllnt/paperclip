@@ -113,13 +113,13 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
     return agent!.id;
   }
 
-  async function grantConfigure(companyId: string, agentId: string) {
+  async function grantConfigure(companyId: string, agentId: string, scope: Record<string, unknown> | null = null) {
     await db.insert(principalPermissionGrants).values({
       companyId,
       principalType: "agent",
       principalId: agentId,
       permissionKey: "agents:configure",
-      scope: null,
+      scope,
       grantedByUserId: null,
     });
   }
@@ -372,10 +372,10 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
     expect(await deniedForAgent(agentId)).toHaveLength(0);
   });
 
-  it("keeps today's behaviour in that race for an agent holding agents:configure", async () => {
+  it("keeps today's behaviour in that race for an agent holding a grant that names itself", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId);
-    await grantConfigure(companyId, agentId);
+    await grantConfigure(companyId, agentId, { agentIds: [agentId] });
 
     const res = await withConcurrentBoardUpdate(
       agentId,
