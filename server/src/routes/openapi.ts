@@ -89,6 +89,9 @@ import {
   updateDecisionQueueSchema,
   updateDecisionTriageSchema,
   updateDecisionRetentionSchema,
+  // Heartbeat runs
+  heartbeatRunStatsQuerySchema,
+  heartbeatRunStatsSchema,
   // Routine
   createRoutineSchema,
   updateRoutineSchema,
@@ -6881,8 +6884,35 @@ registry.registerPath({
   path: "/api/companies/{companyId}/heartbeat-runs",
   tags: ["runs"],
   summary: "List heartbeat runs for a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "Newest first. `status` and `errorCode` take comma-separated values. `since` and `until` (ISO 8601) bound the " +
+    "run's creation time; `until` is exclusive. `limit` is 1-1000. `summary=true` returns lighter rows.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      status: z.string().optional(),
+      errorCode: z.string().optional(),
+      since: z.string().datetime({ offset: true }).optional(),
+      until: z.string().datetime({ offset: true }).optional(),
+      limit: z.string().optional(),
+      summary: z.enum(["true", "1"]).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/heartbeat-runs/stats",
+  tags: ["runs"],
+  summary: "Get heartbeat run stats and daily cap usage for a company",
+  description:
+    "Counts runs created in the window (default: the last 24 hours, at most 90 days) by status, the top error " +
+    "codes, and for each agent its runs today against `runtimeConfig.heartbeat.maxDailyRuns`. `runsToday` counts " +
+    "exactly what the cap counts: runs started in the current UTC day that are not queued or waiting to retry.",
+  request: { params: z.object({ companyId: z.string() }), query: heartbeatRunStatsQuerySchema },
+  responses: { 200: r.ok(heartbeatRunStatsSchema), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({

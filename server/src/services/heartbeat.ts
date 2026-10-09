@@ -17,6 +17,7 @@ import {
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -16913,6 +16914,20 @@ export function heartbeatService(
     return { start, end };
   }
 
+  /**
+   * The runs `maxDailyRuns` counts for a company: started in the current UTC
+   * day and no longer queued or waiting to retry. The cap check and the run
+   * stats both use it, so they never disagree.
+   */
+  function dailyRunCapConditions(companyId: string, window = currentUtcDayWindow()) {
+    return [
+      eq(heartbeatRuns.companyId, companyId),
+      gte(heartbeatRuns.startedAt, window.start),
+      lt(heartbeatRuns.startedAt, window.end),
+      notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+    ];
+  }
+
   async function getHeartbeatDailyCapBlock(
     agent: typeof agents.$inferSelect,
     policy: ReturnType<typeof parseHeartbeatPolicy>,
@@ -16928,11 +16943,8 @@ export function heartbeatService(
     const { start, end } = currentUtcDayWindow();
     if (checkRunCap && policy.maxDailyRuns !== null) {
       const conditions = [
-        eq(heartbeatRuns.companyId, agent.companyId),
+        ...dailyRunCapConditions(agent.companyId, { start, end }),
         eq(heartbeatRuns.agentId, agent.id),
-        gte(heartbeatRuns.startedAt, start),
-        lt(heartbeatRuns.startedAt, end),
-        notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
       ];
       if (options.excludeRunId) {
         conditions.push(sql`${heartbeatRuns.id} <> ${options.excludeRunId}`);
@@ -30905,12 +30917,137 @@ export function heartbeatService(
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
     },
+    /**
+     * Run counts for a company over a creation-time window, the most common
+     * error codes, and each agent's runs today against its daily run cap.
+     */
+    runStats: async (
+      companyId: string,
+      input: { since: Date; until: Date; agentId?: string },
+    ): Promise<HeartbeatRunStats> => {
+      const windowFilters = [
+        eq(heartbeatRuns.companyId, companyId),
+        gte(heartbeatRuns.createdAt, input.since),
+        lt(heartbeatRuns.createdAt, input.until),
+        ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
+      ];
+      const capWindow = currentUtcDayWindow();
+      const [statusRows, errorRows, todayRows, agentRows] = await Promise.all([
+        db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters))
+          .groupBy(heartbeatRuns.agentId, heartbeatRuns.status),
+        db
+          .select({ errorCode: heartbeatRuns.errorCode, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters, isNotNull(heartbeatRuns.errorCode)))
+          .groupBy(heartbeatRuns.errorCode)
+          .orderBy(desc(sql`count(*)`), asc(heartbeatRuns.errorCode))
+          .limit(20),
+        db
+          .select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              ...dailyRunCapConditions(companyId, capWindow),
+              ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
+            ),
+          )
+          .groupBy(heartbeatRuns.agentId),
+        db
+          .select()
+          .from(agents)
+          .where(and(eq(agents.companyId, companyId), ...(input.agentId ? [eq(agents.id, input.agentId)] : []))),
+      ]);
+
+      const isRunStatus = (status: string): status is HeartbeatRunStatus =>
+        HEARTBEAT_RUN_STATUSES.some((known) => known === status);
+      const emptyCounts = () => {
+        const byStatus: Record<HeartbeatRunStatus, number> = {
+          queued: 0,
+          scheduled_retry: 0,
+          running: 0,
+          succeeded: 0,
+          interrupted: 0,
+          failed: 0,
+          cancelled: 0,
+          timed_out: 0,
+        };
+        return { runs: 0, terminal: 0, succeeded: 0, unsuccessful: 0, byStatus };
+      };
+      const addCounts = (counts: ReturnType<typeof emptyCounts>, status: string, count: number) => {
+        counts.runs += count;
+        if (!isRunStatus(status)) return;
+        counts.byStatus[status] += count;
+        if (HEARTBEAT_RUN_TERMINAL_STATUSES.some((terminal) => terminal === status)) counts.terminal += count;
+        if (status === "succeeded") counts.succeeded += count;
+        if (UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.some((unsuccessful) => unsuccessful === status)) {
+          counts.unsuccessful += count;
+        }
+      };
+
+      const totals = emptyCounts();
+      const perAgent = new Map<string, ReturnType<typeof emptyCounts>>();
+      for (const row of statusRows) {
+        const count = Number(row.count);
+        addCounts(totals, row.status, count);
+        const agentCounts = perAgent.get(row.agentId) ?? emptyCounts();
+        addCounts(agentCounts, row.status, count);
+        perAgent.set(row.agentId, agentCounts);
+      }
+      const runsToday = new Map(todayRows.map((row) => [row.agentId, Number(row.count)]));
+
+      const agentStats = agentRows
+        .filter((agent) => agent.status !== "terminated" || perAgent.has(agent.id))
+        .map((agent) => {
+          const maxDailyRuns = parseHeartbeatPolicy(agent).maxDailyRuns;
+          const today = runsToday.get(agent.id) ?? 0;
+          return {
+            agentId: agent.id,
+            name: agent.name,
+            status: agent.status,
+            ...(perAgent.get(agent.id) ?? emptyCounts()),
+            runsToday: today,
+            maxDailyRuns,
+            remainingToday: maxDailyRuns === null ? null : Math.max(0, maxDailyRuns - today),
+            capReached: maxDailyRuns !== null && today >= maxDailyRuns,
+          };
+        })
+        .sort((a, b) => b.runs - a.runs || b.runsToday - a.runsToday || a.name.localeCompare(b.name));
+
+      return {
+        companyId,
+        window: { since: input.since.toISOString(), until: input.until.toISOString() },
+        dailyCapWindow: { start: capWindow.start.toISOString(), end: capWindow.end.toISOString() },
+        totals,
+        topErrorCodes: errorRows
+          .filter((row): row is { errorCode: string; count: number } => row.errorCode !== null)
+          .map((row) => ({ errorCode: row.errorCode, count: Number(row.count) })),
+        agents: agentStats,
+      };
+    },
+
     list: async (
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: {
+        summary?: boolean;
+        statuses?: string[];
+        errorCodes?: string[];
+        since?: Date;
+        until?: Date;
+      } = {},
     ) => {
+      const filters = [
+        eq(heartbeatRuns.companyId, companyId),
+        ...(agentId ? [eq(heartbeatRuns.agentId, agentId)] : []),
+        ...(options.statuses?.length ? [inArray(heartbeatRuns.status, options.statuses)] : []),
+        ...(options.errorCodes?.length ? [inArray(heartbeatRuns.errorCode, options.errorCodes)] : []),
+        ...(options.since ? [gte(heartbeatRuns.createdAt, options.since)] : []),
+        ...(options.until ? [lt(heartbeatRuns.createdAt, options.until)] : []),
+      ];
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
       const query = db
@@ -30933,14 +31070,7 @@ export function heartbeatService(
                 },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(
-                eq(heartbeatRuns.companyId, companyId),
-                eq(heartbeatRuns.agentId, agentId),
-              )
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(and(...filters))
         .orderBy(desc(heartbeatRuns.createdAt));
 
       const rows = limit ? await query.limit(limit) : await query;
