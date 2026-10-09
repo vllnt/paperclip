@@ -310,6 +310,25 @@ describe("grok_local testEnvironment", () => {
     expect(runProcessMock).not.toHaveBeenCalled();
   });
 
+  it("fails with the exact missing prerequisite and how to install it when the grok binary is not on the worker", async () => {
+    ensureCommandMock.mockRejectedValueOnce(new Error("Command not found in PATH: grok"));
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "grok_local",
+      config: { command: "grok", cwd: "/tmp/project" },
+    });
+
+    expect(result.status).toBe("fail");
+    const missing = result.checks.find((check: { code: string }) => check.code === "grok_command_unresolvable");
+    expect(missing).toMatchObject({ level: "error", detail: "grok" });
+    expect(missing?.message).toContain("Command not found in PATH: grok");
+    expect(missing?.hint).toContain("@xai-official/grok");
+    expect(missing?.hint).toContain("scripts/install-grok-build.sh");
+    expect(missing?.hint).toContain("doc/workers/grok-build.md");
+    expect(runProcessMock).not.toHaveBeenCalled();
+  });
+
   it("emits no adapter_auth_missing check for a local target with missing authentication", async () => {
     // The canonical check gates sandbox login eligibility only. A local target
     // has no sandbox login to offer, so the check must not appear.
@@ -338,5 +357,52 @@ describe("grok_local testEnvironment", () => {
     expect(result.checks.some((check: { code: string }) => check.code === "adapter_auth_missing")).toBe(
       false,
     );
+  });
+
+  describe("gateway model guard", () => {
+    const gatewayEnv = { GROK_XAI_API_BASE_URL: "https://gateway.example/v1", XAI_API_KEY: "test-key" };
+
+    it.each([undefined, "", "grok-build", "claude-3-5-haiku"])(
+      "fails with grok_gateway_model_required and a fix hint for model %j behind a gateway",
+      async (model) => {
+        const result = await testEnvironment({
+          companyId: "company-1",
+          adapterType: "grok_local",
+          config: { command: "grok", cwd: "/tmp/project", env: gatewayEnv, ...(model === undefined ? {} : { model }) },
+        });
+
+        expect(result.status).toBe("fail");
+        const check = result.checks.find((entry: { code: string }) => entry.code === "grok_gateway_model_required");
+        expect(check).toMatchObject({ level: "error" });
+        expect(check?.hint).toContain("grok-4.7");
+        expect(check?.hint).toContain("model");
+        expect(runProcessMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it("does not add the check for a pinned grok-* model behind a gateway", async () => {
+      runProcessMock.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" });
+
+      const result = await testEnvironment({
+        companyId: "company-1",
+        adapterType: "grok_local",
+        config: { command: "grok", cwd: "/tmp/project", env: gatewayEnv, model: "grok-4.7" },
+      });
+
+      expect(result.checks.some((entry: { code: string }) => entry.code === "grok_gateway_model_required")).toBe(false);
+      expect(runProcessMock).toHaveBeenCalled();
+    });
+
+    it("does not add the check for an unset model when no gateway is configured", async () => {
+      runProcessMock.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" });
+
+      const result = await testEnvironment({
+        companyId: "company-1",
+        adapterType: "grok_local",
+        config: { command: "grok", cwd: "/tmp/project", env: { XAI_API_KEY: "test-key" } },
+      });
+
+      expect(result.checks.some((entry: { code: string }) => entry.code === "grok_gateway_model_required")).toBe(false);
+    });
   });
 });

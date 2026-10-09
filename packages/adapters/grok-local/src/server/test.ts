@@ -24,6 +24,7 @@ import path from "node:path";
 import { stageGrokHomeForSync } from "./grok-home.js";
 import { copyBackGrokAuth } from "./grok-auth-copyback.js";
 import { DEFAULT_GROK_LOCAL_MODEL } from "../index.js";
+import { findGrokGatewayModelProblem, GROK_GATEWAY_MODEL_REQUIRED } from "./gateway-model-guard.js";
 import { parseGrokJsonl } from "./parse.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
 
@@ -205,6 +206,22 @@ export async function testEnvironment(
       level: "error",
       message: err instanceof Error ? err.message : "Command is not executable",
       detail: command,
+      hint:
+        "Install the pinned Grok Build CLI (npm package @xai-official/grok) with scripts/install-grok-build.sh, " +
+        "or set adapterConfig.command to its path. See doc/workers/grok-build.md.",
+    });
+  }
+
+  const configuredModel = asString(config.model, DEFAULT_GROK_LOCAL_MODEL).trim();
+
+  const gatewayModelProblem = findGrokGatewayModelProblem({ model: configuredModel, env: runtimeEnv });
+  if (gatewayModelProblem) {
+    checks.push({
+      code: GROK_GATEWAY_MODEL_REQUIRED,
+      level: "error",
+      message: gatewayModelProblem.message,
+      detail: configuredModel || null,
+      hint: gatewayModelProblem.hint,
     });
   }
 
@@ -212,9 +229,8 @@ export async function testEnvironment(
     checks.every((check) =>
       check.code !== "grok_cwd_invalid" &&
       check.code !== "grok_command_unresolvable" &&
-      check.code !== "grok_environment_unprepared");
-
-  const configuredModel = asString(config.model, DEFAULT_GROK_LOCAL_MODEL).trim();
+      check.code !== "grok_environment_unprepared" &&
+      check.code !== GROK_GATEWAY_MODEL_REQUIRED);
 
   if (canRunProbe) {
     const modelsProbe = await runAdapterExecutionTargetProcess(

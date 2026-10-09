@@ -764,6 +764,8 @@ const grokLocalAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) => ({
     command: readConfiguredCommand(config, "grok"),
     detectCommand: readConfiguredCommand(config, "grok"),
+    // No sandbox self-install: the generic `npm install -g` is unpinned. Workers get
+    // the checksum-verified scripts/install-grok-build.sh (doc/workers/grok-build.md).
     installCommand: null,
   }),
   agentConfigurationDoc: grokAgentConfigurationDoc,

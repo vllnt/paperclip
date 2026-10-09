@@ -33,6 +33,7 @@ const CAPACITY_RE = /at capacity|capacity limit|overloaded|\b529\b|high demand|s
 const TRANSIENT_UPSTREAM_CODES = new Set([
   "claude_transient_upstream",
   "codex_transient_upstream",
+  "grok_transient_upstream",
 ]);
 const RECLASSIFIABLE_QUOTA_CODES = new Set([
   ...TRANSIENT_UPSTREAM_CODES,

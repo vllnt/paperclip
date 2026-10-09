@@ -36,6 +36,9 @@ describe("classifyQuotaFailure", () => {
     ["the proxy cooldown 429 reported as transient (production 2026-10-08)", { errorCode: "claude_transient_upstream", errorFamily: "transient_upstream", errorMessage: "API Error: Request rejected (429) · All credentials for model claude-opus-5-5 are cooling down (last err…" }, "usage_limit"],
     ["Codex capacity", { errorCode: "provider_quota", errorFamily: "provider_quota", errorMessage: "Selected model is at capacity. Please try a different model." }, "capacity"],
     ["Claude overloaded", { errorCode: "claude_transient_upstream", errorFamily: "transient_upstream", errorMessage: "529 overloaded_error: Overloaded" }, "capacity"],
+    ["Grok overloaded, known by its code alone", { errorCode: "grok_transient_upstream", errorMessage: "The model is overloaded. Please try again later." }, "capacity"],
+    ["Grok model cooldown", { errorCode: "provider_quota", errorFamily: "provider_quota", errorMessage: "All credentials for model grok-4.7 are cooling down" }, "usage_limit"],
+    ["an xAI team out of credits", { errorCode: "provider_quota", errorFamily: "provider_quota", errorMessage: "Your team 1a2b3c has either used all available credits or reached its monthly spending limit." }, "usage_limit"],
   ] as const)("triggers on %s", (_label, input, kind) => {
     const decision = classifyQuotaFailure({ ...failed, ...input });
     expect(decision).toMatchObject({ trigger: true, kind });
@@ -48,6 +51,8 @@ describe("classifyQuotaFailure", () => {
     ["a task failure", { errorCode: "adapter_failed", errorMessage: "Tests failed: 3 assertions" }, "not_quota"],
     ["a plain transient failure", { errorCode: "codex_transient_upstream", errorFamily: "transient_upstream", errorMessage: "stream disconnected before completion" }, "not_quota"],
     ["a bare 429 rate limit", { errorCode: "claude_transient_upstream", errorFamily: "transient_upstream", errorMessage: "429 Too Many Requests" }, "not_quota"],
+    ["a Grok sign-in failure", { errorCode: "grok_auth_required", errorMessage: "Not signed in. usage limit" }, "auth"],
+    ["a Grok bare 429", { errorCode: "grok_transient_upstream", errorFamily: "transient_upstream", errorMessage: "429 Too Many Requests" }, "not_quota"],
     ["a refusal", { errorCode: "claude_refusal", errorFamily: "model_refusal" }, "not_quota"],
     ["a quota hit after useful work", { errorCode: "provider_quota", errorFamily: "provider_quota", usefulWork: true }, "useful_work"],
     ["a timed-out run", { status: "timed_out", errorCode: "provider_quota" }, "not_failed"],

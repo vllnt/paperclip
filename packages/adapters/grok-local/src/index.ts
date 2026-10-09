@@ -10,11 +10,9 @@ export const models = [
   { id: "grok-4.5", label: "Grok 4.5" },
 ];
 
-export function grokLocalReasoningEffortsForModel(model: string): readonly string[] {
-  return model.trim() === "grok-4.7" || model.trim() === "grok-4.6"
-    ? ["low", "medium", "high", "xhigh"]
-    : ["low", "medium", "high"];
-}
+export { grokLocalReasoningEffortsForModel } from "./reasoning-efforts.js";
+export { planCodexToGrokSwitch } from "./switch-from-codex.js";
+export type { GrokSwitchOptions, GrokSwitchPlan, GrokSwitchSource } from "./switch-from-codex.js";
 
 export const agentConfigurationDoc = `# grok_local agent configuration
 

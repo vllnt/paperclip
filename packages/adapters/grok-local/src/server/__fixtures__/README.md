@@ -19,6 +19,21 @@ reads this fixture. The test never reads a live secret.
 | File | Condition | Expected parse result |
 |---|---|---|
 | `device-login-prompt.txt` | Normal prompt, no pseudo-terminal | a URL and a code |
+| `error-not-signed-in.jsonl` | `--output-format streaming-json --single` with no `XAI_API_KEY` and an empty `GROK_HOME` | `errorMessage` that starts "Not signed in" |
+| `error-model-cooldown.jsonl` | `--single` with `XAI_API_KEY` set against a local HTTP mock that answered every chat request with a 429 and no `Retry-After` | `errorMessage` "All credentials for model grok-4.7 are cooling down" |
+
+## Error events (2026-10-09)
+
+Both error fixtures come from `grok 1.0.49 (8e66fdf1fd8e)`, run on macOS with an
+isolated `HOME` and `GROK_HOME`. The CLI wrapper is real: one
+`{"type":"error","message":…}` line on stdout, the same text on stderr, exit
+code 1. For the cooldown fixture only the upstream response body was
+synthetic (a CLIProxy-style 429), because no xAI key was available. The CLI
+keeps only the `message` text. It drops the body's `code` and `reset_seconds`,
+so a reset time can only come from text in the message itself.
+
+With a `Retry-After` header on the 429, the CLI printed nothing for 90 seconds
+and had to be killed. The adapter timeout is the only bound on that case.
 
 ## Redaction
 

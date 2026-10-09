@@ -59,7 +59,10 @@ type Outcome =
   | { kind: "auth" }
   | { kind: "task_failure" }
   | { kind: "usage_limit_after_comment" }
-  | { kind: "proxy_cooldown_as_transient"; withResetBody?: boolean };
+  | { kind: "proxy_cooldown_as_transient"; withResetBody?: boolean }
+  // What grok_local returns for the CLI's real error events (adapter fixtures error-model-cooldown / error-not-signed-in).
+  | { kind: "grok_cooldown" }
+  | { kind: "grok_not_signed_in" };
 
 interface Invocation {
   runId: string;
@@ -74,7 +77,7 @@ describeEmbeddedPostgres("agent harness fallback", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-  const scripts: Record<string, Outcome[]> = { claude_local: [], codex_local: [] };
+  const scripts: Record<string, Outcome[]> = { claude_local: [], codex_local: [], grok_local: [] };
   const invocations: Invocation[] = [];
 
   async function postProgressComment(ctx: AdapterExecutionContext) {
@@ -87,7 +90,7 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     });
   }
 
-  function scripted(adapterType: "claude_local" | "codex_local") {
+  function scripted(adapterType: "claude_local" | "codex_local" | "grok_local") {
     return async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
       invocations.push({
         runId: ctx.runId,
@@ -98,7 +101,7 @@ describeEmbeddedPostgres("agent harness fallback", () => {
         sessionId: ctx.runtime.sessionId ?? null,
       });
       const outcome = scripts[adapterType].shift() ?? { kind: "success" };
-      const provider = adapterType === "claude_local" ? "anthropic" : "openai";
+      const provider = adapterType === "claude_local" ? "anthropic" : adapterType === "grok_local" ? "xai" : "openai";
       const model = String(ctx.config.model ?? "default");
       if (outcome.kind === "success") {
         await postProgressComment(ctx);
@@ -118,6 +121,22 @@ describeEmbeddedPostgres("agent harness fallback", () => {
           exitCode: 1, signal: null, timedOut: false, provider, model,
           errorMessage: "Not logged in. Please run /login (usage limit unknown).",
           errorCode: "claude_auth_required",
+        };
+      }
+      if (outcome.kind === "grok_cooldown") {
+        const message = `All credentials for model ${model} are cooling down`;
+        return {
+          exitCode: 1, signal: null, timedOut: false, provider, model,
+          errorMessage: message, errorCode: "provider_quota", errorFamily: "provider_quota",
+          resultJson: { stderr: `Error: ${message}`, errorFamily: "provider_quota" },
+        };
+      }
+      if (outcome.kind === "grok_not_signed_in") {
+        return {
+          exitCode: 1, signal: null, timedOut: false, provider, model,
+          errorMessage: "Not signed in. To authenticate without a browser, run:\n  grok login --device-code",
+          errorCode: "grok_auth_required",
+          resultJson: { stderr: "Error: Not signed in." },
         };
       }
       if (outcome.kind === "task_failure") {
@@ -152,7 +171,7 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-harness-fallback-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
-    for (const type of ["claude_local", "codex_local"] as const) {
+    for (const type of ["claude_local", "codex_local", "grok_local"] as const) {
       registerServerAdapter({
         type,
         supportsLocalAgentJwt: false,
@@ -172,6 +191,7 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     vi.restoreAllMocks();
     scripts.claude_local = [];
     scripts.codex_local = [];
+    scripts.grok_local = [];
     invocations.length = 0;
     await db.execute(sql.raw(`
       TRUNCATE TABLE "activity_log", "heartbeat_run_events", "issue_comments", "issues",
@@ -185,6 +205,7 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     unregisterServerAdapter("claude_local");
     unregisterServerAdapter("codex_local");
+    unregisterServerAdapter("grok_local");
     await tempDb?.cleanup();
   });
 
@@ -612,6 +633,43 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     expect(await pending(companyId, "harness_fallback")).toBeNull();
     expect(await db.select().from(agentHarnessCooldowns)).toHaveLength(0);
     expect(invocations.map((call) => call.adapterType)).toEqual(["claude_local"]);
+  });
+
+  it("moves a grok_local agent's gateway cooldown to its codex_local fallback on a Grok model, and cools the Grok target down", async () => {
+    const { companyId, agentId, issueId } = await seed({
+      adapterType: "grok_local",
+      model: "grok-4.7",
+      fallbacks: [{ adapterType: "codex_local", model: "grok-4.6", env: { CODEX_HOME: "/srv/codex-home" } }],
+    });
+    scripts.grok_local = [{ kind: "grok_cooldown" }];
+
+    await assign(agentId, issueId);
+    const [primaryRun] = await runs(companyId);
+    expect(primaryRun).toMatchObject({ status: "failed", errorCode: "provider_quota", executedAdapterType: "grok_local", executedModel: "grok-4.7" });
+    expect(await pending(companyId, "transient_failure")).toBeNull();
+
+    const fallbackRun = await runPending(companyId, "harness_fallback");
+    expect(fallbackRun).toMatchObject({
+      status: "succeeded", executedAdapterType: "codex_local", executedModel: "grok-4.6", fallbackReason: "provider_usage_limit",
+    });
+    expect(invocations.map((call) => [call.adapterType, call.model])).toEqual([["grok_local", "grok-4.7"], ["codex_local", "grok-4.6"]]);
+    const cooldowns = await db.select().from(agentHarnessCooldowns);
+    expect(cooldowns).toHaveLength(1);
+    expect(cooldowns[0]).toMatchObject({ adapterType: "grok_local" });
+  });
+
+  it("does not fall back or cool down when grok_local is not signed in", async () => {
+    const { companyId, agentId, issueId } = await seed({
+      adapterType: "grok_local",
+      model: "grok-4.7",
+      fallbacks: [{ adapterType: "codex_local", model: "grok-4.6", env: { CODEX_HOME: "/srv/codex-home" } }],
+    });
+    scripts.grok_local = [{ kind: "grok_not_signed_in" }];
+    await assign(agentId, issueId);
+    expect((await runs(companyId))[0]).toMatchObject({ status: "failed", errorCode: "grok_auth_required" });
+    expect(await pending(companyId, "harness_fallback")).toBeNull();
+    expect(await db.select().from(agentHarnessCooldowns)).toHaveLength(0);
+    expect(invocations.map((call) => call.adapterType)).toEqual(["grok_local"]);
   });
 
   it("falls back on a capacity failure only after the existing bounded retries", async () => {

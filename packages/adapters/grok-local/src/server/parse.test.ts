@@ -1,5 +1,10 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
+import { classifyGrokFailure, isGrokUnknownSessionError, parseGrokJsonl } from "./parse.js";
+
+const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "__fixtures__");
 
 describe("parseGrokJsonl", () => {
   it("collects streamed thought/text content and final session metadata", () => {
@@ -88,5 +93,77 @@ describe("isGrokUnknownSessionError", () => {
   it("detects stale resume failures", () => {
     expect(isGrokUnknownSessionError("", "session not found")).toBe(true);
     expect(isGrokUnknownSessionError("", "everything fine")).toBe(false);
+  });
+});
+
+describe("classifyGrokFailure", () => {
+  const now = new Date("2026-10-09T12:00:00.000Z");
+  const fixture = (name: string) => readFileSync(path.join(fixturesDir, name), "utf8");
+  const classify = (errorMessage: string | null, stderr = "") => classifyGrokFailure({ errorMessage, stderr }, now);
+
+  it("classifies the real signed-out error from the CLI as an authentication failure", () => {
+    const parsed = parseGrokJsonl(fixture("error-not-signed-in.jsonl"));
+    expect(classify(parsed.errorMessage)).toMatchObject({ errorCode: "grok_auth_required", errorFamily: null });
+  });
+
+  it("classifies the CLI's model cooldown error as a provider quota, not an authentication failure", () => {
+    const parsed = parseGrokJsonl(fixture("error-model-cooldown.jsonl"));
+    expect(classify(parsed.errorMessage)).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: null,
+    });
+  });
+
+  it("classifies an xAI team out of credits as a provider quota with no reset time", () => {
+    expect(classify(
+      "Your team 1a2b3c has either used all available credits or reached its monthly spending limit. To continue making API requests, please purchase more credits or raise your spending limit.",
+    )).toEqual({ errorCode: "provider_quota", errorFamily: "provider_quota", retryNotBefore: null });
+  });
+
+  it("reads the reset time from the message when it names one", () => {
+    expect(classify("429: usage limit reached, try again in 20 minutes")).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-10-09T12:20:00.000Z",
+    });
+  });
+
+  it("classifies overload and capacity errors as transient upstream failures", () => {
+    for (const message of [
+      "The model is overloaded. Please try again later.",
+      "503 Service Unavailable",
+      "xAI is at capacity right now",
+      "429 Too Many Requests",
+    ]) {
+      expect(classify(message), message).toEqual({
+        errorCode: "grok_transient_upstream",
+        errorFamily: "transient_upstream",
+        retryNotBefore: null,
+      });
+    }
+  });
+
+  it("reads the stderr line when the stream carried no error event", () => {
+    expect(classify(null, "Error: Not signed in. To authenticate without a browser, run:")).toMatchObject({
+      errorCode: "grok_auth_required",
+    });
+  });
+
+  it("leaves task and unknown failures unclassified", () => {
+    for (const message of ["Grok exited with code 2", "Tool call failed: ls returned 1", null]) {
+      expect(classify(message), String(message)).toEqual({ errorCode: null, errorFamily: null, retryNotBefore: null });
+    }
+  });
+
+  it("does not take a quota or capacity word inside tool output for a provider failure", () => {
+    expect(classify("Tests failed: expected 429 but got 200 in rate-limit.test.ts")).toMatchObject({ errorCode: null });
+  });
+
+  it("classifies a 100k-character message in linear time", () => {
+    const started = performance.now();
+    classify(`${"a ".repeat(50_000)}`);
+    classify(`not signed ${"in ".repeat(40_000)}`);
+    expect(performance.now() - started).toBeLessThan(200);
   });
 });

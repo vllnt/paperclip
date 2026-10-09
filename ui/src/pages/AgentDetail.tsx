@@ -42,6 +42,7 @@ import { toolsApi } from "../api/tools";
 import { getUIAdapter, buildTranscript, onAdapterChange } from "../adapters";
 import { StatusBadge } from "../components/StatusBadge";
 import { AgentFallbacksSection, AgentHarnessFallbackBadge } from "../components/AgentHarnessFallback";
+import { AgentGrokSwitchNotice } from "../components/AgentGrokSwitch";
 import { MarkdownBody } from "../components/MarkdownBody";
 import { CopyText } from "../components/CopyText";
 import { IssueRow } from "../components/IssueRow";
@@ -2069,6 +2070,7 @@ export function ConfigurationTab({
 
   return (
     <div className="agent-settings-form space-y-6">
+      {content === "runtime" && companyId ? <AgentGrokSwitchNotice agent={agent} companyId={companyId} /> : null}
       {content !== "permissions" ? <AgentConfigForm
         mode="edit"
         agent={agent}

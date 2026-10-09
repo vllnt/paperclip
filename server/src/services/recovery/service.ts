@@ -488,6 +488,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "codex_harness_crash",
   "claude_transient_upstream",
+  "grok_transient_upstream",
   "provider_quota",
   "timeout",
 ]);
