@@ -1,4 +1,5 @@
 import { browserUseRoutes } from "./routes/browser-use.js";
+import { browserProfileRoutes } from "./routes/browser-profiles.js";
 import { browserUseService } from "./services/browser-use.js";
 import { slackToolRoutes } from "./routes/slack-tools.js";
 import { agentAvatarRoutes } from "./routes/agent-avatars.js";
@@ -933,6 +934,7 @@ export async function createApp(
     { cancelWorkForScope: heartbeatService(db, { pluginWorkerManager: workerManager }).cancelBudgetScopeWork },
     (session, run) => toolGateway.browserUseSessionAuthorized({ ...session, runId: run.heartbeatRunId, invocationId: run.invocationId }));
   api.use(browserUseRoutes(db, browserUse));
+  api.use(browserProfileRoutes(db));
   api.use(toolGatewayRoutes(db, toolGateway));
   api.use(
     pluginRoutes(
