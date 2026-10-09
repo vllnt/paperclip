@@ -572,6 +572,16 @@ export interface IssueRecoveryAction {
   updatedAt: Date | string;
 }
 
+/** One row of `GET /api/companies/:companyId/recovery-actions`. */
+export interface CompanyIssueRecoveryActionListItem extends IssueRecoveryAction {
+  issue: {
+    id: string;
+    identifier: string | null;
+    title: string;
+    status: IssueStatus;
+  };
+}
+
 export type SuccessfulRunHandoffStateKind = "required" | "resolved" | "escalated";
 
 export interface SuccessfulRunHandoffState {

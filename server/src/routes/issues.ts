@@ -86,6 +86,10 @@ import {
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
   retryWorkspaceExportSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT,
+  type CompanyIssueRecoveryActionListItem,
   runnerGoalActionRequestSchema,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
@@ -9068,6 +9072,37 @@ export function issueRoutes(
     }
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     res.json({ ok: true });
+  });
+
+  // Company-wide recovery actions. Same boundary as the per-issue read: company
+  // access first, then actors without company-scope read only see actions whose
+  // source issue passes their issue-read check (the rule the company issue list
+  // uses). Read-only: no revalidation, so stale actions are not cancelled here.
+  router.get("/companies/:companyId/recovery-actions", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const query = listCompanyIssueRecoveryActionsQuerySchema.parse(req.query);
+    const rows = await recoveryActionsSvc.listForCompany(companyId, {
+      statuses: query.status ?? COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES,
+      limit: query.limit ?? COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT,
+    });
+    let visibleRows = rows;
+    if (!(await actorCanReadCompanyScope(req, companyId))) {
+      const readableIssueIds = new Set(
+        (await filterIssuesForActor(req, rows.map((row) => row.issue))).map((issue) => issue.id),
+      );
+      visibleRows = rows.filter((row) => readableIssueIds.has(row.issue.id));
+    }
+    const body: CompanyIssueRecoveryActionListItem[] = visibleRows.map((row) => ({
+      ...row.action,
+      issue: {
+        id: row.issue.id,
+        identifier: row.issue.identifier,
+        title: row.issue.title,
+        status: row.issue.status as CompanyIssueRecoveryActionListItem["issue"]["status"],
+      },
+    }));
+    res.json(body);
   });
 
   router.get("/issues/:id/recovery-actions", async (req, res) => {
