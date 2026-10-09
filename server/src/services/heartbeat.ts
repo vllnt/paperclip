@@ -118,6 +118,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  ISSUE_WAIT_MONITOR_MAX_ATTEMPTS,
   envBindingSchema,
   isEnvironmentDriverSupportedForAdapter,
   isToolConnectionAttentionHealth,
@@ -449,6 +450,7 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
+import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
 import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
@@ -853,8 +855,6 @@ export {
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
-// A monitor whose wake the queue dropped is retried after this delay.
-const MONITOR_WAKE_RETRY_DELAY_MS = 5 * 60_000;
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30_000, 30_000,
 ] as const;
@@ -11841,8 +11841,65 @@ export function heartbeatService(
     }
 
     const monitorWakeKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
+    // The queue dropped or refused the wake. Keep the monitor armed: count the
+    // attempt, back off, and hand the issue to owner recovery once the attempts
+    // run out, so a permanently blocked agent cannot retry without end.
+    const holdMonitorForRetry = async (message: string, skipReason: string) => {
+      if (nextAttemptCount >= ISSUE_WAIT_MONITOR_MAX_ATTEMPTS) {
+        return clearIssueMonitorAndRecover({
+          claimed,
+          policy,
+          scheduledAtIso,
+          nextAttemptCount,
+          clearReason: "max_attempts_exhausted",
+          recoveryPolicy,
+          monitor,
+          now: input.now,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
+      }
+      const retryAt = new Date(
+        input.now.getTime() + monitorWakeRetryDelayMs(claimed.monitorAttemptCount ?? 0),
+      );
+      const rescheduled = buildIssueMonitorRescheduledPatch({
+        issue: { ...claimed, monitorAttemptCount: nextAttemptCount },
+        policy,
+        nextCheckAt: retryAt,
+      });
+      await db
+        .update(issues)
+        .set(
+          rescheduled
+            ? { ...rescheduled, monitorAttemptCount: nextAttemptCount, updatedAt: new Date() }
+            : { monitorWakeRequestedAt: null, updatedAt: new Date() },
+        )
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_wake_skipped",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: scheduledAtIso,
+          retryAt: retryAt.toISOString(),
+          attemptCount: nextAttemptCount,
+          skipReason,
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "skipped" as const, reason: message };
+    };
     let monitorWake: Awaited<ReturnType<typeof enqueueWakeup>> | undefined;
-    const monitorWakeStartedAt = new Date();
+    let monitorWakeStartedAt = input.now;
     try {
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
@@ -11900,7 +11957,15 @@ export function heartbeatService(
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
         }
-      } else
+      } else {
+        // The receipt lookup below compares database timestamps, so the start
+        // mark comes from the database clock too.
+        monitorWakeStartedAt = await db
+          .select({ now: sql<string>`clock_timestamp()` })
+          .from(agents)
+          .where(eq(agents.id, targetAgentId))
+          .limit(1)
+          .then((rows) => (rows[0] ? new Date(rows[0].now) : input.now));
         monitorWake = await enqueueWakeup(targetAgentId, {
           source: input.source,
           triggerDetail: input.triggerDetail,
@@ -11931,6 +11996,7 @@ export function heartbeatService(
             manualTrigger: input.activitySource === "manual",
           },
         });
+      }
 
       // enqueueWakeup returns null for a wake it admitted behind a live run, and
       // also for one it dropped (wake on demand off, tree hold, pause). Only a
@@ -11952,34 +12018,10 @@ export function heartbeatService(
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (skipped) {
-          const retryAt = new Date(input.now.getTime() + MONITOR_WAKE_RETRY_DELAY_MS);
-          const rescheduled = buildIssueMonitorRescheduledPatch({ issue: claimed, policy, nextCheckAt: retryAt });
-          await db
-            .update(issues)
-            .set(
-              rescheduled
-                ? { ...rescheduled, updatedAt: new Date() }
-                : { monitorWakeRequestedAt: null, updatedAt: new Date() },
-            )
-            .where(eq(issues.id, claimed.id));
-          await logActivity(db, {
-            companyId: claimed.companyId,
-            actorType: input.actorType,
-            actorId: input.actorId,
-            agentId: input.agentId,
-            runId: input.runId,
-            action: "issue.monitor_wake_skipped",
-            entityType: "issue",
-            entityId: claimed.id,
-            details: {
-              identifier: claimed.identifier,
-              nextCheckAt: scheduledAtIso,
-              retryAt: retryAt.toISOString(),
-              skipReason: skipped.reason,
-              source: input.activitySource,
-            },
-          });
-          return { outcome: "skipped" as const, reason: `Monitor wake skipped (${skipped.reason})` };
+          return holdMonitorForRetry(
+            `Monitor wake skipped (${skipped.reason ?? "skipped"})`,
+            skipped.reason ?? "skipped",
+          );
         }
       }
 
@@ -12017,6 +12059,9 @@ export function heartbeatService(
 
       return { outcome: "triggered" as const };
     } catch (err) {
+      if (input.clearOnClientError && isRetryableMonitorWakeBlock(err)) {
+        return holdMonitorForRetry((err as HttpError).message, (err as HttpError).message);
+      }
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
           await db
