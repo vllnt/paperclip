@@ -7,6 +7,7 @@ import { ApiError } from "../api/client";
 import { queryKeys } from "../lib/queryKeys";
 import { useToastActions } from "../context/ToastContext";
 import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 
 /**
  * Offered on a Codex agent that runs a Grok model: Grok models need the Grok
@@ -20,11 +21,15 @@ export function AgentGrokSwitchNotice({ agent, companyId }: { agent: AgentDetail
   const [error, setError] = useState<string | null>(null);
   const model = typeof agent.adapterConfig?.model === "string" ? agent.adapterConfig.model : "";
   const applicable = agent.adapterType === "codex_local" && classifyModelVendor(model) === "xai";
+  const [baseUrl, setBaseUrl] = useState("");
   const plan = useMemo(
     () => (applicable
-      ? planCodexToGrokSwitch({ adapterType: agent.adapterType, adapterConfig: agent.adapterConfig ?? {}, runtimeConfig: agent.runtimeConfig })
+      ? planCodexToGrokSwitch(
+          { adapterType: agent.adapterType, adapterConfig: agent.adapterConfig ?? {}, runtimeConfig: agent.runtimeConfig },
+          { xaiBaseUrl: baseUrl },
+        )
       : null),
-    [applicable, agent.adapterType, agent.adapterConfig, agent.runtimeConfig],
+    [applicable, agent.adapterType, agent.adapterConfig, agent.runtimeConfig, baseUrl],
   );
 
   const apply = useMutation({
@@ -54,6 +59,20 @@ export function AgentGrokSwitchNotice({ agent, companyId }: { agent: AgentDetail
           model, instructions, working directory and skills.
         </p>
       </div>
+      {plan.ok || plan.reason === "invalid_base_url" ? (
+        <label className="flex flex-col gap-1 text-xs">
+          Gateway URL (optional)
+          <Input
+            data-testid="agent-grok-switch-base-url"
+            value={baseUrl}
+            placeholder="https://gateway.example/v1"
+            onChange={(event) => setBaseUrl(event.target.value)}
+          />
+          <span className="text-muted-foreground">
+            Sets GROK_XAI_API_BASE_URL. The page cannot read the Codex base URL, because plain-text values are hidden.
+          </span>
+        </label>
+      ) : null}
       {plan.ok ? (
         <>
           <ul className="list-disc space-y-1 pl-4 text-xs text-muted-foreground">

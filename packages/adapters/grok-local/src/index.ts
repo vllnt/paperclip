@@ -12,7 +12,7 @@ export const models = [
 
 export { grokLocalReasoningEffortsForModel } from "./reasoning-efforts.js";
 export { planCodexToGrokSwitch } from "./switch-from-codex.js";
-export type { GrokSwitchPlan, GrokSwitchSource } from "./switch-from-codex.js";
+export type { GrokSwitchOptions, GrokSwitchPlan, GrokSwitchSource } from "./switch-from-codex.js";
 
 export const agentConfigurationDoc = `# grok_local agent configuration
 

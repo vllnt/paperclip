@@ -808,6 +808,32 @@ describe("agent routes adapter validation", () => {
     expect(patch.adapterConfig).not.toHaveProperty("modelReasoningEffort");
   });
 
+  it("keeps a plain env value under the same key when the plan was built from the redacted agent the API returns", async () => {
+    const existing = await mockAgentService.getById();
+    const stored = {
+      ...existing,
+      adapterType: "codex_local",
+      adapterConfig: { model: "grok-4.7", env: { TEAM_REGION: { type: "plain", value: "eu-west-1" } } },
+    };
+    mockAgentService.getById.mockResolvedValue(stored);
+    const redactedView = {
+      adapterType: "codex_local",
+      adapterConfig: { model: "grok-4.7", env: { TEAM_REGION: { type: "plain", value: "***REDACTED***" } } },
+    };
+    const plan = planCodexToGrokSwitch(redactedView);
+    if (!plan.ok) throw new Error(plan.message);
+    expect(plan.patch.adapterConfig.env).toEqual({ TEAM_REGION: { type: "plain", value: "***REDACTED***" } });
+    const app = await createApp();
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send(plan.patch),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, patch] = mockAgentService.update.mock.calls.at(-1)!;
+    expect(patch.adapterConfig.env).toEqual({ TEAM_REGION: { type: "plain", value: "eu-west-1" } });
+  });
+
   it("refuses the switch to grok_local when the instance has disabled that adapter", async () => {
     mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue(["grok_local"]);
     const existing = await mockAgentService.getById();

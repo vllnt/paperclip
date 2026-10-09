@@ -113,7 +113,7 @@ same model, instructions, working directory and skills:
 
 ```sh
 paperclipai agent set-adapter <agent-id> grok_local --dry-run   # show the plan
-paperclipai agent set-adapter <agent-id> grok_local             # apply
+paperclipai agent set-adapter <agent-id> grok_local --xai-base-url https://gateway.example/v1   # apply
 ```
 
 The agent page shows the same plan with a "Switch to Grok Build" button, and the
@@ -123,10 +123,13 @@ API call is `PATCH /api/agents/:id` with the body the plan prints. What it does:
   the skill sync list;
 - `modelReasoningEffort` becomes `reasoningEffort`, lowered to the highest value
   the model takes (`grok-4.5` has no `xhigh`);
-- `OPENAI_API_KEY` becomes `XAI_API_KEY` and `OPENAI_BASE_URL` becomes
-  `GROK_XAI_API_BASE_URL`, when they are secret references or non-secret values.
-  A plain-text key cannot move because the API returns it redacted; bind a
-  secret instead. Other `OPENAI_*` and `CODEX_*` env is dropped;
+- `OPENAI_API_KEY` becomes `XAI_API_KEY` when it is a secret reference. A
+  plain-text key cannot move; bind a secret instead. The API returns every
+  plain-text env value redacted, so the plan cannot read `OPENAI_BASE_URL`
+  either: pass the gateway URL with `--xai-base-url` (or type it on the agent
+  page) and it becomes `GROK_XAI_API_BASE_URL`. Other plain values keep their
+  key, and the server restores them from the stored config. Other `OPENAI_*`
+  and `CODEX_*` env is dropped;
 - refuses an agent with a filesystem or network confinement setting, a managed AI
   connection, or a non-Grok model, instead of silently weakening it.
 
@@ -149,7 +152,10 @@ back its configuration revision (`paperclipai agent config-revisions <agent-id>`
 
 Verified locally on macOS (`grok 1.0.49`): `--version`, `grok models`, an
 unauthenticated `--single` run (exact error captured), an API-key run against a
-local mock gateway, the offline checksum-verified install, tamper detection.
+local mock gateway, the offline checksum-verified install, tamper detection. The
+switch was run from the agent page (desktop and 390 px) and from the CLI against
+a local server: the stored agent became `grok_local` with its model, effort,
+instructions bundle and `XAI_API_KEY` secret reference.
 
 Not verified: execution on Linux (the pins match the registry, but no Linux
 container ran here), a real xAI or CLIProxy run with a valid key, and the exact

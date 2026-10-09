@@ -23,9 +23,17 @@ export type GrokSwitchPlan =
     }
   | {
       ok: false;
-      reason: "not_codex_local" | "not_xai_model" | "managed_connection" | "confinement_not_portable";
+      reason: "not_codex_local" | "not_xai_model" | "managed_connection" | "confinement_not_portable" | "invalid_base_url";
       message: string;
     };
+
+export interface GrokSwitchOptions {
+  /**
+   * The gateway URL for `GROK_XAI_API_BASE_URL`. The API returns plain env
+   * values redacted, so the plan cannot read the agent's `OPENAI_BASE_URL`.
+   */
+  xaiBaseUrl?: string;
+}
 
 /** Keys both harnesses read, copied unchanged. */
 const KEPT_KEYS = [
@@ -69,6 +77,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function isSet(value: unknown): boolean {
   if (value === undefined || value === null || value === false || value === "") return false;
   if (Array.isArray(value)) return value.length > 0;
@@ -93,9 +110,10 @@ function isRedactedBinding(value: unknown): boolean {
  * Codex provider.
  *
  * @param source - The agent's adapter type and config, as the API returns them.
+ * @param options - Values the API hides from the plan, such as the gateway URL.
  * @returns The patch and a report of what changed, or the reason it cannot move.
  */
-export function planCodexToGrokSwitch(source: GrokSwitchSource): GrokSwitchPlan {
+export function planCodexToGrokSwitch(source: GrokSwitchSource, options: GrokSwitchOptions = {}): GrokSwitchPlan {
   if (source.adapterType !== "codex_local") {
     return { ok: false, reason: "not_codex_local", message: `Only codex_local agents can be switched this way; this agent uses ${source.adapterType}.` };
   }
@@ -116,6 +134,10 @@ export function planCodexToGrokSwitch(source: GrokSwitchSource): GrokSwitchPlan 
       reason: "managed_connection",
       message: "The agent uses a managed AI connection bound to Codex. Switch the harness from the agent's AI connection settings instead.",
     };
+  }
+  const xaiBaseUrl = options.xaiBaseUrl?.trim() ?? "";
+  if (xaiBaseUrl && !isHttpUrl(xaiBaseUrl)) {
+    return { ok: false, reason: "invalid_base_url", message: `"${xaiBaseUrl}" is not an http(s) URL. Pass the gateway URL, for example https://gateway.example/v1.` };
   }
   const confinement = CONFINEMENT_KEYS.filter((key) => isSet(config[key]));
   if (confinement.length > 0) {
@@ -163,12 +185,21 @@ export function planCodexToGrokSwitch(source: GrokSwitchSource): GrokSwitchPlan 
     if (!(from in sourceEnv)) continue;
     if (to in sourceEnv) {
       changes.push(`env ${from} dropped (${to} is already set)`);
+    } else if (to === "GROK_XAI_API_BASE_URL" && xaiBaseUrl) {
+      changes.push(`env ${from} dropped (replaced by the xaiBaseUrl option)`);
     } else if (isRedactedBinding(sourceEnv[from])) {
       changes.push(`env ${from} dropped (its plain-text value is not readable through the API)`);
+      if (to === "GROK_XAI_API_BASE_URL") {
+        warnings.push(`OPENAI_BASE_URL was not carried: the API hides plain-text values. Enter the gateway URL (CLI: --xai-base-url), or Grok calls api.x.ai directly with the gateway key.`);
+      }
     } else {
       env[to] = structuredClone(sourceEnv[from]);
       changes.push(`env ${from} -> ${to}`);
     }
+  }
+  if (xaiBaseUrl && !("GROK_XAI_API_BASE_URL" in env)) {
+    env.GROK_XAI_API_BASE_URL = { type: "plain", value: xaiBaseUrl };
+    changes.push("env GROK_XAI_API_BASE_URL set from the xaiBaseUrl option");
   }
   if (!(("XAI_API_KEY") in env)) {
     warnings.push("No XAI_API_KEY is set. Bind one as a company secret before the first run (or log in the Grok home), or the run fails with grok_auth_required.");

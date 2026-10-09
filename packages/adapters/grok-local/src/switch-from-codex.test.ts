@@ -88,6 +88,36 @@ describe("planCodexToGrokSwitch", () => {
     expect(plan.warnings.join("\n")).toMatch(/XAI_API_KEY/);
   });
 
+  it("warns that a base URL the API returned redacted was not carried, and names the option that sets it", () => {
+    const plan = planCodexToGrokSwitch(codexAgent({
+      model: "grok-4.7",
+      env: { OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" }, OPENAI_API_KEY: SECRET },
+    }));
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.patch.adapterConfig.env).toEqual({ XAI_API_KEY: SECRET });
+    expect(plan.warnings.join("\n")).toMatch(/OPENAI_BASE_URL.*--xai-base-url/s);
+  });
+
+  it("sets GROK_XAI_API_BASE_URL from the xaiBaseUrl option, over a redacted OPENAI_BASE_URL", () => {
+    const plan = planCodexToGrokSwitch(
+      codexAgent({ model: "grok-4.7", env: { OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" } } }),
+      { xaiBaseUrl: " https://gateway.example/v1 " },
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    expect(plan.patch.adapterConfig.env).toEqual({
+      GROK_XAI_API_BASE_URL: { type: "plain", value: "https://gateway.example/v1" },
+    });
+    expect(plan.warnings.join("\n")).not.toMatch(/--xai-base-url/);
+  });
+
+  it.each(["gateway.example/v1", "ftp://gateway.example", "not a url"])("refuses xaiBaseUrl %j", (xaiBaseUrl) => {
+    expect(planCodexToGrokSwitch(codexAgent({ model: "grok-4.7" }), { xaiBaseUrl })).toMatchObject({
+      ok: false, reason: "invalid_base_url",
+    });
+  });
+
   it("warns when the agent has no API key to carry, and keeps an XAI_API_KEY it already has", () => {
     const none = planCodexToGrokSwitch(codexAgent({ model: "grok-4.7" }));
     expect(none.ok && none.warnings.join("\n")).toMatch(/XAI_API_KEY/);

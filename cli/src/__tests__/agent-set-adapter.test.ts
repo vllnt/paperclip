@@ -83,6 +83,19 @@ describe("agent set-adapter", () => {
     ]);
   });
 
+  it("takes the gateway URL from --xai-base-url, because the API returns the Codex base URL redacted", async () => {
+    const fetchMock = stubApi(codexAgent({
+      model: "grok-4.7",
+      env: { OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" }, OPENAI_API_KEY: { type: "secret_ref", secretId: SECRET_ID, version: "latest" } },
+    }));
+    await run(["agent", "set-adapter", AGENT_ID, "grok_local", "--xai-base-url", "https://gateway.example/v1"]);
+    const patch = fetchMock.mock.calls.find((call) => call[1]?.method === "PATCH")!;
+    expect(JSON.parse(String(patch[1].body)).adapterConfig.env).toEqual({
+      XAI_API_KEY: { type: "secret_ref", secretId: SECRET_ID, version: "latest" },
+      GROK_XAI_API_BASE_URL: { type: "plain", value: "https://gateway.example/v1" },
+    });
+  });
+
   it("with --dry-run reports the plan and changes nothing", async () => {
     const fetchMock = stubApi(codexAgent(GROK_CONFIG));
     const log = vi.spyOn(console, "log").mockImplementation(() => {});

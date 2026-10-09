@@ -84,6 +84,45 @@ describe("AgentGrokSwitchNotice", () => {
     expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({ tone: "success" }));
   });
 
+  it("sends the gateway URL typed into the page, because the API returns the Codex base URL redacted", async () => {
+    mockAgentsApi.update.mockResolvedValue({});
+    render(makeAgent({
+      adapterConfig: {
+        model: "grok-4.7",
+        env: { OPENAI_API_KEY: SECRET, OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" } },
+      },
+    }));
+    expect(container.textContent).toContain("OPENAI_BASE_URL was not carried");
+
+    const input = container.querySelector<HTMLInputElement>("[data-testid='agent-grok-switch-base-url']")!;
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    flushSync(() => {
+      setValue.call(input, "https://gateway.example/v1");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.textContent).not.toContain("OPENAI_BASE_URL was not carried");
+    flushSync(() => container.querySelector<HTMLButtonElement>("[data-testid='agent-grok-switch-apply']")!.click());
+    await flush();
+
+    expect(mockAgentsApi.update.mock.calls[0]![1].adapterConfig.env).toEqual({
+      XAI_API_KEY: SECRET,
+      GROK_XAI_API_BASE_URL: { type: "plain", value: "https://gateway.example/v1" },
+    });
+  });
+
+  it("blocks the button while the typed gateway URL is not an http(s) URL", () => {
+    render(makeAgent());
+    const input = container.querySelector<HTMLInputElement>("[data-testid='agent-grok-switch-base-url']")!;
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    flushSync(() => {
+      setValue.call(input, "gateway.example");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.querySelector("[data-testid='agent-grok-switch-apply']")).toBeNull();
+    expect(container.querySelector("[data-testid='agent-grok-switch-blocked']")?.textContent).toContain("not an http(s) URL");
+    expect(container.querySelector("[data-testid='agent-grok-switch-base-url']")).not.toBeNull();
+  });
+
   it("shows the server's refusal instead of a success", async () => {
     mockAgentsApi.update.mockRejectedValue(new Error("Adapter \"grok_local\" is not available on this instance."));
     render(makeAgent());

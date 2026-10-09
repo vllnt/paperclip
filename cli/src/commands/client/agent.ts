@@ -64,6 +64,7 @@ interface AgentFallbacksSetOptions extends BaseClientOptions {
 
 interface AgentSetAdapterOptions extends BaseClientOptions {
   dryRun?: boolean;
+  xaiBaseUrl?: string;
 }
 
 interface AgentJsonPayloadOptions extends BaseClientOptions {
@@ -471,6 +472,10 @@ export function registerAgentCommands(program: Command): void {
       .argument("<agentId>", "Agent ID")
       .argument("<adapterType>", "Target adapter; only grok_local is supported")
       .option("--dry-run", "Print the planned change without applying it")
+      .option(
+        "--xai-base-url <url>",
+        "Gateway URL for GROK_XAI_API_BASE_URL. The API hides the agent's OPENAI_BASE_URL, so pass it here",
+      )
       .action(async (agentId: string, adapterType: string, opts: AgentSetAdapterOptions) => {
         try {
           if (adapterType !== "grok_local") {
@@ -479,7 +484,7 @@ export function registerAgentCommands(program: Command): void {
           const ctx = resolveCommandContext(opts);
           const row = await ctx.api.get<Agent>(apiPath`/api/agents/${agentId}`);
           if (!row) throw new Error(`Agent ${agentId} not found`);
-          const plan = planCodexToGrokSwitch(row);
+          const plan = planCodexToGrokSwitch(row, { xaiBaseUrl: opts.xaiBaseUrl });
           if (!plan.ok) throw new Error(plan.message);
           if (opts.dryRun) {
             printOutput({ dryRun: true, patch: plan.patch, changes: plan.changes, warnings: plan.warnings }, { json: ctx.json });
