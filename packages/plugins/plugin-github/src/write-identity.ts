@@ -734,7 +734,7 @@ export function registerWriteIdentity(
   /** Every gate a user-identity write passes. Returns the person, token and any privileged-action evidence. */
   async function authorizeUserWrite(companyId: string, current: GitHubWriteIdentityPolicy, input: {
     repository: string | null; action: GitHubOperationAction; privileged: GitHubPrivilegedAction[]; pullRequest?: number | null; expectedHeadSha?: string | null;
-    merge?: boolean; autoMerge?: boolean; retarget?: boolean; workflowPush?: GitHubWorkflowPush;
+    merge?: boolean; autoMerge?: boolean; retarget?: boolean; workflowPush?: GitHubWorkflowPush; route?: string;
     /** The agent and run that made the call, from the host (never from the command): scoped grants match on the agent. */
     agentId?: string | null; runId?: string | null;
   }) {
@@ -788,17 +788,17 @@ export function registerWriteIdentity(
   }
 
   /**
-   * A workflow push is always recorded, and a dispatch when an agent grant allowed it: who, which run, where, and which
-   * workflow files the checkout reported. It is written before a credential is returned, so an action that cannot be
-   * recorded does not happen: a failed write refuses the call.
+   * Every allowed workflow push and every allowed workflow dispatch is recorded, whoever the policy lets do it (an agent
+   * grant, every agent, or the base-branch exception): who, which run, where, and for a push which workflow files the
+   * checkout reported or which API endpoint was used. It is written before a credential is returned, so an action that
+   * cannot be recorded does not happen: a failed write refuses the call.
    */
   async function recordPrivilegedAllowed(companyId: string, toggles: GitHubPrivilegedToggles, input: {
-    repository: string | null; privileged: GitHubPrivilegedAction[]; workflowPush?: GitHubWorkflowPush; agentId?: string | null; runId?: string | null;
+    repository: string | null; privileged: GitHubPrivilegedAction[]; workflowPush?: GitHubWorkflowPush; route?: string; agentId?: string | null; runId?: string | null;
   }, byBase: boolean): Promise<void> {
     for (const action of input.privileged) {
       if (!isGitHubScopablePrivilegedAction(action)) continue;
       const scope = toggles[action];
-      if (action === "workflowDispatch" && typeof scope !== "object") continue;
       const push = input.workflowPush;
       const paths = push ? [...new Set(push.commits.flatMap(commit => commit.changes.map(change => change.path)))].sort().slice(0, MAX_WORKFLOW_CHANGES) : null;
       const via = action === "editWorkflows" && byBase && !isGitHubPrivilegedAllowed(toggles, action, input.agentId) ? "base-merge" : typeof scope === "object" ? "agent-grant" : "company";
@@ -806,7 +806,7 @@ export function registerWriteIdentity(
         companyId, message: action === "editWorkflows" ? "github.workflow_push_allowed" : "github.workflow_dispatch_allowed",
         ...(input.agentId ? { entityType: "agent", entityId: input.agentId } : {}),
         metadata: { action, via, agentId: input.agentId ?? null, runId: input.runId ?? null, repository: input.repository,
-          ...(action === "editWorkflows" ? { branch: push?.branch ?? null, tip: push?.tip ?? null, paths } : {}) },
+          ...(action === "editWorkflows" ? { branch: push?.branch ?? null, tip: push?.tip ?? null, paths, ...(input.route ? { route: input.route } : {}) } : {}) },
       });
     }
   }
@@ -869,7 +869,7 @@ export function registerWriteIdentity(
       }
       const action = request.action ?? "other";
       const granted = await authorizeUserWrite(companyId, current, { repository, action, privileged: request.privileged, pullRequest: request.pullRequest, expectedHeadSha: request.expectedHeadSha,
-        merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true, workflowPush: request.workflowPush,
+        merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true, workflowPush: request.workflowPush, route: request.route,
         agentId: request.agentId, runId: request.runId });
       return {
         identity: "user", credential: { token: granted.token, ...granted.user },
@@ -1002,6 +1002,8 @@ export function registerWriteIdentity(
     const pullRequest = Number.isSafeInteger(params.pullRequest) && Number(params.pullRequest) > 0 ? Number(params.pullRequest) : null;
     const expectedHeadSha = typeof params.expectedHeadSha === "string" && FULL_SHA.test(params.expectedHeadSha.toLowerCase()) ? params.expectedHeadSha.toLowerCase() : null;
     const workflowPush = parseWorkflowPush(params.workflowPush);
+    // A receipt for the audit record only: it grants nothing, and the host's classification already decided what the write needs.
+    const route = typeof params.route === "string" && params.route ? clip(params.route, 200) : undefined;
     // Only the host calls this action, and it names the agent and run from the run's own token: a scoped grant matches on them.
     const agentId = normalizeGitHubAgentId(params.agentId), runId = normalizeGitHubAgentId(params.runId);
     try {
@@ -1009,7 +1011,7 @@ export function registerWriteIdentity(
         companyId, repository, access, action: action as GitHubOperationAction | null, privileged: privileged as GitHubPrivilegedAction[], agentId, runId,
         wiki: params.wiki === true, pullRequest, expectedHeadSha, ...(params.fallback === true ? { fallback: true } : {}),
         ...(params.merge === true ? { merge: true } : {}), ...(params.autoMerge === true ? { autoMerge: true } : {}), ...(params.retarget === true ? { retarget: true } : {}),
-        ...(workflowPush ? { workflowPush } : {}),
+        ...(workflowPush ? { workflowPush } : {}), ...(route ? { route } : {}),
       });
     } catch (error) {
       if (error instanceof Denied) return { identity: "user", unavailable: error.message };

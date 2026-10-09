@@ -307,8 +307,10 @@ next command, reads continue.
 
 `editWorkflows` and `workflowDispatch` can be handed to chosen agents instead of
 the whole company. Only an instance administrator can change them (an agent
-never can), and each change and each allowed workflow push is recorded in the
-activity feed. The write identity settings in the plugin page show the same
+never can), and each change and each allowed workflow push or dispatch is recorded
+in the activity feed. `editWorkflows` also covers the Git Data API (`gh api` writes
+to `git/blobs`, `git/trees`, `git/commits`, and creating or moving a branch ref):
+use `git push` where an agent has no grant. The write identity settings in the plugin page show the same
 choice as *Workflow permissions*.
 
 ```sh

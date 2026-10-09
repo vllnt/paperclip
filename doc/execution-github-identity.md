@@ -253,7 +253,27 @@ admin-merge guard; and the throttle (`perMinute`, `perHour` per GitHub user).
 | `release` | `gh release` writes, `…/releases` writes | off |
 | `tagPush` | pushes to `refs/tags/*`, tag refs through the API | off |
 | `pushToMain` | pushes or API writes to `main`/`master`, `gh repo sync`, `merge-upstream` | off |
-| `editWorkflows` | a push whose new commits change `.github/workflows/**`, contents API writes there | off (can be granted to chosen agents) |
+| `editWorkflows` | a push whose new commits change `.github/workflows/**`, contents API writes there, Git Data API writes (blobs, trees, commits, and creating or moving a branch ref) | off (can be granted to chosen agents) |
+
+**The Git Data API counts as a workflow edit.** `gh api` can build a commit
+object by object (`git/blobs`, `git/trees`, `git/commits`) and then point a
+branch at it (`git/refs`), and nothing ties the paths in a tree to the ref that
+later uses it. A tree can also be sent from a file, which Paperclip cannot
+read. So every write to `git/blobs`, `git/trees` and `git/commits`, and every
+`POST git/refs` or `PATCH git/refs/<ref>` that is not for a tag, needs
+`editWorkflows`, whichever paths it carries. A tag ref stays under `tagPush`.
+Deleting a ref, and every read, need nothing extra. A branch created or moved
+this way needs the grant even when the commit already exists. Use `git push`
+where the agent has no grant: the launcher reports what that push changes, so
+an ordinary push of other files needs no grant. Before this check a Git Data
+sequence could install a workflow with no grant (it was a plain commit and a plain
+push), on any branch.
+
+**Defaults.** `workflowDispatch` stays on by default, for every agent, and
+`true` keeps its old meaning. A company with no saved policy has no plugin check
+at all: its runs write as their own GitHub user, GitHub decides what that user
+may do, and the plugin never gives the App's credential for a write there (not
+for a workflow edit either, and the App's token is not granted Workflows write).
 
 **Per-agent grants.** `workflowDispatch` and `editWorkflows` are not only
 company-wide switches. In `privileged`, each takes `false` (nobody), `true`
@@ -290,18 +310,22 @@ agent UUID, saved lowercased, sorted and without duplicates; an empty list is
   only the one ID would take the others' grants away. The refusal is the same
   for a board action in the plugin (a person, not an agent): it still says
   "this agent", and a scoped permission is never held by a board action.
-- **Allowed workflow pushes are recorded.** In a company with a saved policy,
-  every `editWorkflows` push that the policy allows writes
+- **Allowed workflow pushes and dispatches are recorded.** In a company with a
+  saved policy, every `editWorkflows` write that the policy allows writes
   `github.workflow_push_allowed` (the agent, the run, the repository, and
   whether an agent grant, a company-wide value, or the base-branch exception
-  allowed it). This includes pushes that a company-wide `true` allowed before:
-  if the activity log cannot take the record, such a push is refused too.
-  The branch, pushed commit and workflow paths are the ones the checkout
-  reported. A push it does not report (several refs, a tag, more history than it
-  reports) and a contents API write to `.github/workflows` are recorded with
-  those three fields `null`. A `workflowDispatch` allowed by an agent grant
-  writes `github.workflow_dispatch_allowed` (agent, run and repository); one
-  allowed for every agent, the default, is not recorded. For the App user the
+  allowed it), and every `workflowDispatch` that it allows writes
+  `github.workflow_dispatch_allowed` (the agent, the run, the repository and the
+  company), the default `true` included. This includes writes that a company-wide
+  value allowed before: if the activity log cannot take the record, such a write
+  is refused too. A board action in the plugin (a person, not an agent) is
+  recorded with no agent. The branch, pushed commit and workflow paths of a
+  push are the ones the checkout reported. A push it does not report (several
+  refs, a tag, more history than it reports) is recorded with those three fields
+  `null`. A `gh api` write (the contents API under `.github/workflows`, or the
+  Git Data API) has no checkout report, so its entry has `null` there and a
+  `route` instead: the endpoint it used, for example `git/trees` or
+  `git/refs/heads/feature`. For the App user the
   record is written before the token is returned. For a company whose runs
   write as their own user, it is written when the policy allows the command,
   before the answer returns, and it says "allowed by the policy": the server can

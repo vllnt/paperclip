@@ -273,6 +273,8 @@ export interface ClassifiedGitHubOperation {
    * plugin lets it through without the toggle only when every path is the base branch's own.
    */
   workflowPush?: GitHubWorkflowPush;
+  /** The endpoint of a `gh api` write that needs `editWorkflows`: the plugin records it with the allowed write. */
+  route?: string;
   /** The agent and run that sent the command, when the server attached them (see {@link GitHubOperationCaller}). */
   caller?: GitHubOperationCaller;
 }
@@ -437,6 +439,7 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     ...(autoMerge ? { autoMerge: true as const } : {}),
     ...(retarget ? { retarget: true as const } : {}),
     ...(workflowPush ? { workflowPush } : {}),
+    ...(command.route ? { route: command.route } : {}),
     ...(operation.caller ? { caller: operation.caller } : {}),
     ...(operation.program === "git" && command.action === "commit" ? { signing: true } : {}),
   };
@@ -541,6 +544,7 @@ export async function resolveGitHubWriteIdentityDecision(
       wiki: operation.wiki, pullRequest: operation.pullRequest, expectedHeadSha: operation.expectedHeadSha,
       ...(operation.merge ? { merge: true } : {}), ...(operation.autoMerge ? { autoMerge: true } : {}), ...(operation.retarget ? { retarget: true } : {}),
       ...(operation.workflowPush ? { workflowPush: operation.workflowPush } : {}),
+      ...(operation.route ? { route: operation.route } : {}),
       ...(operation.caller ? { agentId: operation.caller.agentId, runId: operation.caller.runId } : {}),
       ...(input.fallback ? { fallback: true } : {}),
     }, 15_000);

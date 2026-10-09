@@ -83,6 +83,21 @@ describe("GitHub write identity: run user (VLL-477)", () => {
     expect(f.scoped).not.toHaveBeenCalled();
   });
 
+  it("never gives a company with no saved policy the App's credential, whatever write it asks for, workflow edits included", async () => {
+    const f = await fixture();
+    // No policy: the run's own user writes (GitHub decides what that user may do) and the App is not asked for a token.
+    for (const action of ["commit", "push", "pullRequest", "comment", "other", "project"]) {
+      for (const fallback of [false, true]) {
+        const decision = await f.decide({ repository: "vllnt/paperclip", action, privileged: ["editWorkflows", "workflowDispatch"], fallback });
+        expect(decision, `${action} ${fallback}`).not.toHaveProperty("credential");
+        expect(decision, `${action} ${fallback}`).toMatchObject(fallback ? { identity: "bot", unavailable: "Connect your GitHub account in Paperclip to write as yourself." } : { identity: "user", missingUserConnection: "fail" });
+      }
+    }
+    expect(f.scoped).not.toHaveBeenCalled();
+    // Nothing is recorded as allowed either: there is no policy, so the plugin allowed nothing.
+    expect(f.h.activity.filter(entry => /^github\.workflow_.*_allowed$/.test(entry.message))).toEqual([]);
+  });
+
   it("mints an App token for one repository with the installation's write permissions", async () => {
     const f = await fixture();
     await f.setPolicy({ default: allBot, overrides: [{ match: "vllnt/*", push: "user" }], missingUserConnection: "fail" });
@@ -1920,10 +1935,68 @@ describe("per-agent grants of editWorkflows and workflowDispatch", () => {
     const fresh = await appFixture();
     await fresh.authorize();
     expect(await fresh.write("anthm-fr/songtrivia", { action: "push", privileged: ["editWorkflows"], agentId: DX })).toHaveProperty("unavailable");
-    expect(await fresh.write("anthm-fr/songtrivia", { action: "other", privileged: ["workflowDispatch"], agentId: OTHER })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await fresh.write("anthm-fr/songtrivia", { action: "other", privileged: ["workflowDispatch"], agentId: OTHER, runId: RUN })).toMatchObject({ credential: { login: "agent-owner" } });
     expect(await fresh.write("anthm-fr/songtrivia", { action: "other", privileged: ["workflowDispatch"] })).toMatchObject({ credential: { login: "agent-owner" } });
-    // Dispatching with the default is not recorded: only a grant to agents, or an edit of workflow files, is.
     expect(fresh.h.activity.filter(entry => entry.message === "github.workflow_push_allowed")).toEqual([]);
+    // Every allowed dispatch is recorded, the default's too: the agent, the run, the company and the repository, and that it was company-wide.
+    expect(fresh.h.activity.filter(entry => entry.message === "github.workflow_dispatch_allowed")).toEqual([
+      expect.objectContaining({ companyId: "anthm", entityType: "agent", entityId: OTHER, metadata: { action: "workflowDispatch", via: "company", agentId: OTHER, runId: RUN, repository: "anthm-fr/songtrivia" } }),
+      expect.objectContaining({ companyId: "anthm", metadata: { action: "workflowDispatch", via: "company", agentId: null, runId: null, repository: "anthm-fr/songtrivia" } }),
+    ]);
+    // A dispatch that is refused is not recorded as allowed.
+    const dispatchOff = await grantFixture({ workflowDispatch: false });
+    refused(await dispatchOff.write("anthm-fr/songtrivia", { action: "other", privileged: ["workflowDispatch"], agentId: DX, runId: RUN }), /\(workflowDispatch\) and it is turned off/);
+    expect(dispatchOff.logged("github.workflow_dispatch_allowed")).toEqual([]);
+  });
+
+  it("records a dispatch the run's own user makes, and one that cannot be recorded is refused", async () => {
+    const f = await grantFixture();
+    const policy = { default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "run", allowedRepositories: ["anthm-fr/songtrivia"] };
+    await f.h.performAction("write-identity.set", { companyId: "other", policy }, actors("other").admin);
+    const ask = () => f.h.performAction<any>("repository-write-identity", { companyId: "other", repository: "anthm-fr/songtrivia", access: "write", action: "other", privileged: ["workflowDispatch"], agentId: OTHER, runId: RUN }, actors("other").server);
+    expect(await ask()).toMatchObject({ identity: "user" });
+    expect(f.logged("github.workflow_dispatch_allowed")).toEqual([expect.objectContaining({ companyId: "other", metadata: expect.objectContaining({ via: "company", agentId: OTHER, runId: RUN }) })]);
+    const down = new Error("activity store is down");
+    const log = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(ask()).rejects.toThrow(down);
+    log.mockRestore();
+  });
+
+  it("holds the Git Data API sequence that builds a workflow file object by object: refused without the grant, allowed and recorded with it", async () => {
+    // What the server classifies for gh api blobs, trees (a file, a symlink), commits and the ref of a branch that is not the default one.
+    const sequence = [
+      { action: "commit", route: "git/blobs" }, { action: "commit", route: "git/trees" }, { action: "commit", route: "git/trees" },
+      { action: "commit", route: "git/commits" }, { action: "push", route: "git/refs/heads/feature" },
+    ];
+    const f = await grantFixture();
+    for (const agentId of [OTHER, null, undefined] as const) {
+      for (const call of sequence) refused(await f.push(agentId, call), /no board grant for editWorkflows.*write-identity\.grant/s);
+    }
+    // The route is a receipt, not a permission: a call that names a harmless one is held the same.
+    refused(await f.push(OTHER, { action: "commit", route: "contents/README.md" }), /no board grant for editWorkflows/);
+    refused(await f.push(OTHER, { action: "push" }), /no board grant for editWorkflows/);
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    // The granted agent builds it, and each call is recorded with the endpoint it used.
+    for (const call of sequence) expect(await f.push(DX, call), call.route).toMatchObject({ identity: "user", credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")).toEqual(sequence.map(call => expect.objectContaining({
+      companyId: "anthm", entityType: "agent", entityId: DX,
+      metadata: { action: "editWorkflows", via: "agent-grant", agentId: DX, runId: RUN, repository: "anthm-fr/songtrivia", branch: null, tip: null, paths: null, route: call.route },
+    })));
+    // A record that cannot be written stops the sequence before the credential is returned.
+    const down = new Error("activity store is down");
+    const log = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(f.push(DX, sequence[1])).rejects.toThrow(down);
+    log.mockRestore();
+  });
+
+  it("clips a long receipt and ignores one that is not text", async () => {
+    const f = await grantFixture();
+    const long = `git/refs/heads/${"x".repeat(500)}`;
+    expect(await f.push(DX, { action: "push", route: long })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await f.push(DX, { action: "push", route: { path: "git/trees" } })).toMatchObject({ credential: { login: "agent-owner" } });
+    const [first, second] = f.logged("github.workflow_push_allowed").map(entry => (entry.metadata as any));
+    expect(first.route).toHaveLength(200);
+    expect(second).not.toHaveProperty("route");
   });
 
   it("refuses a workflow push whose record cannot be written, in either mode, and returns no credential", async () => {

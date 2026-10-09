@@ -185,6 +185,8 @@ export interface GitHubWriteIdentityRequest {
   retarget?: boolean;
   /** A push whose workflow changes may arrive without `editWorkflows` when they are the base branch's own (see {@link GitHubWorkflowPush}). */
   workflowPush?: GitHubWorkflowPush;
+  /** The endpoint of a `gh api` write that needs `editWorkflows` (see {@link GitHubCommandClass.route}), for the audit record. */
+  route?: string;
   /** Ask for the App after a `user` write found no GitHub identity. Honoured only under `use_bot`. */
   fallback?: boolean;
 }
@@ -580,6 +582,12 @@ export interface GitHubCommandClass {
    * a write identity policy.
    */
   integrity?: true;
+  /**
+   * The endpoint a `gh api` write used, after `repos/OWNER/REPO/` (for example `git/trees`; a ref write names its ref,
+   * `git/refs/heads/x`), when the write needs `editWorkflows`. The plugin records it, so an allowed API write says
+   * which endpoint it was.
+   */
+  route?: string;
 }
 
 export interface GitHubCommandContext {
@@ -1073,6 +1081,9 @@ export function ghApiRoute(args: readonly string[]): GhApiRoute {
     ?? { route: null, problem: "Paperclip cannot tell which command runs.", repository: null, placeholder: false };
 }
 
+/** The longest endpoint kept as the receipt of an API write that needs `editWorkflows`. */
+const MAX_AUDIT_ROUTE = 200;
+
 function ghApiClass(request: GhApiRequest, endpoint: GhApiRoute): GitHubCommandClass {
   if (request.unknown) return { ...write("other"), denied: `Paperclip does not know the gh api option ${request.unknown.slice(0, 60)}, so it cannot check this request.`, integrity: true };
   if (request.hostname !== null && request.hostname.trim().toLowerCase() !== "github.com") {
@@ -1142,29 +1153,41 @@ function ghApiClass(request: GhApiRequest, endpoint: GhApiRoute): GitHubCommandC
     : isReleaseTag(name) ? { denied: RELEASE_TAG_DENIED } : {};
   if (/^releases(\/|$)/.test(repo)) return { ...write("other", "release"), ...releaseTag(fields.get("tag_name")) };
   if (/^check-(runs|suites)\/[^/]+\/rerequest$/.test(repo)) return write("other", "workflowDispatch");
+  // The Git Data API builds a commit object by object and then points a ref at it. Nothing ties a tree's paths to the ref
+  // that later uses it, and a tree can be sent from a file, so Paperclip cannot see which paths a call carries. Writing
+  // blobs, trees and commits, and creating or moving a ref that is not a tag (a tag is held by tagPush), therefore all
+  // count as a workflow edit. `git push` is the checked path: the launcher reports what the push changes. Deleting a ref
+  // adds no content.
+  const receipt = (value: string) => ({ route: value.slice(0, MAX_AUDIT_ROUTE) });
   if (repo === "git/refs") {
     const ref = fields.get("ref") ?? "";
     if (!ref) return { ...write("push", "tagPush", "pushToMain"), denied: "Name the ref with -f ref=refs/heads/<branch>; Paperclip cannot check a ref it cannot see." };
+    const tag = ref.startsWith("refs/tags/");
     return {
-      ...write("push", ...(ref.startsWith("refs/tags/") ? ["tagPush" as const] : []), ...(ref.startsWith("refs/heads/") && defaultBranch(ref) ? ["pushToMain" as const] : [])),
-      ...releaseTag(ref.startsWith("refs/tags/") ? ref : undefined),
+      ...write("push", ...(tag ? ["tagPush" as const] : ["editWorkflows" as const]), ...(ref.startsWith("refs/heads/") && defaultBranch(ref) ? ["pushToMain" as const] : [])),
+      ...(tag ? {} : receipt(`${repo}/${ref.replace(/^refs\//, "")}`)),
+      ...releaseTag(tag ? ref : undefined),
     };
   }
   const encodedRef = /^git\/refs\/(.+)$/.exec(repo)?.[1];
   const ref = encodedRef ? decodePath(encodedRef) : undefined;
   if (ref) {
+    const moves = effective !== "DELETE" && !ref.startsWith("tags/");
     return {
-      ...write("push", ...(ref.startsWith("tags/") ? ["tagPush" as const] : []), ...(ref.startsWith("heads/") && defaultBranch(ref.slice("heads/".length)) ? ["pushToMain" as const] : [])),
+      ...write("push", ...(ref.startsWith("tags/") ? ["tagPush" as const] : []), ...(moves ? ["editWorkflows" as const] : []), ...(ref.startsWith("heads/") && defaultBranch(ref.slice("heads/".length)) ? ["pushToMain" as const] : [])),
+      ...(moves ? receipt(`git/refs/${ref}`) : {}),
       ...releaseTag(ref.startsWith("tags/") ? ref : undefined),
     };
   }
   if (repo === "git/tags") return { ...write("commit", "tagPush"), ...releaseTag(fields.get("tag")) };
-  if (/^git\/(commits|trees|blobs)$/.test(repo)) return write("commit");
+  if (/^git\/(commits|trees|blobs)(\/|$)/.test(repo)) return { ...write("commit", "editWorkflows"), ...receipt(repo) };
   // The contents API commits to the default branch unless a branch is named.
   if (/^contents(\/|$)/.test(repo)) {
-    return write("commit",
-      ...(defaultBranch(fields.get("branch")) ? ["pushToMain" as const] : []),
-      ...(/^contents\/\.github\/workflows(\/|$)/.test(decodePath(repo)) ? ["editWorkflows" as const] : []));
+    const workflows = /^contents\/\.github\/workflows(\/|$)/.test(decodePath(repo));
+    return {
+      ...write("commit", ...(defaultBranch(fields.get("branch")) ? ["pushToMain" as const] : []), ...(workflows ? ["editWorkflows" as const] : [])),
+      ...(workflows ? receipt(decodePath(repo)) : {}),
+    };
   }
   if (repo === "merges") return write("push", ...(defaultBranch(fields.get("base") ?? "main") ? ["pushToMain" as const] : []));
   // A raw merge can bypass branch rules for an admin, so it counts as an admin merge.

@@ -302,7 +302,7 @@ describe("classifyGitHubCommand", () => {
     expect(classifyGitHubCommand("gh", ["api", "repos/o/r/git/refs", "-fref=refs/tags/pkg@1", "-fsha=abc"]).denied).toMatch(/release workflow/);
     expect(classifyGitHubCommand("gh", ["api", "repos/o/r/git/refs", "--input", "body.json"]).denied).toMatch(/Name this request's fields/);
     expect(classifyGitHubCommand("gh", ["api", "-X", "POST", "repos/o/r/releases", "--input", "release.json"]).denied).toMatch(/Name this request's fields/);
-    expect(classifyGitHubCommand("gh", ["api", "-X", "PATCH", "repos/o/r/git/refs/heads%2Fmain", "-f", "sha=abc"])).toEqual(write("push", "pushToMain"));
+    expect(classifyGitHubCommand("gh", ["api", "-X", "PATCH", "repos/o/r/git/refs/heads%2Fmain", "-f", "sha=abc"])).toEqual({ ...write("push", "editWorkflows", "pushToMain"), route: "git/refs/heads/main" });
     expect(classifyGitHubCommand("gh", ["api", "-X", "POST", "https://evil.example/repos/o/r/issues"]).denied).toMatch(/only to github\.com/);
     expect(classifyGitHubCommand("gh", ["api", "-X", "POST", "repos/o/r/check-runs/9/rerequest"])).toEqual(write("other", "workflowDispatch"));
     // Release tags behind value flags or --tag.
@@ -350,11 +350,11 @@ describe("classifyGitHubCommand", () => {
     [["api", "-X", "POST", "repos/o/r/actions/workflows/deploy.yml/dispatches", "-f", "ref=main"], write("other", "workflowDispatch")],
     [["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v1"], write("other", "release")],
     [["api", "repos/o/r/git/refs", "-f", "ref=refs/tags/v1", "-f", "sha=abc"], write("push", "tagPush")],
-    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc"], write("push", "pushToMain")],
+    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc"], { ...write("push", "editWorkflows", "pushToMain"), route: "git/refs/heads/main" }],
     [["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat"], write("push")],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "message=x", "-f", "content=eA=="], write("commit", "pushToMain")],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "branch=docs", "-f", "message=x"], write("commit")],
-    [["api", "-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs"], write("commit", "editWorkflows")],
+    [["api", "-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs"], { ...write("commit", "editWorkflows"), route: "contents/.github/workflows/ci.yml" }],
     [["api", "-H", "Accept: application/json", "repos/o/r/pulls"], read],
     [["api", "graphql", "-f", 'query=mutation{resolveReviewThread(input:{threadId:"T"}){clientMutationId}}'], write("comment")],
     [["api", "graphql", "-f", "query=query{viewer{login}}"], read],
@@ -829,6 +829,63 @@ describe("security review round 4 (attack regressions)", () => {
       expect(classifyGitHubCommand("gh", ["api", "graphql", "-f", `query=mutation{${mutation}(input:{pullRequestId:"x"}){clientMutationId}}`]).denied, mutation).toMatch(/cannot check the GraphQL mutation/);
     }
     expect(classifyGitHubCommand("git", ["push", "origin", "HEAD:main"]).privileged).toContain("pushToMain");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Git Data API: a workflow file can be built object by object and a ref pointed at it, with no `git push` to inspect.
+// ---------------------------------------------------------------------------
+
+describe("git data API writes need editWorkflows (a workflow edit without git push)", () => {
+  const api = (...args: string[]) => classifyGitHubCommand("gh", ["api", ...args]);
+  const needsWorkflows = (action: string, route: string, ...more: string[]) => ({ access: "write", action, privileged: ["editWorkflows", ...more], route });
+
+  it("holds each call of the four-call sequence, on a branch that is not the default branch", () => {
+    // 1. a blob, 2. a tree that puts a file (or a symlink, mode 120000) under .github/workflows, 3. a commit on that tree, 4. the ref that uses it.
+    expect(api("-X", "POST", "repos/o/r/git/blobs", "-f", "content=on: push", "-f", "encoding=utf-8")).toEqual(needsWorkflows("commit", "git/blobs"));
+    expect(api("-X", "POST", "repos/o/r/git/trees", "-f", "tree[][path]=.github/workflows/evil.yml", "-f", "tree[][mode]=100644", "-f", "tree[][type]=blob", "-f", "tree[][sha]=abc")).toEqual(needsWorkflows("commit", "git/trees"));
+    expect(api("-X", "POST", "repos/o/r/git/trees", "-f", "tree[][path]=.github/workflows/evil.yml", "-f", "tree[][mode]=120000", "-f", "tree[][type]=blob", "-f", "tree[][sha]=abc")).toEqual(needsWorkflows("commit", "git/trees"));
+    expect(api("-X", "POST", "repos/o/r/git/commits", "-f", "message=x", "-f", "tree=abc", "-f", "parents[]=def")).toEqual(needsWorkflows("commit", "git/commits"));
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/feature"));
+    expect(api("repos/o/r/git/refs", "-f", "ref=refs/heads/feature", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/feature"));
+  });
+
+  it("does not need the body to be readable: a tree sent from a file is held the same", () => {
+    expect(api("-X", "POST", "repos/o/r/git/trees", "--input", "tree.json")).toEqual(needsWorkflows("commit", "git/trees"));
+    expect(api("-X", "POST", "repos/o/r/git/commits", "-F", "message=@m.txt")).toEqual(needsWorkflows("commit", "git/commits"));
+  });
+
+  it("holds every spelling GitHub routes to the same endpoint", () => {
+    for (const path of ["repos/o/r/git/trees/", "repos/o/r//git/trees", "repos/o/r/./git/trees", "/repos/o/r/git/%74rees", "https://api.github.com/repos/o/r/git/trees"]) {
+      expect(api("-X", "POST", path), path).toMatchObject({ privileged: ["editWorkflows"], route: "git/trees" });
+    }
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/heads%2Ffeature", "-f", "sha=abc")).toMatchObject({ privileged: ["editWorkflows"], route: "git/refs/heads/feature" });
+  });
+
+  it("keeps the default branch's pushToMain next to it, and the other toggles as they were", () => {
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/main", "pushToMain"));
+    expect(api("-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/heads/main", "-f", "sha=abc")).toEqual(needsWorkflows("push", "git/refs/heads/main", "pushToMain"));
+    // A tag ref is held by tagPush (and refused for a release tag); an annotated tag object by tagPush too.
+    expect(api("-X", "POST", "repos/o/r/git/refs", "-f", "ref=refs/tags/v1", "-f", "sha=abc")).toEqual({ access: "write", action: "push", privileged: ["tagPush"] });
+    expect(api("-X", "PATCH", "repos/o/r/git/refs/tags/v1", "-f", "sha=abc")).toEqual({ access: "write", action: "push", privileged: ["tagPush"] });
+    expect(api("-X", "POST", "repos/o/r/git/tags", "-f", "tag=v1", "-f", "object=abc")).toEqual({ access: "write", action: "commit", privileged: ["tagPush"] });
+  });
+
+  it("lets a ref be deleted and the objects be read: neither adds content", () => {
+    expect(api("-X", "DELETE", "repos/o/r/git/refs/heads/feature")).toEqual({ access: "write", action: "push", privileged: [] });
+    for (const path of ["repos/o/r/git/trees/abc?recursive=1", "repos/o/r/git/blobs/abc", "repos/o/r/git/commits/abc", "repos/o/r/git/refs/heads/feature", "repos/o/r/git/matching-refs/heads"]) {
+      expect(api(path), path).toEqual({ access: "read", action: null, privileged: [] });
+    }
+  });
+
+  it("still refuses a ref it cannot read, and a placeholder, whatever the toggles", () => {
+    expect(api("-X", "POST", "repos/o/r/git/refs", "-F", "ref=@ref.txt", "-f", "sha=abc").denied).toMatch(/Name the ref|fields with -f/);
+    expect(api("-X", "PATCH", "repos/{owner}/{repo}/git/refs/heads/{branch}", "-f", "sha=abc").denied).toMatch(/instead of gh placeholders/);
+  });
+
+  it("holds a workflow file written through the contents API with the same receipt", () => {
+    expect(api("-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs", "-f", "message=x")).toEqual(needsWorkflows("commit", "contents/.github/workflows/ci.yml"));
+    expect(api("-X", "PUT", "repos/o/r/contents/README.md", "-f", "branch=docs", "-f", "message=x")).toEqual({ access: "write", action: "commit", privileged: [] });
   });
 });
 

@@ -108,6 +108,34 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(asked[1]).not.toHaveProperty("runId");
   });
 
+  it("asks the plugin for editWorkflows on each Git Data API call that builds a workflow file, with the run's agent and the endpoint it used", async () => {
+    const run = await seed();
+    const api = (...args: string[]) => ({ program: "gh" as const, args: ["api", ...args] });
+    const calls = [
+      api("-X", "POST", "repos/Acme/Site/git/blobs", "-f", "content=on: push"),
+      api("-X", "POST", "repos/Acme/Site/git/trees", "-f", "tree[][path]=.github/workflows/evil.yml", "-f", "tree[][mode]=120000", "-f", "tree[][sha]=abc"),
+      api("-X", "POST", "repos/Acme/Site/git/commits", "-f", "message=x", "-f", "tree=abc"),
+      api("-X", "PATCH", "repos/Acme/Site/git/refs/heads/feature", "-f", "sha=abc"),
+    ];
+    for (const call of calls) await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: call }), run));
+    expect(asked).toHaveLength(4);
+    expect(asked.map(question => question.route)).toEqual(["git/blobs", "git/trees", "git/commits", "git/refs/heads/feature"]);
+    expect(asked.map(question => question.action)).toEqual(["commit", "commit", "commit", "push"]);
+    for (const question of asked) {
+      expect(question).toMatchObject({ companyId: run.companyId, repository: "acme/site", access: "write", privileged: ["editWorkflows"], agentId: run.agentId, runId: run.runId });
+    }
+    // A route in the launcher's report is not read: only the one the server worked out reaches the plugin, and only for these writes.
+    asked.length = 0;
+    await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: { ...api("-X", "PUT", "repos/Acme/Site/contents/README.md", "-f", "message=x", "-f", "branch=docs"), route: "git/trees" } }), run));
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ action: "commit", privileged: [] });
+    expect(asked[0]).not.toHaveProperty("route");
+    // Deleting a ref and reading objects never ask for editWorkflows.
+    asked.length = 0;
+    await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: api("-X", "DELETE", "repos/Acme/Site/git/refs/heads/feature") }), run));
+    expect(asked[0]).toMatchObject({ action: "push", privileged: [] });
+  });
+
   it("never asks the plugin about a push that is refused whatever the toggles, a release tag with workflow changes included", async () => {
     const run = await seed();
     const tag = await resolveGitHubOperationCredentials(db, run, push({ args: ["push", "origin", "refs/tags/engine@1.0.0"], refs: {} }));
