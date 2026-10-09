@@ -317,10 +317,24 @@ export interface IssueWakeDiagnosticsResponse {
   };
 }
 
+/** The latest heartbeat run whose context issue is the node. */
+export interface IssueSubtreeDiagnosticLastRun {
+  /** Null for actors without company-scope read, like wake-request run ids. */
+  id: string | null;
+  status: string;
+  /** Null for actors without company-scope read. */
+  agentId: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+  errorCode: string | null;
+}
+
 export interface IssueSubtreeDiagnosticNode {
   issue: IssueBlockerDiagnosticIssueSummary;
   parentId: string | null;
   depth: number;
+  lastRun: IssueSubtreeDiagnosticLastRun | null;
   diagnosis: string | null;
   likelyReason: string | null;
   blockers: IssueBlockerDiagnosticNode[];
