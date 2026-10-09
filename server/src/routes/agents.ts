@@ -20,6 +20,7 @@ import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaper
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
+import { rateLimit } from "express-rate-limit";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -2883,28 +2884,28 @@ export function agentRoutes(
     });
   }
 
-  const agentCreationRateLimiter = createInviteRateLimiter({ windowMs: 60_000, maxRequests: 30 });
-
   /**
    * Route middleware for the agent create and hire routes. They authorize the
    * caller and write several rows per request, so each actor gets a bounded
-   * number of requests per company per minute. Runs before validation and
-   * authorization. Answers 429 with `Retry-After` when the limit is spent.
+   * number of requests per company per minute across both routes. Runs before
+   * validation and authorization. A spent limit answers 429 with `Retry-After`
+   * through the error handler.
    */
-  function limitAgentCreation(req: Request, res: Response, next: NextFunction) {
-    const actor = req.actor.type === "agent"
-      ? `agent:${req.actor.agentId ?? req.actor.keyId ?? "unknown"}`
-      : `user:${req.actor.userId ?? req.actor.source ?? "board"}`;
-    const result = agentCreationRateLimiter.consume(`${req.params.companyId}:${actor}`);
-    res.setHeader("X-RateLimit-Limit", String(result.limit));
-    res.setHeader("X-RateLimit-Remaining", String(result.remaining));
-    if (!result.allowed) {
-      res.setHeader("Retry-After", String(result.retryAfterSeconds));
-      next(tooManyRequests("Too many agent creation requests", { retryAfterSeconds: result.retryAfterSeconds }));
-      return;
-    }
-    next();
-  }
+  const limitAgentCreation = rateLimit({
+    windowMs: 60_000,
+    limit: 30,
+    standardHeaders: false,
+    legacyHeaders: true,
+    keyGenerator: (req) => {
+      const actor = req.actor.type === "agent"
+        ? `agent:${req.actor.agentId ?? req.actor.keyId ?? "unknown"}`
+        : `user:${req.actor.userId ?? req.actor.source ?? "board"}`;
+      return `${req.params.companyId}:${actor}`;
+    },
+    handler: (_req, _res, next, options) => {
+      next(tooManyRequests("Too many agent creation requests", { limit: options.limit }));
+    },
+  });
 
   /**
    * An agent that creates or hires an agent may not give it settings it could

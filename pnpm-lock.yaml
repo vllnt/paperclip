@@ -1082,6 +1082,9 @@ importers:
       express:
         specifier: ^5.1.0
         version: 5.2.1
+      express-rate-limit:
+        specifier: 8.6.2
+        version: 8.6.2(express@5.2.1)
       heif2jpeg:
         specifier: 0.1.6
         version: 0.1.6
