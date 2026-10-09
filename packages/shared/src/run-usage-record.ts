@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 /**
  * Version of the `run_usage_records` row shape. A worker pass replaces a stored record only when
  * its version is lower than this one, so a taxonomy or mapping change is a version bump followed
@@ -33,21 +35,23 @@ export type RunUsageTerminalStatus = (typeof RUN_USAGE_TERMINAL_STATUSES)[number
  * Collector health for one company, returned by `GET /companies/:companyId/observability/health`.
  * Counts cover terminal runs that finished more than the settle delay ago. Times are ISO-8601 UTC.
  */
-export interface ObservabilityHealth {
+export const observabilityHealthSchema = z.object({
   /** The record schema version this server writes. */
-  schemaVersion: number;
+  schemaVersion: z.number().int(),
   /** Settled terminal runs created in the last 24 hours. */
-  terminalRuns24h: number;
+  terminalRuns24h: z.number().int().nonnegative(),
   /** Of those, how many have a usage record. */
-  derivedRuns24h: number;
+  derivedRuns24h: z.number().int().nonnegative(),
   /** Settled terminal runs created in the last 48 hours that have no record yet. */
-  pendingRuns: number;
+  pendingRuns: z.number().int().nonnegative(),
   /** Creation time of the oldest pending run, or null when none is pending. */
-  oldestPendingAt: string | null;
+  oldestPendingAt: z.string().nullable(),
   /** Records written more than 48 hours after their run was created (found by the daily sweep). */
-  lateRecords30d: number;
+  lateRecords30d: z.number().int().nonnegative(),
   /** Settled terminal runs created 2 to 30 days ago that still have no record. */
-  unreconciledRuns30d: number;
+  unreconciledRuns30d: z.number().int().nonnegative(),
   /** When the newest record was written, or null when the company has none. */
-  lastDerivedAt: string | null;
-}
+  lastDerivedAt: z.string().nullable(),
+});
+
+export type ObservabilityHealth = z.infer<typeof observabilityHealthSchema>;
