@@ -146,9 +146,11 @@ describeEmbeddedPostgres("company archive export", () => {
       message: FOREIGN_CANARY,
     });
 
-    const records = await collect({ companyId: company.companyId });
+    const until = new Date(Date.now() - 20 * 60_000);
+    const records = await collect({ companyId: company.companyId, until });
     const kinds = records.map((record) => record.kind);
     expect(kinds[0]).toBe("export.header");
+    expect(records[0]?.data).toMatchObject({ requestedUntil: until.toISOString(), until: until.toISOString() });
     expect(kinds.at(-1)).toBe("export.end");
     expect(records.filter((record) => record.kind === "run").map((record) => record.runId)).toEqual([older, newer]);
     expect(JSON.stringify(records)).not.toContain(FOREIGN_CANARY);

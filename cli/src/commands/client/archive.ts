@@ -34,6 +34,8 @@ interface ExportHeader {
   companyId: string;
   include: string[];
   since: string | null;
+  /** The `--until` the export was started with (not the server's cutoff). */
+  until: string | null;
 }
 
 /**
@@ -50,7 +52,7 @@ async function findResumePoint(file: string): Promise<{ header: ExportHeader | n
   for await (const line of lines) {
     offset += Buffer.byteLength(line, "utf8") + 1;
     lineNumber += 1;
-    let record: CompanyArchiveRecord<{ cursor?: unknown; include?: string[]; since?: string | null }>;
+    let record: CompanyArchiveRecord<{ cursor?: unknown; include?: string[]; since?: string | null; requestedUntil?: string | null }>;
     try {
       record = JSON.parse(line);
     } catch {
@@ -58,7 +60,12 @@ async function findResumePoint(file: string): Promise<{ header: ExportHeader | n
       continue;
     }
     if (lineNumber === 1 && record.kind === "export.header") {
-      header = { companyId: record.companyId, include: record.data.include ?? [], since: record.data.since ?? null };
+      header = {
+        companyId: record.companyId,
+        include: record.data.include ?? [],
+        since: record.data.since ?? null,
+        until: record.data.requestedUntil ?? null,
+      };
     }
     if (record.kind === "run.end" && typeof record.data.cursor === "string") {
       point = { cursor: record.data.cursor, length: offset };
@@ -68,8 +75,9 @@ async function findResumePoint(file: string): Promise<{ header: ExportHeader | n
 }
 
 /**
- * A resumed export keeps the original company, --include and --since, so one
- * file never mixes two data sets. Omitted options are taken from the file.
+ * A resumed export keeps the original company, --include, --since and
+ * --until, so one file never mixes two data sets. Omitted options are taken
+ * from the file.
  */
 function resumeOptions(header: ExportHeader | null, companyId: string | undefined, opts: ArchiveExportOptions): ArchiveExportOptions {
   if (!header) throw new Error("--resume: the existing file has no export.header line; start a new export.");
@@ -78,10 +86,16 @@ function resumeOptions(header: ExportHeader | null, companyId: string | undefine
     : null;
   const original = [...header.include].sort().join(",");
   const since = opts.since ? new Date(opts.since).toISOString() : null;
-  if (header.companyId !== companyId || (requested !== null && requested !== original) || (opts.since && since !== header.since)) {
-    throw new Error("--resume: the existing file was exported for another company or with other --include/--since options.");
+  const until = opts.until ? new Date(opts.until).toISOString() : null;
+  if (
+    header.companyId !== companyId
+    || (requested !== null && requested !== original)
+    || (opts.since && since !== header.since)
+    || (opts.until && until !== header.until)
+  ) {
+    throw new Error("--resume: the existing file was exported for another company or with other --include/--since/--until options.");
   }
-  return { ...opts, include: header.include.join(","), since: header.since ?? undefined };
+  return { ...opts, include: header.include.join(","), since: header.since ?? undefined, until: header.until ?? undefined };
 }
 
 interface ExportOutput {

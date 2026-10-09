@@ -286,6 +286,9 @@ export function companyArchiveExportService(db: Db, deps: CompanyArchiveExportDe
         generatedAt: now().toISOString(),
         include: [...include],
         since: options.since?.toISOString() ?? null,
+        // What the caller asked for, as opposed to the effective cutoff below:
+        // a resumed export must keep the same requested window.
+        requestedUntil: options.until?.toISOString() ?? null,
         until: cutoff.toISOString(),
         cursor: options.cursor ? encodeCompanyArchiveCursor(options.cursor) : null,
         limit: options.limit,

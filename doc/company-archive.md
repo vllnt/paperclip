@@ -60,7 +60,7 @@ Every line is one JSON object:
 
 | `kind` | `data` |
 |---|---|
-| `export.header` | `format`, `generatedAt`, `include`, `since`, `until`, `cursor`, `limit`, `redaction` (policy name and version) |
+| `export.header` | `format`, `generatedAt`, `include`, `since`, `requestedUntil` (the `until` the caller asked for, or null), `until` (the effective cutoff), `cursor`, `limit`, `follow`, `redaction` (policy name and version) |
 | `run` | The run row with the same columns and bounded `resultJson` as `GET /api/heartbeat-runs/:runId`, without that route's presentation fields (`execution`, `identityHistory`, `retryExhaustedReason`, `outputSilence`) |
 | `run_event` | One `heartbeat_run_events` row, in `seq` order |
 | `transcript` | One line of the run log: `line` (1-based line number), `ts`, `stream`, `chunk`, `seq`, `attemptId`. A line that is not valid JSON (for example a torn last line after a crash) is `{line, raw}`. |

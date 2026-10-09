@@ -73,7 +73,7 @@ describe("archive export command", () => {
   it("resumes after the last complete run and drops a torn tail", async () => {
     const out = path.join(dir, "resume.ndjson");
     writeFileSync(out, [
-      line("export.header", { include: ["run", "events"], since: null }),
+      line("export.header", { include: ["run", "events"], since: null, requestedUntil: "2026-09-30T00:00:00.000Z" }),
       line("run", { id: "run-1" }, "run-1"),
       line("run.end", { cursor: "c1" }, "run-1"),
       line("run", { id: "run-2" }, "run-2"),
@@ -89,9 +89,9 @@ describe("archive export command", () => {
 
     await run(["archive", "export", "-C", COMPANY_ID, "-o", out, "--resume"]);
 
-    // Resume keeps the original --include from the file header.
+    // Resume keeps the original --include and --until from the file header.
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      `http://localhost:3100/api/companies/${COMPANY_ID}/archive/export?cursor=c1&include=run%2Cevents`,
+      `http://localhost:3100/api/companies/${COMPANY_ID}/archive/export?cursor=c1&until=2026-09-30T00%3A00%3A00.000Z&include=run%2Cevents`,
     );
     const records = readFileSync(out, "utf8").trim().split("\n").map((entry) => JSON.parse(entry));
     expect(records.map((record) => [record.kind, record.runId ?? null])).toEqual([
@@ -121,7 +121,21 @@ describe("archive export command", () => {
       .rejects.toThrow("exit");
 
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(errors.join("\n")).toContain("other --include/--since");
+    expect(errors.join("\n")).toContain("other --include/--since/--until");
+  });
+
+  it("refuses to resume with a different --until", async () => {
+    const out = path.join(dir, "until.ndjson");
+    writeFileSync(out, `${line("export.header", { include: ["run"], since: null, requestedUntil: "2026-09-30T00:00:00.000Z" })}\n${line("run.end", { cursor: "c1" }, "run-1")}\n`);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const { errors } = captureFailure();
+
+    await expect(run(["archive", "export", "-C", COMPANY_ID, "-o", out, "--resume", "--until", "2026-10-05T00:00:00Z"]))
+      .rejects.toThrow("exit");
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(errors.join("\n")).toContain("--until");
   });
 
   function captureFailure() {
