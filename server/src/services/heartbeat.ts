@@ -2,6 +2,7 @@ import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import {
+  agentEnvBindingPrefix,
   HARNESS_FALLBACK_RETRY_REASON,
   HARNESS_FALLBACK_WAKE_REASON,
   applyClaimedHarnessDispatch,
@@ -1613,6 +1614,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
   projectId?: string | null;
   routineId?: string | null;
   executionRunConfig: Record<string, unknown>;
+  /** Binding path prefix of the agent's own env; set for a fallback target. */
+  agentEnvPathPrefix?: string;
   projectEnv: unknown;
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
@@ -1717,6 +1720,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             consumerId: input.agentId,
             responsibleUserId: input.responsibleUserId ?? null,
           },
+          { envPathPrefix: input.agentEnvPathPrefix },
         )),
       );
       if (
@@ -1854,7 +1858,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             : {}),
         }
       : undefined,
-    { adapterType: input.adapterType ?? null },
+    { adapterType: input.adapterType ?? null, envPathPrefix: input.agentEnvPathPrefix },
   );
   if (Object.keys(environmentEnvResolution.env).length > 0) {
     resolvedConfig.env = {
@@ -22034,6 +22038,7 @@ export function heartbeatService(
           routineId: routineEnvContext.routineId,
           responsibleUserId,
           executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
+          agentEnvPathPrefix: agentEnvBindingPrefix(storedAgent, claimedHarnessDispatch),
           projectEnv: aiBinding ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
           routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
           secretsSvc,

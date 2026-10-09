@@ -63,9 +63,14 @@ cool the harness/model down: provider reset, else 5 → 10 → 20 → 40 → 60 
   the 30-second transient lane and recovery retries cannot spin through a
   quota error.
 - **Once per wake.** The re-dispatch is a `harness_fallback` scheduled retry
-  of the failed run (one successor per run). A fallback run that fails again
-  is never re-dispatched. The failed primary run and its re-dispatch count as
-  one run toward `maxDailyRuns`.
+  of the failed run (one successor per run). A fallback run that fails with a
+  quota error is not re-dispatched again: the wake waits for that target's
+  cooldown end (no hop to the next target 30 seconds later). The failed
+  primary run and its re-dispatch count as one run toward `maxDailyRuns`; a
+  partial index keeps that check cheap.
+- **LLM harnesses only.** Cooldowns and the server-side quota
+  reclassification apply to the local LLM harnesses. A `process` or `http`
+  agent that prints "usage limit reached" is not cooled down.
 - **Sessions.** A provider session cannot move between harnesses. When the
   harness of a run differs from the harness of the agent's previous run on
   the issue, the run starts a fresh session with Paperclip's continuation
@@ -75,6 +80,19 @@ cool the harness/model down: provider reset, else 5 → 10 → 20 → 40 → 60 
   `harnessFallback` ("On fallback codex_local/gpt-5.5 until 14:30", or
   "Waiting for provider quota until 14:30"). Activity:
   `agent.harness_fallback_activated`, `agent.harness_fallback_returned`.
+- **Secrets.** Fallback env credentials are secret references. Each target
+  binds its env under its own path (`fallbacks[<n>].env.<KEY>`), so two targets
+  and the primary can hold different secrets for the same key, and the
+  pre-dispatch gate and the resolver use the claimed target's path. Bindings are
+  re-synced when fallbacks change, so removing or reordering a fallback drops or
+  moves them. No schema change: the path is a string. Plain env values are
+  accepted only for paths, credential-free endpoints and model names. Agent
+  keys cannot set instruction paths or host commands in a fallback's
+  `adapterConfig`. An issue's assignee overrides for model, env and CLI args
+  do not apply to a fallback run.
+- **Operator control.** `paperclipai agent cooldowns:clear <id>`
+  (`POST /api/agents/:id/harness-cooldowns/clear`, board only) removes an
+  agent's cooldowns; it is logged as `agent.harness_cooldowns_cleared`.
 - **Security.** An agent changing its own `fallbacks` or
   `quotaBackoffMaxMinutes` (PATCH or rollback) needs `agents:configure` for
   itself; otherwise 403 `agent_self_protected_config_change` and an
@@ -88,6 +106,11 @@ cool the harness/model down: provider reset, else 5 → 10 → 20 → 40 → 60 
    `paperclipai agent fallbacks:set <id> --fallbacks-json '[{"adapterType":"codex_local","model":"gpt-5.5","effort":"high","env":{"OPENAI_API_KEY":{"type":"secret_ref","secretId":"<id>"},"CODEX_HOME":"<home>"}}]'`.
 3. Watch the agent badge, the run's harness line and the activity feed.
 
+Before deploying, audit agents that would now be refused at run start:
+`select id, adapter_type, adapter_config->>'model' from agents where
+adapter_type <> 'claude_local' and adapter_config->>'model' ~* 'claude|anthropic|opus|sonnet|haiku'`
+(and `claude_local` agents with `gpt-`/`grok-` models).
+
 Rollback: `paperclipai agent fallbacks:clear <id>` per agent. To clear a
-cooldown early, delete its `agent_harness_cooldowns` row. A code rollback
+cooldown early, run `paperclipai agent cooldowns:clear <id>`. A code rollback
 leaves the new columns and table unused; the migration only adds them.

@@ -680,6 +680,12 @@ export type AgentSecretAccessEntry = {
 
 type ResolveAdapterConfigForRuntimeOptions = {
   adapterType?: string | null;
+  /**
+   * Prefix of the binding path of this config's `env` entries, for example
+   * `fallbacks[0].`. A fallback target's env is bound under its own path, so two
+   * targets can hold different secrets for the same key.
+   */
+  envPathPrefix?: string;
   skipUserSecrets?: boolean;
   /**
    * Selects how user-scoped secrets are mediated for this resolution.
@@ -869,6 +875,15 @@ function secretResolutionErrorCode(error: unknown): SecretResolutionErrorCode {
     if (error.status >= 500) return "provider_error";
   }
   return "provider_error";
+}
+
+/**
+ * The env key a binding path delivers: `env.KEY` for the primary config and
+ * `fallbacks[<n>].env.KEY` for a fallback target.
+ */
+function envKeyFromBindingPath(configPath: string): string | null {
+  const match = /^(?:fallbacks\[\d+\]\.)?env\.(.+)$/.exec(configPath);
+  return match ? match[1] : null;
 }
 
 function assertSecretBindingConfigPath(input: {
@@ -1424,7 +1439,7 @@ export function secretService(db: Db | DbTransaction) {
         value,
         manifestEntry: {
           configPath: configPath ?? "",
-          envKey: configPath?.startsWith("env.") ? configPath.slice("env.".length) : null,
+          envKey: configPath ? envKeyFromBindingPath(configPath) : null,
           secretId: secret.id,
           bindingId: binding?.id ?? null,
           secretKey: secret.key,
@@ -1833,7 +1848,7 @@ export function secretService(db: Db | DbTransaction) {
       if (!secret) return [];
       const accessBinding = secretBindings.find((binding) => binding.configPath.startsWith(AGENT_ACCESS_CONFIG_PATH_PREFIX));
       const selectedBinding = accessBinding ?? secretBindings[0];
-      const hasEnv = secretBindings.some((binding) => binding.configPath.startsWith("env."));
+      const hasEnv = secretBindings.some((binding) => envKeyFromBindingPath(binding.configPath) !== null);
       const hasApi = Boolean(accessBinding);
       const versionSelector: SecretVersionSelector = selectedBinding.versionSelector === "latest"
         ? "latest"
@@ -5203,7 +5218,9 @@ export function secretService(db: Db | DbTransaction) {
       companyId: string,
       envValue: unknown,
       context: Omit<SecretBindingContext, "configPath">,
+      pathOptions?: { envPathPrefix?: string },
     ): Promise<MissingRuntimeBinding[]> => {
+      const envPrefix = pathOptions?.envPathPrefix ?? "";
       const record = asRecord(envValue);
       if (!record) return [];
       const secretRefs = Object.entries(record).flatMap(([key, rawBinding]) => {
@@ -5212,7 +5229,7 @@ export function secretService(db: Db | DbTransaction) {
         if (!parsed.success) return [];
         const binding = canonicalizeBinding(parsed.data as EnvBinding);
         if (binding.type !== "secret_ref") return [];
-        return [{ key, configPath: `env.${key}`, secretId: binding.secretId }];
+        return [{ key, configPath: `${envPrefix}env.${key}`, secretId: binding.secretId }];
       });
       const userSecretRefs = Object.entries(record).flatMap(([key, rawBinding]) => {
         if (!ENV_KEY_RE.test(key)) return [];
@@ -5221,7 +5238,7 @@ export function secretService(db: Db | DbTransaction) {
         const binding = canonicalizeBinding(parsed.data as EnvBinding);
         if (binding.type !== "user_secret_ref") return [];
         if (!binding.required || binding.allowMissingOverride) return [];
-        return [{ key, configPath: `env.${key}`, binding }];
+        return [{ key, configPath: `${envPrefix}env.${key}`, binding }];
       });
       if (secretRefs.length === 0 && userSecretRefs.length === 0) return [];
 
@@ -5522,6 +5539,7 @@ export function secretService(db: Db | DbTransaction) {
       opts?: ResolveAdapterConfigForRuntimeOptions,
     ): Promise<{ config: Record<string, unknown>; secretKeys: Set<string>; manifest: RuntimeSecretManifestEntry[] }> => {
       const ownerScoped = opts?.userSecretMediation === "owner_scoped";
+      const envPrefix = opts?.envPathPrefix ?? "";
       // Fail closed: owner_scoped skips declaration mediation, so an
       // allowedBindingIds allowlist has no declaration to enforce against.
       // Rejecting (rather than silently stripping) prevents a future low-trust
@@ -5568,11 +5586,11 @@ export function secretService(db: Db | DbTransaction) {
                         // returns null (no binding enforcement) — preserves today's
                         // undefined-context behavior for a prospective config —
                         // while still carrying the actor via accessContext for audit.
-                        accessContext: { ...context, configPath: `env.${key}` },
+                        accessContext: { ...context, configPath: `${envPrefix}env.${key}` },
                       }
                     : {
-                        bindingContext: { ...context, configPath: `env.${key}` },
-                        accessContext: { ...context, configPath: `env.${key}` },
+                        bindingContext: { ...context, configPath: `${envPrefix}env.${key}` },
+                        accessContext: { ...context, configPath: `${envPrefix}env.${key}` },
                       }
                   : undefined,
               );
@@ -5601,7 +5619,7 @@ export function secretService(db: Db | DbTransaction) {
                       }
                     : {
                         ...context,
-                        configPath: `env.${key}`,
+                        configPath: `${envPrefix}env.${key}`,
                         responsibleUserId: context.responsibleUserId ?? null,
                       }
                   : undefined,

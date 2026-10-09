@@ -12,6 +12,7 @@ import {
   type HarnessModelCompatibilityResult,
 } from "@paperclipai/shared";
 import { isProviderQuotaMessage, parseProviderQuotaResetAt } from "@paperclipai/adapter-utils/provider-quota";
+import { fallbackEnvBindingPrefix } from "./agent-secret-bindings.js";
 import { logActivity } from "./activity-log.js";
 import { isAiAuthenticationFailure } from "./ai-auth-failure.js";
 
@@ -336,6 +337,23 @@ export function buildHarnessTargetAgentView<T extends HarnessAgentLike>(agent: T
     },
     runtimeConfig,
   };
+}
+
+/**
+ * The binding path prefix for the agent's own env on a claimed dispatch: empty
+ * for the primary, `fallbacks[<index>].` for a fallback target.
+ *
+ * @param agent - The stored agent.
+ * @param dispatch - The dispatch the run was claimed with.
+ * @returns The prefix to resolve the agent env under.
+ */
+export function agentEnvBindingPrefix(
+  agent: HarnessAgentLike,
+  dispatch: { target: "primary" | "fallback"; targetKey: string } | null,
+): string | undefined {
+  if (!dispatch || dispatch.target !== "fallback") return undefined;
+  const target = listHarnessTargets(agent).find((candidate) => candidate.kind === "fallback" && candidate.key === dispatch.targetKey);
+  return target?.index != null ? fallbackEnvBindingPrefix(target.index) : undefined;
 }
 
 export interface HarnessDispatch {

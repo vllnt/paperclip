@@ -34,9 +34,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import {
-  agentBindingSourceConfigs,
-  collectSecretRefs,
-  collectUserSecretRefs,
+  collectAgentBindingRefs,
   syncAgentAdapterEnvBindings,
 } from "./agent-secret-bindings.js";
 import { logActivity } from "./activity-log.js";
@@ -522,21 +520,21 @@ export function agentService(db: Db) {
       adapterConfig: agent.adapterConfig,
       fallbacks: agent.fallbacks,
     });
-    const previousSources = agentBindingSourceConfigs(previous?.adapterConfig ?? null, previous?.fallbacks);
-    const currentSources = agentBindingSourceConfigs(agent.adapterConfig, agent.fallbacks);
+    const previousBindingRefs = collectAgentBindingRefs(previous?.adapterConfig ?? null, previous?.fallbacks);
+    const currentBindingRefs = collectAgentBindingRefs(agent.adapterConfig, agent.fallbacks);
     const previousRefs = new Set([
-      ...previousSources.flatMap(collectSecretRefs).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
-      ...previousSources.flatMap(collectUserSecretRefs).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
+      ...previousBindingRefs.secretRefs.map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
+      ...previousBindingRefs.userSecretRefs.map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
     ]);
     const createdRefs = [
-      ...currentSources.flatMap(collectSecretRefs).map((ref) => ({
+      ...currentBindingRefs.secretRefs.map((ref) => ({
         key: `secret:${ref.secretId}:${ref.configPath}`,
         configPath: ref.configPath,
         bindingType: "secret_ref",
         secretId: ref.secretId,
         definitionKey: null,
       })),
-      ...currentSources.flatMap(collectUserSecretRefs).map((ref) => ({
+      ...currentBindingRefs.userSecretRefs.map((ref) => ({
         key: `user:${ref.definitionKey}:${ref.configPath}`,
         configPath: ref.configPath,
         bindingType: "user_secret_ref",

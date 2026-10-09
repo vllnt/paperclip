@@ -146,22 +146,43 @@ export function collectUserSecretRefs(adapterConfig: unknown): Array<{
 }
 
 /**
- * The configs whose env bindings an agent needs: its adapterConfig and the env
- * of each fallback target. A fallback run resolves its env at `env.<KEY>` for
- * the same agent, so its references share the agent's binding paths.
+ * The binding path prefix of one fallback target's env entries. Each target
+ * binds its env under its own path, so two targets can hold different secrets
+ * for the same key (for example two `OPENAI_API_KEY` references).
+ *
+ * @param index - Position of the target in the agent's stored `fallbacks`.
+ * @returns A prefix such as `fallbacks[0].`.
+ */
+export function fallbackEnvBindingPrefix(index: number): string {
+  return `fallbacks[${index}].`;
+}
+
+/**
+ * Every secret and user-secret reference an agent needs bound: the primary
+ * adapterConfig at its usual paths and each fallback target's env under that
+ * target's own prefix.
  *
  * @param adapterConfig - The agent's primary adapterConfig.
  * @param fallbacks - The agent's stored fallback targets.
- * @returns Configs to collect secret references from.
+ * @returns Secret and user-secret references with their binding paths.
  */
-export function agentBindingSourceConfigs(adapterConfig: unknown, fallbacks: unknown): unknown[] {
-  const fallbackEnvConfigs = Array.isArray(fallbacks)
-    ? fallbacks.flatMap((entry) => {
-        const env = asRecord(entry)?.env;
-        return env ? [{ env }] : [];
-      })
-    : [];
-  return [adapterConfig, ...fallbackEnvConfigs];
+export function collectAgentBindingRefs(adapterConfig: unknown, fallbacks: unknown) {
+  const secretRefs = [...collectSecretRefs(adapterConfig)];
+  const userSecretRefs = [...collectUserSecretRefs(adapterConfig)];
+  if (Array.isArray(fallbacks)) {
+    fallbacks.forEach((entry, index) => {
+      const env = asRecord(entry)?.env;
+      if (!env) return;
+      const prefix = fallbackEnvBindingPrefix(index);
+      for (const ref of collectSecretRefs({ env })) {
+        secretRefs.push({ ...ref, configPath: `${prefix}${ref.configPath}` });
+      }
+      for (const ref of collectUserSecretRefs({ env })) {
+        userSecretRefs.push({ ...ref, configPath: `${prefix}${ref.configPath}` });
+      }
+    });
+  }
+  return { secretRefs, userSecretRefs };
 }
 
 function uniqueBy<T>(items: T[], key: (item: T) => string): T[] {
@@ -176,17 +197,17 @@ export async function syncAgentAdapterEnvBindings(input: {
   fallbacks?: unknown;
 }) {
   if (input.secretsSvc.syncSecretRefsForTarget) {
-    const sources = agentBindingSourceConfigs(input.adapterConfig, input.fallbacks);
+    const refs = collectAgentBindingRefs(input.adapterConfig, input.fallbacks);
     await input.secretsSvc.syncSecretRefsForTarget(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
-      uniqueBy(sources.flatMap(collectSecretRefs), (ref) => `${ref.secretId}:${ref.configPath}`),
+      uniqueBy(refs.secretRefs, (ref) => ref.configPath),
       { replaceAll: true },
     );
     await input.secretsSvc.syncUserSecretDeclarationsForTarget?.(
       input.companyId,
       { targetType: "agent", targetId: input.agentId },
-      uniqueBy(sources.flatMap(collectUserSecretRefs), (ref) => `${ref.definitionKey}:${ref.configPath}`),
+      uniqueBy(refs.userSecretRefs, (ref) => ref.configPath),
       { replaceAll: true },
     );
     return;

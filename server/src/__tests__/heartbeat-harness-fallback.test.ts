@@ -6,6 +6,7 @@ import {
   agentHarnessCooldowns,
   agents,
   companies,
+  companySecretBindings,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -371,6 +372,79 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     const [cooldown] = await db.select().from(agentHarnessCooldowns);
     // Concurrent failures of one outage do not double the backoff.
     expect(Math.round((cooldown.cooldownUntil.getTime() - Date.now()) / 60_000)).toBeLessThanOrEqual(5);
+  });
+
+  async function secretNamed(companyId: string, name: string, value: string) {
+    return secretService(db).create(companyId, { name, provider: "local_encrypted", value });
+  }
+
+  async function coolDownTargets(companyId: string, agentId: string, keys: string[]) {
+    await db.insert(agentHarnessCooldowns).values(keys.map((targetKey) => {
+      const [adapterType, model] = targetKey.split(":");
+      return { companyId, agentId, targetKey, adapterType, model, reason: "provider_usage_limit", cooldownUntil: new Date(Date.now() + 30 * 60_000) };
+    }));
+  }
+
+  it("binds two fallbacks that use different secrets for the same env key, and each run gets its own value", async () => {
+    const { companyId, agentId, issueId } = await seed({ fallbacks: [] });
+    const first = await secretNamed(companyId, "openai-key-one", "sk-first-value");
+    const second = await secretNamed(companyId, "openai-key-two", "sk-second-value");
+    await agentService(db).update(agentId, {
+      fallbacks: [
+        { adapterType: "codex_local", model: "gpt-5.5", env: { OPENAI_API_KEY: { type: "secret_ref", secretId: first.id } } },
+        { adapterType: "codex_local", model: "gpt-5.4", env: { OPENAI_API_KEY: { type: "secret_ref", secretId: second.id } } },
+      ],
+    });
+
+    const bindings = await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, agentId));
+    expect(bindings.map((row) => [row.configPath, row.secretId]).sort()).toEqual([
+      ["fallbacks[0].env.OPENAI_API_KEY", first.id],
+      ["fallbacks[1].env.OPENAI_API_KEY", second.id],
+    ]);
+
+    await coolDownTargets(companyId, agentId, ["claude_local:claude-opus-5-5"]);
+    await comment(agentId, issueId);
+    expect(invocations.at(-1)).toMatchObject({ model: "gpt-5.5", env: { OPENAI_API_KEY: "sk-first-value" } });
+
+    await coolDownTargets(companyId, agentId, ["codex_local:gpt-5.5"]);
+    await comment(agentId, issueId);
+    expect(invocations.at(-1)).toMatchObject({ model: "gpt-5.4", env: { OPENAI_API_KEY: "sk-second-value" } });
+  });
+
+  it("keeps a primary and a fallback with the same env key but different secrets apart", async () => {
+    const { companyId, agentId, issueId } = await seed({ fallbacks: [] });
+    const primaryKey = await secretNamed(companyId, "anthropic-key", "sk-primary-value");
+    const fallbackKey = await secretNamed(companyId, "openai-key", "sk-fallback-value");
+    await agentService(db).update(agentId, {
+      adapterConfig: { model: "claude-opus-5-5", env: { API_KEY_FOR_PROXY: { type: "secret_ref", secretId: primaryKey.id } } },
+      fallbacks: [{ adapterType: "codex_local", model: "gpt-5.5", env: { API_KEY_FOR_PROXY: { type: "secret_ref", secretId: fallbackKey.id } } }],
+    });
+    await comment(agentId, issueId);
+    expect(invocations.at(-1)).toMatchObject({ adapterType: "claude_local", env: { API_KEY_FOR_PROXY: "sk-primary-value" } });
+
+    await coolDownTargets(companyId, agentId, ["claude_local:claude-opus-5-5"]);
+    await comment(agentId, issueId);
+    expect(invocations.at(-1)).toMatchObject({ adapterType: "codex_local", env: { API_KEY_FOR_PROXY: "sk-fallback-value" } });
+  });
+
+  it("removes a fallback's bindings when the fallback is removed or reordered", async () => {
+    const { companyId, agentId } = await seed({ fallbacks: [] });
+    const first = await secretNamed(companyId, "key-a", "sk-a");
+    const second = await secretNamed(companyId, "key-b", "sk-b");
+    const entry = (model: string, secretId: string) => ({
+      adapterType: "codex_local" as const, model, env: { OPENAI_API_KEY: { type: "secret_ref" as const, secretId } },
+    });
+    const paths = async () => (await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, agentId)))
+      .map((row) => `${row.configPath}=${row.secretId === first.id ? "a" : "b"}`).sort();
+
+    await agentService(db).update(agentId, { fallbacks: [entry("gpt-5.5", first.id), entry("gpt-5.4", second.id)] });
+    expect(await paths()).toEqual(["fallbacks[0].env.OPENAI_API_KEY=a", "fallbacks[1].env.OPENAI_API_KEY=b"]);
+    await agentService(db).update(agentId, { fallbacks: [entry("gpt-5.4", second.id), entry("gpt-5.5", first.id)] });
+    expect(await paths()).toEqual(["fallbacks[0].env.OPENAI_API_KEY=b", "fallbacks[1].env.OPENAI_API_KEY=a"]);
+    await agentService(db).update(agentId, { fallbacks: [entry("gpt-5.4", second.id)] });
+    expect(await paths()).toEqual(["fallbacks[0].env.OPENAI_API_KEY=b"]);
+    await agentService(db).update(agentId, { fallbacks: [] });
+    expect(await paths()).toEqual([]);
   });
 
   it("does not apply an issue's primary model override to a fallback run", async () => {
