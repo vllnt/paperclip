@@ -60,6 +60,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set(RUN_USAGE_TERMINAL_STATUSES);
 const DEFERRAL_ERROR_CODES: ReadonlySet<string> = new Set(["workspace_busy", "ai_connection_busy"]);
 const USAGE_BASES: ReadonlySet<string> = new Set(["per_run", "session_delta"]);
+const VERIFIED_CODEX_ADAPTER = "codex_local";
 
 /**
  * Keeps an identifier column to a short, safe alphabet. Anything else becomes `other`, so free
@@ -95,24 +96,54 @@ function isCodexFamily(value: string | null): boolean {
   return value !== null && value.includes("codex");
 }
 
+/**
+ * Providers whose reported input count already includes the cached part. It holds for OpenAI-family
+ * and xAI models. For every other provider the cached count is reported on top of the input. The
+ * stream shape and the provider decide this, not the adapter type: a `codex_local` run that uses an
+ * Anthropic model streams Anthropic counts.
+ */
+const CACHED_INSIDE_INPUT_PROVIDERS: ReadonlySet<string> = new Set(["openai", "xai"]);
+
+/**
+ * Makes the token classes disjoint: for a provider that counts cached tokens inside the input, the
+ * stored input is the fresh part only. A cached count larger than the input breaks that rule, so
+ * the counts stay as reported and the caller marks the record `declared`.
+ */
+function splitCachedInput(
+  provider: string | null,
+  inputTokens: number | null,
+  cacheReadTokens: number | null,
+): { inputTokens: number | null; consistent: boolean } {
+  if (provider === null || !CACHED_INSIDE_INPUT_PROVIDERS.has(provider)) return { inputTokens, consistent: true };
+  if (inputTokens === null || cacheReadTokens === null) return { inputTokens, consistent: true };
+  if (cacheReadTokens > inputTokens) return { inputTokens, consistent: false };
+  return { inputTokens: inputTokens - cacheReadTokens, consistent: true };
+}
+
 function readUsageBasis(usage: Record<string, unknown>): string | null {
   const basis = usage.usageSource;
   return typeof basis === "string" && USAGE_BASES.has(basis) ? basis : null;
 }
 
 /**
- * Codex counts stay `declared` until the provider's cumulative-versus-per-run basis is verified
- * on real data, so a panel can show a caveat. A server-side baseline subtraction is `derived`.
+ * `measured` is a count the provider reported for this run. `derived` is a server-side baseline
+ * subtraction. `declared` is a count that rests on a claim nobody has checked: the Codex
+ * app-server runner path (only the `codex_local` CLI path was checked on real data, and its counts
+ * are per run), a Codex adapter other than `codex_local`, or a cached count that is larger than
+ * the input of a provider whose input should include it.
  */
 function resolveUsageQuality(input: {
   hasTokens: boolean;
   usageBasis: string | null;
   adapterType: string | null;
   driverKind: string | null;
+  consistent: boolean;
 }): RunUsageQuality {
   if (!input.hasTokens) return "missing";
   if (input.usageBasis === "session_delta") return "derived";
-  if (isCodexFamily(input.adapterType) || isCodexFamily(input.driverKind)) return "declared";
+  if (!input.consistent) return "declared";
+  if (isCodexFamily(input.driverKind)) return "declared";
+  if (isCodexFamily(input.adapterType) && input.adapterType !== VERIFIED_CODEX_ADAPTER) return "declared";
   return "measured";
 }
 
@@ -145,8 +176,10 @@ export function deriveRunUsageRecord(input: DeriveRunUsageRecordInput): RunUsage
   const adapterType = toIdentifier(input.adapterType) ?? "other";
   const driverKind = toIdentifier(run.driverKind);
   const billingType = toIdentifier(usage.billingType);
-  const inputTokens = readCount(usage.inputTokens);
+  const provider = toIdentifier(usage.provider);
+  const reportedInputTokens = readCount(usage.inputTokens);
   const cacheReadTokens = readCount(usage.cachedInputTokens);
+  const { inputTokens, consistent } = splitCachedInput(provider, reportedInputTokens, cacheReadTokens);
   const outputTokens = readCount(usage.outputTokens);
   const usageBasis = readUsageBasis(usage);
   const finishedAt = run.finishedAt ?? run.createdAt;
@@ -163,7 +196,7 @@ export function deriveRunUsageRecord(input: DeriveRunUsageRecordInput): RunUsage
     adapterType,
     runtimeMode: toIdentifier(run.runtimeMode) ?? "other",
     driverKind,
-    provider: toIdentifier(usage.provider),
+    provider,
     biller: toIdentifier(usage.biller),
     billingType,
     model: toIdentifier(usage.model),
@@ -200,6 +233,7 @@ export function deriveRunUsageRecord(input: DeriveRunUsageRecordInput): RunUsage
       usageBasis,
       adapterType,
       driverKind,
+      consistent,
     }),
 
     costMicros: readCostMicros(usage, billingType),
