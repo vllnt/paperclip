@@ -30,6 +30,29 @@ export function isExistingBranchSemanticsZodIssue(issue: Pick<ZodIssue, "path">)
   );
 }
 
+// A goal title or success criteria over the length limit answers 422, the
+// same status the goal service gives a plugin, so every caller sees one
+// answer. Any other invalid field keeps the generic 400.
+const GOAL_TEXT_FIELDS = new Set(["title", "successCriteria"]);
+
+function isGoalTextTooLongZodIssue(issue: ZodIssue): boolean {
+  return issue.code === "too_big" && issue.path.length === 1 && GOAL_TEXT_FIELDS.has(String(issue.path[0]));
+}
+
+export function validateGoalBody(schema: ZodSchema) {
+  return (req: Request, _res: Response, next: NextFunction) => {
+    try {
+      req.body = schema.parse(req.body);
+    } catch (err) {
+      if (err instanceof ZodError && err.issues.length > 0 && err.issues.every(isGoalTextTooLongZodIssue)) {
+        throw unprocessable("Validation error", err.issues);
+      }
+      throw err;
+    }
+    next();
+  };
+}
+
 export function validateIssueMutationBody(schema: ZodSchema) {
   return (req: Request, _res: Response, next: NextFunction) => {
     try {

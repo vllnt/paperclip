@@ -214,6 +214,20 @@ describeEmbeddedPostgres("POST /api/companies/:companyId/onboarding-seed", () =>
     expect(response.body.issueId).toBeNull();
   });
 
+  it("cuts a mission's long first line for the goal title and keeps the whole mission in the description", async () => {
+    const { companyId, app } = await seedCompany();
+    const mission = `${"Make robotics boring enough to trust, ".repeat(52)}😀`.trim();
+
+    const response = await post(app, companyId, { ...SEED, mission });
+
+    expect(response.status).toBe(200);
+    const [goal] = await ctx.db.select().from(goals).where(eq(goals.companyId, companyId));
+    expect(goal?.title.length).toBeLessThanOrEqual(280);
+    expect(goal?.title.isWellFormed()).toBe(true);
+    expect(goal?.title.endsWith("…")).toBe(true);
+    expect(goal?.description).toBe(mission);
+  });
+
   it("accepts a revision-only seed and records it", async () => {
     const { companyId, app } = await seedCompany();
 

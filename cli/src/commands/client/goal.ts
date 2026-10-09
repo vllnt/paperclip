@@ -103,7 +103,7 @@ export function registerGoalCommands(program: Command): void {
       .command("create")
       .description("Create a goal")
       .requiredOption("-C, --company-id <id>", "Company ID")
-      .requiredOption("--title <title>", "Goal title")
+      .requiredOption("--title <title>", "Goal title, at most 280 characters")
       .option("--description <text>", "Goal description")
       .option("--level <level>", "Goal level")
       .option("--status <status>", "Goal status")
@@ -112,7 +112,7 @@ export function registerGoalCommands(program: Command): void {
       .option("--kind <kind>", "goal or milestone; board only")
       .option("--horizon <horizon>", "short, medium or long; short term goals are the company focus; board only")
       .option("--target-date <YYYY-MM-DD>", "Target date; board only")
-      .option("--success-criteria <text>", "How to tell the goal is reached; board only")
+      .option("--success-criteria <text>", "How to tell the goal is reached, at most 280 characters; board only")
       .action(async (opts: GoalCreateOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
@@ -142,7 +142,7 @@ export function registerGoalCommands(program: Command): void {
       .command("update")
       .description("Update a goal. Only the board can change a short term goal or a milestone")
       .argument("<goalId>", "Goal ID")
-      .option("--title <title>", "Goal title")
+      .option("--title <title>", "Goal title, at most 280 characters")
       .option("--description <text|null>", "Goal description")
       .option("--level <level>", "Goal level")
       .option("--status <status>", "Goal status")
@@ -151,7 +151,7 @@ export function registerGoalCommands(program: Command): void {
       .option("--kind <kind>", "goal or milestone; board only")
       .option("--horizon <horizon|null>", "short, medium or long; short term goals are the company focus; board only")
       .option("--target-date <YYYY-MM-DD|null>", "Target date; board only")
-      .option("--success-criteria <text|null>", "How to tell the goal is reached; board only")
+      .option("--success-criteria <text|null>", "How to tell the goal is reached, at most 280 characters; board only")
       .action(async (goalId: string, opts: GoalUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);

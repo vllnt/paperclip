@@ -2,6 +2,7 @@ import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { goals, issues, type Db } from "@paperclipai/db";
 import {
   COMPANY_FOCUS_GUIDANCE,
+  GOAL_TEXT_MAX_LENGTH,
   GOAL_LEVELS,
   GOAL_STATUSES,
   type CompanyFocus,
@@ -10,6 +11,7 @@ import {
   type IssueCompanyFocus,
   type GoalProgress,
   type GoalStatus,
+  truncateAtGrapheme,
 } from "@paperclipai/shared";
 import { executionIssueCondition } from "./issue-visibility.js";
 import { logger } from "../middleware/logger.js";
@@ -18,8 +20,6 @@ type GoalRow = typeof goals.$inferSelect;
 
 const MAX_FOCUS_GOALS = 10;
 const MAX_MILESTONES_PER_GOAL = 5;
-/** Agents read goal text in every run's context, so each piece stays short. */
-const MAX_AGENT_CONTEXT_TEXT = 280;
 /** Focus is advice, so a slow read gives up rather than delay an agent's run or inbox. */
 const FOCUS_READ_TIMEOUT_MS = 500;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -51,10 +51,12 @@ function daysUntil(targetDate: string | null, now: Date): number | null {
   return Math.round((Date.parse(`${targetDate}T00:00:00Z`) - today) / DAY_MS);
 }
 
-/** The one cut for every goal text that reaches an agent's run context. */
+/**
+ * The one cut for every goal text that reaches an agent. New goal text is limited to the same
+ * length when written; this keeps goals written before that limit short too.
+ */
 function capAgentContextText(value: string): string {
-  if (value.length <= MAX_AGENT_CONTEXT_TEXT) return value;
-  return `${value.slice(0, MAX_AGENT_CONTEXT_TEXT - 1)}…`;
+  return truncateAtGrapheme(value, GOAL_TEXT_MAX_LENGTH);
 }
 
 function capOptionalAgentContextText(value: string | null): string | null {
@@ -206,6 +208,18 @@ export function goalFocusService(db: Db, options: { now?: () => Date } = {}) {
       const index = buildFocusIndex(rows);
       return { ...(await buildFocus(companyId, rows)), issueFocusGoalId: issueGoalId ? index.get(issueGoalId) ?? null : null };
     },
+  };
+}
+
+/**
+ * A goal as an agent reads it from the goal and issue APIs: the title and success criteria cut
+ * like the heartbeat context. Board readers get the stored goal.
+ */
+export function capGoalTextForAgents<T extends { title: string; successCriteria?: string | null }>(goal: T): T {
+  return {
+    ...goal,
+    title: capAgentContextText(goal.title),
+    ...(goal.successCriteria != null ? { successCriteria: capAgentContextText(goal.successCriteria) } : {}),
   };
 }
 

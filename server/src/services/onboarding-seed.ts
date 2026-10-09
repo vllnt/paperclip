@@ -1,7 +1,7 @@
 import { and, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companyOnboardingSeeds, goals, issues, projects } from "@paperclipai/db";
-import type { ApplyOnboardingSeed } from "@paperclipai/shared";
+import { GOAL_TEXT_MAX_LENGTH, truncateAtGrapheme, type ApplyOnboardingSeed } from "@paperclipai/shared";
 import { writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { findActiveServerAdapter } from "../adapters/registry.js";
 import { agentService } from "./agents.js";
@@ -64,16 +64,22 @@ function seededAgentAdapterConfig(adapterType: string): Record<string, unknown> 
 /**
  * Split a free-text mission into a goal title + description the same way the
  * first-run wizard's `parseOnboardingGoalInput` does: first line is the title,
- * the remainder is the description.
+ * the remainder is the description. A first line longer than a goal title may
+ * be is cut for the title, and the description then keeps the whole mission,
+ * so no text is lost and the goal write cannot fail on length.
  */
 export function parseSeedMission(raw: string): { title: string; description: string | null } {
   const trimmed = raw.trim();
   if (!trimmed) return { title: "", description: null };
 
   const [firstLine, ...restLines] = trimmed.split(/\r?\n/);
+  const title = (firstLine ?? "").trim();
+  if (title.length > GOAL_TEXT_MAX_LENGTH) {
+    return { title: truncateAtGrapheme(title, GOAL_TEXT_MAX_LENGTH), description: trimmed };
+  }
   const description = restLines.join("\n").trim();
   return {
-    title: (firstLine ?? "").trim(),
+    title,
     description: description.length > 0 ? description : null,
   };
 }

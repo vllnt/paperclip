@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import type { Goal } from "@paperclipai/shared";
-import { GOAL_STATUSES, GOAL_LEVELS, GOAL_KINDS, GOAL_HORIZONS } from "@paperclipai/shared";
+import { GOAL_STATUSES, GOAL_LEVELS, GOAL_KINDS, GOAL_HORIZONS, GOAL_TEXT_MAX_LENGTH } from "@paperclipai/shared";
 import { agentsApi } from "../api/agents";
 import { goalsApi } from "../api/goals";
 import { useCompany } from "../context/CompanyContext";
@@ -229,6 +229,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
             <InlineEditor
               value={goal.successCriteria ?? ""}
               onSave={(successCriteria) => save({ successCriteria: successCriteria.trim() || null })}
+              maxLength={GOAL_TEXT_MAX_LENGTH}
               className="text-sm"
               placeholder="How you know it is done"
               nullable

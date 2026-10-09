@@ -45,7 +45,7 @@ Planning fields, all optional:
 | `targetDate` | `YYYY-MM-DD` or null | When the goal should be reached |
 | `successCriteria` | text or null | How to tell it is reached, for example "open pull requests = 0" |
 
-`parentId` and `ownerAgentId` must belong to the same company. A parent that would put the goal below itself returns `422`. Fields outside this list are ignored on update, and an invalid value returns `422` from every caller, including plugins. `title` is at most 2,000 characters.
+`parentId` and `ownerAgentId` must belong to the same company. A parent that would put the goal below itself returns `422`. Fields outside this list are ignored on update, and an invalid value returns `422` from every caller, including plugins. `title` and `successCriteria` are each at most 280 characters; a longer one returns `422` for every caller, board included. Agents get the title and `successCriteria` of goals written before this limit cut to 280 characters from `GET /api/companies/{companyId}/goals`, `GET /api/goals/{goalId}` and `GET /api/issues/{issueId}`; board users get the stored text.
 
 Only the board sets `kind: "milestone"`, `horizon`, `targetDate` or `successCriteria`, and only the board updates or deletes a goal with the `short` horizon or a milestone, because the company focus shows them to every agent. This holds for a short term goal in any status. An agent or a plugin gets `403` for these; clearing a planning field to null on a goal outside the focus is allowed.
 
