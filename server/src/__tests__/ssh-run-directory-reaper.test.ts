@@ -383,4 +383,97 @@ describeReaper("SSH run directory reaper", () => {
 
     expect(await exists(run.runDir)).toBe(true);
   });
+  // A second released lease for the same run, host and root: two replicas, or two
+  // sweeps, reach the same directory through different lease rows.
+  async function siblingReleasedLease(run: Awaited<ReturnType<typeof releasedRun>>) {
+    const [first] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, run.leaseId));
+    const [second] = await db.insert(environmentLeases).values({
+      companyId, environmentId: environment.id, heartbeatRunId: run.runId, status: "released", leasePolicy: "ephemeral",
+      provider: "ssh", providerLeaseId: first!.providerLeaseId, releasedAt: new Date(Date.now() - 10 * HOUR_MS),
+      metadata: first!.metadata,
+    }).returning();
+    return second as unknown as typeof run.lease;
+  }
+
+  it("lets exactly one of two released leases of the same directory delete it", async () => {
+    const run = await releasedRun("failed");
+    const other = await siblingReleasedLease(run);
+    let calls = 0;
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    const hooks = { beforeRemoteDelete: async () => { calls += 1; if (calls === 1) await gate; } };
+    const firstReplica = sshRunDirectoryReaperService(db, { hooks });
+    const secondReplica = sshRunDirectoryReaperService(db, { hooks });
+
+    const first = firstReplica.reapReleasedLease(environment, run.lease);
+    await vi.waitFor(() => expect(calls).toBe(1), { timeout: 10_000, interval: 20 });
+    // The first owner is mid-removal. The other replica reaches the same directory through its own lease row.
+    await secondReplica.reapReleasedLease(environment, other);
+    expect(calls).toBe(1);
+    openGate();
+    await first;
+
+    expect(await exists(run.runDir)).toBe(false);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(1);
+    expect(await leaseMetadata(other.id)).not.toHaveProperty("sshRunDirectory");
+  });
+
+  it("lets exactly one claim win when two replicas start on the same directory at the same instant", async () => {
+    for (let round = 0; round < 8; round += 1) {
+      const run = await releasedRun("failed");
+      const other = await siblingReleasedLease(run);
+      let active = 0;
+      let mostAtOnce = 0;
+      const hooks = {
+        beforeRemoteDelete: async () => {
+          active += 1;
+          mostAtOnce = Math.max(mostAtOnce, active);
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          active -= 1;
+        },
+      };
+
+      await Promise.all([
+        sshRunDirectoryReaperService(db, { hooks }).reapReleasedLease(environment, run.lease),
+        sshRunDirectoryReaperService(db, { hooks }).reapReleasedLease(environment, other),
+      ]);
+
+      // The second claim may arrive after the first removal finished, and then
+      // finds nothing to remove; it must never overlap the first.
+      expect(mostAtOnce).toBe(1);
+      expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(1);
+      expect(await exists(run.runDir)).toBe(false);
+    }
+  }, 60_000);
+
+  it("refuses a lease that starts while the directory it would use is being removed, and keeps it for the reaper", async () => {
+    const run = await releasedRun("failed");
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    let atDelete!: () => void;
+    const reachedDelete = new Promise<void>((resolve) => { atDelete = resolve; });
+    const service = sshRunDirectoryReaperService(db, { hooks: { beforeRemoteDelete: async () => { atDelete(); await gate; } } });
+
+    const reaping = service.reapReleasedLease(environment, run.lease);
+    await reachedDelete;
+    await expect(runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: run.runId, persistedExecutionWorkspace: null }))
+      .rejects.toThrow(/being removed/);
+    expect(await exists(run.runDir)).toBe(true);
+    openGate();
+    await reaping;
+
+    expect(await exists(run.runDir)).toBe(false);
+    const active = await db.select().from(environmentLeases).where(and(eq(environmentLeases.heartbeatRunId, run.runId), eq(environmentLeases.status, "active")));
+    expect(active).toHaveLength(0);
+  });
+
+  it("does not let a live lease of another run on the same root keep this run's directory, and leaves that run's directory alone", async () => {
+    const run = await releasedRun("failed");
+    const live = await startRun({ status: "running" });
+
+    await sshRunDirectoryReaperService(db).reapReleasedLease(environment, run.lease);
+
+    expect(await exists(run.runDir)).toBe(false);
+    expect(await exists(live.runDir)).toBe(true);
+  });
 });

@@ -75,14 +75,22 @@ Nothing outside `runs/<runId>` is deleted, and no link is followed.
 
 ## Races
 
-A run directory is only ever used by leases of its own run, so the reaper claims
-it for the run.
+A run directory is `runs/<runId>` under one root on one host. The only code that
+makes that path (`prepareRemoteManagedRuntime`, called from
+`prepareAdapterExecutionTargetRuntime`) takes the run id of the run that owns the
+lease, so only leases of the same run can use the directory. A lease of another
+run on the same root uses its own `runs/<otherId>`, and the reaper does not wait
+for it; if it did, nothing could be reaped on a worker that is always busy. The
+claim is therefore keyed by host, port, user, root, and run id.
 
-- **Claim.** One SQL statement checks that no other lease of the run is `active`,
-  `retained`, or `pending_cleanup` and records a claim in the lease's
-  `metadata.sshRunDirectory` (`state: "reaping"`). The reaper checks for such a
-  lease once more after the claim and before the remote delete, and gives the
-  claim back if one appeared.
+- **Claim.** A short transaction locks every lease row of the directory (same
+  key), in id order, and only then decides, so two replicas or two sweeps that
+  reach the same directory through different lease rows cannot both win: the
+  second waits, then sees the first one's claim. The claim also fails while any
+  lease of the run is `active`, `retained`, or `pending_cleanup`. It is recorded
+  in the lease's `metadata.sshRunDirectory` (`state: "reaping"`). The reaper
+  checks for a busy lease once more after the claim and before the remote delete,
+  and gives the claim back if one appeared.
 - **Acquire.** When an SSH lease starts for a run, it checks for a fresh claim on
   that run after its own lease is visible. If there is one, the new lease fails
   and the run must start again. Between the two checks, one side always sees the

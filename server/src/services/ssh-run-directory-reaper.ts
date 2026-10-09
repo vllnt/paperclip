@@ -111,32 +111,65 @@ async function hasBusyLease(db: Db, runId: string, exceptLeaseId: string): Promi
   return Boolean(busy);
 }
 
-// One statement checks that no other lease of the run is busy and records the
-// claim, so the two cannot be separated by a lease that starts in between. The
-// claim fails when another server holds a fresh one.
-async function claimRunDirectory(db: Db, lease: EnvironmentLease, runId: string, context: ReapContext): Promise<boolean> {
+/** What identifies one run directory: the host, its root, and the run. */
+interface RunDirectoryKey {
+  host: string;
+  port: number;
+  username: string;
+  root: string;
+  runId: string;
+}
+
+// Every lease row that names this directory. A directory is `runs/<runId>`
+// under one root on one host, so these are its leases, whatever their status.
+function leasesOfDirectory(key: RunDirectoryKey) {
+  return and(
+    eq(environmentLeases.heartbeatRunId, key.runId),
+    eq(environmentLeases.provider, "ssh"),
+    sql`${environmentLeases.metadata} ->> 'remoteCwd' = ${key.root}`,
+    sql`${environmentLeases.metadata} ->> 'host' = ${key.host}`,
+    sql`${environmentLeases.metadata} ->> 'port' = ${String(key.port)}`,
+    sql`${environmentLeases.metadata} ->> 'username' = ${key.username}`,
+  );
+}
+
+// Takes the one claim on a directory. Two leases of the same directory can be
+// released at the same time (two servers, two sweeps), and a check followed by
+// an update of the caller's own row would let both win. So a short transaction
+// first locks every lease row of the directory, in a fixed order, and decides
+// only then: the second contender waits for the first to commit and then sees
+// its claim. The claim also fails while any lease of the run is busy.
+async function claimRunDirectory(db: Db, lease: EnvironmentLease, key: RunDirectoryKey, context: ReapContext): Promise<boolean> {
   const claim = { state: "reaping", claimedAt: context.now.toISOString(), trigger: context.trigger, attempts: previousAttempts(lease) };
   const staleBefore = new Date(context.now.getTime() - REAP_CLAIM_STALE_MS).toISOString();
   const decision = sql`${environmentLeases.metadata} -> 'sshRunDirectory'`;
-  const claimed = await db
-    .update(environmentLeases)
-    .set({
+  return await db.transaction(async (tx) => {
+    await tx.select({ id: environmentLeases.id }).from(environmentLeases)
+      .where(leasesOfDirectory(key)).orderBy(asc(environmentLeases.id)).for("update");
+    const [held] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      leasesOfDirectory(key),
+      ne(environmentLeases.id, lease.id),
+      sql`${decision} ->> 'state' = 'reaping'`,
+      sql`(${decision} ->> 'claimedAt')::timestamptz > ${staleBefore}::timestamptz`,
+    )).limit(1);
+    if (held) return false;
+    const [busy] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      eq(environmentLeases.heartbeatRunId, key.runId),
+      ne(environmentLeases.id, lease.id),
+      inArray(environmentLeases.status, [...BUSY_LEASE_STATUSES]),
+    )).limit(1);
+    if (busy) return false;
+    const claimed = await tx.update(environmentLeases).set({
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ sshRunDirectory: claim })}::jsonb`,
       updatedAt: new Date(),
-    })
-    .where(and(
+    }).where(and(
       eq(environmentLeases.id, lease.id),
       sql`(${decision} is null
         or ${decision} ->> 'reason' = 'rm_failed'
         or (${decision} ->> 'state' = 'reaping' and (${decision} ->> 'claimedAt')::timestamptz < ${staleBefore}::timestamptz))`,
-      sql`not exists (
-        select 1 from ${environmentLeases} as other
-        where other.heartbeat_run_id = ${runId}
-          and other.id <> ${lease.id}
-          and other.status in (${sql.join(BUSY_LEASE_STATUSES.map((status) => sql`${status}`), sql`, `)}))`,
-    ))
-    .returning({ id: environmentLeases.id });
-  return claimed.length > 0;
+    )).returning({ id: environmentLeases.id });
+    return claimed.length > 0;
+  });
 }
 
 // Gives the claim back, restoring what was decided before it.
@@ -253,7 +286,10 @@ async function reapLease(
 
     // Claim the directory, then look for a lease once more: a lease that began
     // after the checks above sees the claim and refuses, or is seen here.
-    if (!await claimRunDirectory(db, lease, runId, context)) return SKIPPED;
+    const key: RunDirectoryKey = {
+      host: parsed.config.host, port: parsed.config.port, username: parsed.config.username, root: remoteRoot, runId,
+    };
+    if (!await claimRunDirectory(db, lease, key, context)) return SKIPPED;
     try {
       await hooks?.beforeRemoteDelete?.();
       if (await hasBusyLease(db, runId, lease.id)) {
