@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1076,5 +1076,113 @@ describe("parallel restores into one shared project workspace", () => {
     expect(beforeApply).toHaveBeenCalledTimes(1);
     expect(afterApply).toHaveBeenCalledTimes(1);
     expect(await readdir(lockRoot)).toEqual(PERMANENT_LOCK_FILES);
+  });
+});
+
+describe("staging files left behind by a killed merge", () => {
+  const roots: string[] = [];
+  let previousHome: string | undefined;
+  let previousInstanceId: string | undefined;
+
+  afterEach(async () => {
+    if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+    if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+    while (roots.length > 0) await rm(roots.pop()!, { recursive: true, force: true });
+  });
+
+  const HOUR_MS = 60 * 60_000;
+  const stagingName = () => `.paperclip-merge-${randomUUID()}`;
+
+  async function workspace() {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-stale-staging-")));
+    roots.push(root);
+    previousHome = process.env.PAPERCLIP_HOME;
+    previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = path.join(root, "home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const target = path.join(root, "target");
+    const source = path.join(root, "source");
+    await mkdir(path.join(target, "tests"), { recursive: true });
+    await writeFile(path.join(target, "tests", "a.test.ts"), "a\n");
+    await writeFile(path.join(target, "keep.txt"), "keep\n");
+    return { root, target, source };
+  }
+
+  async function leftover(directory: string, ageMs: number): Promise<string> {
+    const file = path.join(directory, stagingName());
+    await writeFile(file, "half a copy\n");
+    const then = new Date(Date.now() - ageMs);
+    await utimes(file, then, then);
+    return file;
+  }
+
+  // The run deleted the whole `tests` directory in its copy of the workspace.
+  async function runDeletingTests(root: string, target: string, source: string) {
+    const baseline = await captureDirectorySnapshot(target);
+    await fsPromises.cp(target, source, { recursive: true });
+    await rm(path.join(source, "tests"), { recursive: true });
+    return baseline;
+  }
+
+  it("removes a stale leftover so a later delete of its directory completes", async () => {
+    const { root, target, source } = await workspace();
+    const stale = await leftover(path.join(target, "tests"), 2 * HOUR_MS);
+    const baseline = await runDeletingTests(root, target, source);
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target });
+
+    await expect(lstat(path.join(target, "tests"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(stale)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(path.join(target, "keep.txt"), "utf8")).toBe("keep\n");
+  });
+
+  it("keeps a recent staging file, which may belong to a merge that is still copying", async () => {
+    const { root, target, source } = await workspace();
+    const recent = await leftover(path.join(target, "tests"), 1_000);
+    const baseline = await runDeletingTests(root, target, source);
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target });
+
+    expect(await readFile(recent, "utf8")).toBe("half a copy\n");
+  });
+
+  it("removes a stale leftover but still keeps a directory that holds real files", async () => {
+    const { root, target, source } = await workspace();
+    const baseline = await runDeletingTests(root, target, source);
+    await writeFile(path.join(target, "tests", "added-by-someone-else.ts"), "mine\n");
+    const stale = await leftover(path.join(target, "tests"), 2 * HOUR_MS);
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target });
+
+    expect(await readFile(path.join(target, "tests", "added-by-someone-else.ts"), "utf8")).toBe("mine\n");
+    await expect(lstat(stale)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32")("never follows or removes a staging-named link, and a directory holding one stays", async () => {
+    const { root, target, source } = await workspace();
+    const outside = path.join(root, "outside.txt");
+    await writeFile(outside, "outside the workspace\n");
+    const link = path.join(target, "tests", stagingName());
+    await symlink(outside, link);
+    const baseline = await runDeletingTests(root, target, source);
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target });
+
+    expect(await readFile(outside, "utf8")).toBe("outside the workspace\n");
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+  });
+
+  it("removes a stale leftover when a file replaces its directory", async () => {
+    const { root, target, source } = await workspace();
+    const stale = await leftover(path.join(target, "tests"), 2 * HOUR_MS);
+    const baseline = await captureDirectorySnapshot(target);
+    await fsPromises.cp(target, source, { recursive: true });
+    await rm(path.join(source, "tests"), { recursive: true });
+    await writeFile(path.join(source, "tests"), "now a file\n");
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target });
+
+    expect(await readFile(path.join(target, "tests"), "utf8")).toBe("now a file\n");
+    await expect(lstat(stale)).rejects.toMatchObject({ code: "ENOTDIR" });
   });
 });

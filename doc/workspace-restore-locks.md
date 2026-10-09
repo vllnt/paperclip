@@ -19,8 +19,18 @@ the lock for more than 30 seconds, so a restore must wait for the whole queue
 ahead of it. Set `PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS` (1 second to 1
 hour) to change the wait. Other writers keep the 30-second limit. A timeout
 still fails the run with `restore_lock_timeout` and the owner diagnostics below.
-Waiters poll the lock; it grants no queue order. The wait bounds how long one
-restore can keep losing to others.
+Contenders are admitted in arrival order. Each takes a ticket in
+`<hash>.lock.queue.sqlite`, and only the oldest live ticket tries the lock, so
+a newer restore cannot overtake an older one. The tickets order attempts only;
+the `.lock.sqlite` transaction above remains the sole authority for mutual
+exclusion, so a lost or stale ticket can delay a contender but never admit two.
+While queued, a contender holds an SQLite lock on its own
+`<hash>.lock.waiter-<uuid>.sqlite` file. The operating system releases that
+lock if the contender crashes, so the next contender sees an unlocked file,
+removes the dead ticket and the file, and moves on. This takes up to about one
+second per dead ticket. PIDs, ages, and clocks do not decide whether a ticket
+is dead. The queue file can be deleted while no instance is writing; it holds
+no state that outlives a queue.
 
 A restore whose files match the run's baseline, and whose remote Git HEAD is
 already in the local history, has nothing to apply. It returns without taking
@@ -28,6 +38,14 @@ the lock, so read-only runs do not lengthen the queue. Snapshot walks and SSH
 sync archives never include a merge's staged `.paperclip-merge-<uuid>` files.
 A snapshot walk treats an entry as absent when another writer deletes or
 renames it, or replaces its parent directory with a file, during the walk.
+
+A merge killed while it copies a file leaves its `.paperclip-merge-<uuid>`
+staging file in the workspace. Walks hide these names, so the file would keep
+its directory non-empty after the run deleted that directory. When a merge
+removes or replaces a directory and finds it non-empty, it deletes the staging
+files directly inside it and retries once. It deletes only a regular file owned
+by the server's user, older than 15 minutes, found by `lstat` and never through
+a link, and it never recurses. A directory that holds anything else stays.
 
 This uses the same built-in `node:sqlite` dependency as workspace manifests.
 See [SQLite file locking](https://www.sqlite.org/lockingv3.html) for the reserved

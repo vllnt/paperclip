@@ -715,13 +715,53 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
 
 }
 
+// A merge killed between staging a copy and renaming it leaves its
+// `.paperclip-merge-<uuid>` file behind. Snapshot walks hide these names, so a
+// leftover is invisible to the baseline, yet it keeps its directory non-empty.
+// Only the caller holding the target's merge lock may call this. The age floor
+// keeps a file that another lock's merge is still copying, such as one inside
+// a nested repository this merge does not own.
+const STALE_STAGING_MIN_AGE_MS = 15 * 60_000;
+
+/** Removes stale staging files directly inside `directory`; returns how many.
+ * It lstat()s every candidate and removes only a regular file owned by this
+ * user, so it never follows or removes a link, and never recurses. */
+async function removeStaleStagingFiles(directory: string): Promise<number> {
+  const parent = await fs.lstat(directory).catch(() => null);
+  if (!parent?.isDirectory()) return 0;
+  const uid = process.getuid?.();
+  let removed = 0;
+  for (const name of await fs.readdir(directory).catch(() => [])) {
+    if (!MERGE_STAGING_NAME.test(name)) continue;
+    const candidate = path.join(directory, name);
+    const stats = await fs.lstat(candidate).catch(() => null);
+    if (!stats?.isFile() || (uid !== undefined && stats.uid !== uid)) continue;
+    if (Date.now() - stats.mtimeMs < STALE_STAGING_MIN_AGE_MS) continue;
+    await fs.rm(candidate, { force: true });
+    removed += 1;
+  }
+  return removed;
+}
+
+// Removes an empty directory. When stale staging files kept it non-empty it
+// removes them and retries once; a directory that still holds anything else is
+// reported as ENOTEMPTY, never emptied.
+async function removeDirectoryDroppingStaleStaging(directory: string): Promise<void> {
+  try {
+    await fs.rmdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || await removeStaleStagingFiles(directory) === 0) throw error;
+    await fs.rmdir(directory);
+  }
+}
+
 // A file or symlink replacing a directory removes it non-recursively. The
 // merge has already deleted the unchanged entries it owns there, and
 // `blockedDirectoryReplacements` refused anything else, so a non-empty
 // directory here means content appeared concurrently and must not be lost.
 async function removeReplacedEntry(targetPath: string): Promise<void> {
   const existing = await fs.lstat(targetPath).catch(() => null);
-  if (existing?.isDirectory()) await fs.rmdir(targetPath);
+  if (existing?.isDirectory()) await removeDirectoryDroppingStaleStaging(targetPath);
   else await fs.rm(targetPath, { force: true });
 }
 
@@ -734,6 +774,7 @@ async function blockedDirectoryReplacements(
 ): Promise<string[]> {
   const ignored = workspacePathMatcher(baseline.ignoredPaths);
   const holdsUnownedEntry = async (relative: string): Promise<boolean> => {
+    await removeStaleStagingFiles(path.join(targetDir, relative));
     for (const name of await fs.readdir(path.join(targetDir, relative))) {
       const child = path.posix.join(relative, name);
       const owned = baseline.entries.get(child);
@@ -909,7 +950,7 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         // Reverse path order visits descendants before their parent directory.
         for (const [relative, entry] of orderedEntries(input.baseline, true)) {
-          if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
+          if (entry.kind === "dir" && !source.entries.has(relative)) await removeDirectoryDroppingStaleStaging(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
           });
         }
