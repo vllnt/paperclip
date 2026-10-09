@@ -144,7 +144,13 @@ describe("appendResourceProbe", () => {
     });
     const { head, probe } = splitResourceProbeOutput(stdout);
     expect(head.trim()).toBe("/ws");
-    expect(Buffer.byteLength(probe ?? "")).toBeLessThanOrEqual(RESOURCE_PROBE_MAX_OUTPUT_BYTES);
+    expect(Buffer.byteLength(probe ?? "")).toBe(RESOURCE_PROBE_MAX_OUTPUT_BYTES);
+  });
+
+  it("parses nothing from a probe cut at the size limit, whose last line may be cut mid-number", () => {
+    const capped = `rc:nproc 8\n${"rc:filler\n".repeat(2000)}`.slice(0, RESOURCE_PROBE_MAX_OUTPUT_BYTES);
+    expect(Buffer.byteLength(capped)).toBe(RESOURCE_PROBE_MAX_OUTPUT_BYTES);
+    expect(parseResourceProbeOutput(capped).cpuCount).toBeNull();
   });
 
   it("ignores a marker printed by the probe itself", async () => {

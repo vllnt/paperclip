@@ -132,7 +132,9 @@ export function parseDfPortableLine(line: string): ResourceDisk | null {
 
 /**
  * Parses probe output into validated numbers. Missing or invalid values are
- * null; output over {@link RESOURCE_PROBE_MAX_OUTPUT_BYTES} yields nothing.
+ * null. Output that reaches {@link RESOURCE_PROBE_MAX_OUTPUT_BYTES} yields
+ * nothing: the worker cuts the probe at that size, so its last line may be
+ * cut mid-number.
  */
 export function parseResourceProbeOutput(output: string): ResourceProbeReading {
   const reading: ResourceProbeReading = {
@@ -142,7 +144,7 @@ export function parseResourceProbeOutput(output: string): ResourceProbeReading {
     memTotalBytes: null,
     memAvailableBytes: null,
   };
-  if (Buffer.byteLength(output) > RESOURCE_PROBE_MAX_OUTPUT_BYTES) return reading;
+  if (Buffer.byteLength(output) >= RESOURCE_PROBE_MAX_OUTPUT_BYTES) return reading;
   const meminfoLines: string[] = [];
   for (const rawLine of output.split("\n")) {
     const line = rawLine.trimEnd();
