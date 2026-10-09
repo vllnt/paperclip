@@ -121,8 +121,11 @@ interface ClaudeLoginContext {
 interface UpdateAgentOptions {
   /**
    * Runs inside the update transaction after the agent row is locked with
-   * `SELECT ... FOR UPDATE`, so a caller that authorized against an earlier
+   * `SELECT ... FOR NO KEY UPDATE`, so a caller that authorized against an earlier
    * read can check the committed row before it writes. A throw aborts the update.
+   * The lock waits for a concurrent update of the row but, unlike `FOR UPDATE`,
+   * not for the key-share lock that the denial log's `agent_id` foreign key
+   * takes on another connection while the hook runs.
    */
   verifyLockedRow?: (locked: typeof agents.$inferSelect) => Promise<void>;
   recordRevision?: RevisionMetadata;
@@ -803,7 +806,7 @@ export function agentService(db: Db) {
           .select()
           .from(agents)
           .where(eq(agents.id, id))
-          .for("update")
+          .for("no key update")
           .then((rows) => rows[0] ?? null);
         if (!locked) return null;
         await options.verifyLockedRow(locked);
