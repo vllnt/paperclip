@@ -76,6 +76,8 @@ export interface RecordSignalOptions {
   manualIssueId?: string;
   /** For a manual link: whether a merge completes the task. Defaults to true. */
   closes?: boolean;
+  /** The pull request's state could not be read; keep it out of status automation. */
+  unresolved?: boolean;
 }
 
 export interface RecordedLink {
@@ -290,6 +292,7 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
     externalId: string,
     evidence: Evidence | null,
     explicit: boolean,
+    unresolved: boolean,
   ): Promise<RecordedLink> {
     return db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${gitLinkLockKey(companyId, externalId)}, 0))`);
@@ -320,8 +323,9 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       const keepsManual = previous?.linkedBy === "manual" && !previous.suppressed && !explicit;
       const linkedBy: IssueGitLinkedBy = keepsManual ? "manual" : evidence ? evidence.linkedBy : previous?.linkedBy ?? "manual";
       const closes = keepsManual ? previous!.closes : evidence ? evidence.closes : previous?.closes ?? false;
-      const verified =
-        linkedBy === "manual" || linkedBy === "workspace_branch" || adoptedByHand
+      const verified = unresolved
+        ? false
+        : linkedBy === "manual" || linkedBy === "workspace_branch" || adoptedByHand
           ? true
           : signal.headRepository
             ? sameRepository(signal.headRepository, signal.repository)
@@ -572,7 +576,7 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
 
     const links: RecordedLink[] = [];
     for (const issue of rows) {
-      links.push(await upsertLink(companyId, issue, effective, externalId, targets.get(issue.id) ?? null, opts.manualIssueId !== undefined));
+      links.push(await upsertLink(companyId, issue, effective, externalId, targets.get(issue.id) ?? null, opts.manualIssueId !== undefined, opts.unresolved === true));
     }
 
     const enabled = await statusAutomationEnabled();
@@ -645,7 +649,11 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
     };
   }
 
-  async function unlinkPullRequest(issueId: string, companyId: string, workProductId: string): Promise<boolean> {
+  async function unlinkPullRequest(
+    issueId: string,
+    companyId: string,
+    workProductId: string,
+  ): Promise<"unlinked" | "already_unlinked" | "not_found"> {
     return db.transaction(async (tx) => {
       const [row] = await tx
         .select()
@@ -657,13 +665,14 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
           eq(issueWorkProducts.type, "pull_request"),
         ))
         .for("update");
-      if (!row) return false;
+      if (!row) return "not_found";
       const git = readGitMeta(row);
+      if (git.suppressed) return "already_unlinked";
       await tx
         .update(issueWorkProducts)
         .set({ status: "archived", metadata: { ...asRecord(row.metadata), git: { ...git, suppressed: true } }, updatedAt: new Date() })
         .where(and(eq(issueWorkProducts.id, row.id), eq(issueWorkProducts.companyId, companyId)));
-      return true;
+      return "unlinked";
     });
   }
 
@@ -690,7 +699,11 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       updatedAt: new Date().toISOString(),
       source,
     };
-    return recordPullRequestSignal(companyId, signal, { manualIssueId: issueId, closes: input.closes });
+    return recordPullRequestSignal(companyId, signal, {
+      manualIssueId: issueId,
+      closes: input.closes,
+      unresolved: details.workProductState === undefined,
+    });
   }
 
   return { recordPullRequestSignal, getView, unlinkPullRequest, linkPullRequest };
