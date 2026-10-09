@@ -1,6 +1,22 @@
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
+import {
+  agentEnvBindingPrefix,
+  COOLDOWN_READ_FAILURE_BASE_MS,
+  HARNESS_FALLBACK_RETRY_REASON,
+  HARNESS_FALLBACK_WAKE_REASON,
+  applyClaimedHarnessDispatch,
+  checkRunHarnessCompatibility,
+  classifyQuotaFailure,
+  harnessFallbackService,
+  isLlmHarnessAdapterType,
+  overridesForHarnessTarget,
+  primaryHarnessDispatch,
+  readClaimedHarnessDispatch,
+  reclassifyProviderQuotaResult,
+  type HarnessDispatch,
+} from "./harness-fallback.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 
@@ -188,7 +204,7 @@ import {
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
-import { conflict, HttpError, notFound } from "../errors.js";
+import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import {
   decideIssueAssignmentWakeRefusal,
@@ -705,6 +721,8 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
+  "agent.harness_fallback_activated",
+  "agent.harness_fallback_returned",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
@@ -876,6 +894,7 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE =
 const GITHUB_PR_WORKFLOW_SKILL_KEY =
   "paperclipai/bundled/software-development/github-pr-workflow";
 const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
+  "harness_model_incompatible",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",
@@ -1596,6 +1615,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
   projectId?: string | null;
   routineId?: string | null;
   executionRunConfig: Record<string, unknown>;
+  /** Binding path prefix of the agent's own env; set for a fallback target. */
+  agentEnvPathPrefix?: string;
   projectEnv: unknown;
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
@@ -1700,6 +1721,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             consumerId: input.agentId,
             responsibleUserId: input.responsibleUserId ?? null,
           },
+          { envPathPrefix: input.agentEnvPathPrefix },
         )),
       );
       if (
@@ -1837,7 +1859,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             : {}),
         }
       : undefined,
-    { adapterType: input.adapterType ?? null },
+    { adapterType: input.adapterType ?? null, envPathPrefix: input.agentEnvPathPrefix },
   );
   if (Object.keys(environmentEnvResolution.env).length > 0) {
     resolvedConfig.env = {
@@ -3375,6 +3397,9 @@ const heartbeatRunListColumns = {
   stdoutExcerpt: sql<string | null>`NULL`.as("stdoutExcerpt"),
   stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
   errorCode: heartbeatRuns.errorCode,
+  executedAdapterType: heartbeatRuns.executedAdapterType,
+  executedModel: heartbeatRuns.executedModel,
+  fallbackReason: heartbeatRuns.fallbackReason,
   externalRunId: heartbeatRuns.externalRunId,
   processPid: heartbeatRuns.processPid,
   processGroupId: heartbeatRunProcessGroupIdColumn,
@@ -9686,6 +9711,7 @@ export function heartbeatService(
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  const harnessFallback = harnessFallbackService(db);
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
@@ -15466,6 +15492,9 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      contextPatch?: Record<string, unknown>;
+      /** The retry is due no earlier than this time. */
+      notBefore?: Date;
     },
   ) {
     if (run.errorCode === "provider_tool_definition_invalid") {
@@ -15601,16 +15630,21 @@ export function heartbeatService(
       }
     }
 
+    // A retry never lands before the provider reset, nor while every
+    // harness/model of the agent is cooling down from a quota failure.
+    const storedAgentForQuota = run.runtimeMode === "native" ? null : await getAgent(run.agentId).catch(() => null);
+    const quotaHeldUntil = storedAgentForQuota
+      ? await harnessFallback.heldUntil(storedAgentForQuota, now)
+      : null;
+    const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
+      .filter((value): value is Date => value !== null)
+      .reduce<Date | null>((latest, value) => (!latest || value > latest ? value : latest), null);
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      notBefore && notBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(
-              0,
-              transientRetryNotBefore.getTime() - now.getTime(),
-            ),
+            dueAt: notBefore,
+            delayMs: Math.max(0, notBefore.getTime() - now.getTime()),
           }
         : baseSchedule;
 
@@ -15723,6 +15757,7 @@ export function heartbeatService(
             }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+        ...(opts?.contextPatch ?? {}),
       },
       "normal_model",
     );
@@ -16894,6 +16929,133 @@ export function heartbeatService(
     return { start, end };
   }
 
+  /** Notes on a held queued run when it can start; written once per cooldown end. */
+  async function recordProviderQuotaWait(run: typeof heartbeatRuns.$inferSelect, heldUntil: Date) {
+    const waitUntil = heldUntil.toISOString();
+    // A merge in SQL: a comment wake can coalesce into this queued run while
+    // we hold it, and a read-modify-write of the snapshot would drop it.
+    const [held] = await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ providerQuotaWaitUntil: waitUntil })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "queued"),
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'providerQuotaWaitUntil', '') <> ${waitUntil}`,
+      ))
+      .returning();
+    if (!held) return;
+    await appendRunEvent(held, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: `Waiting for the provider quota to reset; this run starts at or after ${waitUntil}`,
+      payload: { providerQuotaWaitUntil: waitUntil },
+    }).catch(() => undefined);
+  }
+
+  /**
+   * After a failed legacy run that hit a provider usage limit before useful
+   * work (or a capacity limit whose bounded retries are spent), cools the
+   * harness/model that ran down until the provider's reset, or a bounded
+   * backoff when none is known. With a healthy fallback the same wake is
+   * re-dispatched there once; otherwise every retry and new wake waits for
+   * the cooldown (see scheduleBoundedRetryForRun and claimQueuedRun).
+   */
+  async function handleProviderQuotaFailure(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    executedAgent: typeof agents.$inferSelect;
+    storedAgent: typeof agents.$inferSelect;
+    phase: "failure" | "retry_exhausted";
+  }): Promise<{ redispatched: boolean; awaitingRetryExhaustion: boolean; deferUntil: Date | null }> {
+    const none = { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
+    const { run, executedAgent, storedAgent } = input;
+    if (run.runtimeMode === "native") return none;
+    const dispatch = readClaimedHarnessDispatch(run.runnerProfileJson) ?? primaryHarnessDispatch(storedAgent);
+    if (!isLlmHarnessAdapterType(dispatch.adapterType)) return none;
+    const outputTokens = asNumber(parseObject(run.usageJson).outputTokens, 0);
+    let usefulWork = outputTokens > 0;
+    if (!usefulWork) {
+      const evidence = await buildRunLivenessInput(run, parseObject(run.resultJson))
+        .then((liveness) => liveness.evidence)
+        .catch(() => null);
+      // An unreadable evidence lookup fails closed: the failure still has to
+      // read as a provider quota error, and cooling down is the safe side.
+      usefulWork = !!evidence && (
+        (evidence.issueCommentsCreated ?? 0) > 0 ||
+        (evidence.documentRevisionsCreated ?? 0) > 0 ||
+        (evidence.workProductsCreated ?? 0) > 0 ||
+        (evidence.activityEventsCreated ?? 0) > 0);
+    }
+    const decision = classifyQuotaFailure({
+      status: run.status,
+      errorCode: run.errorCode,
+      errorFamily: readHeartbeatRunErrorFamily(run),
+      errorMessage: run.error,
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+      usefulWork,
+    });
+    if (!decision.trigger) return none;
+    if (decision.requiresRetryExhaustion && input.phase !== "retry_exhausted") {
+      return { ...none, awaitingRetryExhaustion: true };
+    }
+    const reason = `provider_${decision.kind}`;
+    const cooled = await harnessFallback.coolDown({
+      agent: storedAgent,
+      targetKey: dispatch.targetKey,
+      reason,
+      resetAt: decision.resetAt,
+      sourceRunId: run.id,
+    }).catch((err) => {
+      // Fail closed: without a recorded cooldown the normal 30 second retry
+      // would send this wake straight back at the exhausted target.
+      logger.warn({ err, runId: run.id, target: dispatch.targetKey }, "quota cooldown could not be recorded; deferring this wake");
+      return null;
+    });
+    if (!cooled) {
+      return { ...none, deferUntil: new Date(Date.now() + COOLDOWN_READ_FAILURE_BASE_MS) };
+    }
+    const { until, nextTarget } = cooled;
+    if (!until) return none;
+    const context = parseObject(run.contextSnapshot);
+    const alreadyRedispatched = readNonEmptyString(parseObject(context.harnessFallbackRedispatch).fromRunId) !== null;
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: `Harness ${dispatch.targetKey} cooled down until ${until.toISOString()} (${reason})`,
+      payload: {
+        harnessTarget: dispatch.targetKey,
+        reason,
+        cooldownUntil: until.toISOString(),
+        resetKnown: decision.resetAt !== null,
+        nextTarget: nextTarget?.key ?? null,
+        alreadyRedispatched,
+      },
+    });
+    // A wake gets one re-dispatch. A failed fallback run defers the wake to its
+    // own cooldown end instead of hopping to the next target a moment later.
+    if (alreadyRedispatched) return { ...none, deferUntil: until };
+    if (!nextTarget) return none;
+    const scheduled = await scheduleBoundedRetryForRun(run, executedAgent, {
+      retryReason: HARNESS_FALLBACK_RETRY_REASON,
+      wakeReason: HARNESS_FALLBACK_WAKE_REASON,
+      maxAttempts: executionRetryAttemptCount(run, HARNESS_FALLBACK_RETRY_REASON) + 1,
+      delayMs: 0,
+      contextPatch: {
+        harnessFallbackRedispatch: {
+          fromRunId: run.id,
+          fromTarget: dispatch.targetKey,
+          toTarget: nextTarget.key,
+          reason,
+        },
+      },
+    });
+    return { ...none, redispatched: scheduled.outcome === "scheduled" };
+  }
+
   async function getHeartbeatDailyCapBlock(
     agent: typeof agents.$inferSelect,
     policy: ReturnType<typeof parseHeartbeatPolicy>,
@@ -16914,6 +17076,12 @@ export function heartbeatService(
         gte(heartbeatRuns.startedAt, start),
         lt(heartbeatRuns.startedAt, end),
         notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        sql`not exists (
+          select 1 from heartbeat_runs fallback_successor
+          where fallback_successor.company_id = ${heartbeatRuns.companyId}
+            and fallback_successor.retry_of_run_id = ${heartbeatRuns.id}
+            and fallback_successor.scheduled_retry_reason = ${HARNESS_FALLBACK_RETRY_REASON}
+        )`,
       ];
       if (options.excludeRunId) {
         conditions.push(sql`${heartbeatRuns.id} <> ${options.excludeRunId}`);
@@ -17462,6 +17630,22 @@ export function heartbeatService(
       return null;
     }
 
+    const harnessDecision = await harnessFallback.resolveDispatch(agent);
+    if (harnessDecision.heldUntil && run.runtimeMode !== "native") {
+      // Every harness/model of this agent is out of provider quota. Leave the
+      // run queued: the scheduler tick claims it once a target recovers, and
+      // the daily run cap is not charged for the wait.
+      await recordProviderQuotaWait(run, harnessDecision.heldUntil);
+      return null;
+    }
+    const harnessDispatch: HarnessDispatch = harnessDecision.dispatch;
+    const adapterDispatchPatch = JSON.stringify({ adapterDispatch: harnessDispatch });
+    const harnessDispatchColumns = {
+      executedAdapterType: harnessDispatch.adapterType,
+      executedModel: harnessDispatch.model,
+      fallbackReason: harnessDispatch.fallbackReason,
+    };
+
     const issueId = readNonEmptyString(context.issueId);
     if (issueId && activeRunExecutions.size > 0) {
       // Native finalization publishes success before workspace synchronization,
@@ -17800,7 +17984,8 @@ export function heartbeatService(
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
-                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+                    ...harnessDispatchColumns,
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17899,7 +18084,8 @@ export function heartbeatService(
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
-                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+                  ...harnessDispatchColumns,
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17966,7 +18152,8 @@ export function heartbeatService(
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
           const claimValues = {
             status: "running",
-            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+            ...harnessDispatchColumns,
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
@@ -17989,6 +18176,11 @@ export function heartbeatService(
           });
         });
     if (!claimed) return null;
+    if (harnessDispatch.target === "primary") {
+      await harnessFallback.notePrimaryDispatched(agent, claimed.id).catch((err) => {
+        logger.warn({ err, runId: claimed.id }, "failed to record the return to the primary harness");
+      });
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -20658,8 +20850,8 @@ export function heartbeatService(
     let readFailureReportSecrets: () => string[] = () => [];
 
     try {
-      const agent = await getAgent(run.agentId);
-      if (!agent) {
+      const storedAgent = await getAgent(run.agentId);
+      if (!storedAgent) {
         await setRunStatus(runId, "failed", {
           error: "Agent not found",
           errorCode: "agent_not_found",
@@ -20674,6 +20866,11 @@ export function heartbeatService(
         return;
       }
 
+      const claimedHarnessDispatch = readClaimedHarnessDispatch(run.runnerProfileJson);
+      const agent = applyClaimedHarnessDispatch(storedAgent, claimedHarnessDispatch);
+      if (!agent) {
+        throw new Error("Agent fallback target changed during startup; start a new turn with the updated agent.");
+      }
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
       const selectedAdapter = claimedAdapterType(run);
@@ -21788,7 +21985,7 @@ export function heartbeatService(
       });
       const mergedConfig = {
         ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
+        ...overridesForHarnessTarget(issueAssigneeOverrides?.adapterConfig, claimedHarnessDispatch),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
         ...(useIsolatedTaskDirectory ? { workspaceStrategy: { type: "project_primary" } } : {}),
@@ -21848,6 +22045,7 @@ export function heartbeatService(
           routineId: routineEnvContext.routineId,
           responsibleUserId,
           executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
+          agentEnvPathPrefix: agentEnvBindingPrefix(storedAgent, claimedHarnessDispatch),
           projectEnv: aiBinding ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
           routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
           secretsSvc,
@@ -22021,6 +22219,14 @@ export function heartbeatService(
         });
       const configuredModel =
         readConfiguredModelFromAdapterConfig(runtimeConfig);
+      const harnessCompatibility = checkRunHarnessCompatibility({
+        adapterType: agent.adapterType,
+        config: runtimeConfig,
+        fallback: claimedHarnessDispatch?.target === "fallback",
+      });
+      if (!harnessCompatibility.ok) {
+        throw unprocessable(harnessCompatibility.message, { code: harnessCompatibility.code });
+      }
       if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
         const capability = getServerAdapter(agent.adapterType).supportsToolRefreshOnResume;
         const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
@@ -22037,10 +22243,20 @@ export function heartbeatService(
         preserveLegacySessionWithoutConfigMetadata:
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
       });
+      const previousIssueHarness = issueId
+        ? await harnessFallback.previousIssueHarness(agent, issueId, run.id)
+        : null;
+      const harnessSwitched =
+        previousIssueHarness !== null && previousIssueHarness !== agent.adapterType;
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset || harnessSwitched;
       const sessionResetReason =
-        sessionConfigFreshness.reasons.join("; ") || null;
+        [
+          ...sessionConfigFreshness.reasons,
+          ...(harnessSwitched
+            ? [`the harness changed from ${previousIssueHarness} to ${agent.adapterType}`]
+            : []),
+        ].join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
       const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
         db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
@@ -25203,6 +25419,7 @@ export function heartbeatService(
           }
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
+          if (run.runtimeMode !== "native") adapterResult = reclassifyProviderQuotaResult(adapterResult, new Date(), agent.adapterType);
           // A returned result can include a failed restore. Keep the workspace
           // barrier closed until required files have been restored.
           // If recording the barrier itself fails, propagate as a run failure
@@ -25981,7 +26198,28 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          const harnessFallbackOutcome = outcome === "failed" && !isMaxTurnExhaustionRun(livenessRun)
+            ? await handleProviderQuotaFailure({
+                run: livenessRun,
+                executedAgent: agent,
+                storedAgent,
+                phase: "failure",
+              }).catch((err) => {
+                logger.warn({ err, runId: livenessRun.id }, "harness fallback scheduling failed; using the normal retry path");
+                return { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
+              })
+            : null;
+          if (harnessFallbackOutcome?.redispatched) {
+            await appendRunEvent(livenessRun, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "Re-dispatched this wake once on a fallback harness",
+              payload: { retryReason: HARNESS_FALLBACK_RETRY_REASON },
+            });
+          } else if (harnessFallbackOutcome?.deferUntil) {
+            await scheduleBoundedRetryForRun(livenessRun, agent, { notBefore: harnessFallbackOutcome.deferUntil });
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -26007,7 +26245,20 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            const transientRetry = await scheduleBoundedRetryForRun(livenessRun, agent);
+            if (
+              transientRetry.outcome === "retry_exhausted" &&
+              harnessFallbackOutcome?.awaitingRetryExhaustion
+            ) {
+              await handleProviderQuotaFailure({
+                run: livenessRun,
+                executedAgent: agent,
+                storedAgent,
+                phase: "retry_exhausted",
+              }).catch((err) => {
+                logger.warn({ err, runId: livenessRun.id }, "harness fallback after exhausted retries failed");
+              });
+            }
           } else if (
             outcome === "failed" &&
             !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -26714,6 +26965,7 @@ export function heartbeatService(
           }
           await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery:
+              livenessRun.errorCode === "harness_model_incompatible" ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||

@@ -15,6 +15,7 @@ import type {
   TrustPreset,
 } from "../trust-policy.js";
 import type { AgentOrgChainHealth } from "../agent-eligibility.js";
+import type { AgentFallbackTarget, AgentHarnessFallbackState } from "../harness-fallback.js";
 import type { AgentApiKeyScope } from "../validators/agent.js";
 
 export interface AgentPermissions extends Record<string, unknown> {
@@ -95,6 +96,10 @@ export interface Agent {
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
   runtimeConfig: AgentRuntimeConfig;
+  /** Ordered harness/model targets tried when the primary hits a provider quota. */
+  fallbacks?: AgentFallbackTarget[];
+  /** Set while the primary is cooled down and runs use a fallback target. */
+  harnessFallback?: AgentHarnessFallbackState | null;
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;

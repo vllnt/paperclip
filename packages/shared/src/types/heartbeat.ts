@@ -200,6 +200,10 @@ export interface HeartbeatRun {
   stdoutExcerpt: string | null;
   stderrExcerpt: string | null;
   errorCode: string | null;
+  /** The harness and model this run executed; a fallback run names why it left the primary. */
+  executedAdapterType?: string | null;
+  executedModel?: string | null;
+  fallbackReason?: string | null;
   externalRunId: string | null;
   processPid: number | null;
   processGroupId?: number | null;

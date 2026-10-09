@@ -161,6 +161,7 @@ Invariant: every business record belongs to exactly one company.
 - `adapter_type` text; built-ins include `process`, `http`, `claude_local`, `codex_local`, `gemini_local`, `opencode_local`, `pi_local`, `cursor`, `hermes_local`, `hermes_gateway`, and `openclaw_gateway`
 - `adapter_config` jsonb not null
 - `runtime_config` jsonb not null default `{}`; contains Paperclip runtime policy such as heartbeat scheduling and debug settings
+- `fallbacks` jsonb not null default `[]`; ordered harness/model fallback targets (`adapterType`, `model`, `effort`, `adapterConfig`, `env`), at most 3; see §11.8
 - `default_environment_id` uuid fk `environments.id` null
 - `context_mode` enum: `thin | fat` default `thin`
 - `budget_monthly_cents` int not null default 0
@@ -310,6 +311,8 @@ Invariants:
 - `error` text null
 - `external_run_id` text null
 - `context_snapshot` jsonb null
+- `executed_adapter_type`, `executed_model` text null: the harness and model the run executed
+- `fallback_reason` text null: why a run executed on a fallback target (for example `provider_usage_limit`)
 
 ## 7.9 `cost_events`
 
@@ -1369,6 +1372,38 @@ Legacy execution records a renewable controller lease when claiming a queued run
 before provisioning. A live lease protects the run during overlapping service
 deployments. An expired controller loses dispatch authority; a recovery worker
 must establish that the previous execution stopped before starting a successor.
+
+## 11.8 Provider quota cooldowns and harness fallbacks
+
+A legacy run that fails with a provider usage limit before useful work (no
+comment, document, work product, non-bookkeeping activity or output tokens)
+cools down the harness/model that ran (`agent_harness_cooldowns`, keyed by
+`<adapterType>:<model>`). A capacity failure does the same once its bounded
+retries are spent. Auth failures, task failures and refusals never do. The
+server treats quota wording (for example a credential proxy's
+`All credentials for model … are cooling down`) as `provider_quota` even when
+an adapter reports it as transient.
+
+The cooldown ends at the provider reset when the error or adapter names one,
+otherwise after a backoff that starts at 5 minutes and doubles while failures
+repeat, up to `runtime_config.heartbeat.quotaBackoffMaxMinutes` (default 60).
+
+- With a healthy entry in `agents.fallbacks`, the failed wake is re-dispatched
+  once on it (`harness_fallback` scheduled retry). The failed run and its
+  re-dispatch count as one run toward `maxDailyRuns`. A fallback run that
+  fails is not re-dispatched again.
+- Later runs claim the first healthy target in order. When every target is
+  cooling down, queued runs stay queued and every scheduled retry is due no
+  earlier than the first recovery. No run executes the same harness and model
+  again before its cooldown ends.
+- A run on a different harness than the agent's previous run on the issue
+  starts a fresh session with the continuation summary.
+- Harness/model compatibility: `claude_local` runs Anthropic models only,
+  `codex_local` OpenAI and xAI models, `grok_local` xAI models. No non-Claude
+  harness runs an Anthropic model id, including through `extraArgs`. Config
+  writes and run start both enforce this (`harness_model_incompatible`).
+- An agent changing its own `fallbacks` or `quotaBackoffMaxMinutes` needs
+  `agents:configure` for itself.
 
 ## 11.7 Durable agent session goals
 
