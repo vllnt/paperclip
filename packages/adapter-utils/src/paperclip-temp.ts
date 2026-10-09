@@ -163,28 +163,40 @@ export function isPaperclipTempEntryHeld(entry: string): boolean {
 
 type RemoveOutcome = "removed" | "mount_point" | "budget";
 
-// Removes a tree without following a link or crossing into another device.
-// A read-only directory (for example a Go module cache that tar extracted) is
-// made writable first, because a non-root process cannot remove its files.
+// How many children of one directory are removed at once.
+const REMOVE_CONCURRENCY = 16;
+// How many run ids one `classifyRuns` call receives.
+const CLASSIFY_CHUNK = 500;
+
+function ignoreMissing(error: unknown): null {
+  if (errorCode(error) === "ENOENT") return null;
+  throw error;
+}
+
+// Removes a tree without following a link or entering another mounted
+// filesystem. Only a directory can be a mount point, so only directories are
+// compared with the root's device (on overlayfs a file can report its lower
+// layer's device). A read-only directory (for example a Go module cache that
+// tar extracted) is made writable first, because a non-root process cannot
+// remove its files. A node that is already gone counts as removed.
 async function removeConfined(entry: string, rootDev: number, deadline: number, freed: { bytes: number }): Promise<RemoveOutcome> {
-  const stats = await fs.lstat(entry).catch((error: unknown) => {
-    if (errorCode(error) === "ENOENT") return null;
-    throw error;
-  });
+  const stats = await fs.lstat(entry).catch(ignoreMissing);
   if (!stats) return "removed";
-  if (stats.dev !== rootDev) return "mount_point";
   if (!stats.isDirectory()) {
-    await fs.unlink(entry);
-    freed.bytes += stats.size;
+    if (await fs.unlink(entry).then(() => true, (error: unknown) => ignoreMissing(error) ?? false)) freed.bytes += stats.size;
     return "removed";
   }
-  if ((stats.mode & 0o700) !== 0o700) await fs.chmod(entry, (stats.mode & 0o7777) | 0o700);
-  for (const child of await fs.readdir(entry)) {
+  if (stats.dev !== rootDev) return "mount_point";
+  if ((stats.mode & 0o700) !== 0o700) await fs.chmod(entry, (stats.mode & 0o7777) | 0o700).catch(ignoreMissing);
+  const children = (await fs.readdir(entry).catch(ignoreMissing)) ?? [];
+  for (let index = 0; index < children.length; index += REMOVE_CONCURRENCY) {
     if (Date.now() > deadline) return "budget";
-    const outcome = await removeConfined(path.join(entry, child), rootDev, deadline, freed);
-    if (outcome !== "removed") return outcome;
+    const outcomes = await Promise.all(children.slice(index, index + REMOVE_CONCURRENCY)
+      .map((child) => removeConfined(path.join(entry, child), rootDev, deadline, freed)));
+    const stopped = outcomes.find((outcome) => outcome !== "removed");
+    if (stopped) return stopped;
   }
-  await fs.rmdir(entry);
+  await fs.rmdir(entry).catch(ignoreMissing);
   return "removed";
 }
 
@@ -199,8 +211,9 @@ function parseEntryName(name: string): { prefix: string; runId: string | null } 
  * reports as `dead`. It works only on direct children of the real `tmpDir`,
  * keeps symlinks, files, entries another user owns, mount points, entries this
  * process holds, entries changed within `minAgeMs`, and anything it cannot
- * attribute or classify. It removes at most `maxEntries`, oldest first (key
- * material before the rest), within `timeBudgetMs`.
+ * attribute or classify. It classifies every eligible entry, then removes at
+ * most `maxEntries` dead ones, oldest first (key material before the rest),
+ * within `timeBudgetMs`.
  *
  * @param options.classifyRuns - Reports each run id's state. A missing id counts as `run_missing`; a throw keeps every entry as `db_error`.
  * @param options.minAgeMs - The entry's change time must be at least this old.
@@ -229,8 +242,12 @@ export async function sweepPaperclipTempEntries(options: {
 
   // Resolve the root once. Every path below is a direct child of it, so a
   // TMPDIR link that changes during the sweep cannot redirect a removal.
-  const root = await fs.realpath(options.tmpDir ?? os.tmpdir());
+  const listedDir = options.tmpDir ?? os.tmpdir();
+  const root = await fs.realpath(listedDir);
   const rootDev = (await fs.lstat(root)).dev;
+  // A creator registers the path under `os.tmpdir()`, which may be a link to the root.
+  const isHeld = (name: string) =>
+    isPaperclipTempEntryHeld(path.join(root, name)) || isPaperclipTempEntryHeld(path.join(listedDir, name));
 
   const eligible: Array<{ name: string; entry: string; runId: string; rank: number; dev: number; ino: number; ctimeMs: number }> = [];
   for (const name of await fs.readdir(root)) {
@@ -241,7 +258,7 @@ export async function sweepPaperclipTempEntries(options: {
       continue;
     }
     const entry = path.join(root, name);
-    if (isPaperclipTempEntryHeld(entry)) {
+    if (isHeld(name)) {
       keep("held");
       continue;
     }
@@ -269,14 +286,24 @@ export async function sweepPaperclipTempEntries(options: {
     }
   }
   eligible.sort((left, right) => left.rank - right.rank || left.ctimeMs - right.ctimeMs);
-  const batch = eligible.slice(0, Math.max(0, maxEntries));
-  result.deferred += eligible.length - batch.length;
 
-  let verdicts: ReadonlyMap<string, PaperclipTempRunVerdict> | null = null;
-  if (batch.length > 0) {
-    verdicts = await options.classifyRuns([...new Set(batch.map((candidate) => candidate.runId))]).catch(() => null);
+  // Classify every eligible entry before the cap, so entries that are always
+  // kept (a live run, a busy lease) cannot fill every pass.
+  let verdicts: Map<string, PaperclipTempRunVerdict> | null = new Map();
+  const runIds = [...new Set(eligible.map((candidate) => candidate.runId))];
+  try {
+    for (let index = 0; index < runIds.length; index += CLASSIFY_CHUNK) {
+      for (const [runId, verdict] of await options.classifyRuns(runIds.slice(index, index + CLASSIFY_CHUNK))) {
+        verdicts.set(runId, verdict);
+      }
+    }
+  } catch (error) {
+    verdicts = null;
+    result.firstFailure = `classifyRuns: ${errorCode(error) ?? (error instanceof Error ? error.name : "unknown")}`;
   }
-  for (const candidate of batch) {
+
+  let attempts = 0;
+  for (const candidate of eligible) {
     if (!verdicts) {
       keep("db_error");
       continue;
@@ -286,11 +313,12 @@ export async function sweepPaperclipTempEntries(options: {
       keep(verdict);
       continue;
     }
-    if (Date.now() > deadline) {
+    if (attempts >= maxEntries || Date.now() > deadline) {
       result.deferred += 1;
       continue;
     }
-    if (isPaperclipTempEntryHeld(candidate.entry)) {
+    attempts += 1;
+    if (isHeld(candidate.name)) {
       keep("held");
       continue;
     }

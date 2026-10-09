@@ -386,8 +386,11 @@ async function persistSnapshotManifests(runId: string, snapshot: NonNullable<Pre
   } finally {
     // Ownership tracks original scratch directories, never the new durable
     // path. A failed copy fails the run, so remove them on that path too.
-    await disposeDirectorySnapshot(snapshot.baseline);
-    await disposeGitWorkspaceSnapshot(snapshot.gitSnapshot);
+    try {
+      await disposeDirectorySnapshot(snapshot.baseline);
+    } finally {
+      await disposeGitWorkspaceSnapshot(snapshot.gitSnapshot);
+    }
   }
 }
 
