@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { GOAL_STATUSES, GOAL_LEVELS } from "@paperclipai/shared";
+import { GOAL_STATUSES, GOAL_LEVELS, GOAL_HORIZONS, type GoalHorizon } from "@paperclipai/shared";
+import { GOAL_HORIZON_LABELS } from "../lib/goal-dates";
 import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
 import { goalsApi } from "../api/goals";
@@ -21,6 +22,8 @@ import {
   Minimize2,
   Target,
   Layers,
+  Flag,
+  Clock,
 } from "lucide-react";
 import { cn } from "../lib/utils";
 import { MarkdownEditor, type MarkdownEditorRef } from "./MarkdownEditor";
@@ -42,6 +45,10 @@ export function NewGoalDialog() {
   const [status, setStatus] = useState("planned");
   const [level, setLevel] = useState("task");
   const [parentId, setParentId] = useState("");
+  const [isMilestone, setIsMilestone] = useState(false);
+  const [horizon, setHorizon] = useState<GoalHorizon | null>(null);
+  const [targetDate, setTargetDate] = useState("");
+  const [horizonOpen, setHorizonOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
   const [statusOpen, setStatusOpen] = useState(false);
@@ -81,6 +88,9 @@ export function NewGoalDialog() {
     setStatus("planned");
     setLevel("task");
     setParentId("");
+    setIsMilestone(false);
+    setHorizon(null);
+    setTargetDate("");
     setExpanded(false);
   }
 
@@ -92,6 +102,9 @@ export function NewGoalDialog() {
       status,
       level,
       ...(appliedParentId ? { parentId: appliedParentId } : {}),
+      kind: isMilestone ? "milestone" : "goal",
+      ...(horizon ? { horizon } : {}),
+      ...(targetDate ? { targetDate } : {}),
     });
   }
 
@@ -231,6 +244,53 @@ export function NewGoalDialog() {
               ))}
             </PopoverContent>
           </Popover>
+
+          {/* Milestone */}
+          <button
+            type="button"
+            aria-pressed={isMilestone}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors",
+              isMilestone && "bg-accent",
+            )}
+            onClick={() => setIsMilestone(!isMilestone)}
+          >
+            <Flag className="h-3 w-3 text-muted-foreground" />
+            Milestone
+          </button>
+
+          {/* Horizon */}
+          <Popover open={horizonOpen} onOpenChange={setHorizonOpen}>
+            <PopoverTrigger asChild>
+              <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
+                <Clock className="h-3 w-3 text-muted-foreground" />
+                {horizon ? GOAL_HORIZON_LABELS[horizon] : "Horizon"}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent className="w-40 p-1" align="start">
+              {[...GOAL_HORIZONS, null].map((h) => (
+                <button
+                  key={h ?? "none"}
+                  className={cn(
+                    "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
+                    h === horizon && "bg-accent"
+                  )}
+                  onClick={() => { setHorizon(h); setHorizonOpen(false); }}
+                >
+                  {h ? GOAL_HORIZON_LABELS[h] : "No horizon"}
+                </button>
+              ))}
+            </PopoverContent>
+          </Popover>
+
+          {/* Target date */}
+          <input
+            type="date"
+            aria-label="Target date"
+            className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+            value={targetDate}
+            onChange={(e) => setTargetDate(e.target.value)}
+          />
 
           {/* Parent goal */}
           <Popover open={parentOpen} onOpenChange={setParentOpen}>

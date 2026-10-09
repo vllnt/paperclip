@@ -2,12 +2,14 @@ import { useState } from "react";
 import { Link } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import type { Goal } from "@paperclipai/shared";
-import { GOAL_STATUSES, GOAL_LEVELS } from "@paperclipai/shared";
+import { GOAL_STATUSES, GOAL_LEVELS, GOAL_KINDS, GOAL_HORIZONS } from "@paperclipai/shared";
 import { agentsApi } from "../api/agents";
 import { goalsApi } from "../api/goals";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { StatusBadge } from "./StatusBadge";
+import { InlineEditor } from "./InlineEditor";
+import { GOAL_HORIZON_LABELS, formatTargetDate } from "../lib/goal-dates";
 import { formatDate, cn, agentUrl } from "../lib/utils";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -31,16 +33,22 @@ function label(s: string): string {
   return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+function horizonLabel(value: string): string {
+  return value === "short" || value === "medium" || value === "long" ? GOAL_HORIZON_LABELS[value] : "No horizon";
+}
+
 function PickerButton({
   current,
   options,
   onChange,
   children,
+  optionLabel = label,
 }: {
   current: string;
   options: readonly string[];
   onChange: (value: string) => void;
   children: React.ReactNode;
+  optionLabel?: (value: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -62,7 +70,7 @@ function PickerButton({
               setOpen(false);
             }}
           >
-            {label(opt)}
+            {optionLabel(opt)}
           </Button>
         ))}
       </PopoverContent>
@@ -84,6 +92,13 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
     queryFn: () => goalsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+
+  const { data: progressByGoal } = useQuery({
+    queryKey: queryKeys.goals.progress(selectedCompanyId!),
+    queryFn: () => goalsApi.progress(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+  const progress = progressByGoal?.[goal.id];
 
   const ownerAgent = goal.ownerAgentId
     ? agents?.find((a) => a.id === goal.ownerAgentId)
@@ -122,6 +137,65 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
           ) : (
             <span className="text-sm capitalize">{goal.level}</span>
           )}
+        </PropertyRow>
+
+        <PropertyRow label="Kind">
+          {onUpdate ? (
+            <PickerButton current={goal.kind} options={GOAL_KINDS} onChange={(kind) => onUpdate({ kind })}>
+              <span className="text-sm">{label(goal.kind)}</span>
+            </PickerButton>
+          ) : (
+            <span className="text-sm">{label(goal.kind)}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Horizon">
+          {onUpdate ? (
+            <PickerButton
+              current={goal.horizon ?? "none"}
+              options={[...GOAL_HORIZONS, "none"]}
+              optionLabel={horizonLabel}
+              onChange={(horizon) => onUpdate({ horizon: horizon === "none" ? null : horizon })}
+            >
+              <span className="text-sm">{horizonLabel(goal.horizon ?? "none")}</span>
+            </PickerButton>
+          ) : (
+            <span className="text-sm">{horizonLabel(goal.horizon ?? "none")}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Target date">
+          {onUpdate ? (
+            <input
+              type="date"
+              aria-label="Target date"
+              className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+              value={goal.targetDate ?? ""}
+              onChange={(event) => onUpdate({ targetDate: event.target.value || null })}
+            />
+          ) : (
+            <span className="text-sm">{goal.targetDate ? formatTargetDate(goal.targetDate) : "None"}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Target">
+          {onUpdate ? (
+            <InlineEditor
+              value={goal.successCriteria ?? ""}
+              onSave={(successCriteria) => onUpdate({ successCriteria: successCriteria.trim() || null })}
+              className="text-sm"
+              placeholder="How you know it is done"
+              nullable
+            />
+          ) : (
+            <span className="text-sm">{goal.successCriteria ?? "None"}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Progress">
+          <span className="text-sm">
+            {progress ? `${progress.done}/${progress.total} done` : "No tasks yet"}
+          </span>
         </PropertyRow>
 
         <PropertyRow label="Owner">
