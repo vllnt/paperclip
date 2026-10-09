@@ -19,6 +19,12 @@ import {
   type SealedConnectorEvents,
 } from "./paperclip-cloud-connector.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import {
+  issueGitLinkService,
+  pullRequestDetailsEnricher,
+  type PullRequestSignal,
+} from "./issue-git-links.js";
+import { createPullRequestMergeDetailsResolver } from "./github-pull-request-merge.js";
 import { logger } from "../middleware/logger.js";
 
 type LeasedEvent = SealedConnectorEvents["events"][number];
@@ -214,9 +220,14 @@ export function githubConnectionEventService(
     env?: NodeJS.ProcessEnv;
     now?: () => Date;
     wakeup?: NonNullable<Parameters<typeof issueThreadInteractionService>[1]>["wakeup"];
+    /** Links pull requests to tasks. Tests inject one; the default reads GitHub for missing details. */
+    gitLinks?: Pick<ReturnType<typeof issueGitLinkService>, "recordPullRequestSignal">;
   } = {},
 ) {
   const now = options.now ?? (() => new Date());
+  const gitLinks = options.gitLinks ?? issueGitLinkService(db, {
+    enrich: pullRequestDetailsEnricher(createPullRequestMergeDetailsResolver(db)),
+  });
   let nextPollAt = 0;
   let emptyPolls = 0;
 
@@ -233,6 +244,36 @@ export function githubConnectionEventService(
         eq(toolConnections.enabled, true),
       ));
     return bindingRows(rows);
+  }
+
+  /**
+   * Runs before the merge-confirmation sweep on purpose: a confirmation that is still
+   * pending makes status automation hold back, so the woken assignee finishes the task.
+   * A failure here must not fail the delivery; the external object update already happened.
+   */
+  async function linkPullRequestToTasks(
+    companyId: string,
+    event: LeasedEvent,
+    snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+  ) {
+    const payload = event.payload;
+    const signal: PullRequestSignal = {
+      provider: "github",
+      repository: snapshot.repository,
+      number: snapshot.number,
+      url: stringValue(payload.url) ?? `https://github.com/${snapshot.repository}/pull/${snapshot.number}`,
+      headRef: stringValue(payload.headRef),
+      baseRef: stringValue(payload.baseRef),
+      state: snapshot.state === "closed" ? "closed" : "open",
+      merged: snapshot.merged,
+      updatedAt: stringValue(payload.updatedAt),
+      source: "cloud_event",
+    };
+    try {
+      await gitLinks.recordPullRequestSignal(companyId, signal);
+    } catch (error) {
+      logger.warn({ err: error, companyId, repository: snapshot.repository, number: snapshot.number }, "Linking a GitHub pull request to tasks failed");
+    }
   }
 
   async function applyPullRequestEvent(companyId: string, event: LeasedEvent) {
@@ -258,6 +299,7 @@ export function githubConnectionEventService(
       eq(externalObjects.objectType, "pull_request"),
       sql`lower(${externalObjects.externalId}) = lower(${snapshot.externalId})`,
     ));
+    await linkPullRequestToTasks(companyId, event, snapshot);
     if (snapshot.merged && event.action === "closed") {
       await issueThreadInteractionService(db, { wakeup: options.wakeup })
         .sweepMergedPullRequestConfirmations([{
