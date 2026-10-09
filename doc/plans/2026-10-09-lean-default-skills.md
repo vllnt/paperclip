@@ -197,6 +197,10 @@ comment that claims a watcher when `monitorNextCheckAt` is null).
   a background process (PR 27), and commits carry no co-author trailer while git hooks are never bypassed (PR 58). If either PR changes before it merges, update the release. If either is dropped, remove
   the matching rule, or agents on the lean release will call a route that does not exist. The same applies to any
   later change to `skills/paperclip`: the release does not follow it by itself.
+  Status on 2026-10-10: PR 58 is merged (`fd521c23`), so its rule now matches `main`. PR 27 changed after the release
+  was written: the stop-and-recheck of a background process applies to Claude local runs only, and other adapters get no
+  re-check, so the release now says to always end the turn with `issue wait` (`SKILL.md` and `references/monitors.md`).
+  It matches PR 27 at `679001fdf`. PR 29 is unchanged at `3ca33ef5c`.
 - Packaging gap (pre-existing, affects v0 and v7 too): the `server` npm package lists `dist`, `ui-dist` and `skills`
   only, and `scripts/release.sh` copies only `skills`, but the runtime looks for `skills-releases/paperclip`. In a
   published npm install no release is seeded. The Docker image copies the whole repo, so the canary is not affected.
@@ -307,3 +311,29 @@ Whole-eval token use: current 8.1M, lean 4.8M (-41%), because the system prompt 
   `release_gates.dependency_blocked_comment`, and several `mcp_gateway` regexes that reject a negated phrase such as
   "do not bypass the policy". The vacuous `core.*` tests (no scenario) pass only if the model volunteers a rule;
   `skill_workflows.checkout_conflict` tests the 409 rule with an explicit scenario.
+
+## Appendix B. PR 2 outcome (PR 89, cut from `main`, not stacked on this one)
+
+Fixed, each checked against the code before the change:
+
+- Board skill: the agent prompt went to `adapterConfig.systemPrompt`, which no source reads. It now goes to
+  `instructionsBundle.files["AGENTS.md"]`, and edits use the instructions-bundle routes with the required
+  `baseRevisionId`.
+- Board skill: issues were created `in_progress` with no assignee (a 422). Record issues are now `todo`, and the skill
+  finds the "Board Operations" issue that board chat creates instead of making a second one.
+- Board skill: the 300 second timer heartbeat on every hire is gone (the server default and the hiring skill say off).
+- Board skill: `board setup` does not exist (`paperclipai board` has only `prompt`). The step and the test that pinned
+  it are gone.
+- `paperclip-create-agent`: repository-rooted paths became relative links, the role templates are linked from
+  `SKILL.md`, and `api-reference.md` has a contents list.
+- `company-skills.md`: a skill-writing checklist, placed under the existing `## Notes` heading because a new heading
+  fails the capability contract (the file's headings are anchored by line number).
+
+Measured with `checkSkillQuality`, bytes/4 estimate: board skill score 66 to 100, 611 to 178 body lines, 5,384 to
+3,485 tokens (-35%). `paperclip-create-agent` score 63 to 90, 2,127 to 2,160 tokens (+1.6%). The audit expected about
+2,300 tokens for the board skill. The result is higher because the skill must stay self-contained: board chat loads the
+whole body as the system prompt and gives the model no files to open.
+
+Not done: the role templates under `references/agents/` (already 18 to 26 lines, and `coder.md` is read by the
+hiring-template oracle), and the repeated `Authorization` header lines in the hiring skill (small gain, no eval to
+protect a change to a live hiring skill).
