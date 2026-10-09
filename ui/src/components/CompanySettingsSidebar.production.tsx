@@ -5,6 +5,7 @@ import {
   Cpu,
   Download,
   FlaskConical,
+  Globe,
   KeyRound,
   MailPlus,
   MonitorCog,
@@ -135,6 +136,7 @@ export function CompanySettingsSidebar() {
           {showPage("company.secrets") && (
             <SidebarNavItem to="/company/settings/secrets" label="Secrets" icon={KeyRound} end />
           )}
+          <SidebarNavItem to="/company/settings/browser" label="Shared browser" icon={Globe} end />
           {showPage("instance.environments") && (
             <SidebarNavItem
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/environments`}

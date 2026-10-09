@@ -1,0 +1,648 @@
+[
+ {
+  "flow": "saucedemo-checkout",
+  "step": 1,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - StaticText \"Swag Labs\"\n  - main\n    - form \"Login\"\n      - textbox \"Username\" [ref=e5]\n      - textbox \"Password\" [ref=e6]\n      - button \"Login\" [ref=e4]\n    - generic\n      - heading \"Accepted usernames are:\" [level=4, ref=e3]\n    - heading \"Password for all users:\" [level=4, ref=e2]",
+  "candidates": {
+   "c1": "fill @e6 (textbox \"Password\") with \"standard_user\"",
+   "c2": "handoff: ask a human to take over",
+   "c3": "stop: the goal is already achieved",
+   "c4": "click @e4 (button \"Login\")",
+   "c5": "fill @e5 (textbox \"Username\") with \"standard_user\""
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c5"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 2,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - StaticText \"Swag Labs\"\n  - main\n    - form \"Login\"\n      - textbox \"Username\" [ref=e5]: standard_user\n      - textbox \"Password\" [ref=e6]\n      - button \"Login\" [ref=e4]\n    - generic\n      - heading \"Accepted usernames are:\" [level=4, ref=e3]\n    - heading \"Password for all users:\" [level=4, ref=e2]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "stop: the goal is already achieved",
+   "c3": "click @e4 (button \"Login\")",
+   "c4": "fill @e6 (textbox \"Password\") with \"secret_sauce\"",
+   "c5": "fill @e5 (textbox \"Username\") with \"secret_sauce\""
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c4"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 3,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - StaticText \"Swag Labs\"\n  - main\n    - form \"Login\"\n      - textbox \"Username\" [ref=e5]: standard_user\n      - textbox \"Password\" [ref=e6]: ••••••••••••\n      - button \"Login\" [ref=e4]\n    - generic\n      - heading \"Accepted usernames are:\" [level=4, ref=e3]\n    - heading \"Password for all users:\" [level=4, ref=e2]",
+  "candidates": {
+   "c1": "fill @e5 (textbox \"Username\") with \"text\"",
+   "c2": "handoff: ask a human to take over",
+   "c3": "click @e4 (button \"Login\")",
+   "c4": "stop: the goal is already achieved",
+   "c5": "fill @e6 (textbox \"Password\") with \"text\""
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c3"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 4,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/inventory.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e28]\n          - image \"Open Menu\"\n        - StaticText \"Swag Labs\"\n        - button \"Cart, empty\" [ref=e8]\n        - StaticText \"Products\"\n        - StaticText \"Name (A to Z)\"\n        - combobox \"Sort products\" [expanded=false, ref=e7]: Name (A to Z)\n          - MenuListPopup\n            - option \"Name (A to Z)\" [selected, ref=e12]\n            - option \"Name (Z to A)\" [ref=e13]\n            - option \"Price (low to high)\" [ref=e14]\n            - option \"Price (high to low)\" [ref=e15]\n      - main\n        - generic\n          - button \"View details for Sauce Labs Backpack\" [ref=e29]\n          - button \"View details for Sauce Labs Backpack\" [ref=e16]\n          - button \"Add to cart\" [ref=e17]\n        - generic\n          - button \"View details for Sauce Labs Bike Light\" [ref=e30]\n          - button \"View details for Sauce Labs Bike Light\" [ref=e18]\n          - button \"Add to cart\" [ref=e19]\n        - generic\n          - button \"View details for Sauce Labs Bolt T-Shirt\" [ref=e31]\n          - button \"View details for Sauce Labs Bolt T-Shirt\" [ref=e20]\n          - button \"Add to cart\" [ref=e21]\n        - generic\n          - button \"View details for Sauce Labs Fleece Jacket\" [ref=e32]\n          - button \"View details for Sauce Labs Fleece Jacket\" [ref=e22]\n          - button \"Add to cart\" [ref=e23]\n        - generic\n          - button \"View details for Sauce Labs Onesie\" [ref=e33]\n          - button \"View details for Sauce Labs Onesie\" [ref=e24]\n          - button \"Add to cart\" [ref=e25]\n        - generic\n          - button \"View details for Test.allTheThings() T-Shirt (Red)\" [ref=e34]\n          - button \"View details for Test.allTheThings() T-Shirt (Red)\" [ref=e26]\n          - button \"Add to cart\" [ref=e27]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e9]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e10]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e11]",
+  "candidates": {
+   "c1": "stop: the goal is already achieved",
+   "c2": "click @e23 (button \"Add to cart\")",
+   "c3": "click @e20 (button \"View details for Sauce Labs Bolt T-Shirt\")",
+   "c4": "handoff: ask a human to take over",
+   "c5": "click @e34 (button \"View details for Test.allTheThings() T-Shirt (Red)\")",
+   "c6": "click @e17 (button \"Add to cart\")"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c6"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 5,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/inventory.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e28]\n          - image \"Open Menu\"\n        - StaticText \"Swag Labs\"\n        - button \"Cart, 1 items\" [ref=e8]\n          - StaticText \"1\"\n        - StaticText \"Products\"\n        - StaticText \"Name (A to Z)\"\n        - combobox \"Sort products\" [expanded=false, ref=e7]: Name (A to Z)\n          - MenuListPopup\n            - option \"Name (A to Z)\" [selected, ref=e12]\n            - option \"Name (Z to A)\" [ref=e13]\n            - option \"Price (low to high)\" [ref=e14]\n            - option \"Price (high to low)\" [ref=e15]\n      - main\n        - generic\n          - button \"View details for Sauce Labs Backpack\" [ref=e29]\n          - button \"View details for Sauce Labs Backpack\" [ref=e16]\n          - button \"Remove\" [ref=e35]\n        - generic\n          - button \"View details for Sauce Labs Bike Light\" [ref=e30]\n          - button \"View details for Sauce Labs Bike Light\" [ref=e18]\n          - button \"Add to cart\" [ref=e19]\n        - generic\n          - button \"View details for Sauce Labs Bolt T-Shirt\" [ref=e31]\n          - button \"View details for Sauce Labs Bolt T-Shirt\" [ref=e20]\n          - button \"Add to cart\" [ref=e21]\n        - generic\n          - button \"View details for Sauce Labs Fleece Jacket\" [ref=e32]\n          - button \"View details for Sauce Labs Fleece Jacket\" [ref=e22]\n          - button \"Add to cart\" [ref=e23]\n        - generic\n          - button \"View details for Sauce Labs Onesie\" [ref=e33]\n          - button \"View details for Sauce Labs Onesie\" [ref=e24]\n          - button \"Add to cart\" [ref=e25]\n        - generic\n          - button \"View details for Test.allTheThings() T-Shirt (Red)\" [ref=e34]\n          - button \"View details for Test.allTheThings() T-Shirt (Red)\" [ref=e26]\n          - button \"Add to cart\" [ref=e27]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e9]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e10]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e11]",
+  "candidates": {
+   "c1": "click @e33 (button \"View details for Sauce Labs Onesie\")",
+   "c2": "handoff: ask a human to take over",
+   "c3": "click @e8 (button \"Cart, 1 items\")",
+   "c4": "click @e28 (button \"Open Menu\")",
+   "c5": "click @e22 (button \"View details for Sauce Labs Fleece Jacket\")",
+   "c6": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c3"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 6,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/cart.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e44]\n        - StaticText \"Swag Labs\"\n        - button \"Cart, 1 items\" [ref=e38]\n        - StaticText \"Your Cart\"\n      - main\n        - StaticText \"QTY\"\n        - StaticText \"Description\"\n        - StaticText \"1\"\n        - generic\n          - button \"View details for Sauce Labs Backpack\" [ref=e39]\n          - button \"Remove\" [ref=e40]\n        - button \"Continue Shopping\" [ref=e36]\n        - button \"Checkout\" [ref=e37]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e41]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e42]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e43]",
+  "candidates": {
+   "c1": "click @e36 (button \"Continue Shopping\")",
+   "c2": "click @e38 (button \"Cart, 1 items\")",
+   "c3": "stop: the goal is already achieved",
+   "c4": "click @e41 (link \"X\")",
+   "c5": "click @e37 (button \"Checkout\")",
+   "c6": "handoff: ask a human to take over"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c5"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 7,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/checkout-step-one.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e54]\n        - StaticText \"Swag Labs\"\n        - button \"Cart, 1 items\" [ref=e45]\n        - StaticText \"Checkout: Your Information\"\n      - main\n        - form \"Checkout information\"\n          - textbox \"First Name\" [ref=e51]\n          - textbox \"Last Name\" [ref=e52]\n          - textbox \"Zip/Postal Code\" [ref=e53]\n          - button \"Cancel\" [ref=e46]\n          - button \"Continue\" [ref=e47]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e48]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e49]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e50]",
+  "candidates": {
+   "c1": "fill @e53 (textbox \"Zip/Postal Code\") with \"Ada\"",
+   "c2": "click @e50 (link \"LinkedIn\")",
+   "c3": "handoff: ask a human to take over",
+   "c4": "stop: the goal is already achieved",
+   "c5": "click @e48 (link \"X\")",
+   "c6": "fill @e51 (textbox \"First Name\") with \"Ada\""
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c6"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 8,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/checkout-step-one.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e54]\n        - StaticText \"Swag Labs\"\n        - button \"Cart, 1 items\" [ref=e45]\n        - StaticText \"Checkout: Your Information\"\n      - main\n        - form \"Checkout information\"\n          - textbox \"First Name\" [ref=e51]: Ada\n          - textbox \"Last Name\" [ref=e52]\n          - textbox \"Zip/Postal Code\" [ref=e53]\n          - button \"Cancel\" [ref=e46]\n          - button \"Continue\" [ref=e47]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e48]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e49]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e50]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "click @e50 (link \"LinkedIn\")",
+   "c3": "fill @e53 (textbox \"Zip/Postal Code\") with \"Lovelace\"",
+   "c4": "fill @e52 (textbox \"Last Name\") with \"Lovelace\"",
+   "c5": "stop: the goal is already achieved",
+   "c6": "click @e54 (button \"Open Menu\")"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c4"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 9,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/checkout-step-one.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e54]\n        - StaticText \"Swag Labs\"\n        - button \"Cart, 1 items\" [ref=e45]\n        - StaticText \"Checkout: Your Information\"\n      - main\n        - form \"Checkout information\"\n          - textbox \"First Name\" [ref=e51]: Ada\n          - textbox \"Last Name\" [ref=e52]: Lovelace\n          - textbox \"Zip/Postal Code\" [ref=e53]\n          - button \"Cancel\" [ref=e46]\n          - button \"Continue\" [ref=e47]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e48]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e49]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e50]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "fill @e53 (textbox \"Zip/Postal Code\") with \"75001\"",
+   "c3": "click @e50 (link \"LinkedIn\")",
+   "c4": "click @e49 (link \"Facebook\")",
+   "c5": "stop: the goal is already achieved",
+   "c6": "click @e48 (link \"X\")"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c2"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 10,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/checkout-step-one.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e54]\n        - StaticText \"Swag Labs\"\n        - button \"Cart, 1 items\" [ref=e45]\n        - StaticText \"Checkout: Your Information\"\n      - main\n        - form \"Checkout information\"\n          - textbox \"First Name\" [ref=e51]: Ada\n          - textbox \"Last Name\" [ref=e52]: Lovelace\n          - textbox \"Zip/Postal Code\" [ref=e53]: 75001\n          - button \"Cancel\" [ref=e46]\n          - button \"Continue\" [ref=e47]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e48]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e49]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e50]",
+  "candidates": {
+   "c1": "click @e47 (button \"Continue\")",
+   "c2": "click @e48 (link \"X\")",
+   "c3": "click @e49 (link \"Facebook\")",
+   "c4": "stop: the goal is already achieved",
+   "c5": "click @e46 (button \"Cancel\")",
+   "c6": "handoff: ask a human to take over"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c1"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 11,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/checkout-step-two.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e62]\n        - StaticText \"Swag Labs\"\n        - button \"Cart, 1 items\" [ref=e57]\n        - StaticText \"Checkout: Overview\"\n      - main\n        - StaticText \"QTY\"\n        - StaticText \"Description\"\n        - StaticText \"1\"\n        - generic\n          - button \"View details for Sauce Labs Backpack\" [ref=e58]\n        - StaticText \"Payment Information:\"\n        - StaticText \"SauceCard #31337\"\n        - StaticText \"Shipping Information:\"\n        - StaticText \"Free Pony Express Delivery!\"\n        - StaticText \"Price Total\"\n        - generic\n          - StaticText \"Item total: $29.99\"\n        - generic\n          - StaticText \"Tax: $2.40\"\n        - generic\n          - StaticText \"Total: $32.39\"\n        - button \"Cancel\" [ref=e55]\n        - button \"Finish\" [ref=e56]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e59]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e60]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e61]",
+  "candidates": {
+   "c1": "click @e58 (button \"View details for Sauce Labs Backpack\")",
+   "c2": "click @e56 (button \"Finish\")",
+   "c3": "click @e57 (button \"Cart, 1 items\")",
+   "c4": "click @e61 (link \"LinkedIn\")",
+   "c5": "handoff: ask a human to take over",
+   "c6": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c2"
+  }
+ },
+ {
+  "flow": "saucedemo-checkout",
+  "step": 12,
+  "goal": "Sign in to the shop as standard_user (password secret_sauce), add the Sauce Labs Backpack to the cart and complete checkout for Ada Lovelace, zip 75001.",
+  "url": "https://www.saucedemo.com/checkout-complete.html",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e1] clickable [onclick]\n  - generic\n    - generic\n      - banner\n        - generic\n          - button \"Open Menu\" [ref=e70]\n        - StaticText \"Swag Labs\"\n        - button \"Cart, empty\" [ref=e66]\n        - StaticText \"Checkout: Complete!\"\n      - main\n        - image \"Pony Express\"\n        - heading \"Thank you for your order!\" [level=2, ref=e63]\n        - StaticText \"Your order has been dispatched, and will arrive just as fast as the pony can get there!\"\n        - button \"Back Home\" [ref=e64]\n        - button \"Generate PDF order\" [ref=e65]\n    - contentinfo\n      - list\n        - listitem [level=1]\n          - link \"X\" [ref=e67]\n        - listitem [level=1]\n          - link \"Facebook\" [ref=e68]\n        - listitem [level=1]\n          - link \"LinkedIn\" [ref=e69]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "click @e64 (button \"Back Home\")",
+   "c3": "click @e68 (link \"Facebook\")",
+   "c4": "click @e70 (button \"Open Menu\")",
+   "c5": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": true,
+   "needs_human": false,
+   "next_action": "c5"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 1,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/practice-test-login/",
+  "title": "Test Login | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e71]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e78]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e82]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e83]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e84]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e85]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e86]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e87]\n    - main\n      - generic\n        - heading \"Test login\" [level=2, ref=e72]\n        - list\n          - listitem [level=1]\n          - listitem [level=1]\n            - StaticText \"Username: student\"\n            - StaticText \"Password: Password123\"\n        - generic\n          - generic\n            - textbox \"Username\" [ref=e80]\n          - generic\n            - textbox \"Password\" [ref=e81]\n          - button \"Submit\" [ref=e79]\n        - heading \"Test case 1: Positive LogIn test\" [level=5, ref=e73]\n        - heading \"Test case 2: Negative username test\" [level=5, ref=e74]\n        - heading \"Test case 3: Negative password test\" [level=5, ref=e75]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e76]\n        - link \"Privacy Policy\" [ref=e77]",
+  "candidates": {
+   "c1": "click @e84 (link \"COURSES\")",
+   "c2": "fill @e80 (textbox \"Username\") with \"student\"",
+   "c3": "stop: the goal is already achieved",
+   "c4": "click @e82 (link \"HOME\")",
+   "c5": "handoff: ask a human to take over",
+   "c6": "click @e71 (link \"Press \\\")"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c2"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 2,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/practice-test-login/",
+  "title": "Test Login | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e71]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e78]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e82]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e83]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e84]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e85]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e86]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e87]\n    - main\n      - generic\n        - heading \"Test login\" [level=2, ref=e72]\n        - list\n          - listitem [level=1]\n          - listitem [level=1]\n            - StaticText \"Username: student\"\n            - StaticText \"Password: Password123\"\n        - generic\n          - generic\n            - textbox \"Username\" [ref=e80]: student\n          - generic\n            - textbox \"Password\" [ref=e81]\n          - button \"Submit\" [ref=e79]\n        - heading \"Test case 1: Positive LogIn test\" [level=5, ref=e73]\n        - heading \"Test case 2: Negative username test\" [level=5, ref=e74]\n        - heading \"Test case 3: Negative password test\" [level=5, ref=e75]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e76]\n        - link \"Privacy Policy\" [ref=e77]",
+  "candidates": {
+   "c1": "click @e87 (link \"CONTACT\")",
+   "c2": "click @e83 (link \"PRACTICE\")",
+   "c3": "fill @e81 (textbox \"Password\") with \"Password123\"",
+   "c4": "click @e79 (button \"Submit\")",
+   "c5": "handoff: ask a human to take over",
+   "c6": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c3"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 3,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/practice-test-login/",
+  "title": "Test Login | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e71]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e78]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e82]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e83]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e84]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e85]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e86]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e87]\n    - main\n      - generic\n        - heading \"Test login\" [level=2, ref=e72]\n        - list\n          - listitem [level=1]\n          - listitem [level=1]\n            - StaticText \"Username: student\"\n            - StaticText \"Password: Password123\"\n        - generic\n          - generic\n            - textbox \"Username\" [ref=e80]: student\n          - generic\n            - textbox \"Password\" [ref=e81]: ••••••••••\n          - button \"Submit\" [ref=e79]\n        - heading \"Test case 1: Positive LogIn test\" [level=5, ref=e73]\n        - heading \"Test case 2: Negative username test\" [level=5, ref=e74]\n        - heading \"Test case 3: Negative password test\" [level=5, ref=e75]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e76]\n        - link \"Privacy Policy\" [ref=e77]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "click @e84 (link \"COURSES\")",
+   "c3": "click @e79 (button \"Submit\")",
+   "c4": "click @e86 (link \"BLOG\")",
+   "c5": "click @e82 (link \"HOME\")",
+   "c6": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c3"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 4,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/practice-test-login/",
+  "title": "Test Login | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e71]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e78]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e82]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e83]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e84]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e85]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e86]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e87]\n    - main\n      - generic\n        - heading \"Test login\" [level=2, ref=e72]\n        - list\n          - listitem [level=1]\n          - listitem [level=1]\n            - StaticText \"Username: student\"\n            - StaticText \"Password: Password123\"\n        - generic\n          - generic\n            - textbox \"Username\" [ref=e80]\n          - generic\n            - textbox \"Password\" [ref=e81]\n          - button \"Submit\" [ref=e79]\n        - heading \"Test case 1: Positive LogIn test\" [level=5, ref=e73]\n        - heading \"Test case 2: Negative username test\" [level=5, ref=e74]\n        - heading \"Test case 3: Negative password test\" [level=5, ref=e75]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e76]\n        - link \"Privacy Policy\" [ref=e77]",
+  "candidates": {
+   "c1": "fill @e80 (textbox \"Username\") with \"student\"",
+   "c2": "stop: the goal is already achieved",
+   "c3": "click @e87 (link \"CONTACT\")",
+   "c4": "click @e86 (link \"BLOG\")",
+   "c5": "handoff: ask a human to take over",
+   "c6": "click @e71 (link \"Press \\\")"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c1"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 5,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/practice-test-login/",
+  "title": "Test Login | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e71]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e78]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e82]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e83]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e84]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e85]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e86]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e87]\n    - main\n      - generic\n        - heading \"Test login\" [level=2, ref=e72]\n        - list\n          - listitem [level=1]\n          - listitem [level=1]\n            - StaticText \"Username: student\"\n            - StaticText \"Password: Password123\"\n        - generic\n          - generic\n            - textbox \"Username\" [ref=e80]: student\n          - generic\n            - textbox \"Password\" [ref=e81]\n          - button \"Submit\" [ref=e79]\n        - heading \"Test case 1: Positive LogIn test\" [level=5, ref=e73]\n        - heading \"Test case 2: Negative username test\" [level=5, ref=e74]\n        - heading \"Test case 3: Negative password test\" [level=5, ref=e75]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e76]\n        - link \"Privacy Policy\" [ref=e77]",
+  "candidates": {
+   "c1": "click @e78 (link \"Practice Test Automation\")",
+   "c2": "stop: the goal is already achieved",
+   "c3": "fill @e80 (textbox \"Username\") with \"Password123\"",
+   "c4": "click @e76 (link \"Practice Test Automation.\")",
+   "c5": "fill @e81 (textbox \"Password\") with \"Password123\"",
+   "c6": "handoff: ask a human to take over"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c5"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 6,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/practice-test-login/",
+  "title": "Test Login | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e71]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e78]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e82]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e83]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e84]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e85]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e86]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e87]\n    - main\n      - generic\n        - heading \"Test login\" [level=2, ref=e72]\n        - list\n          - listitem [level=1]\n          - listitem [level=1]\n            - StaticText \"Username: student\"\n            - StaticText \"Password: Password123\"\n        - generic\n          - generic\n            - textbox \"Username\" [ref=e80]: student\n          - generic\n            - textbox \"Password\" [ref=e81]: •••••••••••\n          - button \"Submit\" [ref=e79]\n        - heading \"Test case 1: Positive LogIn test\" [level=5, ref=e73]\n        - heading \"Test case 2: Negative username test\" [level=5, ref=e74]\n        - heading \"Test case 3: Negative password test\" [level=5, ref=e75]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e76]\n        - link \"Privacy Policy\" [ref=e77]",
+  "candidates": {
+   "c1": "fill @e80 (textbox \"Username\") with \"text\"",
+   "c2": "click @e87 (link \"CONTACT\")",
+   "c3": "click @e79 (button \"Submit\")",
+   "c4": "handoff: ask a human to take over",
+   "c5": "click @e71 (link \"Press \\\")",
+   "c6": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c3"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 7,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/logged-in-successfully/",
+  "title": "Logged In Successfully | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e88]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e91]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e94]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e95]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e96]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e97]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e98]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e99]\n    - main\n      - generic\n        - article\n          - heading \"Logged In Successfully\" [level=1, ref=e92]\n          - link \"Log out\" [ref=e93]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e89]\n        - link \"Privacy Policy\" [ref=e90]",
+  "candidates": {
+   "c1": "stop: the goal is already achieved",
+   "c2": "handoff: ask a human to take over",
+   "c3": "click @e88 (link \"Press \\\")",
+   "c4": "click @e93 (link \"Log out\")",
+   "c5": "click @e97 (link \"AI WORKSHOP\")",
+   "c6": "click @e89 (link \"Practice Test Automation.\")"
+  },
+  "truth": {
+   "page_state": "signed_in",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c4"
+  }
+ },
+ {
+  "flow": "practice-login-retry",
+  "step": 8,
+  "goal": "Sign in with username student and password Password123, then log out.",
+  "url": "https://practicetestautomation.com/practice-test-login/",
+  "title": "Test Login | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e100]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e107]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e111]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e112]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e113]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e114]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e115]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e116]\n    - main\n      - generic\n        - heading \"Test login\" [level=2, ref=e101]\n        - list\n          - listitem [level=1]\n          - listitem [level=1]\n            - StaticText \"Username: student\"\n            - StaticText \"Password: Password123\"\n        - generic\n          - generic\n            - textbox \"Username\" [ref=e109]\n          - generic\n            - textbox \"Password\" [ref=e110]\n          - button \"Submit\" [ref=e108]\n        - heading \"Test case 1: Positive LogIn test\" [level=5, ref=e102]\n        - heading \"Test case 2: Negative username test\" [level=5, ref=e103]\n        - heading \"Test case 3: Negative password test\" [level=5, ref=e104]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e105]\n        - link \"Privacy Policy\" [ref=e106]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "click @e111 (link \"HOME\")",
+   "c3": "stop: the goal is already achieved",
+   "c4": "click @e114 (link \"AI WORKSHOP\")",
+   "c5": "click @e113 (link \"COURSES\")"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": true,
+   "needs_human": false,
+   "next_action": "c3"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 1,
+  "goal": "Submit the sample form on this page.",
+  "url": "https://www.google.com/recaptcha/api2/demo",
+  "title": "ReCAPTCHA demo",
+  "snapshot": "- form\n  - group \"Sample Form with ReCAPTCHA\"\n    - Legend\n      - StaticText \"Sample Form with ReCAPTCHA\"\n    - list\n      - listitem [level=1]\n        - textbox \"First Name\" [disabled, ref=e117]: Jane\n      - listitem [level=1]\n        - textbox \"Last Name\" [disabled, ref=e118]: Smith\n      - listitem [level=1]\n        - textbox \"Email\" [disabled, ref=e119]: stopallbots@gmail.com\n      - listitem [level=1]\n        - radio \"Red\" [checked=true, disabled, ref=e120]\n        - radio \"Green\" [checked=false, disabled, ref=e121]\n      - listitem [level=1]\n      - listitem [level=1]\n        - button \"Submit\" [ref=e122]",
+  "candidates": {
+   "c1": "stop: the goal is already achieved",
+   "c2": "fill @e119 (textbox \"Email\") with \"text\"",
+   "c3": "fill @e118 (textbox \"Last Name\") with \"text\"",
+   "c4": "handoff: ask a human to take over",
+   "c5": "click @e122 (button \"Submit\")"
+  },
+  "truth": {
+   "page_state": "captcha",
+   "goal_done": false,
+   "needs_human": true,
+   "next_action": "c4"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 2,
+  "goal": "Open https://httpbin.org/status/503 and read the status.",
+  "url": "chrome-error://chromewebdata/",
+  "title": "httpbin.org",
+  "snapshot": "- generic\n  - generic\n    - image\n    - generic\n      - heading \"This page isn’t working\" [level=1, ref=e123]\n  - button \"Reload\" [ref=e124]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "click @e124 (button \"Reload\")",
+   "c3": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "error_page",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c2"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 3,
+  "goal": "Find the practice exercises on this site.",
+  "url": "https://practicetestautomation.com/this-page-does-not-exist-xyz/",
+  "title": "Page not found | Practice Test Automation",
+  "snapshot": "- generic\n  - link \"Press \\\"Enter\\\" to skip to content\" [ref=e125]\n  - generic\n    - banner\n      - navigation\n      - link \"Practice Test Automation\" [ref=e129]\n        - image \"Practice Test Automation\"\n      - navigation\n        - navigation\n          - list\n            - listitem [level=1]\n              - link \"HOME\" [ref=e132]\n            - listitem [level=1]\n              - link \"PRACTICE\" [ref=e133]\n            - listitem [level=1]\n              - link \"COURSES\" [ref=e134]\n            - listitem [level=1]\n              - link \"AI WORKSHOP\" [ref=e135]\n            - listitem [level=1]\n              - link \"BLOG\" [ref=e136]\n            - listitem [level=1]\n              - link \"CONTACT\" [ref=e137]\n    - main\n      - article\n        - heading \"404: Page Not Found\" [level=1, ref=e126]\n        - paragraph\n        - paragraph\n        - search\n          - searchbox \"Search\" [ref=e130]\n          - button \"Search\" [ref=e131]\n    - contentinfo\n      - generic\n        - link \"Practice Test Automation.\" [ref=e127]\n        - link \"Privacy Policy\" [ref=e128]",
+  "candidates": {
+   "c1": "click @e130 (searchbox \"Search\")",
+   "c2": "click @e134 (link \"COURSES\")",
+   "c3": "handoff: ask a human to take over",
+   "c4": "stop: the goal is already achieved",
+   "c5": "click @e133 (link \"PRACTICE\")",
+   "c6": "click @e129 (link \"Practice Test Automation\")"
+  },
+  "truth": {
+   "page_state": "error_page",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c5"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 4,
+  "goal": "Sign in as locked_out_user (password secret_sauce).",
+  "url": "https://www.saucedemo.com/",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e138] clickable [onclick]\n  - StaticText \"Swag Labs\"\n  - main\n    - form \"Login\"\n      - textbox \"Username\" [ref=e142]\n      - textbox \"Password\" [ref=e143]\n      - button \"Login\" [ref=e141]\n    - generic\n      - heading \"Accepted usernames are:\" [level=4, ref=e140]\n    - heading \"Password for all users:\" [level=4, ref=e139]",
+  "candidates": {
+   "c1": "stop: the goal is already achieved",
+   "c2": "fill @e143 (textbox \"Password\") with \"locked_out_user\"",
+   "c3": "fill @e142 (textbox \"Username\") with \"locked_out_user\"",
+   "c4": "handoff: ask a human to take over",
+   "c5": "click @e141 (button \"Login\")"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c3"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 5,
+  "goal": "Sign in as locked_out_user (password secret_sauce).",
+  "url": "https://www.saucedemo.com/",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e138] clickable [onclick]\n  - StaticText \"Swag Labs\"\n  - main\n    - form \"Login\"\n      - textbox \"Username\" [ref=e142]: locked_out_user\n      - textbox \"Password\" [ref=e143]\n      - button \"Login\" [ref=e141]\n    - generic\n      - heading \"Accepted usernames are:\" [level=4, ref=e140]\n    - heading \"Password for all users:\" [level=4, ref=e139]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "stop: the goal is already achieved",
+   "c3": "click @e141 (button \"Login\")",
+   "c4": "fill @e143 (textbox \"Password\") with \"secret_sauce\"",
+   "c5": "fill @e142 (textbox \"Username\") with \"secret_sauce\""
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c4"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 6,
+  "goal": "Sign in as locked_out_user (password secret_sauce).",
+  "url": "https://www.saucedemo.com/",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e138] clickable [onclick]\n  - StaticText \"Swag Labs\"\n  - main\n    - form \"Login\"\n      - textbox \"Username\" [ref=e142]: locked_out_user\n      - textbox \"Password\" [ref=e143]: ••••••••••••\n      - button \"Login\" [ref=e141]\n    - generic\n      - heading \"Accepted usernames are:\" [level=4, ref=e140]\n    - heading \"Password for all users:\" [level=4, ref=e139]",
+  "candidates": {
+   "c1": "fill @e142 (textbox \"Username\") with \"text\"",
+   "c2": "stop: the goal is already achieved",
+   "c3": "fill @e143 (textbox \"Password\") with \"text\"",
+   "c4": "handoff: ask a human to take over",
+   "c5": "click @e141 (button \"Login\")"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c5"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 7,
+  "goal": "Sign in as locked_out_user (password secret_sauce).",
+  "url": "https://www.saucedemo.com/",
+  "title": "Swag Labs",
+  "snapshot": "- generic [ref=e138] clickable [onclick]\n  - StaticText \"Swag Labs\"\n  - main\n    - form \"Login\"\n      - textbox \"Username\" [ref=e142]: locked_out_user\n      - textbox \"Password\" [ref=e143]: ••••••••••••\n      - alert\n        - button \"Dismiss error\" [ref=e144]\n        - StaticText \"Epic sadface: Sorry, this user has been locked out.\"\n      - button \"Login\" [ref=e141]\n    - generic\n      - heading \"Accepted usernames are:\" [level=4, ref=e140]\n    - heading \"Password for all users:\" [level=4, ref=e139]",
+  "candidates": {
+   "c1": "handoff: ask a human to take over",
+   "c2": "fill @e142 (textbox \"Username\") with \"text\"",
+   "c3": "click @e144 (button \"Dismiss error\")",
+   "c4": "fill @e143 (textbox \"Password\") with \"text\"",
+   "c5": "stop: the goal is already achieved"
+  },
+  "truth": {
+   "page_state": "signed_out",
+   "goal_done": false,
+   "needs_human": true,
+   "next_action": "c1"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 8,
+  "goal": "Add a todo called buy milk and mark it done.",
+  "url": "https://demo.playwright.dev/todomvc/#/",
+  "title": "React • TodoMVC",
+  "snapshot": "- generic\n  - link \"real TodoMVC app.\" [ref=e145]\n- sectionheader\n  - heading \"todos\" [level=1, ref=e146]\n  - textbox \"What needs to be done?\" [ref=e147]\n- contentinfo\n  - paragraph\n  - paragraph\n    - link \"Remo H. Jansen\" [ref=e148]\n  - paragraph\n    - link \"TodoMVC\" [ref=e149]",
+  "candidates": {
+   "c1": "stop: the goal is already achieved",
+   "c2": "fill @e147 (textbox \"What needs to be done?\") with \"buy milk\"",
+   "c3": "click @e148 (link \"Remo H. Jansen\")",
+   "c4": "handoff: ask a human to take over",
+   "c5": "click @e149 (link \"TodoMVC\")",
+   "c6": "click @e145 (link \"real TodoMVC app.\")"
+  },
+  "truth": {
+   "page_state": "other",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c2"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 9,
+  "goal": "Add a todo called buy milk and mark it done.",
+  "url": "https://demo.playwright.dev/todomvc/#/",
+  "title": "React • TodoMVC",
+  "snapshot": "- generic\n  - link \"real TodoMVC app.\" [ref=e145]\n- sectionheader\n  - heading \"todos\" [level=1, ref=e146]\n  - textbox \"What needs to be done?\" [ref=e147]\n- generic\n  - checkbox \"❯Mark all as complete\" [checked=false, ref=e150]\n  - list\n    - listitem [level=1]\n      - checkbox \"Toggle Todo\" [checked=false, ref=e151]\n- sectionfooter\n  - strong\n    - StaticText \"1\"\n  - StaticText \"item\"\n  - StaticText \" left\"\n  - list\n    - listitem [level=1]\n      - link \"All\" [ref=e152]\n    - listitem [level=1]\n      - link \"Active\" [ref=e153]\n    - listitem [level=1]\n      - link \"Completed\" [ref=e154]\n- contentinfo\n  - paragraph\n  - paragraph\n    - link \"Remo H. Jansen\" [ref=e148]\n  - paragraph\n    - link \"TodoMVC\" [ref=e149]",
+  "candidates": {
+   "c1": "click @e148 (link \"Remo H. Jansen\")",
+   "c2": "click @e151 (checkbox \"Toggle Todo\")",
+   "c3": "stop: the goal is already achieved",
+   "c4": "handoff: ask a human to take over",
+   "c5": "click @e149 (link \"TodoMVC\")",
+   "c6": "click @e154 (link \"Completed\")"
+  },
+  "truth": {
+   "page_state": "other",
+   "goal_done": false,
+   "needs_human": false,
+   "next_action": "c2"
+  }
+ },
+ {
+  "flow": "hard-states",
+  "step": 10,
+  "goal": "Add a todo called buy milk and mark it done.",
+  "url": "https://demo.playwright.dev/todomvc/#/",
+  "title": "React • TodoMVC",
+  "snapshot": "- generic\n  - link \"real TodoMVC app.\" [ref=e145]\n- sectionheader\n  - heading \"todos\" [level=1, ref=e146]\n  - textbox \"What needs to be done?\" [ref=e147]\n- generic\n  - checkbox \"❯Mark all as complete\" [checked=true, ref=e150]\n  - StaticText \"Mark all as complete\"\n  - list\n    - listitem [level=1]\n      - checkbox \"Toggle Todo\" [checked=true, ref=e151]\n      - button \"Delete\" [ref=e156]\n- sectionfooter\n  - strong\n    - StaticText \"0\"\n  - StaticText \"items\"\n  - StaticText \" left\"\n  - list\n    - listitem [level=1]\n      - link \"All\" [ref=e152]\n    - listitem [level=1]\n      - link \"Active\" [ref=e153]\n    - listitem [level=1]\n      - link \"Completed\" [ref=e154]\n  - button \"Clear completed\" [ref=e155]\n- contentinfo\n  - paragraph\n  - paragraph\n    - link \"Remo H. Jansen\" [ref=e148]\n  - paragraph\n    - link \"TodoMVC\" [ref=e149]",
+  "candidates": {
+   "c1": "stop: the goal is already achieved",
+   "c2": "handoff: ask a human to take over",
+   "c3": "click @e156 (button \"Delete\")",
+   "c4": "click @e155 (button \"Clear completed\")",
+   "c5": "click @e145 (link \"real TodoMVC app.\")"
+  },
+  "truth": {
+   "page_state": "other",
+   "goal_done": true,
+   "needs_human": false,
+   "next_action": "c1"
+  }
+ }
+]

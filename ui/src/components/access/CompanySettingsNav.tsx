@@ -11,6 +11,7 @@ const items = [
   { value: "import", label: "Import", href: "/company/import" },
   { value: "members", label: "Members", href: "/company/settings/members" },
   { value: "secrets", label: "Secrets", href: "/company/settings/secrets" },
+  { value: "browser", label: "Shared browser", href: "/company/settings/browser" },
   { value: "instance-profile", label: "Profile", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/profile` },
   { value: "instance-environments", label: "Environments", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/environments` },
   { value: "instance-access", label: "Access", href: `${INSTANCE_SETTINGS_PATH_PREFIX}/access` },
@@ -87,6 +88,10 @@ export function getCompanySettingsTab(pathname: string): CompanySettingsTab {
 
   if (pathname.includes("/company/settings/secrets")) {
     return "secrets";
+  }
+
+  if (pathname.includes("/company/settings/browser")) {
+    return "browser";
   }
 
   return "general";
