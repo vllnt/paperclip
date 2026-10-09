@@ -3,6 +3,7 @@ import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import {
   agentEnvBindingPrefix,
+  COOLDOWN_READ_FAILURE_BASE_MS,
   HARNESS_FALLBACK_RETRY_REASON,
   HARNESS_FALLBACK_WAKE_REASON,
   applyClaimedHarnessDispatch,
@@ -15633,7 +15634,7 @@ export function heartbeatService(
     // harness/model of the agent is cooling down from a quota failure.
     const storedAgentForQuota = run.runtimeMode === "native" ? null : await getAgent(run.agentId).catch(() => null);
     const quotaHeldUntil = storedAgentForQuota
-      ? await harnessFallback.heldUntil(storedAgentForQuota, now).catch(() => null)
+      ? await harnessFallback.heldUntil(storedAgentForQuota, now)
       : null;
     const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
       .filter((value): value is Date => value !== null)
@@ -17001,13 +17002,22 @@ export function heartbeatService(
       return { ...none, awaitingRetryExhaustion: true };
     }
     const reason = `provider_${decision.kind}`;
-    const { until, nextTarget } = await harnessFallback.coolDown({
+    const cooled = await harnessFallback.coolDown({
       agent: storedAgent,
       targetKey: dispatch.targetKey,
       reason,
       resetAt: decision.resetAt,
       sourceRunId: run.id,
+    }).catch((err) => {
+      // Fail closed: without a recorded cooldown the normal 30 second retry
+      // would send this wake straight back at the exhausted target.
+      logger.warn({ err, runId: run.id, target: dispatch.targetKey }, "quota cooldown could not be recorded; deferring this wake");
+      return null;
     });
+    if (!cooled) {
+      return { ...none, deferUntil: new Date(Date.now() + COOLDOWN_READ_FAILURE_BASE_MS) };
+    }
+    const { until, nextTarget } = cooled;
     if (!until) return none;
     const context = parseObject(run.contextSnapshot);
     const alreadyRedispatched = readNonEmptyString(parseObject(context.harnessFallbackRedispatch).fromRunId) !== null;
@@ -17620,10 +17630,7 @@ export function heartbeatService(
       return null;
     }
 
-    const harnessDecision = await harnessFallback.resolveDispatch(agent).catch((err) => {
-      logger.warn({ err, runId: run.id, agentId: agent.id }, "harness cooldown state unavailable; dispatching on the primary");
-      return { dispatch: primaryHarnessDispatch(agent), heldUntil: null };
-    });
+    const harnessDecision = await harnessFallback.resolveDispatch(agent);
     if (harnessDecision.heldUntil && run.runtimeMode !== "native") {
       // Every harness/model of this agent is out of provider quota. Leave the
       // run queued: the scheduler tick claims it once a target recovers, and

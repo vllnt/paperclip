@@ -68,6 +68,11 @@ cool the harness/model down: provider reset, else 5 → 10 → 20 → 40 → 60 
   cooldown end (no hop to the next target 30 seconds later). The failed
   primary run and its re-dispatch count as one run toward `maxDailyRuns`; a
   partial index keeps that check cheap.
+- **Fails closed.** If the cooldown table cannot be read, every target of that
+  agent waits (15 s, doubling to 5 min), the table is not read again inside the
+  window, and one warning is logged per window. If a cooldown cannot be
+  recorded after a quota failure, the wake is deferred 15 s instead of getting
+  the 30 s retry.
 - **LLM harnesses only.** Cooldowns and the server-side quota
   reclassification apply to the local LLM harnesses. A `process` or `http`
   agent that prints "usage limit reached" is not cooled down.

@@ -385,6 +385,65 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     }));
   }
 
+  /** Makes every read of the cooldown table throw, like a database error during an outage. */
+  function breakCooldownReads() {
+    const original = db.select.bind(db);
+    let reads = 0;
+    const spy = vi.spyOn(db, "select").mockImplementation(((...args: unknown[]) => {
+      const query = (original as (...a: unknown[]) => { from: (table: unknown) => unknown })(...args);
+      const from = query.from.bind(query);
+      query.from = (table: unknown) => {
+        if (table === agentHarnessCooldowns) {
+          reads += 1;
+          throw new Error("cooldown read failed");
+        }
+        return from(table);
+      };
+      return query;
+    }) as unknown as typeof db.select);
+    return { readCount: () => reads, restore: () => spy.mockRestore() };
+  }
+
+  it("fails closed when the cooldown read throws: the run waits instead of using the primary", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const broken = breakCooldownReads();
+    try {
+      await comment(agentId, issueId);
+      await heartbeat.resumeQueuedRuns();
+    } finally {
+      broken.restore();
+    }
+
+    expect(invocations).toHaveLength(0);
+    const [held] = await runs(companyId);
+    expect(held).toMatchObject({ status: "queued" });
+    expect(String((held.contextSnapshot as Record<string, unknown>).providerQuotaWaitUntil)).toMatch(/^\d{4}-/);
+  });
+
+  it("reads an unreadable cooldown once per window and defers with a bounded backoff", async () => {
+    const { agentId } = await seed();
+    const [agentRow] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const service = harnessFallbackService(db);
+    const broken = breakCooldownReads();
+    try {
+      const decisions = [];
+      for (let attempt = 0; attempt < 6; attempt += 1) decisions.push(await service.resolveDispatch(agentRow));
+      const reads = broken.readCount();
+
+      expect(reads).toBe(1);
+      const untilValues = new Set(decisions.map((decision) => decision.heldUntil?.getTime()));
+      expect(untilValues.size).toBe(1);
+      const waitSeconds = ((decisions[0].heldUntil?.getTime() ?? 0) - Date.now()) / 1000;
+      expect(waitSeconds).toBeGreaterThan(0);
+      expect(waitSeconds).toBeLessThanOrEqual(30);
+    } finally {
+      broken.restore();
+    }
+    // The read recovers: the same service answers from the table again.
+    const recovered = await harnessFallbackService(db).resolveDispatch(agentRow);
+    expect(recovered).toMatchObject({ heldUntil: null, dispatch: { target: "primary" } });
+  });
+
   it("binds two fallbacks that use different secrets for the same env key, and each run gets its own value", async () => {
     const { companyId, agentId, issueId } = await seed({ fallbacks: [] });
     const first = await secretNamed(companyId, "openai-key-one", "sk-first-value");

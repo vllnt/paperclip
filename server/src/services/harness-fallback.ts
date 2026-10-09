@@ -13,6 +13,7 @@ import {
 } from "@paperclipai/shared";
 import { isProviderQuotaMessage, parseProviderQuotaResetAt } from "@paperclipai/adapter-utils/provider-quota";
 import { fallbackEnvBindingPrefix } from "./agent-secret-bindings.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { isAiAuthenticationFailure } from "./ai-auth-failure.js";
 
@@ -24,6 +25,9 @@ export const QUOTA_BACKOFF_BASE_MINUTES = 5;
 export const DEFAULT_QUOTA_BACKOFF_MAX_MINUTES = 60;
 export const MAX_QUOTA_BACKOFF_MAX_MINUTES = 1440;
 export const MAX_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+/** First wait after the cooldown table cannot be read; it doubles up to the maximum. */
+export const COOLDOWN_READ_FAILURE_BASE_MS = 15_000;
+export const COOLDOWN_READ_FAILURE_MAX_MS = 5 * 60_000;
 
 const CAPACITY_RE = /at capacity|capacity limit|overloaded|\b529\b|high demand|server is busy/i;
 const TRANSIENT_UPSTREAM_CODES = new Set([
@@ -489,6 +493,8 @@ function describeTarget(target: { adapterType: string; model: string | null }): 
  * @returns Operations used by the heartbeat and agent routes.
  */
 export function harnessFallbackService(db: Db) {
+  const readFailures = new Map<string, { count: number; until: number }>();
+
   async function listCooldowns(companyId: string, agentId: string): Promise<CooldownRow[]> {
     return db
       .select()
@@ -508,7 +514,29 @@ export function harnessFallbackService(db: Db) {
     agent: HarnessFallbackAgent,
     now: Date = new Date(),
   ): Promise<{ dispatch: HarnessDispatch; heldUntil: Date | null }> {
-    const rows = await listCooldowns(agent.companyId, agent.id);
+    // Fail closed. An unreadable cooldown table during a quota outage must not
+    // send runs back at the exhausted target, so every target waits for a
+    // bounded, growing window. The table is not read again inside the window,
+    // which also keeps the failure to one log line per window.
+    const failure = readFailures.get(agent.id);
+    if (failure && failure.until > now.getTime()) {
+      return { dispatch: primaryHarnessDispatch(agent), heldUntil: new Date(failure.until) };
+    }
+    let rows: CooldownRow[];
+    try {
+      rows = await listCooldowns(agent.companyId, agent.id);
+    } catch (err) {
+      const count = (failure?.count ?? 0) + 1;
+      const waitMs = Math.min(COOLDOWN_READ_FAILURE_BASE_MS * 2 ** (count - 1), COOLDOWN_READ_FAILURE_MAX_MS);
+      const until = now.getTime() + waitMs;
+      readFailures.set(agent.id, { count, until });
+      logger.warn(
+        { err, agentId: agent.id, consecutiveFailures: count, retryAt: new Date(until).toISOString() },
+        "quota cooldowns could not be read; holding this agent's runs until the retry time",
+      );
+      return { dispatch: primaryHarnessDispatch(agent), heldUntil: new Date(until) };
+    }
+    readFailures.delete(agent.id);
     if (rows.length === 0) return { dispatch: primaryHarnessDispatch(agent), heldUntil: null };
     const targets = listHarnessTargets(agent);
     const selected = selectHarnessTarget(agent, cooldownMap(rows), now);
