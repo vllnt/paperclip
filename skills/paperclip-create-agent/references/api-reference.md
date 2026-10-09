@@ -1,5 +1,12 @@
 # Paperclip Create Agent API Reference
 
+## Contents
+
+- Core Endpoints
+- `POST /api/companies/:companyId/agent-hires`
+- Approval Lifecycle
+- Safety Notes
+
 ## Core Endpoints
 
 - `GET /llms/agent-configuration.txt`
