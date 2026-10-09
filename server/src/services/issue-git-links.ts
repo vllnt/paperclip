@@ -324,7 +324,6 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       const existing = rows.find((row) => matchesPullRequest(row, signal, externalId)) ?? null;
       // Null for a new row and for a pull request an agent attached by hand.
       const previous = parseGitMeta(existing);
-      const adoptedByHand = existing !== null && previous === null;
 
       if (!explicit && previous?.suppressed) {
         return { issueId: issue.id, identifier: issue.identifier, workProductId: existing!.id, created: false, changed: false, skipped: "suppressed" as const };
@@ -339,16 +338,11 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       const keepsManual = previous?.linkedBy === "manual" && !previous.suppressed && !explicit;
       const linkedBy: IssueGitLinkedBy = keepsManual ? "manual" : evidence ? evidence.linkedBy : previous?.linkedBy ?? "manual";
       const closes = keepsManual ? previous!.closes : evidence ? evidence.closes : previous?.closes ?? false;
-      // A head branch in another repository (a fork) never drives status, however the pull
-      // request was linked: anyone can open a fork pull request with any branch name or text.
-      // A branch-name match alone proves nothing; only a person's or agent's own link is
-      // trusted while the head repository is unknown.
-      const headInRepository = signal.headRepository ? sameRepository(signal.headRepository, signal.repository) : null;
-      const verified = unresolved || headInRepository === false
-        ? false
-        : headInRepository === true || linkedBy === "manual" || adoptedByHand
-          ? true
-          : previous?.verified ?? false;
+      // Verified only when this event shows the head branch lives in the pull request's own
+      // repository. A fork, a deleted fork or an unknown head is unverified, however the pull
+      // request was linked and whatever an earlier event said: anyone can open a fork pull
+      // request with any branch name or text, so only the head repository is proof.
+      const verified = !unresolved && Boolean(signal.headRepository) && sameRepository(signal.headRepository, signal.repository);
       const baseRef = signal.baseRef ?? stringField(asRecord(existing?.metadata), "baseRef");
       const baseIsDefault = signal.baseRef
         ? signal.defaultBranch
@@ -569,9 +563,8 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
 
     let effective = signal;
     const enrich = options.enrich;
-    const untrustedTarget = [...targets.values()].some((e) => !e || e.linkedBy !== "manual");
     const draftUnknown = signal.draft === undefined && signal.state === "open";
-    if (enrich && ((!signal.headRepository && untrustedTarget) || draftUnknown)) {
+    if (enrich && (!signal.headRepository || draftUnknown)) {
       try {
         const extra = await enrich(companyId, signal);
         if (extra) {
