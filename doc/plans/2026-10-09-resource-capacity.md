@@ -1,6 +1,6 @@
 # Resource capacity: host CPU, memory and disk for the instance and its workers
 
-Status: plan, revision 2 (2026-10-09), after independent review round 1. Owner: resource-capacity track.
+Status: plan, revision 3 (2026-10-09), after independent review rounds 1 and 2, with per-metric levels from building slice 1. Owner: resource-capacity track.
 "Resource capacity" means host resources (disk, memory, load). It is not
 provider capacity (model quota, `provider_quota`, PR #12) and not agent run
 slots (`maxConcurrentRuns`).
@@ -62,9 +62,10 @@ endpoint and nothing is emitted as an OpenTelemetry span.
   change to the generated contract.
 - Not **Observability**: no change to `server/src/instrumentation.ts`, the
   span allowlist, or `doc/observability.md`.
-- Not the **run log**: that path is `heartbeat_run_events` and
-  `appendRunEvent` only. This feature appends two lifecycle rows there per
-  held run (section 8.2), through the existing append path and its rules.
+- The two new tables are not the **run log** (`heartbeat_run_events`).
+  Slice 3 does touch the run log: it appends two lifecycle rows per held
+  run (deferred, resumed) through `appendRunEvent`. That part is a run-log
+  change and needs no extra review under the same rule.
 
 Review treatment: ordinary code review. No Telemetry privacy review (nothing
 leaves the instance) and no span-allowlist review. The isolation rules of
@@ -157,6 +158,10 @@ df -Pk . 2>/dev/null | tail -n 1 | sed 's/^/rc:df /'
   probe the same environment in the same interval. A reading taken at lease
   acquire moves `next_sweep_at` forward the same way. Environments are
   probed one at a time per pass.
+- **Workers without `/proc`** (macOS, BSD) report CPU count and disk only.
+  Their readings are `partial`; the disk is classified and can hold runs,
+  memory and load show as unknown (section 6.1). The real-sshd fixture runs
+  on macOS, so it is the end-to-end test of this case.
 - **Parsing is defensive:** the output comes from a host Paperclip does not
   control. Only tagged lines are read; each value must be a finite
   non-negative number in range (`free <= total`, `total > 0`, at most 4096
@@ -170,16 +175,17 @@ df -Pk . 2>/dev/null | tail -n 1 | sed 's/^/rc:df /'
 ### 4.2 Instance sampler
 
 An in-process interval (default 60 s, `PAPERCLIP_RESOURCE_CAPACITY_SAMPLE_INTERVAL_MS`,
-minimum 15 s, `unref`'d, cleared on shutdown) samples the instance. It keeps
-the latest reading in memory for admission and records it through the same
-path as every other reading (section 5.3). It runs in every server process,
+minimum 15 s, `unref`'d, cleared on shutdown) samples the instance and
+records it through the same path as every other reading (section 5.3). It
+runs in every server process,
 including those with `HEARTBEAT_SCHEDULER_ENABLED=false`, because reads and
 the recovery wake (section 8.2) need it. The same interval drives the SSH
 sweep and, once an hour, retention.
 
-Each process samples its own host. A `local` environment's runs execute on
-the process that claims them, so admission for a local run uses that
-process's in-memory instance reading.
+Each process samples its own host, keyed by a hash of its hostname (the
+hostname itself is stored only in the admin-only `host_label`). A `local`
+environment's runs execute on the process that claims them, so admission
+for a local run reads the instance row of that process's host.
 
 ## 5. Data model
 
@@ -202,17 +208,20 @@ A **target key** names what is measured: `instance:<hostname>` or
 | `latest_sampled_at` | timestamptz null | |
 | `latest_status` | text null | `ok`, `partial`, `failed` |
 | `latest_reading` | jsonb null | the metrics of section 4, numbers and closed-set labels only |
-| `level` | text not null default `unknown` | `ok`, `low`, `critical`, `unknown`; the authority for admission |
-| `level_metric` | text null | the metric that sets the level, e.g. `disk:workspaces` |
+| `metric_levels` | jsonb not null default `{}` | level per metric: `disk:data`, `disk:runLogs`, `disk:workspaces`, `memory`, `load`; each `ok`, `low` or `critical`; the authority for admission |
+| `metric_sampled_at` | jsonb not null default `{}` | when each metric was last measured; a metric older than 15 minutes is ignored (6.1) |
+| `level` | text not null default `unknown` | worst of `metric_levels`, kept for listing and sorting |
+| `state_version` | integer not null default 0 | incremented on every level change; the compare-and-set token (5.3) |
 | `level_changed_at` | timestamptz null | |
-| `disk_full_alarm` | boolean not null default false | projection event armed or fired (section 6.2) |
 | `next_sweep_at` | timestamptz null | sweep claim (section 4.1) |
 | `last_history_at` | timestamptz null | history rate limit (5.3) |
 | `updated_at` | timestamptz not null | |
 
 It gives every process one place to read the current level and one row to
 compare-and-set, so sweeps, history appends and level transitions happen
-once across server processes.
+once across server processes. Slice 2 adds `disk_full_alarms` (jsonb, disk
+label to `armed` or `fired`) for the projection event, one state per disk
+root (section 6.2).
 
 ### 5.2 `resource_capacity_samples`: history
 
@@ -236,17 +245,24 @@ Indexes: `(target_key, sampled_at desc)`; `(sampled_at)` for retention.
 ### 5.3 Recording a reading
 
 One function records every reading (instance interval, lease acquire,
-sweep), in one transaction:
+sweep), in one transaction. A reading carries the time it was taken (for a
+probe, when the command returned), not the time it is recorded.
 
-1. Upsert the target row's `latest_*` columns.
-2. Compute the new level from the reading and the stored level
-   (hysteresis, section 6.1). If it differs, run
-   `update ... set level = $new, level_changed_at = now() where target_key = $k and level = $old returning`.
-   Only the process whose update returns a row writes the transition's
-   activity entries (section 6.3), in the same transaction, so each
-   transition is written exactly once.
+1. Update the target row's latest state only if the reading is newer:
+   `update ... set latest_sampled_at = $t, latest_status, latest_reading = latest_reading || $measured, metric_sampled_at = metric_sampled_at || $measuredAt where target_key = $k and (latest_sampled_at is null or latest_sampled_at < $t) returning *`.
+   No row means a newer reading is already recorded; the reading is
+   dropped (no level change, no history). The update locks the row until
+   commit, so recordings of one target apply one at a time, in time order,
+   and step 2 sees committed levels. A partial reading merges: values it
+   lacks keep their last value and their old `metric_sampled_at`.
+2. Compute the new per-metric levels from the reading and the returned
+   `metric_levels` (hysteresis, section 6.1). If any metric differs, run
+   `update ... set metric_levels = $new, level = $worst, state_version = state_version + 1, level_changed_at = $t where target_key = $k and state_version = $read returning`.
+   The process whose update returns a row writes the transitions' activity
+   entries (section 6.3) in the same transaction, so each transition is
+   written exactly once.
 3. Append a history row only if the level changed, or if
-   `update ... set last_history_at = now() where target_key = $k and (last_history_at is null or last_history_at < now() - interval '5 minutes') returning`
+   `update ... set last_history_at = $t where target_key = $k and (last_history_at is null or last_history_at <= $t - interval '5 minutes') returning`
    returns a row.
 
 A recording error is logged and dropped; it never fails a run or a request.
@@ -263,10 +279,12 @@ re-evaluates on every claim attempt (section 8.2). It exists so run lists,
 the issue run ledger and agents can show "deferred: disk 96% used on
 worker-a" without a join. It is written with
 `update ... set admission_hold = $hold where id = $id and status = 'queued' and (admission_hold is null or admission_hold->>'targetKey' <> $k or admission_hold->>'metric' <> $m or admission_hold->>'thresholdsVersion' <> $v) returning id`,
-so repeated passes and several processes write it once per distinct cause;
-an activity entry is written only when that update returns a row. The claim
-update that moves the run to `running` sets it to null. Readers show it only
-while the run is `queued`.
+so repeated passes and several processes write it once per distinct cause.
+The hold update, its run event and its activity entry are written in one
+transaction, and the entries only when the update returns a row, so a crash
+leaves either all three or none. The claim update that moves the run to
+`running` sets it to null; the resumed entries are written in the claim's
+transaction. Readers show the hold only while the run is `queued`.
 
 A dedicated column is used because the existing ones mean something else
 (`nextAction` and `livenessReason` are written by liveness classification
@@ -294,18 +312,24 @@ until a batch deletes fewer. The latest state lives in
 
 ### 6.1 Levels
 
-A disk root or memory is `critical` when free is below the critical
-threshold, `low` below the low threshold, otherwise `ok`. A target's level is
-its worst metric.
+Each metric has its own level: a disk root (keyed by its first label) or
+memory is `critical` when free is below the critical threshold, `low` below
+the low threshold, otherwise `ok`. A target's level is its worst metric.
+Levels are kept per metric because admission needs to know which metric is
+critical (section 8.2: an SSH run is held by the instance `data` root but not
+by the instance `workspaces` root).
 
 A reading is `ok` when it has both disk and memory (CPU count and load are
 optional), `partial` when it has some metrics, `failed` when it has none.
-Only `ok` readings change the stored level; `partial` and `failed` readings
-update the latest state but leave the level as it was, so a worker without
-`/proc` or a dropped connection never fakes a recovery. `unknown` is derived
-on read: no `ok` reading yet, or the last `ok` reading is older than 15
-minutes. Level transitions, and therefore events, happen only between `ok`,
-`low` and `critical`.
+A reading changes only the levels of the metrics it contains; a metric it
+lacks keeps its stored level, so a worker without `/proc` or a dropped
+connection never fakes a recovery, and a disk-only reading still raises a
+full disk. A `failed` reading changes no level. Freshness is per metric
+(`metric_sampled_at`): a metric not measured in the last 15 minutes is
+ignored on read, so a `critical` that no reading confirms any more stops
+holding runs (fail-open), and a target with no fresh metric is `unknown`.
+Level transitions, and therefore events, happen only between `ok`, `low` and
+`critical`.
 
 Each threshold is `min(percent of total, absolute bytes)`, so large disks are
 not held with hundreds of GB free and small disks are not allowed to reach
@@ -340,21 +364,24 @@ minutes. If the slope is negative, `hoursToFull = freeBytes / -slope`. The
 read model returns `{ label, hoursToFull, basisMinutes }`. It is computed on
 read from at most 72 rows per root, so it is never stale. A projection under
 24 hours raises an event (6.3); the event re-arms when the projection is
-over 48 hours or the root is `ok` again.
+over 48 hours or the root is `ok` again. The alarm state is kept per disk
+root in `disk_full_alarms` and changed with a per-label compare-and-set
+(`... where target_key = $k and coalesce(disk_full_alarms->>$label, 'armed') = 'armed' returning`),
+so one root's alarm never suppresses or re-arms another's.
 
 ### 6.3 Activity events (slice 2 and 3)
 
 `activity_log.company_id` is `NOT NULL`, and environments have no company.
 A target event is written once per **affected company**: a company with at
-least one non-terminated agent whose effective environment (the resolver
-extracted in section 8.2, shared with `executeRun`) is the target. An
+least one non-terminated agent whose effective environment (the read-only
+resolver of section 8.2) is the target. An
 instance-target event goes to every company with an agent, because an
 instance root at `critical` (database, run logs) holds every run.
 
 Each transition is written exactly once across server processes: only the
 process whose level compare-and-set returns a row writes it, in the same
 transaction (section 5.3). The projection event uses the same pattern on
-`disk_full_alarm`. Events are rare: transitions have hysteresis, and one
+its disk root's entry in `disk_full_alarms`. Events are rare: transitions have hysteresis, and one
 affected-company lookup (agents plus instance settings) runs per
 transition, not per reading.
 
@@ -417,12 +444,15 @@ UTC, base64url cursor), agreed with that track.
 
 ### 8.1 Where
 
-Inside `claimQueuedRun` (`heartbeat.ts:17432`), as its **last gate**: after
-every gate that cancels a run (agent gone, not invokable, budget, daily
-caps, pause hold, blocked dependencies, staleness) and immediately before
-the claim update that moves the run from `queued` to `running`. On a hold it
-returns `null` and leaves the run `queued`, like the existing "native owner
-still settling" gate (`heartbeat.ts:17485-17499`).
+Inside `claimQueuedRun` (`heartbeat.ts:17432`), right after the last gate
+that cancels a run (agent gone, not invokable, budget, daily caps, pause
+hold, blocked dependencies, staleness, ending near `:17585`) and **before
+all three updates that move a run from `queued` to `running`**: the
+queued-comment claim transaction (`:17821`), the native-review assignment
+claim (`:17920`) and the ordinary claim (`:17987`). On a hold it returns
+`null` and leaves the run `queued`, like the existing "native owner still
+settling" gate (`heartbeat.ts:17485-17499`). Tests cover each of the three
+branches.
 
 - Every path that turns a queued run into a running one goes through
   `claimQueuedRun`: `startNextQueuedRunForAgent` (wakes, scheduled-retry
@@ -436,7 +466,11 @@ still settling" gate (`heartbeat.ts:17485-17499`).
   signal, so a reading that changes between the gate and the claim update
   is acceptable; the claim update itself stays the existing atomic
   compare-and-set.
-- Being last, a run that another gate would cancel is cancelled, not held.
+- A run that a cancelling gate would cancel is cancelled, not held. The
+  chat-control decisions inside the claim branches run after the hold, so a
+  queued-comment run that chat control would discard is held first and
+  decided when capacity recovers; a held run does no work, so the delay
+  changes nothing else.
 - The other `executeRun` callers are native restart recovery and session
   resume of runs already `running`; they never pass through the claim and
   are not gated, because holding them would strand started work.
@@ -454,42 +488,54 @@ new rows.
 
 1. **Target.** Extract the environment resolution of `executeRun`
    (`heartbeat.ts:21900-22011`: agent default, company default, instance
-   default, local; the managed-sandbox redirect; forced Kubernetes) into one
-   read-only helper that both `executeRun` and the gate call, so the two
-   cannot drift. `executeRun` keeps its side effects (`ensureLocalEnvironment`,
-   lazy Kubernetes provisioning) around the helper. Sandbox and plugin
-   targets are not gated. The result is cached per agent for 15 s.
-2. **Readings.** The instance target of this process's host (in memory) and,
-   for an SSH target, the environment's `resource_capacity_targets` row
-   (cached 15 s).
-3. **Decision.** Hold when the instance `data` or `runLogs` root is
-   `critical` (every driver), or the target's disk or memory is `critical`
-   (local: the instance `workspaces` root and host memory; SSH: the remote
-   root and remote memory). The decision is re-evaluated on **every** claim
+   default, local; the managed-sandbox redirect; forced Kubernetes) is
+   resolved by a read-only resolver in the capacity service, built from the
+   same pure functions `executeRun` calls (`resolveExecutionWorkspaceEnvironmentId`,
+   `resolveCompanyEnvironmentDefault`, `isExecutionForcedToKubernetes`) and
+   the environment service's read-only finders. `executeRun` is not
+   restructured: its side effects (`ensureLocalEnvironment`, lazy
+   Kubernetes provisioning) stay where they are, and a parity test pins the
+   resolver to the same cases. Sandbox and plugin targets are not gated.
+   The result is cached per agent for 15 s.
+2. **Readings.** From the database, never process memory: the instance
+   target row of this process's host and, for an SSH target, the
+   environment's row (each cached 15 s). Processes on one host therefore
+   decide alike.
+3. **Decision.** Hold when the instance `disk:data` or `disk:runLogs`
+   metric is `critical` (every driver), or the target's disk or memory
+   metric is `critical` (local: the instance `disk:workspaces` and `memory`;
+   SSH: the environment's `disk:workspaces` and `memory`). The instance
+   `disk:workspaces` and `memory` do not hold SSH runs. The decision is re-evaluated on **every** claim
    attempt from the current target and thresholds. An existing hold never
    authorizes or blocks anything; it is only the record of the last cause.
    So an agent moved to another environment, or a threshold edit, takes
    effect on the next attempt.
-4. **Fail-open.** A level of `unknown` (no `ok` reading, or the last one
-   older than 15 minutes) never holds. A sampling or recording error never
+4. **Fail-open.** Only fresh metrics count (section 6.1): a metric not
+   measured in 15 minutes never holds. A sampling or recording error never
    fails or delays a run.
-5. **Enforce mode.** Write the hold with the conditional update of section
-   5.4. When that update returns a row, append one run event and one
-   `heartbeat.run_deferred_resource_capacity` entry. Return `null`.
+5. **Enforce mode.** In one transaction, write the hold with the
+   conditional update of section 5.4 and, when it returns a row, one run
+   event and one `heartbeat.run_deferred_resource_capacity` entry. Return
+   `null`.
 6. **Warn mode.** Claim as usual; in the same conditional style, write
    `heartbeat.run_admitted_despite_resource_capacity` once per run.
 7. **Resume.** The claim update sets `admission_hold` to null. If the run
    had a hold, write one `heartbeat.run_resumed_resource_capacity` entry and
    one run event.
-8. **Recovery wake.** When a target's level leaves `critical` (the
-   transition of section 5.3), the process that wrote the transition calls
-   `startNextQueuedRunForAgent` for each agent with a queued run whose hold
-   names that target (`select distinct agent_id ... where status = 'queued'
-   and admission_hold->>'targetKey' = $k`). Held runs therefore resume
-   within one reading of recovery, and also on deployments where this
-   process runs with `HEARTBEAT_SCHEDULER_ENABLED=false`, whose interval
-   never calls `resumeQueuedRuns` (`server/src/index.ts:1830-1841`). The
-   30 s tick, where enabled, stays a second path.
+8. **Recovery wake.** Level-based, not only edge-triggered: on every
+   sampler tick (every process, section 4.2), select the agents with a held
+   run (`select distinct agent_id ... where status = 'queued' and admission_hold is not null`,
+   served by a partial index on queued runs with a hold) and call
+   `startNextQueuedRunForAgent` for each agent whose hold's target is no
+   longer critical by the current fresh metrics, or whose hold names a
+   target or metric the gate would no longer pick. A level transition out of
+   `critical` triggers the same check at once. Held runs therefore resume
+   within one tick of recovery, after a crash between a transition and its
+   wake, when failed readings let the `critical` metric go stale, and on
+   deployments where every process runs with
+   `HEARTBEAT_SCHEDULER_ENABLED=false`, whose interval never calls
+   `resumeQueuedRuns` (`server/src/index.ts:1830-1841`). The 30 s tick,
+   where enabled, stays a second path.
 
 The hold is per run and target, so one full worker does not block agents
 on other environments.
@@ -582,7 +628,7 @@ Each slice ships web, API, OpenAPI and CLI together with tests.
 
 | Slice | Scope | Size |
 |---|---|---|
-| **1** | Both tables and the migration, shared types and constants, the recording path with its compare-and-set (5.3), levels with hysteresis, instance sampler, SSH probe at lease acquire and sweep, retention; the extracted environment resolver (needed for "can use"); the three read routes (latest only, no history yet), OpenAPI, CLI `capacity` and `environment capacity`, instance page and environment capacity line; `/api/health` level for admins. | L |
+| **1** | Both tables and the migration, shared types and constants, the recording path with its compare-and-set (5.3), levels with hysteresis, instance sampler, SSH probe at lease acquire and sweep, retention; the read-only environment resolver (needed for "can use"); the three read routes (latest only, no history yet), OpenAPI, CLI `capacity` and `environment capacity`, instance page and environment capacity line; `/api/health` level for admins. | L |
 | **2** | History (`since`, bucketing), sparklines, disk-full projection, the three `resource_capacity.*` activity events with affected-company fan-out. | M |
 | **3** | Admission hold before claim, `admission_hold` column, run and activity events, instance setting with `warn` default, the hold reason in run lists, the issue run ledger and run detail. | M |
 | 4 | Placement: not built (section 9). | none |
@@ -602,20 +648,23 @@ Each item is a test that fails before its slice and passes after.
   Linux, BusyBox and macOS output; missing lines give `partial`; hostile
   output (huge numbers, negative, `free > total`, 1 MB of noise) is rejected.
 - **Classifier (pure):** thresholds as `min(percent, bytes)`, hysteresis in
-  both directions, worst-metric level, `partial` and `failed` readings keep
-  the level, stale gives `unknown`.
+  both directions, worst-metric level, metrics a `partial` reading lacks
+  keep their level, a `failed` reading changes nothing, stale gives `unknown`.
 - **Projection (pure):** steady fill, refill (positive slope gives none),
   too few samples, too short a span.
 - **SSH probe:** with the real-sshd fixture (`ssh-fixture.test.ts`,
   `PAPERCLIP_ENABLE_DARWIN_SSH_ENV_LAB=1` on macOS): `ensureSshWorkspaceReady`
-  with the probe returns the same `remoteCwd` as without; a probe that fails
-  (no `/proc`, failing `df`) still returns `remoteCwd` and a `partial`
-  reading; a root that cannot be created still fails the acquire. Local
+  with the probe returns the same `remoteCwd` as without; on a worker with
+  no `/proc` (the macOS fixture) it still returns `remoteCwd`, CPU count and
+  disk; a root that cannot be created still fails the acquire. Local
   `sh` tests (no sshd needed): a probe printing 1 MB is cut to 16 KB and the
   command still succeeds; a marker printed by the probe does not change
   `remoteCwd`; a failing `mkdir` or `cd` keeps its non-zero status.
 - **Service (embedded Postgres):** a history row at most every 5 minutes
-  or on a level change, whatever the number of lease-acquire readings;
+  or on a level change, whatever the number of lease-acquire readings; a
+  reading older than the recorded one changes nothing; a disk-only reading
+  classifies the disk; `critical` followed by failed readings stays
+  `critical` for 15 minutes, then reads `unknown`;
   retention deletes in batches; the sweep picks only active, non-ok or held
   environments; a sweep failure stores `failed`, keeps the level, and does
   not throw. **Two service instances on one database:** concurrent
@@ -626,12 +675,20 @@ Each item is a test that fails before its slice and passes after.
   with two companies sharing one environment; agents allowed for their own
   company; responses contain no path or hostname (string scan); OpenAPI
   route test covers the new routes.
-- **Events (slice 2):** one entry per affected company per transition
+- **Events (slice 2):** one projection alarm per disk root (two roots
+  filling at once raise two events; one recovering does not re-arm the
+  other); one entry per affected company per transition
   (affected = effective environment, including company and instance
-  defaults), none on an unchanged level or a `partial`/`failed` reading,
+  defaults), none on an unchanged level, a `failed` reading, or a metric a
+  `partial` reading lacks,
   re-arm rules for the projection, exactly once with two service instances.
 - **Admission (slice 3):** a queued run on a `critical` target stays
-  `queued` with `admission_hold` and one activity entry; repeated passes and
+  `queued` with `admission_hold` and one activity entry, on each of the
+  three claim branches (ordinary, queued-comment, native-review); a crash
+  between the hold update and its entries leaves neither (one transaction);
+  a held run resumes on the next sampler tick after its metric goes stale
+  or recovers, with no transition event and the scheduler interval
+  disabled; repeated passes and
   a second service instance write nothing more; the `executeRun` queued
   branch is gated too; recovery claims it, clears the hold and writes one
   resumed entry; the recovery wake resumes it with the scheduler interval
