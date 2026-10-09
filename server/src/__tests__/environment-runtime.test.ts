@@ -7868,6 +7868,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const pluginId = randomUUID();
     const resolvedApiKey = "resolved-provider-api-key";
     const resolvedToken = "resolved-connection-token";
+    const resolvedListToken = "resolved-list-token";
+    const resolvedReplicaToken = "resolved-replica-token";
     const workerManager = {
       isRunning: vi.fn(() => true),
       call: vi.fn(async (_pluginId: string, method: string) => {
@@ -7878,6 +7880,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
               remoteCwd: "/workspace",
               apiKey: resolvedApiKey,
               connection: { host: "sandbox.example.test", token: resolvedToken },
+              tokens: [resolvedListToken],
+              replicas: [{ host: "replica.example.test", token: resolvedReplicaToken }],
             },
           };
         }
@@ -7918,6 +7922,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             displayName: "Secret echo plugin",
             configSchema: {
               type: "object",
+              $defs: {
+                credential: {
+                  type: "object",
+                  properties: { host: { type: "string" }, token: { type: "string", format: "secret-ref" } },
+                },
+              },
               properties: {
                 template: { type: "string" },
                 apiKey: { type: "string", format: "secret-ref" },
@@ -7925,6 +7935,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
                   type: "object",
                   properties: { token: { type: "string", format: "secret-ref" } },
                 },
+                tokens: { type: "array", items: { type: "string", format: "secret-ref" } },
+                replicas: { type: "array", items: { $ref: "#/$defs/credential" } },
               },
             },
           },
@@ -7947,12 +7959,21 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(stored?.metadata).toMatchObject({
       pluginKey: "acme.environments",
       driverKey: "secret-echo-plugin",
-      providerMetadata: { remoteCwd: "/workspace", connection: { host: "sandbox.example.test" } },
+      providerMetadata: {
+        remoteCwd: "/workspace",
+        connection: { host: "sandbox.example.test" },
+        replicas: [{ host: "replica.example.test" }],
+      },
     });
     const storedJson = JSON.stringify(stored?.metadata);
     expect(storedJson).not.toContain(resolvedApiKey);
     expect(storedJson).not.toContain(resolvedToken);
+    expect(storedJson).not.toContain(resolvedListToken);
+    expect(storedJson).not.toContain(resolvedReplicaToken);
+    expect((stored?.metadata as { providerMetadata: Record<string, unknown> }).providerMetadata).not.toHaveProperty("tokens");
     expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedApiKey);
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedListToken);
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedReplicaToken);
   });
 
   it("releases with the driver captured on the lease even if the environment driver changes later", async () => {

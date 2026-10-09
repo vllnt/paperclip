@@ -25,10 +25,44 @@ import {
   collectSecretRefPaths,
   parseSecretRefBindingObject,
   readConfigValueAtPath,
+  redactSecretRefValues,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+
+// A plugin worker resolves its declared secret-ref values itself, so the host
+// never sees them and cannot scrub them out of free text. Worker output that
+// reaches an API response is therefore untrusted: metadata is redacted by the
+// driver's config schema, and provider-written text is replaced by constant text.
+const WITHHELD_PROVIDER_TEXT = "The provider's text is withheld because a provider can echo a resolved secret.";
+const DIAGNOSTIC_SEVERITIES = new Set(["info", "warning", "error"]);
+
+function declaredConfigSchema(driver: PluginEnvironmentDriverDeclaration): Record<string, unknown> | null {
+  const schema = driver.configSchema;
+  return schema && typeof schema === "object" && !Array.isArray(schema) ? (schema as Record<string, unknown>) : null;
+}
+
+function safeProbeOutput(
+  result: { diagnostics?: unknown; metadata?: Record<string, unknown> },
+  configSchema: Record<string, unknown> | null,
+) {
+  const diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics : [];
+  return {
+    diagnostics: diagnostics.map((diagnostic: { severity?: unknown } | null) => ({
+      severity: DIAGNOSTIC_SEVERITIES.has(diagnostic?.severity as string) ? diagnostic?.severity : "info",
+      message: WITHHELD_PROVIDER_TEXT,
+    })),
+    metadata: (redactSecretRefValues(result.metadata ?? {}, configSchema) ?? {}) as Record<string, unknown>,
+  };
+}
+
+function providerRejectedConfig(subject: string, result: { errors?: unknown; warnings?: unknown }) {
+  return unprocessable(`${subject} rejected its config. ${WITHHELD_PROVIDER_TEXT}`, {
+    errorCount: Array.isArray(result.errors) ? result.errors.length : 0,
+    warningCount: Array.isArray(result.warnings) ? result.warnings.length : 0,
+  });
+}
 
 /**
  * The worker methods a sandbox provider must advertise before the host reuses
@@ -336,13 +370,7 @@ export async function validatePluginSandboxProviderConfig(input: {
   });
 
   if (!result.ok) {
-    throw unprocessable(
-      result.errors?.[0] ?? `Sandbox provider "${input.provider}" rejected its config.`,
-      {
-        errors: result.errors ?? [],
-        warnings: result.warnings ?? [],
-      },
-    );
+    throw providerRejectedConfig(`Sandbox provider "${input.provider}"`, result);
   }
 
   return {
@@ -365,13 +393,7 @@ export async function validatePluginEnvironmentDriverConfig(input: {
   });
 
   if (!result.ok) {
-    throw unprocessable(
-      result.errors?.[0] ?? `Plugin environment driver "${pluginDriverProviderKey(input.config)}" rejected its config.`,
-      {
-        errors: result.errors ?? [],
-        warnings: result.warnings ?? [],
-      },
-    );
+    throw providerRejectedConfig(`Plugin environment driver "${pluginDriverProviderKey(input.config)}"`, result);
   }
 
   return {
@@ -387,7 +409,7 @@ export async function probePluginEnvironmentDriver(input: {
   environmentId: string;
   config: PluginEnvironmentConfig;
 }): Promise<EnvironmentProbeResult> {
-  const { plugin } = await resolvePluginEnvironmentDriver(input);
+  const { plugin, driver } = await resolvePluginEnvironmentDriver(input);
   const result = await input.workerManager.call(plugin.id, "environmentProbe", {
     driverKey: input.config.driverKey,
     companyId: input.companyId,
@@ -398,12 +420,11 @@ export async function probePluginEnvironmentDriver(input: {
   return {
     ok: result.ok,
     driver: "plugin",
-    summary: result.summary ?? `Plugin environment driver "${pluginDriverProviderKey(input.config)}" probe ${result.ok ? "passed" : "failed"}.`,
+    summary: `Plugin environment driver "${pluginDriverProviderKey(input.config)}" probe ${result.ok ? "passed" : "failed"}.`,
     details: {
       pluginKey: input.config.pluginKey,
       driverKey: input.config.driverKey,
-      diagnostics: result.diagnostics ?? [],
-      metadata: result.metadata ?? {},
+      ...safeProbeOutput(result, declaredConfigSchema(driver)),
     },
   };
 }
@@ -443,12 +464,11 @@ export async function probePluginSandboxProviderDriver(input: {
   return {
     ok: result.ok,
     driver: "sandbox",
-    summary: result.summary ?? `Sandbox provider "${input.provider}" probe ${result.ok ? "passed" : "failed"}.`,
+    summary: `Sandbox provider "${input.provider}" probe ${result.ok ? "passed" : "failed"}.`,
     details: {
       provider: input.provider,
       pluginKey: resolved.plugin.pluginKey,
-      diagnostics: result.diagnostics ?? [],
-      metadata: result.metadata ?? {},
+      ...safeProbeOutput(result, declaredConfigSchema(resolved.driver)),
     },
   };
 }
