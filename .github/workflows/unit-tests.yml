@@ -1,0 +1,111 @@
+name: Unit tests (informational)
+
+# Runs the whole Vitest suite on Linux and reports the result. Nothing requires
+# these jobs: the test step never fails the job, so a red test shows up as a
+# warning annotation and in the job summary instead of blocking a merge.
+#
+# The suite had no CI job, so a failing test on main went unseen (the OpenAPI
+# route test failed there after #52). Make this job blocking only once the lanes
+# are green on main: remove `continue-on-error` from the "Run tests" step, then
+# add the "Unit tests (...)" checks to the required checks.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: server-1-of-4
+            args: --mode general --group general-server --shard-index 0 --shard-count 4
+          - lane: server-2-of-4
+            args: --mode general --group general-server --shard-index 1 --shard-count 4
+          - lane: server-3-of-4
+            args: --mode general --group general-server --shard-index 2 --shard-count 4
+          - lane: server-4-of-4
+            args: --mode general --group general-server --shard-index 3 --shard-count 4
+          - lane: ui-and-cli
+            args: --mode general --group general-workspaces-a
+          - lane: packages
+            args: --mode general --group general-workspaces-b
+          - lane: serialized-1-of-3
+            args: --mode serialized --shard-index 0 --shard-count 3
+          - lane: serialized-2-of-3
+            args: --mode serialized --shard-index 1 --shard-count 3
+          - lane: serialized-3-of-3
+            args: --mode serialized --shard-index 2 --shard-count 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        id: tests
+        # Informational for now: see the note at the top of this file.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          pnpm run preflight:workspace-links
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          node scripts/run-vitest-stable.mjs ${{ matrix.args }} 2>&1 | tee "$RUNNER_TEMP/unit.log"
+
+      - name: Report failing tests
+        if: always()
+        shell: bash
+        env:
+          LANE: ${{ matrix.lane }}
+          OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          log="$RUNNER_TEMP/unit.log"
+          failed=""
+          if [ -f "$log" ]; then
+            failed=$(grep -E '^ *FAIL ' "$log" | sed -E 's/^ +//' | sort -u || true)
+          fi
+          {
+            echo "### Unit tests: $LANE"
+            echo
+            echo "Result: \`$OUTCOME\`"
+            if [ -n "$failed" ]; then
+              echo
+              echo "Failing tests:"
+              echo
+              echo '```'
+              echo "$failed"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            count=$(printf '%s\n' "$failed" | grep -c . || true)
+            echo "::warning title=Unit tests ($LANE) did not pass::$count failing test entries. This job is informational and does not block the merge. See the job summary."
+          fi
