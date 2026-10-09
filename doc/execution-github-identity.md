@@ -308,7 +308,12 @@ does not know protects it. The write is refused when the branch is the
 default (compared case-insensitively) or protected, and also when GitHub
 cannot be read or answers unclearly: the classifier refuses a branch it has no
 fresh answer for, so any caller that skips the read fails closed. Answers are
-kept for five minutes per repository and branch. Feature branches GitHub does
+kept for five minutes per repository and branch. A write that forces, deletes,
+renames or hard-resets a branch is also refused when Paperclip cannot tell
+which repository it targets: a push report without its remote or push URLs, a
+gh placeholder path, a wiki, or a target that only looks like a local path
+(an unreported remote name reads the same way). Name the repository, or push
+from the managed launcher, which reports the destination. Feature branches GitHub does
 not protect may still be force-pushed (with or without a lease) and deleted.
 
 **gh aliases, extensions and unknown commands.** gh runs an alias or an

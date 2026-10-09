@@ -4,6 +4,7 @@ import { pluginState, plugins, type Db } from "@paperclipai/db";
 import {
   GITHUB_WRITE_IDENTITY_STATE,
   classifyGitHubCommand,
+  gitHubAgentsNeverDenial,
   ghApiRoute,
   ghVerbIndex,
   gitNetworkArguments,
@@ -375,8 +376,15 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     if (run && !deployment) target.actionsRunId = run[1];
   }
   // A branch the write forces, deletes, renames or hard-resets may be GitHub's default or a protected branch.
-  const branchRewrites = !denied && access === "write" && repository !== null && !wiki && command.branchRewrites?.length ? command.branchRewrites : undefined;
-  const branchRefusal = branchRewrites && repository !== null ? protectedBranchRefusal(repository, branchRewrites) : null;
+  const rewrites = !denied && access === "write" && command.branchRewrites?.length ? command.branchRewrites : undefined;
+  // Without the repository (an incomplete report, a placeholder path), or for a wiki (its branches are not the repository's),
+  // Paperclip cannot ask GitHub about these branches: the write is refused. A push target that looks like a local path is no exception:
+  // an unreported remote name (origin) reads the same way, and the real push would carry the credential.
+  const unverifiable = rewrites !== undefined && (repository === null || wiki);
+  const branchRefusal = !rewrites ? null
+    : unverifiable ? gitHubAgentsNeverDenial("defaultBranch", `Paperclip could not tell which repository ${rewrites.slice(0, 3).join(", ")} belongs to; name it in the command and report the push destination`)
+    : repository !== null ? protectedBranchRefusal(repository, rewrites) : null;
+  const branchRewrites = rewrites && !unverifiable && repository !== null ? rewrites : undefined;
   if (branchRefusal) refuse(branchRefusal);
   if (pullRequest) target.pullRequest = pullRequest;
   // Only a full commit SHA binds a merge to one head; an abbreviation is dropped (and the merge refused).

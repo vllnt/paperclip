@@ -180,4 +180,30 @@ const remote = "https://github.com/acme/site.git";
     expect(direct).toMatchObject({ status: "unavailable", failClosed: true, env: {} });
     expect(String((direct as { reason?: unknown }).reason)).toMatch(/could not read from GitHub whether feature\/b/);
   });
+
+  it.each<[string, GitHubOperation]>([
+    ["a force push without remote or pushUrls", { program: "git", args: ["push", "origin", "--force", "release"], currentBranch: "feature", touchesWorkflows: false }],
+    ["a delete push without remote or pushUrls", { program: "git", args: ["push", "origin", "--delete", "release"], currentBranch: "feature" }],
+    ["a force push with a null remote and empty pushUrls", { program: "git", args: ["push", "origin", "--force", "release"], remote: null, pushUrls: [], currentBranch: "feature", touchesWorkflows: false }],
+    ["a colon delete without a remote", { program: "git", args: ["push", "origin", ":release"], remote: null, currentBranch: "feature" }],
+  ])("refuses %s through the route: no token, no GitHub read, an activity record", async (_name, operation) => {
+    const run = await seed();
+    const github = fakeGitHub();
+    const result = await ask(run, operation);
+    expect(result).toMatchObject({ status: "unavailable", failClosed: true, env: {} });
+    expect(result.reason).toMatch(/^Denied: .*could not tell which repository/s);
+    expect(github).toEqual([]);
+    expect(credentials.resolveManagedGitHubCredential).not.toHaveBeenCalled();
+    expect(await denials(run.companyId)).toEqual([expect.objectContaining({
+      action: "github.write_identity_resolved", actorType: "agent", agentId: run.agentId, runId: run.runId,
+      details: expect.objectContaining({ reason: expect.stringMatching(/could not tell which repository/) }),
+    })]);
+  });
+
+  it("still hands a credential to a push with an incomplete report that rewrites nothing", async () => {
+    const run = await seed();
+    fakeGitHub();
+    const result = await ask(run, { program: "git", args: ["push", "origin", "feature/x"], currentBranch: "feature/x", touchesWorkflows: false });
+    expect(result.reason ?? "").not.toMatch(/protected branch/);
+  });
 });

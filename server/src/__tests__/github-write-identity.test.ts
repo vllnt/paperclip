@@ -364,3 +364,40 @@ describe("security review round 5 (attack regressions)", () => {
       .toMatch(/cannot check the GraphQL mutation updatePullRequest/);
   });
 });
+
+describe("destructive branch operations with an incomplete report (review round 3)", () => {
+  const remote = "https://github.com/acme/site.git";
+  const clean = { currentBranch: "feature", touchesWorkflows: false };
+  const refused = /^Denied: .*never delete or force-push a default or protected branch.*could not tell which repository/s;
+
+  it.each([
+    ["force push without remote or pushUrls", ["push", "origin", "--force", "release"]],
+    ["delete push without remote or pushUrls", ["push", "origin", "--delete", "release"]],
+    ["colon delete refspec without remote", ["push", "origin", ":release"]],
+    ["plus refspec without remote", ["push", "origin", "+HEAD:release"]],
+    ["force-with-lease without remote", ["push", "--force-with-lease", "origin", "release"]],
+  ])("refuses a %s", (_name, args) => {
+    const classified = classifyGitHubOperation({ program: "git", args, ...clean });
+    expect(classified).toMatchObject({ access: "write", repository: null, integrity: true });
+    expect(classified.denied).toMatch(refused);
+  });
+
+  it("refuses a rewrite whose report names a remote Paperclip cannot resolve, or a null remote and empty pushUrls", () => {
+    for (const operation of [
+      { program: "git" as const, args: ["push", "origin", "--force", "release"], remote: null, pushUrls: [], ...clean },
+      { program: "git" as const, args: ["push", "origin", "--force", "release"], remote: null, ...clean },
+      { program: "gh" as const, args: ["api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/release"], remote: null },
+      { program: "gh" as const, args: ["repo", "sync", "--force", "--branch", "release"], remote: null },
+    ]) {
+      expect(classifyGitHubOperation(operation).denied, operation.args.join(" ")).toMatch(/Denied: /);
+    }
+  });
+
+  it("keeps complete reports and plain pushes working, and refuses a rewrite to a target that only looks like a local path", () => {
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "origin", "--force", "release"], remote, pushUrls: [remote], ...clean }))
+      .toMatchObject({ repository: "acme/site", branchRewrites: ["release"] });
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "origin", "feature"], ...clean }).denied).toBeUndefined();
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "--force-with-lease", "release"], remote: null, ...clean }).denied).toMatch(refused);
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "release"], remote: null, ...clean }).denied).toBeUndefined();
+  });
+});
