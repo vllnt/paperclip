@@ -617,6 +617,22 @@ describeReaper("SSH run directory reaper", () => {
     expect(await exists(run.runDir)).toBe(false);
   }, 60_000);
 
+  it("records the git command that failed when the worker keeps a directory as preserve_failed", async () => {
+    const run = await releasedRun("failed");
+    const service = sshRunDirectoryReaperService(db, {
+      hooks: { reapRemote: async () => ({ outcome: "kept", reason: "preserve_failed", bytes: 1024, detail: "git status" }) },
+    });
+
+    await service.reapReleasedLease(environment, run.lease);
+
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({
+      sshRunDirectory: { state: "kept", reason: "preserve_failed", detail: "git status" },
+    });
+    const [entry] = await activityFor(run.runId, "environment.ssh_run_directory_kept");
+    expect(entry?.details).toMatchObject({ reason: "preserve_failed", detail: "git status" });
+    expect(await exists(run.runDir)).toBe(true);
+  }, 60_000);
+
   it("gives the claim back and records nothing when the worker has no timeout command, so a later pass can remove the directory", async () => {
     const run = await releasedRun("failed");
     const withoutTimeout = sshRunDirectoryReaperService(db, {

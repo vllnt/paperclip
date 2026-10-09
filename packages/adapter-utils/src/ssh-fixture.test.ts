@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1890,22 +1890,105 @@ describe("SSH run directory reaper", () => {
     return { ...run, ns, headRef: `${ns}/head`, bundlePath: host.preservedBundle(run.runId) };
   }
 
-  it("keeps a bundle that an earlier reap published, and reports the refs that bundle holds", async () => {
+  it("reuses a published bundle that holds exactly the computed refs, without rewriting it", async () => {
     const host = await startHost("SSH reaper existing bundle test");
     if (!host) return;
     const run = await runWithAgentCommit(host);
     await mkdir(path.dirname(run.bundlePath), { recursive: true });
     await git(run.workspace, ["update-ref", run.headRef, "HEAD"]);
-    await git(run.workspace, ["update-ref", `${run.ns}/earlier-pass`, "HEAD"]);
-    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef, `${run.ns}/earlier-pass`]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef]);
     const published = await readFile(run.bundlePath);
 
     const result = await host.reap(run.runId);
 
-    expect(result).toMatchObject({ outcome: "removed", preserved: expect.arrayContaining([run.headRef, `${run.ns}/earlier-pass`]) });
+    expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
     expect((await readFile(run.bundlePath)).equals(published)).toBe(true);
     await expect(stat(path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("rebuilds the bundle when it holds a ref this pass did not compute, so the final bundle holds exactly the computed refs", async () => {
+    const host = await startHost("SSH reaper extra ref test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const clone = await host.hostClone(run.workspace);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["update-ref", run.headRef, "HEAD"]);
+    await git(run.workspace, ["update-ref", `${run.ns}/deleted-since`, "HEAD"]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef, `${run.ns}/deleted-since`]);
+    const earlier = await readFile(run.bundlePath);
+    await git(run.workspace, ["update-ref", "-d", `${run.ns}/deleted-since`]);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
+    const heads = (await git(clone, ["bundle", "list-heads", run.bundlePath])).split("\n").map((line) => line.split(" ")[1]);
+    expect(heads).toEqual([run.headRef]);
+    const superseded = path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`);
+    expect((await readFile(superseded)).equals(earlier)).toBe(true);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  const readFailures = [
+    { name: "git status", detail: "git status", match: '*"-C workspace status --porcelain"*' },
+    { name: "the HEAD lookup", detail: "git rev-parse HEAD", match: '*" rev-parse -q --verify HEAD"*' },
+    { name: "the HEAD reflog", detail: "git reflog", match: '*" reflog show "*' },
+    { name: "the preserved ref listing", detail: "git for-each-ref", match: '*" for-each-ref "*"refs/paperclip/preserved/"*' },
+    { name: "the stash listing", detail: "git stash list", match: '*" stash list "*' },
+    { name: "the worktree listing", detail: "git worktree list", match: '*" worktree list "*' },
+    { name: "the status of an extra worktree", detail: "git status (extra worktree)", match: '*"extra-tree status --porcelain"*' },
+  ];
+
+  it.each(readFailures)("keeps the directory and its only copy when $name fails", async ({ detail, match }) => {
+    const host = await startHost("SSH reaper git read failure test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    await git(run.workspace, ["worktree", "add", "-q", "-b", "side-branch", path.join(run.runDir, "extra-tree")]);
+    await writeFile(path.join(run.workspace, "only-copy"), "uncommitted work\n");
+    const failingGit = `git() { case " $* " in ${match}) return 42;; esac; command git "$@"; }`;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, testHooks: { afterConfine: failingGit },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail });
+    await expect(readFile(path.join(run.workspace, "only-copy"), "utf8")).resolves.toBe("uncommitted work\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("removes old bundles, superseded bundles and leftover temporary bundles after the retention period", async () => {
+    const host = await startHost("SSH reaper retention test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+    const preservedDir = path.dirname(host.preservedBundle(run.runId));
+    await mkdir(preservedDir, { recursive: true });
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    const names = [`${randomUUID()}.bundle`, `${randomUUID()}.superseded.bundle`, `.${randomUUID()}.bundle.aB3dE9`];
+    for (const name of names) {
+      await writeFile(path.join(preservedDir, name), "old");
+      await utimes(path.join(preservedDir, name), old, old);
+    }
+    const recent = `${randomUUID()}.bundle`;
+    await writeFile(path.join(preservedDir, recent), "recent");
+
+    await host.reap(run.runId);
+
+    expect(await readdir(preservedDir)).toEqual([recent]);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("still saves uncommitted work in a repository whose HEAD has no commit yet", async () => {
+    const host = await startHost("SSH reaper unborn HEAD test");
+    if (!host) return;
+    const runId = randomUUID();
+    const runDir = sshRunDirectory(host.root, runId);
+    const workspace = path.join(runDir, "workspace");
+    await mkdir(workspace, { recursive: true });
+    await git(workspace, ["init", "-q", "-b", "main"]);
+    await writeFile(path.join(workspace, "first.txt"), "first file\n");
+
+    const result = await host.reap(runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [`refs/paperclip/preserved/${runId}/worktree`] });
+    await expect(stat(runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(host.preservedBundle(runId))).resolves.toBeTruthy();
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("rebuilds the bundle when a computed ref moved on since an earlier pass, and keeps the superseded one", async () => {

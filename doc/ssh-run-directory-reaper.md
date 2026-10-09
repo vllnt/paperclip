@@ -63,7 +63,8 @@ The directory stays, with a reason in the activity entry and in the lease's
 - `not_git_backed`: no marker and not a git repository, so nothing can be saved.
 - `worktree_dirty`: an extra worktree has uncommitted work.
 - `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
-  verify; or `.git` is a link or a file; or the start commit is unknown; or a
+  verify; or `.git` is a link or a file; or the start commit is unknown; or a git
+  read failed (the `detail` field names the command); or a
   bundle already at the published path is a link or not a regular file, or the
   bundle could not be replaced or still does not match this pass's refs exactly.
 - `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
@@ -142,18 +143,31 @@ instead of the run.
   gives the claim back, records nothing, and logs one warning per environment.
   The directory is tried again on a later sweep, so installing `timeout` on the
   worker (GNU coreutils or busybox) is enough to resume reaping.
+- **Git reads fail closed.** Every read of the repository before a delete (HEAD,
+  its reflog, the preserved refs, the branches, the stash, the worktree list, and
+  `git status` of the workspace and of each extra worktree) must exit 0 and, where
+  an object id is due, print one. A failed read, or one that prints something
+  else, keeps the directory as `preserve_failed`, and the failing command goes in
+  the `detail` field of the lease record and of the activity entry (for example
+  `git status`). Empty output means "nothing to save" only after an exit 0. A
+  repository whose HEAD has no commit yet still works: that is exit 1 with HEAD a
+  symbolic ref.
 - **Published bundle.** `preserved/<runId>.bundle` is saved before any deletion
   starts. A pass that finds one never trusts it by name. It is a regular file
-  (never a link), it verifies, and it must list every ref this pass computed at
-  exactly the commit that ref has now. If so, the bundle is reused untouched.
-  If not (a ref moved on since the earlier pass, or the bundle is unrelated), the
-  pass writes a new bundle under a temporary name, verifies it, keeps the old one
-  as `<runId>.superseded.bundle` (a hard link, no copy), and renames the new one
-  into place. It then checks the same exact match again. A link or a non-regular
-  file at the path, a new bundle that does not verify, a rename that fails, or a
-  final mismatch keeps the directory (`preserve_failed`) and never deletes it.
-  The refs reported are the ones the bundle holds. The 30-day cleanup removes
-  old bundles, superseded ones included.
+  (never a link), it verifies, and its refs are exactly the ones this pass
+  computed: the same number, each at the commit it has now, so none is missing,
+  moved or extra. If so, the bundle is reused untouched. If not (a ref moved on or
+  was deleted since the earlier pass, or the bundle is unrelated), the pass moves
+  the new bundle into the preserved directory under a unique temporary name
+  (`mktemp`), verifies it, flushes it to disk (`sync` of the file, or a global
+  `sync` where the worker's `sync` takes no file), keeps the old one as
+  `<runId>.superseded.bundle` (a hard link, no copy), and renames the new one into
+  place. It then checks the same exact match again. A link or a non-regular file
+  at the path, a new bundle that does not verify, a rename that fails, or a final
+  mismatch keeps the directory (`preserve_failed`) and never deletes it. The 30-day
+  cleanup removes old bundles, superseded ones included. A crash between the
+  flush and the rename leaves only a temporary file, which the cleanup also
+  removes; crash durability of the rename itself is not tested.
 - **Mounts.** Before it changes anything, the script compares the device of
   `runs/<runId>` with the device of `runs`, and asks `mountpoint` where the worker
   has it, so a bind mount on the same device is caught too. A mismatch keeps the
