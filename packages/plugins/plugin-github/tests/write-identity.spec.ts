@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1473,5 +1473,274 @@ describe("security review round 5 (attack regressions)", () => {
       f.github.prFiles = [{ filename }];
       expect(await merge(f), filename).toMatchObject({ unavailable: expect.stringContaining(`protected paths (${filename})`) });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A push may carry workflow changes without editWorkflows only when they arrive by merging the base branch.
+// ---------------------------------------------------------------------------
+
+describe("workflow changes that arrive by merging the base branch", () => {
+  const W = ".github/workflows";
+  type Entry = { mode: string; oid: string };
+  const blob = (text: string, mode = "100644"): Entry => ({ mode, oid: createHash("sha1").update(`blob ${Buffer.byteLength(text)}\0${text}`).digest("hex") });
+  const id = (n: number) => n.toString(16).padStart(40, "0");
+  const change = (file: string, entry: Entry | null) => ({ path: `${W}/${file}`, mode: entry?.mode ?? null, oid: entry?.oid ?? null });
+  const ci = blob("on: push\n"), deploy = blob("on: workflow_dispatch\n"), releaseCi = blob("on: [push, release]\n");
+  const toggle = "editWorkflows";
+
+  async function pushFixture() {
+    const f = await appFixture();
+    await f.authorize();
+    const state = {
+      /** The workflow files of each base branch, by name under .github/workflows. */
+      branches: { main: { "ci.yml": ci, "deploy.yml": deploy }, "release/1": { "ci.yml": releaseCi }, wip: { "ci.yml": blob("on: unreviewed\n") } } as Record<string, Record<string, Entry>>,
+      /** Branches with branch protection (the default branch, main, has none here). */
+      protectedBranches: new Set(["release/1"]),
+      /** The open pull requests of the pushed branch feature/x (their base; a fork's head repository is another one; ref is their head branch). */
+      prs: [] as Array<{ base: string; fork?: boolean; ref?: string }>,
+      defaultBranch: "main",
+      /** Requests GitHub fails on. */
+      failing: [] as RegExp[],
+      truncated: false,
+      githubDirectory: "tree" as "tree" | "none" | "symlink",
+      /** Every request the base comparison made. */
+      calls: [] as string[],
+    };
+    const names = () => Object.keys(state.branches);
+    const ids = (name: string) => { const first = 100 + names().indexOf(name) * 10; return { commit: id(first + 1), root: id(first + 2), github: id(first + 3), workflows: id(first + 4) }; };
+    const repo = "/repos/anthm-fr/songtrivia";
+    const original = f.request.getMockImplementation()!;
+    const answer = (data: unknown) => ({ data: data as any, next: false });
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      const mine = path === repo || path.startsWith(`${repo}/pulls?`) || path.startsWith(`${repo}/git/trees/`) || path.startsWith(`${repo}/branches/`) && names().some(name => path === `${repo}/branches/${encodeURIComponent(name)}`);
+      if (!mine) return (original as any)(path, ...rest);
+      state.calls.push(path);
+      if (state.failing.some(pattern => pattern.test(path))) throw new GitHubError(500);
+      if (path.startsWith(`${repo}/pulls?`)) {
+        return answer(state.prs.map(pr => ({ base: { ref: pr.base }, head: { ref: pr.ref ?? "feature/x", repo: { full_name: pr.fork ? "someone/songtrivia" : "Anthm-FR/songtrivia" } } })));
+      }
+      if (path === repo) return answer({ default_branch: state.defaultBranch });
+      const branch = names().find(name => path === `${repo}/branches/${encodeURIComponent(name)}`);
+      if (branch) return answer({ name: branch, protected: state.protectedBranches.has(branch), commit: { sha: ids(branch).commit, commit: { tree: { sha: ids(branch).root } } } });
+      const [, sha, recursive] = /\/git\/trees\/([0-9a-f]{40})(\?recursive=1)?$/.exec(path) ?? [];
+      const entry = (name: string, mode: string, type: string, oid: string) => ({ path: name, mode, type, sha: oid });
+      for (const name of names()) {
+        const tree = ids(name);
+        if (sha === tree.root) {
+          const github = state.githubDirectory === "tree" ? [entry(".github", "040000", "tree", tree.github)] : state.githubDirectory === "symlink" ? [entry(".github", "120000", "blob", id(7))] : [];
+          return answer({ sha, truncated: false, tree: [entry("README.md", "100644", "blob", id(1)), ...github] });
+        }
+        if (sha === tree.github) return answer({ sha, truncated: false, tree: [entry("CODEOWNERS", "100644", "blob", id(2)), entry("workflows", "040000", "tree", tree.workflows)] });
+        if (sha === tree.workflows) {
+          if (!recursive) throw new Error("The workflow files are read recursively.");
+          return answer({ sha, truncated: state.truncated, tree: Object.entries(state.branches[name]!).map(([file, found]) => entry(file, found.mode, "blob", found.oid)) });
+        }
+      }
+      throw new GitHubError(404);
+    });
+    /** A push of one commit to feature/x with these workflow paths. */
+    const push = (changes: unknown, extra: Record<string, unknown> = {}) => f.write("anthm-fr/songtrivia", { action: "push", privileged: [toggle], workflowPush: { branch: "feature/x", changes }, ...extra });
+    const refused = (decision: any, reason: string | RegExp) => {
+      expect(decision).toMatchObject({ identity: "user", unavailable: typeof reason === "string" ? expect.stringContaining(reason) : expect.stringMatching(reason) });
+      expect(decision).not.toHaveProperty("credential");
+      return decision;
+    };
+    return { ...f, state, ids, push, refused };
+  }
+
+  it("allows a push of the base branch's own workflow changes, deletions included, with the toggle off and evidence of the comparison", async () => {
+    const f = await pushFixture();
+    // main edited ci.yml, added deploy.yml and deleted release.yml (which it does not have).
+    const granted = await f.push([change("ci.yml", ci), change("deploy.yml", deploy), change("release.yml", null)]);
+    expect(granted).toMatchObject({ identity: "user", credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: {
+      branch: "feature/x", base: "main", baseSha: f.ids("main").commit, paths: [`${W}/ci.yml`, `${W}/deploy.yml`, `${W}/release.yml`],
+    } } });
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+    // The base is read fresh from GitHub for this push: the pushed branch's pull requests, the base branch, its trees.
+    const lookup = new URLSearchParams(f.state.calls.find(call => call.includes("/pulls?"))!.split("?")[1]);
+    expect(lookup.get("state")).toBe("open");
+    // The owner as GitHub spells it (the repository's catalog name), not as normalized for comparison.
+    expect(lookup.get("head")).toBe("Anthm-FR:feature/x");
+    expect(f.state.calls.filter(call => call.includes("/git/trees/"))).toHaveLength(3);
+    // The next push reads it again.
+    const reads = f.state.calls.length;
+    f.state.branches.main["ci.yml"] = blob("on: pull_request\n");
+    f.refused(await f.push([change("ci.yml", ci)]), `${W}/ci.yml`);
+    expect(f.state.calls.length).toBeGreaterThan(reads);
+  });
+
+  it("refuses an agent's own workflow edit, naming the files that differ from the base branch", async () => {
+    const f = await pushFixture();
+    const edit = blob("on: push\nenv:\n  A: 1\n");
+    const decision = f.refused(await f.push([change("ci.yml", edit), change("deploy.yml", deploy)]), /differ from main \(\.github\/workflows\/ci\.yml\).*editWorkflows is turned off/s);
+    expect(decision.unavailable).not.toContain("deploy.yml");
+    expect(decision.evidence).toMatchObject({ branch: "feature/x", base: "main", baseSha: f.ids("main").commit, offending: [`${W}/ci.yml`] });
+    // A file added or removed only on the branch differs too.
+    f.refused(await f.push([change("agent.yml", edit)]), `${W}/agent.yml`);
+    f.refused(await f.push([change("ci.yml", null)]), `${W}/ci.yml`);
+    f.refused(await f.push([change("deploy.yml", deploy), change("gone.yml", edit), change("also.yml", null)]), `${W}/gone.yml`);
+  });
+
+  it("refuses a rename or a mode change unless the base branch has the same", async () => {
+    const f = await pushFixture();
+    // A rename is the old name gone and the new name present.
+    f.refused(await f.push([change("ci.yml", null), change("build.yml", ci)]), /ci\.yml, \.github\/workflows\/build\.yml|build\.yml, \.github\/workflows\/ci\.yml/);
+    // A mode change keeps the blob and differs in the mode.
+    f.refused(await f.push([change("ci.yml", { ...ci, mode: "100755" })]), `${W}/ci.yml`);
+    // The base branch with the same rename or mode passes.
+    f.state.branches.main = { "build.yml": ci, "deploy.yml": { ...deploy, mode: "100755" } };
+    expect(await f.push([change("ci.yml", null), change("build.yml", ci), change("deploy.yml", { ...deploy, mode: "100755" })]))
+      .toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("never lets a symlink, a submodule or a symlinked directory through, even when the base branch has the same", async () => {
+    const f = await pushFixture();
+    const link = { mode: "120000", oid: id(55) }, module = { mode: "160000", oid: id(56) };
+    f.state.branches.main = { "link.yml": link, "module.yml": module };
+    for (const [label, changes] of [
+      ["a symlink the base has", [change("link.yml", link)]],
+      ["a symlink the base lacks", [change("other.yml", link)]],
+      ["a submodule", [change("module.yml", module)]],
+      ["the directory replaced by a symlink", [{ path: W, mode: "120000", oid: id(57) }]],
+    ] as const) {
+      f.refused(await f.push(changes), /not regular files/);
+      expect(f.state.calls, label).toEqual([]);
+    }
+  });
+
+  it("refuses when it cannot read the base branch: the pull request lookup, the branch, a tree, a cut tree, an odd .github", async () => {
+    const f = await pushFixture();
+    for (const [label, pattern] of [["the pull request lookup", /\/pulls\?/], ["the base branch", /\/branches\//], ["a tree", /\/git\/trees\//]] as const) {
+      f.state.failing = [pattern];
+      f.refused(await f.push([change("ci.yml", ci)]), /cannot read the workflow files of .*editWorkflows is turned off/s);
+      expect(f.state.calls.length, label).toBeGreaterThan(0);
+      f.state.calls.length = 0;
+    }
+    // Without a pull request the default branch is read; failing that refuses too.
+    f.state.failing = [/^\/repos\/anthm-fr\/songtrivia$/];
+    f.refused(await f.push([change("ci.yml", ci)]), /cannot read the workflow files/);
+    f.state.failing = [];
+    // A branch GitHub does not know.
+    f.state.prs = [{ base: "ghost" }];
+    f.refused(await f.push([change("ci.yml", ci)]), /cannot read the workflow files of ghost/);
+    f.state.prs = [];
+    // A tree GitHub cut short cannot show every workflow file.
+    f.state.truncated = true;
+    f.refused(await f.push([change("ci.yml", ci)]), /cannot read the workflow files/);
+    f.state.truncated = false;
+    // A base branch whose .github is no directory cannot be compared.
+    f.state.githubDirectory = "symlink";
+    f.refused(await f.push([change("ci.yml", ci)]), /cannot read the workflow files/);
+    // A base branch without .github has no workflow files: deleting one is what the base has too, and nothing else passes.
+    f.state.githubDirectory = "none";
+    f.refused(await f.push([change("ci.yml", ci)]), `${W}/ci.yml`);
+    expect(await f.push([change("ci.yml", null)])).toMatchObject({ credential: { login: "agent-owner" } });
+    // Fixed, the same push passes.
+    f.state.githubDirectory = "tree";
+    expect(await f.push([change("ci.yml", ci)])).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("compares with the pull request's base, with the default branch when there is none, and refuses when the base is unclear", async () => {
+    const f = await pushFixture();
+    // The pull request into release/1 is compared with release/1, not with main.
+    f.state.prs = [{ base: "release/1" }];
+    f.refused(await f.push([change("ci.yml", ci)]), /differ from release\/1/);
+    expect(await f.push([change("ci.yml", releaseCi)])).toMatchObject({ evidence: { workflowBaseMerge: { base: "release/1", baseSha: f.ids("release/1").commit } } });
+    // Two pull requests into one base are one base; two bases are none.
+    f.state.prs = [{ base: "main" }, { base: "main" }];
+    expect(await f.push([change("ci.yml", ci)])).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    f.state.prs = [{ base: "main" }, { base: "release/1" }];
+    f.refused(await f.push([change("ci.yml", ci)]), /more than one base branch \(main, release\/1\).*editWorkflows is turned off/s);
+    // A pull request from a fork with the same branch name, or from another branch, is not this branch's.
+    f.state.prs = [{ base: "release/1", fork: true }];
+    expect(await f.push([change("ci.yml", ci)])).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    f.state.prs = [{ base: "release/1", ref: "other" }];
+    expect(await f.push([change("ci.yml", ci)])).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    // No pull request: the repository's default branch.
+    f.state.prs = [];
+    f.state.defaultBranch = "release/1";
+    f.refused(await f.push([change("ci.yml", ci)]), /differ from release\/1/);
+    expect(await f.push([change("ci.yml", releaseCi)])).toMatchObject({ evidence: { workflowBaseMerge: { base: "release/1" } } });
+  });
+
+  it("takes a pull request's base only when it is the default branch or protected, since whoever opens the pull request chooses it", async () => {
+    const f = await pushFixture();
+    const unreviewed = blob("on: unreviewed\n");
+    // An agent can open a pull request into any branch; workflow files on a branch nobody protects are not reviewed.
+    f.state.prs = [{ base: "wip" }];
+    f.refused(await f.push([change("ci.yml", unreviewed)]), /wip is neither the default branch nor protected.*editWorkflows is turned off/s);
+    // The same push into a protected branch passes, and into the default branch (protected or not).
+    f.state.protectedBranches.add("wip");
+    expect(await f.push([change("ci.yml", unreviewed)])).toMatchObject({ evidence: { workflowBaseMerge: { base: "wip" } } });
+    f.state.prs = [{ base: "main" }];
+    expect(await f.push([change("ci.yml", ci)])).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    // A default branch GitHub does not name cannot be told from any other unprotected branch.
+    f.state.protectedBranches.delete("wip");
+    f.state.prs = [{ base: "wip" }];
+    f.state.defaultBranch = "";
+    f.refused(await f.push([change("ci.yml", unreviewed)]), /neither the default branch nor protected/);
+  });
+
+  it("leaves the run identity as it was: the toggle decides and GitHub is not asked", async () => {
+    const f = await pushFixture();
+    await f.setPolicy({ ...anthmPolicy, userSource: "run" });
+    f.refused(await f.push([change("ci.yml", ci)]), /privileged GitHub action \(editWorkflows\) and it is turned off/);
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("asks nothing of GitHub when the company allows workflow edits, and falls back to the toggle without usable paths", async () => {
+    const f = await pushFixture();
+    // The toggle decides when the paths are missing or unreadable, as before.
+    for (const workflowPush of [undefined, null, "ci.yml", { branch: "feature/x" }, { branch: "feature/x", changes: [] }, { branch: "", changes: [change("ci.yml", ci)] },
+      { branch: "feature/x", changes: [{ path: "src/app.ts", mode: "100644", oid: ci.oid }] }, { branch: "feature/x", changes: [{ path: `${W}/ci.yml`, mode: "100644", oid: "xyz" }] },
+      { branch: "feature/x", changes: [{ path: `${W}/ci.yml`, mode: null, oid: ci.oid }] }, { branch: "feature/x", changes: [{ path: `${W}/ci.yml`, mode: "100644", oid: null }] },
+      { branch: "feature/x", changes: Array.from({ length: 101 }, (_, index) => change(`w${index}.yml`, ci)) },
+      { branch: "feature/x", changes: [change(`${"x".repeat(300)}.yml`, ci)] }]) {
+      const decision = await f.write("anthm-fr/songtrivia", { action: "push", privileged: [toggle], ...(workflowPush === undefined ? {} : { workflowPush }) });
+      f.refused(decision, /privileged GitHub action \(editWorkflows\) and it is turned off/);
+    }
+    expect(f.state.calls).toEqual([]);
+    // With the toggle on, anything goes through without a comparison.
+    await f.setPolicy({ ...anthmPolicy, privileged: { editWorkflows: true } });
+    expect(await f.push([change("ci.yml", blob("on: anything\n"))])).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await f.write("anthm-fr/songtrivia", { action: "push", privileged: [toggle] })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("does not unlock any other privileged action, and the kill switch still refuses", async () => {
+    const f = await pushFixture();
+    const same = [change("ci.yml", ci)];
+    const decision = f.refused(await f.push(same, { privileged: [toggle, "pushToMain"] }), /\(pushToMain\)/);
+    expect(decision.unavailable).not.toContain("editWorkflows");
+    f.refused(await f.push(same, { privileged: [toggle, "tagPush"] }), /\(tagPush\)/);
+    expect(f.state.calls).toEqual([]);
+    // The kill switch flipped during the base read refuses the push.
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let waiting = false;
+    const inner = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      if (path.includes("/git/trees/")) { waiting = true; await gate; }
+      return (inner as any)(path, ...rest);
+    });
+    const racing = f.push(same);
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    release();
+    f.refused(await racing, /kill switch/);
+  });
+
+  it("keeps a refusal within the server's 500 characters however many files differ, and keeps them all in the evidence", async () => {
+    const f = await pushFixture();
+    const edit = blob("on: other\n");
+    const files = Array.from({ length: 60 }, (_, index) => `agent-workflow-with-a-rather-long-name-number-${index}.yml`);
+    const decision = f.refused(await f.push(files.map(file => change(file, edit))), /differ from main/);
+    expect(decision.unavailable.length).toBeLessThanOrEqual(500);
+    expect(decision.unavailable).toMatch(/and 5\d more/);
+    expect(decision.evidence.offending).toHaveLength(60);
+    const long = `${"x".repeat(250)}.yml`;
+    f.state.prs = [{ base: "release/1" }];
+    expect((await f.push([change(long, edit)])).unavailable.length).toBeLessThanOrEqual(500);
   });
 });

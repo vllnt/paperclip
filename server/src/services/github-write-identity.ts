@@ -8,6 +8,7 @@ import {
   ghApiRoute,
   ghVerbIndex,
   gitNetworkArguments,
+  gitPushDestinations,
   normalizeGhArgs,
   gitSubcommandIndex,
   parseGhApiArgs,
@@ -18,6 +19,7 @@ import {
   type GitHubOperationAction,
   type GitHubPrivilegedAction,
   type GitHubSignDecision,
+  type GitHubWorkflowPush,
   type GitHubWriteIdentityDecision,
   type GitHubWriteIdentityPolicy,
   type PaperclipPluginManifestV1,
@@ -46,6 +48,12 @@ export const gitHubOperationSchema = z.object({
     .refine(value => !value || Object.keys(value).length <= 64, "Too many refs"),
   /** git push: whether the new commits change `.github/workflows/**`; null when unknown. */
   touchesWorkflows: z.boolean().nullable().optional(),
+  /** git push of one commit: the workflow paths the new commits change, as that commit has them (git mode and blob id; null when gone). Absent when unknown or too many. */
+  workflowChanges: z.array(z.object({
+    path: z.string().max(300),
+    mode: z.string().regex(/^\d{6}$/).nullable(),
+    oid: z.string().regex(/^[0-9a-f]{40,64}$/).nullable(),
+  })).max(100).optional(),
   /** git push: the commit SHAs being pushed (for the audit record). */
   shas: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(64).optional(),
   /** git push: every push URL of the remote (git pushes to all of them). */
@@ -243,6 +251,11 @@ export interface ClassifiedGitHubOperation {
    * refused until that answer is read (resolveGitHubOperationAccess reads it).
    */
   branchRewrites?: string[];
+  /**
+   * A push of one commit to one named branch that asks for `editWorkflows`, with the workflow paths it changes. The
+   * plugin lets it through without the toggle only when every path is the base branch's own.
+   */
+  workflowPush?: GitHubWorkflowPush;
 }
 
 /** A reported command Paperclip could not read: it is treated as a write it cannot check. */
@@ -348,6 +361,18 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     retarget = operation.args.slice(1).some(arg => arg === "--base" || arg.startsWith("--base=") || arg.startsWith("-B"));
   }
   if (operation.program === "git" && subcommand === "push" && operation.shas?.length) target.shas = operation.shas;
+  // One commit to one named branch is the only push whose workflow paths can be tied to a branch for the plugin's base comparison.
+  let workflowPush: GitHubWorkflowPush | undefined;
+  if (operation.program === "git" && subcommand === "push" && privileged.includes("editWorkflows") && operation.touchesWorkflows === true
+    && operation.shas?.length === 1 && operation.workflowChanges?.length) {
+    const destinations = gitPushDestinations(operation.args.slice(index + 1), {
+      currentBranch: operation.currentBranch ?? null, refs: operation.refs, followTags: operation.followTags, implicitPush: operation.implicitPush,
+    });
+    const [only] = destinations;
+    if (destinations.length === 1 && only!.startsWith("refs/heads/") && !only!.includes("*")) {
+      workflowPush = { branch: only!.slice("refs/heads/".length), changes: operation.workflowChanges };
+    }
+  }
   if (operation.program === "gh" && operation.args[0] === "pr" && ghVerb === "merge") {
     const merge = ghPrMergeArguments(operation.args);
     merging = true;
@@ -401,6 +426,7 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     ...(autoMerge ? { autoMerge: true as const } : {}),
     ...(retarget ? { retarget: true as const } : {}),
     ...(branchRewrites ? { branchRewrites } : {}),
+    ...(workflowPush ? { workflowPush } : {}),
     ...(operation.program === "git" && command.action === "commit" ? { signing: true } : {}),
   };
 }
@@ -503,6 +529,7 @@ export async function resolveGitHubWriteIdentityDecision(
       repository: operation.repository, access: operation.access, action: operation.action, privileged: operation.privileged,
       wiki: operation.wiki, pullRequest: operation.pullRequest, expectedHeadSha: operation.expectedHeadSha,
       ...(operation.merge ? { merge: true } : {}), ...(operation.autoMerge ? { autoMerge: true } : {}), ...(operation.retarget ? { retarget: true } : {}),
+      ...(operation.workflowPush ? { workflowPush: operation.workflowPush } : {}),
       ...(input.fallback ? { fallback: true } : {}),
     }, 15_000);
     return raw === null ? UNAVAILABLE : decisionSchema.parse(raw) as GitHubWriteIdentityDecision;
