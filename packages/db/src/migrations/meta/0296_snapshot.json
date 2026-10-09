@@ -1,5 +1,5 @@
 {
-  "id": "d1b54fe3-7081-4b86-a803-5b9b8c751161",
+  "id": "9b3dc3f3-423e-40ff-a8fd-7dce65c42711",
   "prevId": "07a0e151-b7e8-4a62-88f4-04cc58adf85f",
   "version": "7",
   "dialect": "postgresql",
@@ -2301,6 +2301,22 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "agent_wakeup_requests_deferred_requested_idx": {
+          "name": "agent_wakeup_requests_deferred_requested_idx",
+          "columns": [
+            {
+              "expression": "requested_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"agent_wakeup_requests\".\"status\" = 'deferred_issue_execution'",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -24999,33 +25015,6 @@
               "expression": "created_at",
               "isExpression": false,
               "asc": false,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "heartbeat_runs_company_settled_idx": {
-          "name": "heartbeat_runs_company_settled_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "(coalesce(\"finished_at\", \"created_at\"))",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
               "nulls": "last"
             }
           ],
