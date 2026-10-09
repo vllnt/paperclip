@@ -31,6 +31,7 @@ import {
 import { agentsApi } from "@/api/agents";
 import { ApiError } from "@/api/client";
 import { instanceSettingsApi } from "@/api/instanceSettings";
+import { resourceCapacityApi } from "@/api/resourceCapacity";
 import { secretsApi } from "@/api/secrets";
 import {
   AlertDialog,
@@ -48,6 +49,7 @@ import {
   type EnvironmentVariablesEditorHandle,
 } from "@/components/environment-variables-editor";
 import { JsonSchemaForm, getDefaultValues, validateJsonSchemaForm } from "@/components/JsonSchemaForm";
+import { ResourceCapacitySummary } from "@/components/ResourceCapacitySummary";
 import {
   SecretRefHintsContext,
   type SecretRefHint,
@@ -1350,6 +1352,20 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
     enabled: Boolean(selectedCompanyId) && environmentsEnabled,
   });
   const savedEnvironments = environments ?? [];
+  // CPU, memory and disk of the environments this company's agents run on;
+  // other environments have no line.
+  const resourceCapacityQuery = useQuery({
+    queryKey: selectedCompanyId
+      ? queryKeys.resourceCapacity.company(selectedCompanyId)
+      : ["resource-capacity", "company", "none"],
+    queryFn: () => resourceCapacityApi.company(selectedCompanyId!),
+    enabled: Boolean(selectedCompanyId) && environmentsEnabled,
+    refetchInterval: 60_000,
+    retry: false,
+  });
+  const resourceCapacityByEnvironmentId = new Map(
+    (resourceCapacityQuery.data?.environments ?? []).map((capacity) => [capacity.environmentId, capacity]),
+  );
   // Delete preflight: the blast radius names what still references the
   // environment, and the agent list identifies which of this company's agents
   // need reassignment. Both only load while the delete dialog is open.
@@ -2005,9 +2021,16 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
           </Button>
         </div>
 
+        {resourceCapacityQuery.error ? (
+          <div className="text-xs text-destructive">
+            Resource capacity is unavailable:{" "}
+            {resourceCapacityQuery.error instanceof Error ? resourceCapacityQuery.error.message : "request failed"}.
+          </div>
+        ) : null}
         <div className="space-y-1">
           {savedEnvironments.map((environment) => {
             const probe = probeResults[environment.id] ?? null;
+            const resourceCapacity = resourceCapacityByEnvironmentId.get(environment.id);
             const sandboxProvider = readEnvironmentSandboxProvider(environment);
             const sandboxProviderCapability = sandboxProvider
               ? environmentCapabilities?.sandboxProviders?.[sandboxProvider]
@@ -2060,6 +2083,9 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
                     ) : (
                       <div className="text-xs text-muted-foreground">Runs on this Paperclip host.</div>
                     )}
+                    {resourceCapacity && resourceCapacity.sampling === "sampled" ? (
+                      <ResourceCapacitySummary snapshot={resourceCapacity} />
+                    ) : null}
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     {environment.driver !== "local" ? (

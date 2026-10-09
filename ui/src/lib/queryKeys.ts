@@ -517,6 +517,10 @@ export const queryKeys = {
     customImageSetupSession: (sessionId: string) =>
       ["environment-custom-image-setup-sessions", sessionId] as const,
   },
+  resourceCapacity: {
+    instance: ["resource-capacity", "instance"] as const,
+    company: (companyId: string) => ["resource-capacity", "company", companyId] as const,
+  },
   projects: {
     all: (companyId: string) => ["projects", companyId] as const,
     list: (companyId: string, opts: { includeArchived?: boolean } = {}) =>

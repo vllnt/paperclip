@@ -1424,6 +1424,22 @@ or follow the link to inspect the commit on GitHub.
 Opening the menu refreshes `/api/health` so the label reflects recent deploys.
 The label is hidden on other hosts and when commit metadata is unavailable.
 
+## Resource Capacity
+
+Every server process samples its own host (free disk of the instance data,
+run-log and workspace roots, available memory, load per CPU core) and, for
+SSH environments, reads the worker during lease acquire and a slow sweep. No
+daemon runs on workers; a failed read is skipped. Read it on the
+"Resource capacity" instance settings page (instance admins), on the
+environments page, with `paperclipai capacity`, or through
+`GET /api/companies/:companyId/resource-capacity`. For instance admins,
+`/api/health` also returns `resourceCapacity: { level, sampledAt }`.
+
+- `PAPERCLIP_RESOURCE_CAPACITY_SAMPLE_INTERVAL_MS=<ms>` (default `60000`, minimum `15000`)
+- `PAPERCLIP_RESOURCE_CAPACITY_RETENTION_DAYS=<days>` (default `30`, minimum `1`)
+
+The plan and level rules are in `doc/plans/2026-10-09-resource-capacity.md`.
+
 ## Reset Local Dev Database
 
 To wipe local dev data and start fresh:

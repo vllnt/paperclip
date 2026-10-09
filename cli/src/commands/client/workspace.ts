@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { addEnvironmentCapacityCommand } from "./capacity.js";
 import {
   addCommonClientOptions,
   apiPath,
@@ -65,6 +66,7 @@ export function registerWorkspaceCommands(program: Command): void {
   addDelete(environment, "delete", "Delete an environment", "environments");
   addPostEmpty(environment, "probe", "Probe an environment", "environments", "probe");
   addCompanyPostJson(environment, "probe-config", "Probe an environment config", "environments/probe-config");
+  addEnvironmentCapacityCommand(environment);
 
   const projectWorkspace = program.command("project-workspace").description("Project workspace operations");
   addCommonClientOptions(
