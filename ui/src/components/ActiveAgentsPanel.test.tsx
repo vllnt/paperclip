@@ -125,6 +125,7 @@ describe("ActiveAgentsPanel", () => {
   afterEach(() => {
     container.remove();
     document.body.innerHTML = "";
+    window.localStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -144,6 +145,10 @@ describe("ActiveAgentsPanel", () => {
     }
     const placeholder = () => container.querySelector('[data-testid="active-agents-loading"]');
     const linkPlaceholder = () => container.querySelector('[data-testid="active-agents-loading-link"]');
+    const skeletons = () => [...(placeholder()?.querySelectorAll('[data-slot="skeleton"]') ?? [])];
+    const shownSkeletons = () => skeletons().filter((element) => !element.className.includes("hidden"));
+    const storedCount = (scope = "dashboard") =>
+      window.localStorage.getItem(`paperclip:live-run-cards:company-1:${scope}`);
 
     it("does not reserve the link row when the panel has no link", async () => {
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
@@ -165,7 +170,14 @@ describe("ActiveAgentsPanel", () => {
       const root = await renderPanel();
 
       expect(placeholder()?.getAttribute("aria-busy")).toBe("true");
-      expect(placeholder()?.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(4);
+      // No recorded count: one row of the grid is visible (1 card on a phone, 2 from sm, 4 from xl).
+      expect(skeletons().map((element) => element.className.match(/hidden [a-z:]+/)?.[0] ?? "shown")).toEqual([
+        "shown",
+        "hidden sm:block",
+        "hidden xl:block",
+        "hidden xl:block",
+      ]);
+      expect(shownSkeletons()).toHaveLength(1);
       expect(linkPlaceholder()).not.toBeNull();
       expect(container.textContent).not.toContain("No recent agent runs.");
 
@@ -212,10 +224,96 @@ describe("ActiveAgentsPanel", () => {
     });
 
     it.each([
+      ["1", 4, 1],
+      ["2", 4, 2],
+      ["3", 4, 3],
+      ["4", 4, 4],
+      ["9", 4, 4],
+      ["30", 50, 30],
+    ])("sizes the placeholder to the recorded count %s (cardLimit %i): %i cards, all shown", async (stored, cardLimit, expected) => {
+      window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard", stored);
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
+      const root = await renderPanel({ cardLimit });
+
+      expect(skeletons()).toHaveLength(expected);
+      expect(shownSkeletons()).toHaveLength(expected);
+      expect(linkPlaceholder()).not.toBeNull();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("reserves the empty box, not cards, when the last load was empty", async () => {
+      window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard", "0");
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
+      const root = await renderPanel();
+
+      expect(placeholder()).toBeNull();
+      expect(linkPlaceholder()).toBeNull();
+      const box = container.querySelector('[data-testid="active-agents-loading-empty"]');
+      expect(box?.className).toContain("rounded-xl border border-border p-4");
+      expect(box?.querySelector("p")?.className).toContain("invisible");
+      expect(box?.querySelector("p")?.getAttribute("aria-hidden")).toBe("true");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("ignores a count recorded for another company or scope", async () => {
+      window.localStorage.setItem("paperclip:live-run-cards:company-2:dashboard", "3");
+      window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard-live", "3");
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
+      const root = await renderPanel();
+
+      expect(shownSkeletons()).toHaveLength(1);
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it.each([
+      [[1, 2, 3, 4, 5], 4, "4"],
+      [[1], 4, "1"],
+      [[1, 2], 4, "2"],
+      [[], 4, "0"],
+      [[1, 2, 3, 4, 5, 6], 50, "6"],
+    ])("records the cards of a finished load: %j runs with cardLimit %i gives %s", async (indexes, cardLimit, expected) => {
+      mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue(indexes.map(createRun));
+      const root = await renderPanel({ cardLimit });
+
+      await waitForMicrotaskAssertion(() => {
+        expect(placeholder()).toBeNull();
+        expect(storedCount()).toBe(expected);
+      });
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("keeps the recorded count when the runs fail to load", async () => {
+      window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard", "3");
+      mockHeartbeatsApi.liveRunsForCompany.mockRejectedValue(new Error("boom"));
+      const root = await renderPanel();
+
+      await waitForMicrotaskAssertion(() => {
+        expect(placeholder()).toBeNull();
+      });
+      expect(storedCount()).toBe("3");
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it.each([
       [2, 2],
       [4, 4],
       [20, 4],
-    ])("reserves at most the dashboard row: cardLimit %i gives %i placeholders", async (cardLimit, expected) => {
+    ])("reserves at most the dashboard row when no count is recorded: cardLimit %i gives %i placeholders", async (cardLimit, expected) => {
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
       const root = await renderPanel({ cardLimit });
 
