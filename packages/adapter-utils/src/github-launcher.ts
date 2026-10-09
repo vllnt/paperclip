@@ -119,7 +119,11 @@ function foreignRewrites(env, globalArgs) {
   });
 }
 // What a push sends: the checked-out branch, full names of bare refspec names,
-// the commits, and whether new commits change workflow files.
+// the commits, and whether new commits change workflow files (which ones, when few).
+const WORKFLOWS = '.github/workflows';
+// More paths, or longer ones, than the broker reads: none are reported (the report stays readable and the toggle decides).
+const MAX_WORKFLOW_CHANGES = 100;
+const MAX_WORKFLOW_PATH = 300;
 function pushReport(env, globalArgs, pushArgs) {
   const { positional, repoOption, deleting } = gitNetworkArgs('push', pushArgs);
   const branch = gitOutput(env, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
@@ -164,12 +168,32 @@ function pushReport(env, globalArgs, pushArgs) {
   const shas = commits.map(source => (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', source + '^{commit}']) || '').trim())
     .filter(sha => /^[0-9a-f]{40,64}$/.test(sha)).slice(0, 64);
   let touchesWorkflows = commits.length ? null : false;
+  let workflowChanges;
   if (commits.length && shas.length === commits.length) {
-    // Unquoted names (non-ASCII too) and merge commits' own changes against their first parent.
-    const files = gitOutput(env, ['-c', 'core.quotePath=false', ...globalArgs], ['log', '--format=', '--name-only', '--diff-merges=first-parent', ...shas, '--not', '--remotes']);
-    if (files !== null) touchesWorkflows = files.split('\n').some(file => file.startsWith('.github/workflows/'));
+    // NUL-separated names (never quoted), merge commits' own changes against their first parent, and no rename pairing:
+    // a workflow renamed or moved out of the directory shows as a deletion there.
+    const files = gitOutput(env, globalArgs, ['log', '--format=', '--name-only', '-z', '--no-renames', '--diff-merges=first-parent', ...shas, '--not', '--remotes']);
+    if (files !== null) {
+      const paths = [...new Set(files.split('\0').filter(file => file === WORKFLOWS || file.startsWith(WORKFLOWS + '/')))].sort();
+      touchesWorkflows = paths.length > 0;
+      // One pushed commit: what each of those paths is at its tip (mode and blob; null when absent), for the broker to compare with the base branch.
+      if (paths.length && paths.length <= MAX_WORKFLOW_CHANGES && paths.every(file => file.length <= MAX_WORKFLOW_PATH) && shas.length === 1) {
+        const listing = gitOutput(env, globalArgs, ['ls-tree', '-z', '-r', '--full-tree', shas[0], '--', WORKFLOWS]);
+        if (listing !== null) {
+          const entries = new Map();
+          for (const entry of listing.split('\0')) {
+            const parsed = /^(\d{6}) \w+ ([0-9a-f]{40,64})\t([\s\S]+)$/.exec(entry);
+            if (parsed) entries.set(parsed[3], { mode: parsed[1], oid: parsed[2] });
+          }
+          // A path the listing lacks is reported as gone, so make sure the tip has nothing there (not even a directory).
+          const gone = paths.filter(file => !entries.has(file));
+          const there = gone.length ? gitOutput(env, globalArgs, ['ls-tree', '-z', '--full-tree', shas[0], '--', ...gone]) : '';
+          if (there === '') workflowChanges = paths.map(file => ({ path: file, ...(entries.get(file) || { mode: null, oid: null }) }));
+        }
+      }
+    }
   }
-  return { currentBranch: current || null, refs, shas, touchesWorkflows, pushUrls, ...(implicitPush ? { implicitPush: true } : {}), ...(followTags || unknown ? { followTags: true } : {}),
+  return { currentBranch: current || null, refs, shas, touchesWorkflows, ...(workflowChanges ? { workflowChanges } : {}), pushUrls, ...(implicitPush ? { implicitPush: true } : {}), ...(followTags || unknown ? { followTags: true } : {}),
     ...(recursion === 'no' || recursion === 'check' ? {} : { recurseSubmodules: recursion === null ? 'unknown' : recursion.slice(0, 100) }), ...(cut ? { truncated: true } : {}) };
 }
 function operation(env) {

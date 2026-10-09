@@ -255,6 +255,40 @@ admin-merge guard; and the throttle (`perMinute`, `perHour` per GitHub user).
 | `pushToMain` | pushes or API writes to `main`/`master`, `gh repo sync`, `merge-upstream` | off |
 | `editWorkflows` | a push whose new commits change `.github/workflows/**`, contents API writes there | off |
 
+**Workflow files and the base branch.** A push whose new commits change
+`.github/workflows/**` needs `editWorkflows`, with one exception: an agent keeps
+a pull request current by merging its base branch, and the base branch's own
+workflow changes come in with that merge. With `editWorkflows` off, the plugin
+lets such a push through when it is one commit to one named branch and every
+workflow path the new commits change is, at the pushed tip, byte for byte what
+the base branch has now (same git mode and blob), or gone from both. The
+checkout reports each path with its mode and blob ID (the rename of a workflow,
+or a move out of the directory, shows as a deletion plus an addition). The
+plugin reads the base branch from GitHub at that moment with the App's
+read-only token: the base of the open pull request from the pushed branch, else
+the repository's default branch. Whoever opens a pull request chooses its base,
+so the base counts only when it is the default branch or a protected branch;
+workflow files on any other branch are not taken as reviewed. It refuses when the
+branch has open pull requests into different bases, when the base cannot be read
+in full, when the push is more than one commit or one branch, changes more than
+100 workflow paths or a path longer than 300 characters (the report then carries
+no paths and the toggle decides), and for every symlink or submodule among the
+changed paths, whether or not the base branch has the same. The refusal names
+the paths that differ; the audit record lists all of them, and the base branch
+and its commit when the comparison passed. An agent's own edit, a rename, a mode
+change, or a deletion the base branch does not share is refused as before. This
+applies to the App user identity only (with `userSource: "run"` the toggle
+decides as before), and it unlocks no other toggle: `pushToMain`, `tagPush` and
+the rest still apply.
+
+This lifts Paperclip's refusal only. GitHub has its own: it refuses a push that
+changes workflow files from an App without the Workflows write permission, which
+is why the hard limit below is to keep that permission off. Whether GitHub counts
+a merge of the base branch's own workflow files as such a change was not
+verified. If it does, these pushes still fail at GitHub until a human grants the
+permission, and then the checkout's report of the pushed paths is the only gate
+that remains.
+
 Release tags (`name@version`) and bulk tag pushes (`--tags`, `--follow-tags`,
 `--mirror`, tag patterns) are refused whatever the toggles: only the
 repository's release workflow creates release tags. Writes are also refused
@@ -405,7 +439,9 @@ program named `gh` later in `PATH`, or a gh extension, which all run with the
 token in their environment) can skip them for at most 8 hours; the hard limits are GitHub's: the App
 installation's repositories and permissions (keep Workflows write off so
 workflow files cannot change), and the repositories' rulesets. The
-`editWorkflows` check reads the checkout's history, which an agent controls.
+`editWorkflows` check reads the checkout's history, which an agent controls. The
+base-branch comparison trusts the same report of the pushed tip; only the base
+side comes from GitHub.
 `pushToMain` knows `main` and `master` only.
 
 With `userSource: "run"`, the kill switch withholds the run's token entirely

@@ -3,6 +3,8 @@ import {
   classifyGitHubOperation,
   parseGitHubOperation,
   readGitHubOperation,
+  registerGitHubWriteIdentityWorkers,
+  resolveGitHubWriteIdentityDecision,
 } from "../services/github-write-identity.js";
 
 // Destination parsing itself (URLs, scp, local paths, other hosts) is tested with parseGitHubDestination in @paperclipai/shared.
@@ -357,5 +359,74 @@ describe("security review round 5 (attack regressions)", () => {
     }
     expect(classifyGitHubOperation({ program: "gh", args: ["api", "graphql", "-f", 'query=mutation{updatePullRequest(input:{pullRequestId:"x",baseRefName:"main"}){clientMutationId}}'], remote: origin }).denied)
       .toMatch(/cannot check the GraphQL mutation updatePullRequest/);
+  });
+
+  describe("workflow changes of a push", () => {
+    const origin = "https://github.com/Acme/Site.git";
+    const sha = "a".repeat(40);
+    const changes = [{ path: ".github/workflows/ci.yml", mode: "100644", oid: "b".repeat(40) }, { path: ".github/workflows/old.yml", mode: null, oid: null }];
+    const push = (args: string[], extra: Record<string, unknown> = {}) => classifyGitHubOperation({
+      program: "git", args, remote: origin, pushUrls: [origin], currentBranch: "feature/x", refs: { "feature/x": "refs/heads/feature/x" },
+      shas: [sha], touchesWorkflows: true, workflowChanges: changes, ...extra,
+    });
+
+    it("keeps editWorkflows on the push and hands the plugin its one branch and the changed paths", () => {
+      for (const args of [["push", "origin", "feature/x"], ["push"], ["push", "origin", "HEAD"], ["push", "-u", "origin", "HEAD:refs/heads/feature/x"], ["push", "origin", "refs/heads/feature/x"],
+        ["push", "--force-with-lease", "origin", "+feature/x"], ["push", "origin", "heads/feature/x"]]) {
+        const classified = push(args);
+        expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: { branch: "feature/x", changes } });
+        expect(classified.denied, args.join(" ")).toBeUndefined();
+      }
+      // A push to another branch name is that branch.
+      expect(push(["push", "origin", "HEAD:refs/heads/release/1.2"])).toMatchObject({ workflowPush: { branch: "release/1.2", changes } });
+    });
+
+    it("offers nothing the plugin could compare when the push is not exactly one commit to one named branch", () => {
+      const cases: Array<[string, ReturnType<typeof push>]> = [
+        ["two commits", push(["push", "origin", "feature/x"], { shas: [sha, "c".repeat(40)] })],
+        ["two branches", push(["push", "origin", "feature/x", "other"], { refs: { "feature/x": "refs/heads/feature/x", other: "refs/heads/other" } })],
+        ["a tag", push(["push", "origin", "HEAD:refs/tags/v1"])],
+        ["every branch", push(["push", "--all", "origin"])],
+        ["a pattern", push(["push", "origin", "HEAD:refs/heads/*"])],
+        ["config that can push more", push(["push"], { implicitPush: true })],
+        ["a deletion", push(["push", "origin", "--delete", "feature/x"])],
+        ["a detached HEAD (no branch name)", push(["push", "origin", "HEAD"], { currentBranch: null })],
+        ["no reported changes", push(["push", "origin", "feature/x"], { workflowChanges: undefined })],
+        ["an empty list", push(["push", "origin", "feature/x"], { workflowChanges: [] })],
+        ["a push the launcher says has no workflow changes", push(["push", "origin", "feature/x"], { touchesWorkflows: false })],
+      ];
+      for (const [label, classified] of cases) expect(classified, label).not.toHaveProperty("workflowPush");
+      // Without the paths the toggle alone decides, as before.
+      expect(push(["push", "origin", "feature/x"], { workflowChanges: undefined })).toMatchObject({ privileged: ["editWorkflows"] });
+    });
+
+    it("still refuses what the toggles never allow, whatever the push reports", () => {
+      const tag = push(["push", "origin", "refs/tags/engine@1.0.0"]);
+      expect(tag.denied).toMatch(/Release tags/);
+      expect(tag).not.toHaveProperty("workflowPush");
+      expect(push(["push", "origin", "feature/x"], { urlRewrites: true }).denied).toMatch(/url\.\*\.insteadOf/);
+    });
+
+    it("accepts the reported changes only in the launcher's exact shape", () => {
+      const operation = { program: "git", args: ["push", "origin", "feature/x"], remote: origin, shas: [sha], touchesWorkflows: true };
+      expect(parseGitHubOperation({ operation: { ...operation, workflowChanges: changes } })).toMatchObject({ workflowChanges: changes });
+      for (const bad of [[{ path: ".github/workflows/ci.yml", mode: "100644" }], [{ path: ".github/workflows/ci.yml", mode: "644", oid: "b".repeat(40) }],
+        [{ path: ".github/workflows/ci.yml", mode: "100644", oid: "xyz" }], [{ path: 1, mode: null, oid: null }], "x", Array.from({ length: 101 }, () => changes[0]),
+        [{ path: `.github/workflows/${"x".repeat(300)}.yml`, mode: null, oid: null }]]) {
+        expect(readGitHubOperation({ operation: { ...operation, workflowChanges: bad } }), JSON.stringify(bad).slice(0, 60)).toBe("unreadable");
+      }
+    });
+
+    it("sends the plugin the branch and paths with the other write-identity parameters", async () => {
+      const calls: Array<Record<string, any>> = [];
+      registerGitHubWriteIdentityWorkers({ call: async (_plugin: string, _method: string, input: any) => { calls.push(input.params); return { identity: "user", unavailable: "stop here" }; } } as any);
+      try {
+        const record = { pluginId: "plugin-github", ready: true, policy: "invalid", manifest: { projectRepositories: { writeIdentityAction: "repository-write-identity" } } } as any;
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: push(["push", "origin", "feature/x"]) }, record);
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: push(["push", "origin", "feature/x"], { workflowChanges: undefined }) }, record);
+        expect(calls[0]).toMatchObject({ companyId: "company-1", repository: "acme/site", privileged: ["editWorkflows"], workflowPush: { branch: "feature/x", changes } });
+        expect(calls[1]).not.toHaveProperty("workflowPush");
+      } finally { registerGitHubWriteIdentityWorkers(null); }
+    });
   });
 });

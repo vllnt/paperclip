@@ -108,6 +108,24 @@ export interface GitHubWriteIdentityPolicy {
 }
 
 /** What the host asks a GitHub plugin's `writeIdentityAction` for one managed operation. */
+/** One workflow path (`.github/workflows` or below) a push changes, as the pushed tip has it: git mode and blob id, both null when the path is gone there. */
+export interface GitHubWorkflowChange {
+  path: string;
+  mode: string | null;
+  oid: string | null;
+}
+
+/**
+ * A push of one commit to one named branch whose new commits change workflow
+ * files, with those paths as the checkout reports them. The plugin allows it
+ * without `editWorkflows` only when every path is the same on the base branch.
+ */
+export interface GitHubWorkflowPush {
+  /** The branch name, without `refs/heads/`. */
+  branch: string;
+  changes: GitHubWorkflowChange[];
+}
+
 export interface GitHubWriteIdentityRequest {
   companyId: string;
   /** Lowercase `owner/name` (a wiki folded into its repository), or null when unknown. */
@@ -127,6 +145,8 @@ export interface GitHubWriteIdentityRequest {
   autoMerge?: boolean;
   /** The command changes an open pull request's base branch. */
   retarget?: boolean;
+  /** A push whose workflow changes may arrive without `editWorkflows` when they are the base branch's own (see {@link GitHubWorkflowPush}). */
+  workflowPush?: GitHubWorkflowPush;
   /** Ask for the App after a `user` write found no GitHub identity. Honoured only under `use_bot`. */
   fallback?: boolean;
 }
