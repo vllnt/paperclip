@@ -159,7 +159,8 @@ export function resolveObservabilityWindow(
   return { since, until };
 }
 
-interface ReportInput {
+/** Input of one report: the company, the window, the group, and the already-built filters. */
+export interface ReportInput {
   companyId: string;
   dimension: Dimension;
   since: Date;
@@ -173,6 +174,42 @@ interface ReportResult {
   rows: Array<{ raw: RawRow; key: string | null; label: string | null }>;
   totals: RawRow;
   truncated: boolean;
+}
+
+/**
+ * Builds the two statements of a report: the grouped rows and the whole-window totals. They are
+ * exported so the query-plan script can run `EXPLAIN` on exactly the SQL that the service runs.
+ *
+ * @param input - The report input.
+ * @returns The grouped statement, the totals statement, and whether the group is a time bucket.
+ */
+export function buildReportQueries(input: ReportInput): { grouped: SQL; total: SQL; timeBuckets: boolean } {
+  const aggregates = buildAggregates(input.failureFilter);
+  const where = and(
+    eq(runUsageRecords.companyId, input.companyId),
+    gte(runUsageRecords.finishedAt, input.since),
+    lt(runUsageRecords.finishedAt, input.until),
+    ...input.filters,
+  );
+  const timeBuckets = input.dimension === "day" || input.dimension === "hour";
+  const having = input.failureFilter ? sql`having ${aggregates.runs} > 0` : sql``;
+  const order = timeBuckets
+    ? sql`group_key asc`
+    : sql`${aggregates.volume} desc, ${aggregates.runs} desc, group_key asc nulls last`;
+  const limitClause = timeBuckets ? sql`` : sql`limit ${input.limit + 1}`;
+  return {
+    grouped: sql`
+      select ${DIMENSION_KEY[input.dimension]} as group_key, ${aggregates.select}
+      from ${runUsageRecords}
+      where ${where}
+      group by 1
+      ${having}
+      order by ${order}
+      ${limitClause}
+    `,
+    total: sql`select ${aggregates.select} from ${runUsageRecords} where ${where}`,
+    timeBuckets,
+  };
 }
 
 /**
@@ -208,32 +245,9 @@ export function runUsageQueryService(db: Db) {
   }
 
   async function report(input: ReportInput): Promise<ReportResult> {
-    const aggregates = buildAggregates(input.failureFilter);
-    const where = and(
-      eq(runUsageRecords.companyId, input.companyId),
-      gte(runUsageRecords.finishedAt, input.since),
-      lt(runUsageRecords.finishedAt, input.until),
-      ...input.filters,
-    );
-    const timeBuckets = input.dimension === "day" || input.dimension === "hour";
-    const having = input.failureFilter ? sql`having ${aggregates.runs} > 0` : sql``;
-    const order = timeBuckets
-      ? sql`group_key asc`
-      : sql`${aggregates.volume} desc, ${aggregates.runs} desc, group_key asc nulls last`;
-    const limitClause = timeBuckets ? sql`` : sql`limit ${input.limit + 1}`;
-
-    const [grouped, total] = await Promise.all([
-      db.execute(sql`
-        select ${DIMENSION_KEY[input.dimension]} as group_key, ${aggregates.select}
-        from ${runUsageRecords}
-        where ${where}
-        group by 1
-        ${having}
-        order by ${order}
-        ${limitClause}
-      `),
-      db.execute(sql`select ${aggregates.select} from ${runUsageRecords} where ${where}`),
-    ]);
+    const queries = buildReportQueries(input);
+    const timeBuckets = queries.timeBuckets;
+    const [grouped, total] = await Promise.all([db.execute(queries.grouped), db.execute(queries.total)]);
 
     const parsed = Array.from(grouped, (row) => rawRowSchema.parse(row));
     const truncated = !timeBuckets && parsed.length > input.limit;
