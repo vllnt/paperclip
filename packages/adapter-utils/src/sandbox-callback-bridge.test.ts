@@ -1545,7 +1545,6 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/decisions/dec-1/dismiss" },
       { method: "DELETE", path: "/api/companies/co-1/skills/skill-1" },
       { method: "DELETE", path: "/api/companies/co-1/skills/skill-1/files" },
-      { method: "POST", path: "/api/companies/co-1/skills/import" },
       { method: "PATCH", path: "/api/companies/co-1/skills/skill-1/files/extra" },
       { method: "POST", path: "/api/companies/co-1/decision-bundles" },
       // Listing decisions is board-only on the server.
@@ -1566,9 +1565,10 @@ describe("sandbox callback bridge", () => {
     }
   });
 
-  it("admits company skill create, and no other skill write", () => {
+  it("admits company skill create and import, and no other skill write", () => {
     const allowed: Array<{ method: string; path: string }> = [
       { method: "POST", path: "/api/companies/co-1/skills" },
+      { method: "POST", path: "/api/companies/co-1/skills/import" },
     ];
     for (const request of allowed) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
@@ -1584,8 +1584,7 @@ describe("sandbox callback bridge", () => {
       { method: "DELETE", path: "/api/companies/co-1/skills" },
       { method: "PUT", path: "/api/companies/co-1/skills/import" },
       { method: "DELETE", path: "/api/companies/co-1/skills/import" },
-      // Neighbouring skill writes stay human-only: only create is admitted here.
-      { method: "POST", path: "/api/companies/co-1/skills/import" },
+      // Neighbouring skill writes stay human-only: only create and import are admitted.
       { method: "POST", path: "/api/companies/co-1/skills/skill-1" },
       { method: "POST", path: "/api/companies/co-1/skills/install-catalog" },
       { method: "POST", path: "/api/companies/co-1/skills/scan-projects" },

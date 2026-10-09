@@ -157,6 +157,9 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
   { method: "PATCH", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
   { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/skills$/ },
+  // Import takes a source (URL, GitHub, skills.sh or an approved local path). The server checks the source and the
+  // skills.import policy; the other install paths (install-catalog, scan-projects, audit, reset) stay denied.
+  { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/import$/ },
   // Decisions: agents ask the board and withdraw their own open asks (the server allows the origin agent only).
   // Listing stays board-only; deciding and dismissing stay human-only.
   { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/decisions$/ },
