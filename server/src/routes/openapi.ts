@@ -3737,6 +3737,20 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/agents/{id}/harness-cooldowns/clear",
+  tags: ["agents"],
+  summary: "Clear an agent's provider quota cooldowns (board only)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/agents/{id}/clear-error",
   tags: ["agents"],
   summary: "Clear an agent error",
