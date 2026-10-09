@@ -21,6 +21,9 @@ npx paperclipai issue similar --title "..." [--description "..."] [--parent-id <
 # Update issue
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]
 
+# Block an issue on a human step; the board sees it in its inbox and must unblock it
+npx paperclipai issue update <issue-id> --status blocked --unblock-owner board --unblock-action "Click Update branch on PR #123"
+
 # Add comment
 npx paperclipai issue comment <issue-id> --body "..." [--reopen]
 

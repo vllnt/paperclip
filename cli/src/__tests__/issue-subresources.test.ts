@@ -276,6 +276,49 @@ describe("issue subresource commands", () => {
   });
 });
 
+describe("issue update unblock owner", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.PAPERCLIP_API_KEY;
+    delete process.env.PAPERCLIP_API_URL;
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ["board", "board"],
+    [`agent:${ISSUE_ID}`, { agentId: ISSUE_ID }],
+    ["user:board-user", { userId: "board-user" }],
+  ])("sends --unblock-owner %s with its action", async (flag, owner) => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({ id: ISSUE_ID })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "update", ISSUE_ID, "--status", "blocked", "--unblock-owner", flag, "--unblock-action", "Click Update branch"]);
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      status: "blocked",
+      unblockDescriptor: { owner, action: "Click Update branch" },
+    });
+  });
+
+  it("rejects an unknown owner or a missing action before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+
+    await run(["issue", "update", ISSUE_ID, "--unblock-owner", "manager", "--unblock-action", "x"]);
+    await run(["issue", "update", ISSUE_ID, "--unblock-owner", "board"]);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledTimes(2);
+  });
+});
+
 function jsonResponse(body: unknown = { ok: true }, init: ResponseInit = { status: 200 }): Response {
   return new Response(JSON.stringify(body), init);
 }
