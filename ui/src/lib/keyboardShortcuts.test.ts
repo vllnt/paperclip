@@ -5,6 +5,7 @@ import {
   findPageSearchShortcutTarget,
   focusPageSearchShortcutTarget,
   hasBlockingShortcutDialog,
+  isInsideOpenModalDialog,
   isKeyboardShortcutTextInputTarget,
   resolveAttentionQueueKeyAction,
   resolveGoChordKeyAction,
@@ -370,8 +371,39 @@ describe("hasBlockingShortcutDialog", () => {
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "aria-modal": "true" }))).toBe(true);
   });
 
+  it("detects raw Radix dialog content without shadcn slots (the image gallery)", () => {
+    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-state": "open" }))).toBe(true);
+  });
+
   it("ignores closing dialogs and non-modal popovers", () => {
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "dialog-content", "data-state": "closed" }))).toBe(false);
-    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "popover-content", "data-state": "open" }))).toBe(false);
+    // Radix renders popover content (also role=dialog) inside a popper wrapper.
+    const root = document.createElement("div");
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+    const popover = document.createElement("div");
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("data-state", "open");
+    wrapper.appendChild(popover);
+    root.appendChild(wrapper);
+    expect(hasBlockingShortcutDialog(root)).toBe(false);
+    expect(isInsideOpenModalDialog(popover)).toBe(false);
+  });
+
+  it("finds the modal around a popover that is open inside it", () => {
+    const modal = document.createElement("div");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("data-state", "open");
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+    const popover = document.createElement("div");
+    popover.setAttribute("role", "dialog");
+    popover.setAttribute("data-state", "open");
+    const input = document.createElement("input");
+    popover.appendChild(input);
+    wrapper.appendChild(popover);
+    modal.appendChild(wrapper);
+    expect(isInsideOpenModalDialog(input)).toBe(true);
+    expect(isInsideOpenModalDialog(document.createElement("button"))).toBe(false);
   });
 });
