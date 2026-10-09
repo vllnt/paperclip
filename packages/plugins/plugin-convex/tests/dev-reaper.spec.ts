@@ -397,7 +397,9 @@ describe("review fixes (PR #46)", () => {
     f.convex.add(make("pr4320-run5-s1", 9), make("pr4320-s1", 4), make("pr4320-run3-s1", 6));
     // PR 4321 has no run numbers: the older one is replaced by one made at least the minimum age later.
     f.convex.add(make("pr4321-s1", 8), make("pr4321-s2", 2));
-    f.github.pulls.push({ number: 4320, ref: "a" }, { number: 4321, ref: "b" });
+    // PR 4322: two shards made ten minutes apart are one wave, not a replacement.
+    f.convex.add(make("pr4322-s1", 3), make("pr4322-s2", 3 - 10 / 60));
+    f.github.pulls.push({ number: 4320, ref: "a" }, { number: 4321, ref: "b" }, { number: 4322, ref: "c" });
     await f.h.runJob("convex-reaper");
     expect(deleted(f)).toEqual(["pr4320-run3-s1", "pr4321-s1"]);
   });

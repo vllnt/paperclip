@@ -30,7 +30,7 @@ describe("hardDeleteBlock", () => {
     expect(block({ previewIdentifier: `feat/${word}` })).toMatch(/production, staging, main or release/);
   });
 
-  it.each(["staging2", "prod1", "release2026-10", "releaseCandidate", "mainBranch", "prodDb", "preprod", "PRD", "stage", "stg", "Production2"])("blocks %s, where the word is joined to a digit or a capital letter", value => {
+  it.each(["staging2", "prod1", "release2026-10", "releaseCandidate", "mainBranch", "prodDb", "preprod", "PRD", "stage", "stg", "Production2", "2staging", "v3main", "10release"])("blocks %s, where the word is joined to a digit or a capital letter", value => {
     expect(block({ name: "ok-name", reference: `dev/${value}`, previewIdentifier: null }), value).toMatch(/production, staging, main or release/);
   });
 
