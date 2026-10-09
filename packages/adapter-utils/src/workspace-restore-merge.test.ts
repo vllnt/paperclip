@@ -10,6 +10,7 @@ import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 import { WorkspaceManifestMap } from "./workspace-manifest.js";
 import {
   captureDirectorySnapshot,
+  descriptorPinningSupported,
   directorySnapshotSha256,
   disposeDirectorySnapshot,
   classifyWorkspaceRestoreFailure,
@@ -17,6 +18,7 @@ import {
   mergeDirectoryWithBaseline,
   parseDirectorySnapshot,
   serializeDirectorySnapshot,
+  type SnapshotEntry,
   withDirectoryMergeLock,
   WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
 } from "./workspace-restore-merge.js";
@@ -1391,5 +1393,127 @@ describe("merge mutations never follow a symlinked ancestor out of the workspace
     expect(await readFile(path.join(target, "shortcut", "real.txt"), "utf8")).toBe("now a directory\n");
     expect((await lstat(path.join(target, "shortcut"))).isDirectory()).toBe(true);
     expect(await treeOf(outside)).toEqual(before);
+  });
+});
+
+describe("merge mutations are bound to the directory they validated", () => {
+  const roots: string[] = [];
+  let previousHome: string | undefined;
+  let previousInstanceId: string | undefined;
+  // Directory descriptors can be used as path bases only where /proc exposes them.
+  const pinning = typeof descriptorPinningSupported === "function" && descriptorPinningSupported();
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+    if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+    while (roots.length > 0) await rm(roots.pop()!, { recursive: true, force: true });
+  });
+
+  async function workspace() {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-pinned-")));
+    roots.push(root);
+    previousHome = process.env.PAPERCLIP_HOME;
+    previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = path.join(root, "home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const target = path.join(root, "target");
+    const source = path.join(root, "source");
+    const outside = path.join(root, "outside");
+    await mkdir(path.join(target, "a"), { recursive: true });
+    await writeFile(path.join(target, "a", "x"), "inside x\n");
+    await mkdir(outside);
+    await writeFile(path.join(outside, "x"), "outside x\n");
+    return { root, target, source, outside };
+  }
+
+  async function swapAForLinkTo(target: string, outside: string) {
+    await fsPromises.rename(path.join(target, "a"), path.join(target, "a-moved"));
+    await symlink(outside, path.join(target, "a"));
+  }
+
+  async function snapshotOf(dir: string): Promise<Record<string, string>> {
+    const result: Record<string, string> = {};
+    for (const name of await readdir(dir)) result[name] = await readFile(path.join(dir, name), "utf8");
+    return result;
+  }
+
+  it("rejects a snapshot that has a link and a child below it, and leaves the target unchanged", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await mkdir(source);
+    await writeFile(path.join(source, "b"), "child of a link\n");
+    // No real walk produces this: the run's tree has `a` as a link and `a/b` below it.
+    const crafted = new Map<string, SnapshotEntry>([
+      ["a", { kind: "symlink", target: outside }],
+      ["a/b", { kind: "file", mode: 0o644, hash: "0".repeat(64) }],
+    ]);
+    const current = await captureDirectorySnapshot(target);
+
+    await expect(mergeDirectoryWithBaseline({
+      baseline, sourceDir: source, targetDir: target,
+      snapshots: { source: { exclude: [], entries: crafted }, current },
+    })).rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT", paths: ["a"] });
+
+    expect((await lstat(path.join(target, "a"))).isDirectory()).toBe(true);
+    expect(await readFile(path.join(target, "a", "x"), "utf8")).toBe("inside x\n");
+    expect(await snapshotOf(outside)).toEqual({ x: "outside x\n" });
+  });
+
+  it("does not stage a copy through an ancestor that is swapped for a link while the file is copied", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await fsPromises.cp(target, source, { recursive: true });
+    await writeFile(path.join(source, "a", "b"), "new\n");
+    // Swap the ancestor at the moment the copy starts, then see where the bytes went.
+    const realCopyFile = fsPromises.copyFile;
+    let swapped = false;
+    let leaked: string[] = [];
+    vi.spyOn(fsPromises, "copyFile").mockImplementation(async (from, to, mode) => {
+      if (!swapped) { swapped = true; await swapAForLinkTo(target, outside); }
+      await realCopyFile(from, to, mode);
+      leaked = (await readdir(outside)).filter((name) => name !== "x");
+    });
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target }).catch(() => undefined);
+
+    expect(leaked).toEqual([]);
+    expect(await snapshotOf(outside)).toEqual({ x: "outside x\n" });
+  });
+
+  it.skipIf(!pinning)("deletes inside the validated directory when its path is swapped for a link just before the delete", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await fsPromises.cp(target, source, { recursive: true });
+    await rm(path.join(source, "a", "x"));
+    const realRm = fsPromises.rm;
+    let swapped = false;
+    vi.spyOn(fsPromises, "rm").mockImplementation(async (file, options) => {
+      if (!swapped && String(file).endsWith("/x")) { swapped = true; await swapAForLinkTo(target, outside); }
+      return await realRm(file, options);
+    });
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target }).catch(() => undefined);
+
+    expect(swapped).toBe(true);
+    expect(await snapshotOf(outside)).toEqual({ x: "outside x\n" });
+  });
+
+  it.skipIf(!pinning)("renames inside the validated directory when its path is swapped for a link just before the rename", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await fsPromises.cp(target, source, { recursive: true });
+    await writeFile(path.join(source, "a", "b"), "new\n");
+    const realRename = fsPromises.rename;
+    let swapped = false;
+    vi.spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (!swapped && String(to).endsWith("/b")) { swapped = true; await swapAForLinkTo(target, outside); }
+      return await realRename(from, to);
+    });
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target }).catch(() => undefined);
+
+    expect(swapped).toBe(true);
+    expect(await snapshotOf(outside)).toEqual({ x: "outside x\n" });
   });
 });

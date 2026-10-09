@@ -55,16 +55,28 @@ renames it, or replaces its parent directory with a file, during the walk.
 A merge never writes, deletes, or renames through a link. Another restore can
 leave a link where the run saw a directory (`a -> /elsewhere`), and a path such
 as `a/b` would then resolve outside the workspace. Before it writes anything,
-the merge walks the ancestors of every entry it will apply with `lstat`, which
-does not follow links, and refuses with `DIRECTORY_MERGE_CONFLICT` when one is a
-link or a file the run did not replace. Immediately before each write, delete,
-directory removal, and rename it checks the ancestors again, makes missing
-directories one level at a time, and requires the parent's `realpath` to stay
-under the workspace, so a link swapped in after the first check is refused too.
-A plain file in the way of a delete means the entry is already gone and the
-delete is skipped. Node cannot open a directory relative to a descriptor, so a
-swap in the few system calls between a check and its operation is not excluded
-by this check; the lock keeps other merges out of that window.
+the merge refuses with `DIRECTORY_MERGE_CONFLICT` when an ancestor of an entry it
+will apply is a link or a file in the target, or is not a directory in the run's
+own snapshot (a snapshot with a link `a` and a child `a/b` is refused whole), so
+a refused merge leaves the target as it was. A directory that the merge itself
+replaces first is not refused. An I/O failure part way through a merge is a
+different case: the merge is not transactional, and a retry from the same
+baseline is safe.
+
+Each write, delete, directory removal, and rename then re-validates its own
+path. On Linux the merge opens each directory from the previous one with
+`O_DIRECTORY` and `O_NOFOLLOW` and operates through `/proc/self/fd/<n>/name`,
+which stays bound to the directory it validated even if its path is swapped for
+a link a moment later; a swapped path is refused or acts on the original
+directory, never on the outside. Node has no `openat` and macOS has no such
+path, so elsewhere the merge checks every ancestor again with `lstat` and a
+`realpath` containment test immediately before the operation, makes missing
+directories one level at a time, and stages each copy in the target root rather
+than beside its destination, so a long copy cannot write through a link. The
+single system call between that last check and the operation is the remaining
+window on those systems; the lock keeps other merges out of it, and a writer
+that does not take the lock is not covered. A plain file in the way of a delete
+means the entry is already gone and the delete is skipped.
 
 A merge killed while it copies a file leaves its `.paperclip-merge-<uuid>`
 staging file in the workspace. Walks hide these names, so the file would keep
