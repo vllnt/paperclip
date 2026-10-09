@@ -71,7 +71,7 @@ with docs in `docs/api` and `docs/cli` and spec entries.
 | 17 | **The other ~400 UI operations without a CLI command.** | Raw HTTP. | **(h)** generic `paperclipai api <METHOD> <path>` (auth, company context, path params, JSON body) and `paperclipai api ops [--tag]` listing operations from `/api/openapi.json`. This makes every documented operation reachable from the CLI. |
 | 18 | **Board API keys have no scopes.** A key is as powerful as its user, so handing one to another instance hands over the user. | Use a dedicated low-privilege user. | Proposal only (needs a decision): optional company and read-only scopes on board keys, enforced in `authz.ts`. Not started. |
 
-Open PRs so far: #22 (this matrix), #24 (a), #25 (i), #26 (e), #28 (b), #29 (k), #30 (c), #33 (m), #34 (overrides CLI).
+Open PRs so far: #22 (this matrix), #24 (a), #25 (i), #26 (e), #28 (b), #29 (k), #30 (c), #33 (m), #34 (overrides CLI), #35 to #38 (read views).
 
 ## Board Git actions
 
@@ -147,7 +147,7 @@ One theme per PR, each against `main`, reviewed and merged by the operator one a
 5. (b) runs list filters, stats, caps usage + `run list|stats` (#28).
 6. (e) 400 on invalid UUID path params (#26).
 7. (c) plugin actions with a board key, end to end + CLI (#30).
-8. (d) read views: config-revision diff, skill versions, company-wide recovery, issue tree, lease filters (in progress, branch `feat/operator-read-views`).
+8. (d) read views, split into four PRs: #35 config-revision diff and skill versions (CLI only), #36 company-wide recovery actions, #37 issue tree with each node's last run, #38 lease status filter and company-wide leases.
 9. (l) board Git actions, after the credential decision above.
 10. (f) `routine apply`.
 11. (j) chunked, resumable attachment uploads (after a decision on size and retention limits).
