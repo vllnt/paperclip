@@ -562,11 +562,12 @@ permissions. Each slice below ships all three, or names its linked follow-up PR.
 | **W0** | This plan | | | | none | doc |
 | **W1** | **Format v1, shared redaction, streaming export.** `packages/shared/src/company-archive.ts` (kinds, envelope, cursor codec) and `HEARTBEAT_RUN_TERMINAL_STATUSES`; `run-read-redaction.ts` used by the three run routes, plus the export pass; `RunLogStore.openReadStream`; export service; index migration; AGENTS.md data-path entry; `doc/company-archive.md`. | Company Settings, "Data export": window and entities, download (`follow=true`) | `GET /companies/:id/archive/export` (board) | `archive export` with `--resume` | none | M |
 | **W2** | **Company storage destinations (S3-01 subset).** `storage_destinations`; `storage_destination` secret-binding target; S3 provider credentials, SSE, content encoding; endpoint validation and operator allowlist; probe (fail-closed public read, out-of-prefix check, `bucket_default` acknowledgment); one physical bucket per company per instance; activity rows. | Company Settings, "Storage destinations": create, probe, rotate credentials, retire, masked status | `GET/POST /storage/destinations`, `POST …/probe`, `PATCH …/credentials`, `POST …/retire` | `storage destinations list|create|probe|rotate|retire` | none (S3-01 contract) | L |
-| **W3** | **Archive delivery and status.** `company_archive_settings`, `company_archive_runs`; worker (fenced lease, cursor, settle, backoff, parking, byte budget, staging cleanup); bundle writer with attempt prefixes and immutable manifests; reconcile and drift sweep. | Company Settings, "Data archive": enable with consent text and backfill choice, destination pick, status (state, lag, last archived run, last error, parked runs with retry) | `GET/PUT /archive/settings` (board), `GET /archive/status` (board, and agents allowed `company_scope:read`: counts and state only), `POST /archive/runs/:runId/retry` (board) | `archive enable|disable|status|retry` | W1, W2 | L |
+| **W3** | **Archive delivery and status.** `company_archive_settings`, `company_archive_runs`; worker (fenced lease, cursor, settle, backoff, parking, byte budget, staging cleanup); bundle writer with attempt prefixes and immutable manifests; reconcile and drift sweep. | Company Settings, "Data archive": enable with consent text, destination pick, backfill choice (all history by default, with the estimated size and object count shown before confirming; "from now" offered, D2), status (state, lag, last archived run, last error, parked runs with retry) | `GET/PUT /archive/settings` (board), `GET /archive/backfill-estimate` (board), `GET /archive/status` (board, and agents allowed `company_scope:read`: counts and state only), `POST /archive/runs/:runId/retry` (board) | `archive enable|disable|status|retry|estimate` | W1, W2 | L |
 | **W5** | **Verify and re-archive.** Full GET + SHA-256 per bundle (`verifiedAt`), re-archive after a policy bump or late drift, opt-in cleanup of superseded attempts, optional HMAC manifest signing. | Status shows verified share; "Verify now" and "Re-archive since" actions | `POST /archive/verify`, `POST /archive/rearchive` | `archive verify`, `archive rearchive --since` | W3 | M |
 | **W6** | **Prune after verified archive** (section 9), with the observability guard; 410 responses with the archive location. | "Prune after N days" setting with the guard state shown | `PUT /archive/settings` prune fields; 410 on pruned run reads | `archive prune status` | W5, observability 1a/1b | M |
 | **W7** | **Company streams:** activity and costs without a run, issue comments, documents, tool calls, `run_usage_records` (via `listUsageRecordsAfter`) and `run_context_records` (via `listContextRecordsAfter`, kind `observability.context_record`), daily partitions `streams/<entity>/dt=…/part-<n>.ndjson.gz`. | Entity toggles in "Data archive" and "Data export" | export `include` values and archive settings | same flags | W3, observability 1a | M |
-| **F3** | Separate bug fix: reaper race at `heartbeat.ts:19484` (section 4) | none (no surface) | none | none | none | S |
+| **W8** | **Agent export permission (D3):** a grantable `archive:export` permission, off by default, so an agent can run the same export a board user can; every agent export is audited. | Grant shown in the agent permission editor | export route accepts agents holding the grant | `archive export` with an agent key | W1 | S |
+| **F3** | Separate bug fix: reaper race at `heartbeat.ts:19484` (section 4) (#65) | none (no surface) | none | none | none | S |
 
 **Archive status** (W3) is readable on all three surfaces: state (`off`,
 `active`, `backing_off`, `paused_error`), lag (age of the oldest settled run not
@@ -602,16 +603,19 @@ DEVELOPING notes), and reports what it could not run.
 | S3 artifacts plan (S3-01..S3-08) | W2 implements the S3-01 subset (destinations, secret binding, probe) to that contract. S3-02/S3-03 later add `company_storage_settings`, asset columns and `PUT /default` on top. No second destination or credential model. |
 | Migrations | `0296` is claimed by open PRs #31 and #40; W1-W3 take the next free number when they rebase. |
 
-## 17. Decisions for the user
+## 17. Decisions
 
-| ID | Question | Recommendation |
+Decided by the orchestrator on 2026-10-09 under the user's autonomy grant. The
+user may override any of them.
+
+| ID | Question | Decision |
 |---|---|---|
-| D1 | Slice order: export (W1) first, archive delivery in W2-W3? | Yes: smallest, no credentials, fixes the format first. |
-| D2 | When a board enables the archive, default backfill: all history or from now? | All history (the goal is every session over time), shown with the size estimate before confirming. |
-| D3 | Who may call the bulk export: board only, or also agents with an explicit permission? | Board only in v1. |
-| D4 | Default SSE mode `s3_managed` (AES256) with `bucket_default` allowed for providers that reject the header? | Yes. |
-| D5 | Client-side encryption (company key, for example age or libsodium) on top of SSE? | Not in v1; revisit if a company needs protection from its own bucket provider. |
-| D6 | Prune after archive: off by default, minimum 30 days, never runs/costs/activity? | Yes. |
+| D1 | Slice order | **W1 first** (export), then W2 (destinations) and W3 (delivery). Decided by the orchestrator 2026-10-09. |
+| D2 | Default backfill when a board enables the archive | **All history by default.** Before the board confirms, the UI, API and CLI show an estimated size and object count for the backfill, and offer "from now" as the alternative. Decided by the orchestrator 2026-10-09. |
+| D3 | Who may call the bulk export | **Board only in W1**, as shipped. Follow-up slice **W8** adds an explicit, grantable agent permission (for example `archive:export`), off by default, with every agent export audited like a board export. The parity rule asks for parity of surfaces, not of permissions. Decided by the orchestrator 2026-10-09. |
+| D4 | Default server-side encryption | `s3_managed` (AES256) by default, `kms` available, `bucket_default` only for providers that reject the header. The probe fails `s3_managed` and `kms` when the provider does not confirm the encryption (W2). |
+| D5 | Client-side encryption on top of server-side encryption | **None in v1.** Server-side encryption is required and verified by the probe. Revisit if a company needs protection from its own bucket provider. Decided by the orchestrator 2026-10-09. |
+| D6 | Prune after archive | **Off by default, minimum 30 days, never deletes `heartbeat_runs`, `cost_events` or `activity_log` rows.** Only run events and run-log files are pruned, and only under the guard agreed with the observability track (section 9). Decided by the orchestrator 2026-10-09. |
 
 ## 18. Independent review log
 
