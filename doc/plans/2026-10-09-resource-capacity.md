@@ -624,15 +624,18 @@ reopen placement as its own plan.
 | A held run never resumes | The gate re-evaluates on every claim attempt; a recovery transition wakes the held agents directly (section 8.2 step 8), also where the scheduler interval is disabled; stale readings fail open. |
 | Agents changing placement or thresholds | Agents read only. Thresholds are instance settings (board, instance admin). |
 
-## 11. Decisions for the user
+## 11. Decisions
 
-| # | Decision | Options | Recommendation |
-|---|---|---|---|
-| D1 | Admission default | `warn` (log "would defer", start anyway) or `enforce` | Ship `warn` as the code default (safe for every install). Set this deployment to `enforce` after 24 to 48 hours of `run_admitted_despite_resource_capacity` entries look right. |
-| D2 | Who reads environment capacity | (a) members and agents of companies that can use the environment (narrower than today's environment read rule); (b) any board member, as today's environment routes | (a), as the brief asks. |
-| D3 | Instance-root events in every company's audit log | (a) yes, level and percent only; (b) instance admins only, no audit entry | (a): an instance disk at `critical` holds every company's runs, and the audit entry is the explanation. |
-| D4 | Retention | 30 days default | Accept. |
-| D5 | Load-based throttling | not in this track | A per-environment concurrency limit is the right tool for load; propose it as its own issue if wanted. |
+Decided by the orchestrator 2026-10-09, under the user's autonomy grant;
+the user may override.
+
+| # | Decision | Decided |
+|---|---|---|
+| D1 | Admission default | `warn` is the code default. Switching a deployment to `enforce` is the operator's call, after reviewing 24 to 48 hours of warn entries. Slice 3 adds the count of warn entries (`heartbeat.run_admitted_despite_resource_capacity`) per environment for the last 24 and 48 hours, on API, CLI and web, so the switch rests on data. |
+| D2 | Who reads environment capacity | Members and agents of companies whose agents run on the environment; instance admins read everything. A test proves another company is denied. |
+| D3 | Instance-root threshold events | Written to every company's audit log, with level and percent only: no paths, hostnames or other companies' data. |
+| D4 | Retention | 30 days. |
+| D5 | Load-based throttling | Out of this track. A per-environment concurrency limit is proposed separately if the warn data shows it is needed. |
 
 ## 12. Slices
 
@@ -642,7 +645,7 @@ Each slice ships web, API, OpenAPI and CLI together with tests.
 |---|---|---|
 | **1** | Both tables and the migration, shared types and constants, the recording path with its compare-and-set (5.3), levels with hysteresis, instance sampler, SSH probe at lease acquire and sweep, retention; the read-only environment resolver (needed for "can use"); the three read routes (latest only, no history yet), OpenAPI, CLI `capacity` and `environment capacity`, instance page and environment capacity line; `/api/health` level for admins. | L |
 | **2** | History (`since`, bucketing), sparklines, disk-full projection, the three `resource_capacity.*` activity events with affected-company fan-out. | M |
-| **3** | Admission hold before claim, `admission_hold` column, run and activity events, instance setting with `warn` default, the hold reason in run lists, the issue run ledger and run detail. | M |
+| **3** | Admission hold before claim, `admission_hold` column, run and activity events, instance setting with `warn` default, the hold reason in run lists, the issue run ledger and run detail; warn-entry counts per environment for the last 24 and 48 hours (D1) on API, CLI and web. | M |
 | 4 | Placement: not built (section 9). | none |
 
 Follow-ups, not in this track: PR #44's reaper reads the latest capacity
