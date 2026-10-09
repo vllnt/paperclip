@@ -51,7 +51,7 @@ const PROXY_COOLDOWN_BODY = JSON.stringify({
 
 type Outcome =
   | { kind: "success"; sessionId?: string }
-  | { kind: "usage_limit" }
+  | { kind: "usage_limit"; noReset?: boolean }
   | { kind: "capacity" }
   | { kind: "auth" }
   | { kind: "task_failure" }
@@ -134,7 +134,9 @@ describeEmbeddedPostgres("agent harness fallback", () => {
         };
       }
       if (outcome.kind === "usage_limit_after_comment") await postProgressComment(ctx);
-      const message = outcome.kind === "capacity" ? CAPACITY : CLAUDE_LIMIT;
+      const message = outcome.kind === "capacity"
+        ? CAPACITY
+        : outcome.kind === "usage_limit" && outcome.noReset ? "You've hit your usage limit." : CLAUDE_LIMIT;
       return {
         exitCode: 1, signal: null, timedOut: false, provider, model,
         errorMessage: message, errorCode: "provider_quota", errorFamily: "provider_quota",
@@ -308,6 +310,24 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     expect(detail[0].adapterType).toBe("claude_local");
   });
 
+  it("cools the primary down again when the probe run after a cooldown hits the limit, without a 30 second retry", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    scripts.claude_local = [{ kind: "usage_limit" }, { kind: "usage_limit" }];
+    await assign(agentId, issueId);
+    await runPending(companyId, "harness_fallback");
+    await db.update(agentHarnessCooldowns).set({ cooldownUntil: new Date(Date.now() - 1_000) });
+
+    await comment(agentId, issueId);
+
+    const probe = (await runs(companyId)).filter((run) => run.executedAdapterType === "claude_local").at(-1)!;
+    expect(probe).toMatchObject({ status: "failed", errorCode: "provider_quota" });
+    // The return-to-primary activity row is bookkeeping, not useful work.
+    expect(await pending(companyId, "transient_failure")).toBeNull();
+    const [cooldown] = await db.select().from(agentHarnessCooldowns).where(eq(agentHarnessCooldowns.targetKey, "claude_local:claude-opus-5-5"));
+    expect(cooldown.cooldownUntil.getTime()).toBeGreaterThan(Date.now());
+    expect(await pending(companyId, "harness_fallback")).not.toBeNull();
+  });
+
   it("starts a fallback whose credential is a secret reference, binding it to the agent", async () => {
     const { companyId, agentId, issueId } = await seed({ fallbacks: [] });
     const secret = await secretService(db).create(companyId, {
@@ -336,13 +356,18 @@ describeEmbeddedPostgres("agent harness fallback", () => {
       ],
     });
     scripts.claude_local = [{ kind: "usage_limit" }];
-    scripts.codex_local = [{ kind: "usage_limit" }];
+    scripts.codex_local = [{ kind: "usage_limit", noReset: true }];
 
     await assign(agentId, issueId);
     const fallbackRun = await runPending(companyId, "harness_fallback");
     expect(fallbackRun).toMatchObject({ status: "failed", executedModel: "gpt-5.5" });
     expect(await pending(companyId, "harness_fallback")).toBeNull();
     expect((await runs(companyId)).filter((run) => run.scheduledRetryReason === "harness_fallback")).toHaveLength(1);
+    // The failed fallback defers the wake to its cooldown end. It does not hop to the next target 30 seconds later.
+    const deferred = await pending(companyId, "transient_failure");
+    const [fallbackCooldown] = await db.select().from(agentHarnessCooldowns).where(eq(agentHarnessCooldowns.targetKey, "codex_local:gpt-5.5"));
+    expect(deferred!.scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(fallbackCooldown.cooldownUntil.getTime());
+    expect(invocations.map((call) => call.model)).toEqual(["claude-opus-5-5", "gpt-5.5"]);
     // The failed fallback is cooled down too, so the next wake skips it.
     const keys = (await db.select({ key: agentHarnessCooldowns.targetKey }).from(agentHarnessCooldowns)).map((row) => row.key).sort();
     expect(keys).toEqual(["claude_local:claude-opus-5-5", "codex_local:gpt-5.5"]);

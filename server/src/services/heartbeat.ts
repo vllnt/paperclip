@@ -717,6 +717,8 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
+  "agent.harness_fallback_activated",
+  "agent.harness_fallback_returned",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
@@ -15484,6 +15486,8 @@ export function heartbeatService(
       maxAttempts?: number;
       delayMs?: number;
       contextPatch?: Record<string, unknown>;
+      /** The retry is due no earlier than this time. */
+      notBefore?: Date;
     },
   ) {
     if (run.errorCode === "provider_tool_definition_invalid") {
@@ -15625,7 +15629,7 @@ export function heartbeatService(
     const quotaHeldUntil = storedAgentForQuota
       ? await harnessFallback.heldUntil(storedAgentForQuota, now).catch(() => null)
       : null;
-    const notBefore = [transientRetryNotBefore, quotaHeldUntil]
+    const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
       .filter((value): value is Date => value !== null)
       .reduce<Date | null>((latest, value) => (!latest || value > latest ? value : latest), null);
     const schedule =
@@ -16951,8 +16955,8 @@ export function heartbeatService(
     executedAgent: typeof agents.$inferSelect;
     storedAgent: typeof agents.$inferSelect;
     phase: "failure" | "retry_exhausted";
-  }): Promise<{ redispatched: boolean; awaitingRetryExhaustion: boolean }> {
-    const none = { redispatched: false, awaitingRetryExhaustion: false };
+  }): Promise<{ redispatched: boolean; awaitingRetryExhaustion: boolean; deferUntil: Date | null }> {
+    const none = { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
     const { run, executedAgent, storedAgent } = input;
     if (run.runtimeMode === "native") return none;
     const dispatch = readClaimedHarnessDispatch(run.runnerProfileJson) ?? primaryHarnessDispatch(storedAgent);
@@ -16962,11 +16966,13 @@ export function heartbeatService(
       const evidence = await buildRunLivenessInput(run, parseObject(run.resultJson))
         .then((liveness) => liveness.evidence)
         .catch(() => null);
-      usefulWork = !evidence ||
+      // An unreadable evidence lookup fails closed: the failure still has to
+      // read as a provider quota error, and cooling down is the safe side.
+      usefulWork = !!evidence && (
         (evidence.issueCommentsCreated ?? 0) > 0 ||
         (evidence.documentRevisionsCreated ?? 0) > 0 ||
         (evidence.workProductsCreated ?? 0) > 0 ||
-        (evidence.activityEventsCreated ?? 0) > 0;
+        (evidence.activityEventsCreated ?? 0) > 0);
     }
     const decision = classifyQuotaFailure({
       status: run.status,
@@ -16978,7 +16984,7 @@ export function heartbeatService(
     });
     if (!decision.trigger) return none;
     if (decision.requiresRetryExhaustion && input.phase !== "retry_exhausted") {
-      return { redispatched: false, awaitingRetryExhaustion: true };
+      return { ...none, awaitingRetryExhaustion: true };
     }
     const reason = `provider_${decision.kind}`;
     const { until, nextTarget } = await harnessFallback.coolDown({
@@ -17005,7 +17011,10 @@ export function heartbeatService(
         alreadyRedispatched,
       },
     });
-    if (!nextTarget || alreadyRedispatched) return none;
+    // A wake gets one re-dispatch. A failed fallback run defers the wake to its
+    // own cooldown end instead of hopping to the next target a moment later.
+    if (alreadyRedispatched) return { ...none, deferUntil: until };
+    if (!nextTarget) return none;
     const scheduled = await scheduleBoundedRetryForRun(run, executedAgent, {
       retryReason: HARNESS_FALLBACK_RETRY_REASON,
       wakeReason: HARNESS_FALLBACK_WAKE_REASON,
@@ -17020,7 +17029,7 @@ export function heartbeatService(
         },
       },
     });
-    return { redispatched: scheduled.outcome === "scheduled", awaitingRetryExhaustion: false };
+    return { ...none, redispatched: scheduled.outcome === "scheduled" };
   }
 
   async function getHeartbeatDailyCapBlock(
@@ -26175,7 +26184,7 @@ export function heartbeatService(
                 phase: "failure",
               }).catch((err) => {
                 logger.warn({ err, runId: livenessRun.id }, "harness fallback scheduling failed; using the normal retry path");
-                return { redispatched: false, awaitingRetryExhaustion: false };
+                return { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
               })
             : null;
           if (harnessFallbackOutcome?.redispatched) {
@@ -26186,6 +26195,8 @@ export function heartbeatService(
               message: "Re-dispatched this wake once on a fallback harness",
               payload: { retryReason: HARNESS_FALLBACK_RETRY_REASON },
             });
+          } else if (harnessFallbackOutcome?.deferUntil) {
+            await scheduleBoundedRetryForRun(livenessRun, agent, { notBefore: harnessFallbackOutcome.deferUntil });
           } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
