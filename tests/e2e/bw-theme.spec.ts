@@ -3,8 +3,8 @@ import { expect, test, type Page } from "@playwright/test";
 const STORAGE_KEY = "paperclip.theme";
 const PURE_BLACK = /^(oklch\(0 0 0\)|rgb\(0, 0, 0\))$/;
 const PURE_WHITE = /^(oklch\(1 0 0\)|rgb\(255, 255, 255\))$/;
-const LARGE_SURFACE_AREA = 40_000;
-const MAX_GREY_SPREAD = 24;
+const LARGE_SURFACE_AREA = 10_000;
+const MAX_GREY_SPREAD = 6;
 
 async function createCompanyPrefix(page: Page): Promise<string> {
   const response = await page.request.post("/api/companies", {
@@ -112,7 +112,7 @@ for (const scheme of ["dark", "light"] as const) {
     const prefix = await createCompanyPrefix(page);
     await page.emulateMedia({ colorScheme: scheme });
 
-    for (const route of ["dashboard", "issues", "agents", "routines"]) {
+    for (const route of ["dashboard", "issues", "agents", "routines", "audit/costs", "audit", "company/settings"]) {
       await page.goto(`/${prefix}/${route}`);
       await expect(page.locator("main, [role=main], #root > *").first()).toBeVisible();
       await expectRealPageNotOnboarding(page);

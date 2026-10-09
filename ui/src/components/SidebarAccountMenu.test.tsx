@@ -273,7 +273,7 @@ describe("SidebarAccountMenu", () => {
     });
   });
 
-  it("shares the nav background without separator borders", async () => {
+  it("sits on the page surface and is separated from the nav by a hairline, not a tinted fill", async () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
@@ -289,11 +289,10 @@ describe("SidebarAccountMenu", () => {
     await flushReact();
 
     const accountSurface = container.firstElementChild;
-    expect(accountSurface?.className).toContain("bg-border/50");
-    expect(accountSurface?.className).toContain("dark:bg-muted");
-    expect(accountSurface?.className).not.toContain("border-t");
+    expect(accountSurface?.className).toContain("border-t");
+    expect(accountSurface?.className).toContain("border-border");
     expect(accountSurface?.className).not.toContain("border-r");
-    expect(accountSurface?.className).not.toContain("border-border");
+    expect(accountSurface?.className).not.toMatch(/\bbg-(border|muted|accent|secondary)\b/);
     const accountTrigger = container.querySelector('button[aria-label="Open account menu"]');
     expect(accountTrigger?.classList).toContain("rounded-lg");
     expect(accountTrigger?.classList).toContain("hover:bg-sidebar-accent");
