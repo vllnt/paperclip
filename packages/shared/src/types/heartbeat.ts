@@ -419,7 +419,9 @@ export interface DeferredWakeParkedBreakdown {
   behindIssueLock: number;
   /** Owned by another recovery: a queued-comment interrupt, a limit-parked self-reblock wake, chat input. */
   otherRecovery: number;
-  /** No lock, no live run, no recovery wait: the periodic sweep's own work. */
+  /** The wake's agent is paused, terminated or awaiting approval; the sweep leaves it parked until the agent resumes. */
+  heldAgent: number;
+  /** No lock, no live run, no recovery wait, an active agent: the periodic sweep's own work. */
   orphaned: number;
 }
 

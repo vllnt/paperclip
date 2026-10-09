@@ -693,6 +693,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
         awaitingRecovery: { execution_recovery: 6 },
         behindIssueLock: 0,
         otherRecovery: 0,
+        heldAgent: 0,
         orphaned: 0,
       });
       expect(stats.sweep).toMatchObject({
@@ -766,6 +767,10 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     const chatIssueId = await seedIssue(companyId, { assigneeAgentId: agentId });
     await seedDeferredWake(companyId, agentId, chatIssueId, { ageMs: 40 * MINUTE_MS, idempotencyKey: `chat-inbound:${randomUUID()}` });
 
+    const pausedAgentId = await seedAgent(companyId, { name: "Paused", status: "paused" });
+    const pausedAgentIssueId = await seedIssue(companyId, { assigneeAgentId: pausedAgentId });
+    await seedDeferredWake(companyId, pausedAgentId, pausedAgentIssueId, { ageMs: 40 * MINUTE_MS });
+
     const orphanedIssueId = await seedIssue(companyId, { assigneeAgentId: agentId });
     await seedDeferredWake(companyId, agentId, orphanedIssueId, { ageMs: 40 * MINUTE_MS });
     const otherIssueId = await seedIssue(otherCompanyId, { assigneeAgentId: otherAgentId });
@@ -778,9 +783,10 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       awaitingRecovery: { execution_recovery: 2, remote_cleanup: 1 },
       behindIssueLock: 1,
       otherRecovery: 1,
+      heldAgent: 1,
       orphaned: 1,
     });
-    expect(deferredTotal).toBe(7);
+    expect(deferredTotal).toBe(8);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, holderRunId));
   });
 
@@ -1206,6 +1212,70 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
 
       releaseRuns();
       await heartbeat.drainActiveRunExecutions();
+    });
+  });
+
+  describe("an older wake the sweep cannot deliver", () => {
+    it("does not strand the assignee's newer wake behind a paused agent's older wake", async () => {
+      const companyId = await seedCompany();
+      const pausedId = await seedAgent(companyId, { name: "FormerPaused", status: "paused" });
+      const currentId = await seedAgent(companyId, { name: "Current" });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: currentId, title: "Reassigned" });
+      await seedDeferredWake(companyId, pausedId, issueId, { ageMs: 30 * MINUTE_MS });
+      const newerWakeId = await seedDeferredWake(companyId, currentId, issueId, { ageMs: 20 * MINUTE_MS });
+
+      await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.drainActiveRunExecutions();
+
+      expect((await wakeRow(newerWakeId)).status).not.toBe("deferred_issue_execution");
+      expect((await runsForSeededWake(issueId)).filter((run) => run.agentId === currentId)).toHaveLength(1);
+    });
+
+    it("does not strand the assignee's newer wake behind an older wake whose agent cannot be invoked", async () => {
+      const companyId = await seedCompany();
+      const managerId = await seedAgent(companyId, { name: "TerminatedManager", status: "terminated" });
+      const reportId = await seedAgent(companyId, { name: "ReportOfTerminated" });
+      await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, reportId));
+      const currentId = await seedAgent(companyId, { name: "Current" });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: currentId, title: "Chain-blocked older wake" });
+      await seedDeferredWake(companyId, reportId, issueId, { ageMs: 30 * MINUTE_MS });
+      const newerWakeId = await seedDeferredWake(companyId, currentId, issueId, { ageMs: 20 * MINUTE_MS });
+
+      // One pass: the older wake is skipped as not invokable and the issue is
+      // served through the newer wake in the same pass.
+      const pass = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(pass).toMatchObject({ skippedNotInvokable: 1, promoted: 1, skippedCapacity: 0 });
+      expect((await wakeRow(newerWakeId)).status).not.toBe("deferred_issue_execution");
+      expect((await runsForSeededWake(issueId)).filter((run) => run.agentId === currentId)).toHaveLength(1);
+    });
+
+    it("delivers the assignee's newer wake after an active former assignee's older comment wake", async () => {
+      const companyId = await seedCompany();
+      const formerId = await seedAgent(companyId, { name: "FormerActive" });
+      const currentId = await seedAgent(companyId, { name: "Current" });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: currentId, title: "Reassigned active" });
+      const [comment] = await db
+        .insert(issueComments)
+        .values({ companyId, issueId, authorUserId: "user-1", body: "Old message for the former owner." })
+        .returning();
+      await seedDeferredWake(companyId, formerId, issueId, {
+        ageMs: 30 * MINUTE_MS,
+        reason: "issue_commented",
+        commentIds: [comment!.id],
+        actor: { type: "user", id: "user-1" },
+      });
+      const newerWakeId = await seedDeferredWake(companyId, currentId, issueId, { ageMs: 20 * MINUTE_MS });
+
+      for (let pass = 0; pass < 4; pass += 1) {
+        await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+        await heartbeat.drainActiveRunExecutions();
+      }
+
+      expect((await wakeRow(newerWakeId)).status).not.toBe("deferred_issue_execution");
+      expect((await runsForSeededWake(issueId)).filter((run) => run.agentId === currentId)).toHaveLength(1);
     });
   });
 

@@ -19998,13 +19998,14 @@ export function heartbeatService(
       result.skippedNotInvokable = notInvokableWakes.length;
     }
 
-    const selected = selectDeferredWakesToPromote(orphans, freeSlotsByAgent, {
+    // Without them, an issue is served through its oldest wake that can run now.
+    const invokableOrphans = orphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId));
+    const selected = selectDeferredWakesToPromote(invokableOrphans, freeSlotsByAgent, {
       maxTotal: sweepPromotionBudget(opts.maxPromotions),
     });
     // An eligible issue the pass did not select waits for a free slot or the next pass.
     const eligibleIssuesByCompany = new Map<string, Set<string>>();
-    for (const orphan of orphans) {
-      if (notInvokableAgentIds.has(orphan.agentId)) continue;
+    for (const orphan of invokableOrphans) {
       const issuesOfCompany = eligibleIssuesByCompany.get(orphan.companyId) ?? new Set<string>();
       issuesOfCompany.add(orphan.issueId);
       eligibleIssuesByCompany.set(orphan.companyId, issuesOfCompany);

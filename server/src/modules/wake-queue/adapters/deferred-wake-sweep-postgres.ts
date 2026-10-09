@@ -52,10 +52,13 @@ const notOwnedByOtherRecovery = (wake: { payload: AnyPgColumn; idempotencyKey: A
  * blockers, budgets). A closed task is excluded because an old parked wake must
  * not revive it; the release of the task's next run retires the wake.
  *
- * Only an issue's oldest parked wake is returned, as the release drain would
- * promote it. That head is chosen before the recheck window applies: a head that
- * was just examined hides itself and waits out the window, and its younger
- * siblings must not step forward in its place.
+ * Only each agent's oldest parked wake on an issue is returned; the caller then
+ * serves the issue through its oldest returned wake. That head is chosen before
+ * the recheck window applies: a head that was just examined hides itself and
+ * waits out the window, and the agent's younger wakes on the issue must not step
+ * forward in its place. The head is per agent because another agent's older wake
+ * may never be selected (a held agent, a wake below the cutoff) or invoked, and
+ * must not strand the issue.
  *
  * The scan starts from the partial index on deferred wakes, a set of a few rows,
  * and reaches each issue through its primary key.
@@ -101,8 +104,10 @@ export async function listOrphanedDeferredWakes(
         // sweep, a limit-parked self-reblock wake waits out its window there, and
         // durable chat input keeps its receipt and publication path.
         notOwnedByOtherRecovery(agentWakeupRequests),
-        // Only the issue's oldest parked wake (by the same ownership rule) is a
-        // candidate, whatever its agent, age or recheck state.
+        // Only an agent's oldest parked wake on the issue (by the same ownership
+        // rule and cutoff) is a candidate, whatever its age or recheck state. Per
+        // agent, so an older wake the sweep never selects or invokes (a paused
+        // agent, a broken chain of command) cannot strand another agent's wake.
         notExists(
           db
             .select({ id: olderWake.id })
@@ -110,8 +115,10 @@ export async function listOrphanedDeferredWakes(
             .where(
               and(
                 eq(olderWake.companyId, agentWakeupRequests.companyId),
+                eq(olderWake.agentId, agentWakeupRequests.agentId),
                 eq(olderWake.status, DEFERRED_WAKE_STATUS),
                 sql`${olderWake.payload} ->> 'issueId' = ${agentWakeupRequests.payload} ->> 'issueId'`,
+                input.requestedAtGte ? gte(olderWake.requestedAt, input.requestedAtGte) : undefined,
                 notOwnedByOtherRecovery(olderWake),
                 or(
                   lt(olderWake.requestedAt, agentWakeupRequests.requestedAt),
@@ -181,7 +188,9 @@ export type DeferredWakeParkedBreakdown = {
   behindIssueLock: number;
   /** Owned by another recovery: a queued-comment interrupt, a limit-parked self-reblock wake, chat input. */
   otherRecovery: number;
-  /** No lock, no live run, no recovery wait: the periodic sweep's own work. */
+  /** The wake's agent is paused, terminated or awaiting approval; the sweep leaves it parked until the agent resumes. */
+  heldAgent: number;
+  /** No lock, no live run, no recovery wait, an active agent: the periodic sweep's own work. */
   orphaned: number;
 };
 
@@ -211,6 +220,7 @@ export async function getDeferredWakeParkedBreakdown(
             and holder.context_snapshot ->> 'issueId' = ${issues.id}::text
         ) then 'behind_issue_lock'
         when not (${notOwnedByOtherRecovery(agentWakeupRequests)}) then 'other_recovery'
+        when ${inArray(agents.status, [...HELD_AGENT_STATUSES])} then 'held_agent'
         else 'orphaned' end`.as("state"),
       waitReason: sql<string | null>`${agentWakeupRequests.payload} -> 'executionWait' ->> 'reason'`.as("wait_reason"),
     })
@@ -218,6 +228,10 @@ export async function getDeferredWakeParkedBreakdown(
     .leftJoin(
       issues,
       and(eq(issues.id, wakeIssueId), eq(issues.companyId, agentWakeupRequests.companyId)),
+    )
+    .leftJoin(
+      agents,
+      and(eq(agents.id, agentWakeupRequests.agentId), eq(agents.companyId, agentWakeupRequests.companyId)),
     )
     .where(
       and(
@@ -236,6 +250,7 @@ export async function getDeferredWakeParkedBreakdown(
     awaitingRecovery: {},
     behindIssueLock: 0,
     otherRecovery: 0,
+    heldAgent: 0,
     orphaned: 0,
   };
   for (const row of rows) {
@@ -246,6 +261,7 @@ export async function getDeferredWakeParkedBreakdown(
       breakdown.awaitingRecovery[reason] = (breakdown.awaitingRecovery[reason] ?? 0) + total;
     } else if (row.state === "behind_issue_lock") breakdown.behindIssueLock += total;
     else if (row.state === "other_recovery") breakdown.otherRecovery += total;
+    else if (row.state === "held_agent") breakdown.heldAgent += total;
     else breakdown.orphaned += total;
   }
   return breakdown;
