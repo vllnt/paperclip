@@ -5,6 +5,7 @@ import {
   agents,
   companies,
   companySecretBindings,
+  storageDestinations,
   companySecretProviderConfigs,
   companySecrets,
   companySecretVersions,
@@ -2866,6 +2867,23 @@ export function secretService(db: Db | DbTransaction) {
           label: `Run ${row.id.slice(0, 8)}`,
           href: `/agents/${row.agentId}/runs/${row.id}`,
           status: row.status,
+        });
+      }
+    }
+
+    const storageDestinationIds = collectTargetIds(bindings, "storage_destination", { uuidOnly: true });
+    if (storageDestinationIds.length > 0) {
+      const rows = await db
+        .select({ id: storageDestinations.id, label: storageDestinations.label, retiredAt: storageDestinations.retiredAt })
+        .from(storageDestinations)
+        .where(and(eq(storageDestinations.companyId, companyId), inArray(storageDestinations.id, storageDestinationIds)));
+      for (const row of rows) {
+        setTarget({
+          type: "storage_destination",
+          id: row.id,
+          label: `Storage: ${row.label}`,
+          href: "/company/settings",
+          status: row.retiredAt ? "retired" : "active",
         });
       }
     }

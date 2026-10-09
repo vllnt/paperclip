@@ -34,6 +34,8 @@ export interface HeadObjectResult {
   contentLength?: number;
   etag?: string;
   lastModified?: Date;
+  /** S3 only: the encryption the provider reports for the object, when it reports one. */
+  serverSideEncryption?: string;
 }
 
 export interface StorageProvider {

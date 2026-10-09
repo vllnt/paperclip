@@ -1379,6 +1379,11 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
   "GET /api/companies/{companyId}/user-directory",
+  "GET /api/companies/{companyId}/storage/destinations",
+  "POST /api/companies/{companyId}/storage/destinations",
+  "POST /api/companies/{companyId}/storage/destinations/{destinationId}/probe",
+  "PATCH /api/companies/{companyId}/storage/destinations/{destinationId}/credentials",
+  "POST /api/companies/{companyId}/storage/destinations/{destinationId}/retire",
   "GET /api/companies/{companyId}/managed-agent-profiles",
   "POST /api/companies/{companyId}/managed-agent-profiles",
   "GET /api/companies/{companyId}/remote-agent-profiles",
@@ -6704,6 +6709,77 @@ registry.registerPath({
     params: z.object({ companyId: z.string(), userSlug: z.string() }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+const storageLocationOpenApi = z.object({
+  endpoint: z.string().url(),
+  region: z.string(),
+  bucket: z.string(),
+  prefix: z.string().optional(),
+  forcePathStyle: z.boolean().optional(),
+  encryption: z.object({ mode: z.enum(["s3_managed", "kms", "bucket_default"]), kmsKeyId: z.string().optional() }).optional(),
+});
+const storageCredentialRefsOpenApi = z.object({ accessKeySecretId: z.string().uuid(), secretKeySecretId: z.string().uuid() });
+const storageDestinationParams = z.object({ companyId: z.string(), destinationId: z.string().uuid() });
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/storage/destinations",
+  tags: ["companies"],
+  summary: "List the company's storage destinations (board only)",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(z.array(z.record(z.string(), z.unknown()))), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/storage/destinations",
+  tags: ["companies"],
+  summary: "Create an S3-compatible storage destination with company secret references (board only)",
+  description: "Idempotent on the client-generated id: the same id and payload return the existing destination (200); a different payload under that id is 409. A bucket already used by another company on this instance is 409.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(z.object({
+      id: z.string().uuid(),
+      label: z.string(),
+      location: storageLocationOpenApi,
+      credentials: storageCredentialRefsOpenApi,
+    })),
+  },
+  responses: {
+    201: r.ok(), 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden,
+    404: r.notFound, 409: r.conflict, 422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/storage/destinations/{destinationId}/probe",
+  tags: ["companies"],
+  summary: "Probe a storage destination: write, read, checksum, encryption, public read, prefix isolation, delete",
+  request: { params: storageDestinationParams },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/storage/destinations/{destinationId}/credentials",
+  tags: ["companies"],
+  summary: "Replace a storage destination's secret references",
+  request: {
+    params: storageDestinationParams,
+    body: jsonBody(z.object({ credentials: storageCredentialRefsOpenApi, expectedCredentialRevision: z.number().int() })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/storage/destinations/{destinationId}/retire",
+  tags: ["companies"],
+  summary: "Retire a storage destination (stops future use; deletes nothing)",
+  request: { params: storageDestinationParams, body: jsonBody(z.object({ expectedRevision: z.number().int() })) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
