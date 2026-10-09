@@ -177,8 +177,8 @@ Production rules, applied after the grant lookup and not overridable by config:
 
 ### 3.3 Credentials stay server-side
 
-Tokens are company secrets referenced by `secret_ref`; the worker resolves each one at most once per operation (a tool call or a reaper pass,
-because the host limits secret resolution per minute) and never returns, logs or stores it. Cheapest credential first: Preview Deploy Key (get, expiry, delete
+Tokens are company secrets referenced by `secret_ref`; the worker resolves a secret on demand and keeps it in memory for at most a minute (the host limits secret resolution per
+minute; a credential Convex rejects with 401 is dropped at once). It never returns, logs or persists it. Cheapest credential first: Preview Deploy Key (get, expiry, delete
 of that project's previews) -> project token -> team token, falling back to the next on 401/403. The team token also reads the Deployment API
 (documented to accept team tokens) until slice 2 adds per-deployment keys scoped by `allowedActions`. A credential is sent only to `api.convex.dev`
 or `https://*.convex.cloud` (checked before the call), and to `api.github.com` for the GitHub token.
@@ -198,7 +198,9 @@ A call for a project that another company reserved, or one not in the registry f
   on the mapped repository. Names are compared exactly and with separators normalized (`feat/login` = `feat-login`). "Branch gone" is concluded only from the full branch list, never from
   one missing name. Open pull requests and branches are re-read at delete time. Lists above 1000 entries, an unreadable repository, a missing token or repository, and a preview without
   an identifier all fail closed.
-- **An expiry is a delayed delete.** An expiry sooner than the activity window follows the same guards and counts against the run's deletion cap. The reaper applies its own policy (below).
+- **An expiry is a delayed delete.** An agent's expiry earlier than the largest of the preview's current deadline, the reaper's own deadline (`lastDeployTime + ttlHours`) and
+  `now + activityHours` follows the deletion guards and counts against the run's deletion cap. Extending a deadline (up to 7 days) is free. The reaper applies its own policy (below).
+- **Cheap refusals first**: a run that has used its deletion allowance is refused before any network call.
 - **Delete outcome**: a delete that fails or goes unanswered is checked against Convex; if the deployment is gone it is reported as deleted, otherwise as unconfirmed, never as a clean failure.
 - **Lookups**: "does not exist", "not reachable" and "belongs to another company or an unmapped project" return the same message, so deployment names cannot be probed.
 
@@ -249,9 +251,17 @@ Hourly job `convex-reaper` (also `reaper.run` and the `convex_reap_previews` too
 2. deletes previews whose PR is closed or merged, or whose branch is gone and whose last deploy is older than `guards.activityHours`;
 3. sets `expiresAt = lastDeployTime + ttlHours` on kept previews. It shortens an expiry, and it moves an expiry later after a redeploy only when that expiry is one the reaper set
    itself (it remembers them); an expiry a person chose is never extended. When the new moment is less than an hour away (a guarded preview idle for almost `ttlHours`), the reaper does
-   not schedule it; it only gives a preview without any expiry `now + ttlHours`. Convex measures its own default expiry from creation and its docs do not say that a redeploy resets it, so the
+   not schedule it (two hours leaves one hourly pass to see a redeploy); it only gives a preview without any expiry `now + ttlHours`. Convex measures its own default expiry from creation and its docs do not say that a redeploy resets it, so the
    reaper does not rely on that. **Policy note:** as specified, a preview with an open pull request that is not redeployed for `ttlHours` expires and the next push recreates it;
    `guards.activityHours` keeps branches with recent commits from being deleted by the reaper, not from expiring;
 4. counts all team deployments against `reaper.quota` and raises an issue (once a day) and an activity entry at `reaper.alertPercent`.
 
 It is a dry run until `reaper.enabled` is true. When GitHub cannot be read for a project, it changes nothing in that project.
+
+### Known limits of slice 1
+
+- Preview matching assumes Convex derives the preview identifier from the branch name (case and separators are normalized). If a CI step truncates, prefixes or renames the identifier, the open-PR check and
+  the "branch gone" test can miss. Read the dry-run plan before setting `reaper.enabled`.
+- The health fields Convex shows in its dashboard (failure rate, cache hit rate, scheduler lag, function metrics, insights) are not available through a documented API and are reported as unavailable.
+- Convex measures its default preview expiry from creation; its docs do not say a redeploy resets it. The reaper follows redeploys only for expiries it set itself.
+- Single worker: rate limits, the secret cache and per-company serialization live in the worker process.
