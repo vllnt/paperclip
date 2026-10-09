@@ -138,7 +138,18 @@ afterEach(async () => {
       }
     }
   }
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) {
+    // A stand-in bridge records its own pid here, in case its test failed early.
+    const standIn = Number(await readFile(path.join(root, "bridge.pid"), "utf8").catch(() => "0"));
+    if (standIn > 0) {
+      try {
+        process.kill(standIn, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 describe("sandbox callback bridge process lifetime", () => {

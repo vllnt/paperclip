@@ -1623,11 +1623,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
       if (settled || stopping || hostLeaseWriteInFlight) return;
       hostLeaseWriteInFlight = true;
       hostLeaseSequence += 1;
-      void withTimeout(
+      void Promise.resolve().then(() => withTimeout(
         input.client.writeTextFile(directories.hostLeaseFile, `${hostLeaseSequence} ${new Date().toISOString()}\n`),
         iterationTimeoutMs,
         "Sandbox callback bridge host lease",
-      ).catch(() => undefined).finally(() => {
+      )).catch(() => undefined).finally(() => {
         hostLeaseWriteInFlight = false;
       });
     };
@@ -2060,6 +2060,8 @@ export async function startSandboxCallbackBridgeServer(input: {
     }
   };
 
+  // The process the bridge reported, once its ready file parsed.
+  let reportedPid: number | null = null;
   const readBridgeReadiness = async () => {
     requireSuccessfulResult("start sandbox callback bridge", startResult);
 
@@ -2097,6 +2099,7 @@ export async function startSandboxCallbackBridgeServer(input: {
         `Sandbox callback bridge wrote invalid readiness JSON: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    reportedPid = typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : null;
 
     const host = typeof readyData.host === "string" && readyData.host.trim().length > 0
       ? readyData.host.trim()
@@ -2112,7 +2115,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   try {
     readiness = await readBridgeReadiness();
   } catch (error) {
-    await stopBridge(null).catch(() => undefined);
+    await stopBridge(reportedPid).catch(() => undefined);
     throw error;
   }
   const { readyData, host, port } = readiness;
@@ -2409,6 +2412,7 @@ export function getSandboxBridgeProcessBodyLedgerSource(): string {
 export function getSandboxCallbackBridgeServerSource(): string {
   return `import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
+import { performance } from "node:perf_hooks";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import http2 from "node:http2";
