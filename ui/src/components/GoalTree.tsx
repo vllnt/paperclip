@@ -6,6 +6,9 @@ import { GOAL_HORIZON_LABELS, formatTargetDate } from "../lib/goal-dates";
 import { cn } from "../lib/utils";
 import { useState } from "react";
 
+/** Planning details stay on one line and give way to the title on narrow screens. */
+const detailClass = "hidden shrink-0 whitespace-nowrap text-xs text-muted-foreground lg:inline";
+
 interface GoalTreeProps {
   goals: Goal[];
   goalLink?: (goal: Goal) => string;
@@ -52,16 +55,16 @@ function GoalNode({ goal, children, allGoals, depth, goalLink, onSelect, progres
       )}
       <span className="text-xs text-muted-foreground capitalize">{goal.level}</span>
       {goal.kind === "milestone" ? (
-        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+        <span className="inline-flex shrink-0 items-center gap-1 text-xs text-muted-foreground" title="Milestone">
           <Flag className="h-3 w-3" aria-hidden="true" />
-          Milestone
+          <span className="hidden lg:inline">Milestone</span>
         </span>
       ) : null}
-      <span className="flex-1 truncate">{goal.title}</span>
-      {goal.horizon ? <span className="text-xs text-muted-foreground">{GOAL_HORIZON_LABELS[goal.horizon]}</span> : null}
-      {goal.targetDate ? <span className="text-xs text-muted-foreground">{formatTargetDate(goal.targetDate)}</span> : null}
+      <span className="min-w-0 flex-1 truncate">{goal.title}</span>
+      {goal.horizon ? <span className={detailClass}>{GOAL_HORIZON_LABELS[goal.horizon]}</span> : null}
+      {goal.targetDate ? <span className={detailClass}>{formatTargetDate(goal.targetDate)}</span> : null}
       {goalProgress && goalProgress.total > 0 ? (
-        <span className="text-xs text-muted-foreground" title="Tasks done">{goalProgress.done}/{goalProgress.total}</span>
+        <span className={detailClass} title="Tasks done">{goalProgress.done}/{goalProgress.total}</span>
       ) : null}
       <StatusBadge status={goal.status} />
     </>
