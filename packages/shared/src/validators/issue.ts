@@ -1,3 +1,4 @@
+import { runProfileSchema } from "../run-profile.js";
 import { z } from "zod";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
@@ -298,6 +299,8 @@ export const issueAssigneeAdapterOverridesSchema = z
   .object({
     adapterConfig: z.record(z.string(), z.unknown()).optional(),
     useProjectWorkspace: z.boolean().optional(),
+    /** The harness, model and effort this issue runs on; see run-profile.ts. */
+    runProfile: runProfileSchema.optional(),
   })
   .strict();
 

@@ -39,6 +39,8 @@ export interface InstanceGeneralSettings {
   executionMode?: InstanceExecutionMode;
   /** Instance-admin selected execution defaults, keyed by company ID. */
   companyEnvironmentDefaults?: Record<string, string>;
+  /** Named run tiers and the agent allowlist, keyed by company ID. */
+  companyRunTiers?: Record<string, import("../run-profile.js").CompanyRunTiers>;
 }
 
 export interface InstanceExperimentalSettings {
