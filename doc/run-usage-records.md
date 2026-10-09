@@ -29,6 +29,19 @@ paperclipai observability health --company-id <company-id>
 
 `GET /api/companies/:companyId/observability/health` returns the same data. It needs board access to the company, or a same-company agent that `company_scope:read` allows.
 
+Write rows for runs that finished before this feature, or after a rule change:
+
+```sh
+pnpm observability:backfill
+# optional flags
+pnpm observability:backfill -- --company <company-id>
+pnpm observability:backfill -- --since 2026-01-01
+# also replace rows written under an older schema version
+pnpm observability:backfill -- --rederive
+```
+
+The backfill is safe to repeat and safe to run while the server runs. An interrupted backfill resumes from the runs that still have no row. Run it before you enable any pruning of run events or run logs, because later slices read those events.
+
 ## Reports
 
 Two reports read the records. Each one works from the API, the CLI and the UI client (`ui/src/api/observability.ts`). A test fails when a route under `/observability` has no CLI command or no UI client method.
@@ -53,18 +66,22 @@ paperclipai observability failures --company-id <company-id> --group-by agent --
 - **Labels.** `label` holds the name of the agent, project or routine in the company. It is null when the record outlives the agent, or when the group has none.
 - **Access.** The same as `health`: board access to the company, or a same-company agent that `company_scope:read` allows.
 
-Write rows for runs that finished before this feature, or after a rule change:
+### Query cost
 
-```sh
-pnpm observability:backfill
-# optional flags
-pnpm observability:backfill -- --company <company-id>
-pnpm observability:backfill -- --since 2026-01-01
-# also replace rows written under an older schema version
-pnpm observability:backfill -- --rederive
-```
+`server/scripts/observability-explain.ts` fills a throwaway embedded database with synthetic records and times every report through the service (`node --import tsx scripts/observability-explain.ts --rows 2000000 --big-share 90`, from `server/`). The last run had 2,000,000 records. One company held 1,800,000 of them, finished evenly over 365 days (about 4,900 runs a day). The table was 539 MB and its indexes 360 MB. The numbers below are the median of 3 runs in milliseconds, on a Mac that other work shared, so read them as plus or minus 30%.
 
-The backfill is safe to repeat and safe to run while the server runs. An interrupted backfill resumes from the runs that still have no row. Run it before you enable any pruning of run events or run logs, because later slices read those events.
+| Window | agent, project, routine, adapter, model, status | issue | day |
+|---|---|---|---|
+| 7 days | 8 to 19 | 45 | 13 |
+| 30 days | 21 to 29 | 113 | 40 |
+| 90 days | 130 to 164 | 364 | 153 |
+| 365 days | 200 to 276 | 874 | 347 |
+
+Grouped by hour: 4 ms for 1 day, 28 ms for 7 days, 90 ms for 31 days. Failures: by cause 6, 15 and 144 ms for 7, 30 and 365 days; by agent 6, 20 and 196 ms; by day 10, 29 and 307 ms. A small company answered in 1 ms.
+
+- A window of 7 or 30 days reads the `(company_id, finished_at, run_id)` index. A window that covers the whole year of a company that holds almost every row reads the whole table, which is the right plan there, and the time grows in step with the number of records in the window.
+- Grouping by issue is the slowest report. It has 20,000 groups, and the hash aggregate spills to disk at the default `work_mem` of 4 MB.
+- **Rollups (decision D6): none for now.** At this size no report needs more than 1 second. The budget is an assumption: 1 second for the default windows and 3 seconds for a 365-day window. Add a rollup when the 30-day report by issue is slower than 1 second on a copy of a real company, or when one company writes more than 5,000,000 records in a year. A 5,000,000-record table did not fit on the disk of the machine that ran this, so that size is a projection (about 2.5 times the numbers above), not a measurement.
 
 ## For other tracks
 

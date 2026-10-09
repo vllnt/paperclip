@@ -150,26 +150,25 @@ async function main(): Promise<void> {
 
     const service = runUsageQueryService(db);
     const since = (days: number) => new Date(now.getTime() - days * DAY_MS).toISOString();
-    const lines = ["| report | min ms | median ms |", "|---|---|---|"];
+    console.log("| report | min ms | median ms |\n|---|---|---|");
     for (const groupBy of ["agent", "project", "routine", "issue", "adapter", "model", "status", "day"] as const) {
       for (const days of [7, 30, 90, 365]) {
-        lines.push(await timed(`usage by ${groupBy}, ${days} d`, () =>
+        console.log(await timed(`usage by ${groupBy}, ${days} d`, () =>
           service.usage(big, { groupBy, since: since(days), until: now.toISOString() }, now)));
       }
     }
     for (const days of [1, 7, 31]) {
-      lines.push(await timed(`usage by hour, ${days} d`, () =>
+      console.log(await timed(`usage by hour, ${days} d`, () =>
         service.usage(big, { groupBy: "hour", since: since(days), until: now.toISOString() }, now)));
     }
     for (const groupBy of ["cause", "agent", "day"] as const) {
       for (const days of [7, 30, 365]) {
-        lines.push(await timed(`failures by ${groupBy}, ${days} d`, () =>
+        console.log(await timed(`failures by ${groupBy}, ${days} d`, () =>
           service.failures(big, { groupBy, since: since(days), until: now.toISOString() }, now)));
       }
     }
-    lines.push(await timed("usage by agent, 30 d, small company", () =>
+    console.log(await timed("usage by agent, 30 d, small company", () =>
       service.usage(small[0] ?? big, { groupBy: "agent", since: since(30), until: now.toISOString() }, now)));
-    console.log(lines.join("\n"));
 
     const plans: Array<[string, Parameters<typeof buildReportQueries>[0]]> = [
       ["usage by agent, 30 d", { companyId: big, dimension: "agent", since: new Date(since(30)), until: now, limit: 50, filters: [], failureFilter: null }],
