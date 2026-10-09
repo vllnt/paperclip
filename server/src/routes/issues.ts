@@ -21,6 +21,7 @@ import {
   rejectSteeredIdentity,
 } from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -13268,15 +13269,31 @@ export function issueRoutes(
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
         throw unprocessable("unblockDescriptor requires blocked status");
       }
+      // A block owned by the board or a user waits for a human. The agent that
+      // is waiting may not leave it or rewrite its owner; a board user clears it.
+      const existingDescriptor = existing.unblockDescriptor ?? null;
+      const humanOwnedBlock =
+        existing.status === "blocked" &&
+        existingDescriptor !== null &&
+        (existingDescriptor.owner === "board" || "userId" in existingDescriptor.owner);
+      if (req.actor.type === "agent" && humanOwnedBlock) {
+        const changingDescriptor =
+          hasOwn(req.body as Record<string, unknown>, "unblockDescriptor") &&
+          !isDeepStrictEqual(req.body.unblockDescriptor, existingDescriptor);
+        if (nextStatus !== "blocked" || changingDescriptor) {
+          throw forbidden(
+            "This block waits for the board; a board user must unblock it or change its owner",
+          );
+        }
+      }
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
-        if (
-          req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
-        ) {
+        // Agents may hand a block to the board (it lands in the board inbox),
+        // but may not page a specific person or wake another agent.
+        if (req.actor.type === "agent" && owner !== "board" && "userId" in owner) {
           throw forbidden(
-            "Agents may only name themselves as an unblock owner",
+            "Agents may name themselves or the board as an unblock owner",
           );
         }
         if (owner !== "board" && "agentId" in owner) {
@@ -13300,7 +13317,7 @@ export function issueRoutes(
             req.actor.agentId !== owner.agentId
           ) {
             throw forbidden(
-              "Agents may only name themselves as an unblock owner",
+              "Agents may name themselves or the board as an unblock owner",
             );
           }
         } else if (owner !== "board" && "userId" in owner) {
