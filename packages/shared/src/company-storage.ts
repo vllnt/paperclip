@@ -117,6 +117,12 @@ export interface StorageProbeResult {
   isolation: "prefix_scoped" | "bucket_wide" | "not_applicable" | "unknown";
   errorCode: string | null;
   error: string | null;
+  /**
+   * A newer probe that has started but not finished. The fields above keep
+   * the previous result until the new one replaces them, so a destination
+   * that passed stays usable while it is probed again.
+   */
+  pending?: { probeId: string; startedAt: string } | null;
 }
 
 export interface StorageDestinationView {

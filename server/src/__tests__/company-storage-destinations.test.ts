@@ -46,6 +46,8 @@ interface FakeBucketOptions {
   serverSideEncryption?: string;
   /** Deny writes whose prefix differs from the destination's prefix. */
   scopedTo?: string;
+  /** Runs inside every PUT, while a probe is in flight. */
+  onPut?: () => Promise<void>;
 }
 
 /** In-memory S3 stand-in keyed by the full object key, prefix included. */
@@ -59,6 +61,7 @@ function fakeBucket(options: FakeBucketOptions = {}) {
     const provider: StorageProvider = {
       id: "s3",
       async putObject(input) {
+        await options.onPut?.();
         if (options.failPut) throw fail(options.failPut);
         if (options.scopedTo !== undefined && location.prefix !== options.scopedTo) throw fail("AccessDenied");
         const body = Buffer.isBuffer(input.body) ? input.body : Buffer.alloc(0);
@@ -365,6 +368,34 @@ describeEmbeddedPostgres("company storage destinations", () => {
     }), BOARD);
     const result = await service.probe(company.companyId, destination.id, BOARD);
     expect(result).toMatchObject({ status: "passed", encryption: "unverified", isolation: "not_applicable" });
+  });
+
+  it("keeps the last passing probe while a new probe runs, then replaces it", async () => {
+    const company = await seedCompany("reprobe");
+    let service: ReturnType<typeof storageDestinationService>;
+    let destinationId = "";
+    let usableDuringProbe: boolean | null = null;
+    const options: FakeBucketOptions = { serverSideEncryption: "AES256" };
+    const bucket = fakeBucket(options);
+    service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => 403 });
+    ({ destination: { id: destinationId } } = await service.create(company.companyId, createInput(company), BOARD));
+    await service.probe(company.companyId, destinationId, BOARD);
+
+    // Second probe: while it is in flight the earlier pass still applies; then it fails.
+    options.onPut = async () => {
+      options.onPut = undefined;
+      usableDuringProbe = await service.providerFor(company.companyId, destinationId).then(() => true, () => false);
+      const [row] = await db.select().from(storageDestinations).where(eq(storageDestinations.id, destinationId));
+      expect(row?.lastProbeJson).toMatchObject({ status: "passed", pending: { probeId: expect.any(String) } });
+      options.failPut = "AccessDenied";
+    };
+    const second = await service.probe(company.companyId, destinationId, BOARD);
+    expect(usableDuringProbe).toBe(true);
+    expect(second).toMatchObject({ status: "failed", errorCode: "access_denied" });
+    const [row] = await db.select().from(storageDestinations).where(eq(storageDestinations.id, destinationId));
+    expect(row?.lastProbeJson).toMatchObject({ status: "failed" });
+    expect(row?.lastProbeJson).not.toHaveProperty("pending");
+    await expect(service.providerFor(company.companyId, destinationId)).rejects.toMatchObject({ status: 409 });
   });
 
   it("rotates credentials with a revision check, clears the old probe and rebinds", async () => {

@@ -27,6 +27,11 @@ function errorMessage(error: unknown, fallback: string): string {
 }
 
 function probeSummary(probe: StorageProbeResult): string {
+  const summary = baseProbeSummary(probe);
+  return probe.pending && probe.status !== "running" ? `${summary} A new probe is running.` : summary;
+}
+
+function baseProbeSummary(probe: StorageProbeResult): string {
   if (probe.status === "running") return "Probe running";
   if (probe.status === "failed") return probe.error ?? "Probe failed";
   const parts = [

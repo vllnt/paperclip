@@ -27,11 +27,15 @@ function privateOriginAllowlist(): string[] {
 
 /**
  * The S3 SDK's addressing rule: virtual-hosted (`bucket.host`) unless path
- * style is forced, the bucket name has a dot, or the host is an IP address.
+ * style is forced, the host is an IP address, or (over HTTPS only, where a
+ * dotted name would break the certificate) the bucket name has a dot.
  */
 export function usesPathStyle(location: Pick<StorageS3Location, "endpoint" | "bucket" | "forcePathStyle">): boolean {
-  const hostname = new URL(location.endpoint).hostname.replace(/^\[|\]$/g, "");
-  return location.forcePathStyle || location.bucket.includes(".") || isIP(hostname) !== 0;
+  const url = new URL(location.endpoint);
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  return location.forcePathStyle
+    || isIP(hostname) !== 0
+    || (url.protocol === "https:" && location.bucket.includes("."));
 }
 
 /**
@@ -45,11 +49,8 @@ export function storageEndpointPolicy(location: Pick<StorageS3Location, "endpoin
   if (endpoint.protocol !== "https:" && !allowPrivateNetwork) {
     throw unprocessable("Use an HTTPS endpoint. A private endpoint needs an operator allowlist entry.");
   }
-  if (
-    allowPrivateNetwork
-    && location.bucket !== undefined
-    && !usesPathStyle({ endpoint: location.endpoint, bucket: location.bucket, forcePathStyle: Boolean(location.forcePathStyle) })
-  ) {
+  // Explicit, not derived: the SDK's implicit rules differ by protocol.
+  if (allowPrivateNetwork && location.bucket !== undefined && !location.forcePathStyle) {
     throw unprocessable("An allowlisted private endpoint must use path-style addressing.");
   }
   return { endpoint, allowPrivateNetwork };

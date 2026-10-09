@@ -1,7 +1,7 @@
 import type { LookupFunction } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import type { StorageS3Location } from "@paperclipai/shared";
-import { companyS3Lookup, storageEndpointPolicy } from "../storage/company-s3-network.js";
+import { companyS3Lookup, storageEndpointPolicy, usesPathStyle } from "../storage/company-s3-network.js";
 
 const location: StorageS3Location = {
   endpoint: "https://s3.example.com/",
@@ -38,6 +38,21 @@ describe("company S3 endpoint policy", () => {
     process.env.PAPERCLIP_STORAGE_PRIVATE_ORIGINS = "http://minio.internal:9000";
     expect(storageEndpointPolicy({ endpoint: "http://minio.internal:9000/" }).allowPrivateNetwork).toBe(true);
     expect(() => storageEndpointPolicy({ endpoint: "http://minio.internal:9001/" })).toThrow(/HTTPS/);
+  });
+});
+
+describe("company S3 addressing", () => {
+  it("follows the SDK: dotted buckets switch to path style over HTTPS only", () => {
+    expect(usesPathStyle({ endpoint: "https://s3.example.com/", bucket: "dotted.bucket", forcePathStyle: false })).toBe(true);
+    expect(usesPathStyle({ endpoint: "http://minio.internal:9000/", bucket: "dotted.bucket", forcePathStyle: false })).toBe(false);
+    expect(usesPathStyle({ endpoint: "https://127.0.0.9/", bucket: "plain", forcePathStyle: false })).toBe(true);
+    expect(usesPathStyle({ endpoint: "https://s3.example.com/", bucket: "plain", forcePathStyle: false })).toBe(false);
+  });
+
+  it("requires explicit path style for an allowlisted private origin", () => {
+    process.env.PAPERCLIP_STORAGE_PRIVATE_ORIGINS = "http://minio.internal:9000";
+    expect(() => storageEndpointPolicy({ endpoint: "http://minio.internal:9000/", bucket: "dotted.bkt", forcePathStyle: false })).toThrow(/path-style/);
+    expect(storageEndpointPolicy({ endpoint: "http://minio.internal:9000/", bucket: "dotted.bkt", forcePathStyle: true }).allowPrivateNetwork).toBe(true);
   });
 });
 

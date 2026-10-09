@@ -497,7 +497,13 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
         errorCode: null,
         error: null,
       };
-      await writeProbe(db, row, result);
+      // Record the intent before any network call, without discarding the
+      // previous result: a destination that passed stays usable (and keeps
+      // its bucket reservation) until this probe finishes.
+      const previous = row.lastProbeJson;
+      await writeProbe(db, row, previous
+        ? { ...previous, pending: { probeId, startedAt: result.startedAt } }
+        : { ...result, pending: { probeId, startedAt: result.startedAt } });
 
       const objectKey = `${PROBE_PREFIX}/${probeId}`;
       const signal = AbortSignal.timeout(probeTimeoutMs);
