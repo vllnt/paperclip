@@ -26445,18 +26445,21 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
-          await (livenessRun.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE
-            ? scheduleBoundedRetryForRun(livenessRun, agent)
-            : scheduleInteractionContinuationInfrastructureRetryIfEligible(
-                livenessRun,
-                agent,
-              )
-          ).catch((retryError) => {
-            logger.warn(
-              { err: retryError, runId: livenessRun.id },
-              "failed to schedule a retry after a workspace restore lock timeout",
+          if (livenessRun.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE) {
+            // Only this branch tolerates a scheduling error; the other keeps
+            // propagating it as it always did.
+            await scheduleBoundedRetryForRun(livenessRun, agent).catch((retryError) => {
+              logger.warn(
+                { err: retryError, runId: livenessRun.id },
+                "failed to schedule a retry after a workspace restore lock timeout",
+              );
+            });
+          } else {
+            await scheduleInteractionContinuationInfrastructureRetryIfEligible(
+              livenessRun,
+              agent,
             );
-          });
+          }
           await releaseIssueExecutionAndPromote(livenessRun, {
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a

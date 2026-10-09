@@ -64,19 +64,24 @@ different case: the merge is not transactional, and a retry from the same
 baseline is safe.
 
 Each write, delete, directory removal, and rename then re-validates its own
-path. On Linux the merge opens each directory from the previous one with
-`O_DIRECTORY` and `O_NOFOLLOW` and operates through `/proc/self/fd/<n>/name`,
-which stays bound to the directory it validated even if its path is swapped for
-a link a moment later; a swapped path is refused or acts on the original
-directory, never on the outside. Node has no `openat` and macOS has no such
-path, so elsewhere the merge checks every ancestor again with `lstat` and a
-`realpath` containment test immediately before the operation, makes missing
-directories one level at a time, and stages each copy in the target root rather
-than beside its destination, so a long copy cannot write through a link. The
-single system call between that last check and the operation is the remaining
-window on those systems; the lock keeps other merges out of it, and a writer
-that does not take the lock is not covered. A plain file in the way of a delete
-means the entry is already gone and the delete is skipped.
+path. **The guarantee that a swapped path cannot redirect an operation holds on
+Linux only, which is where the server runs.** There the merge opens each
+directory from the previous one with `O_DIRECTORY` and `O_NOFOLLOW` and operates
+through `/proc/self/fd/<n>/name`, which stays bound to the directory it
+validated even if its path is swapped for a link a moment later; a swapped path
+is refused or acts on the original directory, never on the outside. Node has no
+`openat` and macOS has no such path. Off Linux the merge falls back to path
+re-checks: it checks every ancestor again with `lstat` and a `realpath`
+containment test immediately before the operation, makes missing directories one
+level at a time, and stages each copy in the target root rather than beside its
+destination, so a long copy cannot write through a link. That narrows the race
+but does not close it: a link swapped in between the last check and the
+operation can still make a write land outside the workspace (a reviewer probe did
+this on macOS). Do not rely on the fallback for a workspace that untrusted code
+can write while a restore runs. The lock keeps other merges out of the window; a
+writer that does not take the lock is not covered by either mode. A plain file
+in the way of a delete means the entry is already gone and the delete is
+skipped, and a delete never removes a directory's contents.
 
 A merge killed while it copies a file leaves its `.paperclip-merge-<uuid>`
 staging file in the workspace. Walks hide these names, so the file would keep

@@ -850,7 +850,7 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
         return;
       }
       if (existing) {
-        await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
+        await fs.rm(targetPath, { force: true }).catch(() => undefined);
       }
       await fs.mkdir(targetPath).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "EEXIST") throw error;
@@ -1199,7 +1199,7 @@ export async function mergeDirectoryWithBaseline(input: {
           const parent = await pinParentDirectory(canonicalTargetDir, relative, { absentBelowFile: true });
           if (!parent) continue;
           try {
-            await fs.rm(path.join(parent.dir, path.posix.basename(relative)), { recursive: true, force: true });
+            await fs.rm(path.join(parent.dir, path.posix.basename(relative)), { force: true });
           } finally { await parent.close(); }
         }
         // Reverse path order visits descendants before their parent directory.

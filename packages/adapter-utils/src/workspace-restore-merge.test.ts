@@ -1400,8 +1400,6 @@ describe("merge mutations are bound to the directory they validated", () => {
   const roots: string[] = [];
   let previousHome: string | undefined;
   let previousInstanceId: string | undefined;
-  // Directory descriptors can be used as path bases only where /proc exposes them.
-  const pinning = typeof descriptorPinningSupported === "function" && descriptorPinningSupported();
 
   afterEach(async () => {
     vi.restoreAllMocks();
@@ -1481,7 +1479,30 @@ describe("merge mutations are bound to the directory they validated", () => {
     expect(await snapshotOf(outside)).toEqual({ x: "outside x\n" });
   });
 
-  it.skipIf(!pinning)("deletes inside the validated directory when its path is swapped for a link just before the delete", async () => {
+  // Directory descriptors are path bases only on Linux, which is where the
+  // server runs. On Linux these must run: a skip there would hide a broken pin.
+  it("does not delete a directory's contents when the entry it removes has become a directory", async () => {
+    const { target, source } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await fsPromises.cp(target, source, { recursive: true });
+    await rm(path.join(source, "a", "x"));
+
+    await expect(mergeDirectoryWithBaseline({
+      baseline, sourceDir: source, targetDir: target,
+      // After the preflight, another writer replaces the file the run deleted
+      // with a directory that holds new work.
+      afterPreflight: async () => {
+        await rm(path.join(target, "a", "x"));
+        await mkdir(path.join(target, "a", "x"));
+        await writeFile(path.join(target, "a", "x", "concurrent.txt"), "new work\n");
+      },
+    })).rejects.toThrow();
+
+    expect(await readFile(path.join(target, "a", "x", "concurrent.txt"), "utf8")).toBe("new work\n");
+  });
+
+  it.skipIf(process.platform !== "linux")("deletes inside the validated directory when its path is swapped for a link just before the delete", async () => {
+    expect(descriptorPinningSupported()).toBe(true);
     const { target, source, outside } = await workspace();
     const baseline = await captureDirectorySnapshot(target);
     await fsPromises.cp(target, source, { recursive: true });
@@ -1499,7 +1520,8 @@ describe("merge mutations are bound to the directory they validated", () => {
     expect(await snapshotOf(outside)).toEqual({ x: "outside x\n" });
   });
 
-  it.skipIf(!pinning)("renames inside the validated directory when its path is swapped for a link just before the rename", async () => {
+  it.skipIf(process.platform !== "linux")("renames inside the validated directory when its path is swapped for a link just before the rename", async () => {
+    expect(descriptorPinningSupported()).toBe(true);
     const { target, source, outside } = await workspace();
     const baseline = await captureDirectorySnapshot(target);
     await fsPromises.cp(target, source, { recursive: true });
