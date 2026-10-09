@@ -72,6 +72,23 @@ Pick one per agent. A run with none fails with `grok_auth_required` (the CLI say
    `POST /v1/chat/completions` to that URL with `Authorization: Bearer`. The
    gateway must serve xAI models on `/v1/chat/completions`.
 
+## Pin the model when a gateway is used
+
+Through a gateway, the CLI's own default model is **not** a Grok model. In the
+operator's CLIProxy deployment, `grok` with no `--model` runs `claude-3-5-haiku`.
+
+The adapter does not guard against this yet. When an agent's `model` is empty or
+`grok-build` (the adapter's placeholder default), the adapter passes no `--model`
+flag and the gateway's default applies. So until a guard ships:
+
+- set an explicit `grok-*` model on every `grok_local` agent (the canary uses
+  `grok-4.7`);
+- check the model in the run log after the first run.
+
+`paperclipai agent set-adapter` already refuses an agent whose model is not an
+xAI model, so a switched agent keeps its `grok-*` model. The gap is an agent
+created directly on `grok_local` without one.
+
 ## Instance prerequisite
 
 The agent route refuses a switch onto an adapter listed in the instance's
@@ -142,7 +159,9 @@ back its configuration revision (`paperclipai agent config-revisions <agent-id>`
 2. Confirm `grok_local` is enabled on the instance (see above).
 3. Bind `XAI_API_KEY` (and `GROK_XAI_API_BASE_URL` if a gateway is used) as company
    secrets. Run the agent's environment test.
-4. Switch one anthm agent with `--dry-run`, read the plan, apply.
+4. Pick one agent that already runs a `grok-*` model (the canary uses `grok-4.7`).
+   Switch it with `--dry-run`, read the plan, apply. Check the first run used that
+   model and not the gateway default.
 5. Compare its `grok_local` runs against its earlier `codex_local` runs for a
    working day: success rate, duration and cost in the run log (and, once #63
    lands, `/api/companies/:companyId/run-target-stats`).
@@ -157,6 +176,11 @@ switch was run from the agent page (desktop and 390 px) and from the CLI against
 a local server: the stored agent became `grok_local` with its model, effort,
 instructions bundle and `XAI_API_KEY` secret reference.
 
-Not verified: execution on Linux (the pins match the registry, but no Linux
-container ran here), a real xAI or CLIProxy run with a valid key, and the exact
-wording of xAI's rate-limit body.
+Reported by the operator (not checked from this branch): Grok Build 1.0.49 is
+installed on one worker, `grok_local` is enabled on the production instance, and
+workers authenticate through the CLIProxy gateway.
+
+Not verified: a successful `grok_local` run through the gateway (none reported
+yet), whether the install on the worker used `scripts/install-grok-build.sh`, and
+the exact wording of xAI's rate-limit body. No Linux container ran the install
+script from this branch.
