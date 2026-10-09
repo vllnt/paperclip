@@ -280,9 +280,18 @@ describe("round 2: an expiry is a scheduled deletion", () => {
     const f = await setup();
     withExpiry(f, "feat-open", null, { lastDeployTime: NOW - 50 * HOUR });
     f.github.pulls.push({ number: 12, ref: "feat-open" });
-    // The floor is now + the 24 hour activity window: the reaper's own deadline (lastDeploy + 36h) is already past.
-    expect((await expire(f, "feat-open", 23.9)).error).toMatch(/open pull request/i);
-    expect((await expire(f, "feat-open", 24)).data.expiresAt).toBe(NOW + 24 * HOUR);
+    // A stale guarded preview without an expiry: the reaper would give it now + 36h, so that is the floor.
+    expect((await expire(f, "feat-open", 35.9)).error).toMatch(/open pull request/i);
+    expect((await expire(f, "feat-open", 36)).data.expiresAt).toBe(NOW + 36 * HOUR);
+  });
+
+  it("cannot use a short activity window to set a short deadline on a stale guarded preview", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: baseConfig({ guards: { activityHours: 1 } }) } });
+    withExpiry(f, "feat-open", null, { lastDeployTime: NOW - 40 * HOUR });
+    f.github.pulls.push({ number: 12, ref: "feat-open" });
+    expect((await expire(f, "feat-open", 2)).error).toMatch(/open pull request #12/i);
+    expect((await expire(f, "feat-open", 24)).error).toMatch(/open pull request #12/i);
+    expect(f.convex.mutations()).toHaveLength(0);
   });
 
   it("will not set an earlier deadline than the reaper would on a recently deployed guarded preview that has no expiry yet", async () => {
@@ -424,5 +433,87 @@ describe("round 2: secrets, counters and evidence", () => {
     const result = await f.h.executeTool<{ data?: any }>("convex_delete_preview", { name: "pr-42-preview", dryRun: true }, run("janitor"));
     expect(result.data.reason).toMatch(/branch is gone/i);
     expect(result.data.evidence.prState).toBe("none");
+  });
+});
+
+
+describe("round 3: reaper bookkeeping", () => {
+  const enabled = (extra: Record<string, unknown> = {}) => baseConfig({ reaper: { enabled: true }, ...extra });
+  const managedKey = { scopeKind: "company" as const, scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" };
+  const twoProjects = () => enabled({ projects: [
+    { convexProjectId: "100", name: "a", repository: "org/a", token: ref("s-project") },
+    { convexProjectId: "200", name: "b", repository: "org/b" },
+  ] });
+
+  it("keeps tracked expiries of a project that failed to list, even when another project listed fine", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: twoProjects() } });
+    f.convex.add(deployment("a-one", { lastDeployTime: NOW - 10 * HOUR }), deployment("b-one", { projectId: 200, lastDeployTime: NOW - 10 * HOUR }));
+    f.github.pulls.push({ number: 1, ref: "a-one" }, { number: 2, ref: "b-one" });
+    await f.h.runJob("convex-reaper");
+    expect(Object.keys(f.h.getState(managedKey) as object).sort()).toEqual(["a-one", "b-one"]);
+    f.convex.validTokens.delete(PROJECT_TOKEN); // project a can no longer be listed
+    await f.h.runJob("convex-reaper");
+    expect(Object.keys(f.h.getState(managedKey) as object).sort()).toEqual(["a-one", "b-one"]);
+  });
+
+  it("follows a redeploy for an expiry an agent set, because every expiry the plugin sets is tracked", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled() } });
+    // No pull request and no branch: nothing guards this preview, and it is not yet idle long enough to reap.
+    f.convex.add(deployment("feat-x", { lastDeployTime: NOW - 10 * HOUR }));
+    expect((await expire(f, "feat-x", 25)).data.expiresAt).toBe(NOW + 25 * HOUR);
+    f.clock.now += 10 * HOUR;
+    f.convex.deployments.get("feat-x")!.lastDeployTime = f.clock.now - HOUR;
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deployments.get("feat-x")?.expiresAt).toBe(f.clock.now - HOUR + 36 * HOUR);
+  });
+
+  it("still moves its own expiries later while GitHub is down, and touches nothing else", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled() } });
+    f.convex.add(deployment("ours", { lastDeployTime: NOW - 10 * HOUR }), deployment("other", { lastDeployTime: NOW - 10 * HOUR }));
+    f.github.pulls.push({ number: 1, ref: "ours" }, { number: 2, ref: "other" });
+    await f.h.runJob("convex-reaper");
+    f.clock.now += 10 * HOUR;
+    for (const name of ["ours", "other"]) f.convex.deployments.get(name)!.lastDeployTime = f.clock.now - HOUR;
+    f.convex.deployments.get("other")!.expiresAt = f.clock.now + 2 * HOUR; // a person's choice
+    f.github.down = true;
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deployments.get("ours")?.expiresAt).toBe(f.clock.now - HOUR + 36 * HOUR);
+    expect(f.convex.deployments.get("other")?.expiresAt).toBe(f.clock.now + 2 * HOUR);
+    expect(f.convex.deletes()).toHaveLength(0);
+    expect(((await f.h.performAction("reaper.report", {}, member(COMPANY_A))) as any).projects[0].error).toMatch(/GitHub/i);
+  });
+});
+
+describe("round 3: secrets and dry runs", () => {
+  it("drops a cached credential on a 401 from any call, so a corrected token works at once", async () => {
+    const f = await setup({ connect: [], configs: { [COMPANY_A]: baseConfig({ projects: [{ convexProjectId: "100", name: "app", repository: "org/app", token: ref("s-project") }] }) } });
+    f.convex.validTokens.delete(PROJECT_TOKEN);
+    await expect(f.h.performAction("connection.connect", {}, admin(COMPANY_A))).rejects.toThrow(/401/);
+    const rotated = "cvx_project_ROTATED_0987654321";
+    secretValues["s-project"] = rotated;
+    f.convex.validTokens.add(rotated);
+    try { expect((await f.h.performAction<any>("connection.connect", {}, admin(COMPANY_A))).projects).toEqual(["100"]); }
+    finally { secretValues["s-project"] = PROJECT_TOKEN; f.convex.validTokens.add(PROJECT_TOKEN); }
+  });
+
+  it("forgets a company's cached secrets when it disconnects", async () => {
+    const f = await setup();
+    const resolve = f.h.ctx.secrets.resolve as unknown as { mock: { calls: unknown[] }; mockClear(): void };
+    await f.h.performAction("connection.disconnect", {}, admin(COMPANY_A));
+    resolve.mockClear();
+    await f.h.performAction("connection.connect", {}, admin(COMPANY_A));
+    expect(resolve.mock.calls.length).toBeGreaterThan(0);
+  });
+
+  it("does not charge the run allowance for a dry run that would count as a deletion", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: baseConfig({ guards: { maxDeletesPerRun: 1 } }) } });
+    closed(f, "a");
+    closed(f, "b");
+    for (const name of ["a", "b"]) f.convex.deployments.get(name)!.expiresAt = NOW + 100 * HOUR;
+    expect((await del(f, "a")).data.deleted).toBe(true);
+    const planned = await expire(f, "b", 25, { dryRun: true });
+    expect(planned.error).toBeUndefined();
+    expect(planned.data).toMatchObject({ dryRun: true, expiresAt: NOW + 25 * HOUR });
+    expect((await expire(f, "b", 25)).error).toMatch(/limit of 1 deletions/i);
   });
 });

@@ -8,9 +8,12 @@ import {
 import { ConvexApiError, ConvexClient } from "./convex-client.js";
 import { isGranted, hasAnyGrant, type AgentIdentity } from "./grants.js";
 import { GitHubReader } from "./github-reader.js";
+import { reaperDeadline } from "./policy.js";
 import { assessPreview, recheckCache, Refusal, type GuardCache, type PreviewAssessment } from "./preview-guard.js";
 
 const SECRET_TTL_MS = 60_000;
+/** Expiries the plugin set itself, by deployment name. Only these follow a redeploy; an expiry a person set is never moved later. */
+const managedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "reaper", stateKey: "managed-expiry" });
 const registryKey = { scopeKind: "instance" as const, namespace: "connection", stateKey: "projects" };
 const disconnectedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "connection", stateKey: "disconnected" });
 const deletionKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "deletions", stateKey: "runs" });
@@ -35,7 +38,10 @@ export const isShowable = (error: unknown): error is Error => error instanceof R
 export class ConvexService {
   private queue = new Map<string, Promise<unknown>>();
   private calls = new Map<string, number[]>();
-  constructor(readonly d: ServiceDeps) {}
+  constructor(readonly d: ServiceDeps) {
+    d.convex.onUnauthorized = token => this.forgetCredential(token);
+    d.github.onUnauthorized = token => this.forgetCredential(token);
+  }
 
   /** Runs operations on one key one at a time, so counters and registry changes cannot race. */
   serialize<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -101,6 +107,7 @@ export class ConvexService {
       const registry = await this.registry();
       for (const [id, owner] of Object.entries(registry)) if (owner === companyId) delete registry[id];
       await this.d.ctx.state.set(registryKey, registry);
+      for (const key of [...this.secrets.keys()]) if (key.startsWith(`${companyId}:`)) this.secrets.delete(key);
       await this.d.ctx.activity.log({ companyId, message: "Convex disconnected" });
     });
   }
@@ -108,19 +115,25 @@ export class ConvexService {
   // --- credentials: resolved per operation, never stored, logged or returned ---
 
   /**
-   * Resolved secrets are kept in memory for a minute, per company and secret, because the host limits secret resolution per minute and a
-   * reaper pass or a few tool calls would otherwise exhaust it. A credential Convex rejects with 401 is dropped at once.
+   * Resolved secrets are kept in worker memory for a minute, per company and secret, because the host limits secret resolution per minute and a
+   * reaper pass or a few tool calls would otherwise exhaust it. Expired entries are dropped on every lookup, and a credential that Convex or GitHub
+   * rejects with 401 is dropped at once (see `forgetCredential`). Values are never returned, logged or persisted.
    */
   private secrets = new Map<string, { value: Promise<string>; expires: number }>();
   private resolveSecret(_config: ConnectionConfig, ref: SecretRef, companyId: string, configPath: string): Promise<string> {
     const key = `${companyId}:${ref.secretId}`;
     const now = this.d.now();
+    for (const [entryKey, entry] of this.secrets) if (entry.expires <= now) this.secrets.delete(entryKey);
     const known = this.secrets.get(key);
-    if (known && known.expires > now) return known.value;
+    if (known) return known.value;
     const value = this.d.ctx.secrets.resolve(ref, { companyId, configPath });
     this.secrets.set(key, { value, expires: now + SECRET_TTL_MS });
     value.catch(() => { if (this.secrets.get(key)?.value === value) this.secrets.delete(key); });
     return value;
+  }
+  /** A 401 means the cached value is stale (rotated or wrong): forget whichever cached secret holds exactly that value. */
+  private forgetCredential(token: string) {
+    for (const [key, entry] of this.secrets) void entry.value.then(value => { if (value === token && this.secrets.get(key) === entry) this.secrets.delete(key); }, () => {});
   }
   private forgetSecret(companyId: string, ref: SecretRef) { this.secrets.delete(`${companyId}:${ref.secretId}`); }
   /** Listing needs a project token or the team token; a preview deploy key cannot list. */
@@ -264,10 +277,10 @@ export class ConvexService {
     // sooner than the activity window is a deletion and follows the deletion guards. Extending an expiry (up to 7 days) is not.
     const { deployment } = target;
     const lastActivity = deployment.lastDeployTime ?? deployment.createTime ?? now;
-    const floor = Math.max(deployment.expiresAt ?? 0, lastActivity + config.reaper.ttlHours * HOUR_MS, now + config.guards.activityHours * HOUR_MS);
+    const floor = Math.max(deployment.expiresAt ?? 0, reaperDeadline(now, lastActivity, config.reaper.ttlHours), now + config.guards.activityHours * HOUR_MS);
     const deletesSoon = !options.viaReaper && expiresAt < floor;
     if (deletesSoon) {
-      await this.requireRunAllowance(actor, config.guards.maxDeletesPerRun);
+      if (!dryRun && !config.guards.dryRunOnly) await this.requireRunAllowance(actor, config.guards.maxDeletesPerRun);
       const assessment = await this.assess(actor.companyId, target);
       if (assessment.blocked) throw new Refusal(`${assessment.blocked} An expiry sooner than this preview's current deadline deletes it earlier, so it follows the deletion guards.`);
     }
@@ -278,8 +291,28 @@ export class ConvexService {
     }
     if (deletesSoon && actor.kind === "agent") await this.reserveRunDeletion(actor, config.guards.maxDeletesPerRun);
     await this.withCredential(config, actor.companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.setExpiry(token, name, expiresAt));
+    await this.markManaged(actor.companyId, { [name]: expiresAt });
     await this.audit(actor, "Convex preview expiry set", { ...record, outcome: "expiry-set" }, name);
     return { dryRun: false, name, expiresAt, previousExpiresAt: target.deployment.expiresAt };
+  }
+
+  /** Expiries this plugin set, by deployment name. Whoever sets an expiry (the reaper or an agent) records it here, so a later redeploy can move it. */
+  async managedExpiries(companyId: string): Promise<Record<string, number>> {
+    const stored = await this.d.ctx.state.get(managedKey(companyId));
+    return stored && typeof stored === "object" && !Array.isArray(stored) ? { ...(stored as Record<string, number>) } : {};
+  }
+  markManaged(companyId: string, changes: Record<string, number>): Promise<void> {
+    return this.serialize(`managed:${companyId}`, async () => {
+      await this.d.ctx.state.set(managedKey(companyId), { ...(await this.managedExpiries(companyId)), ...changes });
+    });
+  }
+  /** Forgets deployments that no longer exist, so the record stays as small as the preview list. */
+  pruneManaged(companyId: string, live: ReadonlySet<string>): Promise<void> {
+    return this.serialize(`managed:${companyId}`, async () => {
+      const managed = await this.managedExpiries(companyId);
+      for (const name of Object.keys(managed)) if (!live.has(name)) delete managed[name];
+      await this.d.ctx.state.set(managedKey(companyId), managed);
+    });
   }
 
   /** Per-run deletion counts for a company, in one record. Entries older than three days are dropped whenever the record is written. */

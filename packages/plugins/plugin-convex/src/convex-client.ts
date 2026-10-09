@@ -52,6 +52,8 @@ export function assertConvexCloudUrl(value: string): URL {
 }
 
 export class ConvexClient {
+  /** Called with the credential Convex answered 401 for, so the owner can drop a stale cached copy. */
+  onUnauthorized: (token: string) => void = () => {};
   constructor(private fetchImpl: FetchLike = (url, init) => fetch(url, init)) {}
 
   private async request<T>(method: string, url: string, scheme: "Bearer" | "Convex", token: string, body?: unknown): Promise<T> {
@@ -70,7 +72,10 @@ export class ConvexClient {
         throw new ConvexApiError(0, "Convex could not be reached.");
       }
       const raw = await readBody(res);
-      if (!res.ok) throw new ConvexApiError(res.status, describeFailure(res.status, raw, token));
+      if (!res.ok) {
+        if (res.status === 401) this.onUnauthorized(token);
+        throw new ConvexApiError(res.status, describeFailure(res.status, raw, token));
+      }
       if (res.status === 204 || raw === "") return undefined as T;
       try { return JSON.parse(raw) as T; } catch { throw new ConvexApiError(res.status, "Convex returned a response that is not JSON."); }
     } finally { clearTimeout(timer); }

@@ -111,7 +111,7 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Co
     githubToken: secretRef(github.token, "github.token"),
     grants: grants.map(grant),
     guards: {
-      activityHours: bounded(guards.activityHours, "guards.activityHours", 24, 1, 720),
+      activityHours: bounded(guards.activityHours, "guards.activityHours", 24, 1, 168),
       maxDeletesPerRun: bounded(guards.maxDeletesPerRun, "guards.maxDeletesPerRun", 20, 1, 100),
       callsPerMinute: bounded(guards.callsPerMinute, "guards.callsPerMinute", 60, 1, 600),
       dryRunOnly: flag(guards.dryRunOnly, "guards.dryRunOnly", false),

@@ -1,14 +1,10 @@
 import { HOUR_MS, type ConnectionConfig, type ReaperProjectReport, type ReaperReport } from "./contracts.js";
 import { classifyDeployment } from "./classify.js";
-import { GITHUB_UNREADABLE, newGuardCache, Refusal } from "./preview-guard.js";
+import { EXPIRY_TOLERANCE_MS, MIN_PLANNED_LEAD_MS } from "./policy.js";
+import { GITHUB_UNREADABLE, newGuardCache, Refusal, type PreviewAssessment } from "./preview-guard.js";
 import { isShowable, type Actor, type ConvexService, type DeletionBudget } from "./service.js";
 
 export const reportKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "reaper", stateKey: "last-report" });
-/** Expiries the reaper set itself, by deployment name. Only these follow a redeploy; an expiry a person set is never moved later. */
-const managedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "reaper", stateKey: "managed-expiry" });
-const EXPIRY_TOLERANCE_MS = 5 * 60_000;
-/** An expiry sooner than this would make Convex delete a guarded preview before the next hourly pass could see a redeploy, so it is never scheduled. */
-const MIN_PLANNED_LEAD_MS = 2 * HOUR_MS;
 
 const safe = (error: unknown) => isShowable(error) ? error.message : "The Convex action failed.";
 
@@ -26,7 +22,7 @@ export interface ReaperOptions {
  * It is a dry run until the company sets `reaper.enabled`. Every deletion goes through the same guards as the tool.
  */
 export function runReaper(service: ConvexService, companyId: string, options: ReaperOptions): Promise<ReaperReport> {
-  // One pass per company at a time: the hourly job, a board run and an agent's tool call must not interleave their reads and writes of the managed-expiry record.
+  // One pass per company at a time: the hourly job, a board run and an agent's tool call must not interleave their reads and writes.
   return service.serialize(`reaper:${companyId}`, () => reaperPass(service, companyId, options));
 }
 
@@ -40,51 +36,62 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
   const cache = newGuardCache();
   const seen = new Set<string>();
   let listedAll = true;
-  const stored = await ctx.state.get(managedKey(companyId));
-  const managed: Record<string, number> = stored && typeof stored === "object" && !Array.isArray(stored) ? { ...(stored as Record<string, number>) } : {};
+  const managed = await service.managedExpiries(companyId);
   const report: ReaperReport = { at: new Date(now).toISOString(), trigger: options.trigger, dryRun, projects: [], quota: null, errors: [] };
 
   for (const [index, project] of config.projects.entries()) {
     if (!reserved.has(project.convexProjectId)) continue;
     const entry: ReaperProjectReport = { convexProjectId: project.convexProjectId, name: project.name, previews: 0, delete: [], setExpiry: [], kept: 0, deleted: [], expirySet: [], failed: [], skipped: [] };
     report.projects.push(entry);
+    let listed = false;
     try {
-      listedAll = false;
       const token = await service.listToken(config, companyId, project, index);
       const previews = await service.d.convex.listProjectDeployments(token, project.convexProjectId, "preview");
-      listedAll = true;
+      listed = true;
       entry.previews = previews.length;
       for (const preview of previews) seen.add(preview.name);
+      let githubProblem: string | null = null;
       for (const deployment of previews) {
         const { environment, reason } = classifyDeployment(deployment, project);
         if (deployment.projectId !== project.convexProjectId || environment !== "preview") {
           entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: `classified ${environment}: ${reason}` });
           continue;
         }
-        const target = { config, project, projectIndex: index, deployment, environment, reason };
-        const assessment = await service.assess(companyId, target, cache);
-        if (!assessment.checked) {
-          // Without GitHub nothing is known about this project's previews: stop, and neither delete nor shorten any of them.
-          if (assessment.blocked === GITHUB_UNREADABLE) throw new Refusal(assessment.blocked);
-          entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: assessment.blocked ?? "not checked" });
+        const lastDeploy = deployment.lastDeployTime ?? deployment.createTime ?? now;
+        const deadline = lastDeploy + config.reaper.ttlHours * HOUR_MS;
+        const current = deployment.expiresAt;
+        // An expiry the plugin set follows a later deploy; one a person chose never moves later. Moving a deadline later deletes nothing, so it needs no GitHub.
+        const ours = current !== null && managed[deployment.name] !== undefined && Math.abs(managed[deployment.name] - current) <= EXPIRY_TOLERANCE_MS;
+        const extend = ours && deadline - now >= MIN_PLANNED_LEAD_MS && current < deadline - EXPIRY_TOLERANCE_MS;
+
+        let assessment: PreviewAssessment | null = null;
+        let unreadable: string | null = null;
+        try { assessment = await service.assess(companyId, { config, project, projectIndex: index, deployment, environment, reason }, cache); }
+        catch (error) { unreadable = safe(error); }
+        if (assessment && !assessment.checked && assessment.blocked === GITHUB_UNREADABLE) unreadable = assessment.blocked;
+        if (unreadable !== null) {
+          // Without GitHub nothing is known about this preview: it is neither deleted nor shortened. Only a move to a later deadline is safe.
+          githubProblem ??= unreadable;
+          if (extend) { entry.kept += 1; entry.setExpiry.push({ name: deployment.name, from: current, to: deadline }); }
           continue;
         }
-        if (assessment.reapReason) {
-          entry.delete.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: assessment.reapReason });
+        if (!assessment!.checked) {
+          entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: assessment!.blocked ?? "not checked" });
+          continue;
+        }
+        if (assessment!.reapReason) {
+          entry.delete.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: assessment!.reapReason });
           continue;
         }
         entry.kept += 1;
-        const lastDeploy = deployment.lastDeployTime ?? deployment.createTime ?? now;
-        const target36 = lastDeploy + config.reaper.ttlHours * HOUR_MS;
-        const current = deployment.expiresAt;
-        // Shorten to lastDeployTime + TTL. Follow a later deploy only for an expiry this reaper set, never one a person chose.
-        const ours = managed[deployment.name] !== undefined && current !== null && Math.abs(managed[deployment.name] - current) <= EXPIRY_TOLERANCE_MS;
-        if (target36 - now >= MIN_PLANNED_LEAD_MS) {
-          if (current === null || current > target36 + EXPIRY_TOLERANCE_MS || (ours && current < target36 - EXPIRY_TOLERANCE_MS)) entry.setExpiry.push({ name: deployment.name, from: current, to: target36 });
+        // Shorten to lastDeployTime + TTL; when that is too close, only give a preview without any expiry now + TTL.
+        if (deadline - now >= MIN_PLANNED_LEAD_MS) {
+          if (current === null || current > deadline + EXPIRY_TOLERANCE_MS || extend) entry.setExpiry.push({ name: deployment.name, from: current, to: deadline });
         } else if (current === null) {
           entry.setExpiry.push({ name: deployment.name, from: null, to: now + config.reaper.ttlHours * HOUR_MS });
         }
       }
+      if (githubProblem) entry.error = githubProblem;
       if (dryRun) continue;
       for (const item of entry.delete) {
         if (budget.left <= 0) { entry.skipped.push({ ...item, reason: `Deletion limit of ${budget.max} reached for this run.` }); continue; }
@@ -99,7 +106,6 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
       for (const item of entry.setExpiry) {
         try {
           await service.setPreviewExpiry(actor, config, reserved, item.name, 0, false, { expiryAt: item.to, viaReaper: true });
-          managed[item.name] = item.to;
           entry.expirySet.push(item.name);
         } catch (error) {
           if (error instanceof Refusal) entry.skipped.push({ name: item.name, previewIdentifier: null, reason: error.message });
@@ -107,16 +113,14 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
         }
       }
     } catch (error) {
+      // A project that cannot be listed must keep its tracked expiries: pruning is skipped for the whole pass.
+      if (!listed) listedAll = false;
       entry.error = safe(error);
       entry.delete = []; entry.setExpiry = [];
     }
   }
 
-  if (!dryRun) {
-    // Forget deployments that no longer exist, so the record stays as small as the preview list. Skipped when a project failed to list; a later problem, such as an unreadable GitHub repository, does not matter because the list is complete.
-    if (listedAll) for (const name of Object.keys(managed)) if (!seen.has(name)) delete managed[name];
-    await ctx.state.set(managedKey(companyId), managed);
-  }
+  if (!dryRun && listedAll) await service.pruneManaged(companyId, seen);
 
   try {
     const quota = await service.quota(config, companyId, reserved);

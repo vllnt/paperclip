@@ -14,6 +14,8 @@ const encSegments = (name: string) => name.split("/").map(encodeURIComponent).jo
  * throw as "do not delete". Lists that exceed their page budget also throw, because a missing entry would unprotect a preview.
  */
 export class GitHubReader {
+  /** Called with the token GitHub answered 401 for, so the owner can drop a stale cached copy. */
+  onUnauthorized: (token: string) => void = () => {};
   constructor(private fetchImpl: FetchLike = (url, init) => fetch(url, init)) {}
 
   private async get<T>(repo: string, path: string, token: string): Promise<T | null> {
@@ -29,7 +31,11 @@ export class GitHubReader {
         });
       } catch { throw new Error("GitHub could not be reached."); }
       if (res.status === 404) { await res.body?.cancel(); return null; }
-      if (!res.ok) { await res.body?.cancel(); throw new Error(`GitHub answered ${res.status}.`); }
+      if (!res.ok) {
+        await res.body?.cancel();
+        if (res.status === 401) this.onUnauthorized(token);
+        throw new Error(`GitHub answered ${res.status}.`);
+      }
       return await res.json() as T;
     } finally { clearTimeout(timer); }
   }

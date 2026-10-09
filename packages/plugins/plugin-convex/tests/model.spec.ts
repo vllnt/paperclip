@@ -57,6 +57,7 @@ describe("config", () => {
     [{ grants: [{ agentId: "a", environments: ["preview"] }] }, /grants nothing/],
     [{ reaper: { ttlHours: 200 } }, /ttlHours/],
     [{ guards: { maxDeletesPerRun: 0 } }, /maxDeletesPerRun/],
+    [{ guards: { activityHours: 169 } }, /activityHours/],
   ])("rejects %j", (raw, message) => {
     expect(() => parseConfig(raw as Record<string, unknown>)).toThrow(message);
   });

@@ -51,7 +51,7 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       guards: {
         type: "object", additionalProperties: false, properties: {
-          activityHours: { type: "integer", minimum: 1, maximum: 720 }, maxDeletesPerRun: { type: "integer", minimum: 1, maximum: 100 },
+          activityHours: { type: "integer", minimum: 1, maximum: 168 }, maxDeletesPerRun: { type: "integer", minimum: 1, maximum: 100 },
           callsPerMinute: { type: "integer", minimum: 1, maximum: 600 }, dryRunOnly: { type: "boolean" },
         },
       },
