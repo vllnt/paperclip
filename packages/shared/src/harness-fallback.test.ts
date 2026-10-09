@@ -79,6 +79,47 @@ describe("readModelOverridesFromArgs attached spellings", () => {
   });
 });
 
+describe("pathological input", () => {
+  const SIZE = 100_000;
+  const inputs: Array<[string, string]> = [
+    ["many open brackets", `[${"[".repeat(SIZE)}`],
+    ["bracket suffix after many brackets", `${"[".repeat(SIZE)}]`],
+    ["model= followed by tabs", `model=${"\t".repeat(SIZE)}`],
+    ["model with tabs before =", `model${"\t".repeat(SIZE)}x`],
+    ["long dotted prefix", `${"a.".repeat(SIZE / 2)}model=`],
+    ["many quotes", `model=${'"'.repeat(SIZE)}`],
+    ["many slashes and no @", `//${"a/".repeat(SIZE / 2)}`],
+  ];
+
+  it.each(inputs)("classifies and parses %s in linear time", (_label, input) => {
+    const startedAt = performance.now();
+    classifyModelVendor(input);
+    readModelOverridesFromArgs(["-c", input, `--config=${input}`, `-m${input}`]);
+    checkHarnessModelCompatibility({ adapterType: "codex_local", model: input, extraArgs: ["-c", input] }, { requireKnownVendor: false });
+    agentFallbacksSchema.safeParse([{ adapterType: "codex_local", model: "gpt-5.5", env: { OPENAI_BASE_URL: input, OPENAI_MODEL: input } }]);
+    expect(performance.now() - startedAt).toBeLessThan(50);
+  });
+});
+
+describe("config model assignment parsing", () => {
+  it.each([
+    ["model=claude-opus-4", ["claude-opus-4"]],
+    ['model = "gpt-5.5"', ["gpt-5.5"]],
+    ["model='o3'", ["o3"]],
+    ["  profiles.fast.model =\t o4-mini  ", ["o4-mini"]],
+    ["a-b.c.model=grok-4.7", ["grok-4.7"]],
+    ["model=", []],
+    ["model=''", []],
+    ["model=a'b", []],
+    ["models=gpt-5.5", []],
+    [".model=gpt-5.5", []],
+    ["x model=gpt-5.5", []],
+    ["model_provider=anthropic", []],
+  ])("%j", (assignment, expected) => {
+    expect(readModelOverridesFromArgs(["-c", assignment])).toEqual(expected);
+  });
+});
+
 describe("harness ↔ model compatibility matrix", () => {
   it("keeps the documented matrix", () => {
     expect(HARNESS_ALLOWED_MODEL_VENDORS).toEqual({

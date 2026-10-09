@@ -34,7 +34,7 @@ const ROUTER_PREFIX_RE = /^(?:openrouter\/|azure\/|bedrock\/|vertex_ai\/)/;
  * @example classifyModelVendor("anthropic/claude-sonnet-4-5") // "anthropic"
  */
 export function classifyModelVendor(model: string): ModelVendor {
-  const id = model.trim().toLowerCase().replace(/\[[^\]]*\]$/, "");
+  const id = stripTrailingBracketSuffix(model.trim().toLowerCase());
   if (!id) return "unknown";
   if (id.includes("claude") || id.includes("anthropic") || ANTHROPIC_ALIAS_RE.test(id)) return "anthropic";
   if (id.includes("grok")) return "xai";
@@ -43,9 +43,48 @@ export function classifyModelVendor(model: string): ModelVendor {
   return "unknown";
 }
 
+/**
+ * Removes a trailing `[…]` suffix such as Claude's `[1m]` context marker. The
+ * suffix starts at the first `[` after the last `]` that precedes the final
+ * character, so the scan is linear.
+ */
+function stripTrailingBracketSuffix(id: string): string {
+  if (!id.endsWith("]")) return id;
+  const previousClose = id.lastIndexOf("]", id.length - 2);
+  const open = id.indexOf("[", previousClose + 1);
+  return open === -1 ? id : id.slice(0, open);
+}
+
+function isConfigKeyPrefix(prefix: string): boolean {
+  if (prefix.length < 2 || !prefix.endsWith(".")) return false;
+  for (let index = 0; index < prefix.length; index += 1) {
+    const code = prefix.charCodeAt(index);
+    const word = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+    if (!word && code !== 46 && code !== 45) return false;
+  }
+  return true;
+}
+
+function isQuote(char: string | undefined): boolean {
+  return char === '"' || char === "'";
+}
+
+/**
+ * Reads the value of `model=…`, `-c model="…"` or `profiles.x.model=…`. The
+ * key is everything before the first `=`; the value may carry one optional
+ * quote on each side and no quote inside.
+ */
 function readConfigModelAssignment(value: string): string | null {
-  const match = /^(?:[\w.-]+\.)?model\s*=\s*["']?([^"']+)["']?$/.exec(value.trim());
-  return match ? match[1].trim() : null;
+  const text = value.trim();
+  const equals = text.indexOf("=");
+  if (equals === -1) return null;
+  const key = text.slice(0, equals).trimEnd();
+  if (key !== "model" && !(key.endsWith(".model") && isConfigKeyPrefix(key.slice(0, -"model".length)))) return null;
+  let body = text.slice(equals + 1).trimStart();
+  if (isQuote(body[0])) body = body.slice(1);
+  if (isQuote(body[body.length - 1])) body = body.slice(0, -1);
+  if (body.length === 0 || body.includes('"') || body.includes("'")) return null;
+  return body.trim();
 }
 
 /**

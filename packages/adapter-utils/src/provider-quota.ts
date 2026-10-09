@@ -42,16 +42,54 @@ function parseGoDurationMs(value: string): number | null {
   return parts.reduce((total, part) => total + Number(part[1]) * DURATION_UNIT_MS[part[2]], 0);
 }
 
-function parseRelativeDurationMs(text: string): number | null {
-  const match = /(?:try\s+again|retry|resets?)\s+in\s+((?:\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*(?:and\s+)?)+)/i.exec(text);
-  if (!match) return null;
-  let ms = 0;
-  for (const part of match[1].matchAll(/(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/gi)) {
-    const unit = part[2].toLowerCase();
-    const key = unit.startsWith("d") ? "d" : unit.startsWith("h") ? "h" : unit.startsWith("m") ? "m" : "s";
-    ms += Number(part[1]) * DURATION_UNIT_MS[key];
+const RELATIVE_DURATION_MARKERS = ["try again in ", "retry in ", "resets in ", "reset in "];
+
+function isDigit(char: string | undefined): boolean {
+  return char !== undefined && char >= "0" && char <= "9";
+}
+
+function isLetter(char: string | undefined): boolean {
+  return char !== undefined && char >= "a" && char <= "z";
+}
+
+function durationUnitMs(unit: string): number | null {
+  if (unit === "d" || unit === "day" || unit === "days") return DURATION_UNIT_MS.d;
+  if (unit === "h" || unit === "hr" || unit === "hrs" || unit === "hour" || unit === "hours") return DURATION_UNIT_MS.h;
+  if (unit === "m" || unit === "min" || unit === "mins" || unit === "minute" || unit === "minutes") return DURATION_UNIT_MS.m;
+  if (unit === "s" || unit === "sec" || unit === "secs" || unit === "second" || unit === "seconds") return DURATION_UNIT_MS.s;
+  return null;
+}
+
+/** Sums `<n><unit>` pairs such as "2 hours 15 minutes" or "1h, and 5m" in one pass. */
+function sumDurationsMs(lower: string, from: number): number {
+  let index = from;
+  let total = 0;
+  for (;;) {
+    while (index < lower.length && (lower[index] === " " || lower[index] === "," || lower[index] === "\t")) index += 1;
+    if (lower.startsWith("and ", index)) index += 4;
+    while (index < lower.length && lower[index] === " ") index += 1;
+    const digitsStart = index;
+    while (isDigit(lower[index])) index += 1;
+    if (index === digitsStart) return total;
+    const amount = Number(lower.slice(digitsStart, index));
+    while (lower[index] === " ") index += 1;
+    const unitStart = index;
+    while (isLetter(lower[index])) index += 1;
+    const unitMs = durationUnitMs(lower.slice(unitStart, index));
+    if (unitMs === null) return total;
+    total += amount * unitMs;
   }
-  return ms > 0 ? ms : null;
+}
+
+function parseRelativeDurationMs(text: string): number | null {
+  const lower = text.toLowerCase();
+  for (const marker of RELATIVE_DURATION_MARKERS) {
+    const found = lower.indexOf(marker);
+    if (found === -1) continue;
+    const total = sumDurationsMs(lower, found + marker.length);
+    if (total > 0) return total;
+  }
+  return null;
 }
 
 /**
