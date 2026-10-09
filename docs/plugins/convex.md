@@ -256,7 +256,7 @@ Hourly job `convex-reaper` (also `reaper.run` and the `convex_reap_previews` too
    `guards.activityHours` keeps branches with recent commits from being deleted by the reaper, not from expiring;
 4. counts all team deployments against `reaper.quota` and raises an issue (once a day) and an activity entry at `reaper.alertPercent`.
 
-It is a dry run until `reaper.enabled` is true. When GitHub cannot be read for a project, it changes nothing in that project.
+`ttlHours` is 3 to 168, because the reaper keeps a two hour lead and runs hourly. Tracked-expiry bookkeeping is pruned on every pass, including dry runs. It is a dry run until `reaper.enabled` is true. When GitHub cannot be read for a project, it changes nothing in that project.
 
 ### Known limits of slice 1
 
