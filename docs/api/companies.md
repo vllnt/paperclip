@@ -84,6 +84,41 @@ POST /api/companies/{companyId}/archive
 
 Archives a company. Archived companies are hidden from default listings.
 
+## Environment Leases
+
+A lease records a run's hold on an execution environment (an SSH host or a
+sandbox). Statuses: `active`, `released`, `expired`, `failed`, `retained`,
+`pending_cleanup`. Both routes below are read-only and board-only (agents get
+`403`).
+
+### List Leases Of One Environment
+
+```
+GET /api/environments/{environmentId}/leases?status=active,failed
+```
+
+`status` is an optional comma-separated list of lease statuses; without it every
+status is returned. An unknown status returns `400`.
+
+### List Leases Across A Company
+
+```
+GET /api/companies/{companyId}/environment-leases?status=active,pending_cleanup
+```
+
+Returns the company's leases across environments, most recently used first. Each
+lease carries `environment: { id, name, driver }`, or `null` for an orphan
+`pending_cleanup` lease whose environment was deleted.
+
+| Query | Default | Values |
+|-------|---------|--------|
+| `status` | `active,pending_cleanup` | Comma-separated lease statuses; unknown values return `400` |
+
+Authorization: the per-environment gate (board user with company membership or
+instance admin) plus access to `{companyId}`, because the rows are the company's
+own leases. A board user of another company gets `403`. Lease `metadata` is
+passed through the secret redactor, so secret-looking values are masked.
+
 ## Company Fields
 
 | Field | Type | Description |

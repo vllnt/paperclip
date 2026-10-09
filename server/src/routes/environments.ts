@@ -2,11 +2,13 @@ import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_ADAPTER_TYPES,
+  COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
   cancelEnvironmentCustomImageSetupSessionSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   createEnvironmentSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
   getEnvironmentCapabilities,
+  listEnvironmentLeasesQuerySchema,
   probeEnvironmentConfigSchema,
   resolveDeclaredSandboxCapabilities,
   redactEnvironmentCustomImageSetupSession,
@@ -54,7 +56,8 @@ import {
   type ReadyPluginWorkerRecovery,
 } from "../services/plugin-environment-driver.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { redactEventPayload } from "../redaction.js";
+import { assertBoardOrgAccess, assertCompanyAccess, getActorInfo } from "./authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -1106,10 +1109,24 @@ export function environmentRoutes(
       res.status(404).json({ error: "Environment not found" });
       return;
     }
-    const leases = await svc.listLeases(environment.id, {
-      status: req.query.status as string | undefined,
-    });
+    const query = listEnvironmentLeasesQuerySchema.parse(req.query);
+    const leases = await svc.listLeases(environment.id, { status: query.status });
     res.json(leases);
+  });
+
+  // Company-wide lease list. Same gate as the per-environment lease list (board
+  // with org access; agents are denied), plus company access because the rows
+  // are filtered to this company's leases. Lease metadata can echo provider
+  // config, so it is passed through the shared redactor.
+  router.get("/companies/:companyId/environment-leases", async (req, res) => {
+    assertCanReadInstanceEnvironments(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const query = listEnvironmentLeasesQuerySchema.parse(req.query);
+    const leases = await svc.listCompanyLeases(companyId, {
+      statuses: query.status ?? COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
+    });
+    res.json(leases.map((lease) => ({ ...lease, metadata: redactEventPayload(lease.metadata) })));
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {

@@ -20,6 +20,7 @@ import {
   ENVIRONMENT_LEASE_POLICIES,
   ENVIRONMENT_LEASE_STATUSES,
   ENVIRONMENT_STATUSES,
+  type CompanyEnvironmentLeaseListItem,
   type CreateEnvironment,
   type Environment,
   type EnvironmentDeleteBlastRadius,
@@ -1373,17 +1374,61 @@ export function environmentService(db: Db) {
     listLeases: async (
       environmentId: string,
       filters: {
-        status?: string;
+        status?: string | readonly string[];
       } = {},
     ): Promise<EnvironmentLease[]> => {
       const conditions = [eq(environmentLeases.environmentId, environmentId)];
-      if (filters.status) conditions.push(eq(environmentLeases.status, filters.status));
+      if (typeof filters.status === "string") {
+        if (filters.status) conditions.push(eq(environmentLeases.status, filters.status));
+      } else if (filters.status && filters.status.length > 0) {
+        conditions.push(inArray(environmentLeases.status, [...filters.status]));
+      }
       const rows = await db
         .select()
         .from(environmentLeases)
         .where(and(...conditions))
         .orderBy(desc(environmentLeases.lastUsedAt), desc(environmentLeases.createdAt));
       return rows.map(toEnvironmentLease);
+    },
+
+    /**
+     * Leases of one company across environments, most recently used first. The
+     * environment is left-joined because an orphan `pending_cleanup` lease keeps
+     * its row after the environment is deleted.
+     */
+    listCompanyLeases: async (
+      companyId: string,
+      filters: { statuses: readonly string[] },
+    ): Promise<CompanyEnvironmentLeaseListItem[]> => {
+      const rows = await db
+        .select({
+          lease: environmentLeases,
+          environmentName: environments.name,
+          environmentDriver: environments.driver,
+        })
+        .from(environmentLeases)
+        .leftJoin(environments, eq(environments.id, environmentLeases.environmentId))
+        .where(
+          and(
+            eq(environmentLeases.companyId, companyId),
+            inArray(environmentLeases.status, [...filters.statuses]),
+          ),
+        )
+        .orderBy(desc(environmentLeases.lastUsedAt), desc(environmentLeases.createdAt));
+      return rows.map((row) => {
+        const lease = toEnvironmentLease(row.lease);
+        return {
+          ...lease,
+          environment:
+            lease.environmentId && row.environmentName !== null && row.environmentDriver !== null
+              ? {
+                  id: lease.environmentId,
+                  name: row.environmentName,
+                  driver: readEnum(row.environmentDriver, ENVIRONMENT_DRIVERS, "environment driver") ?? "local",
+                }
+              : null,
+        };
+      });
     },
 
     acquireLease: async (input: {
