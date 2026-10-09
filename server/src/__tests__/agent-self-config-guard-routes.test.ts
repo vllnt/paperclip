@@ -782,4 +782,115 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       expect((await readAgent(db, fixture.agent.id)).adapterConfig).toMatchObject({ timeoutSec: 86_400 });
     });
   });
+
+  describe("agent join request approval", () => {
+    async function seedPendingAgentJoin(agentDefaultsPayload: Record<string, unknown>) {
+      const { companyId } = await seedAgent(db, { role: "ceo" });
+      const approverId = await seedPeer(db, companyId);
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "agent",
+        principalId: approverId,
+        status: "active",
+        membershipRole: "member",
+      });
+      await db.insert(principalPermissionGrants).values({
+        companyId,
+        principalType: "agent",
+        principalId: approverId,
+        permissionKey: "joins:approve",
+        scope: null,
+        grantedByUserId: null,
+      });
+      const [invite] = await db
+        .insert(invites)
+        .values({
+          companyId,
+          tokenHash: createHash("sha256").update(`pcp_invite_${randomUUID()}`).digest("hex"),
+          allowedJoinTypes: "agent",
+          expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+          acceptedAt: new Date(),
+        })
+        .returning();
+      const [joinRequest] = await db
+        .insert(joinRequests)
+        .values({
+          inviteId: invite!.id,
+          companyId,
+          requestType: "agent",
+          status: "pending_approval",
+          requestIp: "127.0.0.1",
+          agentName: "Joiner",
+          adapterType: "claude_local",
+          agentDefaultsPayload,
+        })
+        .returning();
+      return { companyId, approverId, joinRequestId: joinRequest!.id };
+    }
+
+    async function companyAgentCount(companyId: string) {
+      return (await db.select().from(agents).where(eq(agents.companyId, companyId))).length;
+    }
+
+    const PROTECTED_PAYLOAD = { model: "large-model", dangerouslySkipPermissions: true };
+
+    it("denies an agent approver creating an agent with the requester's protected settings, before any write", async () => {
+      const { companyId, approverId, joinRequestId } = await seedPendingAgentJoin(PROTECTED_PAYLOAD);
+
+      const res = await request(createAccessApp(db, agentActor(companyId, approverId)))
+        .post(`/api/companies/${companyId}/join-requests/${joinRequestId}/approve`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({
+        code: "agent_self_protected_config_change",
+        fields: ["adapterConfig.dangerouslySkipPermissions", "adapterConfig.model"],
+      });
+      expect(await companyAgentCount(companyId)).toBe(2);
+      const [joinRequest] = await db.select().from(joinRequests).where(eq(joinRequests.id, joinRequestId));
+      expect(joinRequest!.status).toBe("pending_approval");
+      expect((await deniedActivity(db, companyId))[0]).toMatchObject({
+        companyId,
+        actorType: "agent",
+        actorId: approverId,
+        entityType: "company",
+        details: { surface: "join_approval", joinRequestId },
+      });
+    });
+
+    it("still lets an agent approver approve a request with no protected settings", async () => {
+      const { companyId, approverId, joinRequestId } = await seedPendingAgentJoin({ cwd: "/tmp/joiner" });
+
+      const res = await request(createAccessApp(db, agentActor(companyId, approverId)))
+        .post(`/api/companies/${companyId}/join-requests/${joinRequestId}/approve`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await companyAgentCount(companyId)).toBe(3);
+      expect(await deniedActivity(db, companyId)).toHaveLength(0);
+    });
+
+    it("still lets an agent approver holding agents:configure approve protected settings", async () => {
+      const { companyId, approverId, joinRequestId } = await seedPendingAgentJoin(PROTECTED_PAYLOAD);
+      await grantAgentConfigure(db, companyId, approverId, null);
+
+      const res = await request(createAccessApp(db, agentActor(companyId, approverId)))
+        .post(`/api/companies/${companyId}/join-requests/${joinRequestId}/approve`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await companyAgentCount(companyId)).toBe(3);
+    });
+
+    it("keeps a board approver unchanged", async () => {
+      const { companyId, joinRequestId } = await seedPendingAgentJoin(PROTECTED_PAYLOAD);
+
+      const res = await request(createAccessApp(db, boardActor(companyId)))
+        .post(`/api/companies/${companyId}/join-requests/${joinRequestId}/approve`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(await companyAgentCount(companyId)).toBe(3);
+    });
+  });
 });

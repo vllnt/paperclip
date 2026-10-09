@@ -94,7 +94,8 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
   });
 
   /** Seeds a company, the plugin, a managed agent whose config has drifted from the plugin defaults, and a peer agent that can call the plugin. */
-  async function seed() {
+  async function seed(options: { provision?: boolean; manifest?: PaperclipPluginManifestV1 } = {}) {
+    const manifest = options.manifest ?? MANIFEST;
     const companyId = randomUUID();
     const pluginId = randomUUID();
     await db.insert(companies).values({
@@ -105,27 +106,30 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     });
     await db.insert(plugins).values({
       id: pluginId,
-      pluginKey: MANIFEST.id,
+      pluginKey: manifest.id,
       packageName: "@paperclipai/plugin-managed-agent-caller-test",
-      version: MANIFEST.version,
-      apiVersion: MANIFEST.apiVersion,
-      categories: MANIFEST.categories,
-      manifestJson: MANIFEST,
+      version: manifest.version,
+      apiVersion: manifest.apiVersion,
+      categories: manifest.categories,
+      manifestJson: manifest,
       status: "ready",
       installOrder: 1,
     });
-    const services = buildHostServices(db, pluginId, MANIFEST.id, EVENT_BUS_STUB, undefined, { manifest: MANIFEST });
-    const created = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
-    const managedAgentId = created.agentId!;
-    await db
-      .update(agents)
-      .set({
-        adapterConfig: { command: "custom", model: "large-model" },
-        runtimeConfig: { heartbeat: { enabled: true, maxDailyRuns: 5000 } },
-        budgetMonthlyCents: 999_999,
-        permissions: { canCreateAgents: true },
-      })
-      .where(eq(agents.id, managedAgentId));
+    const services = buildHostServices(db, pluginId, manifest.id, EVENT_BUS_STUB, undefined, { manifest });
+    let managedAgentId = "";
+    if (options.provision !== false) {
+      const created = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
+      managedAgentId = created.agentId!;
+      await db
+        .update(agents)
+        .set({
+          adapterConfig: { command: "custom", model: "large-model" },
+          runtimeConfig: { heartbeat: { enabled: true, maxDailyRuns: 5000 } },
+          budgetMonthlyCents: 999_999,
+          permissions: { canCreateAgents: true },
+        })
+        .where(eq(agents.id, managedAgentId));
+    }
     const [peer] = await db
       .insert(agents)
       .values({
@@ -139,7 +143,7 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
       })
       .returning();
     await db.insert(companyMemberships).values(
-      [managedAgentId, peer!.id].map((principalId) => ({
+      [managedAgentId, peer!.id].filter(Boolean).map((principalId) => ({
         companyId,
         principalType: "agent" as const,
         principalId,
@@ -259,6 +263,155 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
 
     expect(reset.status).toBe("reset");
     expect(await readAgent(managedAgentId)).toMatchObject({ title: "Maintains plugin-owned knowledge" });
+    expect(await deniedActivity(managedAgentId)).toHaveLength(0);
+  });
+
+  const ELEVATED_MANIFEST: PaperclipPluginManifestV1 = {
+    ...MANIFEST,
+    agents: [{
+      ...MANIFEST.agents![0]!,
+      adapterConfig: { command: "pnpm wiki:maintain", model: "large-model", dangerouslySkipPermissions: true },
+      permissions: { canCreateAgents: true },
+    }],
+  };
+
+  async function agentCount(companyId: string) {
+    return (await db.select().from(agents).where(eq(agents.companyId, companyId))).length;
+  }
+
+  async function deniedForCompany(companyId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, companyId), eq(activityLog.action, "agent.self_config_update_denied")));
+  }
+
+  it("denies a reconcile started by an agent that would create a managed agent with protected fields, and logs it", async () => {
+    const { companyId, services, peerId } = await seed({ provision: false });
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" })),
+    ).rejects.toMatchObject({
+      status: 403,
+      details: {
+        code: "agent_self_protected_config_change",
+        fields: ["budgetMonthlyCents", "adapterConfig.command", "runtimeConfig.heartbeat.maxDailyRuns"],
+      },
+    });
+
+    expect(await agentCount(companyId)).toBe(1);
+    const denied = await deniedForCompany(companyId);
+    expect(denied).toHaveLength(1);
+    expect(denied[0]).toMatchObject({
+      companyId,
+      actorType: "agent",
+      actorId: peerId,
+      agentId: peerId,
+      entityType: "company",
+      details: {
+        surface: "plugin_managed_create",
+        reason: "deny_no_grant",
+        sourcePluginKey: MANIFEST.id,
+        managedResourceKey: "wiki-maintainer",
+      },
+    });
+  });
+
+  it("denies a declaration that grants canCreateAgents, a model, and a permission bypass flag to an agent-started create", async () => {
+    const { companyId, services, peerId } = await seed({ provision: false, manifest: ELEVATED_MANIFEST });
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" })),
+    ).rejects.toMatchObject({
+      status: 403,
+      details: {
+        fields: expect.arrayContaining([
+          "adapterConfig.dangerouslySkipPermissions",
+          "adapterConfig.model",
+          "permissions.canCreateAgents",
+        ]),
+      },
+    });
+    expect(await agentCount(companyId)).toBe(1);
+  });
+
+  it("still creates the managed agent for a call that no agent started (board, user, or system)", async () => {
+    const { companyId, services } = await seed({ provision: false, manifest: ELEVATED_MANIFEST });
+
+    const created = await services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" });
+
+    expect(created.status).toBe("created");
+    expect(await agentCount(companyId)).toBe(2);
+    expect(await deniedForCompany(companyId)).toHaveLength(0);
+  });
+
+  it("still creates the managed agent for an agent holding company-wide agents:configure", async () => {
+    const { companyId, services, peerId } = await seed({ provision: false, manifest: ELEVATED_MANIFEST });
+    await db.insert(principalPermissionGrants).values({
+      companyId,
+      principalType: "agent",
+      principalId: peerId,
+      permissionKey: "agents:configure",
+      scope: null,
+      grantedByUserId: null,
+    });
+
+    const created = await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+      services.agents.managedReconcile({ companyId, agentKey: "wiki-maintainer" }));
+
+    expect(created.status).toBe("created");
+    expect(await deniedForCompany(companyId)).toHaveLength(0);
+  });
+
+  it.each([
+    { change: "resume" as const, from: "paused", to: "idle" },
+    { change: "pause" as const, from: "idle", to: "paused" },
+  ])("denies a $change started by an agent without agents:configure, and logs it", async ({ change, from }) => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+    await db.update(agents).set({ status: from, pauseReason: from === "paused" ? "budget" : null }).where(eq(agents.id, managedAgentId));
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        services.agents[change]({ companyId, agentId: managedAgentId })),
+    ).rejects.toMatchObject({ status: 403, details: { code: "agent_self_protected_config_change", fields: ["status"] } });
+
+    expect((await readAgent(managedAgentId)).status).toBe(from);
+    expect((await deniedActivity(managedAgentId))[0]).toMatchObject({
+      actorId: peerId,
+      details: { surface: "plugin_status_change", change, sourcePluginKey: MANIFEST.id },
+    });
+  });
+
+  it("denies the managed agent resuming itself through a plugin call", async () => {
+    const { companyId, services, managedAgentId } = await seed();
+    await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, managedAgentId));
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: managedAgentId, runId: null, companyId }, () =>
+        services.agents.resume({ companyId, agentId: managedAgentId })),
+    ).rejects.toMatchObject({ status: 403 });
+    expect((await readAgent(managedAgentId)).status).toBe("paused");
+  });
+
+  it("still pauses and resumes for a call that no agent started, and for an agent holding agents:configure", async () => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+
+    expect((await services.agents.pause({ companyId, agentId: managedAgentId })).status).toBe("paused");
+    expect((await services.agents.resume({ companyId, agentId: managedAgentId })).status).toBe("idle");
+
+    await db.insert(principalPermissionGrants).values({
+      companyId,
+      principalType: "agent",
+      principalId: peerId,
+      permissionKey: "agents:configure",
+      scope: null,
+      grantedByUserId: null,
+    });
+    const paused = await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+      services.agents.pause({ companyId, agentId: managedAgentId }));
+    expect(paused.status).toBe("paused");
     expect(await deniedActivity(managedAgentId)).toHaveLength(0);
   });
 });

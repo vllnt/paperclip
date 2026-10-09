@@ -583,6 +583,56 @@ describe("built-in agent routes", () => {
       expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
     });
 
+    function engineerBuiltInState() {
+      return builtInState({ agent: { ...builtInState().agent, role: "engineer" } });
+    }
+
+    it("denies a reset that would change the stored role without agents:configure, and logs it", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(engineerBuiltInState());
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/reset`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields: ["role"] });
+      expect(mockBuiltInAgentService.reset).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.self_config_update_denied",
+        entityId: agentId,
+        details: expect.objectContaining({ surface: "built_in_reset", fields: ["role"], builtInAgentKey: "briefs" }),
+      }));
+    });
+
+    it("still resets when the stored role already matches the default, and when the reset leaves the agent row out", async () => {
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState());
+      const matching = await request(app).post(`/api/companies/${companyId}/built-in-agents/briefs/reset`).send({});
+      expect(matching.status, JSON.stringify(matching.body)).toBe(200);
+
+      mockBuiltInAgentService.get.mockResolvedValue(engineerBuiltInState());
+      const instructionsOnly = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/reset`)
+        .send({ resources: ["instructions"] });
+      expect(instructionsOnly.status, JSON.stringify(instructionsOnly.body)).toBe(200);
+      expect(mockBuiltInAgentService.reset).toHaveBeenCalledTimes(2);
+    });
+
+    it("still resets a changed role for an agent holding agents:configure", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(engineerBuiltInState());
+      decideByAction(true);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app).post(`/api/companies/${companyId}/built-in-agents/briefs/reset`).send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.reset).toHaveBeenCalled();
+    });
+
     it("keeps a board caller unchanged", async () => {
       mockBuiltInAgentService.get.mockResolvedValue(builtInState());
       decideByAction(false);

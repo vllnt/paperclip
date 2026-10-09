@@ -2,6 +2,7 @@ import {
   createHash,
   generateKeyPairSync,
   randomBytes,
+  randomUUID,
   timingSafeEqual
 } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -94,7 +95,10 @@ import {
   resolveHumanInviteRole,
 } from "../services/company-member-roles.js";
 import { humanJoinGrantsFromDefaults } from "../services/invite-grants.js";
-import { collectAgentProtectedConfigChanges } from "../services/agent-self-config-authz.js";
+import {
+  collectAgentProtectedConfigChanges,
+  collectNewAgentProtectedFields,
+} from "../services/agent-self-config-authz.js";
 import {
   assertAgentProtectedChangeGranted,
   type AgentProtectedChangeActivityActor,
@@ -4319,6 +4323,34 @@ export function accessRoutes(
           throw conflict(
             "Join request cannot be approved because this company has no active CEO"
           );
+        }
+
+        /**
+         * The requester chose the new agent's adapter config. A board approver
+         * sees and accepts it. An agent approver (`joins:approve`) may not
+         * create an agent with settings it could not set itself.
+         */
+        if (req.actor.type === "agent") {
+          await assertAgentProtectedChangeGranted({
+            db,
+            access,
+            req,
+            activityActor: {
+              actorType: "agent",
+              actorId: req.actor.agentId ?? "unknown-agent",
+              agentId: req.actor.agentId ?? null,
+              runId: req.actor.runId ?? null,
+              agentApiKeyId: req.actor.keyId ?? null,
+            },
+            target: { id: randomUUID(), companyId },
+            entity: { type: "company", id: companyId },
+            fields: collectNewAgentProtectedFields({
+              adapterType: existing.adapterType ?? "process",
+              adapterConfig: isPlainObject(existing.agentDefaultsPayload) ? existing.agentDefaultsPayload : {},
+            }),
+            surface: "join_approval",
+            details: { joinRequestId: requestId, inviteId: invite.id },
+          });
         }
 
         const agentName = deduplicateAgentName(

@@ -15,6 +15,7 @@ import type {
   PluginManagedAgentResolution,
 } from "@paperclipai/shared";
 import { isUuidLike } from "@paperclipai/shared";
+import { randomUUID } from "node:crypto";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { agentService } from "./agents.js";
 import { approvalService } from "./approvals.js";
@@ -26,6 +27,7 @@ import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import {
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
+  collectNewAgentProtectedFields,
 } from "./agent-self-config-authz.js";
 import { agentInstructionsBundleMode, agentInstructionsService } from "./agent-instructions.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
@@ -492,8 +494,10 @@ export function pluginManagedAgentService(
     const requiresApproval = company.requireBoardApprovalForNewAgents;
     const adapterType = await resolveManagedAdapterType(companyId, declaration);
     const initialStatus = requiresApproval ? "pending_approval" : declaration.status ?? "idle";
+    const defaults = declarationPatch(declaration, { adapterType });
+    await assertAgentCallerMayCreateProtectedFields(companyId, declaration, defaults);
     let created = await agentSvc.create(companyId, {
-      ...declarationPatch(declaration, { adapterType }),
+      ...defaults,
       status: initialStatus,
       pauseReason: initialStatus === "paused" ? managedAgentPauseReason(options.pluginKey) : null,
       pausedAt: initialStatus === "paused" ? new Date() : null,
@@ -667,39 +671,84 @@ export function pluginManagedAgentService(
     managedResourceKey: string,
     defaults: ReturnType<typeof declarationPatch>,
   ) {
+    await assertAgentCallerGranted({
+      companyId,
+      target: agent,
+      entity: { type: "agent", id: agent.id },
+      managedResourceKey,
+      surface: "plugin_managed_reset",
+      fields: () => [
+        ...collectAgentProtectedConfigChanges(agent, {
+          adapterType: defaults.adapterType,
+          adapterConfig: defaults.adapterConfig,
+          runtimeConfig: defaults.runtimeConfig,
+          budgetMonthlyCents: defaults.budgetMonthlyCents,
+          role: defaults.role,
+          status: agent.status,
+        }),
+        ...collectAgentPermissionChanges(agent.permissions, normalizeAgentPermissions(defaults.permissions)),
+      ],
+    });
+  }
+
+  /**
+   * Creating a managed agent applies the plugin declaration's adapter, runtime
+   * caps, budget, role, and permissions to a new row. When an agent started the
+   * plugin call, those settings are compared with a bare new agent, and a
+   * protected one needs `agents:configure` for the new agent, as on
+   * `POST /companies/:companyId/agents`. Board, user, and system calls keep
+   * their access. Runs before any write.
+   */
+  async function assertAgentCallerMayCreateProtectedFields(
+    companyId: string,
+    declaration: PluginManagedAgentDeclaration,
+    defaults: ReturnType<typeof declarationPatch>,
+  ) {
+    await assertAgentCallerGranted({
+      companyId,
+      target: { id: randomUUID(), companyId },
+      entity: { type: "company", id: companyId },
+      managedResourceKey: declaration.agentKey,
+      surface: "plugin_managed_create",
+      fields: () => collectNewAgentProtectedFields(defaults),
+    });
+  }
+
+  /**
+   * Judges the agent behind the current plugin host call, if any, against the
+   * protected fields `fields` returns. A denial is logged with the plugin and
+   * managed resource key.
+   */
+  async function assertAgentCallerGranted(input: {
+    companyId: string;
+    target: { id: string; companyId: string };
+    entity: { type: "agent" | "company"; id: string };
+    managedResourceKey: string;
+    surface: "plugin_managed_reset" | "plugin_managed_create";
+    fields: () => string[];
+  }) {
     const caller = currentPluginHostCallAgent();
     if (!caller) return;
-    const fields = [
-      ...collectAgentProtectedConfigChanges(agent, {
-        adapterType: defaults.adapterType,
-        adapterConfig: defaults.adapterConfig,
-        runtimeConfig: defaults.runtimeConfig,
-        budgetMonthlyCents: defaults.budgetMonthlyCents,
-        role: defaults.role,
-        status: agent.status,
-      }),
-      ...collectAgentPermissionChanges(agent.permissions, normalizeAgentPermissions(defaults.permissions)),
-    ];
     const actor = { type: "agent" as const, agentId: caller.agentId, companyId: caller.companyId, runId: caller.runId, source: "agent_jwt" as const };
     await assertAgentProtectedChangeGranted({
       actor,
       decide: (request) => authorizationService(db).decide(request),
       recordDenial: async (details) => {
         await logActivity(db, {
-          companyId,
+          companyId: input.companyId,
           actorType: "agent",
           actorId: caller.agentId,
           agentId: caller.agentId,
           runId: caller.runId,
           action: "agent.self_config_update_denied",
-          entityType: "agent",
-          entityId: agent.id,
-          details: { ...details, managedResourceKey },
+          entityType: input.entity.type,
+          entityId: input.entity.id,
+          details: { ...details, managedResourceKey: input.managedResourceKey },
         });
       },
-      target: { id: agent.id, companyId },
-      fields,
-      surface: "plugin_managed_reset",
+      target: input.target,
+      fields: input.fields(),
+      surface: input.surface,
       details: { sourcePluginKey: options.pluginKey },
     });
   }

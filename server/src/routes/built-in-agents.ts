@@ -155,6 +155,41 @@ export function builtInAgentRoutes(db: Db) {
     });
   }
 
+  /**
+   * A reset writes the built-in definition's default role to the agent, and
+   * `role` is a protected field. An agent caller needs `agents:configure` for
+   * the target when that would change the stored role. Resets that leave the
+   * agent row out (`resources` without `agent`) change no protected field.
+   */
+  async function assertAgentCallerMayResetBuiltInDefaults(
+    req: Request,
+    companyId: string,
+    key: string,
+    resources: string[] | undefined,
+  ) {
+    if (req.actor.type !== "agent") return;
+    if (resources && !resources.includes("agent")) return;
+    const current = await svc.get(companyId, key);
+    if (!current.agent) return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target: current.agent,
+      fields: collectAgentProtectedConfigChanges(current.agent, { ...current.agent, role: current.definition.defaultRole }),
+      surface: "built_in_reset",
+      details: { builtInAgentKey: key },
+    });
+  }
+
   async function assertCanControlBuiltInRoutine(req: Request, companyId: string) {
     assertCompanyAccess(req, companyId);
     if (req.actor.type !== "board") {
@@ -280,6 +315,7 @@ export function builtInAgentRoutes(db: Db) {
     const key = req.params.key as string;
     await assertBuiltInAgentsEnabled();
     await assertCanProvisionBuiltInAgents(req, companyId);
+    await assertAgentCallerMayResetBuiltInDefaults(req, companyId, key, req.body.resources);
     const state = await svc.reset(companyId, key, req.body, req.actor);
     await logBuiltInAgentMutation(req, {
       companyId,
