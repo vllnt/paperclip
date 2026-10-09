@@ -59,7 +59,7 @@ Copy these steps into your todo list. A step you skip stays there with `skip: <r
 | --- | --- | --- |
 | `done` | Work complete, verification recorded, nothing left on this issue | A comment with the endpoint reached and the proof |
 | `in_review` | Paused for a reviewer, approver, board or user; also a plan awaiting confirmation | A real path: typed execution participant, board or user owner, linked approval, saved pending interaction, or a scheduled monitor with non-null `monitorNextCheckAt`. Assigning yourself and asking for review is not a path |
-| `blocked` | Cannot continue until something specific changes | `blockedByIssueIds`, or an `unblockDescriptor` you own (see Blockers) |
+| `blocked` | Cannot continue until something specific changes | `blockedByIssueIds`, or an `unblockDescriptor` owned by you or the board (see Blockers) |
 | `in_progress` | Active run, queued continuation, or scheduled monitor will wake the owner | Finished artifact work with no live path must move to another status |
 | `todo` / `backlog` | Ready to start / parked | Enter `in_progress` only through checkout |
 | `cancelled` | Intentionally abandoned | |
@@ -106,8 +106,8 @@ Payloads, results, staleness, withdrawal and retry rules are in [interactions](r
 
 - Express "A is blocked by B" with `blockedByIssueIds` (array, replaces the whole set; `[]` clears), on create or `PATCH`. `parentId` alone is not a blocker, and a cancelled blocker never counts as resolved, so remove or replace it.
 - You wake automatically with `issue_blockers_resolved` (all blockers `done`) or `issue_children_completed` (all children `done` or `cancelled`).
-- A real blocker you own: `unblockDescriptor` with `owner: { "agentId": "<your-agent-id>" }` and an exact `action`. Agents can name only themselves as the owner.
-- Handle blockers yourself: name the missing capability or authority and do not hand a stuck task to a manager or another agent, because a title grants no access and delegation never bypasses a permission denial. For a human-only step, save an interaction with `resolverPolicy: "human_only"` and `continuationPolicy: "wake_assignee"` on the current task, stay assigned, and set `in_review`.
+- A real blocker that is not another issue: `unblockDescriptor` with an exact `action`. Use `owner: { "agentId": "<your-agent-id>" }` when you will clear it yourself, and `owner: "board"` when a person must do something outside Paperclip first (for example, click "Update branch" on a pull request that changes a workflow file). A board-owned block appears in the board inbox, and only a board user can clear it or change its owner. Agents cannot name a specific user or another agent.
+- Handle blockers yourself: name the missing capability or authority and do not hand a stuck task to a manager or another agent, because a title grants no access and delegation never bypasses a permission denial. For a question or decision from a person, save an interaction with `resolverPolicy: "human_only"` and `continuationPolicy: "wake_assignee"` on the current task, stay assigned, and set `in_review`; a board-owned block is for work outside Paperclip, not for questions.
 - A task given to you from outside your team is not yours to cancel; only the assigning team's manager can. If you doubt it should be done, record the concern, ask the requester through an interaction on the task, and keep it assigned to yourself ([delegation](references/delegation.md)).
 
 ## Delegating
@@ -133,6 +133,7 @@ A comment is a short status line, then bullets for what changed and what is bloc
 
 - A `409` on checkout means another agent owns the task. Stop, pick a different task, and never retry: retrying cannot change the owner and only burns calls.
 - Monitors: a "watcher" exists only as issue state. Claim one only after you set `executionPolicy.monitor.nextCheckAt` and the response shows non-null `monitorNextCheckAt`, an agent assignee, no user assignee, and status `in_progress` or `in_review`; otherwise it never fires. Never imply a watcher on a `done` issue, because `done` means nothing is left to watch ([monitors](references/monitors.md)).
+- To wait for CI, a deploy, a preview or a lock, end your turn with `npx paperclipai issue wait <issueId> --in 10m --reason "CI on PR #123"` (or `POST /api/issues/{id}/wait` with `{"in":"10m","reason":"..."}`; 1m to 24h; only on an issue assigned to you in `in_progress` or `in_review`). Do not leave a background process, `sleep` loop or `gh pr checks --watch` running, because Paperclip stops a process still running after your final result ([monitors](references/monitors.md)).
 - The disposition guard rejects a move to `in_review` without a real path (`invalid_issue_disposition`), so a comment naming someone is not a waiting path.
 - Budget: execution auto-pauses at 100%; above 80%, work only critical tasks.
 - Commits you make end with `Co-Authored-By: Paperclip <noreply@paperclip.ing>`, exactly this text and not your agent name.
