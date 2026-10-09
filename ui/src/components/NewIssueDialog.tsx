@@ -1,3 +1,5 @@
+import { RunTierPicker, runTiersAvailable } from "./RunTierPicker";
+import { companiesApi } from "../api/companies";
 import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
 import { createTaskWithDestination, TaskDestinationPicker, useTaskDestination, type TaskDestination } from "@/plugins/task-creation";
 import { AgentAvatar } from "@/components/AgentAvatar";
@@ -512,6 +514,7 @@ export function NewIssueDialog() {
   const [assigneeModelLane, setAssigneeModelLane] = useState<IssueModelLane>("primary");
   const [assigneeModelOverride, setAssigneeModelOverride] = useState("");
   const [assigneeThinkingEffort, setAssigneeThinkingEffort] = useState("");
+  const [runTier, setRunTier] = useState("");
   const [assigneeChrome, setAssigneeChrome] = useState(false);
   const [executionWorkspaceMode, setExecutionWorkspaceMode] = useState<string>("shared_workspace");
   const [selectedExecutionWorkspaceId, setSelectedExecutionWorkspaceId] = useState("");
@@ -615,6 +618,13 @@ export function NewIssueDialog() {
   const supportsAssigneeOverrides = Boolean(
     assigneeAdapterType && ISSUE_OVERRIDE_ADAPTER_TYPES.has(assigneeAdapterType),
   );
+  const { data: runTiers } = useQuery({
+    queryKey: ["company-run-tiers", effectiveCompanyId],
+    queryFn: () => companiesApi.runTiers(effectiveCompanyId!),
+    enabled: Boolean(effectiveCompanyId) && supportsAssigneeOverrides,
+    staleTime: 60_000,
+  });
+  const showRunTierPicker = runTiersAvailable(runTiers, assigneeAdapterType);
   const mentionOptions = useMemo<MentionOption[]>(() => {
     return buildMarkdownMentionOptions({
       agents,
@@ -837,6 +847,7 @@ export function NewIssueDialog() {
       setAssigneeModelLane("primary");
       setAssigneeModelOverride("");
       setAssigneeThinkingEffort("");
+      setRunTier("");
       setAssigneeChrome(false);
       setExecutionWorkspaceMode(defaultExecutionWorkspaceMode);
       setWorkMode(nextWorkMode);
@@ -864,6 +875,7 @@ export function NewIssueDialog() {
       setShowWatchdogRow(false);
       setAssigneeModelOverride("");
       setAssigneeThinkingEffort("");
+      setRunTier("");
       setAssigneeChrome(false);
       setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForIssueDefaults(newIssueDefaults, defaultProject));
       setWorkMode(nextWorkMode);
@@ -940,6 +952,7 @@ export function NewIssueDialog() {
       setShowWatchdogRow(false);
       setAssigneeModelOverride("");
       setAssigneeThinkingEffort("");
+      setRunTier("");
       setAssigneeChrome(false);
       setExecutionWorkspaceMode(defaultExecutionWorkspaceModeForIssueDefaults(newIssueDefaults, defaultProject));
       setSelectedExecutionWorkspaceId(newIssueDefaults.executionWorkspaceId ?? "");
@@ -955,6 +968,7 @@ export function NewIssueDialog() {
       setAssigneeModelLane("primary");
       setAssigneeModelOverride("");
       setAssigneeThinkingEffort("");
+      setRunTier("");
       setAssigneeChrome(false);
       return;
     }
@@ -1046,13 +1060,15 @@ export function NewIssueDialog() {
     const currentTitle = titleRef.current.trim();
     const currentDescription = descriptionRef.current.trim();
     if (!effectiveCompanyId || (!currentTitle && !currentDescription) || createIssue.isPending || taskDestination.blocked) return;
-    const assigneeAdapterOverrides = buildAssigneeAdapterOverrides({
+    const laneOverrides = buildAssigneeAdapterOverrides({
       adapterType: assigneeAdapterType,
       lane: assigneeModelLane,
       modelOverride: assigneeModelOverride,
       thinkingEffortOverride: assigneeThinkingEffort,
       chrome: assigneeChrome,
     });
+    const assigneeAdapterOverrides =
+      showRunTierPicker && runTier ? { ...(laneOverrides ?? {}), runProfile: { tier: runTier } } : laneOverrides;
     const selectedProject = orderedProjects.find((project) => project.id === projectId);
     // Hidden selectors must not submit a restored draft over the managed default.
     const executionWorkspacePolicy =
@@ -1949,6 +1965,14 @@ export function NewIssueDialog() {
             </button>
             {assigneeOptionsOpen && (
               <div className="mt-2 rounded-md border border-border p-3 bg-muted/20 space-y-3">
+                {showRunTierPicker && runTiers ? (
+                  <RunTierPicker
+                    tiers={runTiers}
+                    value={runTier}
+                    onChange={setRunTier}
+                    agentDefaultLabel={`${assigneeAdapterType}/${effectiveAssigneeModel || "default"}`}
+                  />
+                ) : null}
                 <div className="space-y-1.5">
                   <div className="text-xs text-muted-foreground">Model lane</div>
                   <div
