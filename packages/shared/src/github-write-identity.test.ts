@@ -3,7 +3,9 @@ import {
   DEFAULT_GITHUB_PRIVILEGED_TOGGLES,
   DEFAULT_GITHUB_WRITE_IDENTITY_POLICY,
   classifyGitHubCommand,
+  describeGitHubPrivilegedScope,
   ghCommandMayWrite,
+  isGitHubPrivilegedAllowed,
   parseGhCommand,
   gitNetworkArguments,
   gitPushDestinations,
@@ -61,6 +63,69 @@ describe("parseGitHubWriteIdentityPolicy", () => {
       .toMatchObject({ tagPush: true, adminMerge: false, release: false });
     expect(() => parseGitHubWriteIdentityPolicy({ ...anthm, privileged: { deploy: true } })).toThrow(/deploy/);
     expect(() => parseGitHubWriteIdentityPolicy({ ...anthm, privileged: { release: "yes" } })).toThrow(/release/);
+  });
+
+  describe("per-agent grants of editWorkflows and workflowDispatch", () => {
+    const dx = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01", other = "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
+    const parsed = (privileged: unknown) => parseGitHubWriteIdentityPolicy({ ...anthm, privileged }).privileged;
+
+    it("accepts false, true or a list of agents for those two actions, and keeps the legacy values as they were", () => {
+      expect(parsed({ editWorkflows: true })).toMatchObject({ editWorkflows: true, workflowDispatch: true });
+      expect(parsed({ editWorkflows: false, workflowDispatch: false })).toMatchObject({ editWorkflows: false, workflowDispatch: false });
+      expect(parsed({ editWorkflows: { agentIds: [dx] }, workflowDispatch: { agentIds: [dx, other] } }))
+        .toMatchObject({ editWorkflows: { agentIds: [dx] }, workflowDispatch: { agentIds: [other, dx].sort() } });
+      // An unset action keeps its default, and an empty list grants nobody, which is the same as false.
+      expect(parsed({ editWorkflows: { agentIds: [] } })).toMatchObject({ editWorkflows: false, workflowDispatch: true });
+      expect(parsed({})).toMatchObject({ editWorkflows: false, workflowDispatch: true });
+    });
+
+    it("normalizes the agent IDs, so that saving a saved policy changes nothing", () => {
+      const once = parsed({ editWorkflows: { agentIds: [dx.toUpperCase(), dx, other] } });
+      expect(once.editWorkflows).toEqual({ agentIds: [other, dx].sort() });
+      expect(parseGitHubWriteIdentityPolicy({ ...anthm, privileged: once }).privileged).toEqual(once);
+    });
+
+    it("refuses a list on any other action, a list that is not exactly agent IDs, and anything else", () => {
+      for (const action of ["adminMerge", "deploymentApproval", "release", "tagPush", "pushToMain", "wiki"]) {
+        expect(() => parsed({ [action]: { agentIds: [dx] } }), action).toThrow(new RegExp(action));
+      }
+      for (const [label, scope] of [
+        ["a string", "agent"], ["null", null], ["a number", 1], ["an array", [dx]], ["an unknown key", { agentIds: [dx], companyWide: true }],
+        ["no list", {}], ["a list that is no list", { agentIds: dx }], ["an agent name", { agentIds: ["Anthm DX"] }], ["a short ID", { agentIds: ["5f0f6f1c"] }],
+        ["a non-string ID", { agentIds: [7] }], ["too many agents", { agentIds: Array.from({ length: 101 }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`) }],
+      ] as const) {
+        expect(() => parsed({ editWorkflows: scope }), label).toThrow(/editWorkflows/);
+      }
+    });
+
+    it("answers for one agent: company-wide values are the same for everyone, a list names its agents, and an unknown agent is never granted", () => {
+      const toggles = (editWorkflows: unknown, workflowDispatch: unknown = true) => parsed({ editWorkflows, workflowDispatch });
+      for (const agent of [dx, other, null, undefined]) {
+        expect(isGitHubPrivilegedAllowed(toggles(true), "editWorkflows", agent), String(agent)).toBe(true);
+        expect(isGitHubPrivilegedAllowed(toggles(false), "editWorkflows", agent), String(agent)).toBe(false);
+      }
+      const scoped = toggles({ agentIds: [dx] });
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", dx)).toBe(true);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", dx.toUpperCase())).toBe(true);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", other)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", null)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", undefined)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "editWorkflows", "")).toBe(false);
+      // The grant is for that action only.
+      expect(isGitHubPrivilegedAllowed(scoped, "workflowDispatch", other)).toBe(true);
+      expect(isGitHubPrivilegedAllowed(toggles(false, { agentIds: [dx] }), "editWorkflows", dx)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(toggles(false, { agentIds: [dx] }), "workflowDispatch", other)).toBe(false);
+      // Every other action is a plain switch.
+      expect(isGitHubPrivilegedAllowed(scoped, "tagPush", dx)).toBe(false);
+      expect(isGitHubPrivilegedAllowed(scoped, "adminMerge", other)).toBe(true);
+    });
+
+    it("tells who holds a scope in words", () => {
+      expect(describeGitHubPrivilegedScope(true)).toBe("on for every agent");
+      expect(describeGitHubPrivilegedScope(false)).toBe("off");
+      expect(describeGitHubPrivilegedScope({ agentIds: [dx] })).toBe("granted to 1 agent");
+      expect(describeGitHubPrivilegedScope({ agentIds: [dx, other] })).toBe("granted to 2 agents");
+    });
   });
 
   it("normalizes the allowlist, folds wikis and defaults the throttle, kill switch and footer", () => {

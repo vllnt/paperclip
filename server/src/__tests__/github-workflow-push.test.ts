@@ -5,7 +5,7 @@ import { GITHUB_WRITE_IDENTITY_STATE, parseGitHubWriteIdentityPolicy } from "@pa
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
-import { registerGitHubWriteIdentityWorkers } from "../services/github-write-identity.js";
+import { attachGitHubCaller, readGitHubOperation, registerGitHubWriteIdentityWorkers } from "../services/github-write-identity.js";
 
 // The broker runs for real on real rows; only the credential store behind it and the GitHub plugin worker are doubles.
 // The plugin double records what the broker asks it, which is the point: the launcher's workflow paths must reach the plugin.
@@ -24,6 +24,7 @@ const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("a push's workflow paths reach the GitHub plugin through the broker", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
+  let pluginId: string | undefined;
   const asked: Array<Record<string, any>> = [];
 
   beforeAll(async () => {
@@ -51,13 +52,14 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", contextSnapshot: { issueId, projectId } });
     await initializeRunIdentity(db, { companyId, runId, responsibleUserId: "accepted-author", issueId, cause: "instruction" });
     // The company writes as its App user, through an installed GitHub plugin that declares the write identity action.
-    const [plugin] = await db.insert(plugins).values({
-      pluginKey: `github-${companyId}`, packageName: "@vllnt/paperclip-github", version: "0.0.0", status: "ready",
+    // One plugin owns the write identity for the instance (the server refuses more than one); companies differ by their saved policy.
+    pluginId ??= (await db.insert(plugins).values({
+      pluginKey: "github", packageName: "@vllnt/paperclip-github", version: "0.0.0", status: "ready",
       manifestJson: { projectRepositories: { writeIdentityAction: "repository-write-identity" } } as any,
-    }).returning();
+    }).returning())[0]!.id;
     const permissions = { contents: "write", metadata: "read", pull_requests: "write" };
     await db.insert(pluginState).values({
-      pluginId: plugin!.id, scopeKind: "company", scopeId: companyId, ...GITHUB_WRITE_IDENTITY_STATE,
+      pluginId, scopeKind: "company", scopeId: companyId, ...GITHUB_WRITE_IDENTITY_STATE,
       valueJson: parseGitHubWriteIdentityPolicy({
         default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "app", allowedRepositories: ["acme/site"],
         installationRepositories: ["acme/site"], userLogin: "agent-owner", installationPermissions: permissions,
@@ -91,6 +93,19 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(asked).toHaveLength(2);
     expect(asked[1]).toMatchObject({ privileged: ["editWorkflows"] });
     expect(asked[1]).not.toHaveProperty("workflowPush");
+  });
+
+  it("tells the plugin which agent and run sent the push, from the run's own token and not from the report", async () => {
+    const run = await seed();
+    const forged = readGitHubOperation({ operation: { ...push(), caller: { agentId: randomUUID(), runId: randomUUID() }, agentId: randomUUID(), runId: randomUUID() } });
+    await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(forged, run));
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ companyId: run.companyId, agentId: run.agentId, runId: run.runId, privileged: ["editWorkflows"] });
+    // Reported without the server's help, a push names no agent, so a scoped grant matches nobody.
+    await resolveGitHubOperationCredentials(db, run, readGitHubOperation({ operation: { ...push(), caller: { agentId: run.agentId, runId: run.runId }, agentId: run.agentId } }));
+    expect(asked).toHaveLength(2);
+    expect(asked[1]).not.toHaveProperty("agentId");
+    expect(asked[1]).not.toHaveProperty("runId");
   });
 
   it("never asks the plugin about a push that is refused whatever the toggles, a release tag with workflow changes included", async () => {

@@ -3,14 +3,20 @@ import {
   GITHUB_PRIVILEGED_ACTIONS,
   GITHUB_WRITE_ACTIONS,
   GITHUB_WRITE_IDENTITY_STATE,
+  describeGitHubPrivilegedScope,
   gitHubInstallationRepositories,
+  isGitHubPrivilegedAllowed,
   isGitHubRepositoryAllowed,
+  isGitHubScopablePrivilegedAction,
+  normalizeGitHubAgentId,
   normalizeGitHubRepository,
+  parseGitHubPrivilegedScope,
   parseGitHubWriteIdentityPolicy,
   resolveGitHubWriteIdentity,
   resolveGitHubWriteIdentityForOther,
   type GitHubOperationAction,
   type GitHubPrivilegedAction,
+  type GitHubPrivilegedToggles,
   type GitHubSignDecision,
   type GitHubWorkflowChange,
   type GitHubWorkflowCommit,
@@ -56,6 +62,44 @@ const clip = (text: string, max: number) => text.length > max ? `${text.slice(0,
 const short = (sha: string) => sha.slice(0, 8);
 /** The paths for a refusal message: a few, shortened, and how many more there are. */
 const listPaths = (paths: string[]) => paths.slice(0, 3).map(path => clip(path, 70)).join(", ") + (paths.length > 3 ? `, and ${paths.length - 3} more` : "");
+
+/**
+ * Why privileged actions were refused to this caller. An action that is off for the company says so; a scopable
+ * action that is granted to other agents says this agent has no board grant. For those two, the message names the
+ * board action that changes it, with this agent's ID when the host named it.
+ */
+function privilegedRefusal(toggles: GitHubPrivilegedToggles, actions: GitHubPrivilegedAction[], agentId?: string | null): string {
+  const notGranted = actions.filter(action => typeof toggles[action] === "object");
+  const off = actions.filter(action => !notGranted.includes(action));
+  const parts: string[] = [];
+  if (off.length) parts.push(`This is a privileged GitHub action (${off.join(", ")}) and it is turned off for this company.`);
+  for (const action of notGranted) parts.push(`This agent has no board grant for ${action} (${describeGitHubPrivilegedScope(toggles[action])}).`);
+  const first = actions.find(isGitHubScopablePrivilegedAction);
+  return first ? withHint(parts.join(" "), grantHint(toggles, first, agentId)) : clip(parts.join(" "), 500);
+}
+
+/** How a scopable action is unavailable to this caller, to read inside a sentence. */
+function privilegedReason(toggles: GitHubPrivilegedToggles, action: GitHubPrivilegedAction): string {
+  const scope = toggles[action];
+  return typeof scope === "object" ? `this agent has no board grant for ${action} (${describeGitHubPrivilegedScope(scope)})` : `${action} is turned off for this company`;
+}
+
+/**
+ * What the board can do about it: grant this agent (when the host named it), or change the company-wide value.
+ * A grant replaces the list, so the hint says to keep the agents already in it.
+ */
+function grantHint(toggles: GitHubPrivilegedToggles, action: GitHubPrivilegedAction, agentId?: string | null): string {
+  return typeof toggles[action] === "object" && agentId
+    ? `A board administrator can grant it with write-identity.grant, which replaces the whole list (keep the agents already granted): {"action":"${action}","scope":{"agentIds":[…,"${agentId}"]}}.`
+    : `A board administrator can turn it on for every agent, or grant it to chosen agents, with write-identity.grant (scope true, or {"agentIds":[...]}).`;
+}
+
+/** The server accepts a refusal of at most 500 characters: the hint stays whole and the message before it gives way. */
+function withHint(message: string, hint: string): string {
+  const room = 500 - hint.length - 1;
+  return `${message.length > room ? `${message.slice(0, room - 1)}…` : message} ${hint}`;
+}
+
 const workflowPath = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_WORKFLOW_PATH && (value === WORKFLOWS || value.startsWith(`${WORKFLOWS}/`));
 const gitOid = (value: unknown): value is string => typeof value === "string" && GIT_OID.test(value);
 
@@ -556,9 +600,9 @@ export function registerWriteIdentity(
    * protected. Anything not read in full, and any path that is not a regular
    * file, refuses.
    */
-  async function workflowBaseEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, push: GitHubWorkflowPush) {
+  async function workflowBaseEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, push: GitHubWorkflowPush, reason: string) {
     const evidence: Record<string, unknown> = { branch: push.branch, tip: push.tip };
-    const off = "editWorkflows is turned off for this company";
+    const off = reason;
     const irregular = push.commits.flatMap(commit => commit.changes).filter(change => change.mode !== null && !REGULAR_FILE_MODES.includes(change.mode)).map(change => change.path);
     if (irregular.length) throw new Denied(`This push changes workflow paths that are not regular files, symlinks or submodules (${listPaths(irregular)}); ${off}.`, { ...evidence, offending: irregular });
     const token = await readToken(companyId, current, repository);
@@ -691,17 +735,19 @@ export function registerWriteIdentity(
   async function authorizeUserWrite(companyId: string, current: GitHubWriteIdentityPolicy, input: {
     repository: string | null; action: GitHubOperationAction; privileged: GitHubPrivilegedAction[]; pullRequest?: number | null; expectedHeadSha?: string | null;
     merge?: boolean; autoMerge?: boolean; retarget?: boolean; workflowPush?: GitHubWorkflowPush;
+    /** The agent and run that made the call, from the host (never from the command): scoped grants match on the agent. */
+    agentId?: string | null; runId?: string | null;
   }) {
     if (!current.enabled) throw new Denied("GitHub writes are switched off for this company (write identity kill switch).");
     if (input.repository === null && input.action !== "project") {
       throw new Denied("Paperclip cannot check this write against the repository fence. Name the repository (-R owner/name or a repos/<owner>/<name> path).");
     }
     if (input.repository !== null && !isGitHubRepositoryAllowed(current, input.repository)) throw new Denied(`${input.repository} is not in this company's GitHub write allowlist.`);
-    const off = input.privileged.filter(action => !current.privileged[action]);
-    // With editWorkflows off, a push of one commit that only brings in the base branch's own workflow files is checked below instead.
+    const off = input.privileged.filter(action => !isGitHubPrivilegedAllowed(current.privileged, action, input.agentId));
+    // With editWorkflows off for this agent, a push of one commit that only brings in the base branch's own workflow files is checked below instead.
     const byBase = off.includes("editWorkflows") && input.repository !== null ? input.workflowPush : undefined;
     const refused = byBase ? off.filter(action => action !== "editWorkflows") : off;
-    if (refused.length) throw new Denied(`This is a privileged GitHub action (${refused.join(", ")}) and it is turned off for this company.`);
+    if (refused.length) throw new Denied(privilegedRefusal(current.privileged, refused, input.agentId));
     const user = await fencedUser(companyId);
     // Phase 1: no auto-merge and no merge queue as the App user (GitHub would merge later, unchecked).
     if (input.autoMerge) throw new Denied(`Agents do not enable auto-merge or the merge queue: a human must merge this pull request, ${current.userLogin ?? "the App user"} in the GitHub web UI.`);
@@ -713,7 +759,15 @@ export function registerWriteIdentity(
     const admin = input.privileged.includes("adminMerge") && input.repository
       ? await adminMergeEvidence(companyId, current, input.repository, input.pullRequest, input.expectedHeadSha)
       : undefined;
-    const workflows = byBase && input.repository ? await workflowBaseEvidence(companyId, current, input.repository, byBase) : undefined;
+    let workflows: Awaited<ReturnType<typeof workflowBaseEvidence>> | undefined;
+    if (byBase && input.repository) {
+      try { workflows = await workflowBaseEvidence(companyId, current, input.repository, byBase, privilegedReason(current.privileged, "editWorkflows")); }
+      catch (error) {
+        // A push that is not the base branch's own is refused as an edit nobody granted: say how the board grants it.
+        if (error instanceof Denied) throw new Denied(withHint(error.message, grantHint(current.privileged, "editWorkflows", input.agentId)), error.evidence);
+        throw error;
+      }
+    }
     const evidence = merged || admin || workflows
       ? { ...(merged ? { protectedPaths: merged } : {}), ...(admin ? { adminMerge: admin } : {}), ...(workflows ? { workflowBaseMerge: workflows } : {}) } : undefined;
     const wait = throttle.take(user.userId, current.throttle, now());
@@ -723,9 +777,38 @@ export function registerWriteIdentity(
     const latest = await policy(companyId);
     if (!latest || latest.userSource !== "app" || !latest.enabled) throw new Denied("GitHub writes are switched off for this company (write identity kill switch).", evidence);
     if (input.repository !== null && !isGitHubRepositoryAllowed(latest, input.repository)) throw new Denied(`${input.repository} is not in this company's GitHub write allowlist.`, evidence);
-    if (input.privileged.some(action => !latest.privileged[action] && !(workflows && action === "editWorkflows"))) throw new Denied("A privileged GitHub action this write needs was turned off for this company.", evidence);
+    if (input.privileged.some(action => !isGitHubPrivilegedAllowed(latest.privileged, action, input.agentId) && !(workflows && action === "editWorkflows"))) {
+      throw new Denied("A privileged GitHub action this write needs was turned off for this company.", evidence);
+    }
     await fencedUser(companyId);
-    return { user, token: await userToken(companyId), evidence };
+    // The token is taken first so a failed token leaves no "allowed" record; the record is written before it is returned.
+    const token = await userToken(companyId);
+    await recordPrivilegedAllowed(companyId, latest.privileged, input, workflows !== undefined);
+    return { user, token, evidence };
+  }
+
+  /**
+   * A workflow push is always recorded, and a dispatch when an agent grant allowed it: who, which run, where, and which
+   * workflow files the checkout reported. It is written before a credential is returned, so an action that cannot be
+   * recorded does not happen: a failed write refuses the call.
+   */
+  async function recordPrivilegedAllowed(companyId: string, toggles: GitHubPrivilegedToggles, input: {
+    repository: string | null; privileged: GitHubPrivilegedAction[]; workflowPush?: GitHubWorkflowPush; agentId?: string | null; runId?: string | null;
+  }, byBase: boolean): Promise<void> {
+    for (const action of input.privileged) {
+      if (!isGitHubScopablePrivilegedAction(action)) continue;
+      const scope = toggles[action];
+      if (action === "workflowDispatch" && typeof scope !== "object") continue;
+      const push = input.workflowPush;
+      const paths = push ? [...new Set(push.commits.flatMap(commit => commit.changes.map(change => change.path)))].sort().slice(0, MAX_WORKFLOW_CHANGES) : null;
+      const via = action === "editWorkflows" && byBase && !isGitHubPrivilegedAllowed(toggles, action, input.agentId) ? "base-merge" : typeof scope === "object" ? "agent-grant" : "company";
+      await ctx.activity.log({
+        companyId, message: action === "editWorkflows" ? "github.workflow_push_allowed" : "github.workflow_dispatch_allowed",
+        ...(input.agentId ? { entityType: "agent", entityId: input.agentId } : {}),
+        metadata: { action, via, agentId: input.agentId ?? null, runId: input.runId ?? null, repository: input.repository,
+          ...(action === "editWorkflows" ? { branch: push?.branch ?? null, tip: push?.tip ?? null, paths } : {}) },
+      });
+    }
   }
 
   async function decide(companyId: string, request: GitHubWriteIdentityRequest): Promise<GitHubWriteIdentityDecision> {
@@ -739,18 +822,25 @@ export function registerWriteIdentity(
         if (!current.enabled) return { identity: "user", unavailable: "GitHub writes are switched off for this company (write identity kill switch)." };
         if (current.allowedRepositories.length && !repository) return { identity: "user", unavailable: "Paperclip cannot tell which repository this write targets; name it with -R owner/name." };
         if (repository && !isGitHubRepositoryAllowed(current, repository)) return { identity: "user", unavailable: `${repository} is not in this company's GitHub write allowlist.` };
-        const off = request.privileged.filter(action => !current.privileged[action]);
-        if (off.length) return { identity: "user", unavailable: `This is a privileged GitHub action (${off.join(", ")}) and it is turned off for this company.` };
+        const off = request.privileged.filter(action => !isGitHubPrivilegedAllowed(current.privileged, action, request.agentId));
+        if (off.length) return { identity: "user", unavailable: privilegedRefusal(current.privileged, off, request.agentId) };
       }
       const identity = identityKind(current, repository, request.action, "runtime");
+      /**
+       * The run's own token (or the App's) goes out next: the grant that allowed it is recorded first, as it is for the App user.
+       * The re-ask for the App after a missing user connection is the same command, already recorded by the ask before it.
+       */
+      const allowed = async () => { if (current && request.fallback !== true) await recordPrivilegedAllowed(companyId, current.privileged, { ...request, repository }, false); };
       if (identity === "user") {
-        if (request.fallback !== true) return { identity: "user", missingUserConnection: current?.missingUserConnection ?? "fail" };
+        if (request.fallback !== true) { await allowed(); return { identity: "user", missingUserConnection: current?.missingUserConnection ?? "fail" }; }
         if ((current?.missingUserConnection ?? "fail") !== "use_bot") return { identity: "bot", unavailable: "Connect your GitHub account in Paperclip to write as yourself." };
       }
       if (!repository) return { identity: "bot", unavailable: "Run this command in a GitHub checkout or pass --repo so Paperclip can write as the GitHub App." };
       const target = await repositoryFor(companyId, repository);
       if (!target) return { identity: "bot", unavailable: `${repository} is not available through the company's GitHub App.` };
-      return { identity: "bot", credential: await botCredential(companyId, target) };
+      const credential = await botCredential(companyId, target);
+      await allowed();
+      return { identity: "bot", credential };
     }
 
     // userSource "app": the plugin answers every operation; nothing defers to the
@@ -779,7 +869,8 @@ export function registerWriteIdentity(
       }
       const action = request.action ?? "other";
       const granted = await authorizeUserWrite(companyId, current, { repository, action, privileged: request.privileged, pullRequest: request.pullRequest, expectedHeadSha: request.expectedHeadSha,
-        merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true, workflowPush: request.workflowPush });
+        merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true, workflowPush: request.workflowPush,
+        agentId: request.agentId, runId: request.runId });
       return {
         identity: "user", credential: { token: granted.token, ...granted.user },
         ...(await signing()), bodyFooter: current.bodyFooter, ...(granted.evidence ? { evidence: granted.evidence } : {}),
@@ -815,6 +906,39 @@ export function registerWriteIdentity(
     const fence = next?.userSource === "app" && next.enabled && await users.state(companyId) ? await checkFence(companyId) : null;
     const saved = await stored(companyId);
     return { companyId, policy: saved && "policy" in saved ? saved.policy : null, ...(fence ? { fence } : {}) };
+  });
+
+  /**
+   * The board changes who holds editWorkflows or workflowDispatch: nobody, every agent, or chosen agents. Only an
+   * instance administrator in the company can (an agent never can), only in a saved policy, and only for agents of
+   * the company. Nothing else in the policy changes, and the change is recorded.
+   */
+  ctx.actions.register("write-identity.grant", async (params, actor) => {
+    const { companyId, userId } = boardScope(params, actor);
+    requireInstanceAdmin(actor);
+    const action = params.action;
+    if (action !== "editWorkflows" && action !== "workflowDispatch") throw new Error("Choose editWorkflows or workflowDispatch to grant.");
+    const scope = parseGitHubPrivilegedScope(params.scope, action);
+    if (typeof scope === "object") {
+      for (const agentId of scope.agentIds) {
+        if (!(await ctx.agents.get(agentId, companyId))) throw new Error(`${agentId} is not an agent of this company.`);
+      }
+    }
+    const current = await stored(companyId);
+    if (!current) throw new Error("Save a write identity first (write-identity.set): a grant changes a saved policy.");
+    if ("invalid" in current) throw new Error("The saved GitHub write identity is invalid. An instance administrator must save it again before granting.");
+    const previous = current.policy.privileged[action];
+    const next = parseGitHubWriteIdentityPolicy({ ...current.policy, privileged: { ...current.policy.privileged, [action]: scope } });
+    await savePolicy(companyId, next);
+    await ctx.activity.log({ companyId, message: "github.privileged_grant_changed", metadata: { action, previous, scope: next.privileged[action], by: userId } });
+    return { companyId, action, scope: next.privileged[action] };
+  });
+
+  /** The company's agents, for the board to choose whom to grant. */
+  ctx.actions.register("write-identity.agents", async (params, actor) => {
+    const { companyId } = boardScope(params, actor);
+    const agents = await ctx.agents.list({ companyId, limit: 500 });
+    return { companyId, agents: agents.map(agent => ({ id: agent.id, name: agent.name, status: agent.status })).sort((a, b) => a.name.localeCompare(b.name)) };
   });
 
   ctx.actions.register("user-authorization.status", async (params, actor) => {
@@ -878,9 +1002,11 @@ export function registerWriteIdentity(
     const pullRequest = Number.isSafeInteger(params.pullRequest) && Number(params.pullRequest) > 0 ? Number(params.pullRequest) : null;
     const expectedHeadSha = typeof params.expectedHeadSha === "string" && FULL_SHA.test(params.expectedHeadSha.toLowerCase()) ? params.expectedHeadSha.toLowerCase() : null;
     const workflowPush = parseWorkflowPush(params.workflowPush);
+    // Only the host calls this action, and it names the agent and run from the run's own token: a scoped grant matches on them.
+    const agentId = normalizeGitHubAgentId(params.agentId), runId = normalizeGitHubAgentId(params.runId);
     try {
       return await decide(companyId, {
-        companyId, repository, access, action: action as GitHubOperationAction | null, privileged: privileged as GitHubPrivilegedAction[],
+        companyId, repository, access, action: action as GitHubOperationAction | null, privileged: privileged as GitHubPrivilegedAction[], agentId, runId,
         wiki: params.wiki === true, pullRequest, expectedHeadSha, ...(params.fallback === true ? { fallback: true } : {}),
         ...(params.merge === true ? { merge: true } : {}), ...(params.autoMerge === true ? { autoMerge: true } : {}), ...(params.retarget === true ? { retarget: true } : {}),
         ...(workflowPush ? { workflowPush } : {}),
@@ -932,7 +1058,8 @@ export function registerWriteIdentity(
       const name = repository ? normalizeGitHubRepository(repository)?.repository ?? null : null;
       try {
         const granted = await authorizeUserWrite(companyId, current, { repository: name, action: request.action, privileged: request.privileged ?? [], pullRequest: request.pullRequest, expectedHeadSha: request.expectedHeadSha,
-          merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true });
+          merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true,
+          agentId: normalizeGitHubAgentId(request.agentId), runId: normalizeGitHubAgentId(request.runId) });
         await ctx.activity.log({ companyId, message: "github.user_identity_write", metadata: {
           repository: name, action: request.action, privileged: request.privileged ?? [], source: request.source, login: granted.user.login,
           ...(request.agentId ? { agentId: request.agentId } : {}), ...(request.runId ? { runId: request.runId } : {}),

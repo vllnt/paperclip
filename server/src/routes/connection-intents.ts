@@ -17,7 +17,7 @@ import { accessService } from "../services/access.js";
 import type { heartbeatService } from "../services/heartbeat.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { resolveGitHubCommitSignature, resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
-import { readGitHubOperation } from "../services/github-write-identity.js";
+import { attachGitHubCaller, readGitHubOperation } from "../services/github-write-identity.js";
 
 function bearer(req: Request) {
   const value = req.header("authorization") ?? "";
@@ -58,7 +58,8 @@ export function runtimeConnectionIntentRoutes(db: Db) {
   router.post("/runtime-tools/github/credentials", async (req, res) => {
     const run = githubCapability(req);
     res.setHeader("Cache-Control", "no-store");
-    res.json(await resolveGitHubOperationCredentials(db, run, readGitHubOperation(req.body)));
+    // The agent and run come from the capability token above, never from the report.
+    res.json(await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation(req.body), run)));
   });
 
   // The managed git signing program sends each commit object here (tags are refused); the

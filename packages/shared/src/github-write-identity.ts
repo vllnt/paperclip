@@ -38,7 +38,23 @@ export const GITHUB_PRIVILEGED_ACTIONS = [
   "adminMerge", "deploymentApproval", "release", "tagPush", "workflowDispatch", "pushToMain", "editWorkflows", "wiki",
 ] as const;
 export type GitHubPrivilegedAction = (typeof GITHUB_PRIVILEGED_ACTIONS)[number];
-export type GitHubPrivilegedToggles = Record<GitHubPrivilegedAction, boolean>;
+/** The two privileged actions an operator can hand to chosen agents instead of the whole company. */
+export const GITHUB_SCOPABLE_PRIVILEGED_ACTIONS = ["editWorkflows", "workflowDispatch"] as const;
+export type GitHubScopablePrivilegedAction = (typeof GITHUB_SCOPABLE_PRIVILEGED_ACTIONS)[number];
+export const isGitHubPrivilegedAction = (value: string): value is GitHubPrivilegedAction => (GITHUB_PRIVILEGED_ACTIONS as readonly string[]).includes(value);
+export const isGitHubScopablePrivilegedAction = (value: string): value is GitHubScopablePrivilegedAction => (GITHUB_SCOPABLE_PRIVILEGED_ACTIONS as readonly string[]).includes(value);
+/** Who holds a scopable action: nobody (`false`), every agent of the company (`true`, the legacy value), or only these agents. */
+export type GitHubPrivilegedScope = boolean | { agentIds: string[] };
+/**
+ * One value per privileged action. A scopable action's value can be an object, which is truthy:
+ * never test it for truthiness, ask {@link isGitHubPrivilegedAllowed} for the agent that is calling.
+ */
+export type GitHubPrivilegedToggles = { [Action in GitHubPrivilegedAction]: Action extends GitHubScopablePrivilegedAction ? GitHubPrivilegedScope : boolean };
+export const MAX_GITHUB_PRIVILEGED_AGENTS = 100;
+const AGENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** An agent ID as a grant stores it (a lowercase UUID), or null when the value is not one. */
+export const normalizeGitHubAgentId = (value: unknown): string | null => typeof value === "string" && AGENT_ID_PATTERN.test(value) ? value.toLowerCase() : null;
 
 /**
  * Defaults for a saved policy. `release` and `tagPush` stay off: release
@@ -107,7 +123,6 @@ export interface GitHubWriteIdentityPolicy {
   installationPermissions: Record<string, GitHubPermissionLevel> | null;
 }
 
-/** What the host asks a GitHub plugin's `writeIdentityAction` for one managed operation. */
 /** One workflow path (`.github/workflows` or below) as a commit has it: git mode and blob id, both null when the path is gone there. */
 export interface GitHubWorkflowChange {
   path: string;
@@ -142,8 +157,15 @@ export interface GitHubWorkflowPush {
   entries: string[];
 }
 
+/** What the host asks a GitHub plugin's `writeIdentityAction` for one managed operation. */
 export interface GitHubWriteIdentityRequest {
   companyId: string;
+  /**
+   * The agent and run that sent the command, from the run's own token on the server. The launcher's report never
+   * names them, and only the host can call this action. Scoped grants (`{ agentIds }`) match on `agentId`.
+   */
+  agentId?: string | null;
+  runId?: string | null;
   /** Lowercase `owner/name` (a wiki folded into its repository), or null when unknown. */
   repository: string | null;
   access: GitHubAccess;
@@ -309,11 +331,15 @@ export function parseGitHubWriteIdentityPolicy(value: unknown): GitHubWriteIdent
 
   const rawPrivileged = value.privileged ?? {};
   if (!isRecord(rawPrivileged)) throw new Error("privileged must map each privileged action to true or false.");
-  const privileged = { ...DEFAULT_GITHUB_PRIVILEGED_TOGGLES };
+  const privileged: GitHubPrivilegedToggles = { ...DEFAULT_GITHUB_PRIVILEGED_TOGGLES };
   for (const [key, toggle] of Object.entries(rawPrivileged)) {
-    if (!(GITHUB_PRIVILEGED_ACTIONS as readonly string[]).includes(key)) throw new Error(`Unknown privileged action: ${key}.`);
+    if (!isGitHubPrivilegedAction(key)) throw new Error(`Unknown privileged action: ${key}.`);
+    if (isGitHubScopablePrivilegedAction(key)) {
+      privileged[key] = parseGitHubPrivilegedScope(toggle, key);
+      continue;
+    }
     if (typeof toggle !== "boolean") throw new Error(`Turn ${key} on or off with true or false.`);
-    privileged[key as GitHubPrivilegedAction] = toggle;
+    privileged[key] = toggle;
   }
 
   const rawThrottle = value.throttle ?? {};
@@ -359,6 +385,41 @@ export function parseGitHubWriteIdentityPolicy(value: unknown): GitHubWriteIdent
     default: defaults, overrides, missingUserConnection: missing, userSource, enabled, allowedRepositories, installationRepositories,
     privileged, throttle, bodyFooter, userLogin, installationPermissions,
   };
+}
+
+/**
+ * A scopable action's value: `false`, `true`, or `{ agentIds }` (agent UUIDs, lowercased, sorted, without
+ * duplicates). An empty list grants nobody, so it is `false`. Throws a user-facing message on anything else.
+ */
+export function parseGitHubPrivilegedScope(value: unknown, action: string): GitHubPrivilegedScope {
+  if (typeof value === "boolean") return value;
+  if (!isRecord(value) || Object.keys(value).some(key => key !== "agentIds") || !Array.isArray(value.agentIds)) {
+    throw new Error(`Turn ${action} on or off with true or false, or grant it to agents with { "agentIds": [...] }.`);
+  }
+  if (value.agentIds.length > MAX_GITHUB_PRIVILEGED_AGENTS) throw new Error(`Grant ${action} to at most ${MAX_GITHUB_PRIVILEGED_AGENTS} agents.`);
+  const agentIds = [...new Set(value.agentIds.map(id => {
+    const normalized = normalizeGitHubAgentId(id);
+    if (!normalized) throw new Error(`Grant ${action} to agents by ID (a UUID); ${typeof id === "string" ? id.slice(0, 40) || "(empty)" : "a non-string"} is not one.`);
+    return normalized;
+  }))].sort();
+  return agentIds.length ? { agentIds } : false;
+}
+
+/**
+ * Whether the policy allows a privileged action to the agent that is calling. A company-wide value answers
+ * the same for everyone; a list names its agents, and a caller that is not known is never one of them.
+ */
+export function isGitHubPrivilegedAllowed(toggles: GitHubPrivilegedToggles, action: GitHubPrivilegedAction, agentId?: string | null): boolean {
+  const scope: unknown = toggles[action];
+  if (typeof scope === "boolean") return scope;
+  if (!isRecord(scope) || !Array.isArray(scope.agentIds)) return false;
+  return typeof agentId === "string" && agentId !== "" && scope.agentIds.includes(agentId.toLowerCase());
+}
+
+/** A scope in words, for messages and the audit record. */
+export function describeGitHubPrivilegedScope(scope: GitHubPrivilegedScope): string {
+  if (typeof scope === "boolean") return scope ? "on for every agent" : "off";
+  return `granted to ${scope.agentIds.length} agent${scope.agentIds.length === 1 ? "" : "s"}`;
 }
 
 /** `owner/name` glob match; `*` never crosses the `/`. */

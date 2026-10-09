@@ -107,6 +107,16 @@ describe("GitHub write identity: run user (VLL-477)", () => {
     expect(await f.decide({ repository: "vllnt/paperclip", action: "push", fallback: true })).toMatchObject({ identity: "bot", credential: { login: "vllnt-agents[bot]" } });
   });
 
+  it("records a granted workflow push once when the App is asked again after a missing user connection", async () => {
+    const f = await fixture();
+    const agentId = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01";
+    await f.setPolicy({ default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, overrides: [], missingUserConnection: "use_bot", privileged: { editWorkflows: { agentIds: [agentId] } } });
+    const ask = (extra: Record<string, unknown>) => f.decide({ repository: "vllnt/paperclip", action: "push", privileged: ["editWorkflows"], agentId, ...extra });
+    expect(await ask({})).toEqual({ identity: "user", missingUserConnection: "use_bot" });
+    expect(await ask({ fallback: true })).toMatchObject({ identity: "bot", credential: { login: "vllnt-agents[bot]" } });
+    expect(f.h.activity.filter(entry => entry.message === "github.workflow_push_allowed")).toEqual([expect.objectContaining({ entityId: agentId })]);
+  });
+
   it("applies the kill switch and privileged toggles to the run's user too", async () => {
     const f = await fixture();
     const userWrites = { commit: "user", push: "user", pullRequest: "user", comment: "user" };
@@ -1773,5 +1783,250 @@ describe("workflow changes that arrive by merging the base branch", () => {
     ] as const) {
       expect((await f.push(push)).unavailable.length, label).toBeLessThanOrEqual(500);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// editWorkflows and workflowDispatch can be granted to chosen agents instead of the whole company.
+// ---------------------------------------------------------------------------
+
+describe("per-agent grants of editWorkflows and workflowDispatch", () => {
+  const DX = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01", OTHER = "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d", RUN = "7c2d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f", FOREIGN = "0a1b2c3d-4e5f-4a6b-8c7d-111122223333";
+  const tip = "a".repeat(40), parent = "b".repeat(40), oid = "c".repeat(40);
+  /** What the launcher reports for a push of one commit to feature/x that edits ci.yml and deletes old.yml. */
+  const report = {
+    branch: "feature/x", tip, files: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }],
+    commits: [{ sha: tip, parents: [parent], changes: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }, { path: ".github/workflows/old.yml", mode: null, oid: null }] }], entries: [parent],
+  };
+
+  async function grantFixture(privileged: Record<string, unknown> = { editWorkflows: { agentIds: [DX] } }) {
+    const f = await appFixture();
+    await f.authorize();
+    await f.setPolicy({ ...anthmPolicy, privileged });
+    /** A managed push that needs editWorkflows, sent for this agent by the host (undefined: the host named none). */
+    const push = (agentId?: string | null, extra: Record<string, unknown> = {}) =>
+      f.write("anthm-fr/songtrivia", { action: "push", privileged: ["editWorkflows"], runId: RUN, ...(agentId === undefined ? {} : { agentId }), ...extra });
+    const logged = (message: string) => f.h.activity.filter(entry => entry.message === message);
+    return { ...f, push, logged };
+  }
+  const refused = (decision: any, reason: string | RegExp) => {
+    expect(decision).toMatchObject({ identity: "user", unavailable: typeof reason === "string" ? expect.stringContaining(reason) : expect.stringMatching(reason) });
+    expect(decision).not.toHaveProperty("credential");
+    expect(decision.unavailable.length).toBeLessThanOrEqual(500);
+    return decision;
+  };
+
+  it("lets the granted agent push a workflow change, and records the agent, run, repository, branch and workflow paths", async () => {
+    const f = await grantFixture();
+    expect(await f.push(DX, { workflowPush: report })).toMatchObject({ identity: "user", credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")).toEqual([expect.objectContaining({
+      companyId: "anthm", entityType: "agent", entityId: DX,
+      metadata: { action: "editWorkflows", via: "agent-grant", agentId: DX, runId: RUN, repository: "anthm-fr/songtrivia", branch: "feature/x", tip, paths: [".github/workflows/ci.yml", ".github/workflows/old.yml"] },
+    })]);
+    // The grant is the agent's only: the policy is the same afterwards.
+    expect((await f.policy()).privileged.editWorkflows).toEqual({ agentIds: [DX] });
+    // A push whose workflow history is not reported (several refs, say) is still recorded, with what is unknown said so.
+    expect(await f.push(DX)).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")[1]).toMatchObject({ metadata: { agentId: DX, branch: null, paths: null } });
+  });
+
+  it("names the board grant in the refusal of a push that is not the base branch's own, so the agent is told what to ask for", async () => {
+    // GitHub cannot be read in this test, so the push cannot be shown to be a merge of the base branch.
+    const scoped = await grantFixture();
+    const decision = refused(await scoped.push(OTHER, { workflowPush: report }), /cannot read the workflow files.*this agent has no board grant for editWorkflows \(granted to 1 agent\).*write-identity\.grant/s);
+    // A grant replaces the list, so the hint says to keep the agents already in it.
+    expect(decision.unavailable).toContain(`"agentIds":[…,"${OTHER}"]`);
+    expect(decision.unavailable).toMatch(/replaces the whole list \(keep the agents already granted\)/);
+    // With the company-wide switch off the refusal says that, and how to turn it on.
+    const off = await grantFixture({ editWorkflows: false });
+    refused(await off.push(DX, { workflowPush: report }), /cannot read the workflow files.*editWorkflows is turned off for this company.*write-identity\.grant/s);
+    // The agent that has the grant is not asked to prove anything about the base branch.
+    expect(await scoped.push(DX, { workflowPush: report })).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("refuses an agent of the same company that has no grant, one the host did not name, and tells the board how to grant it", async () => {
+    const f = await grantFixture();
+    for (const [label, agentId] of [["another agent", OTHER], ["no agent named", undefined], ["a null agent", null], ["an empty ID", ""], ["a made-up ID", "not-an-agent"]] as const) {
+      const decision = refused(await f.push(agentId), /no board grant for editWorkflows.*write-identity\.grant/s);
+      expect(decision.unavailable, label).toMatch(/granted to 1 agent/);
+      expect(decision.unavailable, label).not.toContain("turned off for this company");
+    }
+    // The refusal names the agent, so the board can paste the grant.
+    expect(refused(await f.push(OTHER), /"agentIds":\[…,"9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d"\]/).unavailable).toContain('"action":"editWorkflows"');
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    // One agent's grant is not another's for a different action.
+    const dispatch = await grantFixture({ editWorkflows: { agentIds: [DX] }, workflowDispatch: false });
+    refused(await dispatch.push(DX, { privileged: ["workflowDispatch"], action: "other" }), /\(workflowDispatch\).*turned off for this company/s);
+  });
+
+  it("keeps a refusal within 500 characters when every privileged action is refused, with the board hint whole", async () => {
+    const f = await grantFixture({ editWorkflows: { agentIds: [DX] }, workflowDispatch: { agentIds: [DX] }, adminMerge: false, deploymentApproval: false, release: false, tagPush: false, pushToMain: false, wiki: false });
+    const all = ["adminMerge", "deploymentApproval", "release", "tagPush", "workflowDispatch", "pushToMain", "editWorkflows", "wiki"];
+    const decision = refused(await f.push(OTHER, { privileged: all }), /write-identity\.grant, which replaces the whole list/);
+    expect(decision.unavailable).toContain(`"agentIds":[…,"${OTHER}"]`);
+  });
+
+  it("refuses an agent of another company, whatever this company grants, and grants nothing across companies", async () => {
+    const f = await grantFixture({ editWorkflows: { agentIds: [DX, FOREIGN] } });
+    // The other company writes as its run users and grants editWorkflows to one agent of its own.
+    const policy = { default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "run", allowedRepositories: ["anthm-fr/songtrivia"], privileged: { editWorkflows: { agentIds: [OTHER] } } };
+    await f.h.performAction("write-identity.set", { companyId: "other", policy }, actors("other").admin);
+    const ask = (agentId: string) => f.h.performAction<any>("repository-write-identity", { companyId: "other", repository: "anthm-fr/songtrivia", access: "write", action: "push", privileged: ["editWorkflows"], agentId, runId: RUN }, actors("other").server);
+    // DX and FOREIGN are granted by the first company; in the second they are nobody.
+    refused(await ask(DX), /no board grant for editWorkflows/);
+    refused(await ask(FOREIGN), /no board grant for editWorkflows/);
+    // Its own agent is granted there, and only there.
+    expect(await ask(OTHER)).not.toHaveProperty("unavailable");
+    refused(await f.push(OTHER), /no board grant for editWorkflows/);
+    // The company that writes as its run users records the allowed push too, under its own ID.
+    expect(f.logged("github.workflow_push_allowed")).toEqual([expect.objectContaining({
+      companyId: "other", entityId: OTHER, metadata: expect.objectContaining({ via: "agent-grant", agentId: OTHER, runId: RUN }),
+    })]);
+    // A company without a grant list at all refuses every agent.
+    await f.h.performAction("write-identity.set", { companyId: "other", policy: { ...policy, privileged: { editWorkflows: false } } }, actors("other").admin);
+    refused(await ask(OTHER), /\(editWorkflows\) and it is turned off for this company/);
+    refused(await ask(DX), /\(editWorkflows\) and it is turned off for this company/);
+  });
+
+  it("does not let an agent grant itself or anyone, by the grant, by saving the policy, or by listing agents", async () => {
+    const f = await grantFixture({ editWorkflows: false });
+    const agent = { ...actors("anthm").agent, actor: { ...actors("anthm").agent.actor, agentId: DX, runId: RUN } } as PluginPerformActionContext;
+    const spoofed = { ...agent, actor: { ...agent.actor, isInstanceAdmin: true } } as PluginPerformActionContext;
+    const before = await f.policy();
+    for (const [label, caller] of [["an agent", agent], ["an agent claiming to be an administrator", spoofed], ["a board member who is no administrator", actors("anthm").member]] as const) {
+      await expect(f.h.performAction("write-identity.grant", { companyId: "anthm", action: "editWorkflows", scope: { agentIds: [DX] } }, caller), label).rejects.toThrow(/board user|administrator/i);
+      await expect(f.h.performAction("write-identity.grant", { companyId: "anthm", action: "editWorkflows", scope: true }, caller), label).rejects.toThrow(/board user|administrator/i);
+      await expect(f.h.performAction("write-identity.set", { companyId: "anthm", policy: { ...before, privileged: { ...before.privileged, editWorkflows: { agentIds: [DX] } } } }, caller), label).rejects.toThrow(/board user|administrator/i);
+    }
+    await expect(f.h.performAction("write-identity.agents", { companyId: "anthm" }, agent)).rejects.toThrow(/board user/i);
+    // Another company's administrator acts on their own company only (the host scopes every call to the caller's company): this one has no policy to grant in.
+    await expect(f.h.performAction("write-identity.grant", { companyId: "anthm", action: "editWorkflows", scope: true }, actors("other").admin)).rejects.toThrow(/Save a write identity first/);
+    expect(await f.policy()).toEqual(before);
+    refused(await f.push(DX), /\(editWorkflows\) and it is turned off for this company/);
+  });
+
+  it("keeps true and false as they were: company-wide values are the same for every agent", async () => {
+    const on = await grantFixture({ editWorkflows: true });
+    for (const agentId of [DX, OTHER, null, undefined]) expect(await on.push(agentId), String(agentId)).toMatchObject({ credential: { login: "agent-owner" } });
+    // Allowed for everyone is still recorded, and said to be company-wide.
+    expect(on.logged("github.workflow_push_allowed").map(entry => (entry.metadata as any).via)).toEqual(["company", "company", "company", "company"]);
+    const off = await grantFixture({ editWorkflows: false });
+    for (const agentId of [DX, OTHER, null, undefined]) {
+      const decision = refused(await off.push(agentId), /This is a privileged GitHub action \(editWorkflows\) and it is turned off for this company\./);
+      expect(decision.unavailable).toMatch(/write-identity\.grant/);
+    }
+    expect(off.logged("github.workflow_push_allowed")).toEqual([]);
+    // The default of a saved policy has editWorkflows off, workflowDispatch on, for everyone.
+    const fresh = await appFixture();
+    await fresh.authorize();
+    expect(await fresh.write("anthm-fr/songtrivia", { action: "push", privileged: ["editWorkflows"], agentId: DX })).toHaveProperty("unavailable");
+    expect(await fresh.write("anthm-fr/songtrivia", { action: "other", privileged: ["workflowDispatch"], agentId: OTHER })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await fresh.write("anthm-fr/songtrivia", { action: "other", privileged: ["workflowDispatch"] })).toMatchObject({ credential: { login: "agent-owner" } });
+    // Dispatching with the default is not recorded: only a grant to agents, or an edit of workflow files, is.
+    expect(fresh.h.activity.filter(entry => entry.message === "github.workflow_push_allowed")).toEqual([]);
+  });
+
+  it("refuses a workflow push whose record cannot be written, in either mode, and returns no credential", async () => {
+    const f = await grantFixture();
+    const down = new Error("activity store is down");
+    const log = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(f.push(DX, { workflowPush: report })).rejects.toThrow(down);
+    log.mockRestore();
+    // Nothing was recorded; once the record can be written the same push goes through.
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    expect(await f.push(DX, { workflowPush: report })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")).toHaveLength(1);
+    // The company that writes as its run users is held to the same rule.
+    const policy = { default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "run", allowedRepositories: ["anthm-fr/songtrivia"], privileged: { editWorkflows: { agentIds: [OTHER] } } };
+    await f.h.performAction("write-identity.set", { companyId: "other", policy }, actors("other").admin);
+    const ask = () => f.h.performAction<any>("repository-write-identity", { companyId: "other", repository: "anthm-fr/songtrivia", access: "write", action: "push", privileged: ["editWorkflows"], agentId: OTHER, runId: RUN }, actors("other").server);
+    const failing = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(ask()).rejects.toThrow(down);
+    failing.mockRestore();
+    expect(await ask()).not.toHaveProperty("unavailable");
+    expect(f.logged("github.workflow_push_allowed")).toHaveLength(2);
+  });
+
+  it("grants workflowDispatch to chosen agents the same way, for the host's commands and the plugin's own tools", async () => {
+    const f = await grantFixture({ workflowDispatch: { agentIds: [DX] } });
+    const dispatch = (agentId?: string | null) => f.write("anthm-fr/songtrivia", { action: "other", privileged: ["workflowDispatch"], ...(agentId === undefined ? {} : { agentId }), runId: RUN });
+    expect(await dispatch(DX)).toMatchObject({ credential: { login: "agent-owner" } });
+    refused(await dispatch(OTHER), /no board grant for workflowDispatch.*write-identity\.grant/s);
+    refused(await dispatch(), /no board grant for workflowDispatch/);
+    expect(f.logged("github.workflow_dispatch_allowed")).toEqual([expect.objectContaining({
+      entityType: "agent", entityId: DX, metadata: { action: "workflowDispatch", via: "agent-grant", agentId: DX, runId: RUN, repository: "anthm-fr/songtrivia" },
+    })]);
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    // The plugin's own tool takes the agent from the run it executes in, never from its input.
+    const original = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, auth?: string, body?: unknown, method?: string) =>
+      path === "/repos/Anthm-FR/songtrivia/check-runs/5/rerequest" && method === "POST" ? { data: {} as any, next: false } : (original as any)(path, auth, body, method));
+    const rerun = (agentId: string, input: Record<string, unknown> = {}) => f.h.executeTool<any>("github_rerun_checks",
+      { repository: "Anthm-FR/songtrivia", number: 7, checkRunId: 5, ...input }, { companyId: "anthm", agentId, projectId: "p1", runId: RUN });
+    expect((await rerun(DX)).error).toBeUndefined();
+    expect((await rerun(OTHER)).error).toMatch(/no board grant for workflowDispatch/);
+    expect((await rerun(OTHER, { agentId: DX, agentIds: [DX] })).error).toMatch(/no board grant for workflowDispatch/);
+  });
+
+  it("lets a board administrator change the scope with the grant action, and records the change", async () => {
+    const f = await grantFixture({ editWorkflows: false });
+    f.h.seed({ agents: [DX, OTHER].map(id => ({ id, companyId: "anthm", name: `Agent ${id.slice(0, 4)}`, status: "idle" })) as any });
+    const admin = actors("anthm").admin;
+    const before = await f.policy();
+    const grant = (scope: unknown, action = "editWorkflows") => f.h.performAction<any>("write-identity.grant", { companyId: "anthm", action, scope }, admin);
+
+    expect(await grant({ agentIds: [DX.toUpperCase(), DX] })).toMatchObject({ companyId: "anthm", action: "editWorkflows", scope: { agentIds: [DX] } });
+    // Only that value changed, and the grant works at once for the agent and for nobody else.
+    expect(await f.policy()).toEqual({ ...before, privileged: { ...before.privileged, editWorkflows: { agentIds: [DX] } } });
+    expect(await f.push(DX)).toMatchObject({ credential: { login: "agent-owner" } });
+    refused(await f.push(OTHER), /no board grant for editWorkflows/);
+    expect(f.logged("github.privileged_grant_changed")).toEqual([expect.objectContaining({ companyId: "anthm", metadata: { action: "editWorkflows", previous: false, scope: { agentIds: [DX] }, by: "admin" } })]);
+    // Two agents, then every agent (the legacy value), then nobody.
+    expect((await grant({ agentIds: [DX, OTHER] })).scope).toEqual({ agentIds: [OTHER, DX].sort() });
+    expect(await f.push(OTHER)).toMatchObject({ credential: { login: "agent-owner" } });
+    await grant(true);
+    expect((await f.policy()).privileged.editWorkflows).toBe(true);
+    expect(await f.push(null)).toMatchObject({ credential: { login: "agent-owner" } });
+    await grant(false);
+    refused(await f.push(DX), /turned off for this company/);
+    await grant({ agentIds: [] });
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+    // The other action keeps its own scope.
+    await grant({ agentIds: [OTHER] }, "workflowDispatch");
+    expect((await f.policy()).privileged).toMatchObject({ editWorkflows: false, workflowDispatch: { agentIds: [OTHER] } });
+    expect(f.logged("github.privileged_grant_changed")).toHaveLength(6);
+  });
+
+  it("refuses a grant that is not for editWorkflows or workflowDispatch, not a scope, not for an agent of this company, or without a saved policy", async () => {
+    const f = await grantFixture({ editWorkflows: false });
+    f.h.seed({ agents: [{ id: DX, companyId: "anthm", name: "Anthm DX", status: "idle" }, { id: FOREIGN, companyId: "elsewhere", name: "Not ours", status: "idle" }] as any });
+    const admin = actors("anthm").admin;
+    const before = await f.policy();
+    const attempt = (params: Record<string, unknown>, caller = admin, company = "anthm") => f.h.performAction("write-identity.grant", { companyId: company, ...params }, caller);
+    await expect(attempt({ action: "adminMerge", scope: { agentIds: [DX] } })).rejects.toThrow(/editWorkflows or workflowDispatch/);
+    await expect(attempt({ action: "pushToMain", scope: true })).rejects.toThrow(/editWorkflows or workflowDispatch/);
+    await expect(attempt({ scope: true })).rejects.toThrow(/editWorkflows or workflowDispatch/);
+    for (const scope of ["all", null, 1, [DX], { agentIds: "x" }, { agentIds: ["Anthm DX"] }, { agentIds: [DX], all: true }]) {
+      await expect(attempt({ action: "editWorkflows", scope }), JSON.stringify(scope)).rejects.toThrow(/editWorkflows/);
+    }
+    await expect(attempt({ action: "editWorkflows", scope: { agentIds: [FOREIGN] } })).rejects.toThrow(new RegExp(`${FOREIGN}.*not an agent of this company`));
+    await expect(attempt({ action: "editWorkflows", scope: { agentIds: [DX, "6b6b6b6b-1111-4111-8111-222222222222"] } })).rejects.toThrow(/not an agent of this company/);
+    // A company that never saved a write identity has nothing to grant in.
+    await expect(attempt({ action: "editWorkflows", scope: true }, actors("fresh").admin, "fresh")).rejects.toThrow(/Save a write identity first/);
+    expect(await f.policy()).toEqual(before);
+    expect(f.logged("github.privileged_grant_changed")).toEqual([]);
+  });
+
+  it("lists the company's agents for the board, and a saved policy keeps its grants when read back and saved again", async () => {
+    const f = await grantFixture({ editWorkflows: { agentIds: [DX] }, workflowDispatch: { agentIds: [OTHER, DX] } });
+    f.h.seed({ agents: [{ id: DX, companyId: "anthm", name: "Anthm DX", status: "idle" }, { id: OTHER, companyId: "anthm", name: "Anthm QA", status: "paused" }, { id: FOREIGN, companyId: "elsewhere", name: "Not ours", status: "idle" }] as any });
+    expect((await f.h.performAction<any>("write-identity.agents", { companyId: "anthm" }, actors("anthm").member)).agents)
+      .toEqual([{ id: DX, name: "Anthm DX", status: "idle" }, { id: OTHER, name: "Anthm QA", status: "paused" }].sort((a, b) => a.name.localeCompare(b.name)));
+    const saved = await f.policy();
+    expect(saved.privileged).toMatchObject({ editWorkflows: { agentIds: [DX] }, workflowDispatch: { agentIds: [OTHER, DX].sort() } });
+    // Saving what was read (the settings page does) changes nothing.
+    await f.setPolicy(saved);
+    expect(await f.policy()).toEqual(saved);
+    expect(await f.push(DX)).toMatchObject({ credential: { login: "agent-owner" } });
   });
 });

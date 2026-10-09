@@ -5,6 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { GitHubPage, GitHubIssues, GitHubTaskButton, GitHubLink, GitHubTaskList } from "../src/ui/index.js";
 import { PAGE_PATH, PLUGIN_ID } from "../src/contracts.js";
 import { saveCredentials, saveConfiguration } from "../src/ui/api.js";
+import { DEFAULT_GITHUB_PRIVILEGED_TOGGLES, DEFAULT_GITHUB_WRITE_IDENTITY_POLICY } from "@paperclipai/shared/github-write-identity";
 const mocks = vi.hoisted(() => ({ actions: new Map<string, ReturnType<typeof vi.fn>>(), navigate: vi.fn() }));
 vi.mock("@paperclipai/plugin-sdk/ui", () => ({ useHostContext: () => ({ userId: "test-user" }),
   usePluginAction: (key: string) => {
@@ -372,6 +373,96 @@ describe("native task sync controls", () => {
       enabled: true,
       privileged: expect.objectContaining({ release: false, tagPush: false }),
     }) });
+  });
+  describe("workflow permissions in the write identity", () => {
+    const dx = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01", qa = "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d", gone = "6b6b6b6b-1111-4111-8111-222222222222";
+    const saved = (editWorkflows: unknown = { agentIds: [dx] }) => ({ ...DEFAULT_GITHUB_WRITE_IDENTITY_POLICY, privileged: { ...DEFAULT_GITHUB_PRIVILEGED_TOGGLES, editWorkflows } });
+    const agents = [{ id: dx, name: "Anthm DX", status: "idle" }, { id: qa, name: "Anthm QA", status: "idle" }];
+    async function open(policy: unknown) {
+      action("status").mockResolvedValue({ configured: true, app });
+      action("catalog").mockResolvedValue({ app, installations: [], repositories: [repository], warnings: [], truncated: false });
+      action("write-identity.get").mockResolvedValue({ companyId: "c1", policy });
+      action("write-identity.agents").mockResolvedValue({ companyId: "c1", agents });
+      action("write-identity.grant").mockImplementation(({ action: name, scope }: any) => Promise.resolve({ companyId: "c1", action: name, scope }));
+      render(<GitHubPage context={context} />);
+      fireEvent.click(await screen.findByText(policy ? "Write identity · Custom" : "Write identity · Default"));
+    }
+
+    it("shows who holds each permission and lets the board grant it to chosen agents, every agent, or nobody", async () => {
+      await open(saved());
+      const edit = await screen.findByLabelText("Edit workflow files") as HTMLSelectElement;
+      expect(edit.value).toBe("agents");
+      expect((screen.getByLabelText("Run and rerun workflows") as HTMLSelectElement).value).toBe("all");
+      expect((await screen.findByLabelText("Anthm DX") as HTMLInputElement).checked).toBe(true);
+      const qaBox = screen.getByLabelText("Anthm QA") as HTMLInputElement;
+      expect(qaBox.checked).toBe(false);
+      // Nothing is sent until the board saves that permission.
+      fireEvent.click(qaBox);
+      expect(action("write-identity.grant")).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Save Edit workflow files" }));
+      await screen.findByText("Saved Edit workflow files");
+      expect(action("write-identity.grant")).toHaveBeenLastCalledWith({ companyId: "c1", action: "editWorkflows", scope: { agentIds: [dx, qa] } });
+      // Every agent: the list goes away and the legacy value is sent.
+      fireEvent.change(edit, { target: { value: "all" } });
+      expect(screen.queryByLabelText("Anthm QA")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Save Edit workflow files" }));
+      await waitFor(() => expect(action("write-identity.grant")).toHaveBeenLastCalledWith({ companyId: "c1", action: "editWorkflows", scope: true }));
+      // Nobody.
+      fireEvent.change(edit, { target: { value: "off" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save Edit workflow files" }));
+      await waitFor(() => expect(action("write-identity.grant")).toHaveBeenLastCalledWith({ companyId: "c1", action: "editWorkflows", scope: false }));
+      // The other permission is its own: it can be granted to an agent too.
+      const dispatch = screen.getByLabelText("Run and rerun workflows") as HTMLSelectElement;
+      fireEvent.change(dispatch, { target: { value: "agents" } });
+      expect((screen.getByRole("button", { name: "Save Run and rerun workflows" }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click((await screen.findAllByLabelText("Anthm QA"))[0]!);
+      fireEvent.click(screen.getByRole("button", { name: "Save Run and rerun workflows" }));
+      await waitFor(() => expect(action("write-identity.grant")).toHaveBeenLastCalledWith({ companyId: "c1", action: "workflowDispatch", scope: { agentIds: [qa] } }));
+      expect(action("write-identity.set")).not.toHaveBeenCalled();
+    });
+
+    it("keeps an agent that no longer exists visible, so the board can take its grant away, and shows a refusal", async () => {
+      await open(saved({ agentIds: [gone] }));
+      const stale = await screen.findByLabelText(/Unknown agent \(6b6b6b6b/) as HTMLInputElement;
+      expect(stale.checked).toBe(true);
+      // Chosen agents with nobody ticked is not a grant, so it cannot be saved.
+      fireEvent.click(stale);
+      expect((screen.getByRole("button", { name: "Save Edit workflow files" }) as HTMLButtonElement).disabled).toBe(true);
+      action("write-identity.grant").mockRejectedValue(new Error("Instance administrator access is required for GitHub connection changes."));
+      fireEvent.click(screen.getByLabelText("Anthm DX"));
+      fireEvent.click(screen.getByRole("button", { name: "Save Edit workflow files" }));
+      expect((await screen.findByRole("alert")).textContent).toContain("Instance administrator access is required");
+      expect(screen.queryByText("Saved Edit workflow files")).toBeNull();
+    });
+
+    it("does not show the stored grants again after the board unticks and reticks the per-action identity", async () => {
+      await open(saved());
+      expect(await screen.findByLabelText("Edit workflow files")).toBeTruthy();
+      const choose = screen.getByLabelText("Choose the identity per action");
+      fireEvent.click(choose);
+      fireEvent.click(choose);
+      // The ticked policy is a new default draft: saving it is what replaces the stored one, so grants are not offered on it.
+      expect(screen.getByText("Save the write identity to grant workflow permissions.")).toBeTruthy();
+      expect(screen.queryByLabelText("Edit workflow files")).toBeNull();
+      expect(action("write-identity.grant")).not.toHaveBeenCalled();
+    });
+
+    it("offers nothing to grant until the write identity is saved", async () => {
+      await open(null);
+      expect(screen.queryByLabelText("Edit workflow files")).toBeNull();
+      fireEvent.click(await screen.findByLabelText("Choose the identity per action"));
+      expect(screen.getByText("Save the write identity to grant workflow permissions.")).toBeTruthy();
+      expect(screen.queryByLabelText("Edit workflow files")).toBeNull();
+      expect(action("write-identity.agents")).not.toHaveBeenCalled();
+    });
+
+    it("saves the policy with the grants it was loaded with, so saving it again never drops them", async () => {
+      await open(saved());
+      action("write-identity.set").mockImplementation(({ policy }: any) => Promise.resolve({ companyId: "c1", policy }));
+      fireEvent.click(await screen.findByRole("button", { name: "Save write identity" }));
+      await screen.findByText("Saved");
+      expect(action("write-identity.set")).toHaveBeenCalledWith({ companyId: "c1", policy: expect.objectContaining({ privileged: expect.objectContaining({ editWorkflows: { agentIds: [dx] } }) }) });
+    });
   });
   it("opens the managed workflow skill for policy edits", async () => {
     action("status").mockResolvedValue({ configured: true, app });
