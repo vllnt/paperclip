@@ -310,6 +310,25 @@ describe("grok_local testEnvironment", () => {
     expect(runProcessMock).not.toHaveBeenCalled();
   });
 
+  it("fails with the exact missing prerequisite and how to install it when the grok binary is not on the worker", async () => {
+    ensureCommandMock.mockRejectedValueOnce(new Error("Command not found in PATH: grok"));
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "grok_local",
+      config: { command: "grok", cwd: "/tmp/project" },
+    });
+
+    expect(result.status).toBe("fail");
+    const missing = result.checks.find((check: { code: string }) => check.code === "grok_command_unresolvable");
+    expect(missing).toMatchObject({ level: "error", detail: "grok" });
+    expect(missing?.message).toContain("Command not found in PATH: grok");
+    expect(missing?.hint).toContain("@xai-official/grok");
+    expect(missing?.hint).toContain("scripts/install-grok-build.sh");
+    expect(missing?.hint).toContain("doc/workers/grok-build.md");
+    expect(runProcessMock).not.toHaveBeenCalled();
+  });
+
   it("emits no adapter_auth_missing check for a local target with missing authentication", async () => {
     // The canonical check gates sandbox login eligibility only. A local target
     // has no sandbox login to offer, so the check must not appear.

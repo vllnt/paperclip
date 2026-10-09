@@ -205,6 +205,9 @@ export async function testEnvironment(
       level: "error",
       message: err instanceof Error ? err.message : "Command is not executable",
       detail: command,
+      hint:
+        "Install the pinned Grok Build CLI (npm package @xai-official/grok) with scripts/install-grok-build.sh, " +
+        "or set adapterConfig.command to its path. See doc/workers/grok-build.md.",
     });
   }
 

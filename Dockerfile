@@ -192,12 +192,15 @@ ARG CLI_TOOLS_CACHE_EPOCH=""
 # Remote-worker deployments do not need global inference CLIs on the control host.
 ARG INSTALL_LOCAL_CLIS=true
 WORKDIR /app
+# Grok Build is pinned and checksum-verified, unlike the @latest CLI tools.
+COPY scripts/install-grok-build.sh /tmp/install-grok-build.sh
 # Tool and OS layer BEFORE the app copy: it references nothing from /app, and
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && if [ "$INSTALL_LOCAL_CLIS" = "true" ]; then npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest; fi \
+  && if [ "$INSTALL_LOCAL_CLIS" = "true" ]; then npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest && sh /tmp/install-grok-build.sh; fi \
+  && rm -f /tmp/install-grok-build.sh \
   && npm cache clean --force \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
