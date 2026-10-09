@@ -2779,6 +2779,7 @@ export type { ExecutionProjection, ExecutionReconciliation, ExecutionBlocker } f
 export { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "./types/execution-projection.js";
 
 export * from "./agent-appearance.js";
+export { estimateTokens } from "./token-estimate.js";
 export * from "./ai-connections.js";
 export * from "./ai-connection-usage.js";
 export { questionSetToAskUserQuestionsPayload } from "./question-set.js";
