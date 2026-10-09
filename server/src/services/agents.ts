@@ -20,6 +20,7 @@ import {
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  agentFallbacksSchema,
   agentRuntimeConfigSchema,
   getAgentWorkEligibility,
   isUuidLike,
@@ -75,6 +76,7 @@ const CONFIG_REVISION_FIELDS = [
   "adapterType",
   "adapterConfig",
   "runtimeConfig",
+  "fallbacks",
   "defaultEnvironmentId",
   "budgetMonthlyCents",
   "metadata",
@@ -175,6 +177,7 @@ function buildConfigSnapshot(
     adapterType: row.adapterType,
     adapterConfig,
     runtimeConfig,
+    fallbacks: Array.isArray(row.fallbacks) ? row.fallbacks.filter(isPlainRecord).map((entry) => sanitizeRecord(entry)) : [],
     defaultEnvironmentId: row.defaultEnvironmentId,
     budgetMonthlyCents: row.budgetMonthlyCents,
     metadata,
@@ -284,6 +287,12 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
   if (!runtimeConfig.success) {
     throw unprocessable("Invalid revision snapshot: runtimeConfig");
   }
+  const fallbacks = Object.prototype.hasOwnProperty.call(snapshot, "fallbacks")
+    ? agentFallbacksSchema.safeParse(snapshot.fallbacks)
+    : null;
+  if (fallbacks && !fallbacks.success) {
+    throw unprocessable("Invalid revision snapshot: fallbacks");
+  }
 
   return {
     name: snapshot.name,
@@ -298,6 +307,7 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
     adapterType: snapshot.adapterType,
     adapterConfig: isPlainRecord(snapshot.adapterConfig) ? snapshot.adapterConfig : {},
     runtimeConfig: runtimeConfig.data,
+    ...(fallbacks ? { fallbacks: fallbacks.data } : {}),
     defaultEnvironmentId:
       typeof snapshot.defaultEnvironmentId === "string" || snapshot.defaultEnvironmentId === null
         ? snapshot.defaultEnvironmentId

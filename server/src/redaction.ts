@@ -989,6 +989,28 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
+/**
+ * Redacts an agent's `fallbacks` for API reads: env bindings as in
+ * `redactAgentAdapterConfig` (secret references kept, plain values masked)
+ * and each entry's adapterConfig through the event payload sanitizer.
+ *
+ * @param fallbacks - Stored `agents.fallbacks`.
+ * @returns The redacted entries; non-arrays become an empty list.
+ */
+export function redactAgentFallbacks(fallbacks: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(fallbacks)) return [];
+  return fallbacks.filter(isPlainObject).map((entry) => {
+    const { env, adapterConfig, ...rest } = entry;
+    return {
+      ...rest,
+      ...(isPlainObject(adapterConfig) ? { adapterConfig: redactEventPayload(adapterConfig) ?? {} } : {}),
+      ...(isPlainObject(env)
+        ? { env: Object.fromEntries(Object.entries(env).map(([key, value]) => [key, redactAgentEnvBinding(value)])) }
+        : {}),
+    };
+  });
+}
+
 export function redactSensitiveText(input: string): string {
   if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(

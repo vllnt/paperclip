@@ -1230,7 +1230,7 @@ describe.sequential("agent permission routes", () => {
         role: "engineer",
         adapterType: "opencode_local",
         adapterConfig: {
-          model: "anthropic/claude-sonnet-4-5",
+          model: "openai/gpt-5.4",
         },
       }));
 
@@ -1241,11 +1241,36 @@ describe.sequential("agent permission routes", () => {
       expect.objectContaining({
         adapterType: "opencode_local",
         adapterConfig: expect.objectContaining({
-          model: "anthropic/claude-sonnet-4-5",
+          model: "openai/gpt-5.4",
         }),
       }),
       { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
     );
+  });
+
+  it("refuses an Anthropic model on opencode_local: Anthropic models run only through claude_local", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/companies/${companyId}/agents`)
+      .send({
+        name: "OpenCode Builder",
+        role: "engineer",
+        adapterType: "opencode_local",
+        adapterConfig: {
+          model: "anthropic/claude-sonnet-4-5",
+        },
+      }));
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ details: { code: "harness_model_incompatible" } });
+    expect(mockAgentService.create).not.toHaveBeenCalled();
   });
 
   it("normalizes hire requests to disable timer heartbeats by default", async () => {

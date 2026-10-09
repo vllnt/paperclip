@@ -66,6 +66,10 @@ export const heartbeatRuns = pgTable(
     stdoutExcerpt: text("stdout_excerpt"),
     stderrExcerpt: text("stderr_excerpt"),
     errorCode: text("error_code"),
+    /** The harness and model this run executed, and why it ran on a fallback target. */
+    executedAdapterType: text("executed_adapter_type"),
+    executedModel: text("executed_model"),
+    fallbackReason: text("fallback_reason"),
     externalRunId: text("external_run_id"),
     // Legacy controller lease. A PID alone is not an identity across containers.
     controllerBootId: uuid("controller_boot_id"),

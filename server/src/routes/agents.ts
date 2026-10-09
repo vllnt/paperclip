@@ -140,8 +140,22 @@ import {
 import {
   REDACTED_EVENT_VALUE,
   redactAgentAdapterConfig,
+  redactAgentFallbacks,
   redactEventPayload,
 } from "../redaction.js";
+import {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  agentFallbacksSchema,
+  harnessTargetKey,
+  type AgentFallbackTarget,
+} from "@paperclipai/shared";
+import {
+  checkRunHarnessCompatibility,
+  harnessFallbackService,
+  readAgentFallbacks,
+  readQuotaBackoffMaxMinutes,
+} from "../services/harness-fallback.js";
+import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import {
   HarnessRuntimeRequestResolutionError,
@@ -739,6 +753,7 @@ export function agentRoutes(
   const recovery = recoveryService(db, { enqueueWakeup: heartbeat.wakeup });
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  const harnessFallbackSvc = harnessFallbackService(db);
   const instructions = agentInstructionsService(db);
   const agentFiles = agentFileStore(db);
   const instructionRevisions = agentInstructionRevisionService(db);
@@ -1666,9 +1681,13 @@ export function agentRoutes(
     const baseAgent = redactAgentRowForResponse(
       options?.restricted ? redactForRestrictedAgentView(agent) : agent,
     );
+    const harnessFallback = options?.restricted
+      ? null
+      : await harnessFallbackSvc.getAgentState(agent).catch(() => null);
 
     return {
       ...baseAgent,
+      harnessFallback,
       chainOfCommand,
       access: accessState,
     };
@@ -3129,6 +3148,7 @@ export function agentRoutes(
       ...agent,
       adapterConfig: {},
       runtimeConfig: {},
+      fallbacks: [],
     };
   }
 
@@ -3136,13 +3156,16 @@ export function agentRoutes(
   // views blank the config wholesale for authorization reasons; this runs for
   // config-reading (board) callers too, so plaintext `adapterConfig.env` values
   // never leave the API regardless of actor scope.
-  function redactAgentRowForResponse<T extends { adapterConfig?: unknown } | null | undefined>(
+  function redactAgentRowForResponse<T extends { adapterConfig?: unknown; fallbacks?: unknown } | null | undefined>(
     agent: T,
   ): T {
     if (!agent || typeof agent !== "object") return agent;
-    if (!agent.adapterConfig || typeof agent.adapterConfig !== "object") return agent;
+    const withFallbacks = hasOwn(agent, "fallbacks")
+      ? { ...agent, fallbacks: redactAgentFallbacks(agent.fallbacks) }
+      : agent;
+    if (!agent.adapterConfig || typeof agent.adapterConfig !== "object") return withFallbacks;
     return {
-      ...agent,
+      ...withFallbacks,
       adapterConfig: redactAgentAdapterConfig(agent.adapterConfig as Record<string, unknown>),
     };
   }
@@ -3160,6 +3183,7 @@ export function agentRoutes(
       adapterType: agent.adapterType,
       adapterConfig: redactAgentAdapterConfig(agent.adapterConfig),
       runtimeConfig: redactEventPayload(agent.runtimeConfig),
+      fallbacks: redactAgentFallbacks(agent.fallbacks),
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
@@ -3187,11 +3211,125 @@ export function agentRoutes(
     return { ...requestedConfig, env: restoredEnv };
   }
 
+  /**
+   * Validates and normalizes an agent's fallback chain for storage: the
+   * primary must be a fallback-capable harness, an echoed redacted env value
+   * keeps its stored value, credential env keys must be secret references,
+   * and each harness gets the same adapter defaults a primary would.
+   */
+  async function normalizeAgentFallbacksForPersistence(input: {
+    companyId: string;
+    agentId: string;
+    primaryAdapterType: string;
+    primaryAdapterConfig: Record<string, unknown>;
+    requested: AgentFallbackTarget[];
+    existing: unknown;
+  }): Promise<AgentFallbackTarget[]> {
+    if (input.requested.length === 0) return [];
+    if (!(HARNESS_FALLBACK_ADAPTER_TYPES as readonly string[]).includes(input.primaryAdapterType)) {
+      throw unprocessable(
+        `Fallbacks are supported only for ${HARNESS_FALLBACK_ADAPTER_TYPES.join(", ")} agents; remove the fallbacks first.`,
+      );
+    }
+    const primaryModel = typeof input.primaryAdapterConfig.model === "string" ? input.primaryAdapterConfig.model : null;
+    const primaryKey = harnessTargetKey({ adapterType: input.primaryAdapterType, model: primaryModel });
+    const stored = readAgentFallbacks(input.existing);
+    const normalized: AgentFallbackTarget[] = [];
+    for (const [index, entry] of input.requested.entries()) {
+      const key = harnessTargetKey(entry);
+      if (key === primaryKey) {
+        throw unprocessable(`fallbacks[${index}] repeats the primary harness and model (${key}).`);
+      }
+      const previous = stored.find((candidate) => harnessTargetKey(candidate) === key);
+      const requestedEnv = entry.env
+        ? asRecord(restoreRedactedAgentEnv({ env: entry.env }, { env: previous?.env ?? {} }).env) ?? {}
+        : undefined;
+      const env = requestedEnv
+        ? await secretsSvc.normalizeEnvBindingsForPersistence(input.companyId, requestedEnv, {
+            strictMode: true,
+            fieldPath: `fallbacks[${index}].env`,
+          })
+        : undefined;
+      const withDefaults = applyCodexLocalKeyIsolation(
+        input.companyId,
+        input.agentId,
+        entry.adapterType,
+        applyCreateDefaultsByAdapterType(entry.adapterType, { ...(entry.adapterConfig ?? {}), ...(env ? { env } : {}) }),
+      );
+      const { env: isolatedEnv, ...adapterConfig } = withDefaults;
+      const isolated = asRecord(isolatedEnv);
+      normalized.push({
+        adapterType: entry.adapterType,
+        model: entry.model,
+        ...(entry.effort ? { effort: entry.effort } : {}),
+        ...(Object.keys(adapterConfig).length > 0 ? { adapterConfig } : {}),
+        ...(isolated ? { env: isolated as AgentFallbackTarget["env"] } : {}),
+      });
+    }
+    const parsed = agentFallbacksSchema.safeParse(normalized);
+    if (!parsed.success) {
+      throw unprocessable(parsed.error.issues[0]?.message ?? "Invalid fallbacks");
+    }
+    return parsed.data;
+  }
+
+  /** Refuses a primary harness/model pair the compatibility matrix rejects. */
+  function assertPrimaryHarnessModelCompatible(adapterType: string, adapterConfig: Record<string, unknown>) {
+    const result = checkRunHarnessCompatibility({ adapterType, config: adapterConfig, fallback: false });
+    if (!result.ok) throw unprocessable(result.message, { code: result.code, model: result.model });
+  }
+
+  /**
+   * The quota settings an agent changes on itself: its `fallbacks` chain and
+   * the quota backoff. Values are compared after normalization, so an
+   * unchanged resubmit (including a redacted echo) passes.
+   */
+  function changedOwnFallbackFields(input: {
+    existing: { fallbacks: unknown; runtimeConfig: unknown };
+    nextFallbacks: unknown;
+    nextRuntimeConfig: unknown;
+  }): string[] {
+    const fields: string[] = [];
+    if (JSON.stringify(readAgentFallbacks(input.existing.fallbacks)) !== JSON.stringify(readAgentFallbacks(input.nextFallbacks))) {
+      fields.push("fallbacks");
+    }
+    if (readQuotaBackoffMaxMinutes(input.existing.runtimeConfig) !== readQuotaBackoffMaxMinutes(input.nextRuntimeConfig)) {
+      fields.push("runtimeConfig.heartbeat.quotaBackoffMaxMinutes");
+    }
+    return fields;
+  }
+
+  async function assertCanChangeOwnFallbacks(
+    req: Request,
+    target: { id: string; companyId: string },
+    fields: string[],
+    surface: "patch" | "config_rollback",
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId !== target.id || fields.length === 0) return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: "agent",
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target,
+      fields,
+      surface,
+    });
+  }
+
   function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {};
     const record = snapshot as Record<string, unknown>;
     return {
       ...record,
+      ...(hasOwn(record, "fallbacks") ? { fallbacks: redactAgentFallbacks(record.fallbacks) } : {}),
       adapterConfig: redactAgentAdapterConfig(
         typeof record.adapterConfig === "object" && record.adapterConfig !== null
           ? (record.adapterConfig as Record<string, unknown>)
@@ -4383,6 +4521,17 @@ export function agentRoutes(
       await assertSelectableAdapterType(rollbackAdapterType);
     }
     const rollbackAdapterConfig = asRecord(rollbackConfig.adapterConfig) ?? {};
+    assertPrimaryHarnessModelCompatible(rollbackAdapterType, rollbackAdapterConfig);
+    await assertCanChangeOwnFallbacks(
+      req,
+      existing,
+      changedOwnFallbackFields({
+        existing,
+        nextFallbacks: hasOwn(rollbackConfig, "fallbacks") ? rollbackConfig.fallbacks : existing.fallbacks,
+        nextRuntimeConfig: rollbackConfig.runtimeConfig ?? {},
+      }),
+      "config_rollback",
+    );
     assertExternalInstructionsAdmin(req, existing);
     assertExternalInstructionsAdmin(req, {
       ...existing,
@@ -4888,6 +5037,15 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
+    assertPrimaryHarnessModelCompatible(createInput.adapterType, normalizedAdapterConfig);
+    const normalizedFallbacks = await normalizeAgentFallbacksForPersistence({
+      companyId,
+      agentId,
+      primaryAdapterType: createInput.adapterType,
+      primaryAdapterConfig: normalizedAdapterConfig,
+      requested: createInput.fallbacks ?? [],
+      existing: [],
+    });
     const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig);
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
@@ -4904,6 +5062,7 @@ export function agentRoutes(
         ...createInput,
         adapterConfig: normalizedAdapterConfig,
         runtimeConfig: normalizedRuntimeConfig,
+        fallbacks: normalizedFallbacks,
         status: "idle",
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
@@ -5573,6 +5732,33 @@ export function agentRoutes(
         adapterConfig: patchData.adapterConfig,
       });
     }
+    const nextPrimaryAdapterConfig = asRecord(patchData.adapterConfig ?? existing.adapterConfig) ?? {};
+    if (touchesAdapterConfiguration) {
+      assertPrimaryHarnessModelCompatible(requestedAdapterType, nextPrimaryAdapterConfig);
+    }
+    if (hasOwn(patchData, "fallbacks") || touchesAdapterConfiguration) {
+      const normalizedFallbacks = await normalizeAgentFallbacksForPersistence({
+        companyId: existing.companyId,
+        agentId: existing.id,
+        primaryAdapterType: requestedAdapterType,
+        primaryAdapterConfig: nextPrimaryAdapterConfig,
+        requested: hasOwn(patchData, "fallbacks")
+          ? (patchData.fallbacks as AgentFallbackTarget[])
+          : readAgentFallbacks(existing.fallbacks),
+        existing: existing.fallbacks,
+      });
+      if (hasOwn(patchData, "fallbacks")) patchData.fallbacks = normalizedFallbacks;
+    }
+    await assertCanChangeOwnFallbacks(
+      req,
+      existing,
+      changedOwnFallbackFields({
+        existing,
+        nextFallbacks: hasOwn(patchData, "fallbacks") ? patchData.fallbacks : existing.fallbacks,
+        nextRuntimeConfig: requestedRuntimeConfig ?? existing.runtimeConfig,
+      }),
+      "patch",
+    );
     if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection) requestedRuntimeConfig.aiConnection = existing.runtimeConfig.aiConnection;
     const nextAiBinding = aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
