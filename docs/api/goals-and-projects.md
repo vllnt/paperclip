@@ -75,7 +75,7 @@ Only the board deletes a goal with the `short` horizon or a milestone; anyone el
 GET /api/companies/{companyId}/goals/focus
 ```
 
-Returns `{ goals, guidance }`. `goals` lists the active goals with the `short` horizon, nearest target date first, at most 10. Each has `progress` (`total`, `done`, `open` tasks, counted over the goal and every goal below it), `daysLeft`, `successCriteria`, and up to 5 open milestones; titles and `successCriteria` are cut to 280 characters. `guidance` is the instruction agents follow. Agents also get this as `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`, with `issueFocusGoalId` saying which focus goal the task serves. The agent inbox (`GET /api/agents/me/inbox-lite`) lists critical tasks first, then tasks that serve the focus, each with `focusGoalId`.
+Returns `{ goals, guidance }`. `goals` lists the active goals with the `short` horizon, nearest target date first, at most 10. Each has `progress` (`total`, `done`, `open` tasks, counted over the goal and every goal below it), `daysLeft`, `successCriteria`, and up to 5 open milestones; titles and `successCriteria` are cut to 280 characters. `guidance` is the instruction agents follow. Agents also get this as `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`, with `issueFocusGoalId` saying which focus goal the task serves; the task's own `goal` block there also cuts its title and `successCriteria` to 280 characters. The agent inbox (`GET /api/agents/me/inbox-lite`) lists critical tasks first, then tasks that serve the focus, each with `focusGoalId`.
 
 When the company has no focus, or the focus cannot be read within 500 ms, the heartbeat context has no `companyFocus` key and the inbox keeps its normal order with no `focusGoalId`.
 

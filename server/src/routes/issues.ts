@@ -1,4 +1,4 @@
-import { goalPlanningFields, readCompanyFocusForIssue } from "../services/goal-focus.js";
+import { heartbeatContextGoal, readCompanyFocusForIssue } from "../services/goal-focus.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -8661,16 +8661,7 @@ export function issueRoutes(
             targetDate: project.targetDate,
           }
         : null,
-      goal: goal
-        ? {
-            id: goal.id,
-            title: goal.title,
-            status: goal.status,
-            level: goal.level,
-            parentId: goal.parentId,
-            ...goalPlanningFields(goal),
-          }
-        : null,
+      goal: goal ? heartbeatContextGoal(goal) : null,
       ...(companyFocus ? { companyFocus } : {}),
       commentCursor,
       wakeComment: safeWakeComment,
