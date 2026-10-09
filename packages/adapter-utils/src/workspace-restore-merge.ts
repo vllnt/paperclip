@@ -690,10 +690,63 @@ export async function withDirectoryMergeLock<T>(
   }
 }
 
+/**
+ * Refuses a mutation of `targetDir/relative` unless every ancestor of it is a
+ * real directory inside the target. Each component is checked with `lstat`,
+ * which does not follow a link, and the parent's `realpath` must stay under
+ * the target. Node has no `openat`, so a path handed to `rename`, `rm`, or
+ * `mkdir` is resolved again by the system; call this immediately before each
+ * mutation, not only in a preflight, so a link swapped in after the preflight
+ * is refused. With `create`, missing ancestors are made one level at a time,
+ * never with a following `mkdir -p`. Throws {@link DirectoryMergeConflict}
+ * naming the first ancestor that is a link, or is not a directory. A removal
+ * passes `absentBelowFile`: a plain file in the way means the entry to remove
+ * is not there, and `false` is returned, as `ENOTDIR` once meant. A link is
+ * always refused. Returns `false` when nothing can exist at `relative`.
+ */
+async function assertRealAncestors(
+  targetDir: string, relative: string, options: { create?: boolean; absentBelowFile?: boolean } = {},
+): Promise<boolean> {
+  const create = options.create ?? false;
+  if (!isSafeSnapshotRelativePath(relative)) throw new DirectoryMergeConflict([relative]);
+  const segments = relative.split("/").slice(0, -1);
+  let current = targetDir;
+  let walked = "";
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    walked = walked ? `${walked}/${segment}` : segment;
+    let stats = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      if (error.code === "ENOTDIR") throw new DirectoryMergeConflict([walked]);
+      throw error;
+    });
+    if (!stats) {
+      // Nothing exists below a missing ancestor, so there is nothing to change.
+      if (!create) return false;
+      await fs.mkdir(current).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
+      stats = await fs.lstat(current);
+    }
+    if (!stats.isDirectory()) {
+      if (options.absentBelowFile && !stats.isSymbolicLink()) return false;
+      throw new DirectoryMergeConflict([walked]);
+    }
+  }
+  if (segments.length === 0) return true;
+  const [realTarget, realParent] = await Promise.all([fs.realpath(targetDir), fs.realpath(current)]);
+  const inside = path.relative(realTarget, realParent);
+  if (inside === ".." || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+    throw new DirectoryMergeConflict([walked]);
+  }
+  return true;
+}
+
 async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry): Promise<void> {
   const sourcePath = path.join(sourceDir, relative);
   const targetPath = path.join(targetDir, relative);
 
+  await assertRealAncestors(targetDir, relative, { create: true });
   if (entry.kind === "dir") {
     const existing = await fs.lstat(targetPath).catch(() => null);
     if (existing?.isDirectory()) {
@@ -702,11 +755,12 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     if (existing) {
       await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
     }
-    await fs.mkdir(targetPath, { recursive: true });
+    await fs.mkdir(targetPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    });
     return;
   }
 
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
   if (entry.kind === "symlink") {
     await removeReplacedEntry(targetDir, relative);
     await fs.symlink(entry.target, targetPath);
@@ -722,8 +776,10 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
     await fs.chmod(temporary, entry.mode);
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
+    await assertRealAncestors(targetDir, relative);
     const existing = await fs.lstat(targetPath).catch(() => null);
     if (existing?.isDirectory()) await removeReplacedEntry(targetDir, relative);
+    await assertRealAncestors(targetDir, relative);
     await fs.rename(temporary, targetPath);
   } finally { await fs.rm(temporary, { force: true }); }
 
@@ -781,6 +837,7 @@ async function removeStaleStagingFiles(root: string, relative: string): Promise<
 // removes them and retries once; a directory that still holds anything else is
 // reported as ENOTEMPTY, never emptied.
 async function removeDirectoryDroppingStaleStaging(root: string, relative: string): Promise<void> {
+  if (!await assertRealAncestors(root, relative, { absentBelowFile: true })) return;
   const directory = path.join(root, relative);
   try {
     await fs.rmdir(directory);
@@ -795,6 +852,7 @@ async function removeDirectoryDroppingStaleStaging(root: string, relative: strin
 // `blockedDirectoryReplacements` refused anything else, so a non-empty
 // directory here means content appeared concurrently and must not be lost.
 async function removeReplacedEntry(targetDir: string, relative: string): Promise<void> {
+  await assertRealAncestors(targetDir, relative);
   const targetPath = path.join(targetDir, relative);
   const existing = await fs.lstat(targetPath).catch(() => null);
   if (existing?.isDirectory()) await removeDirectoryDroppingStaleStaging(targetDir, relative);
@@ -810,6 +868,8 @@ async function blockedDirectoryReplacements(
 ): Promise<string[]> {
   const ignored = workspacePathMatcher(baseline.ignoredPaths);
   const holdsUnownedEntry = async (relative: string): Promise<boolean> => {
+    // A link in the path means the directory is not the one the run saw.
+    if (!await directoryWithoutLinks(targetDir, relative)) return true;
     await removeStaleStagingFiles(targetDir, relative);
     for (const name of await fs.readdir(path.join(targetDir, relative))) {
       const child = path.posix.join(relative, name);
@@ -830,6 +890,40 @@ async function blockedDirectoryReplacements(
     }
     return blocked;
   } finally { ignored.close(); }
+}
+
+/** Directories the merge would write below that are no longer the real
+ * directories the run saw, because another restore left a link or a file there.
+ * A directory the merge itself replaces first is not one of them. Nothing is
+ * written until this is empty. */
+async function linkedAncestorConflicts(
+  targetDir: string, baseline: DirectorySnapshot, source: DirectorySnapshot,
+  isApplied: (relative: string, entry: SnapshotEntry) => boolean,
+): Promise<string[]> {
+  const verdicts = new Map<string, boolean>();
+  const usable = async (ancestor: string): Promise<boolean> => {
+    const known = verdicts.get(ancestor);
+    if (known !== undefined) return known;
+    const stats = await fs.lstat(path.join(targetDir, ancestor)).catch(() => null);
+    const incoming = source.entries.get(ancestor);
+    const replaced = incoming?.kind === "dir" && !entriesMatch(baseline.entries.get(ancestor), incoming);
+    const verdict = !stats || stats.isDirectory() || replaced;
+    verdicts.set(ancestor, verdict);
+    return verdict;
+  };
+  const bad = new Set<string>();
+  for (const [relative, entry] of orderedEntries(source)) {
+    if (!isApplied(relative, entry)) continue;
+    const ancestors: string[] = [];
+    for (let parent = path.posix.dirname(relative); parent !== "."; parent = path.posix.dirname(parent)) ancestors.unshift(parent);
+    for (const ancestor of ancestors) {
+      if (!await usable(ancestor)) { bad.add(ancestor); break; }
+      // Below a missing or replaced directory nothing exists yet to follow.
+      const stats = await fs.lstat(path.join(targetDir, ancestor)).catch(() => null);
+      if (!stats?.isDirectory()) break;
+    }
+  }
+  return [...bad].sort();
 }
 
 export async function captureDirectorySnapshot(
@@ -954,6 +1048,8 @@ export async function mergeDirectoryWithBaseline(input: {
   conflictPolicy?: "reject";
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
+  /** Test seam only: runs after every preflight check and before the first write. */
+  afterPreflight?: () => Promise<void>;
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
   snapshots?: { source: DirectorySnapshot; current: DirectorySnapshot };
@@ -981,9 +1077,16 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         const blocked = await blockedDirectoryReplacements(canonicalTargetDir, input.baseline, source);
         if (blocked.length) throw new DirectoryMergeConflict(blocked);
+        const isApplied = (relative: string, entry: SnapshotEntry) =>
+          !entriesMatch(input.baseline.entries.get(relative), entry) &&
+          !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry));
+        const linked = await linkedAncestorConflicts(canonicalTargetDir, input.baseline, source, isApplied);
+        if (linked.length) throw new DirectoryMergeConflict(linked);
+        await input.afterPreflight?.();
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
+          if (!await assertRealAncestors(canonicalTargetDir, relative, { absentBelowFile: true })) continue;
           await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
         }
         // Reverse path order visits descendants before their parent directory.
@@ -993,8 +1096,7 @@ export async function mergeDirectoryWithBaseline(input: {
           });
         }
         for (const [relative, entry] of orderedEntries(source)) {
-          if (!entriesMatch(input.baseline.entries.get(relative), entry) &&
-              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+          if (isApplied(relative, entry)) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
         }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }

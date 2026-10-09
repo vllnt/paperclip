@@ -52,6 +52,20 @@ sync archives never include a merge's staged `.paperclip-merge-<uuid>` files.
 A snapshot walk treats an entry as absent when another writer deletes or
 renames it, or replaces its parent directory with a file, during the walk.
 
+A merge never writes, deletes, or renames through a link. Another restore can
+leave a link where the run saw a directory (`a -> /elsewhere`), and a path such
+as `a/b` would then resolve outside the workspace. Before it writes anything,
+the merge walks the ancestors of every entry it will apply with `lstat`, which
+does not follow links, and refuses with `DIRECTORY_MERGE_CONFLICT` when one is a
+link or a file the run did not replace. Immediately before each write, delete,
+directory removal, and rename it checks the ancestors again, makes missing
+directories one level at a time, and requires the parent's `realpath` to stay
+under the workspace, so a link swapped in after the first check is refused too.
+A plain file in the way of a delete means the entry is already gone and the
+delete is skipped. Node cannot open a directory relative to a descriptor, so a
+swap in the few system calls between a check and its operation is not excluded
+by this check; the lock keeps other merges out of that window.
+
 A merge killed while it copies a file leaves its `.paperclip-merge-<uuid>`
 staging file in the workspace. Walks hide these names, so the file would keep
 its directory non-empty after the run deleted that directory. When a merge

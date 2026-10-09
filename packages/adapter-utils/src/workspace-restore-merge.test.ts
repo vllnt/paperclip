@@ -1207,3 +1207,189 @@ describe("staging files left behind by a killed merge", () => {
     await expect(lstat(stale)).rejects.toMatchObject({ code: "ENOTDIR" });
   });
 });
+
+describe("merge mutations never follow a symlinked ancestor out of the workspace", () => {
+  const roots: string[] = [];
+  let previousHome: string | undefined;
+  let previousInstanceId: string | undefined;
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+    if (previousInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstanceId;
+    while (roots.length > 0) await rm(roots.pop()!, { recursive: true, force: true });
+  });
+
+  async function workspace() {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-ancestor-")));
+    roots.push(root);
+    previousHome = process.env.PAPERCLIP_HOME;
+    previousInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = path.join(root, "home");
+    process.env.PAPERCLIP_INSTANCE_ID = "test-instance";
+    const target = path.join(root, "target");
+    const source = path.join(root, "source");
+    const outside = path.join(root, "outside");
+    await mkdir(path.join(target, "a", "sub"), { recursive: true });
+    await writeFile(path.join(target, "a", "x"), "inside x\n");
+    await writeFile(path.join(target, "a", "d"), "will be replaced\n");
+    await mkdir(path.join(outside, "sub"), { recursive: true });
+    await mkdir(path.join(outside, "d"));
+    await writeFile(path.join(outside, "x"), "outside x\n");
+    await writeFile(path.join(outside, "keep.txt"), "outside keep\n");
+    return { root, target, source, outside };
+  }
+
+  // Every file and directory below `dir`, with file contents.
+  async function treeOf(dir: string): Promise<Record<string, string>> {
+    const result: Record<string, string> = {};
+    const walk = async (current: string) => {
+      for (const name of await readdir(current)) {
+        const full = path.join(current, name);
+        const stats = await lstat(full);
+        const key = path.relative(dir, full);
+        if (stats.isDirectory()) { result[key] = "<dir>"; await walk(full); }
+        else if (stats.isSymbolicLink()) result[key] = `<link>`;
+        else result[key] = await readFile(full, "utf8");
+      }
+    };
+    await walk(dir);
+    return result;
+  }
+
+  // The run's copy of the workspace, changed by `change`.
+  async function sourceWith(target: string, source: string, change: (source: string) => Promise<void>) {
+    await fsPromises.cp(target, source, { recursive: true });
+    await change(source);
+  }
+
+  async function replaceAWithLinkTo(target: string, outside: string) {
+    await fsPromises.rename(path.join(target, "a"), path.join(target, "a-moved"));
+    await symlink(outside, path.join(target, "a"));
+  }
+
+  it("refuses to write through a link that a queued restore left in place of a directory", async () => {
+    const { target, source, outside } = await workspace();
+    // Restore B starts from this baseline, in which `a` is a directory.
+    const baseline = await captureDirectorySnapshot(target);
+    await sourceWith(target, source, async (dir) => { await writeFile(path.join(dir, "a", "b"), "new\n"); });
+    // Restore A, queued first, turned `a` into a link to a directory outside.
+    await replaceAWithLinkTo(target, outside);
+    const before = await treeOf(outside);
+
+    await expect(mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target }))
+      .rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT", paths: ["a"] });
+
+    expect(await treeOf(outside)).toEqual(before);
+    expect((await lstat(path.join(target, "a"))).isSymbolicLink()).toBe(true);
+  });
+
+  it("writes nothing at all when one entry's ancestor is a link, even an entry that sorts first", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await sourceWith(target, source, async (dir) => {
+      await writeFile(path.join(dir, "0-first.txt"), "would be written first\n");
+      await writeFile(path.join(dir, "a", "b"), "new\n");
+    });
+    await replaceAWithLinkTo(target, outside);
+
+    await expect(mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target }))
+      .rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT", paths: ["a"] });
+
+    await expect(lstat(path.join(target, "0-first.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("refuses when an ancestor becomes a link between the preflight and a write", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await sourceWith(target, source, async (dir) => { await writeFile(path.join(dir, "a", "b"), "new\n"); });
+    const before = await treeOf(outside);
+    // A refused write must not even stage its temporary file through the link.
+    const copiedTo: string[] = [];
+    const realCopyFile = fsPromises.copyFile;
+    vi.spyOn(fsPromises, "copyFile").mockImplementation(async (from, to, mode) => {
+      copiedTo.push(String(to));
+      return await realCopyFile(from, to, mode);
+    });
+
+    await expect(mergeDirectoryWithBaseline({
+      baseline, sourceDir: source, targetDir: target,
+      afterPreflight: async () => { await replaceAWithLinkTo(target, outside); },
+    })).rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT" });
+
+    expect(copiedTo).toEqual([]);
+    expect(await treeOf(outside)).toEqual(before);
+  });
+
+  it("refuses to delete through an ancestor that becomes a link between the preflight and the delete", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await sourceWith(target, source, async (dir) => { await rm(path.join(dir, "a", "x")); });
+    const before = await treeOf(outside);
+
+    await expect(mergeDirectoryWithBaseline({
+      baseline, sourceDir: source, targetDir: target,
+      afterPreflight: async () => { await replaceAWithLinkTo(target, outside); },
+    })).rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT" });
+
+    expect(await readFile(path.join(outside, "x"), "utf8")).toBe("outside x\n");
+    expect(await treeOf(outside)).toEqual(before);
+  });
+
+  it("refuses to remove a directory through an ancestor that becomes a link between the preflight and the removal", async () => {
+    const { target, source, outside } = await workspace();
+    const baseline = await captureDirectorySnapshot(target);
+    await sourceWith(target, source, async (dir) => { await rm(path.join(dir, "a", "sub"), { recursive: true }); });
+    const before = await treeOf(outside);
+
+    await expect(mergeDirectoryWithBaseline({
+      baseline, sourceDir: source, targetDir: target,
+      afterPreflight: async () => { await replaceAWithLinkTo(target, outside); },
+    })).rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT" });
+
+    expect((await lstat(path.join(outside, "sub"))).isDirectory()).toBe(true);
+    expect(await treeOf(outside)).toEqual(before);
+  });
+
+  it("refuses to replace a directory with a file through an ancestor that becomes a link", async () => {
+    const { target, source, outside } = await workspace();
+    await mkdir(path.join(target, "a", "d2"));
+    await rm(path.join(target, "a", "d"));
+    await mkdir(path.join(target, "a", "d"));
+    const baseline = await captureDirectorySnapshot(target);
+    await sourceWith(target, source, async (dir) => {
+      await rm(path.join(dir, "a", "d"), { recursive: true });
+      await writeFile(path.join(dir, "a", "d"), "now a file\n");
+    });
+    const before = await treeOf(outside);
+
+    await expect(mergeDirectoryWithBaseline({
+      baseline, sourceDir: source, targetDir: target,
+      afterPreflight: async () => { await replaceAWithLinkTo(target, outside); },
+    })).rejects.toMatchObject({ code: "DIRECTORY_MERGE_CONFLICT" });
+
+    expect((await lstat(path.join(outside, "d"))).isDirectory()).toBe(true);
+    expect(await treeOf(outside)).toEqual(before);
+  });
+
+  it("still creates missing directories and replaces a link with a directory inside the workspace", async () => {
+    const { target, source, outside } = await workspace();
+    await symlink(outside, path.join(target, "shortcut"));
+    const baseline = await captureDirectorySnapshot(target);
+    await sourceWith(target, source, async (dir) => {
+      await mkdir(path.join(dir, "deep", "er"), { recursive: true });
+      await writeFile(path.join(dir, "deep", "er", "file.txt"), "deep\n");
+      await rm(path.join(dir, "shortcut"));
+      await mkdir(path.join(dir, "shortcut"));
+      await writeFile(path.join(dir, "shortcut", "real.txt"), "now a directory\n");
+    });
+    const before = await treeOf(outside);
+
+    await mergeDirectoryWithBaseline({ baseline, sourceDir: source, targetDir: target });
+
+    expect(await readFile(path.join(target, "deep", "er", "file.txt"), "utf8")).toBe("deep\n");
+    expect(await readFile(path.join(target, "shortcut", "real.txt"), "utf8")).toBe("now a directory\n");
+    expect((await lstat(path.join(target, "shortcut"))).isDirectory()).toBe(true);
+    expect(await treeOf(outside)).toEqual(before);
+  });
+});
