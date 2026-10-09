@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import type { Goal } from "@paperclipai/shared";
+import type { CompanyFocus, Goal } from "@paperclipai/shared";
 import { createGoalSchema, updateGoalSchema } from "@paperclipai/shared";
 import {
   addCommonClientOptions,
@@ -15,7 +15,14 @@ interface GoalListOptions extends BaseClientOptions {
   companyId?: string;
 }
 
-interface GoalCreateOptions extends BaseClientOptions {
+interface GoalPlanningOptions {
+  kind?: string;
+  horizon?: string;
+  targetDate?: string;
+  successCriteria?: string;
+}
+
+interface GoalCreateOptions extends BaseClientOptions, GoalPlanningOptions {
   companyId?: string;
   title: string;
   description?: string;
@@ -25,7 +32,7 @@ interface GoalCreateOptions extends BaseClientOptions {
   ownerAgentId?: string;
 }
 
-interface GoalUpdateOptions extends BaseClientOptions {
+interface GoalUpdateOptions extends BaseClientOptions, GoalPlanningOptions {
   title?: string;
   description?: string;
   level?: string;
@@ -96,12 +103,16 @@ export function registerGoalCommands(program: Command): void {
       .command("create")
       .description("Create a goal")
       .requiredOption("-C, --company-id <id>", "Company ID")
-      .requiredOption("--title <title>", "Goal title")
+      .requiredOption("--title <title>", "Goal title, at most 280 characters")
       .option("--description <text>", "Goal description")
       .option("--level <level>", "Goal level")
       .option("--status <status>", "Goal status")
       .option("--parent-id <id>", "Parent goal ID")
       .option("--owner-agent-id <id>", "Owner agent ID")
+      .option("--kind <kind>", "goal or milestone; board only")
+      .option("--horizon <horizon>", "short, medium or long; short term goals are the company focus; board only")
+      .option("--target-date <YYYY-MM-DD>", "Target date; board only")
+      .option("--success-criteria <text>", "How to tell the goal is reached, at most 280 characters; board only")
       .action(async (opts: GoalCreateOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
@@ -112,6 +123,10 @@ export function registerGoalCommands(program: Command): void {
             status: opts.status,
             parentId: parseNullableString(opts.parentId),
             ownerAgentId: parseNullableString(opts.ownerAgentId),
+            kind: opts.kind,
+            horizon: parseNullableString(opts.horizon),
+            targetDate: parseNullableString(opts.targetDate),
+            successCriteria: parseNullableString(opts.successCriteria),
           });
           const created = await ctx.api.post<Goal>(apiPath`/api/companies/${ctx.companyId}/goals`, payload);
           printOutput(created, { json: ctx.json });
@@ -125,14 +140,18 @@ export function registerGoalCommands(program: Command): void {
   addCommonClientOptions(
     goal
       .command("update")
-      .description("Update a goal")
+      .description("Update a goal. Only the board can change a short term goal or a milestone")
       .argument("<goalId>", "Goal ID")
-      .option("--title <title>", "Goal title")
+      .option("--title <title>", "Goal title, at most 280 characters")
       .option("--description <text|null>", "Goal description")
       .option("--level <level>", "Goal level")
       .option("--status <status>", "Goal status")
       .option("--parent-id <id|null>", "Parent goal ID")
       .option("--owner-agent-id <id|null>", "Owner agent ID")
+      .option("--kind <kind>", "goal or milestone; board only")
+      .option("--horizon <horizon|null>", "short, medium or long; short term goals are the company focus; board only")
+      .option("--target-date <YYYY-MM-DD|null>", "Target date; board only")
+      .option("--success-criteria <text|null>", "How to tell the goal is reached, at most 280 characters; board only")
       .action(async (goalId: string, opts: GoalUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
@@ -143,6 +162,10 @@ export function registerGoalCommands(program: Command): void {
             status: opts.status,
             parentId: parseNullableString(opts.parentId),
             ownerAgentId: parseNullableString(opts.ownerAgentId),
+            kind: opts.kind,
+            horizon: parseNullableString(opts.horizon),
+            targetDate: parseNullableString(opts.targetDate),
+            successCriteria: parseNullableString(opts.successCriteria),
           });
           const updated = await ctx.api.patch<Goal>(apiPath`/api/goals/${goalId}`, payload);
           printOutput(updated, { json: ctx.json });
@@ -154,8 +177,26 @@ export function registerGoalCommands(program: Command): void {
 
   addCommonClientOptions(
     goal
+      .command("focus")
+      .description("Show the company focus: active short term goals, their progress and milestones")
+      .option("-C, --company-id <id>", "Company ID")
+      .action(async (opts: GoalListOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const focus = await ctx.api.get<CompanyFocus>(apiPath`/api/companies/${ctx.companyId}/goals/focus`);
+          if (ctx.json || !focus) printOutput(focus, { json: ctx.json });
+          else printFocus(focus);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    goal
       .command("delete")
-      .description("Delete a goal")
+      .description("Delete a goal. Only the board can delete a short term goal or a milestone")
       .argument("<goalId>", "Goal ID")
       .option("--yes", "Confirm deletion")
       .action(async (goalId: string, opts: GoalDeleteOptions) => {
@@ -169,6 +210,30 @@ export function registerGoalCommands(program: Command): void {
         }
       }),
   );
+}
+
+function describeDue(daysLeft: number | null): string {
+  if (daysLeft === null) return "no date";
+  if (daysLeft === 0) return "due today";
+  const days = Math.abs(daysLeft);
+  const unit = days === 1 ? "day" : "days";
+  return daysLeft > 0 ? `${days} ${unit} left` : `${days} ${unit} overdue`;
+}
+
+function printFocus(focus: CompanyFocus): void {
+  if (focus.goals.length === 0) {
+    console.log("No company focus. Give an active goal the short horizon to set one.");
+    return;
+  }
+  for (const item of focus.goals) {
+    console.log(`${item.title}  (${item.progress.done}/${item.progress.total} done, ${describeDue(item.daysLeft)})  ${item.id}`);
+    if (item.successCriteria) console.log(`  Target: ${item.successCriteria}`);
+    for (const milestone of item.milestones) {
+      console.log(`  - ${milestone.title}  (${milestone.progress.done}/${milestone.progress.total} done, ${describeDue(milestone.daysLeft)})`);
+    }
+  }
+  console.log("");
+  console.log(focus.guidance);
 }
 
 function parseNullableString(value: string | undefined): string | null | undefined {

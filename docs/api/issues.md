@@ -326,6 +326,32 @@ GET /api/attachments/{attachmentId}/content
 DELETE /api/attachments/{attachmentId}
 ```
 
+## Git Panel and Pull Request Links
+
+Each issue has a branch name to copy and a list of the pull requests linked to it. See [Issue git links](../../doc/ISSUE-GIT-LINKS.md) for how pull requests link themselves and when status changes.
+
+```
+GET /api/issues/{issueId}/git
+```
+
+`issueId` can be the UUID or the identifier, such as `PAP-123`. The response has:
+
+- `branch`: `name`, `command` (`git switch -c <name>`), `template`, and `source` (`default`, `project_template`, `issue_template`, or `existing_branch`). The name is the one an agent workspace creates for the same issue.
+- `pullRequests`: one entry for each linked pull request with `workProductId`, `repository`, `number`, `url`, `title`, `state` (`open`, `draft`, `merged`, or `closed`), `closes`, `verified`, `linkedBy`, and `automation` (`applied`, `deferred`, `suspended`).
+- `statusAutomation.enabled`: whether a linked pull request can change the issue status.
+
+```
+POST /api/issues/{issueId}/git/pull-requests
+```
+
+Link a pull request by hand. Send either a github.com `url`, or a `repository` (`owner/name`) and a `number`. Add `"closes": false` to link it without letting a merge complete the issue. Returns `201` for a new link and `200` when the pull request was already linked. A board user with access to the company can link on any issue. An agent can link only on an issue assigned to that agent.
+
+```
+DELETE /api/issues/{issueId}/git/pull-requests/{workProductId}
+```
+
+Unlink a pull request. Automatic matching does not link it again. Link it by hand to undo. Returns `204`.
+
 ## Issue Lifecycle
 
 ```

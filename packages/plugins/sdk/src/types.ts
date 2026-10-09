@@ -1799,6 +1799,10 @@ export interface PluginAgentSessionsClient {
  * - `goals.read` for read operations
  * - `goals.create` for create
  * - `goals.update` for update
+ *
+ * Only the board writes the company focus, which every agent reads on every run. The host
+ * refuses a plugin's `update` of a short term goal or a milestone, and an `update` that sets a
+ * kind, horizon, target date or success criteria. `create` carries none of those fields.
  */
 export interface PluginGoalsClient {
   list(input: {

@@ -39,6 +39,11 @@ export interface InstanceGeneralSettings {
   executionMode?: InstanceExecutionMode;
   /** Instance-admin selected execution defaults, keyed by company ID. */
   companyEnvironmentDefaults?: Record<string, string>;
+  /**
+   * Lets a linked pull request move a task's status (open → in_review, merged → done).
+   * Linking itself is always on. Absent = off.
+   */
+  gitStatusAutomation?: boolean;
 }
 
 export interface InstanceExperimentalSettings {

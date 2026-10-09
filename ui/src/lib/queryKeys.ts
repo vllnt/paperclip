@@ -394,6 +394,7 @@ export const queryKeys = {
       ["issues", "runner-goal", issueId, agentId ?? "__effective__"] as const,
     workProducts: (issueId: string) =>
       ["issues", "work-products", issueId] as const,
+    git: (issueId: string) => ["issues", "git", issueId] as const,
     fileResources: (
       issueId: string,
       options: {
@@ -555,6 +556,9 @@ export const queryKeys = {
   goals: {
     list: (companyId: string) => ["goals", companyId] as const,
     detail: (id: string) => ["goals", "detail", id] as const,
+    /** Under the list key, so invalidating the list refreshes focus and progress too. */
+    focus: (companyId: string) => ["goals", companyId, "focus"] as const,
+    progress: (companyId: string) => ["goals", companyId, "progress"] as const,
   },
   artifacts: {
     list: (

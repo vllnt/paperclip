@@ -59,6 +59,7 @@ import {
   checkoutIssueSchema,
   linkIssueApprovalSchema,
   createIssueWorkProductSchema,
+  linkIssuePullRequestSchema,
   updateIssueWorkProductSchema,
   upsertIssueDocumentSchema,
   restoreIssueDocumentRevisionSchema,
@@ -1580,6 +1581,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
 
 const CREATED_OPERATIONS = new Set([
   "POST /api/adapters/install",
+  "POST /api/issues/{id}/git/pull-requests",
   "POST /api/chat-endpoints/{endpointId}/setup-secret",
   "POST /api/companies/{companyId}/agent-hires",
   "POST /api/companies/{companyId}/agents",
@@ -4184,6 +4186,48 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/git",
+  tags: ["issues"],
+  summary: "Get an issue's branch name to copy and its linked pull requests",
+  description:
+    "The branch name is the one the agent workspace would create for this issue. Pull requests link themselves by branch name, " +
+    "closing words in the title or body, or an agent's execution workspace; each carries how it was linked and what status automation did.",
+  request: { params: z.object({ id: z.string().describe("Issue UUID or identifier such as PAP-123") }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/git/pull-requests",
+  tags: ["issues"],
+  summary: "Link a GitHub pull request to an issue",
+  description:
+    "Give a github.com pull request URL, or a repository and number. Returns 201 for a new link and 200 when the pull request was " +
+    "already linked. Agents may link only on issues assigned to them.",
+  request: {
+    params: z.object({ id: z.string().describe("Issue UUID or identifier such as PAP-123") }),
+    body: jsonBody(linkIssuePullRequestSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/issues/{id}/git/pull-requests/{workProductId}",
+  tags: ["issues"],
+  summary: "Unlink a pull request from an issue",
+  description: "Automatic matching does not re-add an unlinked pull request; link it again by hand to undo.",
+  request: {
+    params: z.object({
+      id: z.string().describe("Issue UUID or identifier such as PAP-123"),
+      workProductId: z.string().describe("The pull request's workProductId from the git view"),
+    }),
+  },
+  responses: { 204: r.noContent, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}/documents",
   tags: ["issues"],
   summary: "List issue documents",
@@ -4839,11 +4883,37 @@ registry.registerPath({
   path: "/api/companies/{companyId}/goals",
   tags: ["goals"],
   summary: "Create a goal",
+  description:
+    "Only the board may set `kind`, `horizon`, `targetDate` or `successCriteria`, or change or delete a short term goal or a " +
+    "milestone, because the company focus shows them to every agent. Anyone else gets 403.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createGoalSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/goals/focus",
+  tags: ["goals"],
+  summary: "Get the company's current focus",
+  description:
+    "Active short-horizon goals, nearest target date first, with progress and open milestones. Agents read this to choose what to " +
+    "work on; it also appears as `companyFocus` in an issue's heartbeat context.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/goals/progress",
+  tags: ["goals"],
+  summary: "Get progress for every goal in a company",
+  description:
+    "Keyed by goal ID. Counts tasks linked to the goal or any goal below it; cancelled, hidden and conversation tasks do not count.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -4860,11 +4930,14 @@ registry.registerPath({
   path: "/api/goals/{id}",
   tags: ["goals"],
   summary: "Update a goal",
+  description:
+    "Only the board may set `kind`, `horizon`, `targetDate` or `successCriteria`, or change or delete a short term goal or a " +
+    "milestone, because the company focus shows them to every agent. Anyone else gets 403.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateGoalSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
 registry.registerPath({
@@ -4872,8 +4945,9 @@ registry.registerPath({
   path: "/api/goals/{id}",
   tags: ["goals"],
   summary: "Delete a goal",
+  description: "Only the board may delete a short term goal or a milestone. Anyone else gets 403.",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 // ─── Secrets ─────────────────────────────────────────────────────────────────

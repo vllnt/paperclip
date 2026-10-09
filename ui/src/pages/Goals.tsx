@@ -6,6 +6,7 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { GoalTree } from "../components/GoalTree";
+import { GoalFocusPanel } from "../components/GoalFocusPanel";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,17 @@ export function Goals() {
   const { data: goals, isLoading, error } = useQuery({
     queryKey: queryKeys.goals.list(selectedCompanyId!),
     queryFn: () => goalsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+
+  const { data: focus } = useQuery({
+    queryKey: queryKeys.goals.focus(selectedCompanyId!),
+    queryFn: () => goalsApi.focus(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+  const { data: progress } = useQuery({
+    queryKey: queryKeys.goals.progress(selectedCompanyId!),
+    queryFn: () => goalsApi.progress(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
 
@@ -55,7 +67,8 @@ export function Goals() {
               New Goal
             </Button>
           </div>
-          <GoalTree goals={goals} goalLink={(goal) => `/goals/${goal.id}`} />
+          {focus ? <GoalFocusPanel focus={focus} /> : null}
+          <GoalTree goals={goals} goalLink={(goal) => `/goals/${goal.id}`} progress={progress} />
         </>
       )}
     </div>

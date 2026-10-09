@@ -31,6 +31,8 @@ interface InlineEditorProps {
   defaultEditing?: boolean;
   /** Notified when the multiline editor swaps between display and edit mode. */
   onEditingChange?: (editing: boolean) => void;
+  /** Longest value the single-line editor accepts, in UTF-16 code units. */
+  maxLength?: number;
 }
 
 /** Shared padding so display and edit modes occupy the exact same box. */
@@ -70,6 +72,7 @@ export function InlineEditor({
   externalReferences,
   defaultEditing = false,
   onEditingChange,
+  maxLength,
 }: InlineEditorProps) {
   const [editing, setEditing] = useState(false);
   const [multilineEditing, setMultilineEditing] = useState(multiline && defaultEditing);
@@ -393,6 +396,7 @@ export function InlineEditor({
         ref={inputRef}
         value={draft}
         rows={1}
+        maxLength={maxLength}
         onChange={(e) => {
           setDraft(e.target.value);
           autoSize(e.target);

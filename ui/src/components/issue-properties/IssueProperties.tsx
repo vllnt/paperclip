@@ -95,6 +95,7 @@ import {
   type WorkspaceRuntimeControlRequest,
 } from "../WorkspaceRuntimeControls";
 import { ExternalObjectRows } from "./external-object-rows";
+import { IssueGitSection } from "./IssueGitSection";
 import {
   asRecord,
   compactRecord,
@@ -2591,6 +2592,8 @@ export function IssueProperties({
           onRetryExternalObjects={onRetryExternalObjects}
         />
       </PropertySection>
+
+      <IssueGitSection issueId={issue.id} streamlined={streamlinedPropertiesEnabled} />
 
       <TaskLinksSidebar issue={issue} />
 

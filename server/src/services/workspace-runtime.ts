@@ -762,7 +762,7 @@ function sanitizeSlugPart(value: string | null | undefined, fallback: string): s
   return normalized.length > 0 ? normalized : fallback;
 }
 
-function renderWorkspaceTemplate(template: string, input: {
+export function renderWorkspaceTemplate(template: string, input: {
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
   projectId: string | null;
@@ -790,13 +790,41 @@ function renderWorkspaceTemplate(template: string, input: {
   });
 }
 
-function sanitizeBranchName(value: string): string {
+const MAX_BRANCH_NAME_LENGTH = 120;
+
+/** One path component git accepts: no leading dot, no trailing dot or `.lock`. */
+function gitSafeRefComponent(component: string): string {
+  let current = component.replace(/^\.+/, "");
+  for (;;) {
+    const next = current.replace(/\.lock$/, "").replace(/\.+$/, "");
+    if (next === current) return current;
+    current = next;
+  }
+}
+
+function gitSafeRefPath(value: string): string {
   return value
-    .trim()
-    .replace(/[^A-Za-z0-9._/-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^[-/.]+|[-/.]+$/g, "")
-    .slice(0, 120) || "paperclip-work";
+    .split("/")
+    .map(gitSafeRefComponent)
+    .filter((component) => component.length > 0)
+    .join("/")
+    .replace(/^[-/.]+|[-/.]+$/g, "");
+}
+
+/**
+ * Turns any text into a branch name `git check-ref-format --branch` accepts, at most 120
+ * characters. A name that is already valid and short enough comes back unchanged.
+ */
+export function sanitizeBranchName(value: string): string {
+  const cleaned = gitSafeRefPath(
+    value
+      .trim()
+      .replace(/[^A-Za-z0-9._/-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/\.{2,}/g, ".")
+      .replace(/\/+/g, "/"),
+  );
+  return gitSafeRefPath(cleaned.slice(0, MAX_BRANCH_NAME_LENGTH)) || "paperclip-work";
 }
 
 function isAbsolutePath(value: string) {

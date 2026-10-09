@@ -198,8 +198,16 @@ Invariant: plaintext key shown once at creation; only hash stored.
 - `parent_id` uuid fk `goals.id` null
 - `owner_agent_id` uuid fk `agents.id` null
 - `status` enum: `planned | active | achieved | cancelled`
+- `kind` enum: `goal | milestone`, default `goal` (a milestone is a dated checkpoint toward its parent goal)
+- `horizon` enum: `short | medium | long`, null
+- `target_date` date null
+- `success_criteria` text null
 
 Invariant: at least one root `company` level goal per company.
+
+Invariant: a goal's parent and owner belong to the goal's company, and a parent is never the goal itself or a goal below it.
+
+Company focus: active goals with the `short` horizon are the company's current focus. Agents receive it as `companyFocus` in the heartbeat context, and their inbox lists tasks under a focus goal first. Only the board writes the focus; with no focus, or when it cannot be read within 500 ms, the context and inbox are unchanged. See `doc/GOALS.md`.
 
 ## 7.5 `projects`
 

@@ -1,3 +1,4 @@
+import { capGoalTextForAgents, heartbeatContextGoal, readCompanyFocusForIssue } from "../services/goal-focus.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -7589,10 +7590,15 @@ export function issueRoutes(
     const directGoalPromise = issue.goalId
       ? goalsSvc.getById(issue.goalId)
       : Promise.resolve(null);
-    const [project, directGoal] = await Promise.all([
+    // A stored id can point into another company; treat such a row as absent.
+    const inIssueCompany = <T extends { companyId: string }>(row: T | null | undefined): T | null =>
+      row && row.companyId === issue.companyId ? row : null;
+    const [storedProject, storedGoal] = await Promise.all([
       projectPromise,
       directGoalPromise,
     ]);
+    const project = inIssueCompany(storedProject);
+    const directGoal = inIssueCompany(storedGoal);
 
     if (directGoal) {
       return { project, goal: directGoal };
@@ -7600,7 +7606,7 @@ export function issueRoutes(
 
     const projectGoalId = project?.goalId ?? project?.goalIds[0] ?? null;
     if (projectGoalId) {
-      const projectGoal = await goalsSvc.getById(projectGoalId);
+      const projectGoal = inIssueCompany(await goalsSvc.getById(projectGoalId));
       return { project, goal: projectGoal };
     }
 
@@ -8545,6 +8551,7 @@ export function issueRoutes(
       continuationSummary,
       currentExecutionWorkspace,
       activeRecoveryAction,
+      companyFocus,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -8565,6 +8572,7 @@ export function issueRoutes(
       ),
       currentExecutionWorkspacePromise,
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      readCompanyFocusForIssue(db, issue.companyId, issue.goalId),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -8650,15 +8658,8 @@ export function issueRoutes(
             targetDate: project.targetDate,
           }
         : null,
-      goal: goal
-        ? {
-            id: goal.id,
-            title: goal.title,
-            status: goal.status,
-            level: goal.level,
-            parentId: goal.parentId,
-          }
-        : null,
+      goal: goal ? heartbeatContextGoal(goal) : null,
+      ...(companyFocus ? { companyFocus } : {}),
       commentCursor,
       wakeComment: safeWakeComment,
       attachments: attachments.map((a) => ({
@@ -8913,12 +8914,17 @@ export function issueRoutes(
     );
     // Recovery revalidation may change the blocker; read it afterwards.
     const executionBlocker = await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id));
+    // An agent reads every goal title here cut like its heartbeat context; the board reads them as stored.
+    const agentReader = req.actor.type === "agent";
+    const goalText = <T extends { title: string; successCriteria?: string | null }>(row: T): T =>
+      agentReader ? capGoalTextForAgents(row) : row;
+    const issueProject = compactIssueProject(project);
     res.setHeader("Server-Timing", timing.header());
     res.json({
       ...issue,
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
-      ancestors,
+      ancestors: ancestors.map((ancestor) => (ancestor.goal ? { ...ancestor, goal: goalText(ancestor.goal) } : ancestor)),
       ...(blockerAttention ? { blockerAttention } : {}),
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
@@ -8932,9 +8938,9 @@ export function issueRoutes(
         (item) => item.issue.identifier ?? item.issue.id,
       ),
       ...documentPayload,
-      project: compactIssueProject(project),
-      goal: goal ?? null,
-      mentionedProjects,
+      project: issueProject ? { ...issueProject, goals: issueProject.goals.map(goalText) } : null,
+      goal: goal ? goalText(goal) : null,
+      mentionedProjects: mentionedProjects.map((mentioned) => ({ ...mentioned, goals: mentioned.goals.map(goalText) })),
       currentExecutionWorkspace: compactIssueExecutionWorkspace(
         currentExecutionWorkspace,
       ),

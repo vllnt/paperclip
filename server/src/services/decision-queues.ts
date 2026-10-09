@@ -1,3 +1,4 @@
+import { linkedWorkProductCondition } from "./work-product-visibility.js";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -691,6 +692,7 @@ export function decisionQueueService(db: Db) {
         .where(and(
           eq(issueWorkProducts.companyId, companyId),
           eq(issueWorkProducts.type, "pull_request"),
+          linkedWorkProductCondition(),
           inArray(issueWorkProducts.issueId, issueIds),
         )).then((rows) => rows.map((row) => row.issueId)));
 

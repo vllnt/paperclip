@@ -565,6 +565,20 @@ export type GoalLevel = (typeof GOAL_LEVELS)[number];
 export const GOAL_STATUSES = ["planned", "active", "achieved", "cancelled"] as const;
 export type GoalStatus = (typeof GOAL_STATUSES)[number];
 
+/** A goal is an outcome; a milestone is a dated checkpoint toward a parent goal. */
+export const GOAL_KINDS = ["goal", "milestone"] as const;
+export type GoalKind = (typeof GOAL_KINDS)[number];
+
+/** When a goal matters: short term goals are the company's current focus. */
+export const GOAL_HORIZONS = ["short", "medium", "long"] as const;
+export type GoalHorizon = (typeof GOAL_HORIZONS)[number];
+
+/** Shown to agents beside the company focus so every run applies it the same way. */
+export const COMPANY_FOCUS_GUIDANCE =
+  "These short term goals are the company's current focus. Pick work that serves them before other work. " +
+  "Within them, finish and land work that is already in review before you start new work. " +
+  "If the focus needs more agents, runs or budget, ask the board with an approval; do not change your own limits.";
+
 export const PROJECT_STATUSES = [
   "backlog",
   "planned",

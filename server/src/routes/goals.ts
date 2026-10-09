@@ -1,34 +1,54 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import { createGoalSchema, updateGoalSchema } from "@paperclipai/shared";
 import { trackGoalCreated } from "@paperclipai/shared/telemetry";
-import { validate } from "../middleware/validate.js";
+import { validateGoalBody } from "../middleware/validate.js";
 import { goalService, logActivity } from "../services/index.js";
+import type { GoalWriter } from "../services/goals.js";
+import { capGoalTextForAgents, goalFocusService } from "../services/goal-focus.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { getTelemetryClient } from "../telemetry.js";
+
+/** Board users write every goal field; anyone else is held to the company focus rule in the goal service. */
+function goalWriter(req: Request): GoalWriter {
+  return req.actor.type === "board" ? "board" : "agent";
+}
 
 export function goalRoutes(db: Db) {
   const router = Router();
   const svc = goalService(db);
+  const focus = goalFocusService(db);
 
   router.get("/companies/:companyId/goals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const result = await svc.list(companyId);
-    res.json(result);
+    res.json(req.actor.type === "agent" ? result.map(capGoalTextForAgents) : result);
+  });
+
+  router.get("/companies/:companyId/goals/focus", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    res.json(await focus.getFocus(companyId));
+  });
+
+  router.get("/companies/:companyId/goals/progress", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    res.json(await focus.getProgress(companyId));
   });
 
   router.get("/goals/:id", async (req, res) => {
     const id = req.params.id as string;
     const goal = await getAccessibleResource(req, res, svc.getById(id), "Goal not found");
     if (!goal) return;
-    res.json(goal);
+    res.json(req.actor.type === "agent" ? capGoalTextForAgents(goal) : goal);
   });
 
-  router.post("/companies/:companyId/goals", validate(createGoalSchema), async (req, res) => {
+  router.post("/companies/:companyId/goals", validateGoalBody(createGoalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const goal = await svc.create(companyId, req.body);
+    const goal = await svc.create(companyId, req.body, goalWriter(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -47,11 +67,11 @@ export function goalRoutes(db: Db) {
     res.status(201).json(goal);
   });
 
-  router.patch("/goals/:id", validate(updateGoalSchema), async (req, res) => {
+  router.patch("/goals/:id", validateGoalBody(updateGoalSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Goal not found");
     if (!existing) return;
-    const goal = await svc.update(id, req.body);
+    const goal = await svc.update(id, req.body, goalWriter(req));
     if (!goal) {
       res.status(404).json({ error: "Goal not found" });
       return;
@@ -76,7 +96,7 @@ export function goalRoutes(db: Db) {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Goal not found");
     if (!existing) return;
-    const goal = await svc.remove(id);
+    const goal = await svc.remove(id, goalWriter(req));
     if (!goal) {
       res.status(404).json({ error: "Goal not found" });
       return;
