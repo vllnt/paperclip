@@ -205,7 +205,7 @@ describe("classifyGitHubCommand", () => {
     expect(classifyGitHubCommand("git", ["push"], { ...clean, currentBranch: "feat/a" })).toEqual(write("push"));
     expect(classifyGitHubCommand("git", ["push", "origin", "feat/a"], { touchesWorkflows: true })).toEqual(write("push", "editWorkflows"));
     expect(classifyGitHubCommand("git", ["push", "origin", "feat/a"], { touchesWorkflows: null })).toEqual(write("push", "editWorkflows"));
-    expect(classifyGitHubCommand("git", ["push", "origin", "--delete", "feat/a"])).toEqual(write("push"));
+    expect(classifyGitHubCommand("git", ["push", "origin", "--delete", "feat/a"])).toEqual({ ...write("push"), branchRewrites: ["feat/a"] });
   });
 
   it("denies release tags (name@version) and bulk tag pushes whatever the toggles", () => {
@@ -286,7 +286,7 @@ describe("classifyGitHubCommand", () => {
     [["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v1"], write("other", "release")],
     [["api", "repos/o/r/git/refs", "-f", "ref=refs/tags/v1", "-f", "sha=abc"], write("push", "tagPush")],
     [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc"], write("push", "pushToMain")],
-    [["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat"], write("push")],
+    [["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat"], { ...write("push"), branchRewrites: ["feat"] }],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "message=x", "-f", "content=eA=="], write("commit", "pushToMain")],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "branch=docs", "-f", "message=x"], write("commit")],
     [["api", "-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs"], write("commit", "editWorkflows")],
@@ -565,7 +565,7 @@ describe("security review round 2c (attack regressions)", () => {
       expect(classifyGitHubCommand("git", ["clone", ...args]).denied, args.join(" ")).toMatch(/does not know the git clone option/);
     }
     // Clustered flags with a value option last take the next argument, as git does.
-    expect(push("-fo", "ci.skip", "origin", "HEAD:refs/heads/feat")).toEqual(write("push"));
+    expect(push("-fo", "ci.skip", "origin", "HEAD:refs/heads/feat")).toEqual({ ...write("push"), branchRewrites: ["feat"] });
     // -f in the cluster force-pushes: to the default branch, that is an operation agents never perform.
     expect(push("-fo", "ci.skip", "origin", "HEAD:refs/heads/main")).toMatchObject({ ...write("push", "pushToMain"), denied: expect.stringMatching(/^Denied: agents never/), integrity: true });
     expect(gitNetworkArguments("push", ["-fo", "ci.skip", "origin", "main"])).toMatchObject({ positional: ["origin", "main"], flags: new Set(["-f"]) });
@@ -796,7 +796,7 @@ describe("operations agents never perform", () => {
   const graphql = (query: string, ...extra: string[]) => gh("api", "graphql", "-f", `query=${query}`, ...extra);
   const never = (what: RegExp) => expect.objectContaining({ access: "write", denied: expect.stringMatching(new RegExp(`^Denied: agents never ${what.source}`)), integrity: true });
   const repository = /archive, delete, rename, transfer or change the settings of a repository/;
-  const defaultBranch = /delete or force-push a default branch \(main, master\)/;
+  const defaultBranch = /delete or force-push a default or protected branch/;
   const protection = /change branch protection or rulesets/;
   const hooks = /change webhooks/;
   const secrets = /change secrets, variables or deploy keys/;
@@ -821,7 +821,6 @@ describe("operations agents never perform", () => {
     [["secret", "delete", "TOKEN"], secrets],
     [["variable", "set", "NAME", "--body", "x"], secrets],
     [["variable", "delete", "NAME", "--env", "production"], secrets],
-    [["deployment", "delete", "42"], deployments],
     [["repo", "sync", "--force"], defaultBranch],
     [["repo", "sync", "o/fork", "--force", "--branch", "main"], defaultBranch],
     [["repo", "sync", "--force=true", "-bmaster"], defaultBranch],
@@ -1001,7 +1000,8 @@ describe("operations agents never perform", () => {
     expect(gh("repo", "create", "o/new", "--private")).toEqual(write("other"));
     expect(gh("repo", "fork", "o/r")).toEqual(write("other"));
     expect(gh("repo", "sync")).toEqual(write("push", "pushToMain"));
-    expect(gh("repo", "sync", "--branch", "feature", "--force")).toEqual(write("push", "pushToMain"));
+    // A named branch the sync hard-resets is checked against GitHub's default and protected branches by the server.
+    expect(gh("repo", "sync", "--branch", "feature", "--force")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["feature"] });
     expect(gh("repo", "deploy-key", "list")).toEqual(write("other"));
     // Placeholders stay usable where they decide nothing: GraphQL variables, a pull request's head, the repository of a read.
     expect(gh("api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}")).toEqual(read);
@@ -1019,25 +1019,90 @@ describe("operations agents never perform", () => {
     expect(gh("api", "-X", "POST", "repos/o/r/deployments/42/statuses", "-f", "state=success")).toEqual(write("other", "deploymentApproval"));
     expect(gh("api", "-X", "POST", "repos/o/r/actions/runs/77/pending_deployments", "-F", "environment_ids[]=1", "-f", "state=approved")).toEqual(write("other", "deploymentApproval"));
     // Feature branches: deleted, renamed or force-updated through the API; the default branch updated without force.
-    expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/feature/x")).toEqual(write("push"));
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", `sha=${sha}`, "-F", "force=true")).toEqual(write("push"));
-    expect(gh("api", "-X", "POST", "repos/o/r/branches/feature/rename", "-f", "new_name=feature-2")).toEqual(write("other"));
+    expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/feature/x")).toEqual({ ...write("push"), branchRewrites: ["feature/x"] });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", `sha=${sha}`, "-F", "force=true")).toEqual({ ...write("push"), branchRewrites: ["feature"] });
+    expect(gh("api", "-X", "POST", "repos/o/r/branches/feature/rename", "-f", "new_name=feature-2")).toEqual({ ...write("other"), branchRewrites: ["feature"] });
     expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`)).toEqual(write("push", "pushToMain"));
     expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force=false")).toEqual(write("push", "pushToMain"));
     // git push: feature branches pushed, force-pushed (lease or not) and deleted; the default branch pushed without force.
     const git = (args: string[], context: Record<string, unknown> = {}) => classifyGitHubCommand("git", args, { ...clean, ...context });
     expect(git(["push", "-u", "origin", "feature/x"])).toEqual(write("push"));
-    expect(git(["push", "--force-with-lease", "origin", "feature/x"])).toEqual(write("push"));
-    expect(git(["push", "--force-with-lease", "--force-if-includes", "origin", "HEAD"], { currentBranch: "feature/x" })).toEqual(write("push"));
-    expect(git(["push", "-f", "origin", "feature/x"])).toEqual(write("push"));
-    expect(git(["push", "origin", "+feature/x"])).toEqual(write("push"));
-    expect(git(["push", "-f"], { currentBranch: "feature/x" })).toEqual(write("push"));
-    expect(git(["push", "origin", "--delete", "feature/x"])).toEqual(write("push"));
-    expect(git(["push", "origin", ":feature/x"])).toEqual(write("push"));
+    // Forced or deleted feature branches name the branch for the server's protected-branch check.
+    const rewrites = (...branches: string[]) => ({ ...write("push"), branchRewrites: branches });
+    expect(git(["push", "--force-with-lease", "origin", "feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "--force-with-lease", "--force-if-includes", "origin", "HEAD"], { currentBranch: "feature/x" })).toEqual(rewrites("feature/x"));
+    expect(git(["push", "-f", "origin", "feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "origin", "+feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "-f"], { currentBranch: "feature/x" })).toEqual(rewrites("feature/x"));
+    expect(git(["push", "origin", "--delete", "feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "origin", ":feature/x"])).toEqual(rewrites("feature/x"));
     expect(git(["push", "--prune", "origin", "feature/x"])).toEqual(write("push"));
-    expect(git(["push", "origin", "+feature/x", "main"])).toEqual(write("push", "pushToMain"));
+    expect(git(["push", "origin", "+feature/x", "main"])).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["feature/x"] });
     expect(git(["push", "origin", "main"])).toEqual(write("push", "pushToMain"));
     expect(git(["push", "--all", "origin"])).toEqual(write("push", "pushToMain"));
     expect(git(["push", "origin", ":"])).toEqual(write("push", "pushToMain"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security review of PR #23 at 99d6cb10: gh aliases and extensions, and protected branches other than main/master.
+// ---------------------------------------------------------------------------
+describe("security review of the agents-never deny (round 2)", () => {
+  const read = { access: "read", action: null, privileged: [] };
+  const write = (action: string, ...privileged: string[]) => ({ access: "write", action, privileged });
+  const sha = "a".repeat(40);
+  const gh = (...args: string[]) => classifyGitHubCommand("gh", args);
+  const integrity = (pattern: RegExp) => expect.objectContaining({ access: "write", denied: expect.stringMatching(pattern), integrity: true });
+
+  it("M1: never creates a gh alias, and never runs one, an extension or the Copilot CLI with GitHub access", () => {
+    for (const args of [
+      ["alias", "set", "wipe", "repo archive --yes"],
+      ["alias", "set", "--shell", "wipe", "gh repo archive --yes"],
+      ["alias", "set", "--clobber", "x", "api -X DELETE repos/o/r/hooks/1"],
+      ["alias", "import", "aliases.yml"],
+      ["alias", "import", "-"],
+    ]) expect(gh(...args), args.join(" ")).toEqual(integrity(/does not create gh aliases/));
+    for (const args of [["extension", "exec", "wipe"], ["extension", "exec", "wipe", "--yes"], ["copilot"], ["copilot", "-p", "archive this repository"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(integrity(/with GitHub access: it cannot tell what/));
+    }
+    // gh runs an alias or an extension for a name it does not know: refused for every company, whatever its arguments.
+    for (const args of [["wipe"], ["wipe", "--yes"], ["-R", "o/r", "wipe"], ["wipe", "-R", "o/r"], ["deployment", "delete", "42"], ["image", "a.png"], ["Pr", "list"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(integrity(/does not know the gh command/));
+    }
+    // The launcher's own grammar: none of these runs without a managed credential either.
+    for (const args of [["wipe"], ["alias", "set", "x", "y"], ["alias", "import", "a.yml"], ["extension", "exec", "x"], ["copilot"]]) {
+      expect(ghCommandMayWrite(parseGhCommand(args)), args.join(" ")).toBe(true);
+    }
+  });
+
+  it("M1: keeps gh's reads and its own write groups working", () => {
+    for (const args of [["alias", "list"], ["alias", "ls"], ["alias", "delete", "x"], ["alias"], ["extension", "list"], ["extension", "search", "x"],
+      ["extension", "install", "owner/gh-x"], ["co", "12"], ["environment"], ["reference"], ["help", "repo"], ["version"], ["--version"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(read);
+    }
+    for (const args of [["label", "create", "bug"], ["gist", "create", "a.txt"], ["codespace", "list"], ["cache", "delete", "x"], ["discussion", "create"], ["skill", "install", "x"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(write("other"));
+    }
+  });
+
+  it("M2: names every branch a write forces, deletes, renames or hard-resets, so the server checks it with GitHub", () => {
+    const git = (args: string[], context: Record<string, unknown> = {}) => classifyGitHubCommand("git", args, { touchesWorkflows: false, ...context });
+    expect(git(["push", "--force", "origin", "protected"])).toEqual({ ...write("push"), branchRewrites: ["protected"] });
+    expect(git(["push", "origin", "--delete", "protected"])).toEqual({ ...write("push"), branchRewrites: ["protected"] });
+    expect(git(["push", "origin", "+HEAD:develop", ":release/1", "feature"], { currentBranch: "feature" })).toEqual({ ...write("push"), branchRewrites: ["develop", "release/1"] });
+    expect(git(["push", "--force-with-lease=develop:" + sha, "origin", "develop"])).toEqual({ ...write("push"), branchRewrites: ["develop"] });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-f", "force=true")).toEqual({ ...write("push"), branchRewrites: ["develop"] });
+    expect(gh("api", "repos/o/r/git/refs/heads/develop", "-X", "PATCH", "--input", "ref.json")).toEqual({ ...write("push"), branchRewrites: ["develop"] });
+    expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/release%2F1")).toEqual({ ...write("push"), branchRewrites: ["release/1"] });
+    expect(gh("api", "-X", "POST", "repos/o/r/branches/develop/rename", "-f", "new_name=dev")).toEqual({ ...write("other"), branchRewrites: ["develop"] });
+    expect(gh("repo", "sync", "--force", "--branch", "develop")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["develop"] });
+    expect(gh("repo", "sync", "o/fork", "--force", "-bdevelop")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["develop"] });
+    // Plain updates of a branch rewrite nothing: GitHub's own protection applies to them.
+    expect(git(["push", "origin", "develop"])).toEqual(write("push"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`)).toEqual(write("push"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-F", "force=false")).toEqual(write("push"));
+    expect(gh("repo", "sync", "--branch", "develop")).toEqual(write("push", "pushToMain"));
+    // Refused writes carry nothing to check.
+    expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/main")).not.toHaveProperty("branchRewrites");
   });
 });

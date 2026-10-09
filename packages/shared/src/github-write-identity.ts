@@ -484,6 +484,13 @@ export interface GitHubCommandClass {
    * perform (see {@link AGENTS_NEVER}).
    */
   integrity?: true;
+  /**
+   * Branches (names without `refs/heads/`) this write deletes, force-updates,
+   * renames or hard-resets. Only GitHub knows whether one is the repository's
+   * default branch or a protected branch, so the server refuses the write
+   * unless it has read from GitHub that none of them is.
+   */
+  branchRewrites?: string[];
 }
 
 export interface GitHubCommandContext {
@@ -516,15 +523,20 @@ const decodePath = (value: string) => { try { return decodeURIComponent(value); 
  */
 const AGENTS_NEVER = {
   repository: "archive, delete, rename, transfer or change the settings of a repository",
-  defaultBranch: `delete or force-push a default branch (${GITHUB_DEFAULT_BRANCH_NAMES.join(", ")})`,
+  defaultBranch: "delete or force-push a default or protected branch",
   protection: "change branch protection or rulesets",
   hooks: "change webhooks",
   secrets: "change secrets, variables or deploy keys",
   deployments: "delete deployments, change or delete environments, or mark a deployment inactive",
 } as const;
-type AgentsNever = keyof typeof AGENTS_NEVER;
+export type GitHubAgentsNever = keyof typeof AGENTS_NEVER;
+type AgentsNever = GitHubAgentsNever;
+/** The refusal of an operation agents never perform, naming its route. */
+export function gitHubAgentsNeverDenial(what: GitHubAgentsNever, route: string): string {
+  return `Denied: agents never ${AGENTS_NEVER[what]} (${route}). A person must do this on GitHub.`;
+}
 const neverByAgents = (base: GitHubCommandClass, what: AgentsNever, route: string): GitHubCommandClass =>
-  ({ ...base, denied: `Denied: agents never ${AGENTS_NEVER[what]} (${route}). A person must do this on GitHub.`, integrity: true });
+  ({ ...base, denied: gitHubAgentsNeverDenial(what, route), integrity: true });
 /** A branch name that is, or may be, a default branch: gh fills `{branch}` and `:branch` from the checkout. */
 const mayBeDefaultBranch = (name: string) => /\{branch\}|:branch\b/.test(name) || GITHUB_DEFAULT_BRANCH_NAMES.includes(name.replace(/^refs\/heads\//, ""));
 
@@ -834,6 +846,10 @@ function classifyGit(args: readonly string[], context: GitHubCommandContext): Gi
         ? "git push with the checkout's push config, which may force or prune every branch; push branches by name"
         : `git push ${destructive.delete ? "deleting" : "force-pushing"} ${destructive.ref}`);
     }
+    // Any other branch the push forces or deletes may be the default or a protected branch: the server asks GitHub.
+    const rewrites = [...new Set(updates.filter(update => (update.force || update.delete) && update.ref.startsWith("refs/heads/"))
+      .map(update => update.ref.slice("refs/heads/".length)))];
+    if (rewrites.length) result.branchRewrites = rewrites;
     if (tags.includes("refs/tags/*")) return { ...result, denied: BULK_TAG_DENIED };
     if (tags.some(ref => isReleaseTag(ref.slice("refs/tags/".length)))) return { ...result, denied: RELEASE_TAG_DENIED };
     return result;
@@ -1068,17 +1084,39 @@ function restWriteAgentsNever(route: string, method: string, request: GhApiReque
   if (/^deployments\/[^/]+\/statuses$/i.test(rest) && (opaque || field("state").some(entry => entry.value.trim().toLowerCase() === "inactive"))) {
     return neverByAgents(write("other", "deploymentApproval"), "deployments", label("repos/{owner}/{repo}/deployments/{id}/statuses with state inactive"));
   }
-  const rename = /^branches\/(.+)\/rename$/i.exec(rest);
-  if (rename && mayBeDefaultBranch(decodePath(rename[1]!))) return neverByAgents(write("other"), "defaultBranch", label("repos/{owner}/{repo}/branches/{default branch}/rename"));
-  const head = /^git\/refs\/heads\/(.+)$/i.exec(rest);
-  if (head && mayBeDefaultBranch(decodePath(head[1]!))) {
-    if (method === "DELETE") return neverByAgents(write("push", "pushToMain"), "defaultBranch", label("repos/{owner}/{repo}/git/refs/heads/{default branch}"));
-    // An update is forced unless force is absent or exactly false; a value Paperclip cannot read may force it.
-    if (opaque || field("force").some(entry => entry.value !== "false")) {
-      return neverByAgents(write("push", "pushToMain"), "defaultBranch", label("repos/{owner}/{repo}/git/refs/heads/{default branch} with force"));
-    }
+  const change = restBranchRewrite(rest, method, opaque, request);
+  if (change && mayBeDefaultBranch(change.branch)) {
+    return neverByAgents(change.kind === "rename" ? write("other") : write("push", "pushToMain"), "defaultBranch", label(change.kind === "rename"
+      ? "repos/{owner}/{repo}/branches/{default branch}/rename"
+      : `repos/{owner}/{repo}/git/refs/heads/{default branch}${change.kind === "force" ? " with force" : ""}`));
   }
   return null;
+}
+
+/**
+ * The branch a `gh api` REST write deletes, force-updates or renames, if any.
+ * `rest` is the route after `repos/OWNER/REPO/`. A ref update is forced unless
+ * `force` is absent or exactly `false`; a value Paperclip cannot read may force it.
+ */
+function restBranchRewrite(rest: string, method: string, opaque: boolean, request: GhApiRequest): { branch: string; kind: "delete" | "force" | "rename" } | null {
+  const rename = /^branches\/(.+)\/rename$/i.exec(rest);
+  if (rename) return { branch: decodePath(rename[1]!), kind: "rename" };
+  const head = /^git\/refs\/heads\/(.+)$/i.exec(rest);
+  if (!head) return null;
+  if (method === "DELETE") return { branch: decodePath(head[1]!), kind: "delete" };
+  const forced = opaque || request.fields.some(entry => entry.name === "force" && entry.value !== "false");
+  return forced ? { branch: decodePath(head[1]!), kind: "force" } : null;
+}
+
+/** The branch a `gh api` write (already classified, not refused) rewrites, as {@link GitHubCommandClass.branchRewrites}. */
+function ghApiBranchRewrites(request: GhApiRequest, endpoint: GhApiRoute): string[] {
+  const method = request.method ?? (request.fields.length || request.input ? "POST" : "GET");
+  const rest = /^(?:repos\/[^/]+\/[^/]+|repositories\/[^/]+)\/(.+)$/i.exec(endpoint.route ?? "")?.[1];
+  if (method === "GET" || method === "HEAD" || rest === undefined) return [];
+  const opaque = request.input || (request.path ?? "").includes("?")
+    || request.fields.some(entry => entry.typed && (entry.value.startsWith("@") || GH_FILLED_PLACEHOLDER.test(entry.value)));
+  const change = restBranchRewrite(rest, method, opaque, request);
+  return change ? [change.branch] : [];
 }
 
 /** A gh placeholder anywhere in a value, with gh's own pattern (`:branch-x` is filled too). */
@@ -1232,6 +1270,13 @@ export function ghVerbIndex(args: readonly string[]): number {
   return parseGhCommand(args).verbIndex;
 }
 
+/**
+ * gh's own command groups (gh 2.97) that may write; its read-only groups are in
+ * the shared gh grammar. gh runs an alias or an extension for any other name.
+ */
+const GH_WRITE_GROUPS = new Set(["pr", "issue", "release", "workflow", "run", "project", "repo", "secret", "variable", "alias", "extension", "copilot",
+  "codespace", "discussion", "gist", "label", "cache", "gpg-key", "ssh-key", "agent-task", "preview", "skill"]);
+
 /** `gh repo` verbs agents never run: they archive, delete, rename, transfer or change the settings of a repository. */
 const GH_REPO_VERBS_AGENTS_NEVER = new Set(["archive", "unarchive", "delete", "rename", "edit", "transfer"]);
 
@@ -1249,7 +1294,16 @@ function classifyGh(original: readonly string[]): GitHubCommandClass {
   if (command.printsToken) return { ...read(), denied: "Paperclip does not hand GitHub credentials to commands that print them.", integrity: true };
   // Whatever the launcher may run without a managed credential is a read here, so a write is never one it runs that way.
   if (!ghCommandMayWrite(command)) return read();
-  if (group === "api") return ghApiClass(command.api!.request, command.api!.endpoint);
+  if (group === "api") {
+    const result = ghApiClass(command.api!.request, command.api!.endpoint);
+    const rewrites = result.denied ? [] : ghApiBranchRewrites(command.api!.request, command.api!.endpoint);
+    return rewrites.length ? { ...result, branchRewrites: rewrites } : result;
+  }
+  // An alias or an extension can run any gh command or program, and the Copilot CLI any command: Paperclip cannot check them.
+  if (!GH_WRITE_GROUPS.has(group)) {
+    return { ...write("other"), denied: `Denied: Paperclip does not know the gh command ${group.slice(0, 60)}, so it cannot check it: gh aliases and extensions do not run with GitHub access. Run the gh command itself.`, integrity: true };
+  }
+  if (group === "copilot") return { ...write("other"), denied: "Denied: Paperclip does not run the Copilot CLI with GitHub access: it cannot tell what it runs.", integrity: true };
   const verbIndex = command.verbIndex;
   // gh <group> --help prints help and runs nothing.
   if (verbIndex < 0 && args.length === 2 && (args[1] === "-h" || args[1] === "--help")) return read();
@@ -1278,13 +1332,14 @@ function classifyGh(original: readonly string[]): GitHubCommandClass {
       const force = args.some(arg => arg === "--force" || (arg.startsWith("--force=") && !/^--force=(false|f|0)$/i.test(arg)));
       const branchAt = args.findIndex(arg => arg === "-b" || arg === "--branch");
       const branch = branchAt > 0 ? args[branchAt + 1] : args.find(arg => /^(--branch=|-b.)/.test(arg))?.replace(/^(--branch=|-b=?)/, "");
-      return force && (branch === undefined || mayBeDefaultBranch(branch))
-        ? neverByAgents(write("push", "pushToMain"), "defaultBranch", "gh repo sync --force")
-        : write("push", "pushToMain");
+      if (force && (branch === undefined || mayBeDefaultBranch(branch))) return neverByAgents(write("push", "pushToMain"), "defaultBranch", "gh repo sync --force");
+      // A named branch may still be protected: the server asks GitHub.
+      return force ? { ...write("push", "pushToMain"), branchRewrites: [branch!] } : write("push", "pushToMain");
     }
     // Secrets and variables never change through an agent; their list and get verbs are reads.
     case "secret": case "variable": return verb === "ls" ? read() : neverByAgents(write("other"), "secrets", `gh ${group} ${verb}`);
-    case "deployment": return verb === "delete" ? neverByAgents(write("other"), "deployments", "gh deployment delete") : write("other");
+    case "alias": return { ...write("other"), denied: "Denied: Paperclip does not create gh aliases for agents: it cannot tell what an alias runs. Run the gh command itself.", integrity: true };
+    case "extension": return { ...write("other"), denied: "Denied: Paperclip does not run gh extensions with GitHub access: it cannot tell what an extension runs.", integrity: true };
     default: return write("other");
   }
 }

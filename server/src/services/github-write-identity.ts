@@ -22,6 +22,7 @@ import {
   type PaperclipPluginManifestV1,
 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { protectedBranchRefusal } from "./github-protected-branches.js";
 
 /**
  * One managed `git`/`gh` invocation as reported by the token-free launcher.
@@ -235,6 +236,12 @@ export interface ClassifiedGitHubOperation {
   autoMerge?: true;
   /** The command changes an open pull request's base branch (gh pr edit --base, the REST base field). */
   retarget?: true;
+  /**
+   * Branches this write forces, deletes, renames or hard-resets, when only
+   * GitHub's answer on default and protected branches decides it: the write is
+   * refused until that answer is read (resolveGitHubOperationAccess reads it).
+   */
+  branchRewrites?: string[];
 }
 
 /** A reported command Paperclip could not read: it is treated as a write it cannot check. */
@@ -367,6 +374,10 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     const run = /^repos\/[^/]+\/[^/]+\/actions\/(?:runs|jobs)\/(\d{1,20})\//.exec(path);
     if (run && !deployment) target.actionsRunId = run[1];
   }
+  // A branch the write forces, deletes, renames or hard-resets may be GitHub's default or a protected branch.
+  const branchRewrites = !denied && access === "write" && repository !== null && !wiki && command.branchRewrites?.length ? command.branchRewrites : undefined;
+  const branchRefusal = branchRewrites && repository !== null ? protectedBranchRefusal(repository, branchRewrites) : null;
+  if (branchRefusal) refuse(branchRefusal);
   if (pullRequest) target.pullRequest = pullRequest;
   // Only a full commit SHA binds a merge to one head; an abbreviation is dropped (and the merge refused).
   expectedHeadSha = expectedHeadSha?.toLowerCase() ?? null;
@@ -381,6 +392,7 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     ...(merging ? { merge: true as const } : {}),
     ...(autoMerge ? { autoMerge: true as const } : {}),
     ...(retarget ? { retarget: true as const } : {}),
+    ...(branchRewrites ? { branchRewrites } : {}),
     ...(operation.program === "git" && command.action === "commit" ? { signing: true } : {}),
   };
 }

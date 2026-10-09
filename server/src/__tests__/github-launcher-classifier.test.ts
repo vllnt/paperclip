@@ -74,6 +74,12 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
       expect(refused.code, args.join(" ")).toBe(1);
       expect(refused.stderr, args.join(" ")).toContain("Denied: agents never");
     }
+    // An alias or an extension can run any of them, so gh never runs a name it does not know with a token (review M1).
+    for (const args of [["wipe"], ["wipe", "--yes"], ["alias", "set", "wipe", "repo archive --yes"], ["extension", "exec", "wipe"]]) {
+      const refused = await f.gh(args, { GH_REPO: "Anthm-FR/linkzic" });
+      expect(refused.code, args.join(" ")).toBe(1);
+      expect(refused.stderr, args.join(" ")).toContain("GitHub refused this command: Denied: Paperclip does not");
+    }
     expect(await f.calls()).toEqual([]);
   }, 60_000);
 });
