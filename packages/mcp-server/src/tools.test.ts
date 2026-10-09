@@ -414,4 +414,61 @@ describe("paperclip MCP tools", () => {
 
     expect(response.content[0]?.text).toContain("must not contain '..'");
   });
+
+  describe("git tools", () => {
+    it("reads the branch name and linked pull requests of an issue by identifier", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ branch: { name: "PAP-12-fix" }, pullRequests: [] }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await getTool("paperclipGetIssueGit").execute({ issueId: "PAP-12" });
+
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-12/git");
+      expect(init.method).toBe("GET");
+      expect(JSON.stringify(result)).toContain("PAP-12-fix");
+    });
+
+    it("links a pull request by URL and by repository and number", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ pullRequests: [] }, 201));
+      vi.stubGlobal("fetch", fetchMock);
+      const tool = getTool("paperclipLinkPullRequest");
+
+      await tool.execute({ issueId: "PAP-12", url: "https://github.com/acme/app/pull/7" });
+      await tool.execute({ issueId: "PAP-12", repository: "acme/app", number: 7, closes: false });
+
+      const calls = fetchMock.mock.calls as Array<[string, RequestInit]>;
+      expect(String(calls[0]![0])).toBe("http://localhost:3100/api/issues/PAP-12/git/pull-requests");
+      expect(calls[0]![1].method).toBe("POST");
+      expect(JSON.parse(String(calls[0]![1].body))).toEqual({ url: "https://github.com/acme/app/pull/7" });
+      expect(JSON.parse(String(calls[1]![1].body))).toEqual({ repository: "acme/app", number: 7, closes: false });
+      expect((calls[0]![1].headers as Record<string, string>)["X-Paperclip-Run-Id"]).toBe("33333333-3333-3333-3333-333333333333");
+    });
+
+    it("rejects a link request that names neither a URL nor a repository and number, without calling the API", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const tool = getTool("paperclipLinkPullRequest");
+
+      const neither = await tool.execute({ issueId: "PAP-12" });
+      const both = await tool.execute({ issueId: "PAP-12", url: "https://github.com/a/b/pull/1", repository: "a/b", number: 1 });
+      const half = await tool.execute({ issueId: "PAP-12", repository: "a/b" });
+
+      for (const result of [neither, both, half]) expect(result.content[0]!.text).toContain("either a url, or a repository and number");
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("unlinks a pull request", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await getTool("paperclipUnlinkPullRequest").execute({
+        issueId: "PAP-12",
+        workProductId: "77777777-7777-4777-8777-777777777777",
+      });
+
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-12/git/pull-requests/77777777-7777-4777-8777-777777777777");
+      expect(init.method).toBe("DELETE");
+    });
+  });
 });
