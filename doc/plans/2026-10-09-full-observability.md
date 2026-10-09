@@ -52,7 +52,11 @@ with it is the consumer's responsibility; the export carries ids, numbers and en
 - **Not measured: any live data.** The only instance available while writing this is a
   development install: its database holds no runs, agents or issues, and its on-disk run
   logs are tiny (none over 4 KB, none with a usage, compaction or skill marker). Nothing
-  here was measured on a production company. The operator's reports are cited, not reproduced.
+  here was measured on a production company by this document's author. The operator's reports are cited, not reproduced.
+  **Update, 2026-10-09:** the operator ran A5, A7 and the count-only checks of Appendix B on a
+  production company. Their qualitative results are applied below (rows 2, 29, 31 to 33 of
+  section 4, section 5 and section 7.9). Figures and names from that instance stay out of this
+  public repository.
   Appendix A is a set of 12 read-only SQL queries for an operator to run on a real company;
   all 12 were executed against a freshly migrated empty schema to prove they parse and
   every column exists (that proves syntax, not results). **A1, A5 and A7 should run
@@ -116,7 +120,7 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 | # | Candidate | Verdict | Evidence | Proposed source | Slice |
 |---|---|---|---|---|---|
 | 1 | Token classes per run: input, cache-read, cache-write, output, reasoning | **Partial** | `UsageSummary` has input/cached/output only (`adapter-utils/src/types.ts:33-37`). Claude folds cache-write into input (`claude-local/parse.ts:49`); its fallback path drops it (`:111-115`). ACPX folds it too (`acpx-engine/execute.ts:3278-3285`); the split survives only in `result_json.usage` as `cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens` (`:3287-3298`, `:5097`). OpenCode folds reasoning into output (`opencode-local/parse.ts:53-62`). Native normalizer drops reasoning (`native-session-executor.ts:9322-9346`). Claude's raw result event, already in `result_json`, probably holds `cache_creation_input_tokens` (UNVERIFIED, see A6). | Disjoint classes in the record; adapter fields in `result_json.observability`; backfill from `result_json` | 1b-1d |
-| 2 | Token-class semantics comparable across providers | **Missing** | Claude `inputTokens` is `input + cacheCreation` with cache-read separate. Codex `input_tokens` is *believed* to include the cached subset, but the only evidence in the repo is circumstantial (cached was 97.6% of input in the token plan's March data, which that plan itself called session-cumulative; the one fixture is `codex-local/parse.test.ts:22`). **UNVERIFIED.** Cache hit rate computed as `cached/input` is wrong for one provider. | Per-adapter mapping into disjoint classes with fixtures captured from the real CLI | 1b-1c |
+| 2 | Token-class semantics comparable across providers | **Missing** | Claude `inputTokens` is `input + cacheCreation` with cache-read separate. **Measured on a production company (2026-10-09):** OpenAI-family and xAI (grok) streams report the cached count *inside* the input count; Anthropic streams report it *on top*. The adapter label does not predict the shape: a `codex_local` run on an Anthropic model emits Claude stream-json. The mapping therefore keys on stream shape and provider, not on `adapter_type`. Cache hit rate computed as `cached/input` is wrong for the providers that count cached tokens inside input. | Per-provider mapping into disjoint classes. Slice 1a applies it for the providers `openai` and `xai`; those two labels are an assumption until a count-only check lists the distinct provider and model pairs. Fixtures from the real CLIs follow in 1b-1c | 1a / 1b-1c |
 | 3 | Per provider and model per run | **Partial** | One model per `cost_events` row. Claude's per-model `modelUsage` is summed away (`parse.ts:39-55`). Provider hard-coded `anthropic` whatever the base URL (`claude-local/execute.ts:1265`); managed connection attribution sits only in `context_snapshot.aiConnection` (`heartbeat.ts:21889`). | `model` (primary) and `model_count` in 1a; per-model child rows in the Claude PR; provider/biller from the connection | 1a / 1b |
 | 4 | Always-loaded footprint per run, by skill | **Partial** | Character counts only, in the `adapter.invoke` event payload (`heartbeat.ts:23651-23663`). Claude's instruction file (`--append-system-prompt-file`, `execute.ts:873-875`), skills manifest (`:526-533`) and mounted skills (`:549`) are **not measured**. No tokenizer anywhere. | Launch-time manifest (kind, `skillKey@versionId`, chars) plus measured first-turn prompt tokens (needs per-message usage; the Claude parser ignores it, `parse.ts:76-89`) | 1b |
 | 5 | Queue wait vs run time | **Derivable** | `started_at - created_at`; native `heartbeat.queue` span row exists. Nothing stores or aggregates it. | Derived once into the record | 1a |
@@ -143,11 +147,11 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 | 26 | Waste: unproductive runs | **Present** | `liveness_state` (`plan_only`, `empty_response`, `blocked`, ...), `last_useful_action_at`. | Copy to the record | 1a |
 | 27 | Retention | **Missing** | No prune job on any table in scope except DB backup pruning (`backup-lib.ts:123`). | Retention for the new tables from day one; separate follow-up for run events and NDJSON | 1e |
 | 28 | Interventions (changes tied to measured impact) | **Missing** | No concept. `agent_config_revisions`, `company_skill_versions`, `agent_instruction_revisions` exist as raw material. | Derived "changes" view plus impact on read | 6 |
-| 29 | Privacy | **Gap to avoid** | `adapter.invoke` stores the full `prompt` and `context` in the run log (`claude-local/execute.ts:955-962`); no key rule matches `prompt`. Not copied into the new record. Reported, not fixed here (F2). | Allowlist-only builder | all |
+| 29 | Privacy | **Gap to avoid** | `adapter.invoke` stores the full `prompt` and `context` in the run log (`claude-local/execute.ts:955-962`); no key rule matches `prompt`. The operator's check confirmed that production rows hold the prompt and the process environment. Not copied into the new record. Reported, not fixed here (F2). A separate PR extends `redactEnvForLogs` with more env names and value rules (URL user info, PEM blocks). | Allowlist-only builder | all |
 | 30 | Provider-side retry and no-work runs | **Partial** | Deferral cancellations (`workspace_busy`, `ai_connection_busy`, `heartbeat.ts:16423,16474`) are terminal runs that never started provider work; counting them as "failed runs" overstates failure. | `provider_work_started` flag on the record | 1a |
-| 31 | Context fill per turn (how a session's context grows) | **Missing** | The server parser keeps only the final usage (`claude-local/parse.ts:76-89` ignores per-assistant-message `usage`); the UI parser reads result-level usage only (`ui/parse-stdout.ts:125-128`). ACP `usage_update` (`used`, `size`) is shown live (`TaskChatUsageReadout.tsx:11-13`); whether it is persisted is **UNVERIFIED**. Native and Codex events carry cumulative and run-delta spend, not fill (`runnerd-codex-transport.ts:1706-1709`). | Per-adapter pure `parseContextSamples` over the stored NDJSON, on read (7.9) | C1 |
-| 32 | Compaction and truncation events | **Partial** | The runner emits `context.compacted` v1 (`reason`, `sameSession`, `compactionId`) for Codex `thread/compacted` and compaction items, but **`preTokens` and `postTokens` are always `null`** (`provider-events.ts:761-768`, `:1062-1069`), so a native compaction is a marker with no size. Claude's documented `system` / `compact_boundary` (`compact_metadata.trigger`, `pre_tokens`) has no handler anywhere in the repo. | Parse both into the record and timeline: Claude carries `pre_tokens`; native shows the marker only until a protocol change fills the sizes (C5) | C1 |
-| 33 | Model context window | **Partial** | Only ACP `size` is seen. Claude `modelUsage[].contextWindow` is **UNVERIFIED** (no fixture). | Store when reported, else `unknown`; never guess a window | C1 |
+| 31 | Context fill per turn (how a session's context grows) | **Missing** | The server parser keeps only the final usage (`claude-local/parse.ts:76-89` ignores per-assistant-message `usage`); the UI parser reads result-level usage only (`ui/parse-stdout.ts:125-128`). ACP `usage_update` (`used`, `size`) is shown live (`TaskChatUsageReadout.tsx:11-13`); no `usage_update` event appeared in the sampled production logs, so treat it as not persisted until a fixture shows otherwise. Native and Codex events carry cumulative and run-delta spend, not fill (`runnerd-codex-transport.ts:1706-1709`). | Per-adapter pure `parseContextSamples` over the stored NDJSON, on read (7.9) | C1 |
+| 32 | Compaction and truncation events | **Partial** | The runner emits `context.compacted` v1 (`reason`, `sameSession`, `compactionId`) for Codex `thread/compacted` and compaction items, but **`preTokens` and `postTokens` are always `null`** (`provider-events.ts:761-768`, `:1062-1069`), so a native compaction is a marker with no size. Claude's documented `system` / `compact_boundary` (`compact_metadata.trigger`, `pre_tokens`) has no handler anywhere in the repo, and no `compact_boundary` event appeared in the sampled production logs: the parser follows the documented shape and is tested on a hand-written fixture until a real one exists. | Parse both into the record and timeline: Claude carries `pre_tokens`; native shows the marker only until a protocol change fills the sizes (C5) | C1 |
+| 33 | Model context window | **Partial** | Only ACP `size` is seen in code. Claude `modelUsage[].contextWindow` is usually present in the result event of production runs (operator check, 2026-10-09); a run without it reads `unknown`. | Store when reported, else `unknown`; never guess a window | C1 |
 | 34 | Context composition at invoke time | **Partial** | Claude records `promptMetrics` chars (bootstrap, wake, handoff, task context, heartbeat prompt) in `adapter.invoke` (`claude-local/execute.ts:923-961`, `adapter-utils/types.ts:159`). Instructions and skill-listing sizes are not recorded. Instructions are injected only on a fresh Claude session (`execute.ts:931`). | One `contextComposition` key on the existing `adapter.invoke` payload, estimated tokens (7.9) | C1 |
 | 35 | Skill impact on context | **Missing** | Footprint (row 21) lists skills but no token size and no load counts. UI knows a `Skill` tool name (`tool-taxonomy.test.ts:97`); the server does not count it. | Token sizes from the #51 counter; loads counted by the worker | C3 |
 | 36 | System-prompt impact per agent | **Missing** | `agent_instruction_revisions` holds the content; nothing measures it against context or cost. | Baseline budget and share of first-turn context | C2 |
@@ -165,10 +169,14 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
    observed one reused session's counter growing across 3,607 runs. If the CLI is
    cumulative on resume, **Codex token totals are overcounted** for every resumed
    session, on any install that resumes Codex sessions. Appendix A7 answers this directly (about 100% non-decreasing
-   pairs per session means cumulative; about 50% means per-run). Until then the record
-   marks Codex rows `usage_quality='declared'` and panels show a caveat. If A7 shows
-   cumulative, the parser basis is fixed in its own bug-fix PR with a regression test,
-   before any Codex rollup is shown without a caveat (**decision D8**).
+   pairs per session means cumulative; about 50% means per-run).
+   **Resolved by A7 on a production company (2026-10-09): `codex_local` counts are per
+   run.** The declaration holds, so no parser fix is needed (decision D8 is dropped). The
+   record marks `codex_local` rows `measured`. Codex rows from the runner's app-server path
+   and from any other Codex adapter stay `declared`, because only the CLI path was checked.
+   One gap remains: the check could not cover a resume that reuses the same session id. Slice
+   1c adds one guard test for it, and a violation would turn the rows `derived` or `declared`
+   again.
 2. **Claude is `per_run` on its normal path** (final result event, `parse.ts:127`; the
    `modelUsage` fallback, `execute.ts:1113-1117`). On the rare path where neither the
    stream usage nor `modelUsage` parses and it falls back to the top-level `usage`, the
@@ -182,7 +190,10 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 4. **Token classes mean different things per provider** (row 2). The record uses
    disjoint classes: `input` (fresh, uncached), `cache_read`, `cache_write`, `output`;
    `reasoning` is a subset of `output`. Cache hit rate is
-   `cache_read / (input + cache_read + cache_write)`.
+   `cache_read / (input + cache_read + cache_write)`. The deriver applies the rule by
+   provider: for `openai` and `xai` the stored `input` is the reported input minus the cached
+   part. If the cached count is larger than the input, the counts stay as reported and the row
+   is `declared`. Claude `input` still includes cache creation until slice 1b splits it.
 5. **`cost_events` is not a safe base for analytics:** int4 cents (sub-cent rounds to 0),
    finalization-time `occurred_at`, no unique run constraint, heavy per-insert side effects.
    The record carries cost in micro-USD and is reconciled against the ledger, not derived from it.
@@ -392,10 +403,10 @@ marked, and the first step of C1 is to capture real fixtures that settle it.
 
 | Adapter lane | Context fill per turn | Compaction | Window | Status |
 |---|---|---|---|---|
-| `claude_local` | `assistant` events carry `message.usage` (documented `BetaMessage`). One API turn can emit several assistant events that share `message.id`, so dedupe by id. | `system` / `compact_boundary` with `compact_metadata {trigger: manual\|auto, pre_tokens}` (documented) | `modelUsage[].contextWindow` (**UNVERIFIED**) | **UNVERIFIED in this repo**: no fixture, the parser ignores per-message usage, and no local run log holds one |
-| ACPX and ACP lanes | `usage_update` status events: `used`, `size` | none seen | `size` | live in the UI; persistence in the run log **UNVERIFIED** |
+| `claude_local` | `assistant` events carry `message.usage` (documented `BetaMessage`). One API turn can emit several assistant events that share `message.id`, so dedupe by id. | `system` / `compact_boundary` with `compact_metadata {trigger: manual\|auto, pre_tokens}` (documented) | `modelUsage[].contextWindow` (usually present on production runs) | Window confirmed. Per-message usage and `compact_boundary` are documented but **not yet seen** in sampled production logs; the parser ignores per-message usage today, so C1 starts from a captured fixture |
+| ACPX and ACP lanes | `usage_update` status events: `used`, `size` | none seen | `size` | live in the UI; no `usage_update` appeared in sampled production logs, so treat it as not persisted |
 | `paperclip_runner` (native) | spend deltas only (`usage.reported`: `cumulative`, `runDelta`) | `context.compacted` v1: marker with `reason` and `sameSession`; `preTokens` and `postTokens` are always `null` today | not carried | spend and compaction markers available; fill and compaction size are not |
-| `codex_local` CLI | `turn.completed` totals only | none parsed | none | spend only |
+| `codex_local` CLI | `turn.completed` totals only (per run, A7). A run on an Anthropic model streams Claude stream-json and is read by the Claude lane | none parsed | none | spend only |
 | gemini, cursor, opencode, pi, kimi, hermes, openclaw | none per turn | none | none | `none` |
 
 The API returns `availability` (`full` fill and window, `partial` fill without window or
@@ -414,7 +425,7 @@ compaction, `spend_only`, `none`) and a closed-enum `reason`. An unsupported ada
 
 - *Always-on tokens*: the description in the listing (estimate).
 - *On-demand tokens*: the body plus the reference files that were loaded (estimate over the version's files).
-- *Loads*: `Skill` tool calls counted by the worker from the NDJSON through the adapter parser (the tool name exists in the UI taxonomy; the input key is **UNVERIFIED** until fixtures exist).
+- *Loads*: `Skill` tool calls counted by the worker from the NDJSON through the adapter parser (the tool name exists in the UI taxonomy). In sampled production logs a `Skill` tool call appears only inside the escaped JSON of a log line's `chunk` field, so the counter decodes each line's JSON and then the event inside it. The input key is **UNVERIFIED** until a fixture exists.
 - *Runs exposed* and *share*: `share = min(1, always-on tokens / reported first-turn context)`, shown only when the reported value is above zero. When the estimate exceeds the reported value the share is clamped to 1 and the row is flagged `estimate_exceeds_reported`; the panel shows how many runs were flagged, so an over-estimating counter is visible.
 - *Version-change delta*: estimator over consecutive `company_skill_versions`, plus the read-time before/after comparison of 7.6 (equal windows, minimum sample, overlapping changes listed as confounders). It never claims causality.
 
@@ -472,7 +483,7 @@ no run-path change**.
 | **0** | This plan (`docs(observability): ...`) | none | doc |
 | **1a** | **Record + derivation worker:** `run_usage_records` (migration), shared types, cause taxonomy and classifier, async worker with advisory lock, row-derived fields only (tokens and cost from `usage_json`, timings, cause, issue/project/routine, runtime_mode, driver_kind, retry, liveness, `provider_work_started`), backfill and `--rederive` commands, health endpoint with CLI `health`, the keyset read `listUsageRecordsAfter` and the exported `RUN_USAGE_RECORD_EVENTS_CONSUMED_VERSION` constant that the session-warehouse prune guard needs (section 9). Tests: classifier table, worker idempotency and version replace, lookback and settle delay, single-worker lock, two-company isolation, canary. | none | L |
 | **1b** | **Run-path builder + Claude** (CLI and ACP lanes): `buildRunObservability`, cache-write, `modelUsage` child rows, turns and tool counts, first-turn prompt tokens, footprint from `listRuntimeSkillEntries` (`heartbeat.ts:21910`) and `promptMetrics`; Claude result-key fixtures (settles A6). | 1a | M |
-| **1c** | **Codex + Grok** (CLI and ACP lanes): disjoint-class mapping from captured real fixtures; resolution of the Codex usage basis (D8), as its own regression-tested fix if A7 shows cumulative counters | 1a, A7 | M |
+| **1c** | **Codex + Grok** (CLI and ACP lanes): disjoint-class mapping from captured real fixtures; the Codex usage basis is per run (A7), so there is no parser fix (D8 dropped); one guard test for a resume that reuses a session id | 1a, A7 | M |
 | **1d** | **Native (`paperclip_runner`) + ACPX engine, then the remaining adapters** (gemini, cursor, opencode, pi, kimi, hermes, openclaw): `usage.reported` and span rows, per-adapter fixtures, usage-basis audit | 1a | M |
 | **1e** | Retention job for the new tables | 1a | S |
 | **2** | **Query service + API + CLI + parity:** `GET usage`, `failures`, `footprint`; shared authorization guard; OpenAPI; the table-driven parity test (every OpenAPI path under the prefix needs a CLI command and a UI client method; assigned here because `main` has none, and written to coexist with PR #22's matrix); issue-lifecycle reader over `activity_log`; `EXPLAIN` evidence at 5M rows and the rollup decision (D6); price catalog if D3 accepted | 1a | L |
@@ -489,7 +500,7 @@ no run-path change**.
 | **C4** | **Audit token deltas:** `contextDelta` on activity entries and on `GET /changes` rows for instruction, skill-version, skill-sync and model or adapter changes, with the deterministic row-to-revision mapping of 7.9 (adds `revisionId` to the `details` of six writers; additive); Audit hub badge; the CLI prints it. The before/after impact join stays in 6. | C2, C3 (shared estimator helper), #62 | M |
 | **C5 (linked follow-up)** | Codex per-turn context fill (last-turn usage and window in the runner's usage event, schema and validators); Claude `/context` probe if D10 is accepted. | C1, D10, D11 | M |
 
-**Unverified log shapes.** The operator runs A7 and the count-only checks of Appendix B on a production company and sends the results. Until they arrive, slices 1c and C1 do not rely on any log shape that is marked unverified. They build behind the stated assumptions, with tests on fixtures, and each assumption is replaced by the measured shape when the result arrives.
+**Unverified log shapes.** The operator's A7 and Appendix B results arrived on 2026-10-09 (qualitative only; section 7.9 and rows 2, 29 and 31 to 33 of section 4 carry them). Settled: Codex CLI usage is per run, cached tokens sit inside input for OpenAI-family and xAI streams, `contextWindow` is usually present, and the `Skill` call shape. Still unverified: per-message `usage` and `compact_boundary` in Claude streams, the `Skill` input key, ACP `usage_update` persistence, resumes that reuse one Codex session id, and the exact provider and model labels. Slices 1c and C1 do not rely on any of those. They build behind the stated assumptions, with tests on fixtures, and each assumption is replaced by the measured shape when it is checked.
 
 Parity contract per panel (API is the source; CLI and UI are thin):
 
