@@ -34,91 +34,91 @@ function agentActor(req: Request, companyId: string): { agentId: string; runId: 
 /**
  * Browser profile routes. Board users manage profiles and sign in; agents can
  * only run actions on profiles the board allowed them to use. Every route is
- * company scoped and every response is `no-store`.
+ * company scoped and every response is `no-store`. Paths stay literal so the
+ * OpenAPI coverage test can read them.
  * @param db - Database handle.
  * @param service - Injectable for tests.
  */
 export function browserProfileRoutes(db: Db, service: BrowserProfileService = browserProfileService(db)) {
   const router = Router();
-  const base = "/companies/:companyId/browser";
   const companyId = (req: Request) => idSchema.parse(req.params.companyId);
   const profileId = (req: Request) => idSchema.parse(req.params.profileId);
 
-  router.use(base, (_req, res, next) => {
+  router.use("/companies/:companyId/browser", (_req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     next();
   });
 
-  router.get(`${base}/overview`, async (req, res) => {
+  router.get("/companies/:companyId/browser/overview", async (req, res) => {
     boardUserId(req, companyId(req));
     res.json(await service.overview(companyId(req)));
   });
 
-  router.put(`${base}/settings`, async (req, res) => {
+  router.put("/companies/:companyId/browser/settings", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     const { enabled } = companyBrowserSettingsSchema.parse(req.body);
     res.json(await service.setEnabled(companyId(req), enabled, userId));
   });
 
-  router.post(`${base}/profiles`, async (req, res) => {
+  router.post("/companies/:companyId/browser/profiles", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     res.status(201).json(await service.create(companyId(req), createBrowserProfileSchema.parse(req.body), userId));
   });
 
-  router.patch(`${base}/profiles/:profileId`, async (req, res) => {
+  router.patch("/companies/:companyId/browser/profiles/:profileId", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     res.json(await service.update(companyId(req), profileId(req), updateBrowserProfileSchema.parse(req.body), userId));
   });
 
-  router.post(`${base}/profiles/:profileId/suspend`, async (req, res) => {
+  router.post("/companies/:companyId/browser/profiles/:profileId/suspend", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     res.json(await service.setSuspended(companyId(req), profileId(req), true, userId));
   });
 
-  router.post(`${base}/profiles/:profileId/resume`, async (req, res) => {
+  router.post("/companies/:companyId/browser/profiles/:profileId/resume", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     res.json(await service.setSuspended(companyId(req), profileId(req), false, userId));
   });
 
-  router.delete(`${base}/profiles/:profileId`, async (req, res) => {
+  router.delete("/companies/:companyId/browser/profiles/:profileId", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     await service.destroy(companyId(req), profileId(req), userId);
     res.json({ ok: true });
   });
 
-  router.post(`${base}/profiles/:profileId/signin`, async (req, res) => {
+  router.post("/companies/:companyId/browser/profiles/:profileId/signin", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     const { startUrl } = browserSignInStartSchema.parse(req.body ?? {});
     res.json(await service.startSignIn(companyId(req), profileId(req), userId, startUrl));
   });
 
-  router.get(`${base}/profiles/:profileId/signin/state`, async (req, res) => {
+  router.get("/companies/:companyId/browser/profiles/:profileId/signin/state", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     res.json(await service.signInStatus(companyId(req), profileId(req), userId));
   });
 
-  router.get(`${base}/profiles/:profileId/signin/frame`, async (req, res) => {
+  router.get("/companies/:companyId/browser/profiles/:profileId/signin/frame", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     const frame = await service.signInFrame(companyId(req), profileId(req), userId);
     res.type("image/jpeg").send(frame);
   });
 
-  router.post(`${base}/profiles/:profileId/signin/input`, async (req, res) => {
+  router.post("/companies/:companyId/browser/profiles/:profileId/signin/input", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     res.json(await service.signInInput(companyId(req), profileId(req), userId, browserSignInInputSchema.parse(req.body)));
   });
 
-  router.post(`${base}/profiles/:profileId/signin/end`, async (req, res) => {
+  router.post("/companies/:companyId/browser/profiles/:profileId/signin/end", async (req, res) => {
     const userId = boardUserId(req, companyId(req));
     res.json(await service.endSignIn(companyId(req), profileId(req), userId));
   });
 
-  router.get(`${base}/agent-profiles`, async (req, res) => {
+  router.get("/companies/:companyId/browser/agent-profiles", async (req, res) => {
     const actor = agentActor(req, companyId(req));
     res.json(await service.listForAgent(companyId(req), actor.agentId));
   });
 
-  router.post(`${base}/profiles/:profileId/actions`, async (req, res) => {
+  router.post("/companies/:companyId/browser/profiles/:profileId/actions", async (req, res) => {
     const actor = agentActor(req, companyId(req));
     res.json(await service.agentAction(companyId(req), profileId(req), actor, browserAgentActionSchema.parse(req.body)));
   });
