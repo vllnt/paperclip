@@ -285,6 +285,15 @@ describe("round 2: an expiry is a scheduled deletion", () => {
     expect((await expire(f, "feat-open", 24)).data.expiresAt).toBe(NOW + 24 * HOUR);
   });
 
+  it("will not set an earlier deadline than the reaper would on a recently deployed guarded preview that has no expiry yet", async () => {
+    const f = await setup();
+    withExpiry(f, "feat-open", null, { lastDeployTime: NOW - 1 * HOUR });
+    f.github.pulls.push({ number: 12, ref: "feat-open" });
+    // lastDeployTime + 36h is 35h away; 30h is beyond the 24h activity window but earlier than the reaper's own deadline.
+    expect((await expire(f, "feat-open", 30)).error).toMatch(/open pull request #12/i);
+    expect((await expire(f, "feat-open", 35)).data.expiresAt).toBe(NOW + 35 * HOUR);
+  });
+
   it("will not shorten below the deadline the reaper set", async () => {
     const f = await setup();
     withExpiry(f, "feat-open", NOW + 26 * HOUR, { lastDeployTime: NOW - 10 * HOUR });
