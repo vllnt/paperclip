@@ -762,7 +762,7 @@ function sanitizeSlugPart(value: string | null | undefined, fallback: string): s
   return normalized.length > 0 ? normalized : fallback;
 }
 
-function renderWorkspaceTemplate(template: string, input: {
+export function renderWorkspaceTemplate(template: string, input: {
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
   projectId: string | null;
@@ -790,7 +790,7 @@ function renderWorkspaceTemplate(template: string, input: {
   });
 }
 
-function sanitizeBranchName(value: string): string {
+export function sanitizeBranchName(value: string): string {
   return value
     .trim()
     .replace(/[^A-Za-z0-9._/-]+/g, "-")
