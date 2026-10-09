@@ -113,6 +113,22 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
       await page.keyboard.press("Enter");
       await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/projects/`));
 
+      // Arrow keys move the selection between rows; Enter runs the selected row.
+      await openLauncher(page);
+      await page.keyboard.type("launcher");
+      const taskRow = page.getByRole("option", { name: new RegExp(seed.issueTitle) });
+      await expect(taskRow).toBeVisible();
+      const selected = page.locator("[cmdk-item][aria-selected='true']");
+      await expect(selected).toContainText(seed.projectName);
+      await page.keyboard.press("ArrowDown");
+      await expect(selected).toContainText(seed.issueTitle);
+      await page.keyboard.press("ArrowUp");
+      await expect(selected).toContainText(seed.projectName);
+      await page.keyboard.press("ArrowDown");
+      await expect(selected).toContainText(seed.issueTitle);
+      await page.keyboard.press("Enter");
+      await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/issues/${seed.issueIdentifier}`));
+
       // No local match: Enter hands the query to the full search page.
       await openLauncher(page);
       await page.keyboard.type("qqxz nothing");
