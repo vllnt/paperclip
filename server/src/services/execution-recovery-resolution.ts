@@ -379,10 +379,19 @@ export async function markExecutionReconciliation(
     );
 }
 
+/**
+ * Wakes the return owner of every reconciled execution whose continuation is
+ * still pending. The durable sweep calls it unscoped, over all companies. A
+ * request handler passes `scope` so one company's request only delivers the
+ * actions that request created: it must not trigger, or be crowded out by,
+ * another company's pending continuations.
+ */
 export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
+  scope?: { companyId: string; actionIds: readonly string[] },
 ) {
+  if (scope && scope.actionIds.length === 0) return;
   const pending = await db
     .select()
     .from(issueRecoveryActions)
@@ -390,6 +399,12 @@ export async function deliverReconciledExecutions(
       and(
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        ...(scope
+          ? [
+              eq(issueRecoveryActions.companyId, scope.companyId),
+              inArray(issueRecoveryActions.id, [...scope.actionIds]),
+            ]
+          : []),
       ),
     )
     .limit(25);
