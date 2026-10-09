@@ -76,7 +76,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
-  tempSweepMaxAgeHours: number;
+  tempSweepRunGraceMinutes: number;
   tempSweepIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
@@ -291,16 +291,15 @@ export function loadConfig(): Config {
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
       : 7;
-  // The temp sweep removes per-run temp entries that a dead process left in
-  // the OS temp directory once no process has changed them for this many
-  // hours. Values between 0 and 1 use 1; zero, a negative or a non-numeric value
-  // uses 2.
-  const tempSweepMaxAgeHoursEnv = process.env.PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS?.trim();
-  const tempSweepMaxAgeHoursRaw = Number(tempSweepMaxAgeHoursEnv);
-  const tempSweepMaxAgeHours =
-    tempSweepMaxAgeHoursEnv && Number.isFinite(tempSweepMaxAgeHoursRaw) && tempSweepMaxAgeHoursRaw > 0
-      ? Math.max(tempSweepMaxAgeHoursRaw, 1)
-      : 2;
+  // The temp sweep removes a per-run temp entry only after its run finished
+  // this many minutes ago. Values between 0 and 1 use 1; zero, a negative or a
+  // non-numeric value uses 15.
+  const tempSweepRunGraceMinutesEnv = process.env.PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES?.trim();
+  const tempSweepRunGraceMinutesRaw = Number(tempSweepRunGraceMinutesEnv);
+  const tempSweepRunGraceMinutes =
+    tempSweepRunGraceMinutesEnv && Number.isFinite(tempSweepRunGraceMinutesRaw) && tempSweepRunGraceMinutesRaw > 0
+      ? Math.max(tempSweepRunGraceMinutesRaw, 1)
+      : 15;
   // The sweep also runs on this period. 0 sweeps on startup only; other values
   // are kept between 1 and 1440 (one day, well inside the timer limit); a
   // negative or non-numeric value uses 60.
@@ -356,7 +355,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
-    tempSweepMaxAgeHours,
+    tempSweepRunGraceMinutes,
     tempSweepIntervalMinutes,
     serveUi:
       process.env.SERVE_UI !== undefined

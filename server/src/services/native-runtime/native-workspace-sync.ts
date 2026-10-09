@@ -362,29 +362,33 @@ async function persistSnapshotManifests(runId: string, snapshot: NonNullable<Pre
     yield* gitManifests(snapshot.gitSnapshot);
   };
   const copies = new Map<string, string>();
-  for (const manifest of manifests()) {
-    const oldPath = manifest.filePath;
-    const previous = copies.get(oldPath);
-    if (previous) { manifest.filePath = previous; continue; }
-    // A shared reference may already have been updated by the baseline.
-    if (path.dirname(oldPath) === descriptorDirectory(runId)) continue;
-    const temporary = path.join(descriptorDirectory(runId), `manifest.${randomUUID()}.tmp`);
-    try {
-      const sourceStat = await fs.lstat(oldPath);
-      if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("native_workspace_sync_manifest_invalid");
-      assertWorkspaceManifestDiskSpace(descriptorDirectory(runId), sourceStat.size);
-      await fs.copyFile(oldPath, temporary);
-      await fs.chmod(temporary, 0o600);
-      const digest = await manifestFileSha256(temporary);
-      const target = path.join(descriptorDirectory(runId), `manifest.${digest}.sqlite`);
-      await fs.rename(temporary, target);
-      copies.set(oldPath, target);
-      manifest.filePath = target;
-    } finally { await fs.rm(temporary, { force: true }); }
+  try {
+    for (const manifest of manifests()) {
+      const oldPath = manifest.filePath;
+      const previous = copies.get(oldPath);
+      if (previous) { manifest.filePath = previous; continue; }
+      // A shared reference may already have been updated by the baseline.
+      if (path.dirname(oldPath) === descriptorDirectory(runId)) continue;
+      const temporary = path.join(descriptorDirectory(runId), `manifest.${randomUUID()}.tmp`);
+      try {
+        const sourceStat = await fs.lstat(oldPath);
+        if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error("native_workspace_sync_manifest_invalid");
+        assertWorkspaceManifestDiskSpace(descriptorDirectory(runId), sourceStat.size);
+        await fs.copyFile(oldPath, temporary);
+        await fs.chmod(temporary, 0o600);
+        const digest = await manifestFileSha256(temporary);
+        const target = path.join(descriptorDirectory(runId), `manifest.${digest}.sqlite`);
+        await fs.rename(temporary, target);
+        copies.set(oldPath, target);
+        manifest.filePath = target;
+      } finally { await fs.rm(temporary, { force: true }); }
+    }
+  } finally {
+    // Ownership tracks original scratch directories, never the new durable
+    // path. A failed copy fails the run, so remove them on that path too.
+    await disposeDirectorySnapshot(snapshot.baseline);
+    await disposeGitWorkspaceSnapshot(snapshot.gitSnapshot);
   }
-  // Ownership tracks original scratch directories, never the new durable path.
-  await disposeDirectorySnapshot(snapshot.baseline);
-  await disposeGitWorkspaceSnapshot(snapshot.gitSnapshot);
 }
 
 function parseGitSnapshot(

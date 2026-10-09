@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
-import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
+import { createPaperclipTempDir, removePaperclipTempDir, type PaperclipTempPrefix } from "./paperclip-temp.js";
 import {
   createUnrelatedHistoryGraftCommit,
   commitTreeWithSyncIdentity,
@@ -362,7 +362,7 @@ async function resolveCommandPath(command: string): Promise<string | null> {
 
 // The file lives alone in a fresh `0700` directory, created with `mode`.
 async function withTempFile(
-  prefix: string,
+  prefix: PaperclipTempPrefix,
   contents: string,
   mode: number,
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {

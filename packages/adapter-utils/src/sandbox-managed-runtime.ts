@@ -49,7 +49,7 @@ import {
 } from "./sync-operation-schedule.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 import { withWorkspaceRestoreDiagnostics } from "./workspace-restore-diagnostics.js";
-import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
+import { createPaperclipTempDir, removePaperclipTempDir, type PaperclipTempPrefix } from "./paperclip-temp.js";
 
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
@@ -751,7 +751,7 @@ export function sandboxExecutionSessionMatches(saved: unknown, current: SandboxR
   );
 }
 
-async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
+async function withTempDir<T>(prefix: PaperclipTempPrefix, fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await createPaperclipTempDir(prefix);
   try {
     return await fn(dir);

@@ -1,11 +1,9 @@
-import { existsSync, promises as fs } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../config.ts";
 import {
   startPaperclipTempSweeper,
   type PaperclipTempSweepLogRecord,
+  type PaperclipTempSweepTrigger,
 } from "../services/paperclip-temp-sweeper.js";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -15,25 +13,25 @@ describe("temp sweep config parsing", () => {
     vi.unstubAllEnvs();
   });
 
-  it("defaults to a 2 hour age limit and a 60 minute interval", () => {
-    vi.stubEnv("PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS", undefined);
+  it("defaults to a 15 minute run grace and a 60 minute interval", () => {
+    vi.stubEnv("PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES", undefined);
     vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "  ");
-    expect(loadConfig()).toMatchObject({ tempSweepMaxAgeHours: 2, tempSweepIntervalMinutes: 60 });
+    expect(loadConfig()).toMatchObject({ tempSweepRunGraceMinutes: 15, tempSweepIntervalMinutes: 60 });
   });
 
-  it("raises an age limit below 1 hour to 1 hour and keeps an interval of 0", () => {
-    vi.stubEnv("PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS", "0.25");
+  it("raises a run grace below 1 minute to 1 minute and keeps an interval of 0", () => {
+    vi.stubEnv("PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES", "0.25");
     vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "0");
-    expect(loadConfig()).toMatchObject({ tempSweepMaxAgeHours: 1, tempSweepIntervalMinutes: 0 });
+    expect(loadConfig()).toMatchObject({ tempSweepRunGraceMinutes: 1, tempSweepIntervalMinutes: 0 });
   });
 
   it("falls back to the defaults for non-positive or non-numeric values", () => {
-    vi.stubEnv("PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS", "0");
+    vi.stubEnv("PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES", "0");
     vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "-5");
-    expect(loadConfig()).toMatchObject({ tempSweepMaxAgeHours: 2, tempSweepIntervalMinutes: 60 });
-    vi.stubEnv("PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS", "soon");
+    expect(loadConfig()).toMatchObject({ tempSweepRunGraceMinutes: 15, tempSweepIntervalMinutes: 60 });
+    vi.stubEnv("PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES", "soon");
     vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "hourly");
-    expect(loadConfig()).toMatchObject({ tempSweepMaxAgeHours: 2, tempSweepIntervalMinutes: 60 });
+    expect(loadConfig()).toMatchObject({ tempSweepRunGraceMinutes: 15, tempSweepIntervalMinutes: 60 });
   });
 
   it("keeps a nonzero interval between 1 minute and 1 day", () => {
@@ -45,70 +43,82 @@ describe("temp sweep config parsing", () => {
   });
 
   it("reads explicit values", () => {
-    vi.stubEnv("PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS", "6");
+    vi.stubEnv("PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES", "30");
     vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "15");
-    expect(loadConfig()).toMatchObject({ tempSweepMaxAgeHours: 6, tempSweepIntervalMinutes: 15 });
+    expect(loadConfig()).toMatchObject({ tempSweepRunGraceMinutes: 30, tempSweepIntervalMinutes: 15 });
   });
 });
 
 describe("startPaperclipTempSweeper", () => {
-  let tmpDir = "";
   let stop: (() => void) | null = null;
 
-  beforeEach(async () => {
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-temp-sweeper-test-"));
-  });
-
-  afterEach(async () => {
+  afterEach(() => {
     stop?.();
     stop = null;
     vi.useRealTimers();
-    await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
-  async function staleEntry(name: string): Promise<string> {
-    const entry = path.join(tmpDir, name);
-    await fs.mkdir(entry);
-    await fs.writeFile(path.join(entry, "payload"), "1234567890");
-    return entry;
+  function record(trigger: PaperclipTempSweepTrigger): PaperclipTempSweepLogRecord {
+    return { event: "paperclip_tmp_sweep", trigger, runGraceMs: 15 * 60 * 1000, removed: 1, freedBytes: 10, kept: {}, deferred: 0 };
   }
 
-  it("sweeps on startup and every interval, and logs count and bytes freed", async () => {
+  it("sweeps on startup and every interval, and logs each pass", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
-    const first = await staleEntry("paperclip-ssh-sync-back-aaaaaa");
+    const sweep = vi.fn(async (trigger: PaperclipTempSweepTrigger) => record(trigger));
     const records: PaperclipTempSweepLogRecord[] = [];
     const sweeper = startPaperclipTempSweeper({
-      maxAgeMs: 2 * HOUR_MS,
+      sweep,
       intervalMs: HOUR_MS,
-      tmpDir,
-      now: () => Date.now() + 3 * HOUR_MS,
-      log: (record) => records.push(record),
+      log: (entry) => records.push(entry),
       onError: (error) => { throw error; },
     });
     stop = sweeper.stop;
 
     await sweeper.startup;
-    expect(existsSync(first)).toBe(false);
-    expect(records).toEqual([{
-      event: "paperclip_tmp_sweep",
-      trigger: "startup",
-      maxAgeMs: 2 * HOUR_MS,
-      removed: 1,
-      freedBytes: 10,
-      held: 0,
-      recent: 0,
-      failed: 0,
-    }]);
+    expect(records).toEqual([record("startup")]);
 
-    const second = await staleEntry("paperclip-ssh-key-bbbbbb");
     vi.advanceTimersByTime(HOUR_MS);
     await vi.waitFor(() => expect(records).toHaveLength(2));
-    expect(records[1]).toMatchObject({ trigger: "interval", removed: 1, freedBytes: 10 });
-    expect(existsSync(second)).toBe(false);
+    expect(records[1]).toEqual(record("interval"));
 
     sweeper.stop();
-    await staleEntry("paperclip-ssh-key-cccccc");
     vi.advanceTimersByTime(2 * HOUR_MS);
-    expect(records).toHaveLength(2);
+    expect(sweep).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips a tick while a pass runs, logs nothing when another process swept, and reports errors", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    let finish: (value: PaperclipTempSweepLogRecord | null) => void = () => undefined;
+    const sweep = vi.fn(() => new Promise<PaperclipTempSweepLogRecord | null>((resolve) => { finish = resolve; }));
+    const records: PaperclipTempSweepLogRecord[] = [];
+    const errors: unknown[] = [];
+    const sweeper = startPaperclipTempSweeper({
+      sweep,
+      intervalMs: HOUR_MS,
+      log: (entry) => records.push(entry),
+      onError: (error) => errors.push(error),
+    });
+    stop = sweeper.stop;
+
+    vi.advanceTimersByTime(HOUR_MS);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    finish(null);
+    await sweeper.startup;
+    expect(records).toEqual([]);
+
+    sweep.mockImplementationOnce(async () => { throw new Error("database down"); });
+    vi.advanceTimersByTime(HOUR_MS);
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect(records).toEqual([]);
+  });
+
+  it("sweeps only on startup when the interval is 0", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const sweep = vi.fn(async (trigger: PaperclipTempSweepTrigger) => record(trigger));
+    const sweeper = startPaperclipTempSweeper({ sweep, intervalMs: 0, log: () => undefined, onError: () => undefined });
+    stop = sweeper.stop;
+    await sweeper.startup;
+    vi.advanceTimersByTime(24 * HOUR_MS);
+    expect(sweep).toHaveBeenCalledTimes(1);
   });
 });

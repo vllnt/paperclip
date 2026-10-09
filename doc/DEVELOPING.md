@@ -1483,14 +1483,19 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
-- `PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS=<hours>` sets the age at which the temp
-  sweep removes a per-run temp entry (`paperclip-ssh-key-*`,
-  `paperclip-ssh-sync-back-*`, `paperclip-workspace-baseline-*`, and similar)
-  that a dead process left in the OS temp directory. The default is `2`. Values
-  between `0` and `1` use `1`; zero, negative and non-numeric values use the
-  default. The sweep runs on startup, never removes an entry a live run holds,
-  and logs `event: "paperclip_tmp_sweep"` with the count and bytes freed, and the
-  first removal failure (`firstFailure`) when one occurs.
+- `PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES=<minutes>` sets how long after a run
+  finished the temp sweep keeps its per-run temp entries in the OS temp
+  directory (`paperclip-ssh-key-<runId>-*`, `paperclip-ssh-sync-back-<runId>-*`,
+  `paperclip-workspace-baseline-<runId>-*`, and similar). The default is `15`.
+  Values between `0` and `1` use `1`; zero, negative and non-numeric values use
+  the default. The sweep removes an entry only when the database shows its run
+  terminal, finished at least this long ago, with no `active`, `retained` or
+  `pending_cleanup` lease, and not executing. It keeps an entry without a run id
+  (also every entry from before this change), a link, a mount point, and
+  anything it cannot classify. One pass handles at most 200 entries in 30
+  seconds, and only one server process sweeps at a time. It logs
+  `event: "paperclip_tmp_sweep"` with `removed`, `freedBytes`, `deferred`, the
+  kept reasons (`kept`), and the first removal failure (`firstFailure`).
 - `PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES=<minutes>` sets how often the temp sweep
   runs after startup. The default is `60`. A value of `0` sweeps on startup only.
   Other values are kept between `1` and `1440`; negative and non-numeric values

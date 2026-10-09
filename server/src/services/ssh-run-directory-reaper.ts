@@ -16,10 +16,10 @@ import { logActivity } from "./activity-log.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 import { environmentService } from "./environments.js";
 
-const TERMINAL_RUN_STATUSES: readonly string[] = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"];
+export const TERMINAL_RUN_STATUSES: readonly string[] = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"];
 const REAPABLE_LEASE_STATUSES = ["released", "expired", "failed"] as const;
 // A lease or run that is still using the host keeps its directory.
-const BUSY_LEASE_STATUSES = ["active", "retained", "pending_cleanup"] as const;
+export const BUSY_LEASE_STATUSES = ["active", "retained", "pending_cleanup"] as const;
 
 const REAPER_ACTOR_ID = "ssh_run_directory_reaper";
 const REAPED_ACTION = "environment.ssh_run_directory_reaped";

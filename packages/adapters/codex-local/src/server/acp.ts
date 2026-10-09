@@ -181,7 +181,7 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
 async function prepareCodexRemoteManagedHome(
   input: AcpxRemoteManagedHomeContext,
 ): Promise<AcpxRemoteManagedHomeResult> {
-  const { env, runId, onLog } = input;
+  const { env, onLog } = input;
   // The host managed Codex home the engine seeded and set on env.CODEX_HOME.
   const effectiveCodexHome = env.CODEX_HOME;
   if (!effectiveCodexHome) {
@@ -196,7 +196,7 @@ async function prepareCodexRemoteManagedHome(
     || process.env.OPENAI_API_KEY?.trim() || process.env.CODEX_API_KEY?.trim(),
   );
   // Curated allowlist temp dir (auth/config/skills only); caller owns cleanup.
-  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome);
   let stagedRuntime;
   try {
     stagedRuntime = await input.stage([
