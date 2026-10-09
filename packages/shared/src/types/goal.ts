@@ -57,3 +57,9 @@ export interface CompanyFocus {
   goals: CompanyFocusGoal[];
   guidance: string;
 }
+
+/** The company focus as an agent sees it for one task. */
+export interface IssueCompanyFocus extends CompanyFocus {
+  /** The focus goal this task serves, or null when it serves none. */
+  issueFocusGoalId: string | null;
+}

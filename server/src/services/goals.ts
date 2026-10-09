@@ -1,6 +1,7 @@
 import { and, asc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, goals } from "@paperclipai/db";
+import { updateGoalSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 
 type GoalReader = Pick<Db, "select">;
@@ -100,7 +101,18 @@ export function goalService(db: Db) {
         .then((rows) => rows[0]);
     },
 
-    update: async (id: string, data: Partial<typeof goals.$inferInsert>) => {
+    /**
+     * Applies only the fields a goal update may change, validated the same way as the API.
+     * Plugins call this directly, so it must not trust its input: a stray `companyId` or `id`
+     * is dropped, and an invalid horizon or date is refused.
+     */
+    update: async (id: string, input: unknown) => {
+      const parsed = updateGoalSchema.safeParse(input);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        throw unprocessable(`Invalid goal update: ${issue?.path.join(".") || "goal"}: ${issue?.message ?? "invalid"}`);
+      }
+      const data = parsed.data;
       const [existing] = await db.select({ companyId: goals.companyId }).from(goals).where(eq(goals.id, id));
       if (!existing) return null;
       await assertGoalRelations(db, existing.companyId, data, id);

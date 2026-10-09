@@ -209,7 +209,7 @@ describe("project and goal commands", () => {
       goals: [{
         id: GOAL_ID, title: "Land open PRs", kind: "goal", level: "company", targetDate: "2026-10-16", daysLeft: 7,
         successCriteria: "Open PRs = 0", ownerAgentId: null, progress: { total: 4, done: 1, open: 3 },
-        milestones: [{ id: PROJECT_ID, title: "First half", status: "active", targetDate: "2026-10-12", daysLeft: 3, progress: { total: 2, done: 1, open: 1 } }],
+        milestones: [{ id: PROJECT_ID, title: "First half", status: "active", targetDate: "2026-10-10", daysLeft: 1, progress: { total: 2, done: 1, open: 1 } }],
       }],
     };
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(focus), { status: 200 }));
@@ -230,6 +230,8 @@ describe("project and goal commands", () => {
     expect(text).toContain("7 days left");
     expect(text).toContain("Open PRs = 0");
     expect(text).toContain("First half");
+    expect(text).toContain("1 day left");
+    expect(text).not.toContain("1 days");
     expect(text).toContain("Pick work that serves the focus first.");
   });
 });

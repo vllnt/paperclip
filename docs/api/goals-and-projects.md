@@ -45,7 +45,7 @@ Planning fields, all optional:
 | `targetDate` | `YYYY-MM-DD` or null | When the goal should be reached |
 | `successCriteria` | text or null | How to tell it is reached, for example "open pull requests = 0" |
 
-`parentId` and `ownerAgentId` must belong to the same company. A parent that would put the goal below itself returns `422`.
+`parentId` and `ownerAgentId` must belong to the same company. A parent that would put the goal below itself returns `422`. Fields outside this list are ignored on update, and an invalid value returns `422` from every caller, including plugins.
 
 ### Update Goal
 
@@ -65,7 +65,7 @@ Valid status values: `planned`, `active`, `achieved`, `cancelled`.
 GET /api/companies/{companyId}/goals/focus
 ```
 
-Returns `{ goals, guidance }`. `goals` lists the active goals with the `short` horizon, nearest target date first, at most 10. Each has `progress` (`total`, `done`, `open` tasks, counted over the goal and every goal below it), `daysLeft`, `successCriteria`, and its open milestones. `guidance` is the instruction agents follow. Agents also get this as `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`, with `issueFocusGoalId` saying which focus goal the task serves.
+Returns `{ goals, guidance }`. `goals` lists the active goals with the `short` horizon, nearest target date first, at most 10. Each has `progress` (`total`, `done`, `open` tasks, counted over the goal and every goal below it), `daysLeft`, `successCriteria` (cut to 280 characters), and up to 5 open milestones. `guidance` is the instruction agents follow. Agents also get this as `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`, with `issueFocusGoalId` saying which focus goal the task serves. The agent inbox (`GET /api/agents/me/inbox-lite`) lists critical tasks first, then tasks that serve the focus.
 
 ### Goal Progress
 
