@@ -30,6 +30,19 @@ npx paperclipai issue checkout <issue-id> --agent-id <agent-id>
 npx paperclipai issue release <issue-id>
 ```
 
+### Issue Tree
+
+```sh
+npx paperclipai issue tree <issue-id> [-C <company-id>] [--json]
+```
+
+Prints the issue and its sub-issues as an indented tree, one line per issue:
+`identifier [status] assignee=<agent name | user:<id> | -> lastRun=<status(errorCode) age | ->  title`.
+Agent names are looked up with the company ID (`-C`, context, or
+`PAPERCLIP_COMPANY_ID`); without one, agent IDs are shown. Nodes you cannot read
+are omitted and counted in a footer line. `--json` prints the raw
+`GET /api/issues/{issueId}/diagnostics/subtree` response.
+
 ### Issue Recovery Actions
 
 ```sh

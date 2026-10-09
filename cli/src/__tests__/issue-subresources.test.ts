@@ -173,6 +173,49 @@ describe("issue subresource commands", () => {
     });
   });
 
+  it("prints the issue tree with agent names and passes the raw response with --json", async () => {
+    const AGENT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const tree = {
+      nodes: [
+        {
+          issue: { id: ISSUE_ID, identifier: "PC-1", title: "Root", status: "in_progress", assigneeAgentId: AGENT_ID, assigneeUserId: null },
+          parentId: null,
+          depth: 0,
+          lastRun: { status: "failed", errorCode: "timeout", createdAt: new Date(Date.now() - 120_000).toISOString(), startedAt: null, finishedAt: null },
+        },
+        {
+          issue: { id: COMMENT_ID, identifier: "PC-2", title: "Child", status: "todo", assigneeAgentId: null, assigneeUserId: "user-1" },
+          parentId: ISSUE_ID,
+          depth: 1,
+          lastRun: null,
+        },
+      ],
+      omittedUnauthorizedNodeCount: 0,
+      truncated: false,
+    };
+    const fetchMock = vi.fn().mockImplementation((url: string) =>
+      Promise.resolve(jsonResponse(url.endsWith("/agents") ? [{ id: AGENT_ID, name: "Builder" }] : tree)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run(["issue", "tree", ISSUE_ID, "--company-id", COMPANY_ID]);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `http://localhost:3100/api/issues/${ISSUE_ID}/diagnostics/subtree`,
+      `http://localhost:3100/api/companies/${COMPANY_ID}/agents`,
+    ]);
+    expect(log.mock.calls.map((call) => call[0])).toEqual([
+      "PC-1 [in_progress] assignee=Builder lastRun=failed(timeout) 2m ago  Root",
+      "  PC-2 [todo] assignee=user:user-1 lastRun=-  Child",
+    ]);
+
+    fetchMock.mockClear();
+    log.mockClear();
+    await run(["issue", "tree", ISSUE_ID, "--company-id", COMPANY_ID, "--json"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual(tree);
+  });
+
   it("rejects an execution reconciliation without --provider-stopped before calling the API", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
