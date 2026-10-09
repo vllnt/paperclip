@@ -64,7 +64,7 @@ test("board user connects, probes and retires a storage destination", async ({ p
   await expect(section.getByTestId("storage-destination-status")).toHaveText("Not probed yet.");
 
   await section.getByTestId("storage-destination-probe").click();
-  await expect(section.getByTestId("storage-destination-status")).toHaveText("The endpoint did not answer.", { timeout: 45_000 });
+  await expect(section.getByTestId("storage-destination-status")).toHaveText("The endpoint is unreachable or outside the network policy of this instance.", { timeout: 45_000 });
 
   // The audit trail has the creation and the failed probe.
   const activity = await page.request.get(`/api/companies/${company.id}/activity?entityType=storage_destination`);

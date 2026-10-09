@@ -9,7 +9,7 @@ import {
 import { badRequest, forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { storageDestinationService, type StorageDestinationActor } from "../services/storage-destinations.js";
-import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertCompanyAdmin, getActorInfo } from "./authz.js";
 
 function parse<T>(schema: z.ZodType<T>, input: unknown): T {
   const parsed = schema.safeParse(input);
@@ -20,11 +20,14 @@ function parse<T>(schema: z.ZodType<T>, input: unknown): T {
 /**
  * Board-only company storage destinations (S3-01). Cloud-managed instances
  * keep storage under the platform's control, so every route refuses there.
+ * Choosing where company keys are sent (create, key rotation) and retiring
+ * need a company owner or admin, like secret definitions.
  */
-function authorize(req: Request): { companyId: string; actor: StorageDestinationActor } {
+function authorize(req: Request, options: { admin?: boolean } = {}): { companyId: string; actor: StorageDestinationActor } {
   assertBoard(req);
   const companyId = req.params.companyId as string;
   assertCompanyAccess(req, companyId);
+  if (options.admin) assertCompanyAdmin(req, companyId);
   if (isCloudManagedInstance()) throw forbidden("Storage destinations are managed by the platform on this instance");
   const actor = getActorInfo(req);
   return {
@@ -49,7 +52,7 @@ export function companyStorageRoutes(db: Db) {
   });
 
   router.post("/companies/:companyId/storage/destinations", async (req, res) => {
-    const { companyId, actor } = authorize(req);
+    const { companyId, actor } = authorize(req, { admin: true });
     const input = parse(createStorageDestinationSchema, req.body);
     const { destination, created } = await destinations.create(companyId, input, actor);
     res.status(created ? 201 : 200).json(destination);
@@ -61,13 +64,13 @@ export function companyStorageRoutes(db: Db) {
   });
 
   router.patch("/companies/:companyId/storage/destinations/:destinationId/credentials", async (req, res) => {
-    const { companyId, actor } = authorize(req);
+    const { companyId, actor } = authorize(req, { admin: true });
     const input = parse(rotateStorageCredentialsSchema, req.body);
     res.json(await destinations.rotateCredentials(companyId, destinationId(req), input, actor));
   });
 
   router.post("/companies/:companyId/storage/destinations/:destinationId/retire", async (req, res) => {
-    const { companyId, actor } = authorize(req);
+    const { companyId, actor } = authorize(req, { admin: true });
     const input = parse(retireStorageDestinationSchema, req.body);
     res.json(await destinations.retire(companyId, destinationId(req), input, actor));
   });

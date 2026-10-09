@@ -30,7 +30,9 @@ describe("S3 provider encryption", () => {
     const provider = createS3StorageProvider({
       bucket: "acme-archive",
       region: "us-east-1",
+      endpoint: "https://s3.example.com",
       credentials: { accessKeyId: "AKIA", secretAccessKey: "secret" },
+      requestHandler: { connectionTimeout: 5_000 },
       serverSideEncryption: { mode: "kms", kmsKeyId: "alias/archive" },
     });
     await provider.putObject({ objectKey: "a", body: Buffer.from("x"), contentType: "text/plain", contentLength: 1 });
@@ -42,6 +44,14 @@ describe("S3 provider encryption", () => {
     expect(put.input).toMatchObject({ ServerSideEncryption: "aws:kms", SSEKMSKeyId: "alias/archive" });
     expect(create.input).toMatchObject({ ServerSideEncryption: "aws:kms", SSEKMSKeyId: "alias/archive" });
     expect(head.serverSideEncryption).toBe("aws:kms");
+  });
+
+  it("refuses a company client without its endpoint and network handler", () => {
+    expect(() => createS3StorageProvider({
+      bucket: "acme-archive",
+      region: "us-east-1",
+      credentials: { accessKeyId: "AKIA", secretAccessKey: "secret" },
+    })).toThrow(/network policy handler/);
   });
 
   it("leaves instance storage requests unchanged", async () => {

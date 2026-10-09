@@ -16,19 +16,41 @@ import {
 function privateOriginAllowlist(): string[] {
   return (process.env.PAPERCLIP_STORAGE_PRIVATE_ORIGINS ?? "")
     .split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean);
+    .flatMap((origin) => {
+      try {
+        return [new URL(origin.trim()).origin];
+      } catch {
+        return [];
+      }
+    });
+}
+
+/**
+ * The S3 SDK's addressing rule: virtual-hosted (`bucket.host`) unless path
+ * style is forced, the bucket name has a dot, or the host is an IP address.
+ */
+export function usesPathStyle(location: Pick<StorageS3Location, "endpoint" | "bucket" | "forcePathStyle">): boolean {
+  const hostname = new URL(location.endpoint).hostname.replace(/^\[|\]$/g, "");
+  return location.forcePathStyle || location.bucket.includes(".") || isIP(hostname) !== 0;
 }
 
 /**
  * Company endpoints must be public HTTPS unless the operator allowlists the
- * exact origin. A company cannot edit the allowlist.
+ * exact origin. A company cannot edit the allowlist. An allowlisted private
+ * origin must use path style, so no bucket-named subdomain of it is dialled.
  */
-export function storageEndpointPolicy(location: Pick<StorageS3Location, "endpoint">) {
+export function storageEndpointPolicy(location: Pick<StorageS3Location, "endpoint"> & Partial<Pick<StorageS3Location, "bucket" | "forcePathStyle">>) {
   const endpoint = new URL(location.endpoint);
   const allowPrivateNetwork = privateOriginAllowlist().includes(endpoint.origin);
   if (endpoint.protocol !== "https:" && !allowPrivateNetwork) {
     throw unprocessable("Use an HTTPS endpoint. A private endpoint needs an operator allowlist entry.");
+  }
+  if (
+    allowPrivateNetwork
+    && location.bucket !== undefined
+    && !usesPathStyle({ endpoint: location.endpoint, bucket: location.bucket, forcePathStyle: Boolean(location.forcePathStyle) })
+  ) {
+    throw unprocessable("An allowlisted private endpoint must use path-style addressing.");
   }
   return { endpoint, allowPrivateNetwork };
 }
@@ -40,7 +62,7 @@ const endpointUnavailable = (_message?: string, code?: string) =>
 /** Host names the S3 client may connect to for this location. */
 export function allowedStorageHosts(location: Pick<StorageS3Location, "endpoint" | "bucket" | "forcePathStyle">) {
   const hostname = new URL(location.endpoint).hostname;
-  return location.forcePathStyle ? [hostname] : [hostname, `${location.bucket}.${hostname}`];
+  return usesPathStyle(location) ? [hostname] : [hostname, `${location.bucket}.${hostname}`];
 }
 
 /**

@@ -16,7 +16,7 @@ import { logActivity } from "./activity-log.js";
 import { resolveApprovedRemoteHttpAddresses } from "./remote-http-endpoint-guard.js";
 import { guardedRemoteHttpFetch } from "./remote-http-fetch.js";
 import { secretService } from "./secrets.js";
-import { companyS3RequestHandler, storageEndpointPolicy } from "../storage/company-s3-network.js";
+import { companyS3RequestHandler, storageEndpointPolicy, usesPathStyle } from "../storage/company-s3-network.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
 
@@ -43,20 +43,27 @@ export interface StorageDestinationDeps {
 const PROBE_PREFIX = "paperclip-probe";
 const ISOLATION_PROBE_PREFIX = "paperclip-isolation-probe";
 const CLEANUP_TIMEOUT_MS = 10_000;
+const SYSTEM_ACTOR: StorageDestinationActor = { actorType: "system", actorId: "storage" };
 
-/** Fixed, provider-independent probe failures: no raw provider text reaches the API. */
+/**
+ * Fixed, provider-independent probe failures. No provider text reaches the
+ * API, and network failures share one code so the probe cannot be used to map
+ * internal host names or ports.
+ */
 const PROBE_ERRORS = {
   credentials_unavailable: "The access key secrets cannot be read. Check that both secrets exist and are active.",
-  endpoint_rejected: "The endpoint is outside the network policy of this instance.",
-  endpoint_unreachable: "The endpoint did not answer.",
+  endpoint_unavailable: "The endpoint is unreachable or outside the network policy of this instance.",
   invalid_credentials: "The provider rejected the access key.",
   access_denied: "The access key is not allowed to write, read and delete objects under this prefix.",
   bucket_not_found: "The bucket does not exist or is in another region.",
   encryption_unsupported: "The provider rejected the requested encryption. Try bucket default encryption.",
   encryption_mismatch: "The provider stored the object with a different encryption than requested.",
+  encryption_unverified: "The provider did not confirm the requested encryption. Use bucket default encryption if the provider encrypts at rest.",
   read_mismatch: "The object read back does not match what was written.",
   public_read: "Objects in this bucket can be read without credentials. Make the bucket private.",
-  cleanup_failed: "The probe object could not be deleted. Check the delete permission.",
+  public_read_unverified: "The probe could not confirm that the bucket refuses unauthenticated reads.",
+  location_unavailable: "This storage location is not available. Use a bucket of your own.",
+  cleanup_failed: "A probe object could not be deleted. Check the delete permission.",
   timeout: "The probe did not finish within its time limit.",
   probe_failed: "The probe failed.",
 } as const;
@@ -71,46 +78,61 @@ class ProbeFailure extends Error {
 function probeErrorCode(error: unknown): ProbeErrorCode {
   if (error instanceof ProbeFailure) return error.code;
   // Our own errors: the endpoint policy, or the secret service refusing the keys.
-  if (error instanceof HttpError) {
-    const reason = (error.details as { code?: unknown } | undefined)?.code;
-    if (reason === "remote_http_dns_failed") return "endpoint_unreachable";
-    return /endpoint/i.test(error.message) ? "endpoint_rejected" : "credentials_unavailable";
-  }
-  const name = (error as { name?: string; code?: string } | null)?.name ?? "";
+  if (error instanceof HttpError) return /endpoint/i.test(error.message) ? "endpoint_unavailable" : "credentials_unavailable";
+  const name = (error as { name?: string } | null)?.name ?? "";
   const code = (error as { code?: string } | null)?.code ?? "";
   if (name === "TimeoutError" || name === "AbortError") return "timeout";
   if (name === "InvalidAccessKeyId" || name === "SignatureDoesNotMatch") return "invalid_credentials";
   if (name === "AccessDenied" || name === "Forbidden") return "access_denied";
   if (name === "NoSuchBucket" || name === "PermanentRedirect") return "bucket_not_found";
   if (name === "NotImplemented" || name === "InvalidArgument" || name === "InvalidEncryptionAlgorithmError") return "encryption_unsupported";
-  if (["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"].includes(code)) return "endpoint_unreachable";
-  if (error instanceof Error && error.message.includes("network policy")) return "endpoint_rejected";
+  if (["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH"].includes(code)) return "endpoint_unavailable";
+  if (error instanceof Error && /network policy|endpoint/i.test(error.message)) return "endpoint_unavailable";
   return "probe_failed";
 }
 
-/** Normalized endpoint host and bucket: the unit a company may not share. */
+/** AWS S3 host names that all address the same global bucket namespace. */
+const AWS_S3_HOST = /^s3([.-][a-z0-9-]+)*\.amazonaws\.com(\.cn)?$/;
+
+/**
+ * Canonical endpoint host and bucket: one physical bucket serves one company
+ * per instance. Best effort: a trailing dot is dropped and every AWS S3
+ * regional, dualstack and legacy host maps to one name. Custom aliases of the
+ * same service (two DNS names for one MinIO) are not detected.
+ */
 export function storagePhysicalKey(location: Pick<StorageS3Location, "endpoint" | "bucket">): string {
   const url = new URL(location.endpoint);
-  return `${url.host.toLowerCase()}/${location.bucket.toLowerCase()}`;
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  const host = AWS_S3_HOST.test(hostname) ? "s3.amazonaws.com" : `${hostname}${url.port ? `:${url.port}` : ""}`;
+  return `${host}/${location.bucket.toLowerCase()}`;
 }
 
-/** Object URL for an unauthenticated GET, in the location's addressing style. */
+/** Object URL for an unauthenticated GET, with the same addressing the S3 client uses. */
 export function storageObjectUrl(location: StorageS3Location, objectKey: string): string {
   const url = new URL(location.endpoint);
   const fullKey = [location.prefix, objectKey].filter(Boolean).join("/");
   const path = fullKey.split("/").map(encodeURIComponent).join("/");
-  if (location.forcePathStyle) return `${url.origin}/${location.bucket}/${path}`;
+  if (usesPathStyle(location)) return `${url.origin}/${location.bucket}/${path}`;
   return `${url.protocol}//${location.bucket}.${url.host}/${path}`;
 }
 
-/** Whether the provider reported the encryption the destination asked for. */
+/**
+ * Whether the provider confirmed the encryption the destination asked for.
+ * `bucket_default` sends no header, so silence there is only "unverified".
+ */
 export function encryptionVerdict(
   encryption: StorageEncryption,
   reported: string | undefined,
 ): StorageProbeResult["encryption"] {
-  if (!reported) return "unverified";
+  if (!reported) return encryption.mode === "bucket_default" ? "unverified" : "failed";
   if (encryption.mode === "kms" && !reported.startsWith("aws:kms")) return "failed";
   return "verified";
+}
+
+/** A destination is usable once a probe passed with its current keys and the bucket refused anonymous reads. */
+export function isProbeCurrent(row: Pick<DestinationRow, "lastProbeJson" | "credentialRevision">): boolean {
+  const probe = row.lastProbeJson;
+  return probe?.status === "passed" && probe.credentialRevision === row.credentialRevision && probe.publicRead === "denied";
 }
 
 function view(row: DestinationRow): StorageDestinationView {
@@ -150,6 +172,11 @@ function sameCreatePayload(row: DestinationRow, input: CreateStorageDestination)
     && row.credentialsJson.secretKeySecretId === input.credentials.secretKeySecretId;
 }
 
+function isUniqueViolation(error: unknown) {
+  return (error as { code?: string } | null)?.code === "23505"
+    || (error as { cause?: { code?: string } } | null)?.cause?.code === "23505";
+}
+
 async function defaultProviderFactory(input: {
   location: StorageS3Location;
   credentials: { accessKeyId: string; secretAccessKey: string };
@@ -179,7 +206,7 @@ async function defaultAnonymousGet(url: string, location: StorageS3Location, sig
 
 /**
  * Company storage destinations: create, list, probe, rotate credentials and
- * retire, plus the authenticated client for consumers (the company archive).
+ * retire, plus the authenticated client for consumers such as the archive.
  */
 export function storageDestinationService(db: Db, deps: StorageDestinationDeps = {}) {
   const secrets = secretService(db);
@@ -205,12 +232,34 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
     }
   }
 
-  /** Secrets must be this company's, company scoped; the current versions are pinned. */
+  /** Another company's destination for the same bucket that already passed a probe. */
+  async function provenClaimByOtherCompany(connection: Pick<Db, "select">, companyId: string, physicalKey: string) {
+    const rows = await connection
+      .select({ id: storageDestinations.id, lastProbeJson: storageDestinations.lastProbeJson, credentialRevision: storageDestinations.credentialRevision })
+      .from(storageDestinations)
+      .where(and(
+        eq(storageDestinations.physicalKey, physicalKey),
+        ne(storageDestinations.companyId, companyId),
+        isNull(storageDestinations.retiredAt),
+      ));
+    return rows.some((row) => row.lastProbeJson?.status === "passed");
+  }
+
+  /**
+   * The secrets must be this company's, company scoped, and used by nothing
+   * but storage destinations: S3 signing sends the access key id in clear to
+   * the endpoint, so an existing secret (an API key, a token) must never be
+   * picked as a storage key. The current versions are pinned.
+   */
   async function pinCredentials(companyId: string, refs: StorageCredentialRefs): Promise<StorageCredentialPins> {
     for (const secretId of [refs.accessKeySecretId, refs.secretKeySecretId]) {
       const secret = await secrets.getById(secretId);
       if (!secret || secret.companyId !== companyId || secret.scope !== "company") {
         throw notFound("Company secret not found");
+      }
+      const otherUses = (await secrets.listBindings(companyId, secretId)).filter((binding) => binding.targetType !== "storage_destination");
+      if (otherUses.length > 0) {
+        throw unprocessable("This secret is already used elsewhere. Create dedicated secrets for the storage keys.", { code: "secret_in_use" });
       }
     }
     return {
@@ -228,12 +277,18 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
   }
 
   /**
-   * Resolves the pinned keys through the binding check on every call (each
-   * read is recorded in secret_access_events), so a revoked secret stops the
-   * next operation. Nothing is cached.
+   * Resolves the pinned keys through the binding check on every call; each
+   * read is recorded in secret_access_events with the acting user or system.
+   * Nothing is cached, so a revoked secret stops the next operation.
    */
-  async function resolveCredentials(row: DestinationRow) {
-    const context = { consumerType: "storage_destination" as const, consumerId: row.id, actorType: "system" as const, actorId: null };
+  async function resolveCredentials(row: DestinationRow, actor: StorageDestinationActor) {
+    const context = {
+      consumerType: "storage_destination" as const,
+      consumerId: row.id,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      responsibleUserId: actor.actorType === "user" ? actor.actorId : null,
+    };
     const pins = row.credentialsJson;
     const [accessKeyId, secretAccessKey] = await Promise.all([
       secrets.resolveSecretValue(row.companyId, pins.accessKeySecretId, pins.accessKeyVersion, { ...context, configPath: "credentials.accessKeyId" }),
@@ -242,8 +297,8 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
     return { accessKeyId, secretAccessKey };
   }
 
-  async function audit(companyId: string, id: string, action: string, actor: StorageDestinationActor, details: Record<string, unknown>) {
-    await logActivity(db, {
+  async function audit(connection: Db, companyId: string, id: string, action: string, actor: StorageDestinationActor, details: Record<string, unknown>) {
+    await logActivity(connection, {
       companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
@@ -256,37 +311,51 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
     });
   }
 
-  async function writeProbe(row: DestinationRow, result: StorageProbeResult) {
-    await db
+  async function writeProbe(connection: Pick<Db, "update">, row: DestinationRow, result: StorageProbeResult) {
+    await connection
       .update(storageDestinations)
       .set({ lastProbeJson: result, updatedAt: new Date() })
       .where(and(eq(storageDestinations.companyId, row.companyId), eq(storageDestinations.id, row.id)));
   }
 
   /** Writes one byte outside the prefix: success means the key is not limited to the prefix. */
-  async function checkIsolation(row: DestinationRow, credentials: { accessKeyId: string; secretAccessKey: string }, probeId: string) {
+  async function checkIsolation(
+    row: DestinationRow,
+    credentials: { accessKeyId: string; secretAccessKey: string },
+    probeId: string,
+    signal: AbortSignal,
+  ): Promise<StorageProbeResult["isolation"]> {
     const location = row.locationJson;
-    const segments = location.prefix.split("/");
-    const parent = segments.slice(0, -1).join("/");
+    const parent = location.prefix.split("/").slice(0, -1).join("/");
     const outside = await providerFactory({ location: { ...location, prefix: parent }, credentials });
     const objectKey = `${ISOLATION_PROBE_PREFIX}/${probeId}`;
     try {
-      await outside.putObject({ objectKey, body: Buffer.from("x"), contentType: "application/octet-stream", contentLength: 1 });
+      await outside.putObject({ objectKey, body: Buffer.from("x"), contentType: "application/octet-stream", contentLength: 1, signal });
     } catch (error) {
       const name = (error as { name?: string } | null)?.name;
-      return name === "AccessDenied" || name === "Forbidden" ? "prefix_scoped" as const : "unknown" as const;
+      return name === "AccessDenied" || name === "Forbidden" ? "prefix_scoped" : "unknown";
     }
-    await outside.deleteObject({ objectKey, signal: AbortSignal.timeout(CLEANUP_TIMEOUT_MS) }).catch(() => undefined);
-    return "bucket_wide" as const;
+    try {
+      await outside.deleteObject({ objectKey, signal: AbortSignal.timeout(CLEANUP_TIMEOUT_MS) });
+    } catch {
+      throw new ProbeFailure("cleanup_failed");
+    }
+    return "bucket_wide";
   }
 
   return {
     get,
-    /** The authenticated client, for consumers such as the company archive. */
-    async providerFor(companyId: string, id: string): Promise<StorageProvider> {
+
+    /**
+     * The authenticated client, for consumers such as the company archive.
+     * Only a destination whose latest probe passed with its current keys and
+     * found the bucket private can be used.
+     */
+    async providerFor(companyId: string, id: string, actor: StorageDestinationActor = SYSTEM_ACTOR): Promise<StorageProvider> {
       const row = await get(companyId, id);
       if (row.retiredAt) throw conflict("Storage destination is retired");
-      return providerFactory({ location: row.locationJson, credentials: await resolveCredentials(row) });
+      if (!isProbeCurrent(row)) throw conflict("Probe this storage destination before it is used", { code: "storage_destination_unverified" });
+      return providerFactory({ location: row.locationJson, credentials: await resolveCredentials(row, actor) });
     },
 
     async list(companyId: string): Promise<StorageDestinationView[]> {
@@ -306,52 +375,43 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
       await assertEndpointAllowed(input.location);
       const physicalKey = storagePhysicalKey(input.location);
       const pins = await pinCredentials(companyId, input.credentials);
-      const outcome = await db.transaction(async (tx) => {
-        // Serialize creates of one physical bucket so two companies cannot both claim it.
-        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`storage_destination:${physicalKey}`}))`);
-        const [existing] = await tx.select().from(storageDestinations).where(eq(storageDestinations.id, input.id));
-        if (existing) {
-          if (existing.companyId !== companyId || !sameCreatePayload(existing, input)) {
-            throw conflict("This destination id is already used with different settings");
+      try {
+        return await db.transaction(async (tx) => {
+          const connection = tx as unknown as Db;
+          // Serialize claims on one physical bucket so two companies cannot both win it.
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`storage_destination:${physicalKey}`}))`);
+          const [existing] = await tx.select().from(storageDestinations).where(eq(storageDestinations.id, input.id));
+          if (existing) {
+            if (existing.companyId !== companyId || !sameCreatePayload(existing, input)) {
+              throw conflict("This destination id is already used with different settings");
+            }
+            return { destination: view(existing), created: false };
           }
-          return { row: existing, created: false };
-        }
-        const [claimed] = await tx
-          .select({ id: storageDestinations.id })
-          .from(storageDestinations)
-          .where(and(
-            eq(storageDestinations.physicalKey, physicalKey),
-            ne(storageDestinations.companyId, companyId),
-            isNull(storageDestinations.retiredAt),
-          ))
-          .limit(1);
-        // Say only that the location is unavailable, never which company uses it.
-        if (claimed) throw conflict("This storage location is not available. Use a bucket of your own.");
-        const [row] = await tx
-          .insert(storageDestinations)
-          .values({
-            id: input.id,
-            companyId,
+          // Only a probed claim reserves a bucket, so a company cannot squat
+          // another's bucket with keys that do not work. Say only that the
+          // location is unavailable, never which company uses it.
+          if (await provenClaimByOtherCompany(tx, companyId, physicalKey)) {
+            throw conflict(PROBE_ERRORS.location_unavailable);
+          }
+          const [row] = await tx
+            .insert(storageDestinations)
+            .values({ id: input.id, companyId, label: input.label, locationJson: input.location, physicalKey, credentialsJson: pins })
+            .returning();
+          await bindCredentials(connection, companyId, input.id, pins);
+          const location = input.location;
+          await audit(connection, companyId, input.id, "created", actor, {
             label: input.label,
-            locationJson: input.location,
-            physicalKey,
-            credentialsJson: pins,
-          })
-          .returning();
-        await bindCredentials(tx as unknown as Db, companyId, input.id, pins);
-        return { row: row!, created: true };
-      });
-      if (outcome.created) {
-        const location = input.location;
-        await audit(companyId, input.id, "created", actor, {
-          label: input.label,
-          endpointHost: new URL(location.endpoint).host,
-          bucket: location.bucket,
-          prefix: location.prefix,
-          encryptionMode: location.encryption.mode,
+            endpointHost: new URL(location.endpoint).host,
+            bucket: location.bucket,
+            prefix: location.prefix,
+            encryptionMode: location.encryption.mode,
+          });
+          return { destination: view(row!), created: true };
         });
+      } catch (error) {
+        if (isUniqueViolation(error)) throw conflict("This destination id is already used with different settings");
+        throw error;
       }
-      return { destination: view(outcome.row), created: outcome.created };
     },
 
     async rotateCredentials(
@@ -364,6 +424,7 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
       if (current.retiredAt) throw conflict("Storage destination is retired");
       const pins = await pinCredentials(companyId, input.credentials);
       const row = await db.transaction(async (tx) => {
+        const connection = tx as unknown as Db;
         const [updated] = await tx
           .update(storageDestinations)
           .set({
@@ -382,10 +443,10 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
           ))
           .returning();
         if (!updated) throw conflict("The destination changed; reload and try again");
-        await bindCredentials(tx as unknown as Db, companyId, id, pins);
+        await bindCredentials(connection, companyId, id, pins);
+        await audit(connection, companyId, id, "credentials_rotated", actor, { credentialRevision: updated.credentialRevision });
         return updated;
       });
-      await audit(companyId, id, "credentials_rotated", actor, { credentialRevision: row.credentialRevision });
       return view(row);
     },
 
@@ -393,26 +454,30 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
     async retire(companyId: string, id: string, input: { expectedRevision: number }, actor: StorageDestinationActor) {
       const current = await get(companyId, id);
       if (current.retiredAt) return view(current);
-      const [row] = await db
-        .update(storageDestinations)
-        .set({ retiredAt: new Date(), revision: sql`${storageDestinations.revision} + 1`, updatedAt: new Date() })
-        .where(and(
-          eq(storageDestinations.companyId, companyId),
-          eq(storageDestinations.id, id),
-          eq(storageDestinations.revision, input.expectedRevision),
-          isNull(storageDestinations.retiredAt),
-        ))
-        .returning();
-      if (!row) throw conflict("The destination changed; reload and try again");
-      await audit(companyId, id, "retired", actor, { revision: row.revision });
+      const row = await db.transaction(async (tx) => {
+        const [updated] = await tx
+          .update(storageDestinations)
+          .set({ retiredAt: new Date(), revision: sql`${storageDestinations.revision} + 1`, updatedAt: new Date() })
+          .where(and(
+            eq(storageDestinations.companyId, companyId),
+            eq(storageDestinations.id, id),
+            eq(storageDestinations.revision, input.expectedRevision),
+            isNull(storageDestinations.retiredAt),
+          ))
+          .returning();
+        if (!updated) throw conflict("The destination changed; reload and try again");
+        await audit(tx as unknown as Db, companyId, id, "retired", actor, { revision: updated.revision });
+        return updated;
+      });
       return view(row);
     },
 
     /**
      * PUT, HEAD (size and encryption), GET with SHA-256, an unauthenticated
-     * GET that must be refused, an optional out-of-prefix write, and DELETE.
-     * The intent is stored before any network call; cleanup has its own
-     * deadline, and a failed probe never blocks retiring the destination.
+     * GET that must be refused, an optional out-of-prefix write, and DELETE,
+     * all under one deadline. The intent is stored before any network call;
+     * cleanup has its own deadline, and a failed probe never blocks retire.
+     * A passing probe is what reserves the bucket for this company.
      */
     async probe(companyId: string, id: string, actor: StorageDestinationActor): Promise<StorageProbeResult> {
       const row = await get(companyId, id);
@@ -432,7 +497,7 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
         errorCode: null,
         error: null,
       };
-      await writeProbe(row, result);
+      await writeProbe(db, row, result);
 
       const objectKey = `${PROBE_PREFIX}/${probeId}`;
       const signal = AbortSignal.timeout(probeTimeoutMs);
@@ -440,12 +505,12 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
       let wrote = false;
       try {
         storageEndpointPolicy(location);
-        const credentials = await resolveCredentials(row);
+        const credentials = await resolveCredentials(row, actor);
         client = await providerFactory({ location, credentials });
         const body = randomBytes(32);
         const expectedSha = createHash("sha256").update(body).digest("hex");
         try {
-          await client.putObject({ objectKey, body, contentType: "application/octet-stream", contentLength: body.length });
+          await client.putObject({ objectKey, body, contentType: "application/octet-stream", contentLength: body.length, signal });
         } catch (error) {
           result.checks.write = "failed";
           throw error;
@@ -459,7 +524,9 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
           throw new ProbeFailure("read_mismatch");
         }
         result.encryption = encryptionVerdict(location.encryption, head.serverSideEncryption);
-        if (result.encryption === "failed") throw new ProbeFailure("encryption_mismatch");
+        if (result.encryption === "failed") {
+          throw new ProbeFailure(head.serverSideEncryption ? "encryption_mismatch" : "encryption_unverified");
+        }
 
         const object = await client.getObject({ objectKey, signal });
         const hash = createHash("sha256");
@@ -468,14 +535,16 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
         result.checks.checksum = hash.digest("hex") === expectedSha ? "passed" : "failed";
         if (result.checks.checksum === "failed") throw new ProbeFailure("read_mismatch");
 
+        // Fail closed: a check that could not run proves nothing about privacy.
         const anonymousStatus = await anonymousGet(storageObjectUrl(location, objectKey), location, signal).catch(() => null);
         result.publicRead = anonymousStatus === null ? "unknown" : anonymousStatus >= 200 && anonymousStatus < 300 ? "allowed" : "denied";
         if (result.publicRead === "allowed") throw new ProbeFailure("public_read");
+        if (result.publicRead === "unknown") throw new ProbeFailure("public_read_unverified");
 
-        if (location.prefix) result.isolation = await checkIsolation(row, credentials, probeId);
+        if (location.prefix) result.isolation = await checkIsolation(row, credentials, probeId, signal);
         result.status = "passed";
       } catch (error) {
-        const code = signal.aborted ? "timeout" : probeErrorCode(error);
+        const code = signal.aborted && !(error instanceof ProbeFailure) ? "timeout" : probeErrorCode(error);
         result.status = "failed";
         result.errorCode = code;
         result.error = PROBE_ERRORS[code];
@@ -494,15 +563,27 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
           }
         }
         result.finishedAt = new Date().toISOString();
-        await writeProbe(row, result);
       }
-      await audit(companyId, id, "probed", actor, {
-        probeId,
-        status: result.status,
-        errorCode: result.errorCode,
-        encryption: result.encryption,
-        publicRead: result.publicRead,
-        isolation: result.isolation,
+
+      // Record the result and its audit row together. A passing probe claims
+      // the bucket, so recheck other companies' claims under the same lock.
+      await db.transaction(async (tx) => {
+        const connection = tx as unknown as Db;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`storage_destination:${row.physicalKey}`}))`);
+        if (result.status === "passed" && await provenClaimByOtherCompany(tx, companyId, row.physicalKey)) {
+          result.status = "failed";
+          result.errorCode = "location_unavailable";
+          result.error = PROBE_ERRORS.location_unavailable;
+        }
+        await writeProbe(tx, row, result);
+        await audit(connection, companyId, id, "probed", actor, {
+          probeId,
+          status: result.status,
+          errorCode: result.errorCode,
+          encryption: result.encryption,
+          publicRead: result.publicRead,
+          isolation: result.isolation,
+        });
       });
       return result;
     },

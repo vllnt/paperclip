@@ -89,6 +89,11 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
 
   const prefix = normalizePrefix(config.prefix);
   const companyClient = Boolean(config.credentials);
+  // A company client without the guarded handler would dial any address the
+  // endpoint resolves to; refuse rather than build one.
+  if (companyClient && (!config.requestHandler || !config.endpoint)) {
+    throw unprocessable("A company S3 client needs its endpoint and network policy handler");
+  }
   const client = new S3Client({
     region,
     endpoint: config.endpoint,
@@ -126,6 +131,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           ContentLength: input.contentLength,
           ...encryption,
         }),
+        { abortSignal: input.signal },
       );
     },
 
@@ -190,6 +196,7 @@ export function createS3StorageProvider(config: S3ProviderConfig): StorageProvid
           Bucket: bucket,
           Key: key,
         }),
+        { abortSignal: input.signal },
       );
     },
   };

@@ -23,7 +23,12 @@ import type { CreateStorageDestination, StorageS3Location } from "@paperclipai/s
 import { errorHandler } from "../middleware/error-handler.js";
 import { companyStorageRoutes } from "../routes/company-storage.js";
 import { secretService } from "../services/secrets.js";
-import { storageDestinationService, type StorageDestinationDeps } from "../services/storage-destinations.js";
+import {
+  storageDestinationService,
+  storageObjectUrl,
+  storagePhysicalKey,
+  type StorageDestinationDeps,
+} from "../services/storage-destinations.js";
 import type { StorageProvider } from "../storage/types.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -191,7 +196,7 @@ describeEmbeddedPostgres("company storage destinations", () => {
     expect(await db.select().from(storageDestinations)).toHaveLength(1);
   });
 
-  it("refuses another company's secrets and another company's bucket", async () => {
+  it("refuses another company's secrets and secrets already used elsewhere", async () => {
     const owner = await seedCompany("owner");
     const other = await seedCompany("other");
     const service = storageDestinationService(db);
@@ -200,24 +205,53 @@ describeEmbeddedPostgres("company storage destinations", () => {
       credentials: { accessKeySecretId: owner.accessKeyId, secretKeySecretId: other.secretKeyId },
     }, BOARD)).rejects.toMatchObject({ status: 404 });
 
-    const first = await service.create(owner.companyId, createInput(owner), BOARD);
-    // Same endpoint and bucket, other prefix, other host case: still the same physical bucket.
+    // A secret bound to anything else (here an instance setting) must not be sent to a bucket endpoint.
+    await secretService(db).syncSecretRefsForTarget(owner.companyId, { targetType: "system", targetId: "integration" }, [
+      { secretId: owner.accessKeyId, configPath: "env.OTHER_TOKEN" },
+    ]);
+    await expect(service.create(owner.companyId, createInput(owner), BOARD))
+      .rejects.toMatchObject({ status: 422, details: { code: "secret_in_use" } });
+  });
+
+  it("reserves a bucket for the first company whose probe passes", async () => {
+    const owner = await seedCompany("claim-owner");
+    const other = await seedCompany("claim-other");
+    const deps = { providerFactory: fakeBucket({ serverSideEncryption: "AES256" }).factory, anonymousGet: async () => 403 };
+    const service = storageDestinationService(db, deps);
+
+    // An unproven claim does not block anyone: no squatting with keys that do not work.
+    const squat = await service.create(other.companyId, createInput(other, { location: location({ prefix: "theirs" }) }), BOARD);
+    const { destination } = await service.create(owner.companyId, createInput(owner), BOARD);
+    await expect(service.probe(owner.companyId, destination.id, BOARD)).resolves.toMatchObject({ status: "passed" });
+
+    // Now the bucket is the owner's: same bucket under another host alias and prefix is refused.
     const claim = service.create(other.companyId, createInput(other, {
-      location: location({ endpoint: "https://S3.EXAMPLE.COM/", prefix: "theirs" }),
+      location: location({ endpoint: "https://S3.EXAMPLE.COM./", prefix: "again" }),
     }), BOARD);
     await expect(claim).rejects.toMatchObject({ status: 409 });
     await expect(claim).rejects.not.toThrow(owner.companyId);
-
+    // The earlier unproven claim cannot pass a probe any more.
+    await expect(service.probe(other.companyId, squat.destination.id, BOARD))
+      .resolves.toMatchObject({ status: "failed", errorCode: "location_unavailable" });
     // The owner may use the bucket again under another prefix.
     await expect(service.create(owner.companyId, createInput(owner, { location: location({ prefix: "second" }) }), BOARD))
       .resolves.toMatchObject({ created: true });
 
-    // Once every owner destination is retired, the bucket is free.
+    // Once the owner retires its destinations, the bucket is free.
     for (const row of await service.list(owner.companyId)) {
       await service.retire(owner.companyId, row.id, { expectedRevision: row.revision }, BOARD);
     }
-    expect(first.destination.id).toBeTruthy();
     await expect(service.create(other.companyId, createInput(other), BOARD)).resolves.toMatchObject({ created: true });
+  });
+
+  it("canonicalizes AWS host aliases and builds the probe URL the way the S3 client addresses the bucket", () => {
+    const aws = (endpoint: string) => storagePhysicalKey({ endpoint, bucket: "Acme-Archive" });
+    expect(aws("https://s3.amazonaws.com/")).toBe("s3.amazonaws.com/acme-archive");
+    expect(aws("https://s3.us-east-1.amazonaws.com/")).toBe("s3.amazonaws.com/acme-archive");
+    expect(aws("https://s3.dualstack.eu-west-1.amazonaws.com./")).toBe("s3.amazonaws.com/acme-archive");
+    expect(aws("https://minio.example.com:9000/")).toBe("minio.example.com:9000/acme-archive");
+    expect(storageObjectUrl(location({ bucket: "dotted.bucket" }), "k")).toBe("https://s3.example.com/dotted.bucket/paperclip/k");
+    expect(storageObjectUrl(location(), "k")).toBe("https://acme-archive.s3.example.com/paperclip/k");
   });
 
   it("requires HTTPS and public addresses unless the operator allowlists the origin", async () => {
@@ -229,25 +263,37 @@ describeEmbeddedPostgres("company storage destinations", () => {
       .rejects.toMatchObject({ status: 422 });
     await expect(service.create(company.companyId, createInput(company, { location: location({ endpoint: "https://169.254.169.254/" }) }), BOARD))
       .rejects.toMatchObject({ status: 422 });
-    process.env.PAPERCLIP_STORAGE_PRIVATE_ORIGINS = "http://127.0.0.1:9000";
+    // Allowlist entries are compared as origins, so a trailing slash still matches.
+    process.env.PAPERCLIP_STORAGE_PRIVATE_ORIGINS = "http://127.0.0.1:9000/, http://minio.internal:9000";
+    // An allowlisted private host name must use path style, so no bucket subdomain of it is dialled.
+    await expect(service.create(company.companyId, createInput(company, {
+      location: location({ endpoint: "http://minio.internal:9000/", bucket: "local-minio", forcePathStyle: false, prefix: "vhost" }),
+    }), BOARD)).rejects.toMatchObject({ status: 422 });
     await expect(service.create(company.companyId, createInput(company, {
       location: location({ endpoint: "http://127.0.0.1:9000/", bucket: "local-minio", forcePathStyle: true }),
     }), BOARD)).resolves.toMatchObject({ created: true });
   });
 
-  it("resolves the pinned keys through the binding check and stops when a secret is disabled", async () => {
+  it("hands out a client only after a current passing probe, with keys resolved through the binding check", async () => {
     const company = await seedCompany("resolve");
-    const bucket = fakeBucket();
-    const service = storageDestinationService(db, { providerFactory: bucket.factory });
+    const bucket = fakeBucket({ serverSideEncryption: "AES256" });
+    const service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => 403 });
     const { destination } = await service.create(company.companyId, createInput(company), BOARD);
-    await service.providerFor(company.companyId, destination.id);
-    expect(bucket.seenCredentials).toEqual([{ accessKeyId: "AKIA-resolve", secretAccessKey: "secret-resolve" }]);
-    const reads = await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.consumerId, destination.id));
-    expect(reads.map((event) => event.consumerType)).toEqual(["storage_destination", "storage_destination"]);
+    await expect(service.providerFor(company.companyId, destination.id))
+      .rejects.toMatchObject({ status: 409, details: { code: "storage_destination_unverified" } });
 
+    await service.probe(company.companyId, destination.id, BOARD);
+    await service.providerFor(company.companyId, destination.id);
+    expect(bucket.seenCredentials.at(-1)).toEqual({ accessKeyId: "AKIA-resolve", secretAccessKey: "secret-resolve" });
+    const reads = await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.consumerId, destination.id));
+    expect(new Set(reads.map((event) => event.consumerType))).toEqual(new Set(["storage_destination"]));
+    // The probe reads the keys as the board user who asked for it; the archive client as the system.
+    expect(reads.filter((event) => event.actorType === "user").map((event) => event.actorId)).toContain("board-user-1");
+
+    const seen = bucket.seenCredentials.length;
     await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, company.secretKeyId));
     await expect(service.providerFor(company.companyId, destination.id)).rejects.toBeTruthy();
-    expect(bucket.seenCredentials).toHaveLength(1);
+    expect(bucket.seenCredentials).toHaveLength(seen);
   });
 
   it("probes write, read, checksum, encryption, public read and isolation, then deletes its object", async () => {
@@ -286,10 +332,20 @@ describeEmbeddedPostgres("company storage destinations", () => {
       { bucket: { failPut: "AccessDenied" }, anonymousStatus: 403, code: "access_denied" },
       { bucket: { failDelete: true, serverSideEncryption: "AES256" }, anonymousStatus: 403, code: "cleanup_failed" },
       { bucket: { serverSideEncryption: "AES256" }, anonymousStatus: 403, locationOverride: { encryption: { mode: "kms", kmsKeyId: "alias/archive" } }, code: "encryption_mismatch" },
+      // s3_managed asked for, nothing reported: a provider that ignores the header stores plaintext.
+      { bucket: {}, anonymousStatus: 403, code: "encryption_unverified" },
+      // The privacy check could not run (here: a dotted bucket host that does not resolve): fail closed.
+      { bucket: { serverSideEncryption: "AES256" }, anonymousStatus: -1, locationOverride: { bucket: "dotted.archive" }, code: "public_read_unverified" },
     ];
     for (const [index, testCase] of cases.entries()) {
       const bucket = fakeBucket(testCase.bucket);
-      const service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => testCase.anonymousStatus });
+      const service = storageDestinationService(db, {
+        providerFactory: bucket.factory,
+        anonymousGet: async () => {
+          if (testCase.anonymousStatus < 0) throw new Error("getaddrinfo ENOTFOUND");
+          return testCase.anonymousStatus;
+        },
+      });
       const { destination } = await service.create(company.companyId, createInput(company, {
         location: location({ prefix: `case-${index}`, ...testCase.locationOverride }),
       }), BOARD);
@@ -377,6 +433,9 @@ describeEmbeddedPostgres("company storage destinations", () => {
       await request(app({ type: "agent", source: "agent_key", agentId: randomUUID(), companyId: company.companyId } as Express.Request["actor"]))
         .get(`/api/companies/${company.companyId}/storage/destinations`).expect(403);
       await request(app(board(company.companyId, "viewer"))).post(`/api/companies/${company.companyId}/storage/destinations`).send(createInput(company)).expect(403);
+      // Choosing where company keys go is an owner or admin action.
+      await request(app(board(company.companyId, "member"))).post(`/api/companies/${company.companyId}/storage/destinations`).send(createInput(company)).expect(403);
+      await request(app(board(company.companyId, "member"))).get(`/api/companies/${company.companyId}/storage/destinations`).expect(200);
       await request(app(board(company.companyId))).post(`/api/companies/${company.companyId}/storage/destinations/not-a-uuid/retire`).send({ expectedRevision: 0 }).expect(400);
       await request(app(board(company.companyId))).post(`/api/companies/${company.companyId}/storage/destinations`).send({ ...input, extra: true }).expect(400);
     });

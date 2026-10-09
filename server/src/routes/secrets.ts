@@ -16,7 +16,7 @@ import {
   updateUserSecretValueSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource } from "./authz.js";
+import { assertBoard, assertBoardOrAgent, assertCompanyAccess, assertCompanyAdmin, getAccessibleResource, hasCompanyAdminAccess } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -65,18 +65,8 @@ function setProposalPaginationHeaders(
   if (hasMore) res.setHeader("X-Next-Offset", String(page.offset + page.limit));
 }
 
-function hasSecretDefinitionAdminAccess(req: Parameters<typeof assertBoard>[0], companyId: string) {
-  assertBoard(req);
-  assertCompanyAccess(req, companyId);
-  if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return true;
-  const membership = req.actor.memberships?.find((item) => item.companyId === companyId);
-  return membership?.status === "active" && ["owner", "admin"].includes(String(membership.membershipRole));
-}
-
-function assertSecretDefinitionAdmin(req: Parameters<typeof assertBoard>[0], companyId: string) {
-  if (hasSecretDefinitionAdminAccess(req, companyId)) return;
-  throw forbidden("Company admin access required");
-}
+const hasSecretDefinitionAdminAccess = hasCompanyAdminAccess;
+const assertSecretDefinitionAdmin = assertCompanyAdmin;
 
 function assertCompanySecretWrite(req: Parameters<typeof assertBoard>[0], companyId: string) {
   assertBoard(req);

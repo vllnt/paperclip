@@ -8,6 +8,8 @@ export interface PutObjectInput {
   body: Buffer | Readable;
   contentType: string;
   contentLength: number;
+  /** Cancels a single-request upload (S3). */
+  signal?: AbortSignal;
 }
 
 export interface GetObjectInput {
