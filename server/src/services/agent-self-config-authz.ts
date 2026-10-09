@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { ADAPTER_AGNOSTIC_KEYS } from "@paperclipai/shared";
+import { normalizeAgentPermissions } from "./agent-permissions.js";
 
 /**
  * Agent fields that bound how much an agent may run and spend, where it runs,
@@ -280,6 +281,55 @@ export function agentProtectedConfigAfterPatch(
       ? (typeof patch.defaultEnvironmentId === "string" ? patch.defaultEnvironmentId : null)
       : existing.defaultEnvironmentId,
   };
+}
+
+/**
+ * Lists the protected settings a caller supplies when it creates, hires, or
+ * first-provisions an agent, by comparing the request with a bare new agent.
+ * There is no existing agent to compare with, so this is the check that an
+ * agent cannot hand a new agent limits it could not set on an existing one.
+ * Left out on purpose: `adapterType` (every create picks one), `cwd` (a limit
+ * only with a sandbox scope, which is protected), the `ceo` role only (other
+ * roles carry no authority), and `runtimeConfig.aiConnection` (its own
+ * connection-access check governs it). Supplying `canCreateAgents: true`
+ * always counts.
+ */
+export function collectNewAgentProtectedFields(input: {
+  adapterType: string;
+  adapterConfig?: unknown;
+  runtimeConfig?: unknown;
+  budgetMonthlyCents?: number | null;
+  role?: string | null;
+  defaultEnvironmentId?: string | null;
+  permissions?: unknown;
+}): string[] {
+  const baseline: AgentProtectedConfigState = {
+    adapterType: input.adapterType,
+    adapterConfig: {},
+    runtimeConfig: {},
+    budgetMonthlyCents: 0,
+    role: "general",
+    defaultEnvironmentId: null,
+  };
+  const requested: AgentProtectedConfigState = {
+    adapterType: input.adapterType,
+    adapterConfig: input.adapterConfig ?? {},
+    runtimeConfig: input.runtimeConfig ?? {},
+    budgetMonthlyCents: input.budgetMonthlyCents ?? 0,
+    role: input.role === "ceo" ? "ceo" : "general",
+    defaultEnvironmentId: input.defaultEnvironmentId ?? null,
+  };
+  const fields = collectAgentProtectedConfigChanges(baseline, requested)
+    .filter((field) => field !== "adapterConfig.cwd" && field !== "runtimeConfig.aiConnection");
+
+  const supplied = recordOrEmpty(input.permissions);
+  const defaults = normalizeAgentPermissions({}, { context: "create" });
+  for (const key of Object.keys(supplied).sort()) {
+    if (!isDeepStrictEqual(defaults[key], supplied[key]) || (key === "canCreateAgents" && supplied[key] === true)) {
+      fields.push(`permissions.${key}`);
+    }
+  }
+  return fields;
 }
 
 /**

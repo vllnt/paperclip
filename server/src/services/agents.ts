@@ -119,6 +119,12 @@ interface ClaudeLoginContext {
 }
 
 interface UpdateAgentOptions {
+  /**
+   * Runs inside the update transaction after the agent row is locked with
+   * `SELECT ... FOR UPDATE`, so a caller that authorized against an earlier
+   * read can check the committed row before it writes. A throw aborts the update.
+   */
+  verifyLockedRow?: (locked: typeof agents.$inferSelect) => Promise<void>;
   recordRevision?: RevisionMetadata;
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
@@ -792,6 +798,16 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      if (options?.verifyLockedRow) {
+        const locked = await txDb
+          .select()
+          .from(agents)
+          .where(eq(agents.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!locked) return null;
+        await options.verifyLockedRow(locked);
+      }
       const updated = await txDb
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
@@ -1211,6 +1227,7 @@ export function agentService(db: Db) {
       id: string,
       revisionId: string,
       actor: { agentId?: string | null; userId?: string | null },
+      rollbackOptions?: Pick<UpdateAgentOptions, "verifyLockedRow">,
     ) => {
       const revision = await db
         .select()
@@ -1224,6 +1241,7 @@ export function agentService(db: Db) {
 
       const patch = configPatchFromSnapshot(revision.afterConfig);
       return updateAgent(id, patch, {
+        verifyLockedRow: rollbackOptions?.verifyLockedRow,
         recordRevision: {
           createdByAgentId: actor.agentId ?? null,
           createdByUserId: actor.userId ?? null,

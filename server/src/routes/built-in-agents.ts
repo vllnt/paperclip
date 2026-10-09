@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import { builtInAgentEmptyMutationSchema, builtInAgentProvisionSchema, builtInAgentResetSchema } from "@paperclipai/shared";
@@ -6,7 +7,7 @@ import { forbidden, notFound } from "../errors.js";
 import { accessService, instanceSettingsService, logActivity } from "../services/index.js";
 import { builtInAgentService } from "../services/built-in-agents.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
-import { collectAgentProtectedConfigChanges } from "../services/agent-self-config-authz.js";
+import { collectAgentProtectedConfigChanges, collectNewAgentProtectedFields } from "../services/agent-self-config-authz.js";
 import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import type { BuiltInAgentState } from "../services/built-in-agents.js";
@@ -96,10 +97,11 @@ export function builtInAgentRoutes(db: Db) {
   }
 
   /**
-   * Provisioning an existing built-in agent applies the caller's adapter type,
-   * adapter config, and budget to it. `agents:create` does not cover that, so
-   * an agent caller must hold `agents:configure` for the target to change a
-   * protected field this way, as it must on `PATCH /agents/:id`.
+   * Provisioning applies the caller's adapter type, adapter config, and budget
+   * to an existing built-in agent, or creates the agent with them. `agents:create`
+   * does not cover that, so an agent caller must hold `agents:configure` to
+   * change a protected field this way, as it must on `PATCH /agents/:id`. A
+   * first-time provision has no target, so it is compared with a bare new agent.
    */
   async function assertAgentCallerMayProvisionProtectedFields(
     req: Request,
@@ -110,19 +112,37 @@ export function builtInAgentRoutes(db: Db) {
     if (req.actor.type !== "agent") return;
     if (body.adapterType === undefined && body.adapterConfig === undefined && body.budgetMonthlyCents === undefined) return;
     const existing = (await svc.get(companyId, key)).agent;
-    if (!existing) return;
     const actor = getActorInfo(req);
+    const activityActor = {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+    };
+    if (!existing) {
+      await assertAgentProtectedChangeGranted({
+        db,
+        access,
+        req,
+        activityActor,
+        target: { id: randomUUID(), companyId },
+        entity: { type: "company", id: companyId },
+        fields: collectNewAgentProtectedFields({
+          adapterType: body.adapterType ?? "process",
+          adapterConfig: body.adapterConfig,
+          budgetMonthlyCents: body.budgetMonthlyCents,
+        }),
+        surface: "built_in_first_provision",
+        details: { builtInAgentKey: key },
+      });
+      return;
+    }
     await assertAgentProtectedChangeGranted({
       db,
       access,
       req,
-      activityActor: {
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-      },
+      activityActor,
       target: existing,
       fields: collectAgentProtectedConfigChanges(existing, {
         adapterType: body.adapterType ?? existing.adapterType,

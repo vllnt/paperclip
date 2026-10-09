@@ -111,8 +111,10 @@ import {
   collectAgentConfigRollbackChanges,
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
+  collectNewAgentProtectedFields,
+  type AgentProtectedConfigState,
 } from "../services/agent-self-config-authz.js";
-import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import { assertAgentProtectedChangeGranted, type AgentProtectedChangeSurface } from "./agent-protected-change-guard.js";
 import { configPatchFromSnapshot } from "../services/agents.js";
 import { normalizeAgentPermissions } from "../services/agent-permissions.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -2860,7 +2862,7 @@ export function agentRoutes(
     req: Request,
     targetAgent: { id: string; companyId: string },
     fields: string[],
-    surface: "patch" | "config_rollback" | "permissions",
+    surface: AgentProtectedChangeSurface,
   ) {
     if (req.actor.type !== "agent" || req.actor.agentId !== targetAgent.id || fields.length === 0) return;
     const actor = getActorInfo(req);
@@ -2879,6 +2881,105 @@ export function agentRoutes(
       fields,
       surface,
     });
+  }
+
+  /**
+   * An agent that creates or hires an agent may not give it settings it could
+   * not set on an existing agent. There is no target to compare with, so the
+   * request is compared with a bare new agent, and a protected setting needs
+   * `agents:configure` for the new agent (a company-wide grant). Board callers
+   * and hires that wait for board approval are not checked here.
+   */
+  async function assertAgentMayCreateWithProtectedFields(
+    req: Request,
+    companyId: string,
+    newAgentId: string,
+    input: Parameters<typeof collectNewAgentProtectedFields>[0],
+    surface: "agent_create" | "agent_hire",
+  ) {
+    if (req.actor.type !== "agent") return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target: { id: newAgentId, companyId },
+      entity: { type: "company", id: companyId },
+      fields: collectNewAgentProtectedFields(input),
+      surface,
+    });
+  }
+
+  function protectedStateOfAgentRow(row: {
+    adapterType: string;
+    adapterConfig: unknown;
+    runtimeConfig: unknown;
+    budgetMonthlyCents: number;
+    role: string;
+    status: string;
+    defaultEnvironmentId: string | null;
+  }): AgentProtectedConfigState {
+    return {
+      adapterType: row.adapterType,
+      adapterConfig: row.adapterConfig,
+      runtimeConfig: row.runtimeConfig,
+      budgetMonthlyCents: row.budgetMonthlyCents,
+      role: row.role,
+      status: row.status,
+      defaultEnvironmentId: row.defaultEnvironmentId,
+    };
+  }
+
+  /**
+   * Builds the check `svc.update` runs on the locked agent row. The route
+   * authorized an agent's change against an earlier read. If a protected value
+   * changed since that read (for example a board user lowered a cap), the write
+   * would put the stale value back, so an agent without `agents:configure` gets
+   * 409 and the committed value stays. No concurrent protected change means
+   * the earlier decision stands. Only an agent editing itself needs this.
+   */
+  function lockedRowVerifier(
+    req: Request,
+    existing: Parameters<typeof protectedStateOfAgentRow>[0] & { id: string; companyId: string },
+    patch: () => Record<string, unknown>,
+    surface: "patch_conflict" | "config_rollback_conflict",
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId !== existing.id) return undefined;
+    return async (locked: Parameters<typeof protectedStateOfAgentRow>[0]) => {
+      const lockedState = protectedStateOfAgentRow(locked);
+      if (collectAgentProtectedConfigChanges(protectedStateOfAgentRow(existing), lockedState).length === 0) return;
+      const written = patch();
+      const fields = collectAgentProtectedConfigChanges(lockedState, {
+        adapterType: typeof written.adapterType === "string" ? written.adapterType : locked.adapterType,
+        adapterConfig: written.adapterConfig ?? locked.adapterConfig,
+        runtimeConfig: written.runtimeConfig ?? locked.runtimeConfig,
+        budgetMonthlyCents: typeof written.budgetMonthlyCents === "number" ? written.budgetMonthlyCents : locked.budgetMonthlyCents,
+        role: typeof written.role === "string" ? written.role : locked.role,
+        status: typeof written.status === "string" ? written.status : locked.status,
+        defaultEnvironmentId: Object.prototype.hasOwnProperty.call(written, "defaultEnvironmentId")
+          ? (typeof written.defaultEnvironmentId === "string" ? written.defaultEnvironmentId : null)
+          : locked.defaultEnvironmentId,
+      });
+      if (fields.length === 0) return;
+      try {
+        await assertCanChangeOwnProtectedAgentFields(req, existing, fields, surface);
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 403) {
+          throw conflict("The agent configuration changed while this update was being applied. Re-read the agent and retry.", {
+            code: "agent_config_changed_concurrently",
+            fields,
+          });
+        }
+        throw error;
+      }
+    };
   }
 
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
@@ -4451,6 +4552,8 @@ export function agentRoutes(
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
       agentId: actor.agentId,
       userId: actor.actorType === "user" ? actor.actorId : null,
+    }, {
+      verifyLockedRow: lockedRowVerifier(req, existing, () => configPatchFromSnapshot(rollbackConfig), "config_rollback_conflict"),
     });
     if (!updated) {
       res.status(404).json({ error: "Revision not found" });
@@ -4655,6 +4758,16 @@ export function agentRoutes(
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
+    }
+
+    if (!company.requireBoardApprovalForNewAgents) {
+      await assertAgentMayCreateWithProtectedFields(
+        req,
+        companyId,
+        hiredAgentId,
+        { ...hireInput, adapterConfig: inheritRuntimeFrom === "caller" ? {} : hireInput.adapterConfig },
+        "agent_hire",
+      );
     }
 
     // Idempotency within a run: if this run already created a hire from this
@@ -4902,6 +5015,7 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     const agentId = randomUUID();
+    await assertAgentMayCreateWithProtectedFields(req, companyId, agentId, createInput, "agent_create");
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
       agentId,
@@ -5697,6 +5811,7 @@ export function agentRoutes(
 
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
+      verifyLockedRow: lockedRowVerifier(req, existing, () => patchData, "patch_conflict"),
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,

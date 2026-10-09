@@ -27,10 +27,13 @@ export async function assertAgentProtectedChangeGranted(input: {
   req: Request;
   activityActor: AgentProtectedChangeActivityActor;
   target: { id: string; companyId: string };
+  /** Where the denial is logged. Defaults to the target agent; creates log against the company because the agent does not exist yet. */
+  entity?: { type: "agent" | "company"; id: string };
   fields: string[];
   surface: AgentProtectedChangeSurface;
   details?: Record<string, unknown>;
 }): Promise<void> {
+  const entity = input.entity ?? { type: "agent" as const, id: input.target.id };
   await assertProtectedChangeGranted({
     actor: input.req.actor,
     decide: (request) => input.access.decide(request),
@@ -39,8 +42,8 @@ export async function assertAgentProtectedChangeGranted(input: {
         companyId: input.target.companyId,
         ...input.activityActor,
         action: "agent.self_config_update_denied",
-        entityType: "agent",
-        entityId: input.target.id,
+        entityType: entity.type,
+        entityId: entity.id,
         details,
       });
     },

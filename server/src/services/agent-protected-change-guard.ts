@@ -11,7 +11,12 @@ export type AgentProtectedChangeSurface =
   | "permissions"
   | "join_replay"
   | "plugin_managed_reset"
-  | "built_in_provision";
+  | "built_in_provision"
+  | "patch_conflict"
+  | "config_rollback_conflict"
+  | "agent_create"
+  | "agent_hire"
+  | "built_in_first_provision";
 
 /**
  * Refuses a change to an agent's protected fields unless the actor holds a
