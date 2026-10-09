@@ -6,9 +6,11 @@ import {
   agents,
   companies,
   companySkills,
+  costEvents,
   createDb,
   documents,
   documentRevisions,
+  financeEvents,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -44,6 +46,8 @@ describeEmbeddedPostgres("cleanup removal services", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(financeEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(issueReadStates);
@@ -277,6 +281,42 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     expect(removed?.id).toBe(companyId);
     await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
     await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
+    await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("removes cost and finance events before deleting the runs they reference", async () => {
+    const { agentId, companyId, issueId, runId } = await seedFixture();
+    const costEventId = randomUUID();
+    const now = new Date();
+
+    await db.insert(costEvents).values({
+      id: costEventId,
+      companyId,
+      agentId,
+      issueId,
+      heartbeatRunId: runId,
+      provider: "anthropic",
+      model: "claude-test",
+      costCents: 12,
+      occurredAt: now,
+    });
+    await db.insert(financeEvents).values({
+      companyId,
+      agentId,
+      heartbeatRunId: runId,
+      costEventId,
+      eventKind: "inference_charge",
+      biller: "anthropic",
+      amountCents: 12,
+      occurredAt: now,
+    });
+
+    const removed = await companyService(db).remove(companyId);
+
+    expect(removed?.id).toBe(companyId);
+    await expect(db.select().from(costEvents).where(eq(costEvents.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(financeEvents).where(eq(financeEvents.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
   });
 });
