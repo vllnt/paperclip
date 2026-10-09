@@ -3676,7 +3676,10 @@ function createPluginEnvironmentDriver(
         expiresAt: providerAttestedLeaseExpiry(input.requestedExpiresAt, parseExpiresAt(providerLease.expiresAt)),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
-          providerMetadata: providerLease.metadata ?? {},
+          providerMetadata: stripSecretRefValuesFromPluginLeaseMetadata({
+            metadata: providerLease.metadata,
+            schema: driver.configSchema as Record<string, unknown> | null | undefined,
+          }),
           driver: input.environment.driver,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: plugin.id,
