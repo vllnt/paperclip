@@ -533,6 +533,7 @@ npx paperclipai agent create --company-id <company-id> --payload-json '{"name":"
 npx paperclipai agent hire --company-id <company-id> --payload-json '{...}'
 npx paperclipai agent update <agent-id> --payload-json '{"title":"Senior Builder"}'
 npx paperclipai agent delete <agent-id> --yes
+npx paperclipai agent set-adapter <agent-id> grok_local [--dry-run]
 npx paperclipai agent me
 npx paperclipai agent inbox
 npx paperclipai agent inbox-mine --user-id <board-user-id>

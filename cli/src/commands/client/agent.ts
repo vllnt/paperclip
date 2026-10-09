@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { planCodexToGrokSwitch } from "@paperclipai/adapter-grok-local";
 import {
   agentFallbacksSchema,
   agentSkillSyncSchema,
@@ -59,6 +60,10 @@ interface AgentWakeOptions extends BaseClientOptions {
 
 interface AgentFallbacksSetOptions extends BaseClientOptions {
   fallbacksJson: string;
+}
+
+interface AgentSetAdapterOptions extends BaseClientOptions {
+  dryRun?: boolean;
 }
 
 interface AgentJsonPayloadOptions extends BaseClientOptions {
@@ -451,6 +456,37 @@ export function registerAgentCommands(program: Command): void {
           const ctx = resolveCommandContext(opts);
           const result = await ctx.api.post(apiPath`/api/agents/${agentId}/harness-cooldowns/clear`, {});
           printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("set-adapter")
+      .description(
+        "Move a codex_local agent that runs a Grok model onto grok_local, keeping its model, instructions, working directory and skills",
+      )
+      .argument("<agentId>", "Agent ID")
+      .argument("<adapterType>", "Target adapter; only grok_local is supported")
+      .option("--dry-run", "Print the planned change without applying it")
+      .action(async (agentId: string, adapterType: string, opts: AgentSetAdapterOptions) => {
+        try {
+          if (adapterType !== "grok_local") {
+            throw new Error(`set-adapter supports only grok_local; got "${adapterType}". Use the agent update API for other changes.`);
+          }
+          const ctx = resolveCommandContext(opts);
+          const row = await ctx.api.get<Agent>(apiPath`/api/agents/${agentId}`);
+          if (!row) throw new Error(`Agent ${agentId} not found`);
+          const plan = planCodexToGrokSwitch(row);
+          if (!plan.ok) throw new Error(plan.message);
+          if (opts.dryRun) {
+            printOutput({ dryRun: true, patch: plan.patch, changes: plan.changes, warnings: plan.warnings }, { json: ctx.json });
+            return;
+          }
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, plan.patch);
+          printOutput({ agent: updated, changes: plan.changes, warnings: plan.warnings }, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
