@@ -41,6 +41,7 @@ import {
   removeHotRestartIntent,
   writeHotRestartIntent,
 } from "../services/hot-restart.js";
+import { resourceCapacityService } from "../services/resource-capacity.js";
 
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,
@@ -385,6 +386,19 @@ export function healthRoutes(
         })
       : undefined;
 
+    // Instance admins only: the host's capacity level lets a health check
+    // alert on a full disk. No numbers; the instance capacity route has them.
+    const actor = "actor" in req ? req.actor : undefined;
+    const resourceCapacity =
+      exposeFullDetails
+      && actor?.type === "board"
+      && (actor.source === "local_implicit" || actor.isInstanceAdmin === true)
+        ? await resourceCapacityService(db).getCurrentInstanceLevel().catch((error) => {
+            logger.warn({ err: error }, "resource capacity health summary failed");
+            return undefined;
+          })
+        : undefined;
+
     if (!exposeFullDetails) {
       const redactedDatabaseBackup = databaseBackup ? redactedDatabaseBackupHealth(databaseBackup) : undefined;
       const redactedWarnings = redactedDatabaseBackup?.warnings.length ? redactedDatabaseBackup.warnings : undefined;
@@ -426,6 +440,7 @@ export function healthRoutes(
       serverInfo,
       startupRecovery,
       nativeRecovery,
+      ...(resourceCapacity ? { resourceCapacity } : {}),
       ...(databaseBackup ? { databaseBackup } : {}),
       ...(warnings ? { warnings } : {}),
       ...(devServer ? { devServer } : {}),
