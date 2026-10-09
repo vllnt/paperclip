@@ -165,7 +165,9 @@ df -Pk . 2>/dev/null | tail -n 1 | sed 's/^/rc:df /'
 - **Parsing is defensive:** the output comes from a host Paperclip does not
   control. Only tagged lines are read; each value must be a finite
   non-negative number in range (`free <= total`, `total > 0`, at most 4096
-  CPUs); unknown lines are ignored; output over 16 KB is discarded. The raw
+  CPUs); unknown lines are ignored; output that reaches the 16 KB cap is
+  discarded whole, because the worker's `head -c` may have cut its last line
+  mid-number. The raw
   output is never stored. A sample with any missing metric has
   `status: "partial"`; a failed command stores `status: "failed"` and a
   bounded error class (`timeout`, `auth`, `exit_<code>`), never stderr.
@@ -494,9 +496,19 @@ new rows.
    `resolveCompanyEnvironmentDefault`, `isExecutionForcedToKubernetes`) and
    the environment service's read-only finders. `executeRun` is not
    restructured: its side effects (`ensureLocalEnvironment`, lazy
-   Kubernetes provisioning) stay where they are, and a parity test pins the
+   Kubernetes provisioning) stay where they are, and a test pins the
    resolver to the same cases. Sandbox and plugin targets are not gated.
    The result is cached per agent for 15 s.
+   **No target.** The resolver returns no environment where `executeRun`
+   would create one or fail: forced Kubernetes before the company's managed
+   Kubernetes row exists (lazy provisioning), or managed-sandbox-only with no
+   managed row. Both outcomes are `sandbox` environments (or a fail-closed
+   run), which are never measured or gated. So a run with no resolved
+   target is gated by the instance `disk:data` and `disk:runLogs` rule only,
+   exactly as it would be once the sandbox row exists: provisioning cannot
+   change the admission decision. The company view lists the Kubernetes
+   environment (as `unsupported`) once it exists. If a measurable driver
+   ever gains lazy provisioning, this rule must be revisited.
 2. **Readings.** From the database, never process memory: the instance
    target row of this process's host and, for an SSH target, the
    environment's row (each cached 15 s). Processes on one host therefore
