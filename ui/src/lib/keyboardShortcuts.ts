@@ -9,6 +9,18 @@ export const KEYBOARD_SHORTCUT_TEXT_INPUT_SELECTOR = [
 ].join(", ");
 
 const PAGE_SEARCH_SHORTCUT_SELECTOR = "[data-page-search-target='true']";
+
+/**
+ * An open modal dialog. Radix (shadcn `dialog`, `sheet`, `alert-dialog`)
+ * marks modal content with `data-state` but not `aria-modal`, so both forms
+ * are listed. Popover content also has `role="dialog"` but is not modal.
+ */
+export const OPEN_MODAL_DIALOG_SELECTOR = [
+  "[role='dialog'][aria-modal='true']",
+  "[data-slot='dialog-content'][data-state='open']",
+  "[data-slot='sheet-content'][data-state='open']",
+  "[data-slot='alert-dialog-content'][data-state='open']",
+].join(", ");
 const MODIFIER_ONLY_KEYS = new Set(["Shift", "Meta", "Control", "Alt"]);
 
 export type InboxQuickArchiveKeyAction = "ignore" | "archive" | "disarm";
@@ -21,6 +33,11 @@ export type IssueDetailGoKeyAction =
   | "open_file_viewer"
   | "disarm";
 export type AttentionQueueKeyAction = "ignore" | "next" | "previous" | "toggle" | "dismiss";
+export type GoChordKeyAction =
+  | { type: "ignore" }
+  | { type: "arm" }
+  | { type: "disarm" }
+  | { type: "run"; actionId: string };
 
 export function isKeyboardShortcutTextInputTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -29,14 +46,14 @@ export function isKeyboardShortcutTextInputTarget(target: EventTarget | null): b
 }
 
 export function hasBlockingShortcutDialog(root: ParentNode = document): boolean {
-  return !!root.querySelector("[role='dialog'][aria-modal='true']");
+  return !!root.querySelector(OPEN_MODAL_DIALOG_SELECTOR);
 }
 
 function isVisibleShortcutTarget(element: HTMLElement): boolean {
   if (!element.isConnected) return false;
   if ("disabled" in element && typeof element.disabled === "boolean" && element.disabled) return false;
   if (element.closest("[hidden], [aria-hidden='true'], [inert]")) return false;
-  if (element.closest("[role='dialog'][aria-modal='true']")) return false;
+  if (element.closest(OPEN_MODAL_DIALOG_SELECTOR)) return false;
 
   const style = window.getComputedStyle(element);
   if (style.display === "none" || style.visibility === "hidden") return false;
@@ -210,4 +227,44 @@ export function resolveIssueDetailGoKeyAction({
   if (normalizedKey === "f") return "open_file_viewer";
   if (normalizedKey === "g") return "arm";
   return "disarm";
+}
+
+/**
+ * The global `g` chord: `g` arms it, and the next key runs the action that
+ * `chords` maps it to (see `commandActionGoChords`). Page handlers that claim
+ * a chord first (issue detail's `g c`) prevent the default, which disarms.
+ */
+export function resolveGoChordKeyAction({
+  armed,
+  chords,
+  defaultPrevented,
+  key,
+  metaKey,
+  ctrlKey,
+  altKey,
+  target,
+  hasOpenDialog,
+}: {
+  armed: boolean;
+  chords: ReadonlyMap<string, string>;
+  defaultPrevented: boolean;
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  target: EventTarget | null;
+  hasOpenDialog: boolean;
+}): GoChordKeyAction {
+  if (defaultPrevented) return { type: armed ? "disarm" : "ignore" };
+  if (metaKey || ctrlKey || altKey || isModifierOnlyKey(key)) return { type: "ignore" };
+  if (hasOpenDialog || isKeyboardShortcutTextInputTarget(target)) {
+    return { type: armed ? "disarm" : "ignore" };
+  }
+
+  const normalizedKey = key.toLowerCase();
+  if (!armed) return { type: normalizedKey === "g" ? "arm" : "ignore" };
+  const actionId = chords.get(normalizedKey);
+  if (actionId) return { type: "run", actionId };
+  if (normalizedKey === "g") return { type: "arm" };
+  return { type: "disarm" };
 }
