@@ -2935,20 +2935,21 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        // A plugin is not the board, so the company focus stays out of its reach.
         return (await goals.create(companyId, {
           title: params.title,
           description: params.description,
-          level: params.level as any,
-          status: params.status as any,
+          level: params.level,
+          status: params.status,
           parentId: params.parentId,
           ownerAgentId: params.ownerAgentId,
-        })) as Goal;
+        }, "plugin")) as Goal;
       },
       async update(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         requireInCompany("Goal", await goals.getById(params.goalId), companyId);
-        return (await goals.update(params.goalId, params.patch)) as Goal;
+        return (await goals.update(params.goalId, params.patch, "plugin")) as Goal;
       },
     },
 

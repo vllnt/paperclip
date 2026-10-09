@@ -6,7 +6,7 @@ import { writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/se
 import { findActiveServerAdapter } from "../adapters/registry.js";
 import { agentService } from "./agents.js";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "./company-skills.js";
-import { goalService } from "./goals.js";
+import { goalService, type GoalWriter } from "./goals.js";
 import { projectService } from "./projects.js";
 import { issueService } from "./issues.js";
 import { readBuiltInAgentMarker } from "./built-in-agent-metadata.js";
@@ -189,6 +189,7 @@ export function onboardingSeedService(db: Db) {
     dbx: Db,
     companyId: string,
     seed: ApplyOnboardingSeed,
+    goalWriter: GoalWriter,
   ): Promise<OnboardingSeedApplication> {
     const agentSvc = agentService(dbx);
     const goalSvc = goalService(dbx);
@@ -223,7 +224,7 @@ export function onboardingSeedService(db: Db) {
         await goalSvc.update(target, {
           title: parsed.title,
           description: parsed.description,
-        });
+        }, goalWriter);
         goalId = target;
       } else {
         const created = await goalSvc.create(companyId, {
@@ -231,7 +232,7 @@ export function onboardingSeedService(db: Db) {
           description: parsed.description,
           level: "company",
           status: "active",
-        });
+        }, goalWriter);
         goalId = created.id;
       }
     }
@@ -404,7 +405,8 @@ export function onboardingSeedService(db: Db) {
         sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:onboarding-seed:${companyId}`}, 0))`,
       );
       const dbx = tx as unknown as Db;
-      const applied = await applyWithin(dbx, companyId, seed);
+      // Cloud pushes as the board. Anyone else is held to the goal service's company focus rule.
+      const applied = await applyWithin(dbx, companyId, seed, audit?.actorType === "user" ? "board" : "agent");
 
       if (applied.changed && audit) {
         await logActivity(

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -301,6 +301,50 @@ describeEmbeddedPostgres("POST /api/companies/:companyId/onboarding-seed", () =>
     expect(response.status).toBe(403);
     expect(await ctx.db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
     expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
+  });
+
+  describe("company focus", () => {
+    async function seedCompanyGoalAndAgent(companyId: string, horizon: "short" | "long") {
+      const [goal] = await ctx.db
+        .insert(goals)
+        .values({ companyId, title: "Ship v2", level: "company", status: "active", horizon })
+        .returning();
+      const agentId = randomUUID();
+      await ctx.db.insert(agents).values({
+        id: agentId, companyId, name: "Writer", role: "engineer", status: "idle",
+        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      const agentApp = routeApp(ctx.db, { type: "agent", source: "agent_key", companyId, agentId } as never, onboardingSeedRoutes);
+      return { goalId: goal!.id, agentApp };
+    }
+
+    it("refuses an agent that would rename a short term company goal, and lets the board", async () => {
+      const { companyId, app } = await seedCompany();
+      const { goalId, agentApp } = await seedCompanyGoalAndAgent(companyId, "short");
+
+      const refused = await post(agentApp, companyId, SEED);
+
+      expect(refused.status).toBe(403);
+      expect((await ctx.db.select().from(goals).where(eq(goals.id, goalId)))[0]?.title).toBe("Ship v2");
+      expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
+      expect(await ctx.db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
+
+      const applied = await post(app, companyId, SEED);
+
+      expect(applied.status).toBe(200);
+      expect(applied.body.goalId).toBe(goalId);
+      expect((await ctx.db.select().from(goals).where(eq(goals.id, goalId)))[0]?.title).toBe(SEED.mission);
+    });
+
+    it("still lets an agent apply a seed when the company goal is outside the focus", async () => {
+      const { companyId } = await seedCompany();
+      const { goalId, agentApp } = await seedCompanyGoalAndAgent(companyId, "long");
+
+      const applied = await post(agentApp, companyId, SEED);
+
+      expect(applied.status).toBe(200);
+      expect((await ctx.db.select().from(goals).where(eq(goals.id, goalId)))[0]?.title).toBe(SEED.mission);
+    });
   });
 
   it("rejects a body missing the revision", async () => {
