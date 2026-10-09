@@ -524,6 +524,65 @@ describe("built-in agent routes", () => {
       expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
     });
 
+    it.each([
+      {
+        label: "adapter config",
+        body: { adapterType: "codex_local", adapterConfig: { model: "gpt-large", dangerouslyBypassApprovalsAndSandbox: true } },
+        fields: ["adapterConfig.dangerouslyBypassApprovalsAndSandbox", "adapterConfig.model"],
+      },
+      {
+        label: "budget",
+        body: { adapterType: "codex_local", budgetMonthlyCents: 9_999_999 },
+        fields: ["budgetMonthlyCents"],
+      },
+    ])("denies a first-time provision with $label from an agent and logs it against the company", async ({ body, fields }) => {
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState({ agent: null }));
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields });
+      expect(mockBuiltInAgentService.provision).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        entityType: "company",
+        entityId: companyId,
+        action: "agent.self_config_update_denied",
+        details: expect.objectContaining({ surface: "built_in_first_provision", fields, builtInAgentKey: "briefs" }),
+      }));
+    });
+
+    it("still lets an agent first-provision a built-in agent with no protected settings", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState({ agent: null }));
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send({ adapterType: "codex_local" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
+    });
+
+    it("still first-provisions protected settings for an agent holding agents:configure", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState({ agent: null }));
+      decideByAction(true);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send({ adapterType: "codex_local", budgetMonthlyCents: 9_999_999 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
+    });
+
     it("keeps a board caller unchanged", async () => {
       mockBuiltInAgentService.get.mockResolvedValue(builtInState());
       decideByAction(false);
