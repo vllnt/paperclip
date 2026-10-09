@@ -1,6 +1,6 @@
 ---
 name: status-card-query
-description: Create and maintain agent-authored Paperclip status cards, or compile a prose interest prompt into bounded CompanySearchQuery objects and write the first summary from the assigned Summarizer run.
+description: Creates and maintains agent-authored Paperclip status cards, and compiles a card's prose prompt into bounded CompanySearchQuery objects. Use when asked to create or update a status card, or when assigned a summarizer run that writes a card's first summary.
 key: paperclipai/bundled/paperclip-operations/status-card-query
 recommendedForRoles:
   - general

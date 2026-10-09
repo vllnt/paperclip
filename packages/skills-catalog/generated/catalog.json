@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-08-11T15:05:34.526Z",
+  "generatedAt": "2026-10-09T21:01:33.833Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -11,7 +11,7 @@
       "category": "docs",
       "slug": "doc-maintenance",
       "name": "doc-maintenance",
-      "description": "Keep project docs aligned with recent code and feature changes — detect drift, update affected pages, and add release-relevant notes without rewriting unchanged sections.",
+      "description": "Keeps project docs aligned with recent code changes by detecting drift, updating affected pages, and adding release notes without rewriting unchanged sections. Use when user-visible behavior changed or before a release.",
       "path": "catalog/bundled/docs/doc-maintenance",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -32,11 +32,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 4478,
-          "sha256": "fb0353386c5e5e5e13bcbb3233f044e3dccecf371f429d6328f26c26d7cb6169"
+          "sizeBytes": 4525,
+          "sha256": "a3630d6bf1a881df12675c94d4f88fc4a17eb61c5c24847e7ae99a2b1f2b66fd"
         }
       ],
-      "contentHash": "sha256:2e02299210fd17c1fe1867b4ee8c144a11b6fe1fe481f83b8268cfbaaf10f9aa"
+      "contentHash": "sha256:391ec1b6ec7ed9c2772c8784f006eda6ee8e8c28359def180d1e4f940a2daeee"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:issue-triage",
@@ -45,7 +45,7 @@
       "category": "paperclip-operations",
       "slug": "issue-triage",
       "name": "issue-triage",
-      "description": "Triage Paperclip inbox issues that are stale, blocked, in-review, or assigned-but-not-progressing, and decide a single next action per issue (resume, reassign, unblock, escalate, or close).",
+      "description": "Triages Paperclip inbox issues that are stale, blocked, in review, or assigned but not progressing, and picks one next action per issue (resume, reassign, unblock, escalate, or close). Use for shift-start inbox reviews or when issues have stopped moving.",
       "path": "catalog/bundled/paperclip-operations/issue-triage",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -67,11 +67,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 4042,
-          "sha256": "df5bdc8bf5e017b7ba5f70a4b5323fad51d0c323278f386580f26cf43ad09160"
+          "sizeBytes": 4107,
+          "sha256": "5c5d40e189bb58d11bef6df562226c35f1dfd58729f47fe71ae34172c5869e45"
         }
       ],
-      "contentHash": "sha256:88dc13560371fb364963782cb4f6eeb4090fcde92ee3774479428ed6b90e11c1"
+      "contentHash": "sha256:8e044fdf8385f2e8155a1dbbffc24065cda0954a968ad9615f40ee7d78c49d69"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:reflection-coach",
@@ -115,7 +115,7 @@
       "category": "paperclip-operations",
       "slug": "status-card-query",
       "name": "status-card-query",
-      "description": "Create and maintain agent-authored Paperclip status cards, or compile a prose interest prompt into bounded CompanySearchQuery objects and write the first summary from the assigned Summarizer run.",
+      "description": "Creates and maintains agent-authored Paperclip status cards, and compiles a card's prose prompt into bounded CompanySearchQuery objects. Use when asked to create or update a status card, or when assigned a summarizer run that writes a card's first summary.",
       "path": "catalog/bundled/paperclip-operations/status-card-query",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -137,11 +137,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 6368,
-          "sha256": "0c6140f51d503cbadc98723ce54c0def48e7e31ea159b0935b8ad6369291498a"
+          "sizeBytes": 6429,
+          "sha256": "978d991c022f5125ea47883a07228138c3dccf98769ab0dd50be9a7e6c632dc3"
         }
       ],
-      "contentHash": "sha256:2b6e53bf8491f027afdbd6961ad84f677cfd385a0a6a73616ea84111ca8886ed"
+      "contentHash": "sha256:4d54dc1c0de08317f68973370b5d464ceb8dc0846aff4e913ae4f3c170324deb"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:summarize-status",
@@ -150,7 +150,7 @@
       "category": "paperclip-operations",
       "slug": "summarize-status",
       "name": "summarize-status",
-      "description": "Write a short, colloquial summary for a Paperclip summary slot: open with the 1–3 specific, concrete actions the reader needs to take right now to unblock the work, then a brief plain-language status, streaming progress as it works.",
+      "description": "Writes a short, colloquial summary for a Paperclip summary slot, opening with the 1–3 concrete actions the reader must take to unblock the work, followed by a plain-language status. Use when a summary-generation issue names a scope and slot, or a board user refreshes a summary card.",
       "path": "catalog/bundled/paperclip-operations/summarize-status",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -172,11 +172,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 8877,
-          "sha256": "4cb3d177f5d16e3cc2052d2f80e7fb245ab95e79c1e947abdc84cd4ee3d8c61e"
+          "sizeBytes": 8928,
+          "sha256": "567fb438f7bc1ec2102a3532746413495f29ea80729cc6a22429bc7f61342b4a"
         }
       ],
-      "contentHash": "sha256:3e49ee2b8d83d1371fb0f59197bb96c46b64f722540405f46d4a5a756fbe1b89"
+      "contentHash": "sha256:612699c09923997e8e13efdbdea4e220309e5389fe377294b2c2dde46fd08a73"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:task-planning",
@@ -185,7 +185,7 @@
       "category": "paperclip-operations",
       "slug": "task-planning",
       "name": "task-planning",
-      "description": "Turn a Paperclip issue or request into a structured implementation plan with child task graph, blockers, owners, and acceptance criteria, then save it as the issue `plan` document.",
+      "description": "Turns a Paperclip issue or request into a structured implementation plan with a child task graph, blockers, owners, and acceptance criteria, saved as the issue `plan` document. Use when asked to plan, scope, or break down work, or when an issue is too large for one heartbeat.",
       "path": "catalog/bundled/paperclip-operations/task-planning",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -207,11 +207,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 4938,
-          "sha256": "9c52a44a30ec8d306119da51bf298e9e3e6c382a9a9559ffd3054bf5e0c75f36"
+          "sizeBytes": 5034,
+          "sha256": "8e923a63c93a1008ba71912d73ee55ccedc19f49c5e772dd3214344149e18cc5"
         }
       ],
-      "contentHash": "sha256:487c3116eead89fef4f71c984329c41836bd69951b7ef9ed8736c69435e02438"
+      "contentHash": "sha256:8ff223d473d4af8830f5f15f544780356124b5c413a4c7ab01dbf0fed6649be3"
     },
     {
       "id": "paperclipai:bundled:product:paperclip-capsules",
@@ -354,7 +354,7 @@
       "category": "quality",
       "slug": "qa-acceptance",
       "name": "qa-acceptance",
-      "description": "Produce QA acceptance criteria and a manual validation plan for a feature change — golden path, edge cases, error states, performance limits, and explicit pass/fail evidence.",
+      "description": "Produces QA acceptance criteria and a manual validation plan for a feature change, covering golden path, edge cases, error states, performance limits, and explicit pass/fail evidence. Use when a feature change heads to QA or a reviewer must verify user-visible behavior.",
       "path": "catalog/bundled/quality/qa-acceptance",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -376,11 +376,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 3861,
-          "sha256": "c631b437ab26d104af6cdb963d8f679a9341439041b3cb3ec8835f4ff551b378"
+          "sizeBytes": 3955,
+          "sha256": "187795d30f39a713d406e92115f20e3a3ab15bf36abc7cc8258f8c2b1afd5a70"
         }
       ],
-      "contentHash": "sha256:32372dacaf62e93454b9855968c4eec96456ba78b509f450b3dfaa48e31ef356"
+      "contentHash": "sha256:f1e1407c1d628922f115df92c7852f8e89d93902f274f8f0a61e988377d95dee"
     },
     {
       "id": "paperclipai:bundled:software-development:github-pr-workflow",
@@ -389,7 +389,7 @@
       "category": "software-development",
       "slug": "github-pr-workflow",
       "name": "github-pr-workflow",
-      "description": "Prepare a GitHub pull request from a feature branch — branch hygiene, commit shape, title/body, verification notes, screenshots for UI work, and replies to review comments.",
+      "description": "Prepares a GitHub pull request from a feature branch, covering branch hygiene, commit shape, title and body, verification notes, UI screenshots, and replies to review comments. Use when opening a PR or responding to review feedback.",
       "path": "catalog/bundled/software-development/github-pr-workflow",
       "entrypoint": "SKILL.md",
       "trustLevel": "markdown_only",
@@ -409,11 +409,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 3970,
-          "sha256": "f498ec4ebb1779dea37adeb1db8a8b22316282798e35ee02e2fc5ff627d7e261"
+          "sizeBytes": 4028,
+          "sha256": "6ef87e766637894faa28af6020f8dbddb27a4304edb0e9a1c32c47defe945729"
         }
       ],
-      "contentHash": "sha256:90f278c89aa0711be150c1cd2456ca25620d02f36995b113ca9837d756a37f6c"
+      "contentHash": "sha256:a32099b35bfaa301a3423cdd23dc4c170c5cfb7a9ee6942b36f40313351573f5"
     },
     {
       "id": "paperclipai:optional:browser:agent-browser",

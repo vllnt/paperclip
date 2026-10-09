@@ -19,6 +19,18 @@ const KNOWN_CATALOG_ERRORS: Record<string, string[]> = {
   "optional/content/release-announcement": ["B4"],
 };
 
+/**
+ * Catalog skills whose description does not yet say when to use the skill (F7). The list may only shrink, so a
+ * bundled skill cannot lose its use-when clause and an optional skill that gets one must leave this list.
+ */
+const KNOWN_CATALOG_WITHOUT_USE_WHEN = [
+  "optional/browser/agent-browser",
+  "optional/content/release-announcement",
+  "optional/content/simplified-english",
+  "optional/finance/ramp",
+  "optional/product/design-critique",
+];
+
 /** Warnings the lean core release accepts on purpose. B2 is the bytes/4 estimate of the always-loaded file. */
 const ACCEPTED_RELEASE_WARNINGS: string[] = ["B2"];
 
@@ -77,6 +89,13 @@ describe("skill quality of shipped skills", () => {
       if (report.metrics.bodyLines > 500) violations.push(`${relative}: body is ${report.metrics.bodyLines} lines`);
     }
     expect(violations).toEqual([]);
+  });
+
+  it("says when to use every bundled catalog skill, beyond the known optional ones", () => {
+    const withoutUseWhen = catalogSkillDirectories()
+      .filter((relative) => checkSkillDirectory(path.join(CATALOG_ROOT, relative), path.basename(relative)).findings.some((f) => f.id === "F7"))
+      .sort();
+    expect(withoutUseWhen).toEqual([...KNOWN_CATALOG_WITHOUT_USE_WHEN].sort());
   });
 });
 
