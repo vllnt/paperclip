@@ -1,0 +1,540 @@
+# Full observability: usage, cost, waste, bottlenecks and closed feedback loops
+
+Date: 2026-10-09
+Status: Phase 1 (data inventory and slice plan). No code written yet.
+Branch: `feat/full-observability`
+
+## 1. Goal and constraints
+
+Give operators one place (the Audit hub, API and CLI with identical data) to see
+what every run consumed and what it achieved, per run, routine, agent, issue,
+project and company, so bottlenecks and waste are found from data and every change
+is measured afterwards: **data, finding, decision, change, measured result**.
+
+Why now (operator evidence from anthm, 2026-10-09, not independently measured here):
+about 950 runs a day with about 30% failing in bursts (server restarts, worker disk
+full, restore-lock timeouts, provider quota, Convex `DeploymentQuotaReached`); the
+core skill is about 16k tokens loaded on every run (about 15M tokens a day); no view
+joins agent effort to outcomes (runs, PRs, CI cycles, review rounds, merges).
+
+Constraints, all binding:
+
+- **Company isolation** on every table, query, panel and export.
+- **No secrets or prompt contents in metrics.** Counts, closed enums, ids and
+  length-capped identifiers only.
+- **Cheap at write time**, heavy work async, indexes planned for millions of runs,
+  an explicit retention policy.
+- **Fail-open.** An observability failure never fails, delays or retries a run.
+- **Migrations safe on a live DB**: additive `CREATE TABLE` only, no `ALTER` of hot tables.
+- **API, CLI and UI parity** for every panel.
+
+### Which data path this is (AGENTS.md section 5.7)
+
+This feature is on the **run-log path**: rows in the local instance database,
+queried by the local server. It is **not Paperclip Telemetry** (first-party events to
+a Paperclip endpoint) and **not OpenTelemetry** (operator OTLP endpoint). This
+feature itself sends nothing off the instance, so neither the strict telemetry review
+nor the generated telemetry contract applies. The existing `agent.task_run` telemetry
+event (`packages/shared/src/telemetry/events.ts:127-154`) and the terminal-run seam that
+emits it (`heartbeat.ts:12939`) are not used. A reviewer should reject any slice that
+imports from `packages/shared/src/telemetry/`. What a *consumer* of the export (Jev) does
+with it is the consumer's responsibility; the export carries ids, numbers and enums only.
+
+## 2. How this was measured, and what was not
+
+- **Method:** read the schema and the code that writes it (five parallel read-only
+  inventories, spot-checks of every claim that drives the design, then an independent
+  adversarial review that checked about 35 `file:line` claims and challenged the
+  design; its corrections are applied in this version). Each claim carries a
+  `file:line` from `main` at `a91d77cc4`. Items I could not confirm in code are marked
+  **UNVERIFIED**.
+- **Not measured: any live data.** The only local instance (`~/.paperclip/instances/default`)
+  holds zero runs, agents or issues, and I have no access to anthm. The operator's
+  figures (950 runs/day, 30% failed, 15M tokens/day) are cited, not reproduced.
+  Appendix A is a set of 12 read-only SQL queries for the operator to run on anthm;
+  all 12 were executed against a freshly migrated empty schema to prove they parse and
+  every column exists (that proves syntax, not results). **A1, A5 and A7 should run
+  before any token rollup is trusted** (section 5).
+- **Prior art this builds on, not replaces:**
+  - `doc/plans/2026-03-14-billing-ledger-and-reporting.md`: `cost_events` stays the
+    canonical **spend** ledger; `heartbeat_runs` stays the operational log. The new
+    record is a third thing, an **analytics fact** per run, and never feeds billing.
+  - `doc/plans/2026-03-13-TOKEN-OPTIMIZATION-PLAN.md`: found cumulative session totals
+    stored as per-run usage. `usage_json` now has normalized and raw keys plus
+    `usageSource`; section 5 covers what is still unsafe.
+  - `doc/run-log-events.md` and `doc/acp-run-lifecycle.md`: the closed-allowlist,
+    duration-and-outcome-only, fail-open pattern for run-log events. Reused here.
+
+## 3. What exists today
+
+### 3.1 Per-run storage
+
+| Where | What it holds | Writer | Gaps for observability |
+|---|---|---|---|
+| `heartbeat_runs` (`packages/db/src/schema/heartbeat_runs.ts`) | status, `error_code` (free text), `created_at`/`started_at`/`finished_at`, retry links (`retry_of_run_id`, `scheduled_retry_*`), `liveness_state`, `usage_json`, `result_json`, `context_snapshot`, `runtime_mode`, `driver_kind`, `driver_version`, log pointers (`log_bytes`) | claim at `heartbeat.ts:17802`, main terminal patch `:25721-25742`; 20+ other writers make a run terminal (reaper, shutdown, cancel, deferral, native reconcilers) | No model, provider, token or cost columns. Run to issue link is jsonb only. `process_loss_retry_count` has no writer (`heartbeat.ts:19510` reads a value that is always 0). No status history. No retention. Index `(company_id, created_at desc)` exists; nothing indexes `finished_at` or `usage_json` keys. |
+| `usage_json` (same table) | normalized `inputTokens`/`cachedInputTokens`/`outputTokens`, `raw*` twins, `usageSource` (`session_delta` or `per_run`), session reuse flags, `provider`, `biller`, `model`, `costUsd`, `cacheAdjustedCostUsd`, `costStatus`, `billingType` | single writer `heartbeat.ts:25641-25727`, only on the main adapter-result path; null when there is neither usage nor cost | Untyped (`Record<string, unknown>`); readers tolerate snake_case aliases (`activity.ts:45-85`, `work-timeline.ts:143-157`), so the shape has drifted. Three token classes only. Runs killed by the reaper or shutdown have none. |
+| `result_json` (same table) | adapter result plus server keys (`summary`, `executionRecovery`, `configFreshness`, `errorFamily`, `stopReason`, `cancellation`, `workspaceBusy`, ...). For Claude it is the raw CLI result event (`claude-local/execute.ts:1239-1240`) | `heartbeat.ts:25706-25710` | The natural home for a bounded, versioned `observability` object (section 7.2). |
+| `cost_events` (`schema/cost_events.ts`) | one row per finalized run with tokens or cost above 0: provider, biller, billing type, `cost_status`, model, input/cached/output (int4), `cost_cents` (int4), `heartbeat_run_id`, issue, project | `updateRuntimeState`, `heartbeat.ts:20120-20190` | No cache-write, reasoning, routine or latency. Sub-cent cost rounds to 0 cents (`heartbeat.ts:5375-5382`). `occurred_at` is finalization time. Each insert also runs two monthly SUMs, two updates and budget evaluation (`costs.ts:56-104`), so it is not a cheap write to copy. |
+| `agent_runtime_state` | lifetime counters (`total_input_tokens` ...), `last_run_*` | `heartbeat.ts:20154-20168` | No time dimension; cannot be trended. |
+| `heartbeat_run_events` | per-run log: lifecycle rows, `adapter.invoke`, retries, interruptions, `run.phase.timing`, `run.startup.step`, native `run.performance.span` and `usage.reported` | `appendRunEvent`, `heartbeat.ts:13950-14037`; each append locks (`FOR UPDATE`) and rewrites the run row (`heartbeat-run-events.ts:55-76`) | No retention. Native runs persist every protocol event (hundreds to thousands of rows per run, estimate). No `agent_id` index. |
+| `tool_call_events` / `tool_invocations` (`schema/tool_access.ts:726-783,818-871`) | run-linked `tool_name`, `outcome`, `latency_ms`, `result_size_bytes`, `error_code`; index `(company_id, run_id)` | tool gateway | Gateway tools only; native and CLI-internal tool calls are not here (UNVERIFIED how complete). |
+| NDJSON run log | raw stdout/stderr chunks with server receive time | `onLog`, `heartbeat.ts:23489-23563`; store `run-log-store.ts` | No retention (UNVERIFIED for the S3 mirror). Timestamps are receive time, not provider time. |
+| `agent_wakeup_requests` | `requested_at`, `claimed_at`, `finished_at`, `status` (including `skipped`, `coalesced`), `reason`, `coalesced_count` | 20+ sites | `(company, agent, day)` has no exact index. |
+| `workspace_operations`, `environment_leases`, `execution_workspace_runtime_leases` | workspace phase timings; lease acquire/release; per-workspace lock | `workspace-operations.ts:524`, `environments.ts:1606-1759`, `workspace-runtime-leases.ts:195` | Lease acquire latency is not stored (`acquired_at` is `defaultNow`). The runtime lease row is deleted on release (`:307`), so lock-contention history is gone. |
+| `activity_log` | `issue.updated` with `details.changes.status.{from,to}`, plugin rows, `run_id` | `activity-log.ts:163` | Status key shape differs by writer (`_previous.status`, `previousStatus`, `reopenedFrom`). No index on `action`. |
+| `agent_config_revisions`, `company_skill_versions`, `agent_instruction_revisions` | who changed what and when | `agents.ts:838-849` | Raw material for the "changes" view; no link to later metrics. |
+
+### 3.2 Aggregations and surfaces on `main`
+
+- **Audit hub exists:** `ui/src/pages/audit/AuditHub.tsx` with sections `activity`, `runs`, `costs`, `budgets`, `timeline` at `/activity/*` (`App.tsx:405-420`). The routes sit behind `streamlinedUiEnabled`, which `Inbox.tsx:821` hard-codes to `true`. New panels extend this hub.
+- **Costs page** (`ui/src/pages/Costs.tsx`) and routes `GET /companies/:id/costs/{summary,by-agent,by-agent-model,by-provider,by-biller,by-project,window-spend}` (`routes/costs.ts`). They group by agent, provider, biller, model, project. **None groups by day** (`costs.ts` and `dashboard.ts` contain no `date_trunc`).
+- **Dashboard** (`services/dashboard.ts:30`): 14 UTC days of `{succeeded, failed, recovered, other, failedByErrorCode}` via a retry-chain CTE. No tokens, no cost per day. "Recovered" is computed at read time from retry chains.
+- **Recovery report:** `GET /companies/:id/recovery-observability` (weekly recovery rate against a 2% threshold, by cause group). No UI client, no CLI.
+- **Run detail** (`AgentDetail.tsx:3381`, `runMetrics()` `:365-389`) reads `usageJson` per run. `AuditRuns.tsx` lists at most 200 runs.
+- **CLI:** `cost` (no date flags although the API takes `from`/`to`), `finance`, `budget`, `dashboard get`, `activity list`, `run list/live/get/events/log`, `routine runs`. None for `audit/agent-actions` or `recovery-observability`.
+- **Parity enforcement on `main`:** only `server/src/__tests__/openapi-routes.test.ts` (every mounted route literal must be registered in `routes/openapi.ts`). There is **no** CLI-to-API parity test on `main`; PR #22 adds a coverage matrix and is unmerged.
+- **PR #28 (open):** `GET .../heartbeat-runs` filters and `GET .../heartbeat-runs/stats` (status counts, top-20 error codes, per-agent cap usage). Query-only, no migration. It does **not** cover tokens, cost, per-day or per-cause series.
+
+### 3.3 Outcomes and lifecycle
+
+- **Issues:** `createdAt`, `startedAt`, `completedAt`, `cancelledAt` exist; **no `in_review_at`**. First run is `min(heartbeat_runs.started_at)` via the `context_snapshot->>'issueId'` expression index. In-review time is only in `activity_log`.
+- **Routines:** `routine_runs` has status (`received|coalesced|skipped|issue_created|completed|failed`), `linkedIssueId`, `coalescedIntoRunId`, `failureReason`. A routine is linked to runs only through `issues.origin_kind='routine_execution'` and `origin_id`; the run path resolves it at `heartbeat.ts:10969-11033` but **never persists it**. No endpoint rolls up per-routine cost or outcome.
+- **Human wait:** `issue_thread_interactions.resolved_at - created_at`; indexes are per issue only.
+- **Review rounds (internal):** `issue_execution_decisions` (stage `review|approval`, outcome).
+- **Work products:** `issue_work_products` (`pull_request` type, statuses `merged|closed|...`) with PR state refreshed on read; **`merged_at` is reduced to a boolean and discarded** (`github-external-object-provider.ts:199`). No open or merge timestamps stored. `metadata.git` does not exist on `main`; PR #45 adds it and hides unlinked rows via `linkedWorkProductCondition()`.
+- **GitHub plugin:** the one-minute poll lists issues only and drops PRs (`github.ts:287-290`). PRs arrive only by webhook (`sync.ts:518-563`), which anthm has off. `check_run` payloads are used to find a PR number and the conclusion is dropped. CI checks and reviews are read live for merge gating and never persisted. Runner minutes: no code at all.
+- **Plugin SDK host APIs:** `ctx.metrics.write` (stored as `plugin_logs` rows with `level='metric'`, not query-friendly), `ctx.telemetry.track` (forwards to the external telemetry client; not persisted), `ctx.entities`, `ctx.db`, `ctx.events.emit`. No outcome-reporting API.
+- **Plugin company scoping is not enforced by the host.** Plugins are instance-wide and `ensurePluginAvailableForCompany` is a documented no-op (`plugin-host-services.ts:803-808`); `ensureCompanyId` only checks the id is present (`:767-770`).
+
+## 4. What is missing
+
+Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or lossy),
+**Derivable** (computable from stored data, nobody does), **Present**.
+
+| # | Candidate | Verdict | Evidence | Proposed source | Slice |
+|---|---|---|---|---|---|
+| 1 | Token classes per run: input, cache-read, cache-write, output, reasoning | **Partial** | `UsageSummary` has input/cached/output only (`adapter-utils/src/types.ts:33-37`). Claude folds cache-write into input (`claude-local/parse.ts:49`); its fallback path drops it (`:111-115`). ACPX folds it too (`acpx-engine/execute.ts:3278-3285`); the split survives only in `result_json.usage` as `cachedReadTokens`, `cachedWriteTokens`, `thoughtTokens` (`:3287-3298`, `:5097`). OpenCode folds reasoning into output (`opencode-local/parse.ts:53-62`). Native normalizer drops reasoning (`native-session-executor.ts:9322-9346`). Claude's raw result event, already in `result_json`, probably holds `cache_creation_input_tokens` (UNVERIFIED, see A6). | Disjoint classes in the record; adapter fields in `result_json.observability`; backfill from `result_json` | 1b-1d |
+| 2 | Token-class semantics comparable across providers | **Missing** | Claude `inputTokens` is `input + cacheCreation` with cache-read separate. Codex `input_tokens` is *believed* to include the cached subset, but the only evidence in the repo is circumstantial (cached was 97.6% of input in the token plan's March data, which that plan itself called session-cumulative; the one fixture is `codex-local/parse.test.ts:22`). **UNVERIFIED.** Cache hit rate computed as `cached/input` is wrong for one provider. | Per-adapter mapping into disjoint classes with fixtures captured from the real CLI | 1b-1c |
+| 3 | Per provider and model per run | **Partial** | One model per `cost_events` row. Claude's per-model `modelUsage` is summed away (`parse.ts:39-55`). Provider hard-coded `anthropic` whatever the base URL (`claude-local/execute.ts:1265`); managed connection attribution sits only in `context_snapshot.aiConnection` (`heartbeat.ts:21889`). | `model` (primary) and `model_count` in 1a; per-model child rows in the Claude PR; provider/biller from the connection | 1a / 1b |
+| 4 | Always-loaded footprint per run, by skill | **Partial** | Character counts only, in the `adapter.invoke` event payload (`heartbeat.ts:23651-23663`). Claude's instruction file (`--append-system-prompt-file`, `execute.ts:873-875`), skills manifest (`:526-533`) and mounted skills (`:549`) are **not measured**. No tokenizer anywhere. | Launch-time manifest (kind, `skillKey@versionId`, chars) plus measured first-turn prompt tokens (needs per-message usage; the Claude parser ignores it, `parse.ts:76-89`) | 1b |
+| 5 | Queue wait vs run time | **Derivable** | `started_at - created_at`; native `heartbeat.queue` span row exists. Nothing stores or aggregates it. | Derived once into the record | 1a |
+| 6 | Lock and lease wait (restore lock, workspace busy) | **Partial** | Restore lock: only the timeout code, no wait duration on success (`workspace-restore-merge.ts:204,274`; PR #21 raises the wait to 10 min). Workspace busy: a chain of cancelled runs linked by `retry_of_run_id` (`heartbeat.ts:16474-16553`). Lease acquire latency not stored. | Workspace-busy chain derivable in 1a. A `lock_wait_ms` column is added in the PR that adds a source (after #21) | 1a / later |
+| 7 | Retries and their cause | **Partial** | `retry_of_run_id`, `scheduled_retry_reason` (about 9 values), `scheduled_retry_attempt`. In-run provider retries and 429s not counted (pi's `auto_retry_end` used only on final failure). | `retry_depth`, `retry_reason` in 1a; in-run provider error counts with the adapter PRs | 1a / 1b-1d |
+| 8 | Provider latency, 429s, capacity errors | **Partial** | No legacy time-to-first-token. Native persists `provider.time_to_first_agent_event` span rows (`native-run-trace.ts:281-311`), which nothing reads. Runtime classification into `errorFamily` exists only for claude, codex, hermes gateway and ACPX (`hermes/.../execute.ts:773`, `acpx-engine/execute.ts:5043-5069`). Gemini, kimi and openclaw return named setup/gateway codes (`gemini-local/.../execute.ts:217`, `kimi-local/.../execute.ts:197`, `openclaw-gateway/.../execute.ts:1056-1403`) but nothing for runtime quota or rate limit; grok, cursor, opencode, pi fall to `adapter_failed` (`heartbeat.ts:25600-25602`). | Native span rows; shared classifier over the stderr excerpt | 1a / 1d |
+| 9 | Worker CPU, memory, disk per run | **Missing** | No `rss`/`memoryUsage`/`du` stored anywhere. Disk-full has **no error code**; ENOSPC appears only in a diagnostics errno list (`workspace-restore-diagnostics.ts:6`). Low free space throws `workspace_git_scan_failed` (`workspace-manifest.ts:18-26`). A `statfsSync` free-space check already runs there: a free sampling point. | Cause classifier now (stderr/errno); sampling of free bytes at that point as a separate PR | 1a (classifier) / 7 |
+| 10 | Run-workspace bytes | **Missing** | `execution_workspaces` has no size. PR #44 records `bytesFreed` in `activity_log` when it reaps. | Read #44's activity rows | 7 |
+| 11 | Per-routine cost and outcome | **Derivable** | routine to issue (`origin_id`) to runs and `cost_events.issue_id`. No endpoint. | Persist `routine_id` on the record, resolved with the existing resolver logic | 1a / 2 |
+| 12 | Issue lifecycle timings (created, first run, in review, done) | **Partial** | See 3.3. In-review needs `activity_log` parsing; `status_decisions` is native-runtime only. | One normalizing reader over `activity_log` (see section 9; no history table exists and none is planned elsewhere). Known shapes: `details.status` with `details._previous.status`, `details.changes.status.{from,to}` (both read by `issue-review-policy.ts`), plus `issue.git_status_automated` rows after #45. Other writers (`issue.stalled_review_decided`, plugin updates) are **not audited**; verify with A12 on real rows | 2 |
+| 13 | External outcomes: PR opened/merged, CI cycles, runner minutes, review rounds | **Missing** | See 3.3. | PR lifecycle timestamps first (3a), then `outcome_events` through a shared plugin host call (3b) | 3 |
+| 14 | Convex deployment outcomes | **Missing** | No Convex plugin on `main` (PR #42 open). | Same host call, after #42 | 3 |
+| 15 | Interruptions by cause (deploy, backup, crash) | **Partial** | `server_shutdown_interrupted` (graceful signal, `heartbeat.ts:15348-15431`) versus `process_lost` (`:19524`), `restartKind hot\|hard\|graceful` in the native recovery event. No boot or shutdown record, so deploy vs restart vs crash vs backup cannot be told apart. | `server_boot_events` (instance-level, section 7.6) plus the classifier | 1a / 6 |
+| 16 | Failure cause taxonomy | **Partial** | `error_code` is free text with about 150 distinct literals (reviewer count 153; `heartbeat_runs.ts:68`) and no enum. Liveness is a closed set of 7 (`constants.ts:931-939`). `recovery-observability.ts` has its own cause groups. Convex quota has no code. | Shared closed `RUN_FAILURE_CAUSES` plus a pure classifier (error code, error family, status, signal, stderr excerpt patterns); unmapped codes surfaced | 1a |
+| 17 | Turn count, tool calls, tool errors per run | **Partial** | Native: `tool.execution.*` with duration and exit code in the run log. Gateway tools: `tool_call_events` (row above). Legacy CLI tools: only in UI parsers (`claude-local/ui/parse-stdout.ts:74-117`); pi's server parser discards them. `num_turns` appears nowhere in code; Claude's raw result event, already stored in `result_json`, is expected to carry it (UNVERIFIED, A6). | Count in the adapter parsers; fixture-verify the Claude result keys | 1b-1d |
+| 18 | Tokens per tool call | **Not directly observable** | CLIs report usage per assistant message, not per tool. `tool_call_events.result_size_bytes` gives a size proxy for gateway tools only. | Approximate tool-result size as context growth between consecutive turns; deferred, Jev-oriented | later |
+| 19 | Dollar cost for non-billed usage | **Partial** | Server never prices (`heartbeat.ts:5375-5397`): Codex `costUsd` is always null, so those runs are `unpriced` with 0 cents. Claude subscription runs keep an API-equivalent `costUsd` in `usage_json` while `cost_cents` is forced to 0. The only price table is eval-only (`evals/model-pricing.ts`). | Tokens are the primary metric. Optional versioned price catalog for an "API-equivalent" estimate, flagged `estimated`. **Decision D3** | 2 |
+| 20 | Per-day series of tokens, cost, failures | **Missing** | Section 3.2. | Query service over the record | 2 |
+| 21 | Always-loaded context in tokens | **Missing** | No tokenizer (`rg tiktoken\|countTokens` finds nothing). | Measured first-turn tokens where the adapter exposes per-message usage; otherwise `chars/4` flagged `estimated` | 1b |
+| 22 | Waste: failed and interrupted runs | **Derivable** | status, error code, cause. | Query layer | 5 |
+| 23 | Waste: duplicate runs | **Partial** | Admission-time controls exist: wake coalescing (`status=coalesced`), `issue-rewake-throttle.ts` (its header documents a 25-session, 2.4x cost case), `SELF_REBLOCK_WAKE_LIMIT`. Nothing detects duplicates among runs that actually executed. | Window query over the record by (agent, issue, wake reason) | 5 |
+| 24 | Waste: runs on closed issues | **Partial** | Only queued runs are cancelled for a terminal issue (`QueuedRunStalenessErrorCode`). A run already started on one is not flagged. | Issue status at run start and end, derived from the status timeline | 5 |
+| 25 | Waste: runs on stale heads, work on merged PRs | **Missing** | No detector. | Needs PR head sha and merge time from outcome events plus the sha a run worked on | 3 / 5 |
+| 26 | Waste: unproductive runs | **Present** | `liveness_state` (`plan_only`, `empty_response`, `blocked`, ...), `last_useful_action_at`. | Copy to the record | 1a |
+| 27 | Retention | **Missing** | No prune job on any table in scope except DB backup pruning (`backup-lib.ts:123`). | Retention for the new tables from day one; separate follow-up for run events and NDJSON | 1e |
+| 28 | Interventions (changes tied to measured impact) | **Missing** | No concept. `agent_config_revisions`, `company_skill_versions`, `agent_instruction_revisions` exist as raw material. | Derived "changes" view plus impact on read | 6 |
+| 29 | Privacy | **Gap to avoid** | `adapter.invoke` stores the full `prompt` and `context` in the run log (`claude-local/execute.ts:955-962`); no key rule matches `prompt`. Not copied into the new record. Reported, not fixed here (F2). | Allowlist-only builder | all |
+| 30 | Provider-side retry and no-work runs | **Partial** | Deferral cancellations (`workspace_busy`, `ai_connection_busy`, `heartbeat.ts:16423,16474`) are terminal runs that never started provider work; counting them as "failed runs" overstates failure. | `provider_work_started` flag on the record | 1a |
+
+## 5. Data-quality findings to settle before any rollup is trusted
+
+1. **Codex usage basis is an unmeasured assertion.** The `codex_local` CLI parser
+   declares `usageBasis: "per_run"` and overwrites rather than sums repeated
+   `turn.completed` events (`codex-local/parse.ts:74-93`). The declaration came from
+   commit `efcce9cc8` (PR #9505), whose text asserts the semantics without data. In
+   contrast the repo's own runner treats Codex app-server totals as **monotonic session
+   totals** and subtracts a baseline captured at resume to get a run delta
+   (`paperclip-runner/src/drivers/codex/codex-usage-baseline.ts:1-45`). The token plan
+   observed one reused session's counter growing across 3,607 runs. If the CLI is
+   cumulative on resume, **Codex token totals are overcounted** for every resumed
+   session, on anthm too. Appendix A7 answers this directly (about 100% non-decreasing
+   pairs per session means cumulative; about 50% means per-run). Until then the record
+   marks Codex rows `usage_quality='declared'` and panels show a caveat. If A7 shows
+   cumulative, the parser basis is fixed in its own bug-fix PR with a regression test,
+   before any Codex rollup is shown without a caveat (**decision D8**).
+2. **Claude is `per_run` on its normal path** (final result event, `parse.ts:127`; the
+   `modelUsage` fallback, `execute.ts:1113-1117`). On the rare path where neither the
+   stream usage nor `modelUsage` parses and it falls back to the top-level `usage`, the
+   basis is null and the server's session-delta heuristic applies.
+3. **The session-delta heuristic can undercount.** For adapters without `per_run`, the
+   server subtracts the previous run's raw totals whenever the session id repeats
+   (`heartbeat.ts:12189-12205`, `:5595-5620`). That repairs a cumulative counter and
+   corrupts a per-invocation one. Affected: cursor, gemini, opencode, pi, kimi, hermes,
+   openclaw, and the Claude fallback above. The record stores `usage_basis` and
+   `usage_quality` so affected rows are visible, not hidden.
+4. **Token classes mean different things per provider** (row 2). The record uses
+   disjoint classes: `input` (fresh, uncached), `cache_read`, `cache_write`, `output`;
+   `reasoning` is a subset of `output`. Cache hit rate is
+   `cache_read / (input + cache_read + cache_write)`.
+5. **`cost_events` is not a safe base for analytics:** int4 cents (sub-cent rounds to 0),
+   finalization-time `occurred_at`, no unique run constraint, heavy per-insert side effects.
+   The record carries cost in micro-USD and is reconciled against the ledger, not derived from it.
+6. **`process_loss_retry_count` never increments**, so the one-retry guard at `heartbeat.ts:19510` is dead. Reported, out of scope.
+7. **Unbounded growth.** `heartbeat_run_events` (native: every protocol event) and the NDJSON logs have no retention. Reported as follow-up F1, not part of this feature.
+
+## 6. What traces and transcripts already hold that Jev can use
+
+Persisted today, no new collection needed to mine:
+
+- **Native runs:** `emittedAt`-timed tool and turn events, `tool.execution.*` (name, status, duration, exit code), `usage.reported` with `runDelta` (the only token source for native runs finalized by the reconciler), and `run.performance.span` rows (queue, environment acquire, workspace realize, provider time-to-first-event, settle). Nothing reads the span rows today.
+- **Legacy and ACP runs:** `run.phase.timing` over 12 closed phases and `run.startup.step` (`startup-timing.ts:649-862`). The `sandbox.exec` and `restore.*` details are **OTel-only** and lost without an endpoint (`doc/run-log-events.md:149-158`).
+- **Gateway tools:** `tool_call_events` with latency, outcome, result size and error code per call.
+- **Claude result event:** stored whole in `result_json` (`execute.ts:1239-1240`), so keys the parser ignores (per-model costs, possibly `num_turns` and `duration_api_ms`) are already on disk for backfill.
+- **NDJSON log:** raw stream-json from which tool-call sequences, identical repeated calls (name plus input), `isError` results and idle gaps can be derived with the adapter parsers. Needs the UI-side parsers moved or duplicated server-side; gaps use receive time.
+- **Control-plane signals:** wake skip reasons (`issue_rewake_throttled`, `heartbeat.timer.no_actionable_work`, ...), `coalesced_count`, liveness state and reason, watchdog decisions, `routine_runs` coalesced and skipped with reasons.
+
+Not persisted (cannot be mined without new collection): legacy turn count and per-message usage, provider latency on legacy adapters, restore-lock wait on success, resource usage.
+
+Boundary rule for the loop: metrics and exports carry **ids, numbers and enums only**. Jev
+dereferences a run id through the existing authorized run and log APIs, which is where
+content access is already controlled. Content never travels through the observability store.
+
+## 7. Design
+
+### 7.1 One new fact table: `run_usage_records`
+
+One row per terminal heartbeat run, **derived from the run's own row** by an async
+worker (7.2), not written from the run path. Why a table, stated honestly: the existing
+`(company_id, created_at desc)` index already supports time-window scans, and
+`heartbeat_runs` is never pruned, so neither indexing nor retention alone justifies a
+table. What does: (a) the record joins data that does not live on the run row (issue
+status timeline, routine origin, wake reason, cause classification), which should be
+computed once, not on every panel query; (b) it is a typed, versioned shape while
+`usage_json` is untyped and has drifted; (c) it can be re-derived when the taxonomy
+improves (`schema_version`) without touching the operational row; (d) it keeps analytics
+indexes off the hottest table, where every run event already rewrites the row.
+
+Columns (about 40). Every text column is either a closed enum (values outside the set map
+to `other`) or an identifier restricted to `[a-z0-9_.:@-]`, at most 80 characters. No
+free text, no hashes.
+
+- **Keys:** `run_id` (PK), `company_id` (FK, leads every index), `agent_id`, `issue_id`, `project_id`, `routine_id`. No FKs to agents or runs: this is an analytics fact and must survive agent deletion.
+- **Dimensions:** `adapter_type`, `runtime_mode`, `driver_kind` (native agents have `adapter_type = paperclip_runner`, which hides the real engine, `heartbeat.ts:25685`), `provider`, `biller`, `billing_type`, `model` (primary), `model_count`, `invocation_source`, `wake_reason` (mapped to the known set, else `other`), `is_retry`, `retry_depth`, `retry_reason`, `session_reused`.
+- **Outcome:** `status`, `error_code`, `cause_family` (closed enum, 7.3), `liveness_state`, `provider_work_started`, `useful_action`, `issue_status_at_start`, `issue_status_at_end`.
+- **Tokens (bigint):** `input_tokens`, `cache_read_tokens`, `cache_write_tokens` (null = adapter does not report), `output_tokens`, `reasoning_tokens` (null likewise), `usage_basis`, `usage_quality` (`measured|declared|derived|missing`).
+- **Cost (micro-USD):** `cost_micros`, `api_equivalent_micros` (nullable), `cost_status`.
+- **Time:** `run_created_at`, `started_at`, `finished_at`, `day` (UTC date of `finished_at`), `queue_wait_ms`, `duration_ms`, `startup_ms`, `first_event_ms` (the last two nullable).
+- **Activity (nullable):** `turns`, `tool_calls`, `tool_errors`.
+- **Footprint (nullable):** `first_turn_prompt_tokens` (measured), `footprint_chars`, `footprint_sources` (jsonb, at most 32 entries of `{kind, ref, chars}`; `kind` is a closed set `instructions|skill|bootstrap|wake|task_context|session_handoff|prompt|mcp`; `ref` is `skillKey@versionId` for skills, so the same skill at two versions is two footprints, or an instruction revision id).
+- **Meta:** `schema_version`, `source` (`derived|backfill`), `derived_at`.
+
+Deliberately left out until a source exists: `lock_wait_ms`, `provider_active_ms`, in-run provider error counts, per-model split (arrives as a child table `run_usage_models` with the Claude adapter PR), content hashes.
+
+Indexes (4, btree): `(company_id, finished_at desc)`; `(company_id, agent_id, finished_at)`; partial `(company_id, issue_id)` where issue not null; partial `(company_id, routine_id, finished_at)` where routine not null. The `finished_at`-leading shape also serves range-delete retention.
+
+### 7.2 Collection: derive from the row, change the run path as little as possible
+
+The run path gets **one small addition**: a pure function `buildRunObservability(...)`
+called while assembling the existing terminal `result_json` (`heartbeat.ts:25706-25710`),
+so it rides the terminal UPDATE that already happens (no new query, no new write). It
+takes typed inputs only (the adapter result and the invocation metadata), never reads
+`prompt`, `context`, stdout or stderr, returns a bounded versioned object
+`result_json.observability`, and is wrapped so any throw yields `undefined` and the
+terminal write proceeds unchanged. It carries only what the row does not already hold:
+`cacheWriteTokens`, `reasoningTokens`, `turns`, `toolCalls`, `toolErrors`,
+`firstTurnPromptTokens`, `modelUsage[]` (at most 8), `footprint.sources[]` (at most 32).
+
+Everything else is **derived asynchronously** by a worker from rows that already exist:
+
+- Every 60 seconds (configurable), under a Postgres advisory lock so only one instance works at a time, for each company: select terminal runs created within a 48-hour lookback and finished more than 10 minutes ago (so `liveness_state`, written after the terminal write at `heartbeat.ts:18508`, and late metadata have settled) that have no record. The scan uses the existing `(company_id, created_at desc)` index. Batches of 200.
+- Build each record from the run row, `agents` (adapter type), the issue (project, routine origin), the wake request (reason), the status timeline (issue status at start and end) and `result_json.observability`. Upsert by `run_id`, replacing only when the new `schema_version` is higher.
+- **Backfill is the same code** with a larger `--since` and `source='backfill'`; re-derivation after a taxonomy change is the same code with `--rederive`.
+- Runs whose terminal write carried no adapter result (reaper, shutdown, cancel, deferral) have no `usage_json`: they are recorded with `usage_quality='missing'`, which is true, and still carry cause, timings and issue. Their wasted tokens are unknown rather than guessed.
+
+Why this and not a hook beside finalization: a review of the code found 20+ writers that
+make a run terminal (the main adapter-result path, the reaper, graceful shutdown,
+deferral cancellations, native reconcilers, queue and wake-queue cancels, recovery
+service), only one of which has an adapter result, and about 20 awaited steps between
+the terminal write and `updateRuntimeState` where a throw would skip a hook placed there.
+Deriving from the row covers every path by construction, cannot affect a run, heals
+itself after a crash or a lagging worker, and needs no shutdown drain. The shared
+terminal seam (`emitTerminalAgentTaskRun`, `heartbeat.ts:12939`) is the Telemetry and
+Sentry path and is deliberately not used.
+
+Failure behavior: the worker logs once per interval and exposes `derived / terminal` for
+the last 24 hours at `GET /observability/health`. A lagging or failed worker delays
+panels; it never touches a run.
+
+### 7.3 Failure cause taxonomy
+
+Closed `RUN_FAILURE_CAUSES` in `packages/shared`, one pure classifier, table-tested
+against every known error code (about 150, including the 12 listed per area in the inventory):
+
+`interrupted_graceful` (deploy or restart), `interrupted_crash` (process lost, detached, duplex lost), `disk_or_workspace` (restore failed, git scan failed, ENOSPC pattern), `workspace_lock` (busy, restore lock timeout), `provider_quota`, `provider_transient`, `external_service_quota` (Convex `DeploymentQuotaReached`-style patterns), `timeout`, `auth_or_config`, `budget_or_cap`, `control_plane_cancel`, `operator_cancel`, `adapter_failure`, `unknown`.
+
+The classifier may make one bounded pattern pass over `stderrExcerpt` to choose a cause;
+the matched text is discarded and never stored. Unmapped codes land in `unknown` and are
+listed by an "unmapped codes" view, so the taxonomy grows from data instead of guesses.
+Deploy vs restart vs crash vs backup needs an outside marker: 7.6.
+
+### 7.4 Query service first, rollups only when evidence demands them
+
+At about 950 runs a day a company produces about 350,000 rows a year, and the stated
+scale target is millions. Hourly and daily views are `date_trunc` queries over the record
+behind the same API contract. Plan: slice 2 ships the query service with the index plan
+and records `EXPLAIN (ANALYZE)` for every panel query against a synthetic 5-million-row
+table in a throwaway embedded database. **Materialized rollups are built only if a panel
+query misses its latency budget there, or when long-range history must outlive record
+retention (decision D6).** If built, the requirements are fixed now so they are not
+rediscovered:
+
+- Grain `(bucket_kind, bucket_start, company_id, agent_id, routine_id, project_id, adapter_type, model, cause_family)` with **non-null surrogate keys** (nil UUID or `'none'` instead of null; a primary key cannot contain null) and counts and sums only.
+- **Dirty-bucket rows** written in the same transaction as the record upsert, and a per-bucket `pg_advisory_xact_lock` while recomputing, so commit-order races (`derived_at` is not a safe watermark) and two instances cannot write a stale bucket.
+- A bucket is **frozen once its records are pruned**; never recompute a bucket whose facts have been partly deleted.
+- Per-model attribution comes from `run_usage_models`, not a "largest model" guess.
+- "Recovered" stays a read-time computation from retry links; it is not stored.
+- Percentiles come from the record inside its retention window; sums and trends from rollups.
+
+### 7.5 Outcomes and the join to effort
+
+`outcome_events` (append-only, company-scoped): `kind` (closed set: `pull_request.opened|merged|closed|head_updated`, `ci.run.completed`, `review.submitted`, `deployment.completed`), `issue_id`, `run_id` (nullable), `occurred_at`, `subject_ref` (for example `owner/repo#123`; shown in the panel, never exported), `attrs` (bounded: conclusion, duration_ms, runner_ms, head sha), `source` (plugin id), `source_event_id` (idempotency key, unique per company and source).
+
+Phased: **3a** persists PR lifecycle timestamps on the work product through the existing refresh path (small; merges per hour needs only this); **3b** adds `outcome_events`, the SDK methods, and CI and review ingestion.
+
+- **One SDK edit, two host methods (agreed with the Linear-grade session, 2026-10-09).**
+  - `ctx.git.reportPullRequest(snapshot)` under a new capability `git.report`. The snapshot is a typed object carrying repository, number, url, state, draft, merged, headRef, baseRef, headSha, `createdAt`, `mergedAt`, `closedAt`, `updatedAt` (plus the title/body fields their link service needs). One host handler fans out to their link service and to the outcome collector. They pass fields through; I derive events and own the keys.
+  - `ctx.outcomes.report(event)` for `ci.run.completed`, `review.submitted`, `deployment.completed`, in the same SDK change.
+  - PR events use **per-kind idempotency keys** (`repo#number:opened`, `:merged`, `:closed`, `:head:<sha12>`), not one key per snapshot, so a repeated or later snapshot of the same PR is a no-op.
+- **Company scoping is not enforced by the plugin host** (3.3). The `companyId` in a plugin payload is plugin-supplied and unchecked. The outcome handler must (1) require the capability, (2) verify the company exists, (3) verify every `issue_id` and `run_id` in the event belongs to that company (the host has an `inCompany` pattern at `:827`) and reject on mismatch, and (4) bound every field. Panels stay company-filtered regardless. Residual risk, stated plainly: a trusted instance-level plugin can still inject false events for an issue it names correctly; every event carries its `source` plugin id so the panel can show provenance. The Linear-grade link handler applies the same checks (agreed).
+- **GitHub on anthm (no webhooks):** the PR listing does not exist on `main` (`github.ts:287-290` drops PRs). The Linear-grade session owns writing it (ETag per repo and page, cached in plugin state) in the `github-sync` job and messages before the first edit to `sync.ts`. I add check-run fetching on top, only for PRs whose head moved. If the outcome work lands first, they reuse mine. CI cycles = distinct completed workflow runs per PR; runner minutes from the run timing endpoint where the repo uses hosted runners (**UNVERIFIED** for anthm's runners).
+- **Merge-time fix** (`github-external-object-provider.ts:199` discards `merged_at`): PR #45 edits the same `pullRequestSnapshot` data and `PullRequestMergeDetails`, so 3a waits and rebases on #45.
+- **Work-product reads** (linked PRs per issue) count only rows where `linkedWorkProductCondition()` holds (added by #45, which hides unlinked rows).
+- **Efficiency metrics** attribute to a merged PR the runs on its issue up to `merged_at`: tokens per merged PR, runs per merged PR, CI cycles per PR, review rounds per PR, merges per hour. Sub-issue trees reuse the existing tree recursion in a later pass.
+
+### 7.6 The changes view, impact on read, and the Jev loop
+
+No intervention table in the first cut (decision D7). Changes are **derived from tables
+that already record them**, which is "recording every change" without double-writing:
+
+| Change | Existing source |
+|---|---|
+| Agent config, cap or model change | `agent_config_revisions` (`changed_keys`, actor, `created_at`) |
+| Skill release or pin | `company_skill_versions`; keyed on `skillKey@versionId` (pins apply only with `experimental.enableBetaSkills`) |
+| Instruction change | `agent_instruction_revisions` |
+| Routine change or pause | `routine_revisions`, routine status in `activity_log` |
+| Budget policy | `budget_policies` writes in `activity_log` |
+| Deploy, restart, crash | `server_boot_events` |
+
+`server_boot_events(id, booted_at, version, previous_shutdown)` is the one new small
+table: written at boot, and `previous_shutdown` records whether the prior process
+recorded a graceful shutdown (and the signal) or ended uncleanly. It is **instance-level
+metadata with no company or user data**, so it follows the same documented exception as
+the announcement publication-ID registry in AGENTS.md section 5.1; that PR updates
+AGENTS.md accordingly. Panels join it by time, which is what separates a deploy cluster
+of `server_shutdown_interrupted` from a crash cluster of `process_lost`.
+
+- **Impact is computed on read:** the same metric over an equal window before and after on the same scope, with a minimum-sample guard and the overlapping changes listed as confounders. It is not frozen; if a frozen result or a manual entry is needed later, an `observability_interventions` table is added then (D7).
+- **Findings are ordinary issues** labeled for the audit, not a new table. A decision is the issue; the change is the revision row it caused. The loop closes with existing primitives.
+- **Jev export:** `GET .../observability/export` (NDJSON, cursor): usage aggregates, deterministic anomaly flags computed on read (spikes against a trailing 14-day baseline per agent, model and cause; unknown-cause share; tokens-per-run drift), the derived change list (kind, ids, timestamps only, no free text), and at most N sample run ids per flag. It excludes intervention summaries, `subject_ref` and any per-issue rows. Access: board, or an agent holding an explicit audit permission (decided in PR 6).
+
+### 7.7 Retention
+
+Instance setting with defaults: records 400 days, `server_boot_events` kept. A daily job deletes in batches of 5,000 by `finished_at`, off the run path. If rollups are built (D6): hourly 90 days, daily 3 years. No partitioning until a measured table exceeds about 20M rows.
+
+### 7.8 Isolation, authorization and privacy (tests, not intent)
+
+- Every query filters `company_id`; `agentId`, `issueId`, `routineId` and `runId` filters are verified to belong to the company before use.
+- **Authorization.** `assertCompanyCostReadAllowed` is a closure inside the cost router (`routes/costs.ts:75`), not importable; PR 2 extracts it to a shared guard used by the cost and observability routes. It denies low-trust agents, so the rule is "board and same-company agents allowed by `company_scope:read`", not "all same-company agents". Company-level endpoints return **no per-issue or per-run rows**; per-issue queries (`issueId=`) require `issue:read`, as `/issues/:id/cost-summary` does (`routes/costs.ts:86-100`).
+- A two-company integration test covers every endpoint, the export, the worker and the boot-event join (which must expose no company data).
+- A canary test puts unique strings in the prompt, context, stdout, stderr, instruction text and skill content, runs the builder and the worker, and asserts none appears in any new table or in `result_json.observability`.
+- A column-contract test fails if any new text column lacks a closed enum or the identifier charset and length cap.
+
+## 8. Slice plan (stacked PRs)
+
+Stack order is the dependency order. Each PR is independently reviewable, carries its
+own tests and docs, and ships API, CLI and OpenAPI together. Estimated size is rough.
+Because collection is derived from rows, **1a delivers value with no adapter change and
+no run-path change**.
+
+| PR | Scope | Depends on | Size |
+|---|---|---|---|
+| **0** | This plan (`docs(observability): ...`) | none | doc |
+| **1a** | **Record + derivation worker:** `run_usage_records` (migration), shared types, cause taxonomy and classifier, async worker with advisory lock, row-derived fields only (tokens and cost from `usage_json`, timings, cause, issue/project/routine, runtime_mode, driver_kind, retry, liveness, `provider_work_started`), backfill and `--rederive` commands, health endpoint with CLI `health`. Tests: classifier table, worker idempotency and version replace, lookback and settle delay, single-worker lock, two-company isolation, canary. | none | L |
+| **1b** | **Run-path builder + Claude** (CLI and ACP lanes): `buildRunObservability`, cache-write, `modelUsage` child rows, turns and tool counts, first-turn prompt tokens, footprint from `listRuntimeSkillEntries` (`heartbeat.ts:21910`) and `promptMetrics`; Claude result-key fixtures (settles A6). | 1a | M |
+| **1c** | **Codex + Grok** (CLI and ACP lanes): disjoint-class mapping from captured real fixtures; resolution of the Codex usage basis (D8), as its own regression-tested fix if A7 shows cumulative counters | 1a, A7 | M |
+| **1d** | **Native (`paperclip_runner`) + ACPX engine, then the remaining adapters** (gemini, cursor, opencode, pi, kimi, hermes, openclaw): `usage.reported` and span rows, per-adapter fixtures, usage-basis audit | 1a | M |
+| **1e** | Retention job for the new tables | 1a | S |
+| **2** | **Query service + API + CLI + parity:** `GET usage`, `failures`, `footprint`; shared authorization guard; OpenAPI; the table-driven parity test (every OpenAPI path under the prefix needs a CLI command and a UI client method; assigned here because `main` has none, and written to coexist with PR #22's matrix); issue-lifecycle reader over `activity_log`; `EXPLAIN` evidence at 5M rows and the rollup decision (D6); price catalog if D3 accepted | 1a | L |
+| **3a** | PR lifecycle timestamps persisted on work products; `GET efficiency` (merges per hour, tokens and runs per merged PR) | 2, #45 | M |
+| **3b** | `outcome_events`, SDK methods and capability, GitHub PR and check polling on top of the Linear-grade listing; `GET bottlenecks` (CI cycles, review rounds, queue and status time) | 3a, Linear-grade 1b | L |
+| **4** | **UI:** Usage (tokens, cost, model, skill footprint) and Failures panels in the Audit hub; desktop and mobile browser verification, token-gate check | 2 | L |
+| **5** | **Waste:** failed and interrupted, duplicates, runs on closed issues, unproductive runs; `GET waste` + CLI + panel (stale-head later, needs 3b head shas) | 2 | M |
+| **3c / 5b** | Bottlenecks, Efficiency panels, each in the PR that adds its API | 3a / 3b | M each |
+| **6** | **Changes view + impact on read + Jev export + anomaly flags;** `server_boot_events` and the AGENTS.md exception | 2 (3a/3b for outcome metrics) | L |
+| **7 (optional)** | Worker free-bytes sampling at the existing `statfsSync` point and workspace bytes; tokens-per-tool-result approximation | operator go-ahead (D5), #44 | M |
+
+Parity contract per panel (API is the source; CLI and UI are thin):
+
+| Panel | API (under `/companies/:companyId/observability`) | CLI (`paperclipai observability ...`) | Slice |
+|---|---|---|---|
+| Tokens and cost by agent, routine, project, model, adapter, day, hour | `GET /usage` | `usage --group-by --since --until --agent-id ...` | 2 |
+| Footprint by skill and source | `GET /footprint` | `footprint` | 2 |
+| Failure causes over time | `GET /failures` | `failures` | 2 |
+| Collector health | `GET /health` | `health` | 1a |
+| Waste | `GET /waste` | `waste` | 5 |
+| Efficiency trend | `GET /efficiency` | `efficiency` | 3a |
+| Bottlenecks (queue, lock, status time, CI, review) | `GET /bottlenecks` | `bottlenecks` | 3b |
+| Changes and impact | `GET /changes`, `GET /changes/:id/impact` | `changes`, `impact` | 6 |
+| Jev export | `GET /export` | `export` | 6 |
+
+Every CLI command accepts `--json` and date filters (the existing `cost` CLI lacks them, a known gap not repeated here). The health status appears as a chip in the Usage panel so it has a UI client.
+
+## 9. Coordination
+
+| Item | Overlap | Plan |
+|---|---|---|
+| **PR #28** run stats | `heartbeat-runs/stats` (status counts, top-20 error codes, daily cap) | Do not touch. `failures` adds per-day and per-cause series on top. Expect a trivial conflict in `packages/shared/src/index.ts` exports and `routes/openapi.ts`; rebase after it lands. |
+| **PR #31** harness fallbacks | adds `executed_adapter_type`, `executed_model`, `fallback_reason` to `heartbeat_runs` and a migration | Record the agent's `adapter_type` at first; add the executed values after #31 merges. |
+| **PR #12** provider capacity retry | writes `resultJson.providerQuotaBeforeUsefulAction` | Read that jsonb key when present (no compile dependency); counts as not-wasteful in the waste view. |
+| **PR #21** restore queue | longer lock wait | Add `lock_wait_ms` after it lands; ask for a wait duration on the success path. |
+| **PR #44** SSH workspace reaping | `bytesFreed` in activity rows | Source for workspace bytes in the optional PR 7. |
+| **PR #45 / Linear-grade session** (agreed 2026-10-09) | `metadata.git` on work products, `pullRequestSnapshot` edits in `github-external-object-provider.ts`, planned PR listing in the `github-sync` job (slice 1b, not started), planned SDK call | One SDK edit with two host methods (section 7.5). They write the PR listing; I add check-run fetching on top. Neither of us edits the SDK or `sync.ts` until the shape is settled in writing; they message before touching `sync.ts`. No status-history table: I read `activity_log` (they have not audited every status writer; A12 checks real rows). My `merged_at` change rebases on #45. Count only `linkedWorkProductCondition()` rows. Both handlers validate issue-company ownership because the plugin host does not (3.3). |
+| **PR #42** Convex plugin | Convex deployments and quota | Outcome events from it after merge. |
+| **Lean-default-skills session** | skill footprint | They cut it, this measures it. Their PR 1 carries release `v8-lean` and a skill-quality check; they send me the PR number, and the change appears in the changes view keyed on `skillKey@versionId`. Their files (`skills-releases/paperclip/`, `evals/promptfoo/`, `packages/skills-catalog/src/`, `doc/plans/2026-10-09-lean-default-skills.md`) do not overlap mine. I do not edit `skills/paperclip/SKILL.md` (line anchors, see `capability-contract`). |
+| **Jev session** | judgement on top of this data | Export contract in 7.6; ids, numbers and enums only. I could not map the Jev session id to a live session, so no message was sent. |
+| **Migrations** | `0296` is claimed twice (#40 `0296_clear_lord_tyger`, #31 `0296_tricky_unicorn`) | Mine take the next free number at rebase and are regenerated then; the SQL is additive and uses `IF NOT EXISTS`, so reordering is safe. |
+| **Adding MCP tools** | fails the production image check (capability contract needs the external corpus) | No MCP tools; agents use the REST API and CLI. |
+
+## 10. Verification per slice
+
+- **Unit:** classifier against every known error code; per-adapter usage mapping from real captured fixtures with the disjoint-class invariant (`total = input + cache_read + cache_write + output`); `buildRunObservability` never throws, is bounded, and returns `undefined` on bad input.
+- **Run path:** with the builder forced to throw, the terminal UPDATE still writes the same row as before (regression test on the unchanged columns).
+- **Integration (embedded Postgres):** worker derives a record for each terminal status and for runs with no `usage_json`; idempotent re-run; version-bump replace; settle delay and lookback; single-worker advisory lock; backfill resumes after interruption; two-company isolation on every endpoint and the export; retention batches; canary strings never persisted.
+- **Contract:** OpenAPI route test, the new CLI/UI parity test, CLI mocked-fetch tests for URLs and flags.
+- **Reconciliation:** over a backfilled window, `sum(cost_micros) / 10000` matches `sum(cost_cents)` of `cost_events` within rounding, and token sums match `usage_json` normalized totals; differences are reported by the backfill, not hidden.
+- **UI:** real browser at desktop and mobile widths, zero console errors, `pnpm check:token-gates`, `DESIGN.md` token-only rule.
+- **Scale:** `EXPLAIN (ANALYZE)` on each panel query against a synthetic 5M-row record table in a throwaway embedded database.
+- Local gaps on this host (no `cargo`, so no full build; known pre-existing failures) are recorded in `local-test-setup` and will be reported, not hidden.
+
+## 11. Decisions for the operator
+
+| ID | Question | Recommendation |
+|---|---|---|
+| D1 | Retention default: records 400 days | Accept. Cheap, and covers a year-over-year view without rollups. |
+| D2 | Shared host call with the Linear-grade track | **Settled** with that session (7.5). |
+| D3 | Add a versioned price catalog for an "API-equivalent" dollar estimate (Codex cost is always null today)? | Yes, small and flagged `estimated`; tokens stay the primary metric. Without it, Codex cost panels are blank. |
+| D4 | GitHub polling load on anthm (PR list plus check-runs, conditional requests) | Accept with a per-repo budget and a visible "last synced" in the panel. |
+| D5 | Worker disk sampling (PR 7): wanted now? | After PR 2. The classifier already names disk failures; sampling adds the early warning at a point (`workspace-manifest.ts:15-26`) that already checks free space. |
+| D6 | Build materialized rollups now (as originally asked) or gate them on `EXPLAIN` evidence at 5M rows? | Gate on evidence. 350k rows a year per company does not need them, and the design requirements are written down (7.4) for when it does. Say so if you want them built regardless. |
+| D7 | Interventions as a table now, or derived from existing revision tables? | Derived first (7.6); add the table only for manual entries or frozen results. |
+| D8 | Codex usage basis: run A7 on anthm first. If cumulative, fix the parser basis as its own bug-fix PR before showing Codex rollups without a caveat. | Run A7 this week; it decides whether anthm's Codex token totals are inflated. |
+| F1 | Follow-up (not in this feature): retention for `heartbeat_run_events` and NDJSON logs, which grow without bound | Separate issue. Once records exist, raw events can be pruned safely. |
+| F2 | Follow-up: `adapter.invoke` persists prompt and context in the run log | Separate privacy issue; this feature does not depend on it. |
+
+## Appendix A. Read-only measurement queries for anthm
+
+Run on the production database with a read-only role. All are `SELECT` only and
+return counts and distributions, never content. Use the results to confirm
+the assumptions in sections 4 and 5 before slice 1 is merged. **A1, A5 and A7 first.**
+All 12 were executed against a freshly migrated empty schema (parse and column check only).
+
+```sql
+-- A1. Usage coverage by adapter (last 7 days): how many runs have usage at all
+select a.adapter_type, count(*) runs,
+       count(r.usage_json) with_usage,
+       count(*) filter (where r.usage_json ? 'rawInputTokens') with_raw,
+       count(*) filter (where r.usage_json ->> 'usageSource' = 'session_delta') session_delta,
+       count(*) filter (where r.usage_json ->> 'usageSource' = 'per_run') per_run
+from heartbeat_runs r join agents a on a.id = r.agent_id
+where r.created_at > now() - interval '7 days'
+group by 1 order by 2 desc;
+
+-- A2. Daily run volume and failure share (checks "~950 runs/day, ~30% failed")
+select date_trunc('day', created_at) d, count(*) runs,
+       count(*) filter (where status in ('failed','timed_out')) failed,
+       count(*) filter (where status = 'interrupted') interrupted,
+       count(*) filter (where status = 'cancelled') cancelled,
+       count(*) filter (where status = 'scheduled_retry') scheduled_retry
+from heartbeat_runs where created_at > now() - interval '14 days' group by 1 order by 1;
+
+-- A3. Failure mix by error code (checks the cause taxonomy and the unmapped share)
+select coalesce(error_code, '(null)') error_code, count(*) n
+from heartbeat_runs
+where created_at > now() - interval '14 days'
+  and status not in ('succeeded','queued','running','scheduled_retry')
+group by 1 order by 2 desc limit 60;
+
+-- A4. Cost status by billing shape (how much is unpriced or subscription)
+select provider, biller, billing_type, cost_status, count(*) rows,
+       sum(input_tokens)::bigint inp, sum(cached_input_tokens)::bigint cached,
+       sum(output_tokens)::bigint outp, sum(cost_cents)::bigint cents
+from cost_events where occurred_at > now() - interval '7 days'
+group by 1,2,3,4 order by rows desc;
+
+-- A5. Token-class semantics: is cached a subset of input? (ratio near 1 means subset;
+--     compare codex_local with claude_local)
+select a.adapter_type,
+       sum((r.usage_json ->> 'cachedInputTokens')::numeric) / nullif(sum((r.usage_json ->> 'inputTokens')::numeric), 0) cached_over_input,
+       count(*) runs
+from heartbeat_runs r join agents a on a.id = r.agent_id
+where r.created_at > now() - interval '7 days' and r.usage_json is not null
+group by 1 order by 3 desc;
+
+-- A6. What Claude and ACPX already keep in result_json (backfill sources and unverified CLI keys)
+select count(*) runs,
+       count(*) filter (where result_json ? 'modelUsage') with_model_usage,
+       count(*) filter (where result_json ? 'num_turns') with_num_turns,
+       count(*) filter (where result_json ? 'duration_api_ms') with_duration_api_ms,
+       count(*) filter (where (result_json -> 'usage') ? 'cache_creation_input_tokens') claude_cache_creation,
+       count(*) filter (where (result_json -> 'usage') ? 'cachedWriteTokens') acpx_with_cache_write,
+       count(*) filter (where (result_json -> 'usage') ? 'thoughtTokens') acpx_with_thought_tokens
+from heartbeat_runs where created_at > now() - interval '7 days';
+
+-- A7. Cumulative vs per-run counters: within one session, does raw input only ever grow?
+--     About 100% non-decreasing pairs = cumulative counter; about 50% = per-run counter.
+--     Decides whether codex_local token totals are overcounted (section 5, item 1).
+with pairs as (
+  select a.adapter_type,
+         (r.usage_json ->> 'rawInputTokens')::numeric as cur,
+         lag((r.usage_json ->> 'rawInputTokens')::numeric)
+           over (partition by r.agent_id, r.session_id_after order by r.created_at) as prev
+  from heartbeat_runs r join agents a on a.id = r.agent_id
+  where r.created_at > now() - interval '7 days'
+    and r.session_id_after is not null
+    and r.usage_json ? 'rawInputTokens'
+)
+select adapter_type, count(*) pairs,
+       round(100.0 * count(*) filter (where cur >= prev) / count(*), 1) pct_non_decreasing
+from pairs where prev is not null
+group by 1 order by 2 desc;
+
+-- A8. Queue wait distribution by agent (seconds)
+select agent_id, count(*) n,
+       percentile_cont(0.5) within group (order by extract(epoch from started_at - created_at)) p50,
+       percentile_cont(0.95) within group (order by extract(epoch from started_at - created_at)) p95
+from heartbeat_runs where created_at > now() - interval '7 days' and started_at is not null
+group by 1 order by p95 desc limit 25;
+
+-- A9. Linkage: share of runs that resolve to an issue
+select count(*) runs, count(*) filter (where context_snapshot ->> 'issueId' is not null) with_issue
+from heartbeat_runs where created_at > now() - interval '7 days';
+
+-- A10. Run-log growth (is retention urgent?)
+select relname, pg_size_pretty(pg_total_relation_size(c.oid)) size,
+       (select reltuples::bigint) approx_rows
+from pg_class c where relname in ('heartbeat_runs','heartbeat_run_events','activity_log','cost_events','agent_wakeup_requests');
+
+-- A11. Footprint signal available today: adapter.invoke events carrying char metrics
+select count(*) events,
+       count(*) filter (where payload -> 'promptMetrics' is not null) with_prompt_metrics
+from heartbeat_run_events where event_type = 'adapter.invoke' and created_at > now() - interval '1 day';
+
+-- A12. Status-change shapes in activity_log (the issue lifecycle reader must handle each one found)
+select action,
+       (details ? 'status') has_status,
+       ((details -> '_previous') ? 'status') has_prev_status,
+       ((details -> 'changes') ? 'status') has_changes_status,
+       count(*) n
+from activity_log
+where entity_type = 'issue' and created_at > now() - interval '14 days'
+  and ((details ? 'status') or ((details -> 'changes') ? 'status') or ((details -> '_previous') ? 'status'))
+group by 1, 2, 3, 4 order by n desc;
+```
