@@ -488,8 +488,10 @@ function invalidateVisibleIssueRunQueries(
 
   const runId = readString(payload.runId);
   const agentId = readString(payload.agentId);
+  const issueId = readString(payload.issueId);
   const matchesVisibleIssue =
     (runId !== null && context.runIds.has(runId)) ||
+    (issueId !== null && context.issueRefs.has(issueId)) ||
     (!!agentId &&
       !!context.assigneeAgentId &&
       agentId === context.assigneeAgentId);

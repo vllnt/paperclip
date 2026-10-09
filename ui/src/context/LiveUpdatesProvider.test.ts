@@ -1092,6 +1092,68 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     expect(invalidated).toBe(false);
     expect(invalidations).toEqual([]);
   });
+
+  function visibleIssueClient(invalidations: unknown[]) {
+    return {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
+          return {
+            id: "issue-1",
+            identifier: "PAP-759",
+            assigneeAgentId: "agent-1",
+          };
+        }
+        return undefined;
+      },
+      setQueryData: vi.fn(),
+    };
+  }
+
+  it("refreshes the visible issue when a run starts from a different agent on that issue", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      { runId: "run-new", agentId: "agent-2", issueId: "issue-1", status: "queued" },
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("PAP-759") });
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("issue-1") });
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.activeRun("PAP-759") });
+  });
+
+  it("matches the visible issue by its identifier as well", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      { runId: "run-new", agentId: "agent-2", issueId: "PAP-759", status: "queued" },
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+  });
+
+  it("still ignores a run that names a different issue", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      { runId: "run-new", agentId: "agent-2", issueId: "issue-2", status: "queued" },
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(false);
+    expect(invalidations).toEqual([]);
+  });
 });
 
 describe("LiveUpdatesProvider visible issue comment hydration", () => {
