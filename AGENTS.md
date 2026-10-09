@@ -115,10 +115,13 @@ This repo has three separate data paths. Do not confuse them. Match a change to 
   - `packages/adapter-utils/src/duplex-observability.ts`
   - `server/src/services/duplex-observability-recorder.ts`
   - the span attributes in `packages/adapter-utils/src/acpx-engine/startup-timing.ts`
-- **The run log** holds rows in the local `heartbeat_run_events` table. The data stays in the instance database. Its paths are:
+- **The run log** holds rows in the local `heartbeat_run_events` table, and the `run_usage_records` table that a worker derives from run rows. The data stays in the instance database. Its paths are:
   - `doc/run-log-events.md`
   - `packages/db/src/schema/heartbeat_run_events.ts`
   - the append path `appendRunEvent` in `server/src/services/heartbeat.ts`
+  - `doc/run-usage-records.md`
+  - `packages/db/src/schema/run_usage_records.ts`
+  - `server/src/services/run-usage-records.ts` and `server/src/services/run-usage-record-derive.ts`
 
 Apply a review level that matches the path:
 
