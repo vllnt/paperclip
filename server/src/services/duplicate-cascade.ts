@@ -188,7 +188,6 @@ export async function scoreCandidates(input: {
         sameOutcomeProbability: probability,
         verdict,
         modelId: outcome.modelId,
-        inputHash: outcome.inputHash,
       };
     }),
   );
