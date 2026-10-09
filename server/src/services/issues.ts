@@ -139,6 +139,7 @@ import {
 } from "./native-runtime/native-chat-review-presentation.js";
 import {
   buildInitialIssueMonitorFields,
+  buildIssueMonitorClearedPatch,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -6618,6 +6619,24 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
+/**
+ * The fields that clear an issue's monitor because its assignee agent changes.
+ * A monitor and its note belong to the agent that scheduled them, so release and
+ * checkout clear it the way a PATCH reassignment does. Null when nothing is armed.
+ */
+function monitorClearedForAssigneeChange(
+  issue: typeof issues.$inferSelect,
+  nextAssigneeAgentId: string | null,
+) {
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  if (!policy?.monitor && !issue.monitorNextCheckAt) return null;
+  if (issue.assigneeAgentId === nextAssigneeAgentId) return null;
+  return {
+    ...buildIssueMonitorClearedPatch({ issue, policy, clearReason: "reassigned" }),
+    monitorNotes: null,
+  };
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -11426,6 +11445,11 @@ export function issueService(db: Db) {
       });
 
       const now = new Date();
+      const previousIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         issueCompany.companyId,
         id,
@@ -11496,6 +11520,7 @@ export function issueService(db: Db) {
       const updated = await db
         .update(issues)
         .set({
+          ...(previousIssue ? monitorClearedForAssigneeChange(previousIssue, agentId) : {}),
           assigneeAgentId: agentId,
           assigneeUserId: null,
           checkoutRunId,
@@ -11867,11 +11892,13 @@ export function issueService(db: Db) {
         const isTerminal = existing.status === "done" || existing.status === "cancelled";
         const releaseStatus =
           existing.status === "in_progress" ? "todo" : existing.status;
+        const releasedAssigneeAgentId = isTerminal ? existing.assigneeAgentId : null;
         const updated = await tx
           .update(issues)
           .set({
+            ...(isTerminal ? {} : monitorClearedForAssigneeChange(existing, releasedAssigneeAgentId)),
             status: releaseStatus,
-            assigneeAgentId: isTerminal ? existing.assigneeAgentId : null,
+            assigneeAgentId: releasedAssigneeAgentId,
             checkoutRunId: null,
             executionRunId: null,
             executionAgentNameKey: null,
