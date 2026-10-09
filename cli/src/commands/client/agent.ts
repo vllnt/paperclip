@@ -30,6 +30,7 @@ import {
   resolveCommandContext,
   type BaseClientOptions,
 } from "./common.js";
+import { diffConfigRevision, formatConfigRevisionDiff } from "./config-diff.js";
 
 interface AgentListOptions extends BaseClientOptions {
   companyId?: string;
@@ -501,6 +502,30 @@ export function registerAgentCommands(program: Command): void {
           const ctx = resolveCommandContext(opts);
           const result = await ctx.api.get(apiPath`/api/agents/${agentId}/config-revisions/${revisionId}`);
           printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("config-revision:diff")
+      .description("Show what one agent config revision changed (redacted values stay redacted)")
+      .argument("<agentId>", "Agent ID")
+      .argument("<revisionId>", "Revision ID")
+      .action(async (agentId: string, revisionId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const revision = await ctx.api.get<Record<string, unknown>>(
+            apiPath`/api/agents/${agentId}/config-revisions/${revisionId}`,
+          );
+          const diff = diffConfigRevision(revision ?? {});
+          if (ctx.json) {
+            printOutput(diff, { json: true });
+            return;
+          }
+          for (const line of formatConfigRevisionDiff(diff)) console.log(line);
         } catch (err) {
           handleCommandError(err);
         }
