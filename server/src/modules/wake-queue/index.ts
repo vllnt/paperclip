@@ -10,6 +10,7 @@ import {
 import {
   claimDeferredWakeExamination,
   getDeferredWakeAgentStats,
+  getDeferredWakeParkedBreakdown,
   listOrphanedDeferredWakes,
 } from "./adapters/deferred-wake-sweep-postgres.js";
 import { createQueuedCommentIssueLockWriter } from "./adapters/queued-comment-postgres.js";
@@ -69,6 +70,7 @@ export {
 export type { OrphanedDeferredWake } from "./domain/deferred-wake-sweep.js";
 export type {
   DeferredWakeAgentStats,
+  DeferredWakeParkedBreakdown,
   OrphanedDeferredWakeRow,
 } from "./adapters/deferred-wake-sweep-postgres.js";
 export {
@@ -150,6 +152,9 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
     },
     getDeferredWakeAgentStats(input: Parameters<typeof getDeferredWakeAgentStats>[1]) {
       return getDeferredWakeAgentStats(db, input);
+    },
+    getDeferredWakeParkedBreakdown(input: Parameters<typeof getDeferredWakeParkedBreakdown>[1]) {
+      return getDeferredWakeParkedBreakdown(db, input);
     },
   };
 }

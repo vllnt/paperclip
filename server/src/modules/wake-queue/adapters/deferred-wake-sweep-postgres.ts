@@ -1,4 +1,5 @@
-import { and, asc, eq, gte, isNull, lte, notInArray, sql } from "drizzle-orm";
+import { and, asc, count, eq, gte, inArray, isNull, lt, lte, notExists, notInArray, or, sql } from "drizzle-orm";
+import { alias, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { agentWakeupRequests, agents, companies, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY } from "../domain/self-reblock-wake.js";
 import { DEFERRED_WAKE_SWEEP_BATCH_LIMIT, type OrphanedDeferredWake } from "../domain/deferred-wake-sweep.js";
@@ -34,6 +35,14 @@ export type OrphanedDeferredWakeRow = OrphanedDeferredWake & {
 /** `payload.issueId` as a uuid, or null when it is not one, so the join can use the issue primary key. */
 const wakeIssueId = sql`(case when ${agentWakeupRequests.payload} ->> 'issueId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' then (${agentWakeupRequests.payload} ->> 'issueId')::uuid end)`;
 
+/** Wakes another recovery owns: a queued-comment interrupt, a limit-parked self-reblock wake, durable chat input. */
+const notOwnedByOtherRecovery = (wake: { payload: AnyPgColumn; idempotencyKey: AnyPgColumn }) =>
+  and(
+    sql`${wake.payload} -> 'queuedCommentInterrupt' is null`,
+    sql`${wake.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}::text is null`,
+    sql`coalesce(${wake.idempotencyKey}, '') not like 'chat-inbound:%'`,
+  );
+
 /**
  * Deferred wakes whose issue lock is free: nothing holds `executionRunId` and no
  * queued, running or scheduled-retry run exists for the issue. Such a wake has no
@@ -43,6 +52,11 @@ const wakeIssueId = sql`(case when ${agentWakeupRequests.payload} ->> 'issueId' 
  * blockers, budgets). A closed task is excluded because an old parked wake must
  * not revive it; the release of the task's next run retires the wake.
  *
+ * Only an issue's oldest parked wake is returned, as the release drain would
+ * promote it. That head is chosen before the recheck window applies: a head that
+ * was just examined hides itself and waits out the window, and its younger
+ * siblings must not step forward in its place.
+ *
  * The scan starts from the partial index on deferred wakes, a set of a few rows,
  * and reaches each issue through its primary key.
  */
@@ -50,6 +64,7 @@ export async function listOrphanedDeferredWakes(
   db: Db,
   input: ListOrphanedDeferredWakesInput,
 ): Promise<OrphanedDeferredWakeRow[]> {
+  const olderWake = alias(agentWakeupRequests, "older_deferred_wake");
   return db
     .select({
       wakeId: agentWakeupRequests.id,
@@ -85,9 +100,29 @@ export async function listOrphanedDeferredWakes(
         // Owned by other recovery: a queued-comment interrupt resumes on its own
         // sweep, a limit-parked self-reblock wake waits out its window there, and
         // durable chat input keeps its receipt and publication path.
-        sql`${agentWakeupRequests.payload} -> 'queuedCommentInterrupt' is null`,
-        sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}::text is null`,
-        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+        notOwnedByOtherRecovery(agentWakeupRequests),
+        // Only the issue's oldest parked wake (by the same ownership rule) is a
+        // candidate, whatever its agent, age or recheck state.
+        notExists(
+          db
+            .select({ id: olderWake.id })
+            .from(olderWake)
+            .where(
+              and(
+                eq(olderWake.companyId, agentWakeupRequests.companyId),
+                eq(olderWake.status, DEFERRED_WAKE_STATUS),
+                sql`${olderWake.payload} ->> 'issueId' = ${agentWakeupRequests.payload} ->> 'issueId'`,
+                notOwnedByOtherRecovery(olderWake),
+                or(
+                  lt(olderWake.requestedAt, agentWakeupRequests.requestedAt),
+                  and(
+                    eq(olderWake.requestedAt, agentWakeupRequests.requestedAt),
+                    lt(olderWake.id, agentWakeupRequests.id),
+                  ),
+                ),
+              ),
+            ),
+        ),
         sql`not exists (
           select 1 from ${heartbeatRuns} holder
           where holder.company_id = ${issues.companyId}
@@ -135,6 +170,85 @@ export async function claimDeferredWakeExamination(
     )
     .returning({ id: agentWakeupRequests.id });
   return claimed.length > 0;
+}
+
+export type DeferredWakeParkedBreakdown = {
+  /** On a done, cancelled, hidden or deleted issue; the next run's release retires the wake. */
+  closedIssue: number;
+  /** Parked by an execution-recovery gate (`payload.executionWait`), by that gate's reason. */
+  awaitingRecovery: Record<string, number>;
+  /** Behind a held issue lock or a live run; the release drain promotes it. */
+  behindIssueLock: number;
+  /** Owned by another recovery: a queued-comment interrupt, a limit-parked self-reblock wake, chat input. */
+  otherRecovery: number;
+  /** No lock, no live run, no recovery wait: the periodic sweep's own work. */
+  orphaned: number;
+};
+
+/**
+ * Why each of a company's parked wakes is parked, from durable state. The same
+ * facts the sweep reads, grouped so a reader sees the cause of a stall without
+ * the process that ran the sweep: a wake on a recovery wait is not an orphan.
+ * Classes are exclusive and tested in the order of the type above.
+ */
+export async function getDeferredWakeParkedBreakdown(
+  db: Db,
+  input: { companyId: string },
+): Promise<DeferredWakeParkedBreakdown> {
+  const parked = db
+    .select({
+      state: sql<string>`case
+        when ${issues.id} is null or ${issues.hiddenAt} is not null or ${inArray(issues.status, [...CLOSED_ISSUE_STATUSES])}
+          then 'closed_issue'
+        when ${agentWakeupRequests.payload} -> 'executionWait' is not null then 'awaiting_recovery'
+        when ${issues.executionRunId} is not null or exists (
+          select 1 from ${heartbeatRuns} holder
+          where holder.company_id = ${issues.companyId}
+            and holder.status in (${sql.join(
+              EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.map((status) => sql`${status}`),
+              sql`, `,
+            )})
+            and holder.context_snapshot ->> 'issueId' = ${issues.id}::text
+        ) then 'behind_issue_lock'
+        when not (${notOwnedByOtherRecovery(agentWakeupRequests)}) then 'other_recovery'
+        else 'orphaned' end`.as("state"),
+      waitReason: sql<string | null>`${agentWakeupRequests.payload} -> 'executionWait' ->> 'reason'`.as("wait_reason"),
+    })
+    .from(agentWakeupRequests)
+    .leftJoin(
+      issues,
+      and(eq(issues.id, wakeIssueId), eq(issues.companyId, agentWakeupRequests.companyId)),
+    )
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+      ),
+    )
+    .as("parked");
+  const rows = await db
+    .select({ state: parked.state, waitReason: parked.waitReason, count: count() })
+    .from(parked)
+    .groupBy(parked.state, parked.waitReason);
+
+  const breakdown: DeferredWakeParkedBreakdown = {
+    closedIssue: 0,
+    awaitingRecovery: {},
+    behindIssueLock: 0,
+    otherRecovery: 0,
+    orphaned: 0,
+  };
+  for (const row of rows) {
+    const total = Number(row.count);
+    if (row.state === "closed_issue") breakdown.closedIssue += total;
+    else if (row.state === "awaiting_recovery") {
+      const reason = row.waitReason?.trim() || "unspecified";
+      breakdown.awaitingRecovery[reason] = (breakdown.awaitingRecovery[reason] ?? 0) + total;
+    } else if (row.state === "behind_issue_lock") breakdown.behindIssueLock += total;
+    else if (row.state === "other_recovery") breakdown.otherRecovery += total;
+    else breakdown.orphaned += total;
+  }
+  return breakdown;
 }
 
 export type DeferredWakeAgentStats = {

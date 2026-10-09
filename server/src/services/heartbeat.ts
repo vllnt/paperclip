@@ -629,6 +629,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
+import type { DeferredWakeSweepCounters } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { getEnvironmentDriverTraits } from "./environment-driver-traits.js";
@@ -9606,6 +9607,37 @@ export function resolveHeartbeatSchedulingSuppression(
     return { suppressed: true, reason: "task_drain" };
   }
   return { suppressed: false, reason: null };
+}
+
+// Counters for deferred-wake redelivery, one set per company so a reader of one
+// company never sees another company's activity. They live at module scope on
+// purpose: the scheduler and each route module build their own
+// `heartbeatService`, and a counter kept inside one instance is invisible to the
+// others (the endpoint read an idle copy). They reset on restart;
+// `getDeferredWakeStats` pairs them with durable counts read from the queue.
+const deferredWakeSweepCounters = new Map<string, DeferredWakeSweepCounters>();
+function deferredWakeCountersForCompany(companyId: string): DeferredWakeSweepCounters {
+  let counters = deferredWakeSweepCounters.get(companyId);
+  if (!counters) {
+    counters = {
+      examined: 0,
+      promoted: 0,
+      retired: 0,
+      stillDeferred: 0,
+      skippedHeld: 0,
+      skippedPauseHold: 0,
+      skippedExecutionBlocker: 0,
+      skippedOperatorStop: 0,
+      skippedBudget: 0,
+      skippedNotInvokable: 0,
+      skippedCapacity: 0,
+      executionBlockerCauses: {},
+      failed: 0,
+      lastExaminedAt: null,
+    };
+    deferredWakeSweepCounters.set(companyId, counters);
+  }
+  return counters;
 }
 
 export function heartbeatService(
@@ -19753,39 +19785,7 @@ export function heartbeatService(
     });
   }
 
-  // Counters for deferred-wake redelivery, kept per company so a reader of one
-  // company never sees another company's activity. They reset on restart;
-  // `getDeferredWakeStats` pairs them with durable counts read from the queue.
-  type DeferredWakeCompanyCounters = {
-    examined: number;
-    promoted: number;
-    retired: number;
-    stillDeferred: number;
-    skippedHeld: number;
-    skippedBudget: number;
-    skippedNotInvokable: number;
-    failed: number;
-    lastExaminedAt: Date | null;
-  };
-  const deferredWakeSweepCounters = new Map<string, DeferredWakeCompanyCounters>();
-  const countersForCompany = (companyId: string) => {
-    let counters = deferredWakeSweepCounters.get(companyId);
-    if (!counters) {
-      counters = {
-        examined: 0,
-        promoted: 0,
-        retired: 0,
-        stillDeferred: 0,
-        skippedHeld: 0,
-        skippedBudget: 0,
-        skippedNotInvokable: 0,
-        failed: 0,
-        lastExaminedAt: null,
-      };
-      deferredWakeSweepCounters.set(companyId, counters);
-    }
-    return counters;
-  };
+  const countersForCompany = deferredWakeCountersForCompany;
   // The completion trigger runs after a run frees a slot. Promotion queues a run
   // whose start calls `startNextQueuedRunForAgent` again, so one pass per agent.
   const deferredWakeCompletionPassesInFlight = new Set<string>();
@@ -19799,7 +19799,11 @@ export function heartbeatService(
    * and the per-issue blocker read only for the wakes about to be promoted.
    */
   async function readDeferredWakeHolds(candidates: readonly OrphanedDeferredWakeRow[]) {
-    const holds = new Map<string, "pause_hold" | "execution_blocker" | "operator_stop">();
+    // An execution blocker carries its cause, so a reader sees which recovery holds the wake.
+    const holds = new Map<
+      string,
+      { reason: "pause_hold" | "execution_blocker" | "operator_stop"; cause: string | null }
+    >();
     if (candidates.length === 0) return holds;
 
     const companyIds = [...new Set(candidates.map((candidate) => candidate.companyId))];
@@ -19835,11 +19839,12 @@ export function heartbeatService(
         companiesWithPauseHold.has(candidate.companyId) &&
         (await treeControlSvc.getActivePauseHoldGate(candidate.companyId, candidate.issueId))
       ) {
-        holds.set(candidate.wakeId, "pause_hold");
+        holds.set(candidate.wakeId, { reason: "pause_hold", cause: null });
         continue;
       }
-      if (await getExecutionBlocker(db, candidate.companyId, candidate.issueId)) {
-        holds.set(candidate.wakeId, "execution_blocker");
+      const blocker = await getExecutionBlocker(db, candidate.companyId, candidate.issueId);
+      if (blocker) {
+        holds.set(candidate.wakeId, { reason: "execution_blocker", cause: blocker.cause });
         continue;
       }
       const latest = latestRunByIssueId.get(candidate.issueId);
@@ -19850,7 +19855,7 @@ export function heartbeatService(
             (parseObject(latest.resultJson?.executionCancellation).state === "acknowledged" ||
               isAcknowledgedNativeStop(latest))))
       ) {
-        holds.set(candidate.wakeId, "operator_stop");
+        holds.set(candidate.wakeId, { reason: "operator_stop", cause: null });
       }
     }
     return holds;
@@ -19922,9 +19927,13 @@ export function heartbeatService(
       retired: 0,
       stillDeferred: 0,
       skippedHeld: 0,
+      skippedPauseHold: 0,
+      skippedExecutionBlocker: 0,
+      skippedOperatorStop: 0,
       skippedBudget: 0,
       skippedNotInvokable: 0,
       skippedCapacity: 0,
+      executionBlockerCauses: {} as Record<string, number>,
       failed: 0,
     };
     if ((await getSchedulingSuppression()).suppressed) return result;
@@ -19992,11 +20001,22 @@ export function heartbeatService(
     const selected = selectDeferredWakesToPromote(orphans, freeSlotsByAgent, {
       maxTotal: sweepPromotionBudget(opts.maxPromotions),
     });
-    result.skippedCapacity = Math.max(
-      0,
-      new Set(orphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId)).map((orphan) => orphan.issueId)).size -
-        selected.length,
-    );
+    // An eligible issue the pass did not select waits for a free slot or the next pass.
+    const eligibleIssuesByCompany = new Map<string, Set<string>>();
+    for (const orphan of orphans) {
+      if (notInvokableAgentIds.has(orphan.agentId)) continue;
+      const issuesOfCompany = eligibleIssuesByCompany.get(orphan.companyId) ?? new Set<string>();
+      issuesOfCompany.add(orphan.issueId);
+      eligibleIssuesByCompany.set(orphan.companyId, issuesOfCompany);
+    }
+    for (const [companyId, eligibleIssues] of eligibleIssuesByCompany) {
+      const left = Math.max(
+        0,
+        eligibleIssues.size - selected.filter((candidate) => candidate.companyId === companyId).length,
+      );
+      countersForCompany(companyId).skippedCapacity += left;
+      result.skippedCapacity += left;
+    }
     const holds = await readDeferredWakeHolds(selected);
     // Company, agent and project decide a budget block, so one read serves every
     // wake that shares them.
@@ -20012,9 +20032,20 @@ export function heartbeatService(
           now: new Date(),
         });
         if (!claimed) continue;
-        if (holds.has(candidate.wakeId)) {
-          result.skippedHeld += 1;
-          counters.skippedHeld += 1;
+        const hold = holds.get(candidate.wakeId);
+        if (hold) {
+          // The wake stays parked and moves to the back of the recheck window.
+          // Count it by what holds it, so the endpoint says why it was not woken.
+          const reasonKey = {
+            pause_hold: "skippedPauseHold",
+            execution_blocker: "skippedExecutionBlocker",
+            operator_stop: "skippedOperatorStop",
+          }[hold.reason] as "skippedPauseHold" | "skippedExecutionBlocker" | "skippedOperatorStop";
+          for (const tally of [result, counters]) {
+            tally.skippedHeld += 1;
+            tally[reasonKey] += 1;
+            if (hold.cause) tally.executionBlockerCauses[hold.cause] = (tally.executionBlockerCauses[hold.cause] ?? 0) + 1;
+          }
           continue;
         }
         const budgetScope = `${candidate.companyId}:${candidate.agentId}:${candidate.projectId ?? ""}`;
@@ -20044,9 +20075,11 @@ export function heartbeatService(
       }
     }
 
-    if (result.promoted > 0 || result.failed > 0) {
-      logger.warn({ ...result }, "re-delivered orphaned deferred issue-execution wakes");
-    }
+    // One line per pass that read any wake, so a stall can be read from the log:
+    // what was seen, what started, and what held the rest.
+    const summary = { trigger: opts.agentId ? "run_completed" : "periodic", ...result };
+    if (result.failed > 0) logger.warn(summary, "deferred wake sweep pass");
+    else logger.info(summary, "deferred wake sweep pass");
     return result;
   }
 
@@ -20074,6 +20107,7 @@ export function heartbeatService(
    */
   async function getDeferredWakeStats(companyId: string, now = new Date()) {
     const perAgent = await wakeQueue.getDeferredWakeAgentStats({ companyId, now });
+    const parked = await wakeQueue.getDeferredWakeParkedBreakdown({ companyId });
     const agentStats = perAgent.map((row) => ({
       agentId: row.agentId,
       agentName: row.agentName,
@@ -20095,7 +20129,11 @@ export function heartbeatService(
       oldestDeferredAt: oldest,
       oldestDeferredAgeSeconds: oldest ? Math.max(0, Math.round((now.getTime() - oldest.getTime()) / 1000)) : null,
       agents: agentStats,
-      sweep: { ...countersForCompany(companyId) },
+      parked,
+      sweep: {
+        ...countersForCompany(companyId),
+        executionBlockerCauses: { ...countersForCompany(companyId).executionBlockerCauses },
+      },
     };
   }
 
