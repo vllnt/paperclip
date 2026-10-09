@@ -15,6 +15,8 @@ This page documents what ships in the first slice.
 | Navigation and snapshot policy | `server/src/services/browser-profile-policy.ts` |
 | Browser engine (Playwright, optional) | `server/src/services/browser-executor.ts` |
 | Service and routes | `server/src/services/browser-profiles.ts`, `server/src/routes/browser-profiles.ts` |
+| OpenAPI entries (tag **Shared Browser**, 14 operations) | `server/src/routes/openapi.ts`, covered by `openapi-routes.test.ts` |
+| CLI (`paperclipai browser ...`) | `cli/src/commands/client/browser.ts`, [`CLI.md`](CLI.md#shared-browser-commands) |
 | Board UI | Company settings → **Shared browser** |
 
 ## Turning it on
@@ -23,7 +25,8 @@ This page documents what ships in the first slice.
    `PAPERCLIP_BROWSER_EXECUTABLE_PATH` to a Chromium executable. Without it the page
    reports "No browser is configured" and nothing launches.
 2. A board user opens Company settings → Shared browser and switches the company on.
-   The default is off, and every route returns 404 while it is off.
+   The default is off. While it is off, creating, changing, signing in to and acting
+   on profiles return 404, the overview reports it as off, and agents see no profiles.
 3. Create a profile: a name and the domains agents may open (`app.example.com` or
    `*.example.com`). An empty list means agents can open nothing.
 4. Choose which agents may use it. An agent that is not listed gets 403 and an
@@ -36,9 +39,19 @@ This page documents what ships in the first slice.
 > reach whatever that host can reach, apart from the literal-IP and `localhost`
 > blocks below. Production use should wait for the isolated browser hub in the plan.
 
+## Board API and CLI
+
+Everything the Shared browser page does is also a board API route and a CLI command,
+so an agent holding a board credential can run the same steps as a person. All 14
+routes are in `GET /api/openapi.json` under the **Shared Browser** tag; the commands
+are `paperclipai browser ...` ([CLI reference](CLI.md#shared-browser-commands)).
+Permissions are the API's, not looser. Typing into the sign-in page from the CLI puts
+the text on the command line, so use the web page for passwords and one-time codes.
+
 ## Agent API
 
-Agents use their normal Paperclip credentials.
+Agents use their normal Paperclip credentials. The CLI equivalents are
+`paperclipai browser agent-profiles` and `paperclipai browser action`.
 
 ```
 GET  /api/companies/:companyId/browser/agent-profiles

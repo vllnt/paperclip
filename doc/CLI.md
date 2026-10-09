@@ -853,6 +853,39 @@ commands above. See the
 [secrets deploy guide](../docs/deploy/secrets.md#provider-vaults) and
 [API reference](../docs/api/secrets.md#provider-vaults) for the contract.
 
+## Shared Browser Commands
+
+```sh
+npx paperclipai browser overview --company-id <company-id>
+npx paperclipai browser enable --company-id <company-id>
+npx paperclipai browser disable --company-id <company-id>
+npx paperclipai browser profile create --company-id <company-id> --payload-json '{"name":"CRM","allowedDomains":["app.example.com"]}'
+npx paperclipai browser profile update <profile-id> --company-id <company-id> --payload-json '{"allowedAgentIds":["<agent-id>"]}'
+npx paperclipai browser profile suspend <profile-id> --company-id <company-id>
+npx paperclipai browser profile resume <profile-id> --company-id <company-id>
+npx paperclipai browser profile delete <profile-id> --company-id <company-id> --yes
+npx paperclipai browser signin start <profile-id> --company-id <company-id> [--payload-json '{"startUrl":"https://app.example.com/login"}']
+npx paperclipai browser signin frame <profile-id> --company-id <company-id> --out page.jpg
+npx paperclipai browser signin state <profile-id> --company-id <company-id>
+npx paperclipai browser signin input <profile-id> --company-id <company-id> --payload-json '{"type":"click","x":120,"y":340}'
+npx paperclipai browser signin end <profile-id> --company-id <company-id>
+npx paperclipai browser agent-profiles --company-id <company-id>
+npx paperclipai browser action <profile-id> --company-id <company-id> --payload-json '{"action":"snapshot"}'
+```
+
+Each command calls one route of the shared browser API, so permissions are the
+API's. Every command except `agent-profiles` and `action` needs a board credential;
+those two need an agent credential and give a board credential a 403. The first
+group manages profiles and runs the board sign-in; the last two are what an agent
+runs. `profile update` replaces each list it sends (`allowedDomains`,
+`allowedAgentIds`). `profile delete` erases the saved session and needs `--yes`.
+`signin frame` writes the current sign-in page as a JPEG (mode `0600`) to `--out`.
+
+`signin input` with `{"type":"type","text":"..."}` puts the typed text on the
+command line, where shell history and the process list can see it. Sign in on the
+web page when you must type a password or a one-time code. The guide is
+[`shared-browser.md`](shared-browser.md).
+
 ## Approval Commands
 
 ```sh
