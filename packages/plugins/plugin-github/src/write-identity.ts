@@ -41,6 +41,8 @@ const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MAX_PULL_REQUEST_FILE_PAGES = 30;
 /** Pages read for a fence or merge check; a list that still has a next page after this fails closed. */
 const MAX_PAGES = 10;
+/** The conclusions of a finished check run that pass a required check, as GitHub counts them. */
+const PASSING_CONCLUSIONS = ["success", "skipped"];
 
 /** Reads every page of a paginated GitHub list, or throws when it has more than {@link MAX_PAGES} pages. */
 async function allPages<T>(read: (page: number) => Promise<{ items: T[]; next: boolean }>, what: string): Promise<T[]> {
@@ -499,9 +501,10 @@ export function registerWriteIdentity(
       ...statuses.map(status => ({ name: status.context, result: status.state }))];
     evidence.checks = checks;
     if (!checks.length) throw new Denied(`No check has reported on ${headSha.slice(0, 12)}; an admin merge needs green checks.`, { ...evidence, failing: [] });
-    const failing = required.filter(check => !runs.some(run => run.name === check.context && run.status === "completed" && run.conclusion === "success" && (check.integrationId === null || run.appId === check.integrationId))
+    // GitHub passes a required check that succeeded or was skipped (a job its path filter or condition skipped); a commit status has no skipped state.
+    const failing = required.filter(check => !runs.some(run => run.name === check.context && run.status === "completed" && PASSING_CONCLUSIONS.includes(String(run.conclusion)) && (check.integrationId === null || run.appId === check.integrationId))
       && !(check.integrationId === null && statuses.some(status => status.context === check.context && status.state === "success"))).map(check => check.context);
-    if (failing.length) throw new Denied(`Required checks have not all succeeded on ${headSha.slice(0, 12)}: ${[...new Set(failing)].join(", ")}.`, { ...evidence, failing: [...new Set(failing)] });
+    if (failing.length) throw new Denied(`Required checks have not all passed (success or skipped) on ${headSha.slice(0, 12)}: ${[...new Set(failing)].join(", ")}.`, { ...evidence, failing: [...new Set(failing)] });
     return evidence;
   }
 

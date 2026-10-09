@@ -274,8 +274,11 @@ check runs with the App's read-only token, and refuses unless the head equals
 that SHA exactly, the base branch's classic protection is on and binds
 administrators ("Do not allow bypassing the above settings", `enforce_admins`),
 the base branch requires at least one check, and every required check, from
-rulesets and classic branch protection, concluded `success` in its latest run
-(from the pinned integration when the rule names one). GitHub's branch read
+rulesets and classic branch protection, concluded `success` or `skipped` in its
+latest run (from the pinned integration when the rule names one). `skipped` is a
+job that its path filter or condition skipped, which GitHub passes too; a check
+that never reported, one still running, a commit status that is not `success`,
+and every other conclusion (`neutral` included) do not pass. GitHub's branch read
 (`GET /repos/{owner}/{repo}/branches/{branch}`) never includes `enforce_admins`;
 it reports administrators as bound with
 `protection.required_status_checks.enforcement_level: "everyone"`
