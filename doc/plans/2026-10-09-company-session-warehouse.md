@@ -150,10 +150,10 @@ Agreed with the observability track (same envelope and cursor in its
   taken before that move. Section 19 shows every current writer meets it except
   one pre-existing reaper race (`heartbeat.ts:19484`, `setRunStatus` matches on
   id only), which can flip a just-finished run back to running and let a later
-  `run.finishedAt ?? now` write keep the old key. Fix proposed as a separate
-  bug-fix PR **F3** (use the existing `setRunStatusIfRunning`
-  compare-and-set, with a regression test). Until it lands the archive's
-  reconcile sweep (section 7.4) catches such runs, and the export documents it.
+  `run.finishedAt ?? now` write keep the old key. The fix is its own bug-fix PR
+  **F3** (#65: the existing `setRunStatusIfRunning` compare-and-set, with a
+  regression test), and W1 merges after it. The archive's reconcile sweep
+  (section 7.4) stays as a second line of defense.
 
 ## 5. Archive layout
 
@@ -628,6 +628,14 @@ items and resolutions:
 | B3 | The shared mutable manifest is not fenced | Removed: per-attempt immutable manifests named by fencing generation; readers take the greatest (section 5) |
 | B4 | Marks cannot reveal late cost or activity rows | `run.end` marks now carry `costCount` and `activityCount` (implemented and tested) |
 | New | A page of deleted runs ends the export early | Cursor advances before the skip (implemented); test deletes a run mid-stream |
+
+**Round 3** (Codex `gpt-6-astra`, verdict REJECT). B3, B4 and the pagination
+item resolved. Remaining:
+
+| # | Finding | Resolution |
+|---|---|---|
+| B2 | The reaper race still breaks the incremental guarantee for W1 export consumers; the W3 sweep does not help them. Satisfied by landing F3 or an export-side reconciliation | F3 built as its own PR (#65): `setRunStatusIfRunning` compare-and-set, regression test red before and green after. W1 (#61) merges after #65 |
+| New | CLI `--resume` neither keeps nor validates `--until` | `export.header` records `requestedUntil`; resume reuses it when omitted and refuses a different one (tested) |
 
 A separate code review (Claude code-reviewer, round 1 of W1 code) found 11
 defects, all fixed with tests: unreadable run logs and event pages no longer
