@@ -209,6 +209,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
       ...(parsed.data.companyEnvironmentDefaults ? { companyEnvironmentDefaults: parsed.data.companyEnvironmentDefaults } : {}),
+      ...(parsed.data.companyRunTiers ? { companyRunTiers: parsed.data.companyRunTiers } : {}),
     };
   }
   return {

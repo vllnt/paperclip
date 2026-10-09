@@ -153,7 +153,7 @@ function nonEmptyString(value: unknown): string | undefined {
  */
 export function issueRunProfileFromOverrides(
   overrides:
-    | { runProfile?: RunProfile | null; adapterConfig?: Record<string, unknown>; useProjectWorkspace?: boolean }
+    | { runProfile?: RunProfile | null; adapterConfig?: Record<string, unknown> | null; useProjectWorkspace?: boolean | null }
     | null
     | undefined,
 ): { profile: RunProfile; origin: "run_profile" | "legacy_adapter_config" } | null {
