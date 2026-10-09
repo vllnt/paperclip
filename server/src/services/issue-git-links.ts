@@ -65,6 +65,22 @@ export interface PullRequestEnrichment {
 
 export type PullRequestEnricher = (companyId: string, signal: PullRequestSignal) => Promise<PullRequestEnrichment | null>;
 
+/** Reads a pull request's details from GitHub, for signals that arrive without them. */
+export function pullRequestDetailsEnricher(resolve: PullRequestMergeDetailsResolver): PullRequestEnricher {
+  return async (companyId, signal) => {
+    const [owner, repo] = signal.repository.split("/");
+    if (!owner || !repo) return null;
+    const details = await resolve(companyId, { host: "github.com", owner, repo, number: signal.number });
+    if (details.state === "unknown") return null;
+    return {
+      headRepository: details.headRepository ?? null,
+      defaultBranch: details.defaultBranch ?? null,
+      title: details.title ?? null,
+      draft: details.draft ?? null,
+    };
+  };
+}
+
 export interface IssueGitLinkServiceOptions {
   statusAutomationEnabled?: () => Promise<boolean>;
   enrich?: PullRequestEnricher;
@@ -551,7 +567,8 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
     let effective = signal;
     const enrich = options.enrich;
     const untrustedTarget = [...targets.values()].some((e) => !e || (e.linkedBy !== "manual" && e.linkedBy !== "workspace_branch"));
-    if (enrich && !signal.headRepository && untrustedTarget) {
+    const draftUnknown = signal.draft === undefined && signal.state === "open";
+    if (enrich && ((!signal.headRepository && untrustedTarget) || draftUnknown)) {
       try {
         const extra = await enrich(companyId, signal);
         if (extra) {
