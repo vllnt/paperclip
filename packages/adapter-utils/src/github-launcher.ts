@@ -305,15 +305,19 @@ function pushReport(env, globalArgs, pushArgs, known) {
 // command: { tips: the ones this checkout has, heads: branch name -> commit, defaultTip: the default branch's commit }.
 // null when they cannot be read in full.
 // This is what a push may call "already on GitHub"; the remote-tracking refs in a checkout say nothing of the sort.
+// The read holds the credential, so it is a sealed command too (see privateGit): the literal URL, a git directory of its own
+// and an environment of its own. What it lists is then checked against this checkout without the credential (local).
 const MAX_REMOTE_REFS = 2000;
-function remoteRefs(env, globalArgs, url) {
-  const git = gitBinary();
-  if (!git) return null;
+function remoteRefs(env, local, globalArgs, scratch, url) {
+  const dir = privateGit(env, local, globalArgs, scratch, 'list');
+  if (!dir) return null;
   const { spawnSync } = require('node:child_process');
-  const options = { env: { ...env, GIT_NO_LAZY_FETCH: '1' }, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
+  const options = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
   try {
+    lockPrivateGit(dir, false);
     // Branches, tags and HEAD (with the branch it names): the patterns keep the many refs/pull/* of a busy repository out of the list.
-    const listed = spawnSync(git, [...globalArgs, 'ls-remote', '--symref', url, 'HEAD', 'refs/heads/*', 'refs/tags/*'], { ...options, timeout: 30000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const listed = spawnSync(dir.git, [...SEALED_CONFIG(dir), 'ls-remote', '--symref', '--', url, 'HEAD', 'refs/heads/*', 'refs/tags/*'],
+      { ...options, env: { ...dir.sealed, GIT_NO_LAZY_FETCH: '1' }, timeout: 30000, stdio: ['ignore', 'pipe', 'ignore'] });
     if (listed.error || listed.status !== 0) return null;
     const lines = listed.stdout.split('\n').filter(Boolean);
     if (lines.length > MAX_REMOTE_REFS) return null;
@@ -331,7 +335,7 @@ function remoteRefs(env, globalArgs, url) {
     const defaultTip = defaultBranch ? heads.get(defaultBranch) || '' : '';
     if (!shas.size) return { tips: [], heads, defaultTip };
     // Only objects this checkout has can be left out of what a push sends; git reads the others as missing.
-    const present = spawnSync(git, [...globalArgs, 'cat-file', '--batch-check'], { ...options, timeout: 10000, input: [...shas].join('\n') + '\n', stdio: ['pipe', 'pipe', 'ignore'] });
+    const present = spawnSync(dir.git, [...globalArgs, 'cat-file', '--batch-check'], { ...options, env: { ...local, GIT_NO_LAZY_FETCH: '1' }, timeout: 10000, input: [...shas].join('\n') + '\n', stdio: ['pipe', 'pipe', 'ignore'] });
     if (present.error || present.status !== 0) return null;
     const tips = present.stdout.split('\n').map(line => line.split(' ')).filter(parts => parts[1] === 'commit' || parts[1] === 'tag').map(parts => parts[0]);
     return { tips, heads, defaultTip };
@@ -402,11 +406,47 @@ function sealedOptions(pushArgs) {
 // A sealed push's whole environment: nothing of the checkout's own steering (GIT_DIR, GIT_EXEC_PATH, GIT_TRACE*, GIT_SSH,
 // object and index paths…) is carried over, only what a credentialed command needs.
 const SEALED_ENV = /^(LANG|LC_[A-Z_]+|TMPDIR|TMP|TEMP|SYSTEMROOT|COMSPEC|GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GH_HOST|GH_CONFIG_DIR|GIT_TERMINAL_PROMPT|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|GIT_SSH_COMMAND|SSH_AUTH_SOCK)$/;
+// ssh never uses an agent, a config file or a key of the host: GitHub traffic is HTTPS, and an ssh URL is not a way around that.
+const SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
 function sealedEnv(env, home, gitDir) {
   const sealed = {};
   for (const [key, value] of Object.entries(env)) if (SEALED_ENV.test(key) && typeof value === 'string') sealed[key] = value;
   return { ...sealed, PATH: originalPath.join(path.delimiter), HOME: home, GIT_DIR: gitDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
-    GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1' };
+    GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_SSH_COMMAND: SSH_COMMAND };
+}
+// Every command that holds the credential runs in a git directory of the launcher's own (see privateGit), not in the checkout:
+// the checkout's config can redirect it (url.*.insteadOf, http.<url>.proxy, remote URLs and their upload-pack), its hooks and
+// helpers would run with the credential, and the agent's UID can change both after the broker has answered. Command-line
+// config cannot undo that (a rewrite or a URL-scoped setting in the repository's own config ties with or outranks it), so
+// the only thing that closes it is that the command never reads the checkout's config.
+const SEALED_CONFIG = dir => ['-c', 'core.hooksPath=' + dir.hooks, '-c', 'protocol.ext.allow=never'];
+// The git directory: no remotes, refs, hooks or settings of the checkout, a default config that this launcher wrote, and what
+// the caller adds. Its setup runs without the credential (local is the checkout's environment as it was before any credential
+// came); sealed is the environment of the one command that holds it. null when it cannot be made.
+function privateGit(env, local, globalArgs, scratch, label) {
+  const git = gitBinary();
+  if (!git || !scratch) return null;
+  const { spawnSync } = require('node:child_process');
+  try {
+    const root = fs.mkdtempSync(path.join(scratch, label + '-'));
+    const gitDir = path.join(root, 'git'), hooks = path.join(root, 'hooks');
+    fs.mkdirSync(hooks);
+    const setup = sealedEnv(local, root, gitDir);
+    const format = (gitOutput(local, globalArgs, ['rev-parse', '--show-object-format']) || 'sha1').trim();
+    const made = /^sha(1|256)$/.test(format)
+      && spawnSync(git, ['init', '-q', '--bare', '--template=', '--object-format=' + format], { env: setup, encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'ignore', 'ignore'] }).status === 0;
+    return made ? { git, root, gitDir, hooks, setup, sealed: sealedEnv(env, root, gitDir) } : null;
+  } catch { return null; }
+}
+// Read-only from here (the whole directory unless the command writes in it). A process of the same user can undo that, so it
+// narrows the window and does not close it: what matters is that the destination, the refs and the settings are in the
+// arguments and the environment, and that the config holds nothing of them.
+function lockPrivateGit(dir, writable) {
+  fs.chmodSync(path.join(dir.gitDir, 'config'), 0o400);
+  fs.chmodSync(dir.gitDir, writable ? 0o700 : 0o500);
+  // The (empty) directory that core.hooksPath names is locked too: a hook put there would run with the credential.
+  fs.chmodSync(dir.hooks, 0o500);
+  process.prependOnceListener('exit', () => { try { fs.chmodSync(dir.gitDir, 0o700); fs.chmodSync(dir.hooks, 0o700); } catch {} });
 }
 // A ref as the child is given it: whole, with no characters that git refuses or that could be taken for something else.
 const WHOLE_REF = /^refs\/[^\s~^:?*\[\\]+$/;
@@ -484,16 +524,15 @@ function sealedRefspecs(env, globalArgs, specs, options, authorized, name, liste
 }
 // The command, environment and private git directory of the sealed push, or { problem, advice }. authorized is the report
 // that the broker answered with a credential: the sealed push must send exactly what it described, to the one URL it
-// listed. listing is GitHub's branches as read for the check of that report (null when they were not read).
-function sealedPush(env, globalArgs, pushArgs, authorized, scratch, listing) {
+// listed. listing is GitHub's branches as read for the check of that report (null when they were not read). Everything it reads
+// of the checkout is read with local, the environment without the credential.
+function sealedPush(env, local, globalArgs, pushArgs, authorized, scratch, listing) {
   const options = sealedOptions(pushArgs);
   if (options.problem) return { problem: options.problem };
-  const git = gitBinary();
-  if (!git || !scratch) return { problem: 'its private git directory cannot be made' };
   const { positional, repoOption } = gitNetworkArgs('push', pushArgs);
   if (JSON.stringify(positional) !== JSON.stringify(options.rest)) return { problem: 'its arguments cannot be read the way git reads them' };
-  const branch = gitOutput(env, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
-  const where = pushTarget(env, globalArgs, positional, repoOption, branch ? branch.trim() : '', (key, type) => gitConfigValue(env, globalArgs, key, type) || '');
+  const branch = gitOutput(local, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  const where = pushTarget(local, globalArgs, positional, repoOption, branch ? branch.trim() : '', (key, type) => gitConfigValue(local, globalArgs, key, type) || '');
   const url = where.allUrls.length === 1 ? where.allUrls[0] : '';
   const reported = authorized.pushUrls || [];
   if (!url || /[\x00-\x1f]/.test(url) || reported.length !== 1 || reported[0] !== url) return { problem: 'it does not go to exactly one destination that the broker was told' };
@@ -506,39 +545,28 @@ function sealedPush(env, globalArgs, pushArgs, authorized, scratch, listing) {
   let fetched;
   const listed = () => {
     if (listing) return listing.heads;
-    if (fetched === undefined) fetched = remoteRefs(env, globalArgs, url);
+    if (fetched === undefined) fetched = remoteRefs(env, local, globalArgs, scratch, url);
     return fetched ? fetched.heads : null;
   };
-  const planned = sealedRefspecs(env, globalArgs, specs, options, authorized, name, listed);
+  const planned = sealedRefspecs(local, globalArgs, specs, options, authorized, name, listed);
   if (planned.problem) return planned;
-  const { spawnSync } = require('node:child_process');
+  const dir = privateGit(env, local, globalArgs, scratch, 'push');
+  if (!dir) return { problem: 'its private git directory cannot be made' };
   try {
-    const root = fs.mkdtempSync(path.join(scratch, 'push-'));
-    const gitDir = path.join(root, 'git'), hooks = path.join(root, 'hooks');
-    fs.mkdirSync(hooks);
-    const sealed = sealedEnv(env, root, gitDir);
-    const run = args => spawnSync(git, args, { env: sealed, encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'ignore', 'ignore'] }).status === 0;
-    const format = (gitOutput(env, globalArgs, ['rev-parse', '--show-object-format']) || 'sha1').trim();
-    if (!/^sha(1|256)$/.test(format) || !run(['init', '-q', '--bare', '--template=', '--object-format=' + format])) return { problem: 'its private git directory cannot be made' };
     // The checkout's objects, and its shallow boundary (what a push of a shallow checkout leaves out).
-    const place = what => (gitOutput(env, globalArgs, ['rev-parse', '--path-format=absolute', '--git-path', what]) || '').trim();
+    const place = what => (gitOutput(local, globalArgs, ['rev-parse', '--path-format=absolute', '--git-path', what]) || '').trim();
     const objects = place('objects');
     if (!objects) return { problem: 'the objects of this checkout cannot be located' };
-    const more = (env.GIT_ALTERNATE_OBJECT_DIRECTORIES || '').split(path.delimiter).filter(Boolean).map(dir => path.resolve(dir));
-    fs.mkdirSync(path.join(gitDir, 'objects', 'info'), { recursive: true });
-    fs.writeFileSync(path.join(gitDir, 'objects', 'info', 'alternates'), [objects, ...more].join('\n') + '\n');
+    const more = (local.GIT_ALTERNATE_OBJECT_DIRECTORIES || '').split(path.delimiter).filter(Boolean).map(other => path.resolve(other));
+    fs.mkdirSync(path.join(dir.gitDir, 'objects', 'info'), { recursive: true });
+    fs.writeFileSync(path.join(dir.gitDir, 'objects', 'info', 'alternates'), [objects, ...more].join('\n') + '\n');
     const shallow = place('shallow');
-    if (shallow && fs.existsSync(shallow)) fs.copyFileSync(shallow, path.join(gitDir, 'shallow'));
-    // Read-only from here. A process of the same user can undo that, so it narrows the window and does not close it: what
-    // matters is that the destination, the refs and the lease are in the arguments, and the config holds nothing of them.
-    const config = path.join(gitDir, 'config');
-    fs.chmodSync(config, 0o400);
-    fs.chmodSync(gitDir, 0o500);
-    process.prependOnceListener('exit', () => { try { fs.chmodSync(gitDir, 0o700); } catch {} });
+    if (shallow && fs.existsSync(shallow)) fs.copyFileSync(shallow, path.join(dir.gitDir, 'shallow'));
+    lockPrivateGit(dir, false);
     return {
-      args: ['-c', 'core.hooksPath=' + hooks, '-c', 'push.followTags=false', '-c', 'push.recurseSubmodules=no', '-c', 'protocol.ext.allow=never',
+      args: [...SEALED_CONFIG(dir), '-c', 'push.followTags=false', '-c', 'push.recurseSubmodules=no',
         'push', ...planned.flags, '--no-verify', '--no-follow-tags', '--no-recurse-submodules', '--', url, ...planned.refspecs],
-      env: sealed, gitDir, name, updates: planned.updates, upstream: options.upstream, dryRun: options.dryRun,
+      env: dir.sealed, gitDir: dir.gitDir, name, updates: planned.updates, upstream: options.upstream, dryRun: options.dryRun,
     };
   } catch { return { problem: 'its private git directory cannot be made' }; }
 }
@@ -561,6 +589,247 @@ function sealedSync(env, globalArgs, plan, code) {
       }
     }
   } catch {}
+}
+// A fetch or an ls-remote that holds the credential is sealed like a push: it reads from the one URL the broker was told, in a
+// git directory of its own (see privateGit), with an environment of its own and no hooks. The checkout's remote names, config
+// and hooks are not consulted after the check. A fetch keeps the refs, FETCH_HEAD and shallow boundary of the checkout up to
+// date afterwards, with processes that do not hold the credential (sealedFetchFinish). A pull is not run: it fetches and then
+// merges in one command, and the merge runs this checkout's hooks and config. Whatever cannot be reduced to one URL and one
+// list of refs is refused, with the reason.
+const FETCH_OPTIONS = {
+  flags: ['--quiet', '--no-quiet', '--verbose', '--no-verbose', '--progress', '--no-progress', '--ipv4', '--ipv6', '--force', '--prune', '--prune-tags', '--no-tags', '--tags',
+    '--keep', '--dry-run', '--atomic', '--unshallow', '--update-shallow', '--update-head-ok', '--show-forced-updates', '--no-show-forced-updates', '--write-fetch-head',
+    '--no-write-fetch-head', '--porcelain', '--append'],
+  values: ['--depth', '--deepen', '--shallow-since', '--shallow-exclude', '--refmap', '--server-option', '--negotiation-tip'],
+  // Done by the sealed fetch whatever was asked: no submodules (their remotes were never checked), no maintenance of the checkout.
+  dropped: ['--no-recurse-submodules', '--recurse-submodules', '--auto-gc', '--no-auto-gc', '--auto-maintenance', '--no-auto-maintenance', '--write-commit-graph', '--no-write-commit-graph'],
+  dropValue: ['--jobs', '--recurse-submodules-default', '--submodule-prefix'],
+  short: { q: '--quiet', v: '--verbose', 4: '--ipv4', 6: '--ipv6', f: '--force', p: '--prune', P: '--prune-tags', n: '--no-tags', t: '--tags', k: '--keep', u: '--update-head-ok', a: '--append' },
+  valueShort: { j: 'drop', o: '--server-option' },
+  refused: {
+    '--all': 'fetches from several remotes, and each needs its own URL', '--multiple': 'fetches from several remotes, and each needs its own URL',
+    '--upload-pack': 'runs a program of its own while it holds the credential', '--filter': 'needs the settings of a partial clone, which a sealed fetch does not have',
+    '--refetch': 'is not done by a sealed fetch', '--prefetch': 'is not done by a sealed fetch', '--stdin': 'is not done by a sealed fetch',
+    '--negotiate-only': 'is not done by a sealed fetch', '--set-upstream': 'is not done by a sealed fetch',
+  },
+};
+const LS_REMOTE_OPTIONS = {
+  flags: ['--quiet', '--heads', '--branches', '--tags', '--refs', '--exit-code', '--get-url', '--symref', '--ipv4', '--ipv6'],
+  values: ['--sort', '--server-option'], dropped: [], dropValue: [],
+  short: { q: '--quiet', h: '--heads', t: '--tags', 4: '--ipv4', 6: '--ipv6' }, valueShort: { o: '--server-option' },
+  refused: { '--upload-pack': 'runs a program of its own while it holds the credential', '--exec': 'runs a program of its own while it holds the credential' },
+};
+// The options of a sealed fetch or ls-remote, from a table: forwarded in their long form, dropped (the sealed command does them
+// itself), or refused. rest is what is left: the repository and its refspecs or patterns.
+function sealedReadOptions(table, args) {
+  const flags = [], rest = [];
+  let append = false, updateHeadOk = false;
+  const missing = { problem: 'an option is missing its value' };
+  const flag = name => { if (name === '--append') append = true; else flags.push(name); if (name === '--update-head-ok') updateHeadOk = true; };
+  for (let at = 0; at < args.length; at++) {
+    const arg = args[at];
+    if (arg === '--') { rest.push(...args.slice(at + 1)); break; }
+    if (!arg.startsWith('-') || arg === '-') { rest.push(arg); continue; }
+    if (arg.startsWith('--')) {
+      const equals = arg.indexOf('=');
+      const name = equals < 0 ? arg : arg.slice(0, equals), attached = equals < 0 ? undefined : arg.slice(equals + 1);
+      if (table.refused[name]) return { problem: 'the option ' + name + ' ' + table.refused[name] };
+      if (table.dropped.includes(name)) continue;
+      if (table.dropValue.includes(name)) { if (attached === undefined) at++; continue; }
+      if (table.values.includes(name)) {
+        const value = attached === undefined ? args[++at] : attached;
+        if (value === undefined) return missing;
+        flags.push(name + '=' + value);
+        continue;
+      }
+      if (table.flags.includes(name) && attached === undefined) { flag(name); continue; }
+      return { problem: 'the option ' + name.slice(0, 40) + ' cannot be reduced to one URL and one list of refs' };
+    }
+    for (let i = 1; i < arg.length; i++) {
+      const value = table.valueShort[arg[i]];
+      if (value) {
+        const given = i + 1 < arg.length ? arg.slice(i + 1) : args[++at];
+        if (given === undefined) return missing;
+        if (value !== 'drop') flags.push(value + '=' + given);
+        break;
+      }
+      if (!table.short[arg[i]]) return { problem: 'the option -' + arg[i] + ' cannot be reduced to one URL and one list of refs' };
+      flag(table.short[arg[i]]);
+    }
+  }
+  return { flags, rest, append, updateHeadOk };
+}
+// The values of a config key that can be set more than once: [] when unset, null when git could not tell.
+function gitConfigValues(env, globalArgs, key) {
+  const result = gitRun(env, globalArgs, ['config', '-z', '--get-all', key]);
+  return result.status === 0 ? result.stdout.split('\0').filter(Boolean) : result.status === 1 ? [] : null;
+}
+// The one URL a fetch or ls-remote reads from: the URL given as the target, or the URL of the configured remote that is named
+// (or that git defaults to), which must be the one the broker was told. name is that remote, if it is one.
+function readTarget(local, globalArgs, given, branch, authorized) {
+  const target = given || (branch && gitConfigValue(local, globalArgs, 'branch.' + branch + '.remote')) || 'origin';
+  // A configured remote name first, as git does (and as a push does); otherwise the target is itself a URL or a path.
+  const url = !target.includes(':') && REMOTE_NAME.test(target) ? remoteUrl(local, globalArgs, target, false) : null;
+  if (url) {
+    if (url !== authorized.remote) return { problem: 'its remote ' + target.slice(0, 60) + ' is not the repository that the broker was told about', advice: 'Name the remote that you mean (git fetch <remote>) and run it again.' };
+    return { url, name: target };
+  }
+  if (!/[:/]/.test(target)) return { problem: target.slice(0, 60) + ' is neither a configured remote nor a URL' };
+  if (/[\x00-\x1f]/.test(target) || target.length > 1000) return { problem: 'its destination cannot be read' };
+  return { url: target, name: null };
+}
+// Every ref of a repository as name -> commit, and the symbolic ones as name -> target: null when git could not list them.
+function readRefs(env, globalArgs) {
+  const git = gitBinary();
+  if (!git) return null;
+  const result = require('node:child_process').spawnSync(git, [...globalArgs, 'for-each-ref', '--format=%(objectname) %(refname) %(symref)'],
+    { env, encoding: 'utf8', timeout: 60000, maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  if (result.error || result.status !== 0) return null;
+  const refs = new Map(), symbolic = new Map();
+  for (const line of result.stdout.split('\n')) {
+    if (!line) continue;
+    const [sha, name, symref] = line.split(' ');
+    if (!/^[0-9a-f]{40,64}$/.test(sha) || !name) return null;
+    if (symref) symbolic.set(name, symref); else refs.set(name, sha);
+  }
+  return { refs, symbolic };
+}
+function sealedLsRemote(env, local, globalArgs, lsArgs, authorized, scratch) {
+  const options = sealedReadOptions(LS_REMOTE_OPTIONS, lsArgs);
+  if (options.problem) return { problem: options.problem, advice: 'List one remote (git ls-remote <remote> [<pattern>]) without other options.' };
+  if (JSON.stringify(gitNetworkArgs('ls-remote', lsArgs).positional) !== JSON.stringify(options.rest)) return { problem: 'its arguments cannot be read the way git reads them' };
+  const branch = (gitOutput(local, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']) || '').trim();
+  const target = readTarget(local, globalArgs, options.rest[0], branch, authorized);
+  if (target.problem) return target;
+  const dir = privateGit(env, local, globalArgs, scratch, 'ls');
+  if (!dir) return { problem: 'its private git directory cannot be made' };
+  try {
+    lockPrivateGit(dir, false);
+    return {
+      args: [...SEALED_CONFIG(dir), 'ls-remote', ...options.flags, '--', target.url, ...options.rest.slice(1)],
+      env: dir.sealed, gitDir: dir.gitDir, finish: code => code,
+    };
+  } catch { return { problem: 'its private git directory cannot be made' }; }
+}
+// A fetch runs in a git directory that has the checkout's refs (so that git negotiates, fast-forwards, follows tags and prunes as
+// it does in the checkout), its shallow boundary, and the checkout's object directory (so that what it fetches lands there).
+// What git needs to know about the remote comes as environment config of this launcher's own: the URL the broker was told,
+// where its branches go, tag and prune settings, and the upstream of the current branch. Nothing is read from a file the agent
+// could change as the command starts. Afterwards the refs it changed, FETCH_HEAD and the shallow boundary are applied to the
+// checkout by processes that do not hold the credential.
+function sealedFetch(env, local, globalArgs, fetchArgs, authorized, scratch) {
+  const options = sealedReadOptions(FETCH_OPTIONS, fetchArgs);
+  if (options.problem) return { problem: options.problem, advice: 'Fetch one remote at a time, by name (git fetch <remote> [<refspec>]), without other options.' };
+  if (JSON.stringify(gitNetworkArgs('fetch', fetchArgs).positional) !== JSON.stringify(options.rest)) return { problem: 'its arguments cannot be read the way git reads them' };
+  const branch = (gitOutput(local, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']) || '').trim();
+  const target = readTarget(local, globalArgs, options.rest[0], branch, authorized);
+  if (target.problem) return target;
+  // The objects a partial clone lacks are fetched on demand from a promisor remote, which a private git directory does not know.
+  if (gitConfigValue(local, globalArgs, 'extensions.partialclone') !== '') return { problem: 'this checkout is a partial clone' };
+  const settings = [];
+  let readable = true;
+  const copy = key => { const found = gitConfigValues(local, globalArgs, key); if (found === null) readable = false; else for (const value of found) settings.push([key, value]); };
+  if (target.name) {
+    settings.push(['remote.' + target.name + '.url', target.url]);
+    for (const key of ['fetch', 'tagopt', 'prune', 'pruneTags', 'followRemoteHEAD']) copy('remote.' + target.name + '.' + key);
+  }
+  for (const key of ['fetch.prune', 'fetch.pruneTags']) copy(key);
+  if (branch) for (const key of ['remote', 'merge']) copy('branch.' + branch + '.' + key);
+  if (!readable) return { problem: 'its configuration cannot be read' };
+  const place = what => (gitOutput(local, globalArgs, ['rev-parse', '--path-format=absolute', '--git-path', what]) || '').trim();
+  const objects = place('objects');
+  if (!objects) return { problem: 'the objects of this checkout cannot be located' };
+  const seed = readRefs(local, globalArgs);
+  if (!seed) return { problem: 'its refs cannot be read' };
+  const dir = privateGit(env, local, globalArgs, scratch, 'fetch');
+  if (!dir) return { problem: 'its private git directory cannot be made' };
+  try {
+    const lines = [...seed.refs].sort((a, b) => Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0]))).map(([name, sha]) => sha + ' ' + name);
+    fs.writeFileSync(path.join(dir.gitDir, 'packed-refs'), '# pack-refs with: sorted \n' + (lines.length ? lines.join('\n') + '\n' : ''));
+    if (branch) fs.writeFileSync(path.join(dir.gitDir, 'HEAD'), 'ref: refs/heads/' + branch + '\n');
+    // Symbolic refs (refs/remotes/<name>/HEAD) stay symbolic, so that git creates, follows and warns about them as it does.
+    for (const [name, to] of seed.symbolic) {
+      if (!/^refs\/[^\s~^:?*\[\\]+$/.test(name) || !/^refs\/[^\s~^:?*\[\\]+$/.test(to)) continue;
+      fs.mkdirSync(path.dirname(path.join(dir.gitDir, name)), { recursive: true });
+      fs.writeFileSync(path.join(dir.gitDir, name), 'ref: ' + to + '\n');
+    }
+    const shallowFile = place('shallow');
+    const shallowBefore = shallowFile && fs.existsSync(shallowFile) ? fs.readFileSync(shallowFile, 'utf8') : null;
+    if (shallowBefore !== null) fs.writeFileSync(path.join(dir.gitDir, 'shallow'), shallowBefore);
+    lockPrivateGit(dir, true);
+    const inside = { ...local, GIT_DIR: dir.gitDir, GIT_OBJECT_DIRECTORY: objects, GIT_NO_LAZY_FETCH: '1' };
+    const child = { ...dir.sealed, GIT_OBJECT_DIRECTORY: objects, GIT_NO_LAZY_FETCH: '1' };
+    if (local.GIT_ALTERNATE_OBJECT_DIRECTORIES) child.GIT_ALTERNATE_OBJECT_DIRECTORIES = local.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+    for (const [key, value] of settings) appendGitConfig(child, key, value);
+    // The reflog line names the remote, never a URL's user and password.
+    const message = 'fetch ' + (target.name || target.url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^\/@]*@/i, '$1')).slice(0, 200);
+    const plan = { dir, inside, seed, options, shallowFile, shallowBefore, fetchHeadFile: place('FETCH_HEAD'), message };
+    return {
+      // Maintenance (gc, commit graphs) would work on the checkout's objects from this directory's refs, which are not all of its refs.
+      args: [...SEALED_CONFIG(dir), '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'fetch', ...options.flags, '--no-recurse-submodules', '--', target.name || target.url, ...options.rest.slice(1)],
+      env: child, gitDir: dir.gitDir, finish: code => sealedFetchFinish(local, globalArgs, plan, code),
+    };
+  } catch { return { problem: 'its private git directory cannot be made' }; }
+}
+// Applies what a sealed fetch did to the checkout, without the credential: the refs it changed (each only if the checkout still
+// has the value the fetch started from), FETCH_HEAD, and the shallow boundary. Returns the exit code of the fetch command.
+function sealedFetchFinish(local, globalArgs, plan, code) {
+  const { spawnSync } = require('node:child_process');
+  const git = gitBinary();
+  const { dir, seed, options } = plan;
+  try { fs.chmodSync(dir.gitDir, 0o700); } catch {}
+  let failed = code !== 0;
+  const complain = text => { failed = true; process.stderr.write('Paperclip: ' + text + '\n'); };
+  try {
+    const after = readRefs(plan.inside, []);
+    if (!after) { complain('the refs that this fetch changed could not be read, so they were not applied to the checkout'); return code || 1; }
+    const changes = [];
+    for (const [name, sha] of after.refs) if (seed.refs.get(name) !== sha) changes.push({ name, old: seed.refs.get(name) || null, sha });
+    for (const [name, old] of seed.refs) if (!after.refs.has(name)) changes.push({ name, old, sha: null });
+    // git does not fetch into a branch that is checked out (a worktree's HEAD) unless it is told to: it stops before it changes
+    // anything. This fetch has already run, so nothing of it is applied to the checkout.
+    const checkedOut = new Map();
+    let worktree = '';
+    for (const line of (gitOutput(local, globalArgs, ['worktree', 'list', '--porcelain']) || '').split('\n')) {
+      if (line.startsWith('worktree ')) worktree = line.slice(9);
+      else if (line.startsWith('branch ')) checkedOut.set(line.slice(7), worktree);
+    }
+    const blocked = options.updateHeadOk ? undefined : changes.find(change => !seed.symbolic.has(change.name) && checkedOut.has(change.name));
+    if (blocked) {
+      process.stderr.write('fatal: refusing to fetch into branch \'' + blocked.name + '\' checked out at \'' + checkedOut.get(blocked.name) + '\'\n');
+      return 128;
+    }
+    const applied = changes.filter(change => !seed.symbolic.has(change.name));
+    const run = (args, input, quiet) => spawnSync(git, [...globalArgs, 'update-ref', '-m', plan.message, ...args], { env: local, encoding: 'utf8', input, timeout: 120000, stdio: ['pipe', 'ignore', quiet ? 'ignore' : 'inherit'] }).status === 0;
+    const zero = change => '0'.repeat((change.sha || change.old).length);
+    if (applied.length && !run(['--stdin'], applied.map(change => change.sha === null ? 'delete ' + change.name + ' ' + change.old + '\n'
+      : change.old === null ? 'create ' + change.name + ' ' + change.sha + '\n' : 'update ' + change.name + ' ' + change.sha + ' ' + change.old + '\n').join(''), true)) {
+      // One that cannot be updated (someone else moved it meanwhile) does not stop the others, as with git.
+      for (const change of applied) {
+        const done = change.sha === null ? run(['-d', change.name, change.old], undefined, false) : run([change.name, change.sha, change.old || zero(change)], undefined, false);
+        if (!done) complain('could not update ' + change.name + ' in the checkout');
+      }
+    }
+    // A symbolic ref that git created or pointed elsewhere (refs/remotes/<name>/HEAD).
+    for (const [name, to] of after.symbolic) {
+      if (seed.symbolic.get(name) === to || seed.refs.has(name)) continue;
+      const done = spawnSync(git, [...globalArgs, 'symbolic-ref', '-m', plan.message, name, to], { env: local, encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'ignore', 'inherit'] }).status === 0;
+      if (!done) complain('could not update ' + name + ' in the checkout');
+    }
+    const fetched = path.join(dir.gitDir, 'FETCH_HEAD');
+    if (plan.fetchHeadFile && fs.existsSync(fetched)) {
+      if (options.append) fs.appendFileSync(plan.fetchHeadFile, fs.readFileSync(fetched, 'utf8')); else fs.writeFileSync(plan.fetchHeadFile, fs.readFileSync(fetched, 'utf8'));
+    }
+    const shallowNow = path.join(dir.gitDir, 'shallow');
+    const shallowAfter = fs.existsSync(shallowNow) ? fs.readFileSync(shallowNow, 'utf8') : null;
+    if (shallowAfter !== plan.shallowBefore) {
+      const current = plan.shallowFile && fs.existsSync(plan.shallowFile) ? fs.readFileSync(plan.shallowFile, 'utf8') : null;
+      if (current !== plan.shallowBefore) complain('the shallow boundary of the checkout changed while this fetch ran, so its new boundary was not applied');
+      else if (shallowAfter === null) fs.rmSync(plan.shallowFile, { force: true });
+      else { fs.writeFileSync(plan.shallowFile + '.paperclip', shallowAfter); fs.renameSync(plan.shallowFile + '.paperclip', plan.shallowFile); }
+    }
+  } catch { complain('the result of this fetch could not be applied to the checkout'); }
+  return code === 0 && failed ? 1 : code;
 }
 // known: the refs GitHub lists for a push's destination, once read (see pushReport).
 function operation(env, known) {
@@ -798,9 +1067,12 @@ async function main() {
     configReady = true;
     process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
   } catch { diagnostic('configuration_directory_unavailable'); }
+  const scratch = configReady ? configDirectory : null;
   // authorized: the report of the command that the broker last answered with a credential; listing: the branches GitHub
-  // listed when that report was checked (see remoteRefs), which the sealed push ties a lease to.
-  let attribution = null, credentialed = false, report = null, authorized = null, listing = null;
+  // listed when that report was checked (see remoteRefs), which the sealed push ties a lease to. readEnv: the environment of
+  // the launcher's own reads of the checkout (and of what it applies to it afterwards), as it was before any credential came:
+  // no hook, helper or setting of the checkout can see the credential through them.
+  let attribution = null, credentialed = false, report = null, authorized = null, listing = null, readEnv = null;
   {
     for (const key of Object.keys(env)) {
       // CODESPACES makes gh send GITHUB_TOKEN to non-github.com hosts. A bare GIT_CONFIG redirects
@@ -826,6 +1098,7 @@ async function main() {
       // sends. (core.graftFile does not turn grafts off; this variable does.)
       GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
     });
+    readEnv = { ...env };
     const takeCredentials = result => {
       for (const [key, value] of Object.entries(result.env || {})) {
         if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
@@ -880,7 +1153,11 @@ async function main() {
       for (const key of Object.keys(env)) {
         if (/^(https?_proxy|all_proxy|git_ssl_no_verify|git_ssl_cainfo|git_ssl_capath|git_ssl_cert|ssl_cert_file|ssl_cert_dir|node_extra_ca_certs|curl_ca_bundle|requests_ca_bundle|git_proxy_command|git_trace_curl|git_curl_verbose|git_trace_redact)$/i.test(key)) delete env[key];
       }
-      if (program === 'git' && gitTrustProblem(env, report)) {
+      // The same settings, read without the credential in the environment.
+      const trust = { ...readEnv };
+      appendGitConfig(trust, 'http.sslVerify', 'true');
+      appendGitConfig(trust, 'http.proxy', '');
+      if (program === 'git' && gitTrustProblem(trust, report)) {
         process.stderr.write('Paperclip: this repository sends GitHub traffic through a proxy or with other TLS trust (http.proxy, http.sslVerify, http.sslCAInfo, http.sslCAPath or http.curloptResolve); it does not run with a GitHub credential.\n');
         process.exit(1);
       }
@@ -893,9 +1170,9 @@ async function main() {
     if (credentialed && program === 'git' && report && Array.isArray(report.shas) && report.shas.length && report.touchesWorkflows === false) {
       let at = 0;
       while (at < argv.length && argv[at].startsWith('-')) at += GIT_GLOBAL_WITH_VALUE.includes(argv[at]) ? 2 : 1;
-      const known = report.pushUrls && report.pushUrls.length === 1 ? remoteRefs(env, argv.slice(0, at), report.pushUrls[0]) : null;
+      const known = report.pushUrls && report.pushUrls.length === 1 ? remoteRefs(env, readEnv, argv.slice(0, at), scratch, report.pushUrls[0]) : null;
       listing = known;
-      const checked = operation(env, known || 'unknown');
+      const checked = operation(readEnv, known || 'unknown');
       if (checked.touchesWorkflows !== false) {
         if (!known) process.stderr.write('Paperclip: the branches GitHub has could not be read, so this push is treated as one that may change workflow files.\n');
         let second = null;
@@ -926,7 +1203,7 @@ async function main() {
   if (program === 'git') while (gitAt < argv.length && argv[gitAt].startsWith('-')) gitAt += GIT_GLOBAL_WITH_VALUE.includes(argv[gitAt]) ? 2 : 1;
   const gitSubcommand = program === 'git' ? argv[gitAt] : undefined;
   if (credentialed && authorized && ['push', 'fetch', 'pull', 'ls-remote'].includes(gitSubcommand)) {
-    const now = operation(env, 'unknown');
+    const now = operation(readEnv, 'unknown');
     if (!['remote', 'pushUrls', 'shas', 'refs', 'currentBranch'].every(key => JSON.stringify(now[key] === undefined ? null : now[key]) === JSON.stringify(authorized[key] === undefined ? null : authorized[key]))) {
       process.stderr.write('Paperclip: the remote or the commits of this command changed while Paperclip checked it, so it does not run with a GitHub credential. Run it again.\n');
       process.exit(1);
@@ -939,16 +1216,26 @@ async function main() {
   // recapture a newer identity. All ordinary descendants stay in this operation.
   env.ZDOTDIR = configDirectory;
   env.BASH_ENV = '/dev/null';
-  env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
-  const scratch = configReady ? configDirectory : null;
+  env.GIT_SSH_COMMAND = SSH_COMMAND;
+  // The launcher's own reads of the checkout, and what it applies to it after a sealed command, run the same way, without the credential.
+  Object.assign(readEnv, { PATH: env.PATH, ZDOTDIR: env.ZDOTDIR, BASH_ENV: env.BASH_ENV, GIT_SSH_COMMAND: SSH_COMMAND });
   const args = attribution ? attributedArgs(argv, attribution, scratch) : argv;
-  // A push that holds a credential runs sealed (see sealedPush): one URL, one list of refs, a git directory of its own, no
-  // hooks, and an environment that carries nothing of the checkout's steering.
+  // A git command that goes to the network with a credential runs sealed (see privateGit): a git directory of its own, the URL
+  // the broker was told, no hooks, and an environment that carries nothing of the checkout's steering. A push sends one list
+  // of refs (sealedPush); a fetch and an ls-remote read from one URL (sealedFetch, sealedLsRemote). A pull is not run: it
+  // fetches and then merges in one command, and the merge would run this checkout's hooks and config with the credential.
   let sealedPlan = null;
-  if (credentialed && authorized && gitSubcommand === 'push') {
-    sealedPlan = sealedPush(env, argv.slice(0, gitAt), argv.slice(gitAt + 1), authorized, scratch, listing);
+  if (credentialed && authorized && ['push', 'fetch', 'ls-remote', 'pull'].includes(gitSubcommand)) {
+    const globalArgs = argv.slice(0, gitAt), subArgs = argv.slice(gitAt + 1);
+    sealedPlan = gitSubcommand === 'push' ? sealedPush(env, readEnv, globalArgs, subArgs, authorized, scratch, listing)
+      : gitSubcommand === 'fetch' ? sealedFetch(env, readEnv, globalArgs, subArgs, authorized, scratch)
+      : gitSubcommand === 'ls-remote' ? sealedLsRemote(env, readEnv, globalArgs, subArgs, authorized, scratch)
+      : { problem: 'it fetches and then merges in one command, and the merge would run this checkout\'s hooks and configuration while it holds the credential',
+        advice: 'Run git fetch <remote> <branch>, then git merge FETCH_HEAD (or git rebase <remote>/<branch>) yourself.' };
     if (sealedPlan.problem) {
-      process.stderr.write('Paperclip: this push cannot run with a GitHub credential, because ' + sealedPlan.problem + '. ' + (sealedPlan.advice || 'Push one branch to one remote (git push <remote> <branch>) without other options.') + '\n');
+      const advice = { push: 'Push one branch to one remote (git push <remote> <branch>) without other options.', fetch: 'Fetch one remote at a time, by name (git fetch <remote> [<refspec>]), without other options.',
+        'ls-remote': 'List one remote (git ls-remote <remote> [<pattern>]) without other options.' }[gitSubcommand];
+      process.stderr.write('Paperclip: ' + (gitSubcommand === 'push' ? 'this push' : 'git ' + gitSubcommand) + ' cannot run with a GitHub credential, because ' + sealedPlan.problem + '. ' + (sealedPlan.advice || advice) + '\n');
       process.exit(1);
     }
   }
@@ -965,7 +1252,8 @@ async function main() {
   });
   const reviewing = program === 'gh' && args[0] === 'pr' && args[1] === 'review' && args.some(arg => SELF_REVIEW_VERDICTS[arg]);
   let result = sealedPlan ? await run(sealedPlan.args, false, sealedPlan.env) : await run(args, reviewing);
-  if (sealedPlan) sealedSync(env, argv.slice(0, gitAt), sealedPlan, result.code);
+  if (sealedPlan && gitSubcommand === 'push') sealedSync(readEnv, argv.slice(0, gitAt), sealedPlan, result.code);
+  else if (sealedPlan) result = { ...result, code: sealedPlan.finish(result.code) };
   if (reviewing && result.code !== 0 && /own pull request/i.test(result.stderr)) {
     const fallback = selfReviewFallbackArgs(args, scratch);
     if (fallback) {

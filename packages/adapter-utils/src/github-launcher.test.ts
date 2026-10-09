@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { readFileSync, writeFileSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, symlink, writeFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, symlink, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -682,14 +682,14 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     const ci = `${W}/ci.yml`;
     const refusal = { body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } };
     /** origin is the bare repository (main and feature/x are on it, and this checkout has both); the broker allows the first question and answers a second one with `second`. */
-    async function githubLike(second: { body: unknown } = refusal) {
+    async function githubLike(second: { body: unknown } = refusal, token = "t") {
       let asked = 0;
       // Something the checkout's owner does while the broker is answering the first question.
       const hooks: { first: (() => void) | null } = { first: null };
       const f = await brokered(() => {
         if (asked++ > 0) return second;
         hooks.first?.();
-        return { body: { status: "available", env: { GH_TOKEN: "t", ...identity } } };
+        return { body: { status: "available", env: { GH_TOKEN: token, ...identity } } };
       });
       const sys = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "file" } }).toString().trim();
       const bare = path.join(f.root, "github.git");
@@ -863,7 +863,10 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
       expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
     }, 60_000);
 
-    it("asks the broker about the new destination when a URL rewrite appears while it answers", async () => {
+    // Before review r7 the listing of GitHub's branches followed the rewrite to the attacker's repository, which made the push look
+    // like a workflow change and so reached the broker a second time, with urlRewrites. The listing is sealed now: it reads the
+    // URL that was authorised, finds the push clean, and the check right before the command stops it, as for a changed URL.
+    it("stops a push when a URL rewrite appears while the broker answers", async () => {
       const r = await githubLike();
       const attacker = path.join(r.root, "attacker.git");
       await mkdir(attacker);
@@ -873,10 +876,9 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
       const before = r.onGitHub("feature/x");
       r.hooks.first = () => { r.git("config", `url.${attacker}.insteadOf`, r.bare); };
       const result = await r.push("origin", "feature/x");
-      // The first answer was for the old destination; the broker is told that URLs are rewritten now, and refuses.
-      expect(r.requests).toHaveLength(2);
-      expect(r.requests[1].body.operation).toMatchObject({ urlRewrites: true });
+      expect(r.requests).toHaveLength(1);
       expect(result.code).toBe(1);
+      expect(result.stderr).toContain("changed while Paperclip checked it");
       expect(r.onGitHub("feature/x")).toBe(before);
       expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
     }, 60_000);
@@ -1430,6 +1432,269 @@ process.exit(result.status === null ? 1 : result.status);
       expect(r.onGitHub("feature/x")).toBe(before);
       expect(edit).not.toBe(before);
     }, 60_000);
+
+    // Review r7: a fetch, a pull or an ls-remote that holds the credential used to run from the checkout, whose config, hooks and
+    // refs the agent's UID can write after the broker has answered. Like a push, it runs sealed: in a git directory of its own, with
+    // the URL and the few settings it needs given as environment config, and an environment of its own. What it changed is applied to
+    // the checkout afterwards, by processes that do not hold the credential.
+    describe("a fetch, pull or ls-remote that holds the credential is sealed (review r7)", () => {
+      const TOKEN = "fake-token-fake-token-fake-token";
+      const sealedDir = /\/(push|fetch|ls|list)-[^/]+\/git$/;
+      /** The broker allows every question (these tests run several commands), with a credential that is easy to recognise. */
+      const allowed = () => githubLike({ body: { status: "available", env: { GH_TOKEN: TOKEN, ...identity } } }, TOKEN);
+      const NETWORK = ["push", "fetch", "ls-remote"];
+      /** A stand-in for the real git that logs every call (with whether it held the credential) and applies `actions` to the checkout when the first fetch, pull or ls-remote starts. */
+      async function readShim(r: GithubLike, actions: string[][] = []) {
+        const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
+        const dir = path.join(r.root, "real");
+        await writeFile(path.join(dir, "reads.json"), JSON.stringify({ repo: r.repo, actions }));
+        await writeFile(path.join(dir, "git"), `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const plan = JSON.parse(fs.readFileSync(path.join(__dirname, "reads.json"), "utf8"));
+let at = 0;
+while (at < args.length && args[at].startsWith("-")) at += args[at] === "-c" || args[at] === "-C" ? 2 : 1;
+const sub = args[at];
+const network = ["fetch", "pull", "ls-remote", "push"].includes(sub);
+fs.appendFileSync(path.join(__dirname, "calls.jsonl"), JSON.stringify({ sub, args, token: process.env.GH_TOKEN || null, gitDir: process.env.GIT_DIR || null, env: network ? process.env : undefined }) + "\\n");
+const done = path.join(__dirname, "reads.done");
+if (["fetch", "pull", "ls-remote"].includes(sub) && !fs.existsSync(done) && plan.actions.length) {
+  fs.writeFileSync(done, "1");
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  for (const key of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|OBJECT_DIRECTORY|CONFIG_(COUNT|KEY_.*|VALUE_.*))$/.test(key)) delete env[key];
+  for (const action of plan.actions) spawnSync(${JSON.stringify(realGit)}, action, { cwd: plan.repo, env, stdio: "ignore" });
+}
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" });
+process.exit(result.status === null ? 1 : result.status);
+`, { mode: 0o700 });
+        return { calls: async () => (await readFile(path.join(dir, "calls.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) as Array<{ sub: string; args: string[]; token: string | null; gitDir: string | null; env?: Record<string, string> }> };
+      }
+      /** Someone else puts a commit on feature/x, a new branch and a tag on GitHub; this checkout has none of them. */
+      async function someoneElse(r: GithubLike) {
+        const other = path.join(r.root, "other");
+        await mkdir(other);
+        r.sys(other, "clone", "-q", r.bare, ".");
+        r.sys(other, "checkout", "-q", "feature/x");
+        await writeFile(path.join(other, "other.ts"), "o\n");
+        r.sys(other, "add", ".");
+        r.sys(other, "commit", "-q", "-m", "someone else");
+        r.sys(other, "branch", "other-branch");
+        r.sys(other, "tag", "v2");
+        r.sys(other, "push", "-q", "origin", "feature/x", "other-branch", "v2");
+        return r.onGitHub("feature/x");
+      }
+      /** A repository that has a different commit on feature/x: where the agent would like the command to read from. */
+      async function attackerWithItsOwnCommit(r: GithubLike) {
+        const attacker = await bareRepository(r, "attacker.git");
+        const work = path.join(r.root, "evil");
+        await mkdir(work);
+        r.sys(work, "clone", "-q", r.bare, ".");
+        r.sys(work, "checkout", "-q", "feature/x");
+        await writeFile(path.join(work, "evil.ts"), "e\n");
+        r.sys(work, "add", ".");
+        r.sys(work, "commit", "-q", "-m", "evil");
+        r.sys(work, "push", "-q", attacker, "feature/x");
+        return { attacker, evil: r.sys(work, "rev-parse", "HEAD") };
+      }
+      const fetchHead = (r: GithubLike) => readFile(path.join(r.repo, ".git", "FETCH_HEAD"), "utf8").catch(() => "");
+
+      it.each([
+        ["its URL", (_r: GithubLike, attacker: string) => [["remote", "set-url", "origin", attacker]]],
+        ["a URL rewrite", (r: GithubLike, attacker: string) => [["config", `url.${attacker}.insteadOf`, r.bare]]],
+      ])("fetches from the URL that was authorised, even when the remote changes as the command starts: %s", async (_label, changes) => {
+        const r = await githubLike();
+        const theirs = await someoneElse(r);
+        const { attacker, evil } = await attackerWithItsOwnCommit(r);
+        await readShim(r, changes(r, attacker));
+        const result = await r.run("git", ["fetch", "origin"]);
+        expect(result.code).toBe(0);
+        expect(r.requests).toHaveLength(1);
+        expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(theirs);
+        expect(await fetchHead(r)).toContain(theirs);
+        expect(await fetchHead(r)).not.toContain(evil);
+        expect(() => r.git("cat-file", "-e", evil)).toThrow();
+      }, 60_000);
+
+      // The report of `git fetch` with no remote names origin; git itself reads the current branch's remote first.
+      it.each([["fetch"], ["ls-remote"]])("refuses git %s when git would default to another remote than the one the broker was told about", async (subcommand) => {
+        const r = await allowed();
+        const { attacker, evil } = await attackerWithItsOwnCommit(r);
+        r.git("remote", "add", "upstream", attacker);
+        r.git("config", "branch.feature/x.remote", "upstream");
+        r.git("config", "branch.feature/x.merge", "refs/heads/feature/x");
+        const shim = await readShim(r);
+        const result = await r.run("git", [subcommand]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("is not the repository that the broker was told about");
+        expect(result.stdout).not.toContain(evil);
+        expect((await shim.calls()).filter(call => call.token !== null)).toEqual([]);
+        expect(() => r.git("cat-file", "-e", evil)).toThrow();
+      }, 60_000);
+
+      it("lists the authorised repository for ls-remote, even when the remote changes as the command starts", async () => {
+        const r = await githubLike();
+        const theirs = await someoneElse(r);
+        const { attacker, evil } = await attackerWithItsOwnCommit(r);
+        await readShim(r, [["remote", "set-url", "origin", attacker]]);
+        const result = await r.run("git", ["ls-remote", "origin"]);
+        expect(result.code).toBe(0);
+        expect(result.stdout).toContain(`${theirs}\trefs/heads/feature/x`);
+        expect(result.stdout).not.toContain(evil);
+      }, 60_000);
+
+      it("does not run the checkout's upload-pack command or hooks with the credential, and gives the fetch an environment of its own", async () => {
+        const r = await allowed();
+        await someoneElse(r);
+        const stolen = path.join(r.root, "stolen");
+        const uploadPack = path.join(r.root, "my-upload-pack");
+        await writeFile(uploadPack, `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-uploadpack\nexec git upload-pack "$@"\n`, { mode: 0o755 });
+        r.git("config", "remote.origin.uploadpack", uploadPack);
+        // reference-transaction is the hook a fetch runs when it updates refs.
+        await writeFile(path.join(r.repo, ".git", "hooks", "reference-transaction"), `#!/bin/sh\nprintenv GH_TOKEN >> ${stolen}-hook\nexit 0\n`, { mode: 0o755 });
+        const shim = await readShim(r);
+        const result = await exec(path.join(r.bin, "git"), ["fetch", "origin"], { cwd: r.repo, env: { ...r.env, GIT_EXEC_PATH: path.join(r.root, "nowhere"), GIT_TRACE: path.join(r.root, "trace"), GIT_ASKPASS: "/bin/false", GIT_INDEX_FILE: "/nonexistent" } })
+          .then(() => 0, (error: any) => error.code as number);
+        expect(result).toBe(0);
+        expect(await readFile(`${stolen}-uploadpack`, "utf8").catch(() => null)).toBeNull();
+        expect(await readFile(`${stolen}-hook`, "utf8").catch(() => "")).not.toContain(TOKEN);
+        const [child] = (await shim.calls()).filter(call => call.sub === "fetch");
+        expect(child!.env!.GH_TOKEN).toBe(TOKEN);
+        expect(child!.gitDir).toMatch(sealedDir);
+        expect(Object.keys(child!.env!).filter(key => /^GIT_(EXEC_PATH|TRACE.*|ASKPASS|INDEX_FILE|WORK_TREE|NAMESPACE|TEMPLATE_DIR|SSH)$/.test(key))).toEqual([]);
+        expect(child!.args).toEqual(expect.arrayContaining(["--no-recurse-submodules"]));
+        expect(child!.args.slice(-2)).toEqual(["--", "origin"]);
+        // Where "origin" is comes from the launcher's own environment config (the URL the broker was told), not from a file.
+        const keys = Object.entries(child!.env!).filter(([key]) => key.startsWith("GIT_CONFIG_KEY_")).map(([key, value]) => [value, child!.env![key.replace("KEY", "VALUE")]]);
+        expect(keys).toContainEqual(["remote.origin.url", r.bare]);
+      }, 60_000);
+
+      it("passes the credential to no git process of the launcher except the command that needs it", async () => {
+        const r = await allowed();
+        const shim = await readShim(r);
+        await r.write("app.ts", "z\n");
+        r.git("commit", "-a", "-m", "more app");
+        const pushed = await r.push("origin", "feature/x");
+        expect(pushed.code, pushed.stderr).toBe(0);
+        await someoneElse(r);
+        const fetched = await r.run("git", ["fetch", "origin"]);
+        expect(fetched.code, fetched.stderr).toBe(0);
+        const listed = await r.run("git", ["ls-remote", "origin"]);
+        expect(listed.code, listed.stderr).toBe(0);
+        const calls = await shim.calls();
+        expect(calls.filter(call => call.token !== null).map(call => call.sub).sort()).toEqual(["fetch", "ls-remote", "ls-remote", "push"]);
+        for (const call of calls.filter(call => call.token !== null)) {
+          expect(call.token).toBe(TOKEN);
+          expect(call.gitDir, call.args.join(" ")).toMatch(sealedDir);
+        }
+        // The branches GitHub lists for the push are read in a git directory of their own, from the literal URL.
+        const listing = calls.find(call => call.sub === "ls-remote" && call.args.includes("--symref"))!;
+        expect(listing.gitDir).toMatch(/\/list-[^/]+\/git$/);
+        expect(listing.args.slice(-5)).toEqual(["--", r.bare, "HEAD", "refs/heads/*", "refs/tags/*"]);
+      }, 120_000);
+
+      /** The checkout after the same fetch, run by plain git on a copy: the refs, FETCH_HEAD and shallow boundary must be the same. */
+      async function sameAsGit(r: GithubLike, args: string[]) {
+        const copy = path.join(r.root, "oracle");
+        await cp(r.repo, copy, { recursive: true });
+        let plainOk = true;
+        try { r.sys(copy, "fetch", ...args); } catch { plainOk = false; }
+        const sealed = await r.run("git", ["fetch", ...args]);
+        expect(sealed.code === 0, sealed.stderr).toBe(plainOk);
+        const state = async (dir: string) => ({
+          refs: r.sys(dir, "for-each-ref", "--format=%(objectname) %(refname) %(symref)"),
+          fetchHead: await readFile(path.join(dir, ".git", "FETCH_HEAD"), "utf8").catch(() => ""),
+          shallow: await readFile(path.join(dir, ".git", "shallow"), "utf8").catch(() => ""),
+          head: r.sys(dir, "rev-parse", "HEAD"),
+        });
+        expect(await state(r.repo)).toEqual(await state(copy));
+      }
+      it.each([
+        ["with no arguments", (_r: GithubLike) => []],
+        ["a remote", (_r: GithubLike) => ["origin"]],
+        ["a remote and a branch", (_r: GithubLike) => ["origin", "feature/x"]],
+        ["a remote and the tag", (_r: GithubLike) => ["origin", "v2"]],
+        ["--tags", (_r: GithubLike) => ["--tags", "origin"]],
+        ["--prune", (_r: GithubLike) => ["--prune", "origin"]],
+        ["--no-tags", (_r: GithubLike) => ["--no-tags", "origin"]],
+        ["a refspec with a pattern", (_r: GithubLike) => ["origin", "+refs/heads/*:refs/remotes/up/*"]],
+        ["a refspec for a new local branch", (_r: GithubLike) => ["origin", "feature/x:refs/heads/copied"]],
+        ["a URL and a branch", (r: GithubLike) => [r.bare, "feature/x"]],
+        ["--depth", (_r: GithubLike) => ["--depth=1", "origin"]],
+        ["the current branch as a destination (git refuses)", (_r: GithubLike) => ["origin", "feature/x:feature/x"]],
+        ["--dry-run", (_r: GithubLike) => ["--dry-run", "origin"]],
+      ])("updates the checkout as git does: git fetch %s", async (_label, argsFor) => {
+        const r = await githubLike();
+        await someoneElse(r);
+        r.git("branch", "--set-upstream-to=origin/feature/x");
+        r.git("update-ref", "refs/remotes/origin/gone", r.tip());
+        await sameAsGit(r, argsFor(r));
+      }, 90_000);
+
+      it.each([
+        ["--all"], ["--multiple", "origin"], ["--upload-pack=/bin/true", "origin"], ["--filter=blob:none", "origin"], ["--set-upstream", "origin", "feature/x"],
+      ])("refuses git fetch %s: it cannot be reduced to one URL and one list of refs", async (...args) => {
+        const r = await allowed();
+        const shim = await readShim(r);
+        const result = await r.run("git", ["fetch", ...args]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("cannot run with a GitHub credential");
+        expect((await shim.calls()).filter(call => call.sub === "fetch")).toEqual([]);
+      }, 60_000);
+
+      it("does not run git pull with the credential: it fetches and merges in one command, with the checkout's hooks and config", async () => {
+        const r = await allowed();
+        const theirs = await someoneElse(r);
+        const stolen = path.join(r.root, "stolen");
+        for (const name of ["post-merge", "post-rewrite", "pre-merge-commit", "post-checkout"]) {
+          await writeFile(path.join(r.repo, ".git", "hooks", name), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-${name}\nexit 0\n`, { mode: 0o755 });
+        }
+        r.git("branch", "--set-upstream-to=origin/feature/x");
+        const before = r.tip();
+        const shim = await readShim(r);
+        const result = await r.run("git", ["pull", "origin", "feature/x"]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("git pull cannot run with a GitHub credential");
+        expect(result.stderr).toContain("git fetch");
+        expect(r.tip()).toBe(before);
+        for (const name of ["post-merge", "post-rewrite", "pre-merge-commit", "post-checkout"]) expect(await readFile(`${stolen}-${name}`, "utf8").catch(() => null), name).toBeNull();
+        expect((await shim.calls()).filter(call => call.token !== null)).toEqual([]);
+        // The way the message points still works: fetch (sealed), then merge, which holds no credential.
+        const fetched = await r.run("git", ["fetch", "origin", "feature/x"]);
+        expect(fetched.code, fetched.stderr).toBe(0);
+        expect(r.git("rev-parse", "FETCH_HEAD")).toBe(theirs);
+        r.git("merge", "--ff-only", "FETCH_HEAD");
+        expect(r.tip()).toBe(theirs);
+      }, 60_000);
+
+      it.each([
+        ["with no arguments", (_r: GithubLike) => []],
+        ["a remote", (_r: GithubLike) => ["origin"]],
+        ["--heads", (_r: GithubLike) => ["--heads", "origin"]],
+        ["--refs and a pattern", (_r: GithubLike) => ["--refs", "origin", "refs/tags/*"]],
+        ["--get-url", (_r: GithubLike) => ["--get-url", "origin"]],
+        ["a URL", (r: GithubLike) => [r.bare]],
+      ])("prints what git prints: git ls-remote %s", async (_label, argsFor) => {
+        const r = await githubLike();
+        await someoneElse(r);
+        const args = argsFor(r);
+        const result = await r.run("git", ["ls-remote", ...args]);
+        expect(result.code).toBe(0);
+        expect(result.stdout).toBe(`${r.sys(r.repo, "ls-remote", ...args)}\n`);
+      }, 60_000);
+
+      it.each([
+        ["--upload-pack=/bin/true", "origin"], ["--exec=/bin/true", "origin"],
+      ])("refuses git ls-remote %s: it would run a program with the credential", async (...args) => {
+        const r = await allowed();
+        const shim = await readShim(r);
+        const result = await r.run("git", ["ls-remote", ...args]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("cannot run with a GitHub credential");
+        expect((await shim.calls()).filter(call => NETWORK.includes(call.sub))).toEqual([]);
+      }, 60_000);
+    });
   });
 
   it("reports where a push really goes and what could make it go elsewhere", async () => {

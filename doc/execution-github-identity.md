@@ -334,6 +334,21 @@ out is refused by GitHub. `GIT_EXEC_PATH` is dropped from the environment of
 every launcher command, so a helper found through it (`git-remote-*`,
 `git-receive-pack`) never runs with the credential.
 
+**A command that goes to the network with a credential is sealed.** A push, a
+fetch and an `ls-remote` do not run in the checkout, whose config, hooks and refs
+the agent's UID can change after the broker has answered. Each runs in a git
+directory that the launcher makes for it. That directory holds none of the
+checkout's remotes, refs, hooks or settings. The command gets the URL the broker
+was told as its literal target, `core.hooksPath` pointing at an empty directory,
+`protocol.ext.allow=never`, and an environment of its own. Command-line config
+cannot do this job: a `url.*.insteadOf` rule, or a URL-scoped `http.<url>.proxy`,
+in the repository's own config ties with it or outranks it. The only way to know
+that a setting of the checkout is not read is that the command does not read the
+checkout's config. What the launcher itself reads of the checkout before and
+after (remotes, refs, commits, the refs that it applies after a fetch) runs
+without the credential in the environment, so a hook or helper that the checkout
+configures never sees it. The next paragraphs say how each command is sealed.
+
 **A push with a credential is sealed.** Once the broker has answered, the push
 does not run as typed. Its destination and its refs are arguments, not names that
 git looks up. The command is `git -c core.hooksPath=<empty> -c
@@ -391,8 +406,43 @@ the checkout after a push that succeeded (not after `-n`): it moves or deletes t
 remote-tracking refs of the branches the push changed, and `-u` records the
 upstream. If the push fails, the tracking refs stay as they were. The
 checkout's own hooks (a `pre-push` hook, `core.hooksPath`) do not run for a
-push that holds a credential. Fetches and pulls keep the earlier check only:
-their remote, refs and commits are read again right before they run.
+push that holds a credential.
+
+A **fetch** is sealed the same way. Its git directory has the checkout's refs (so
+git negotiates, fast-forwards, follows tags and prunes as it does in the
+checkout), its shallow boundary, and the checkout's object directory, so what it
+fetches lands there. What git needs to know about the remote comes as
+environment config of the launcher's own, not from a file: the URL the broker
+was told, where the remote's branches go (`remote.<name>.fetch`), its tag and
+prune settings, and the upstream of the current branch. The remote has to be the
+repository the broker was told about: one that points elsewhere now, or that git
+would default to instead of the `origin` that was reported, is refused. When the
+command has finished, the launcher applies what it did to the checkout, with
+processes that do not hold the credential: the refs it changed (each only if the
+checkout still has the value the fetch started from; the checkout's
+`reference-transaction` hook runs for them as for any ref update), the symbolic
+refs it made, `FETCH_HEAD` and the shallow boundary. A fetch into a branch that
+is checked out is refused as git refuses it (nothing is applied, exit 128).
+Submodules are not fetched and no maintenance (`gc`, commit graphs) runs. These
+are refused, with the reason: `--all` and `--multiple` (each remote needs its own
+URL), `--upload-pack`, `--filter` and partial clones, `--set-upstream`,
+`--refetch`, `--prefetch`, `--stdin`, `--negotiate-only`, and any option that is
+not listed. Name one remote and its refspecs.
+
+An **`ls-remote`** is sealed with the literal URL; `--upload-pack` and `--exec`
+are refused. The launcher's own read of the branches and tags that GitHub lists
+for a push (above) is sealed the same way, so it cannot be redirected either.
+
+A **`pull`** is not run with a credential. It fetches and then merges or rebases
+in one command, and the merge runs the checkout's hooks (`post-merge`,
+`post-rewrite`) and config while it holds the credential. It cannot be split
+without redoing git's own handling of the `pull` options, of the merge
+descriptions in `FETCH_HEAD` and of a rebase's fork point. The refusal says what
+to do: `git fetch <remote> <branch>`, then `git merge FETCH_HEAD` or
+`git rebase <remote>/<branch>`.
+
+`clone`, `git submodule add|update` and `git lfs` also reach the network with a
+credential and are not sealed (see the limits).
 
 The base is the base of the same-repository open pull request whose head is the
 pushed branch, else the repository's default branch. Whoever opens a pull
@@ -642,7 +692,8 @@ a proxy or other TLS trust (URL-specific `http.<url>.proxy` or `sslVerify`,
 it; gh always gets a fresh private `GH_CONFIG_DIR`. Such a command therefore
 cannot use a proxy the network needs. The allowlist, toggles, throttle and
 guard hold on the managed path only. An agent that captures a user token (for example from the git hook of a
-command other than a push, a program named `gh` later in `PATH`, or a gh extension, which all run with the
+command other than a push, a fetch or an `ls-remote` (`clone`, `git submodule add|update`, `git lfs` and `gh`
+still run unsealed), a program named `gh` later in `PATH`, or a gh extension, which all run with the
 token in their environment; or a process of the same user that reads the environment of the running
 command) can skip them for at most 8 hours; the hard limits are GitHub's: the App
 installation's repositories and permissions (keep Workflows write off so
