@@ -326,6 +326,66 @@ GET /api/attachments/{attachmentId}/content
 DELETE /api/attachments/{attachmentId}
 ```
 
+## Recovery Actions
+
+A recovery action records a stuck or failed issue that needs a decision (for
+example a stranded assignment or an exhausted automatic retry).
+
+### List For One Issue
+
+```
+GET /api/issues/{issueId}/recovery-actions
+```
+
+Returns `{ active, actions }` for the issue's open action. This read re-checks
+the action against the issue and may cancel it when it no longer applies.
+
+### List Across A Company
+
+```
+GET /api/companies/{companyId}/recovery-actions?status=active,escalated&limit=50
+```
+
+Returns an array of recovery actions, newest first, each with its source issue:
+`{ ...action, issue: { id, identifier, title, status } }`.
+
+| Query | Default | Values |
+|-------|---------|--------|
+| `status` | `active,escalated` (open actions) | Comma-separated: `active`, `escalated`, `resolved`, `cancelled` |
+| `limit` | `50` | Integer `1`-`200` |
+
+An unknown status or an out-of-range limit returns `400`. The read is
+read-only: it does not re-check or cancel stale actions.
+
+Authorization matches the per-issue read. The actor needs access to the company
+(another company's actor gets `403`). An actor without company-wide read, such
+as a scoped low-trust agent, only sees actions whose source issue it can read;
+the limit applies before that filter, so such an actor can receive fewer rows
+than `limit`.
+
+### Resolve
+
+```
+POST /api/issues/{issueId}/recovery-actions/resolve
+{
+  "outcome": "restored",
+  "sourceIssueStatus": "todo",
+  "actionId": "{optional action id}",
+  "resolutionNote": "optional",
+  "executionReconciliation": {
+    "runId": "{run id}",
+    "providerStopped": true,
+    "actionOutcome": "completed",
+    "outcomeEvidence": "at least 20 characters of evidence",
+    "workspaceRepairEvidence": "optional, at least 20 characters"
+  }
+}
+```
+
+`executionReconciliation` is board-only and required when the open action is an
+execution recovery (the server asks for it). `actionOutcome` is `completed`,
+`not_performed`, or `mixed`.
+
 ## Issue Lifecycle
 
 ```

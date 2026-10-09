@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, issues, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
 import type {
   IssueRecoveryAction,
@@ -257,6 +257,49 @@ export function issueRecoveryActionService(db: Db) {
     }
     await projectNativeRunActivity(companyId, [...result.values()], db);
     return result;
+  }
+
+  /**
+   * Company-wide read of recovery actions with their source issue, newest
+   * first. Read-only: unlike the per-issue read, it does not revalidate (and so
+   * never cancels) stale actions. The issue authorization fields are returned
+   * so the route can apply the same per-issue visibility filter.
+   */
+  async function listForCompany(
+    companyId: string,
+    input: { statuses: readonly IssueRecoveryActionStatus[]; limit: number },
+  ) {
+    const rows = await db
+      .select({
+        action: issueRecoveryActions,
+        issue: {
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          projectId: issues.projectId,
+          parentId: issues.parentId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+        },
+      })
+      .from(issueRecoveryActions)
+      .innerJoin(
+        issues,
+        and(eq(issues.id, issueRecoveryActions.sourceIssueId), eq(issues.companyId, issueRecoveryActions.companyId)),
+      )
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          inArray(issueRecoveryActions.status, [...input.statuses]),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.createdAt), desc(issueRecoveryActions.id))
+      .limit(input.limit);
+    const actions = rows.map((row) => toReadModel(row.action));
+    await projectNativeRunActivity(companyId, actions, db);
+    return rows.map((row, index) => ({ action: actions[index]!, issue: row.issue }));
   }
 
   async function retryUpsertSourceScoped(
@@ -570,6 +613,7 @@ export function issueRecoveryActionService(db: Db) {
   return {
     getActiveForIssue,
     listActiveForIssues,
+    listForCompany,
     resolveActiveForIssue,
     upsertSourceScoped,
   };
