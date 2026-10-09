@@ -77,7 +77,7 @@ describe("GoalProperties planning fields", () => {
     expect(container.querySelector<HTMLInputElement>('input[type="date"]')?.value).toBe("2026-10-16");
   });
 
-  it("saves a new target date and clears it", async () => {
+  it("saves the date only when the field is left, so partial typing never saves", async () => {
     const onUpdate = vi.fn();
     await render(goal, onUpdate);
     const input = container.querySelector<HTMLInputElement>('input[type="date"]')!;
@@ -85,12 +85,31 @@ describe("GoalProperties planning fields", () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
+    const leave = () => act(() => { input.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); });
 
-    setValue("2026-10-20");
+    for (const partial of ["0002-10-16", "0020-10-16", "0202-10-16", "2026-10-20"]) setValue(partial);
+    expect(onUpdate).not.toHaveBeenCalled();
+    leave();
+    expect(onUpdate.mock.calls).toEqual([[{ targetDate: "2026-10-20" }]]);
+
+    leave();
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+
     setValue("");
+    leave();
+    expect(onUpdate.mock.calls.at(-1)).toEqual([{ targetDate: null }]);
+  });
 
-    expect(onUpdate).toHaveBeenNthCalledWith(1, { targetDate: "2026-10-20" });
-    expect(onUpdate).toHaveBeenNthCalledWith(2, { targetDate: null });
+  it("saves on Enter", async () => {
+    const onUpdate = vi.fn();
+    await render(goal, onUpdate);
+    const input = container.querySelector<HTMLInputElement>('input[type="date"]')!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "2026-11-01");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    expect(onUpdate.mock.calls).toEqual([[{ targetDate: "2026-11-01" }]]);
   });
 
   it("offers no editing controls when read only", async () => {

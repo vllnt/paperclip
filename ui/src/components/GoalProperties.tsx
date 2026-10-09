@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import type { Goal } from "@paperclipai/shared";
@@ -75,6 +75,38 @@ function PickerButton({
         ))}
       </PopoverContent>
     </Popover>
+  );
+}
+
+/**
+ * Saves when the field is left or Enter is pressed. A browser date field changes on every
+ * keystroke (typing a year passes through 0002, 0020, ...), so saving on change would write
+ * wrong dates.
+ */
+function TargetDateInput({ value, onCommit }: { value: string | null; onCommit: (value: string | null) => void }) {
+  const [draft, setDraft] = useState(value ?? "");
+  const saved = useRef(value ?? "");
+  useEffect(() => {
+    setDraft(value ?? "");
+    saved.current = value ?? "";
+  }, [value]);
+  const commit = () => {
+    if (draft === saved.current) return;
+    saved.current = draft;
+    onCommit(draft || null);
+  };
+  return (
+    <input
+      type="date"
+      aria-label="Target date"
+      className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") commit();
+      }}
+    />
   );
 }
 
@@ -166,13 +198,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
 
         <PropertyRow label="Target date">
           {onUpdate ? (
-            <input
-              type="date"
-              aria-label="Target date"
-              className="h-7 rounded-md border border-border bg-background px-2 text-xs"
-              value={goal.targetDate ?? ""}
-              onChange={(event) => onUpdate({ targetDate: event.target.value || null })}
-            />
+            <TargetDateInput value={goal.targetDate} onCommit={(targetDate) => onUpdate({ targetDate })} />
           ) : (
             <span className="text-sm">{goal.targetDate ? formatTargetDate(goal.targetDate) : "None"}</span>
           )}
