@@ -45,16 +45,52 @@ function declaredConfigSchema(driver: PluginEnvironmentDriverDeclaration): Recor
   return schema && typeof schema === "object" && !Array.isArray(schema) ? (schema as Record<string, unknown>) : null;
 }
 
+const MAX_PROBE_DIAGNOSTICS = 50;
+
+interface ProbeDiagnostic {
+  severity: string;
+  message: string;
+  code?: string;
+  omitted?: number;
+}
+
+function readDiagnosticSeverity(diagnostic: unknown): string {
+  if (typeof diagnostic !== "object" || diagnostic === null || !("severity" in diagnostic)) return "info";
+  const { severity } = diagnostic;
+  return typeof severity === "string" && DIAGNOSTIC_SEVERITIES.has(severity) ? severity : "info";
+}
+
+/**
+ * Maps the diagnostics of a provider probe to constant entries, at most
+ * `MAX_PROBE_DIAGNOSTICS` of them plus one marker that counts the rest. A worker
+ * response can hold millions of entries, so the list is cut before it is mapped:
+ * the cost of the probe response does not depend on how many entries arrive.
+ *
+ * @param diagnostics - The `diagnostics` value of a probe result. Anything but an array maps to none.
+ * @returns The kept entries, each with a checked severity and constant text, and a marker when entries were left out.
+ */
+function boundedProbeDiagnostics(diagnostics: unknown): ProbeDiagnostic[] {
+  if (!Array.isArray(diagnostics)) return [];
+  const kept = diagnostics.slice(0, MAX_PROBE_DIAGNOSTICS).map(
+    (diagnostic): ProbeDiagnostic => ({
+      severity: readDiagnosticSeverity(diagnostic),
+      message: WITHHELD_PROVIDER_TEXT,
+    }),
+  );
+  const omitted = diagnostics.length - kept.length;
+  if (omitted <= 0) return kept;
+  return [
+    ...kept,
+    { severity: "warning", message: WITHHELD_PROVIDER_TEXT, code: "diagnostics_truncated", omitted },
+  ];
+}
+
 function safeProbeOutput(
   result: { diagnostics?: unknown; metadata?: Record<string, unknown> },
   configSchema: Record<string, unknown> | null,
 ) {
-  const diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics : [];
   return {
-    diagnostics: diagnostics.map((diagnostic: { severity?: unknown } | null) => ({
-      severity: DIAGNOSTIC_SEVERITIES.has(diagnostic?.severity as string) ? diagnostic?.severity : "info",
-      message: WITHHELD_PROVIDER_TEXT,
-    })),
+    diagnostics: boundedProbeDiagnostics(result.diagnostics),
     metadata: redactProviderMetadata(result.metadata, configSchema),
   };
 }

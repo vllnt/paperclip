@@ -224,6 +224,79 @@ describe("provider-controlled output is not returned to the caller", () => {
     expect(result.summary).toBe('Sandbox provider "secure-plugin" probe passed.');
   });
 
+  function lazyList(length: number): { list: unknown[]; reads: { count: number } } {
+    const reads = { count: 0 };
+    const isIndex = (property: string | symbol): property is string =>
+      typeof property === "string" && /^\d+$/.test(property);
+    const list = new Proxy<unknown[]>([], {
+      get(target, property, receiver) {
+        if (property === "length") return length;
+        if (isIndex(property)) {
+          reads.count += 1;
+          return null;
+        }
+        return Reflect.get(target, property, receiver);
+      },
+      has(target, property) {
+        return isIndex(property) ? Number(property) < length : Reflect.has(target, property);
+      },
+    });
+    return { list, reads };
+  }
+
+  function readDiagnostics(result: Awaited<ReturnType<typeof probePluginSandboxProviderDriver>>): unknown[] {
+    const diagnostics = result.details?.diagnostics;
+    return Array.isArray(diagnostics) ? diagnostics : [];
+  }
+
+  async function probeSandboxWith(diagnostics: unknown) {
+    return await probePluginSandboxProviderDriver({
+      db: {} as Db,
+      workerManager: workerManagerReturning({ ok: true, diagnostics }),
+      companyId: "company-1",
+      environmentId: "environment-1",
+      provider: "secure-plugin",
+      config: { provider: "secure-plugin" },
+    });
+  }
+
+  async function probeGenericWith(diagnostics: unknown) {
+    return await probePluginEnvironmentDriver({
+      db: {} as Db,
+      workerManager: workerManagerReturning({ ok: true, diagnostics }),
+      companyId: "company-1",
+      environmentId: "environment-1",
+      config: pluginConfig,
+    });
+  }
+
+  it.each([
+    ["sandbox provider", probeSandboxWith],
+    ["plugin environment driver", probeGenericWith],
+  ])("keeps 50 diagnostics and one marker for a million, and reads only the first 50, for a %s", async (_name, probe) => {
+    const { list, reads } = lazyList(1_000_000);
+
+    const diagnostics = readDiagnostics(await probe(list));
+
+    expect(diagnostics).toHaveLength(51);
+    expect(diagnostics[0]).toEqual({ severity: "info", message: expect.any(String) });
+    expect(diagnostics[50]).toEqual({
+      severity: "warning",
+      message: expect.any(String),
+      code: "diagnostics_truncated",
+      omitted: 999_950,
+    });
+    expect(reads.count).toBeLessThanOrEqual(50);
+  });
+
+  it("adds a marker only when more than 50 diagnostics arrive", async () => {
+    expect(readDiagnostics(await probeSandboxWith(new Array(50).fill(null)))).toHaveLength(50);
+
+    const diagnostics = readDiagnostics(await probeSandboxWith(new Array(51).fill(null)));
+    expect(diagnostics).toHaveLength(51);
+    expect(diagnostics[50]).toMatchObject({ code: "diagnostics_truncated", omitted: 1 });
+  });
+
   function deeplyNested(depth: number): unknown {
     let value: unknown = "leaf";
     for (let level = 0; level < depth; level += 1) value = { child: value };
