@@ -338,3 +338,18 @@ backlog -> todo -> in_progress -> in_review -> done
 - `started_at` auto-set on `in_progress`
 - `completed_at` auto-set on `done`
 - Terminal states: `done`, `cancelled`
+
+### Reconcile a stopped execution
+
+`POST /api/issues/{id}/execution/reconcile` is a board-only operator action for an issue blocked by one or more stopped execution holds. It records the observed provider outcome for every stacked hold, clears the no-replay blocker, and queues one fresh continuation for the current assignee.
+
+```json
+{
+  "outcome": "none",
+  "note": "The provider stopped before any external write was made.",
+  "expectedRunId": "<latest-stopped-run-id>",
+  "workspaceRepairNote": "<required when the run reports an unsafe workspace restore>"
+}
+```
+
+`outcome` is `done`, `none`, or `mixed`. The note is retained as recovery evidence; secrets and raw provider transcripts are not accepted. The operation is transactional and returns the reconciled run/action IDs plus the continuation status. A stale expected run, live provider process, unreleased environment lease, or changed issue owner returns `409` without changing any hold.
