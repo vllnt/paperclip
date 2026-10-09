@@ -344,8 +344,17 @@ the literal target (never the remote's name), and each refspec is the object
 (a tag object stays a tag object) and the full name it goes to, or `:<full name>`
 to delete. The commits are read again and must be the ones in the report the
 broker answered. `--force-with-lease` becomes `--force-with-lease=<full
-ref>:<commit>` for each ref: the commit the checkout last saw of the remote's
-branch, which is what git compares with, or the commit that was named. The
+ref>:<commit>` for each ref. A commit that the command names (or none, for a ref
+that must not exist) is used as typed. A value that comes out of the checkout's
+refs (a lease without a value, which means the remote-tracking ref, or a name
+such as `origin/x`) is the checkout's to write, so it is taken only when it is
+the commit GitHub lists for that branch: as read for the check of the report, or,
+when the check did not read the branches, as read when the push is planned. The
+child is given that listed commit. A checkout that disagrees with GitHub, or
+branches that cannot be read, is refused, as git refuses a lease whose remote has
+moved: fetch, look at what is new on that branch, and run it again. A value from
+the checkout's refs for a ref that is not a branch is refused too (name the
+commit: `--force-with-lease=<ref>:<commit>`). The
 environment holds only the credential, `PATH`, the locale and what git needs, and
 none of the checkout's steering (`GIT_DIR`, `GIT_EXEC_PATH`, `GIT_TRACE*`,
 `GIT_SSH`, object and index paths); `HOME` is the private directory.
