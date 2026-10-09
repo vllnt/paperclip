@@ -11,7 +11,7 @@ what every run consumed and what it achieved, per run, routine, agent, issue,
 project and company, so bottlenecks and waste are found from data and every change
 is measured afterwards: **data, finding, decision, change, measured result**.
 
-Why now (operator reports from a busy production company, not independently measured
+Why now (operator reports, not independently measured
 here): hundreds of runs a day with a large share failing in bursts (server restarts,
 worker disk full, restore-lock timeouts, provider quota, external-service quota); a
 large always-loaded skill that every run pays for; no view joins agent effort to
@@ -38,7 +38,7 @@ feature itself sends nothing off the instance, so neither the strict telemetry r
 nor the generated telemetry contract applies. The existing `agent.task_run` telemetry
 event (`packages/shared/src/telemetry/events.ts:127-154`) and the terminal-run seam that
 emits it (`heartbeat.ts:12939`) are not used. A reviewer should reject any slice that
-imports from `packages/shared/src/telemetry/`. What a *consumer* of the export (Jev) does
+imports from `packages/shared/src/telemetry/`. What a *consumer* of the export (for example a decisions engine) does
 with it is the consumer's responsibility; the export carries ids, numbers and enums only.
 
 ## 2. How this was measured, and what was not
@@ -49,10 +49,10 @@ with it is the consumer's responsibility; the export carries ids, numbers and en
   design; its corrections are applied in this version). Each claim carries a
   `file:line` from `main` at `a91d77cc4`. Items I could not confirm in code are marked
   **UNVERIFIED**.
-- **Not measured: any live data.** The only local instance (`~/.paperclip/instances/default`)
-  holds zero runs, agents or issues in its database, its on-disk run logs are tiny
-  (no file over 4 KB, none with a usage, compaction or skill marker), and I have no
-  access to a production company. The operator's reports are cited, not reproduced.
+- **Not measured: any live data.** The only instance available while writing this is a
+  development install: its database holds no runs, agents or issues, and its on-disk run
+  logs are tiny (none over 4 KB, none with a usage, compaction or skill marker). Nothing
+  here was measured on a production company. The operator's reports are cited, not reproduced.
   Appendix A is a set of 12 read-only SQL queries for an operator to run on a real company;
   all 12 were executed against a freshly migrated empty schema to prove they parse and
   every column exists (that proves syntax, not results). **A1, A5 and A7 should run
@@ -132,7 +132,7 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 | 15 | Interruptions by cause (deploy, backup, crash) | **Partial** | `server_shutdown_interrupted` (graceful signal, `heartbeat.ts:15348-15431`) versus `process_lost` (`:19524`), `restartKind hot\|hard\|graceful` in the native recovery event. No boot or shutdown record, so deploy vs restart vs crash vs backup cannot be told apart. | `server_boot_events` (instance-level, section 7.6) plus the classifier | 1a / 6 |
 | 16 | Failure cause taxonomy | **Partial** | `error_code` is free text with about 150 distinct literals (reviewer count 153; `heartbeat_runs.ts:68`) and no enum. Liveness is a closed set of 7 (`constants.ts:931-939`). `recovery-observability.ts` has its own cause groups. Convex quota has no code. | Shared closed `RUN_FAILURE_CAUSES` plus a pure classifier (error code, error family, status, signal, stderr excerpt patterns); unmapped codes surfaced | 1a |
 | 17 | Turn count, tool calls, tool errors per run | **Partial** | Native: `tool.execution.*` with duration and exit code in the run log. Gateway tools: `tool_call_events` (row above). Legacy CLI tools: only in UI parsers (`claude-local/ui/parse-stdout.ts:74-117`); pi's server parser discards them. `num_turns` appears nowhere in code; Claude's raw result event, already stored in `result_json`, is expected to carry it (UNVERIFIED, A6). | Count in the adapter parsers; fixture-verify the Claude result keys | 1b-1d |
-| 18 | Tokens per tool call | **Not directly observable** | CLIs report usage per assistant message, not per tool. `tool_call_events.result_size_bytes` gives a size proxy for gateway tools only. | Approximate tool-result size as context growth between consecutive turns; deferred, Jev-oriented | later |
+| 18 | Tokens per tool call | **Not directly observable** | CLIs report usage per assistant message, not per tool. `tool_call_events.result_size_bytes` gives a size proxy for gateway tools only. | Approximate tool-result size as context growth between consecutive turns; deferred, analysis-oriented | later |
 | 19 | Dollar cost for non-billed usage | **Partial** | Server never prices (`heartbeat.ts:5375-5397`): Codex `costUsd` is always null, so those runs are `unpriced` with 0 cents. Claude subscription runs keep an API-equivalent `costUsd` in `usage_json` while `cost_cents` is forced to 0. The only price table is eval-only (`evals/model-pricing.ts`). | Tokens are the primary metric. Optional versioned price catalog for an "API-equivalent" estimate, flagged `estimated`. **Decision D3** | 2 |
 | 20 | Per-day series of tokens, cost, failures | **Missing** | Section 3.2. | Query service over the record | 2 |
 | 21 | Always-loaded context in tokens | **Missing** | No tokenizer (`rg tiktoken\|countTokens` finds nothing). | Measured first-turn tokens where the adapter exposes per-message usage; otherwise `chars/4` flagged `estimated` | 1b |
@@ -146,9 +146,9 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 | 29 | Privacy | **Gap to avoid** | `adapter.invoke` stores the full `prompt` and `context` in the run log (`claude-local/execute.ts:955-962`); no key rule matches `prompt`. Not copied into the new record. Reported, not fixed here (F2). | Allowlist-only builder | all |
 | 30 | Provider-side retry and no-work runs | **Partial** | Deferral cancellations (`workspace_busy`, `ai_connection_busy`, `heartbeat.ts:16423,16474`) are terminal runs that never started provider work; counting them as "failed runs" overstates failure. | `provider_work_started` flag on the record | 1a |
 | 31 | Context fill per turn (how a session's context grows) | **Missing** | The server parser keeps only the final usage (`claude-local/parse.ts:76-89` ignores per-assistant-message `usage`); the UI parser reads result-level usage only (`ui/parse-stdout.ts:125-128`). ACP `usage_update` (`used`, `size`) is shown live (`TaskChatUsageReadout.tsx:11-13`); whether it is persisted is **UNVERIFIED**. Native and Codex events carry cumulative and run-delta spend, not fill (`runnerd-codex-transport.ts:1706-1709`). | Per-adapter pure `parseContextSamples` over the stored NDJSON, on read (7.9) | C1 |
-| 32 | Compaction and truncation events | **Partial** | Runner emits `context.compacted` v1 with `reason`, `preTokens`, `postTokens`, `sameSession` (`provider-events.ts:755-764`). Claude's documented `system` / `compact_boundary` (`compact_metadata.trigger`, `pre_tokens`) has no handler anywhere in the repo. | Parse both into the context record and timeline | C1 |
+| 32 | Compaction and truncation events | **Partial** | The runner emits `context.compacted` v1 (`reason`, `sameSession`, `compactionId`) for Codex `thread/compacted` and compaction items, but **`preTokens` and `postTokens` are always `null`** (`provider-events.ts:761-768`, `:1062-1069`), so a native compaction is a marker with no size. Claude's documented `system` / `compact_boundary` (`compact_metadata.trigger`, `pre_tokens`) has no handler anywhere in the repo. | Parse both into the record and timeline: Claude carries `pre_tokens`; native shows the marker only until a protocol change fills the sizes (C5) | C1 |
 | 33 | Model context window | **Partial** | Only ACP `size` is seen. Claude `modelUsage[].contextWindow` is **UNVERIFIED** (no fixture). | Store when reported, else `unknown`; never guess a window | C1 |
-| 34 | Context composition at invoke time | **Partial** | Claude records `promptMetrics` chars (bootstrap, wake, handoff, task context, heartbeat prompt) in `adapter.invoke` (`claude-local/execute.ts:923-961`, `adapter-utils/types.ts:159`). Instructions and skill-listing sizes are not recorded. Instructions are injected only on a fresh Claude session (`execute.ts:931`). | One `context.composition` run event at invoke, estimated tokens (7.9) | C1 |
+| 34 | Context composition at invoke time | **Partial** | Claude records `promptMetrics` chars (bootstrap, wake, handoff, task context, heartbeat prompt) in `adapter.invoke` (`claude-local/execute.ts:923-961`, `adapter-utils/types.ts:159`). Instructions and skill-listing sizes are not recorded. Instructions are injected only on a fresh Claude session (`execute.ts:931`). | One `contextComposition` key on the existing `adapter.invoke` payload, estimated tokens (7.9) | C1 |
 | 35 | Skill impact on context | **Missing** | Footprint (row 21) lists skills but no token size and no load counts. UI knows a `Skill` tool name (`tool-taxonomy.test.ts:97`); the server does not count it. | Token sizes from the #51 counter; loads counted by the worker | C3 |
 | 36 | System-prompt impact per agent | **Missing** | `agent_instruction_revisions` holds the content; nothing measures it against context or cost. | Baseline budget and share of first-turn context | C2 |
 | 37 | Token delta on instruction, skill and model changes | **Missing** | Audit actions exist (`agent.instructions_*`, `agent.skills_synced`, `agent.updated`, `agent.config_rolled_back`, `company.skill_version_created\|updated\|file_updated`) with no size information. | Delta computed on read from revision rows | C4 |
@@ -189,7 +189,7 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 6. **`process_loss_retry_count` never increments**, so the one-retry guard at `heartbeat.ts:19510` is dead. Reported, out of scope.
 7. **Unbounded growth.** `heartbeat_run_events` (native: every protocol event) and the NDJSON logs have no retention. Reported as follow-up F1, not part of this feature.
 
-## 6. What traces and transcripts already hold that Jev can use
+## 6. What traces and transcripts already hold that an analysis consumer can use
 
 Persisted today, no new collection needed to mine:
 
@@ -202,7 +202,7 @@ Persisted today, no new collection needed to mine:
 
 Not persisted (cannot be mined without new collection): legacy turn count and per-message usage, provider latency on legacy adapters, restore-lock wait on success, resource usage.
 
-Boundary rule for the loop: metrics and exports carry **ids, numbers and enums only**. Jev
+Boundary rule for the loop: metrics and exports carry **ids, numbers and enums only**. The consumer
 dereferences a run id through the existing authorized run and log APIs, which is where
 content access is already controlled. Content never travels through the observability store.
 
@@ -318,7 +318,7 @@ Phased: **3a** persists PR lifecycle timestamps on the work product through the 
 - **Work-product reads** (linked PRs per issue) count only rows where `linkedWorkProductCondition()` holds (added by #45, which hides unlinked rows).
 - **Efficiency metrics** attribute to a merged PR the runs on its issue up to `merged_at`: tokens per merged PR, runs per merged PR, CI cycles per PR, review rounds per PR, merges per hour. Sub-issue trees reuse the existing tree recursion in a later pass.
 
-### 7.6 The changes view, impact on read, and the Jev loop
+### 7.6 The changes view, impact on read, and the analysis loop
 
 No intervention table in the first cut (decision D7). Changes are **derived from tables
 that already record them**, which is "recording every change" without double-writing:
@@ -342,7 +342,7 @@ of `server_shutdown_interrupted` from a crash cluster of `process_lost`.
 
 - **Impact is computed on read:** the same metric over an equal window before and after on the same scope, with a minimum-sample guard and the overlapping changes listed as confounders. It is not frozen; if a frozen result or a manual entry is needed later, an `observability_interventions` table is added then (D7).
 - **Findings are ordinary issues** labeled for the audit, not a new table. A decision is the issue; the change is the revision row it caused. The loop closes with existing primitives.
-- **Jev export:** `GET .../observability/export` (NDJSON; every line has `kind` and integer `v`; resumable through an opaque base64url cursor and a trailing `{"kind":"cursor","next":...}` line, the same envelope as the session-warehouse export, section 9): usage aggregates, deterministic anomaly flags computed on read (spikes against a trailing 14-day baseline per agent, model and cause; unknown-cause share; tokens-per-run drift), the derived change list (kind, ids, timestamps only, no free text), and at most N sample run ids per flag. It excludes intervention summaries, `subject_ref` and any per-issue rows. Access: board, or an agent holding an explicit audit permission (decided in PR 6).
+- **Analysis export:** `GET .../observability/export` (NDJSON; every line has `kind` and integer `v`; resumable through an opaque base64url cursor and a trailing `{"kind":"cursor","next":...}` line, the same envelope as the session-warehouse export, section 9): usage aggregates, deterministic anomaly flags computed on read (spikes against a trailing 14-day baseline per agent, model and cause; unknown-cause share; tokens-per-run drift), the derived change list (kind, ids, timestamps only, no free text), and at most N sample run ids per flag. It excludes intervention summaries, `subject_ref` and any per-issue rows. Access: board, or an agent holding an explicit audit permission (decided in PR 6).
 
 ### 7.7 Retention
 
@@ -372,14 +372,18 @@ context, in the web UI, through the API and through the CLI.
 `packages/skills-catalog/src/skill-quality-text.ts` (lean-skills PR #51): UTF-8 bytes
 divided by 4, rounded. It is an **estimate, not a tokenizer**. Every number from it is
 stored and returned with `basis: "estimated"` and `tokenizer: "bytes_div_4"`; every number
-a provider reported is `basis: "reported"`. The two are never summed into one field. #51
-exports `checkSkillQuality` (whose `metrics.estimatedTokens` counts the whole SKILL.md) but
-does not export `estimateTokens` from the package index. Composition needs per-file and
-description-only counts, so I ask lean-skills for a one-line index export rather than copy
-the function (section 9). The `countTokens` option of the quality check and the
-`tokenizer` field already leave room for a real tokenizer later (D9). The reader sees how
-good the estimate is: `calibration = median(reported first-turn context / estimated
-composition)` per adapter and model, computed on read from two stored fields.
+a provider reported is `basis: "reported"`. The two are never summed into one field. The
+lean-skills session exports `estimateTokens` from the package index on #51 and pins its
+behavior in a test (`"abcd"` is 1, four `"é"` are 2, `""` is 0); its
+`metrics.estimatedTokens` counts the whole SKILL.md including frontmatter, so
+description-only and per-file counts call `estimateTokens` directly. Where the function
+lives is decision D12. **The estimate is biased low for some models.** On the same v8-lean
+SKILL.md the estimate is about 5.6k tokens against 7.8k measured with a Sonnet 5 tokenizer
+(about 30% under) and 5.7k with a Haiku 4.5 tokenizer (close), a figure from that session.
+So no panel presents an estimated share as exact. The reader sees the error: `calibration =
+median(reported first-turn context / estimated composition)` per adapter and model,
+computed on read from two stored fields. The `countTokens` option of the quality check and
+the `tokenizer` field leave room for a real tokenizer later (D9).
 
 **Sources by adapter.** Only what the repo or the vendor documents is claimed; the rest is
 marked, and the first step of C1 is to capture real fixtures that settle it.
@@ -388,7 +392,7 @@ marked, and the first step of C1 is to capture real fixtures that settle it.
 |---|---|---|---|---|
 | `claude_local` | `assistant` events carry `message.usage` (documented `BetaMessage`). One API turn can emit several assistant events that share `message.id`, so dedupe by id. | `system` / `compact_boundary` with `compact_metadata {trigger: manual\|auto, pre_tokens}` (documented) | `modelUsage[].contextWindow` (**UNVERIFIED**) | **UNVERIFIED in this repo**: no fixture, the parser ignores per-message usage, and no local run log holds one |
 | ACPX and ACP lanes | `usage_update` status events: `used`, `size` | none seen | `size` | live in the UI; persistence in the run log **UNVERIFIED** |
-| `paperclip_runner` (native) | spend deltas only (`usage.reported`: `cumulative`, `runDelta`) | `context.compacted` v1: `reason`, `preTokens`, `postTokens`, `sameSession` | not carried | spend and compaction available, fill is not |
+| `paperclip_runner` (native) | spend deltas only (`usage.reported`: `cumulative`, `runDelta`) | `context.compacted` v1: marker with `reason` and `sameSession`; `preTokens` and `postTokens` are always `null` today | not carried | spend and compaction markers available; fill and compaction size are not |
 | `codex_local` CLI | `turn.completed` totals only | none parsed | none | spend only |
 | gemini, cursor, opencode, pi, kimi, hermes, openclaw | none per turn | none | none | `none` |
 
@@ -400,7 +404,7 @@ compaction, `spend_only`, `none`) and a closed-enum `reason`. An unsupported ada
 
 - **Timeline: not stored.** Derived on read from the run's NDJSON through an optional pure per-adapter `parseContextSamples(lines)` (numbers and enums only), capped at 2,000 points and downsampled. If the log was pruned (section 9) the response says `log_pruned`.
 - **Summary: sibling table `run_context_records`**, one row per run: `company_id`, unique `run_id`, `agent_id`, `finished_at` (as in 7.1), its own `schema_version`, `adapter_type`, `model`, `availability`, `window_tokens`, `turns`, `first_turn_context_tokens`, `peak_context_tokens`, `final_context_tokens`, `compactions_auto`, `compactions_manual`, `session_resumed`, `composition` (jsonb, at most 40 parts: kind enum, tokens, count, `ref` = `skillKey@versionId` or revision id) and `skill_loads` (jsonb, at most 50). The **same worker pass** as 7.2 writes it (same lock, lookback, settle delay, backfill and `--rederive`). It is a separate table with its own `schema_version` so adding context fields never bumps the usage record's version, which would move the prune-guard constant in section 9. Retention follows 7.7. The privacy canary and column-contract tests of 7.8 cover it.
-- **Composition is captured at invoke time**, once, fail-open, as one `context.composition` row through the existing `appendRunEvent`, just before `adapter.invoke` (about `heartbeat.ts:23651`). It cannot be derived afterwards because the instructions bundle and skill set may change before the worker runs. Parts: `instructions` (bytes of the resolved bundle files, revision id), one `skill_listing` part per skill (`skillKey@versionId`, description tokens, always loaded), and the adapter's existing numeric `promptMetrics` (bootstrap, wake, handoff, task context, heartbeat prompt; flagged as character-based). The worker reads an allowlist of numeric keys only; the full prompt that `adapter.invoke` also carries (F2) is never read. The event is added to the allowlist in `doc/run-log-events.md`. One extra append per run is small next to the hundreds a native run already writes; each append locks the run row, which the C1 test measures.
+- **Composition is captured at invoke time** as one extra key, `contextComposition`, on the payload of the **existing** `adapter.invoke` event that `onAdapterMeta` already appends (`heartbeat.ts:23651-23663`). **No new append, no new row lock, no new await.** (An independent review pointed out that this existing call awaits `appendRunEvent`, which takes a `FOR UPDATE` lock on the run row and throws on a binding or database error, `heartbeat-run-events.ts:67-80`; a second row would double that exposure. That behavior is already there, is not changed, and is reported rather than fixed here.) The value comes from a pure `buildContextComposition(...)` wrapped in try/catch that returns `undefined` on any error, so the payload is then byte-identical to today's. It cannot be derived afterwards because the instructions bundle and skill set may change before the worker runs. Parts: `instructions` (bytes of the resolved bundle files, revision id), one `skill_listing` part per skill (`skillKey@versionId`, description tokens, always loaded), and the adapter's existing numeric `promptMetrics` (bootstrap, wake, handoff, task context, heartbeat prompt; flagged as character-based). The worker reads an allowlist of numeric keys from that payload only; the full prompt that `adapter.invoke` also carries (F2) is never read. The key is documented in `doc/run-log-events.md`; there is no new event type.
 - **Fresh versus resumed sessions.** Claude injects the instructions file only on a fresh session (`execute.ts:931`), and later turns read it back from cache. `session_resumed` is stored, so the system-prompt cost view counts the write on fresh sessions and the cheaper read on resumed ones, instead of charging every run the same.
 - Runs from before this ships have no composition event. Their `availability` shows what can still be derived (`spend_only`); nothing is invented.
 
@@ -409,14 +413,43 @@ compaction, `spend_only`, `none`) and a closed-enum `reason`. An unsupported ada
 - *Always-on tokens*: the description in the listing (estimate).
 - *On-demand tokens*: the body plus the reference files that were loaded (estimate over the version's files).
 - *Loads*: `Skill` tool calls counted by the worker from the NDJSON through the adapter parser (the tool name exists in the UI taxonomy; the input key is **UNVERIFIED** until fixtures exist).
-- *Runs exposed* and *share*: always-on tokens divided by the run's reported first-turn context.
+- *Runs exposed* and *share*: `share = min(1, always-on tokens / reported first-turn context)`, shown only when the reported value is above zero. When the estimate exceeds the reported value the share is clamped to 1 and the row is flagged `estimate_exceeds_reported`; the panel shows how many runs were flagged, so an over-estimating counter is visible.
 - *Version-change delta*: estimator over consecutive `company_skill_versions`, plus the read-time before/after comparison of 7.6 (equal windows, minimum sample, overlapping changes listed as confounders). It never claims causality.
 
-**System-prompt impact** (C2), per agent: instruction tokens (estimate, from the revision each run used), the **baseline budget** (instructions, skill listing and fixed wake preamble; mean of recent composition events), its share of reported first-turn context, and a run-cost allocation `run cost × share` labeled `estimated` because it is an allocation, not a measurement. Trend by day.
+**System-prompt impact** (C2), per agent: instruction tokens (estimate, from the revision each run used), the **baseline budget** (instructions, skill listing and fixed wake preamble; mean of recent composition events), its share of reported first-turn context (bounded to 0..1 as above), and **carried tokens per run** = system-prompt tokens × turns, with `shareOfRunInput = min(1, carried / reported run input)` (input = fresh + cache read + cache write). The **cost allocation** is `allocatedCostMicros = round(shareOfRunInput × inputShareOfRunTokens × cost_micros)` with `inputShareOfRunTokens = reportedInput / (reportedInput + output)`. It assumes one price per token across classes, so it is labeled `basis: "allocated"`, never exceeds the run's cost by construction, is omitted when the run's cost status is not measured, and is replaced by an exact figure only if the price catalog (D3) gives per-class prices. Trend by day.
 
-**Audit token deltas** (C4): for the existing actions `agent.instructions_bundle_updated`, `agent.instructions_file_updated`, `agent.instructions_file_deleted`, `agent.instructions_path_updated`, `agent.skills_synced`, `agent.updated` (model or adapter keys), `agent.config_rolled_back` (`routes/agents.ts`) and `company.skill_version_created`, `company.skill_updated`, `company.skill_file_updated` (`routes/company-skills.ts`), return `contextDelta {beforeTokens, afterTokens, delta, basis}` computed **on read** from `agent_instruction_revisions`, `agent_config_revisions` and the skill version rows. A model or adapter change shows the old and new window where known. There is no write-path change in the 20-plus activity writers and no stored delta to go stale. How an activity row maps to its revision (an id in `details`, or agent id plus `created_at`) is read from the writers first in C4 and is its first open item.
+**Audit token deltas** (C4): for the existing actions `agent.instructions_bundle_updated`, `agent.instructions_file_updated`, `agent.instructions_file_deleted`, `agent.instructions_path_updated`, `agent.skills_synced`, `agent.updated` (model or adapter keys), `agent.config_rolled_back` (`routes/agents.ts`) and `company.skill_version_created`, `company.skill_updated`, `company.skill_file_updated` (`routes/company-skills.ts`), return `contextDelta {beforeTokens, afterTokens, delta, basis}` computed **on read** from `agent_instruction_revisions`, `agent_config_revisions` and the skill version rows. A model or adapter change shows the old and new window where known. No stored delta, so nothing goes stale.
 
-**Surfaces and permissions** (parity in section 8). The run context follows the run-read check (same company; the check `GET /heartbeat-runs/:id` uses). The agent budget and skill impact aggregate across runs, so they use the shared guard of 7.8. Every response carries counts, enums and ids only.
+The activity-row-to-revision mapping, checked against the writers (no guessing by time):
+
+| Action | Key linking the row to its change today | C4 |
+|---|---|---|
+| `agent.config_rolled_back` | `details.revisionId` (an `agent_config_revisions` id, `routes/agents.ts:4422`) | none needed |
+| `company.skill_version_created` | `entityId` is the version id (`routes/company-skills.ts:894-896`) | none needed |
+| `agent.instructions_bundle_updated`, `agent.instructions_file_updated`, `agent.instructions_file_deleted`, `agent.instructions_path_updated` | none (`details` hold mode, path, size; `routes/agents.ts:5182-5187`, `:5294-5298`) | add `details.revisionId` at these four call sites; additive JSON key, existing readers ignore it |
+| `agent.updated`, `agent.skills_synced` | none (`summarizeAgentUpdateDetails`; desired-skill lists) | add `details.configRevisionId` at the two call sites |
+| `company.skill_updated`, `company.skill_file_updated` | to be read in C4 | same additive rule |
+
+Rows written before C4 carry no reference, so their activity entry answers
+`contextDelta.unavailable = "no_revision_ref"`. They are never matched by timestamp. The
+change rows of slice 6, which are derived straight from the revision tables, show the delta
+for the whole history regardless. The instruction delta needs no content read:
+`agent_instruction_revisions.byte_length` already holds the byte count, so
+`round(byte_length / 4)` equals the shared estimate (a test pins this against a fixture).
+A test asserts every `revisionId` written by C4 points at a row of the same company and agent.
+
+**Surfaces and permissions** (parity in section 8). Each Track C route reuses, unchanged, the guard of the resource's own `GET`; no new permission is invented:
+
+| Route | Guard it reuses | Agent key |
+|---|---|---|
+| `GET /heartbeat-runs/:runId/context` | `getAccessibleResource` plus `assertRunTelemetryReadAllowed` as in `GET /heartbeat-runs/:runId` (`routes/agents.ts:7025-7029`) | exactly what that route allows |
+| `GET /agents/:agentId/context-budget` | `assertCanReadAgent` (`routes/agents.ts:2146`): board needs config-read; an agent key must be of the same company | same-company only; another company's id answers 404 |
+| `GET /companies/:companyId/skills/:skillId/impact` | the read guard of `GET /companies/:companyId/skills/:skillId` | same as that route |
+| `contextDelta` on activity and `GET /changes` | the existing activity-list guard | same as that route |
+
+A table-driven test sends the same request as board, same-company agent, other-company
+agent and unauthenticated to the base route and to the Track C route and asserts the
+status codes are identical. Every response carries counts, enums and ids only.
 
 **Deliberately not in v1.**
 
@@ -445,12 +478,12 @@ no run-path change**.
 | **4** | **UI:** Usage (tokens, cost, model, skill footprint) and Failures panels in the Audit hub; desktop and mobile browser verification, token-gate check | 2 | L |
 | **5** | **Waste:** failed and interrupted, duplicates, runs on closed issues, unproductive runs; `GET waste` + CLI + panel (stale-head later, needs 3b head shas) | 2 | M |
 | **3c / 5b** | Bottlenecks, Efficiency panels, each in the PR that adds its API | 3a / 3b | M each |
-| **6** | **Changes view + impact on read + Jev export + anomaly flags;** `server_boot_events` and the AGENTS.md exception | 2 (3a/3b for outcome metrics) | L |
+| **6** | **Changes view + impact on read + analysis export + anomaly flags;** `server_boot_events` and the AGENTS.md exception | 2 (3a/3b for outcome metrics) | L |
 | **7 (optional)** | Worker free-bytes sampling at the existing `statfsSync` point and workspace bytes; tokens-per-tool-result approximation | operator go-ahead (D5), #44 | M |
-| **C1** | **Run context (Track C, 7.9):** first step is to capture real fixtures (Appendix B) and settle the UNVERIFIED rows; `run_context_records` (migration), the `context.composition` invoke event, the worker pass, `parseContextSamples` for Claude, ACP/ACPX and runner events, `GET /heartbeat-runs/:runId/context`, `paperclipai run context <runId>`, and the Context section on run detail (timeline chart, compactions, peak against window, composition). All three surfaces in this PR. | 1a, 2 (guard, parity test) | L |
+| **C1** | **Run context (Track C, 7.9):** first step is to capture real fixtures (Appendix B) and settle the UNVERIFIED rows; `run_context_records` (migration), the `contextComposition` key on the existing `adapter.invoke` payload (no new row), the worker pass, `parseContextSamples` for Claude, ACP/ACPX and runner events, `GET /heartbeat-runs/:runId/context`, `paperclipai run context <runId>`, and the Context section on run detail (timeline chart, compactions, peak against window, composition). All three surfaces in this PR. | 1a, 2 (guard, parity test) | L |
 | **C2** | **Agent context budget:** `GET /agents/:agentId/context-budget`, `paperclipai agent context-budget <agentId>`, an AgentDetail card (baseline budget, share of first-turn context, cost allocation, estimator calibration, trend). | C1 | M |
-| **C3** | **Skill impact:** `GET /companies/:companyId/skills/:skillId/impact`, `paperclipai skill impact <skillId>`, a skill-page panel (always-on, on-demand, loads, version-change delta). | C1, lean-skills #51 (`estimateTokens` export) | M |
-| **C4** | **Audit token deltas:** `contextDelta` on activity entries and on `GET /changes` rows for instruction, skill-version, skill-sync and model or adapter changes; Audit hub badge; the CLI prints it. The before/after impact join stays in 6. | C2, C3 (shared estimator helper) | M |
+| **C3** | **Skill impact:** `GET /companies/:companyId/skills/:skillId/impact`, `paperclipai skill impact <skillId>`, a skill-page panel (always-on, on-demand, loads, version-change delta). | C1, the shared token estimate (D12) | M |
+| **C4** | **Audit token deltas:** `contextDelta` on activity entries and on `GET /changes` rows for instruction, skill-version, skill-sync and model or adapter changes, with the deterministic row-to-revision mapping of 7.9 (adds `revisionId` to the `details` of six writers; additive); Audit hub badge; the CLI prints it. The before/after impact join stays in 6. | C2, C3 (shared estimator helper) | M |
 | **C5 (linked follow-up)** | Codex per-turn context fill (last-turn usage and window in the runner's usage event, schema and validators); Claude `/context` probe if D10 is accepted. | C1, D10, D11 | M |
 
 Parity contract per panel (API is the source; CLI and UI are thin):
@@ -465,7 +498,7 @@ Parity contract per panel (API is the source; CLI and UI are thin):
 | Efficiency trend | `GET /efficiency` | `efficiency` | 3a |
 | Bottlenecks (queue, lock, status time, CI, review) | `GET /bottlenecks` | `bottlenecks` | 3b |
 | Changes and impact | `GET /changes`, `GET /changes/:id/impact` | `changes`, `impact` | 6 |
-| Jev export | `GET /export` | `export` | 6 |
+| Analysis export | `GET /export` | `export` | 6 |
 | Run context (timeline, compactions, composition); UI: run detail, Context section | `GET /heartbeat-runs/:runId/context` | `run context <runId>`, next to `run events` and `run log` (`cli/src/commands/client/run.ts`) | C1 |
 | Agent context budget; UI: AgentDetail card | `GET /agents/:agentId/context-budget` | `agent context-budget <agentId>` | C2 |
 | Skill impact; UI: skill page panel | `GET /companies/:companyId/skills/:skillId/impact` | `skill impact <skillId>` | C3 |
@@ -488,11 +521,11 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 | **Session-warehouse track** (`feat/session-warehouse`, agreed 2026-10-09 with amendments) | Per-company opt-in archive of finished runs to the company's own S3-compatible bucket, plus `GET /companies/:id/archive/export` and `paperclipai archive export` | **Boundary: I measure, they archive and export.** I create no bucket writes and export no raw content; they create no `run_usage_records`, `server_boot_events`, `outcome_events`, cause taxonomy or `/observability/*` route. **Prune guard** (replaces "record exists"): they may delete `heartbeat_run_events` rows and run-log files (and their S3 mirror) only for runs that finished at least their minimum age ago (default off, at least 30 days), whose archive upload is verified, AND that have a `run_usage_records` row with `schema_version >= RUN_USAGE_RECORD_EVENTS_CONSUMED_VERSION` (a constant exported from `packages/shared`; 1a defines it as the first version, 1b and 1d raise it when they start reading events). They never prune `heartbeat_runs`, `cost_events`, `activity_log` or revision tables: the worker, `--rederive` and the issue-lifecycle reader read them. Before a company enables pruning, run my backfill first, or its event-derived fields are lost for good. **Formats:** NDJSON, `kind` closed set plus integer `v` on every line, raw UUIDs, ISO-8601 UTC, opaque base64url cursor over `{v, t, id}` keyset `(finished_at, run_id)` ascending with a trailing `{"kind":"cursor","next":...}` line. Their cursor is adopted. Two amendments: the keyset time is `coalesce(finished_at, created_at)` (immutable, non-null), and only runs finished more than 10 minutes ago are exported (the same settle delay as my worker), because `finished_at` is assigned in the app and a slower commit could land behind a cursor that already passed it; consumers dedupe on `(kind, id)`. **Archiving my data:** one entity file `usage_records.ndjson` with `kind: "observability.usage_record"` and `v = schema_version`, read through my service (`listUsageRecordsAfter({companyId, cursor, limit})`, shipped in 1a), never re-derived. Records are replaced when `schema_version` rises, so archive objects are keyed by `(run_id, schema_version)` and are not immutable. My export stays separate (aggregates, flags, change list; ids, numbers and enums only) and uses a different route and permission from their raw-content export. |
 | **PR #42** Convex plugin | Convex deployments and quota | Outcome events from it after merge. |
 | **Lean-default-skills session** | skill footprint | They cut it, this measures it. Their PR 1 carries release `v8-lean` and a skill-quality check; they send me the PR number, and the change appears in the changes view keyed on `skillKey@versionId`. Their files (`skills-releases/paperclip/`, `evals/promptfoo/`, `packages/skills-catalog/src/`, `doc/plans/2026-10-09-lean-default-skills.md`) do not overlap mine. I do not edit `skills/paperclip/SKILL.md` (line anchors, see `capability-contract`). |
-| **Jev session** | judgement on top of this data | Export contract in 7.6; ids, numbers and enums only. I could not map the Jev session id to a live session, so no message was sent. |
+| **Decisions-engine track** | judgement on top of this data | Export contract in 7.6; ids, numbers and enums only. |
 | **Migrations** | `0296` is claimed twice (#40 `0296_clear_lord_tyger`, #31 `0296_tricky_unicorn`) | Mine take the next free number at rebase and are regenerated then; the SQL is additive and uses `IF NOT EXISTS`, so reordering is safe. |
 | **Adding MCP tools** | fails the production image check (capability contract needs the external corpus) | No MCP tools; agents use the REST API and CLI. |
-| **Lean-default-skills, PR #51 (Track C)** | the token counter: `estimateTokens` (bytes / 4) in `skill-quality-text.ts`, not exported from `packages/skills-catalog/src/index.ts`; `checkSkillQuality` is exported | Ask them for a one-line index export of `estimateTokens`. Until it lands, C3 waits; if they decline, C3 adds that one export after #51 merges. No second counter, no copy. I edit none of their files before then. |
-| **Session-warehouse track (Track C)** | the prune guard in the row above | Track C also consumes run events and NDJSON (`context.composition`, per-turn usage, `context.compacted`). Add a second constant `RUN_CONTEXT_RECORD_EVENTS_CONSUMED_VERSION` (exported with the first); a run finished after C1 ships may be pruned only when its `run_context_records` row is at that version, or when it has no composition event. After pruning, the timeline answers `log_pruned` by design. `run_context_records` can join the archive as a second entity file (`kind: "observability.context_record"`) through `listContextRecordsAfter`, shipped in C1; their choice. |
+| **Lean-default-skills, PR #51 (Track C)** | the token counter: `estimateTokens` (UTF-8 bytes / 4, rounded) lives in `packages/skills-catalog/src/skill-quality-text.ts` and is now exported from that package's index on #51 (head `ea7067aed`, **draft**, held behind #27, #29 and #58 and an eval-credit block, so no merge date) | One counter, one owner, available on `main` now: see decision D12. They confirmed the semantics will not change silently; a real tokenizer would be a new function or the `countTokens` option. I edit none of their files. |
+| **Session-warehouse track (Track C)** | the prune guard in the row above | Track C also consumes run events and NDJSON (the `adapter.invoke` composition key, per-turn usage, `context.compacted`). Add a second constant `RUN_CONTEXT_RECORD_EVENTS_CONSUMED_VERSION` (exported with the first). A run finished after C1 ships may be pruned only when its `run_context_records` row exists at that version; **there is no exception for runs without a composition event**, because those can still hold per-turn usage. The worker writes a record for every terminal run (availability `none` when nothing is derivable), and `--backfill` creates records for older runs from their logs, so an operator runs it before enabling pruning. After pruning, the per-turn **timeline** answers `log_pruned` by design while the per-run summary (peak, compactions, composition) survives; the timeline can be rebuilt from the archived NDJSON in the company's own bucket. `run_context_records` can join the archive as a second entity file (`kind: "observability.context_record"`) through `listContextRecordsAfter`, shipped in C1; their choice. |
 | **Runner protocol (`packages/paperclip-runner`)** | the normalized usage event lacks last-turn usage and window | Only C5 touches it, with the schema, validators and Rust side together. Not in C1-C4. |
 
 ## 10. Verification per slice
@@ -506,7 +539,7 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 - **Scale:** `EXPLAIN (ANALYZE)` on each panel query against a synthetic 5M-row record table in a throwaway embedded database.
 - **Track C:**
   - Per-adapter `parseContextSamples` from captured real fixtures: dedupe by `message.id`, compaction rows, window, and the `availability` degrade path when per-message usage is absent.
-  - `context.composition` is bounded, numeric, fail-open and passes the canary (a prompt-only string never reaches the event or either table). A measurement of the extra append's lock cost on a native-sized run.
+  - `contextComposition` is bounded, numeric, fail-open and passes the canary (a prompt-only string never reaches the payload key or either table). With `buildContextComposition` forced to throw, the `adapter.invoke` payload equals today's byte for byte, and the number of appends per run is unchanged (asserted).
   - The worker pass writes `run_context_records` idempotently; version replace and `--rederive` behave as for the usage record.
   - Estimator identity: the server imports the skills-catalog function and a test asserts one implementation (no `/ 4` byte counter elsewhere).
   - Each of the four Track C routes: two-company isolation, agent-within-permission read, and CLI mocked-fetch tests for URL and flags.
@@ -529,6 +562,7 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 | D9 | Token counter for Track C: keep the shared bytes / 4 estimate (flagged `estimated`, with a calibration metric against provider-reported tokens), or add a real tokenizer dependency? | Keep the estimate. No new dependency, and the calibration metric shows its error from real data. Revisit only if calibration is poor. |
 | D10 | Claude exact `/context` probe (per-category and per-skill tokens from the provider): add an opt-in, sampled probe per agent? | Defer. It adds a step to sampled runs and exists only on request; ship the estimate and calibration first (C5 if wanted). |
 | D11 | Codex per-turn context fill needs last-turn usage and window in the runner's usage event (a protocol change across Rust and TypeScript). | Separate follow-up (C5) after C1 shows the gap on real data; do not widen C1. |
+| D12 | Where does the single token estimate live? Today only in `skills-catalog`, on lean-skills draft PR #51, which has no merge date. C1, C2 and C4 need it on `main`. | Put `estimateTokens` (same behavior, same test) in `packages/shared` in its own small first PR; `skills-catalog` already depends on `@paperclipai/shared`, so #51 replaces its body with an import on rebase. One counter, owned by the package everyone already depends on, no wait on a draft. If lean-skills prefers, the alternative is to stack C-track PRs on #51 and wait for it. Needs agreement with lean-skills, not the user. |
 | F1 | Follow-up (not in this feature): retention for `heartbeat_run_events` and NDJSON logs, which grow without bound | **Handed to the session-warehouse track** as an opt-in "prune after verified archive" step, with the guard in section 9. Not pruning on the strength of "a record exists": 1b and 1d read `adapter.invoke`, `usage.reported` and `run.performance.span` events, so only a record at the event-consuming schema version makes them safe to delete. |
 | F2 | Follow-up: `adapter.invoke` persists prompt and context in the run log | Separate privacy issue; this feature does not depend on it. |
 
