@@ -7,6 +7,7 @@ import {
   hasBlockingShortcutDialog,
   isKeyboardShortcutTextInputTarget,
   resolveAttentionQueueKeyAction,
+  resolveGoChordKeyAction,
   resolveIssueDetailGoKeyAction,
   resolveInboxQuickArchiveKeyAction,
   resolveInboxUndoArchiveKeyAction,
@@ -317,5 +318,60 @@ describe("keyboardShortcuts helpers", () => {
       target: input,
       hasOpenDialog: false,
     })).toBe("disarm");
+  });
+});
+
+describe("resolveGoChordKeyAction", () => {
+  const chords = new Map([["d", "nav.dashboard"]]);
+  const base = {
+    armed: false,
+    chords,
+    defaultPrevented: false,
+    key: "g",
+    metaKey: false,
+    ctrlKey: false,
+    altKey: false,
+    target: null,
+    hasOpenDialog: false,
+  };
+
+  it("arms on g and runs the mapped action on the next key", () => {
+    expect(resolveGoChordKeyAction(base)).toEqual({ type: "arm" });
+    expect(resolveGoChordKeyAction({ ...base, armed: true, key: "D" })).toEqual({ type: "run", actionId: "nav.dashboard" });
+    expect(resolveGoChordKeyAction({ ...base, armed: true, key: "x" })).toEqual({ type: "disarm" });
+  });
+
+  it("ignores typing in text fields and keys over a modal dialog", () => {
+    const input = document.createElement("input");
+    expect(resolveGoChordKeyAction({ ...base, target: input })).toEqual({ type: "ignore" });
+    expect(resolveGoChordKeyAction({ ...base, armed: true, key: "d", target: input })).toEqual({ type: "disarm" });
+    expect(resolveGoChordKeyAction({ ...base, hasOpenDialog: true })).toEqual({ type: "ignore" });
+  });
+
+  it("ignores modified keys and disarms on keys another handler claimed", () => {
+    expect(resolveGoChordKeyAction({ ...base, metaKey: true })).toEqual({ type: "ignore" });
+    expect(resolveGoChordKeyAction({ ...base, armed: true, key: "d", defaultPrevented: true })).toEqual({ type: "disarm" });
+  });
+});
+
+describe("hasBlockingShortcutDialog", () => {
+  function mount(attributes: Record<string, string>) {
+    const root = document.createElement("div");
+    const element = document.createElement("div");
+    for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, value);
+    root.appendChild(element);
+    return root;
+  }
+
+  it("detects open Radix modal contents, which carry no aria-modal", () => {
+    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "dialog-content", "data-state": "open" }))).toBe(true);
+    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "sheet-content", "data-state": "open" }))).toBe(true);
+    expect(hasBlockingShortcutDialog(mount({ role: "alertdialog", "data-slot": "alert-dialog-content", "data-state": "open" }))).toBe(true);
+    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "aria-modal": "true" }))).toBe(true);
+  });
+
+  it("ignores closing dialogs and non-modal popovers", () => {
+    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "dialog-content", "data-state": "closed" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "popover-content", "data-state": "open" }))).toBe(false);
   });
 });
