@@ -79,6 +79,12 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
     selfHostedPath: fileURLToPath(new URL("../../../packages/plugins/plugin-github", import.meta.url)),
   },
   {
+    key: "convex",
+    pluginKey: "vllnt.paperclip-convex",
+    relativePath: "plugin-convex",
+    selfHostedPath: fileURLToPath(new URL("../../../packages/plugins/plugin-convex", import.meta.url)),
+  },
+  {
     key: "createos",
     pluginKey: "paperclip.createos-sandbox-provider",
     relativePath: "sandbox-providers/createos",
@@ -123,10 +129,12 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
 
 /**
  * Keys ensured on a self-hosted instance (no managed config present).
- * The fork includes Providers and GitHub alongside the kubernetes sandbox
- * provider. Each is installed only when its built bundle is present.
+ * The fork includes Providers, GitHub and Convex alongside the kubernetes
+ * sandbox provider. Each is installed only when its built bundle is present.
+ * Convex does nothing for a company until an instance administrator configures
+ * and connects it.
  */
-export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes", "providers", "github"];
+export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes", "providers", "github", "convex"];
 
 export function resolveBundledCatalogRoot(
   env: Record<string, string | undefined>,

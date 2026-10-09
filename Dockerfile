@@ -48,6 +48,7 @@ COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-w
 COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
 COPY packages/plugins/plugin-providers/package.json packages/plugins/plugin-providers/
 COPY packages/plugins/plugin-github/package.json packages/plugins/plugin-github/
+COPY packages/plugins/plugin-convex/package.json packages/plugins/plugin-convex/
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
@@ -142,12 +143,13 @@ RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
+RUN pnpm --filter @vllnt/paperclip-convex build
 # Build the remaining bundled local plugins here. The production root filesystem
 # is read-only and cannot run the server's install-time auto-build, so a bundled
 # plugin without its dist entrypoints cannot be installed from the UI.
 RUN pnpm --filter @paperclipai/plugin-llm-wiki build \
   && pnpm --filter @paperclipai/plugin-workspace-diff build \
-  && for plugin in plugin-llm-wiki plugin-workspace-diff plugin-providers plugin-github; do \
+  && for plugin in plugin-llm-wiki plugin-workspace-diff plugin-providers plugin-github plugin-convex; do \
        test -f "packages/plugins/$plugin/dist/manifest.js" \
          || { echo "ERROR: bundled plugin $plugin has no dist/manifest.js" >&2; exit 1; }; \
      done

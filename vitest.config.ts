@@ -20,6 +20,7 @@ export default defineConfig({
       "packages/plugins/sdk",
       "packages/plugins/plugin-providers",
       "packages/plugins/plugin-github",
+      "packages/plugins/plugin-convex",
       "packages/plugins/create-paperclip-plugin",
       "packages/plugins/sandbox-providers/daytona",
       "server",
