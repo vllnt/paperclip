@@ -205,15 +205,10 @@ function sameWorkflowFiles(a, b) {
 // refs of this checkout say, and those refs are the agent's to write. Once the refs GitHub lists have been read (see
 // remoteRefs), they replace them: known is { tips, heads }, or 'unknown' when they could not be read, and then nothing
 // is reported as free of workflow changes.
-function pushReport(env, globalArgs, pushArgs, known) {
-  const { positional, repoOption, deleting } = gitNetworkArgs('push', pushArgs);
-  const branch = gitOutput(env, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
-  const current = branch ? branch.trim() : '';
-  let unknown = false;
-  const config = (key, type) => { const value = gitConfigValue(env, globalArgs, key, type); if (value === null) unknown = true; return value || ''; };
-  // Booleans as git reads them (yes, on, 1 and true are all true); an invalid one is unknown, so it counts as set.
-  const followTags = config('push.followTags', 'bool') === 'true';
-  // The remote git pushes to: the argument, --repo, then branch and repository config.
+// The remote a push goes to, as git reads the configuration: the argument, --repo, then branch and repository config.
+// target is a remote name, a URL or a path; configured lists the URLs behind a configured remote name (git looks names
+// up first); allUrls is where it goes.
+function pushTarget(env, globalArgs, positional, repoOption, current, config) {
   const target = positional[0] || repoOption
     || (current && config('branch.' + current + '.pushRemote'))
     || config('remote.pushDefault')
@@ -223,6 +218,17 @@ function pushReport(env, globalArgs, pushArgs, known) {
   const configured = !target.includes(':') && REMOTE_NAME.test(target)
     ? (gitOutput(env, globalArgs, ['remote', 'get-url', '--push', '--all', target]) || '').split('\n').map(url => url.trim()).filter(Boolean) : [];
   const allUrls = configured.length ? configured : /[:/]/.test(target) ? [target.slice(0, 1000)] : [];
+  return { target, configured, allUrls };
+}
+function pushReport(env, globalArgs, pushArgs, known) {
+  const { positional, repoOption, deleting } = gitNetworkArgs('push', pushArgs);
+  const branch = gitOutput(env, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  const current = branch ? branch.trim() : '';
+  let unknown = false;
+  const config = (key, type) => { const value = gitConfigValue(env, globalArgs, key, type); if (value === null) unknown = true; return value || ''; };
+  // Booleans as git reads them (yes, on, 1 and true are all true); an invalid one is unknown, so it counts as set.
+  const followTags = config('push.followTags', 'bool') === 'true';
+  const { target, configured, allUrls } = pushTarget(env, globalArgs, positional, repoOption, current, config);
   const pushUrls = allUrls.slice(0, 16);
   // Without refspecs, repository config can make git push more than the current branch.
   const pushDefault = config('push.default');
@@ -330,6 +336,158 @@ function remoteRefs(env, globalArgs, url) {
     const tips = present.stdout.split('\n').map(line => line.split(' ')).filter(parts => parts[1] === 'commit' || parts[1] === 'tag').map(parts => parts[0]);
     return { tips, heads, defaultTip };
   } catch { return null; }
+}
+// A push that runs with a credential goes to one URL and sends one list of refs, both fixed before it starts, and it
+// runs in a git directory of its own: config that this launcher writes (that URL, no push settings, no hooks), a copy of
+// the refs it names, and the checkout's objects as an alternate. What the checkout's config, hooks, remote names,
+// refspecs and environment say after the check cannot reach it. A push that cannot be reduced to that is refused.
+const PUSH_SHORT = { f: '--force', n: '--dry-run', q: '--quiet', v: '--verbose', u: '--set-upstream', d: '--delete', 4: '--ipv4', 6: '--ipv6' };
+const PUSH_LONG = ['--force', '--dry-run', '--quiet', '--verbose', '--progress', '--no-progress', '--porcelain', '--atomic', '--no-atomic', '--thin', '--no-thin',
+  '--force-if-includes', '--no-force-if-includes', '--delete', '--set-upstream', '--ipv4', '--ipv6', '--no-force-with-lease'];
+// The sealed push does these itself, whatever was asked.
+const PUSH_FORCED = ['--no-verify', '--verify', '--no-follow-tags', '--no-recurse-submodules'];
+// The options a sealed push forwards, and its arguments; a problem names what cannot be reduced (--all, --mirror, --tags,
+// --follow-tags, --prune, --signed, --receive-pack and any option not listed).
+function sealedOptions(pushArgs) {
+  const flags = [], rest = [];
+  let upstream = false;
+  const missing = { problem: 'an option is missing its value' };
+  for (let at = 0; at < pushArgs.length; at++) {
+    const arg = pushArgs[at];
+    if (arg === '--') { rest.push(...pushArgs.slice(at + 1)); break; }
+    if (!arg.startsWith('-') || arg === '-') { rest.push(arg); continue; }
+    if (arg.startsWith('--')) {
+      const equals = arg.indexOf('=');
+      const name = equals < 0 ? arg : arg.slice(0, equals), attached = equals < 0 ? undefined : arg.slice(equals + 1);
+      if (PUSH_FORCED.includes(name) && attached === undefined) continue;
+      if (name === '--recurse-submodules' && attached === 'no') continue;
+      // The destination is bound by the sealed push, not by the option.
+      if (name === '--repo') { if (attached === undefined) at++; continue; }
+      if (name === '--push-option') {
+        const value = attached === undefined ? pushArgs[++at] : attached;
+        if (value === undefined) return missing;
+        flags.push('--push-option=' + value);
+        continue;
+      }
+      if (name === '--force-with-lease' || (PUSH_LONG.includes(name) && attached === undefined)) {
+        flags.push(arg);
+        if (name === '--set-upstream') upstream = true;
+        continue;
+      }
+      return { problem: 'the option ' + name.slice(0, 40) + ' sends refs that cannot be listed' };
+    }
+    for (let i = 1; i < arg.length; i++) {
+      if (arg[i] === 'o') {
+        const value = i + 1 < arg.length ? arg.slice(i + 1) : pushArgs[++at];
+        if (value === undefined) return missing;
+        flags.push('--push-option=' + value);
+        break;
+      }
+      if (!PUSH_SHORT[arg[i]]) return { problem: 'the option -' + arg[i] + ' sends refs that cannot be listed' };
+      flags.push(PUSH_SHORT[arg[i]]);
+      if (arg[i] === 'u') upstream = true;
+    }
+  }
+  return { flags, rest, upstream };
+}
+// A sealed push's whole environment: nothing of the checkout's own steering (GIT_DIR, GIT_EXEC_PATH, GIT_TRACE*, GIT_SSH,
+// object and index paths…) is carried over, only what a credentialed command needs.
+const SEALED_ENV = /^(LANG|LC_[A-Z_]+|TMPDIR|TMP|TEMP|SYSTEMROOT|COMSPEC|GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GH_HOST|GH_CONFIG_DIR|GIT_TERMINAL_PROMPT|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|GIT_SSH_COMMAND|SSH_AUTH_SOCK)$/;
+function sealedEnv(env, home, gitDir) {
+  const sealed = {};
+  for (const [key, value] of Object.entries(env)) if (SEALED_ENV.test(key) && typeof value === 'string') sealed[key] = value;
+  return { ...sealed, PATH: originalPath.join(path.delimiter), HOME: home, GIT_DIR: gitDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1' };
+}
+const MAX_SEALED_REFS = 20000;
+// The command, environment and private git directory of the sealed push, or { problem }. authorized is the report that the
+// broker answered with a credential: the sealed push must send exactly what it described, to the one URL it listed.
+function sealedPush(env, globalArgs, pushArgs, authorized, scratch) {
+  const options = sealedOptions(pushArgs);
+  if (options.problem) return { problem: options.problem };
+  const git = gitBinary();
+  if (!git || !scratch) return { problem: 'its private git directory cannot be made' };
+  const { positional, repoOption } = gitNetworkArgs('push', pushArgs);
+  if (JSON.stringify(positional) !== JSON.stringify(options.rest)) return { problem: 'its arguments cannot be read the way git reads them' };
+  const branch = gitOutput(env, globalArgs, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  const where = pushTarget(env, globalArgs, positional, repoOption, branch ? branch.trim() : '', (key, type) => gitConfigValue(env, globalArgs, key, type) || '');
+  const url = where.allUrls.length === 1 ? where.allUrls[0] : '';
+  const reported = authorized.pushUrls || [];
+  if (!url || /[\x00-\x1f]/.test(url) || reported.length !== 1 || reported[0] !== url) return { problem: 'it does not go to exactly one destination that the broker was told' };
+  // Repository config (push.default, a remote's push refspecs or mirror) decides which refs a push without refspecs sends.
+  if (authorized.implicitPush) return { problem: 'repository configuration decides which refs it sends' };
+  const name = where.configured.length ? where.target : null;
+  // Without refspecs git pushes the current branch (the broker was told so: it saw HEAD), and a deletion names its refs.
+  const specs = positional.length > 1 || options.flags.includes('--delete') ? positional.slice(1) : ['HEAD'];
+  const { spawnSync } = require('node:child_process');
+  try {
+    const root = fs.mkdtempSync(path.join(scratch, 'push-'));
+    const gitDir = path.join(root, 'git'), hooks = path.join(root, 'hooks');
+    fs.mkdirSync(hooks);
+    const sealed = sealedEnv(env, root, gitDir);
+    const run = args => spawnSync(git, args, { env: sealed, encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'ignore', 'ignore'] }).status === 0;
+    const format = (gitOutput(env, globalArgs, ['rev-parse', '--show-object-format']) || 'sha1').trim();
+    if (!/^sha(1|256)$/.test(format) || !run(['init', '-q', '--bare', '--template=', '--object-format=' + format])) return { problem: 'its private git directory cannot be made' };
+    const config = path.join(gitDir, 'config');
+    const set = (key, value) => run(['config', '--file', config, key, value]);
+    if (!set('core.hooksPath', hooks)) return { problem: 'its private git directory cannot be made' };
+    if (name && !(set('remote.' + name + '.url', url) && set('remote.' + name + '.fetch', '+refs/heads/*:refs/remotes/' + name + '/*'))) return { problem: 'its private git directory cannot be made' };
+    // The checkout's objects, and its shallow boundary (what a push of a shallow checkout leaves out).
+    const place = what => (gitOutput(env, globalArgs, ['rev-parse', '--path-format=absolute', '--git-path', what]) || '').trim();
+    const objects = place('objects');
+    if (!objects) return { problem: 'the objects of this checkout cannot be located' };
+    const more = (env.GIT_ALTERNATE_OBJECT_DIRECTORIES || '').split(path.delimiter).filter(Boolean).map(dir => path.resolve(dir));
+    fs.mkdirSync(path.join(gitDir, 'objects', 'info'), { recursive: true });
+    fs.writeFileSync(path.join(gitDir, 'objects', 'info', 'alternates'), [objects, ...more].join('\n') + '\n');
+    const shallow = place('shallow');
+    if (shallow && fs.existsSync(shallow)) fs.copyFileSync(shallow, path.join(gitDir, 'shallow'));
+    // The refs the push can name, as they are now: HEAD, branches, tags and the destination's remote-tracking refs.
+    const listed = gitOutput(env, globalArgs, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads', 'refs/tags', ...(name ? ['refs/remotes/' + name] : [])]);
+    if (listed === null) return { problem: 'the refs of this checkout cannot be read in full' };
+    const lines = listed.split('\n').filter(Boolean);
+    if (lines.length > MAX_SEALED_REFS) return { problem: 'this checkout has too many refs to copy' };
+    const tracking = new Map();
+    for (const line of lines) {
+      const match = /^([0-9a-f]{40,64}) (refs\/(?:heads|tags|remotes)\/\S+)$/.exec(line);
+      if (!match || match[2].split('/').some(part => part === '' || part === '.' || part === '..')) return { problem: 'a ref of this checkout cannot be copied' };
+      fs.mkdirSync(path.dirname(path.join(gitDir, match[2])), { recursive: true });
+      fs.writeFileSync(path.join(gitDir, match[2]), match[1] + '\n');
+      if (name && match[2].startsWith('refs/remotes/')) tracking.set(match[2], match[1]);
+    }
+    const head = gitOutput(env, globalArgs, ['symbolic-ref', '-q', 'HEAD']);
+    const detached = (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', 'HEAD']) || '').trim();
+    if (!head && !detached) return { problem: 'HEAD of this checkout cannot be read' };
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), (head ? 'ref: ' + head.trim() : detached) + '\n');
+    // The push as the private directory will run it must be the push the broker was told about: same commits, refs and branch.
+    const target = name || url;
+    const view = pushReport(sealed, [], [...options.flags, '--', target, ...specs], 'unknown');
+    const same = ['shas', 'refs', 'currentBranch'].every(key => JSON.stringify(view[key] === undefined ? null : view[key]) === JSON.stringify(authorized[key] === undefined ? null : authorized[key]));
+    if (!same || JSON.stringify(view.pushUrls) !== JSON.stringify([url])) return { problem: 'the refs it names are not the ones that the broker was told' };
+    return {
+      args: ['-c', 'core.hooksPath=' + hooks, '-c', 'push.followTags=false', '-c', 'push.recurseSubmodules=no', '-c', 'protocol.ext.allow=never',
+        'push', ...options.flags, '--no-verify', '--no-follow-tags', '--no-recurse-submodules', '--', target, ...specs],
+      env: sealed, gitDir, name, tracking, upstream: options.upstream,
+    };
+  } catch { return { problem: 'its private git directory cannot be made' }; }
+}
+// What git does for a push to a configured remote, done in the checkout after the sealed push: the remote-tracking refs
+// the push moved, and the upstream that -u records.
+function sealedSync(env, globalArgs, plan) {
+  try {
+    if (plan.name) {
+      const out = gitOutput(plan.env, [], ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/' + plan.name + '/']) || '';
+      const now = new Map();
+      for (const line of out.split('\n')) { const at = line.lastIndexOf(' '); if (at > 0) now.set(line.slice(0, at), line.slice(at + 1)); }
+      let commands = '';
+      for (const [ref, sha] of now) if (plan.tracking.get(ref) !== sha) commands += 'update ' + ref + ' ' + sha + '\n';
+      for (const ref of plan.tracking.keys()) if (!now.has(ref)) commands += 'delete ' + ref + '\n';
+      if (commands) gitRun(env, globalArgs, ['update-ref', '--stdin'], commands);
+    }
+    if (plan.upstream) {
+      const recorded = gitOutput(plan.env, [], ['config', '--file', path.join(plan.gitDir, 'config'), '--get-regexp', '^branch\\..*\\.(remote|merge)$']) || '';
+      for (const line of recorded.split('\n')) { const at = line.indexOf(' '); if (at > 0) gitRun(env, globalArgs, ['config', line.slice(0, at), line.slice(at + 1)]); }
+    }
+  } catch {}
 }
 // known: the refs GitHub lists for a push's destination, once read (see pushReport).
 function operation(env, known) {
@@ -573,7 +731,7 @@ async function main() {
     for (const key of Object.keys(env)) {
       // CODESPACES makes gh send GITHUB_TOKEN to non-github.com hosts. A bare GIT_CONFIG redirects
       // git config (what the report reads) but not git push, so every GIT_CONFIG* goes.
-      if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*|GH_HOST|CODESPACES)$/.test(key)) delete env[key];
+      if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*|GH_HOST|CODESPACES|GIT_EXEC_PATH)$/.test(key)) delete env[key];
     }
     Object.assign(env, {
       // gh talks only to github.com, whatever the run set: GitHub credentials are for github.com alone.
@@ -590,8 +748,9 @@ async function main() {
       GIT_CONFIG_KEY_3: 'core.askPass', GIT_CONFIG_VALUE_3: '',
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
       // What a command reports of the history (its commits, their parents and files) is read from the real objects: the
-      // replace refs of a checkout are the agent's to write, and would show other history than the push sends.
-      GIT_NO_REPLACE_OBJECTS: '1',
+      // replace refs and the grafts of a checkout are the agent's to write, and would show other history than the push
+      // sends. (core.graftFile does not turn grafts off; this variable does.)
+      GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
     });
     const takeCredentials = result => {
       for (const [key, value] of Object.entries(result.env || {})) {
@@ -688,15 +847,14 @@ async function main() {
   // A network command goes where, and sends what, the broker was told. The checkout can change meanwhile (another process,
   // or a config change made while the broker answered), so its remote, refs and commits are read again right before it
   // runs, and it does not run with the credential if they changed.
-  if (credentialed && program === 'git' && authorized) {
-    let at = 0;
-    while (at < argv.length && argv[at].startsWith('-')) at += GIT_GLOBAL_WITH_VALUE.includes(argv[at]) ? 2 : 1;
-    if (['push', 'fetch', 'pull', 'ls-remote'].includes(argv[at])) {
-      const now = operation(env, 'unknown');
-      if (!['remote', 'pushUrls', 'shas', 'refs', 'currentBranch'].every(key => JSON.stringify(now[key] === undefined ? null : now[key]) === JSON.stringify(authorized[key] === undefined ? null : authorized[key]))) {
-        process.stderr.write('Paperclip: the remote or the commits of this command changed while Paperclip checked it, so it does not run with a GitHub credential. Run it again.\n');
-        process.exit(1);
-      }
+  let gitAt = 0;
+  if (program === 'git') while (gitAt < argv.length && argv[gitAt].startsWith('-')) gitAt += GIT_GLOBAL_WITH_VALUE.includes(argv[gitAt]) ? 2 : 1;
+  const gitSubcommand = program === 'git' ? argv[gitAt] : undefined;
+  if (credentialed && authorized && ['push', 'fetch', 'pull', 'ls-remote'].includes(gitSubcommand)) {
+    const now = operation(env, 'unknown');
+    if (!['remote', 'pushUrls', 'shas', 'refs', 'currentBranch'].every(key => JSON.stringify(now[key] === undefined ? null : now[key]) === JSON.stringify(authorized[key] === undefined ? null : authorized[key]))) {
+      process.stderr.write('Paperclip: the remote or the commits of this command changed while Paperclip checked it, so it does not run with a GitHub credential. Run it again.\n');
+      process.exit(1);
     }
   }
   // Only this invocation and its children inherit the captured credential.
@@ -709,19 +867,30 @@ async function main() {
   env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
   const scratch = configReady ? configDirectory : null;
   const args = attribution ? attributedArgs(argv, attribution, scratch) : argv;
+  // A push that holds a credential runs sealed (see sealedPush): one URL, one list of refs, a git directory of its own, no
+  // hooks, and an environment that carries nothing of the checkout's steering.
+  let sealedPlan = null;
+  if (credentialed && authorized && gitSubcommand === 'push') {
+    sealedPlan = sealedPush(env, argv.slice(0, gitAt), argv.slice(gitAt + 1), authorized, scratch);
+    if (sealedPlan.problem) {
+      process.stderr.write('Paperclip: this push cannot run with a GitHub credential, because ' + sealedPlan.problem + '. Push one branch to one remote (git push <remote> <branch>) without other options.\n');
+      process.exit(1);
+    }
+  }
   let child = null;
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child && child.kill(signal));
-  const run = (args, captureStderr) => new Promise(resolve => {
+  const run = (args, captureStderr, childEnv = env) => new Promise(resolve => {
     let stderr = '', settled = false;
     const settle = (code) => { if (!settled) { settled = true; resolve({ code, stderr }); } };
-    child = spawn(executable, args, { env, stdio: ['inherit', 'inherit', captureStderr ? 'pipe' : 'inherit'] });
+    child = spawn(executable, args, { env: childEnv, stdio: ['inherit', 'inherit', captureStderr ? 'pipe' : 'inherit'] });
     if (captureStderr) child.stderr.on('data', chunk => { stderr += chunk; process.stderr.write(chunk); });
     child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); settle(1); });
     // A captured stderr is complete only once the pipe closes.
     child.once(captureStderr ? 'close' : 'exit', (code) => settle(code === null ? 128 : code));
   });
   const reviewing = program === 'gh' && args[0] === 'pr' && args[1] === 'review' && args.some(arg => SELF_REVIEW_VERDICTS[arg]);
-  let result = await run(args, reviewing);
+  let result = sealedPlan ? await run(sealedPlan.args, false, sealedPlan.env) : await run(args, reviewing);
+  if (sealedPlan) sealedSync(env, argv.slice(0, gitAt), sealedPlan);
   if (reviewing && result.code !== 0 && /own pull request/i.test(result.stderr)) {
     const fallback = selfReviewFallbackArgs(args, scratch);
     if (fallback) {

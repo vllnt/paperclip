@@ -1025,6 +1025,220 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
       expect(r.requests).toHaveLength(2);
       expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true, shas: [tip], workflowCommits: [], workflowEntries: [base] });
     }, 60_000);
+
+    // Review r4: the push that runs with the credential is sealed. A stand-in for the real git applies the attacker's change at
+    // the last moment, as the child starts (after every check the launcher makes), and records the child's arguments and
+    // environment.
+    async function childShim(r: GithubLike, actions: string[][] = []) {
+      const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
+      const dir = path.join(r.root, "real");
+      await writeFile(path.join(dir, "plan.json"), JSON.stringify({ repo: r.repo, actions }));
+      await writeFile(path.join(dir, "git"), `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const REAL = ${JSON.stringify(realGit)};
+const args = process.argv.slice(2);
+if (args.includes("push")) {
+  fs.appendFileSync(path.join(__dirname, "child.jsonl"), JSON.stringify({ args, env: process.env, cwd: process.cwd() }) + "\\n");
+  const done = path.join(__dirname, "plan.done");
+  if (!fs.existsSync(done)) {
+    fs.writeFileSync(done, "1");
+    const plan = JSON.parse(fs.readFileSync(path.join(__dirname, "plan.json"), "utf8"));
+    const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+    for (const key of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|CONFIG_(COUNT|KEY_.*|VALUE_.*))$/.test(key)) delete env[key];
+    for (const action of plan.actions) spawnSync(REAL, action, { cwd: plan.repo, env, stdio: "ignore" });
+  }
+}
+const result = spawnSync(REAL, args, { stdio: "inherit" });
+process.exit(result.status === null ? 1 : result.status);
+`, { mode: 0o700 });
+      return { children: async () => (await readFile(path.join(dir, "child.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) };
+    }
+    const bareRepository = async (r: GithubLike, name: string) => {
+      const bare = path.join(r.root, name);
+      await mkdir(bare);
+      r.sys(bare, "init", "--bare", "-b", "main");
+      return bare;
+    };
+
+    it.each([
+      ["its URL", (r: GithubLike, attacker: string) => [["remote", "set-url", "origin", attacker]]],
+      ["its push URL", (r: GithubLike, attacker: string) => [["config", "remote.origin.pushurl", attacker]]],
+      ["a URL rewrite", (r: GithubLike, attacker: string) => [["config", `url.${attacker}.insteadOf`, r.bare]]],
+    ])("sends the push to the URL that was authorised, even when the remote changes as the command starts: %s", async (_label, changes) => {
+      const r = await githubLike();
+      const attacker = await bareRepository(r, "attacker.git");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      await childShim(r, changes(r, attacker));
+      const result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.requests).toHaveLength(1);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+      // As git does for a push to a configured remote, the checkout's remote-tracking ref moves.
+      expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(tip);
+    }, 60_000);
+
+    it("sends a push whose target is a URL to that URL, even when a URL rewrite for it appears as the command starts", async () => {
+      const r = await githubLike();
+      const attacker = await bareRepository(r, "attacker.git");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      await childShim(r, [["config", `url.${attacker}.insteadOf`, r.bare]]);
+      const result = await r.push(r.bare, "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+    }, 60_000);
+
+    it("sends only the refs it was told about, even when push settings appear as the command starts", async () => {
+      const r = await githubLike();
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      r.git("tag", "-a", "v1", "-m", "a tag");
+      r.git("branch", "other");
+      // Without refspecs, these settings would make `git push origin` send every branch and tag (or mirror the checkout).
+      await childShim(r, [["config", "push.followTags", "true"], ["config", "remote.origin.push", "refs/heads/*:refs/heads/*"], ["config", "remote.origin.mirror", "true"]]);
+      const result = await r.push("origin");
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.onGitHub("other")).toThrow();
+      expect(() => r.sys(r.bare, "rev-parse", "refs/tags/v1")).toThrow();
+    }, 60_000);
+
+    it("does not run the checkout's hooks or helpers with the credential, and gives the push an environment of its own", async () => {
+      const r = await githubLike();
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      const stolen = path.join(r.root, "stolen");
+      for (const [dir, name] of [[path.join(r.repo, ".git", "hooks"), "pre-push"]] as const) await writeFile(path.join(dir, name), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-hook\nexit 0\n`, { mode: 0o755 });
+      // A hooks path in the repository's own config, and a helper that git would find through GIT_EXEC_PATH.
+      const hooksDir = path.join(r.root, "my-hooks");
+      await mkdir(hooksDir);
+      await writeFile(path.join(hooksDir, "pre-push"), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-hookspath\nexit 0\n`, { mode: 0o755 });
+      r.git("config", "core.hooksPath", hooksDir);
+      const fakeExec = path.join(r.root, "fake-exec");
+      await mkdir(fakeExec);
+      await writeFile(path.join(fakeExec, "git-receive-pack"), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-exec\nexit 1\n`, { mode: 0o755 });
+      const shim = await childShim(r);
+      const ran = await exec(path.join(r.bin, "git"), ["push", "origin", "feature/x"], { cwd: r.repo, env: { ...r.env, GIT_EXEC_PATH: fakeExec, GIT_TRACE: path.join(r.root, "trace"), GIT_ASKPASS: "/bin/false", GIT_INDEX_FILE: "/nonexistent" } })
+        .then(() => 0, (error: any) => error.code as number);
+      expect(ran).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      for (const kind of ["hook", "hookspath", "exec"]) expect(await readFile(`${stolen}-${kind}`, "utf8").catch(() => null), kind).toBeNull();
+      // The environment of the push: the credential and what git needs, and none of the checkout's steering.
+      const [child] = await shim.children();
+      expect(child!.env.GH_TOKEN).toBe("t");
+      expect(child!.env.GIT_DIR).toMatch(/push-[^/]+\/git$/);
+      expect(Object.keys(child!.env).filter(key => /^GIT_(EXEC_PATH|TRACE.*|ASKPASS|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|WORK_TREE|NAMESPACE|TEMPLATE_DIR|SSH)$/.test(key))).toEqual([]);
+      expect(child!.args).toEqual(expect.arrayContaining(["--no-verify", "--no-follow-tags", "--no-recurse-submodules"]));
+      expect(child!.args.slice(-3)).toEqual(["--", "origin", "feature/x"]);
+    }, 60_000);
+
+    it.each([
+      ["--mirror"], ["--all"], ["--tags"], ["--follow-tags"], ["--prune"], ["--signed"], ["--receive-pack=/bin/true"], ["--exec=/bin/true"], ["--no-such-option"], ["-X"],
+    ])("refuses a push with %s: it cannot be reduced to one URL and a list of refs", async option => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const result = await r.push(option, "origin", "feature/x");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("cannot run with a GitHub credential");
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("refuses a push whose refs repository config decides, and one that goes to more than one URL", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      const before = r.onGitHub("feature/x");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      r.git("config", "remote.origin.push", "refs/heads/*:refs/heads/*");
+      let result = await r.push("origin");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("repository configuration decides which refs it sends");
+      r.git("config", "--unset-all", "remote.origin.push");
+      r.git("config", "--add", "remote.origin.pushurl", r.bare);
+      r.git("config", "--add", "remote.origin.pushurl", path.join(r.root, "second.git"));
+      result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("exactly one destination");
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("keeps what git does for a push to a configured remote: no arguments, HEAD, -u, tracking refs, --force-with-lease and --delete", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "1\n");
+      r.git("commit", "-a", "-m", "one");
+      expect((await r.push()).code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(r.tip());
+      await r.write("app.ts", "2\n");
+      r.git("commit", "-a", "-m", "two");
+      expect((await r.push("origin", "HEAD")).code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(r.tip());
+      await r.write("app.ts", "3\n");
+      r.git("commit", "-a", "-m", "three");
+      const three = r.tip();
+      expect((await r.push("-u", "origin", "feature/x")).code).toBe(0);
+      expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(three);
+      expect(r.git("config", "branch.feature/x.remote")).toBe("origin");
+      expect(r.git("config", "branch.feature/x.merge")).toBe("refs/heads/feature/x");
+      // The lease holds while this checkout's view of the branch is GitHub's, and fails once someone else moved it.
+      r.git("commit", "--amend", "--allow-empty", "-m", "three again");
+      const again = r.tip();
+      expect((await r.push("--force-with-lease", "origin", "feature/x")).code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(again);
+      const other = path.join(r.root, "other");
+      await mkdir(other);
+      r.sys(other, "clone", "-q", r.bare, ".");
+      r.sys(other, "checkout", "-q", "feature/x");
+      await writeFile(path.join(other, "other.ts"), "o\n");
+      r.sys(other, "add", ".");
+      r.sys(other, "commit", "-q", "-m", "someone else");
+      r.sys(other, "push", "-q", "origin", "feature/x");
+      const theirs = r.onGitHub("feature/x");
+      r.git("commit", "--amend", "--allow-empty", "-m", "three once more");
+      expect((await r.push("--force-with-lease", "origin", "feature/x")).code).not.toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(theirs);
+      // Deleting a branch removes the checkout's remote-tracking ref too.
+      expect((await r.push("origin", "--delete", "feature/x")).code).toBe(0);
+      expect(() => r.onGitHub("feature/x")).toThrow();
+      expect(() => r.git("rev-parse", "refs/remotes/origin/feature/x")).toThrow();
+    }, 120_000);
+
+    // The reviewer also asked for grafts and a shallow boundary among the adversarial cases.
+    it("reads the real parents, not what info/grafts says", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      await writeFile(path.join(r.repo, ".git", "info", "grafts"), `${edit} ${r.sys(r.repo, "rev-parse", "main")}\n`);
+      await r.push("origin", "feature/x");
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, workflowCommits: [{ sha: edit, parents: [before] }] });
+    }, 60_000);
+
+    it("is not hidden by a shallow boundary: the commit that becomes a root lists all its files", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "undo");
+      const undo = r.tip();
+      // Everything below `undo` (the edit included) is cut off.
+      await writeFile(path.join(r.repo, ".git", "shallow"), `${undo}\n`);
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, shas: [undo] });
+      expect(r.requests[0].body.operation.workflowCommits.map((commit: { sha: string }) => commit.sha)).toEqual([undo]);
+      // Nor does the push carry the edit to GitHub: it needs the parent that the shallow boundary left out.
+      expect(result.code).not.toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(before);
+      expect(edit).not.toBe(before);
+    }, 60_000);
   });
 
   it("reports where a push really goes and what could make it go elsewhere", async () => {

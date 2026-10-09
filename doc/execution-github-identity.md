@@ -324,17 +324,50 @@ and a new branch cut from a default branch the checkout has fetched, carry
 workflow files equal to what they are compared with.
 
 **What the history is read from.** Every launcher git command reads the real
-objects: `GIT_NO_REPLACE_OBJECTS` is set for all of them and for the command
-that runs, because `git replace` refs are the agent's to write and make every
-read show another commit than the one the push sends. Just before a network
-command runs with a credential, its remote (the push URLs it resolves to now,
-rewrites included), its refs and its commits are read again, and it does not run
-if they differ from what the broker was told (another process, or a change made
-while the broker answered, moved them). A change that happens inside git's own
-startup of the child is not caught: closing that would mean pushing to a URL
-instead of a remote, which loses the remote's tracking refs and upstream
-settings, and a process of the same user that can race it can also read the
-credential from the child's environment (see the limits below).
+objects. `GIT_NO_REPLACE_OBJECTS` and `GIT_GRAFT_FILE=/dev/null` are set for all
+of them and for the command that runs, because `git replace` refs and
+`info/grafts` are the agent's to write and make every read show another commit
+than the one the push sends. (`core.graftFile` does not turn grafts off; the
+variable does.) A shallow boundary cannot hide a commit: the commit that becomes
+a root lists all its files, and a push that needs the parents the boundary left
+out is refused by GitHub. `GIT_EXEC_PATH` is dropped from the environment of
+every launcher command, so a helper found through it (`git-remote-*`,
+`git-receive-pack`) never runs with the credential.
+
+**A push with a credential is sealed.** Once the broker has answered, the push
+does not run as typed. It runs in a git directory of its own, made for it and
+under the launcher's private directory: its config is written by the launcher
+(the one URL the broker was told about, no push settings, no hooks), it holds a
+copy of the refs the push names (HEAD, branches, tags and the destination's
+remote-tracking refs, as they are then), and the checkout's objects are its
+alternate. The command is `git -c core.hooksPath=<empty> -c
+push.followTags=false -c push.recurseSubmodules=no -c protocol.ext.allow=never
+push <options> --no-verify --no-follow-tags --no-recurse-submodules -- <remote
+or URL> <refspecs>`, with an environment that holds only the credential, `PATH`,
+the locale and what git needs, and none of the checkout's steering (`GIT_DIR`,
+`GIT_EXEC_PATH`, `GIT_TRACE*`, `GIT_SSH`, object and index paths, `HOME`). What
+the checkout's config, hooks, remote names, refspecs or environment say after
+the check, even in the instant git starts, cannot reach it: the URL, the refs and
+the settings are the launcher's. Before it starts, the refs it names are checked
+again in that directory against the report the broker answered, and the push
+URLs and commits are read again in the checkout; a difference stops it.
+
+A push that cannot be reduced to one URL and a list of refs is refused, with the
+reason: `--all`, `--mirror`, `--tags`, `--follow-tags`, `--prune`, `--signed`,
+`--receive-pack`, `--exec`, any option that is not listed, a destination with
+more than one push URL, and a push without refspecs when the repository's config
+(`push.default`, `remote.<name>.push`, `mirror`) decides what it sends. Name one
+remote and the branches. These options are forwarded: `-f`/`--force`,
+`--force-with-lease[=…]`, `--force-if-includes`, `-n`, `-q`, `-v`, `-u`,
+`-d`/`--delete`, `-o`/`--push-option`, `--atomic`, `--porcelain`, `--progress`,
+`--thin` and the IPv4/IPv6 switches. A push without refspecs sends the current
+branch to the branch of the same name, which is what the broker was told; git
+itself would stop for want of an upstream. After the push, the launcher does in
+the checkout what git does for a push to a configured remote: it moves or deletes
+the remote-tracking refs the push changed, and `-u` records the upstream. The
+checkout's own hooks (a `pre-push` hook, `core.hooksPath`) do not run for a
+push that holds a credential. Fetches and pulls keep the earlier check only:
+their remote, refs and commits are read again right before they run.
 
 The base is the base of the same-repository open pull request whose head is the
 pushed branch, else the repository's default branch. Whoever opens a pull
@@ -583,9 +616,10 @@ a proxy or other TLS trust (URL-specific `http.<url>.proxy` or `sslVerify`,
 `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE` and git's curl tracing variables from
 it; gh always gets a fresh private `GH_CONFIG_DIR`. Such a command therefore
 cannot use a proxy the network needs. The allowlist, toggles, throttle and
-guard hold on the managed path only. An agent that captures a user token (for example from a git hook, a
-program named `gh` later in `PATH`, or a gh extension, which all run with the
-token in their environment) can skip them for at most 8 hours; the hard limits are GitHub's: the App
+guard hold on the managed path only. An agent that captures a user token (for example from the git hook of a
+command other than a push, a program named `gh` later in `PATH`, or a gh extension, which all run with the
+token in their environment; or a process of the same user that reads the environment of the running
+command) can skip them for at most 8 hours; the hard limits are GitHub's: the App
 installation's repositories and permissions (keep Workflows write off so
 workflow files cannot change), and the repositories' rulesets. The
 `editWorkflows` check reads the checkout's objects, which an agent controls. It
