@@ -55,11 +55,11 @@ export type BrandChipColor = "gray" | "blue" | "amber" | "green" | "violet" | "r
 
 export const brandChipBadge: Record<BrandChipColor, string> = {
   gray: "bg-muted text-muted-foreground border-status-neutral",
-  blue: "bg-[#DBEAFE] text-[#1D4ED8] border-[#2563EB] dark:bg-[#2563eb2e] dark:text-[#2563EB] dark:border-[#2563eb73]",
+  blue: "bg-[#DBEAFE] text-[#1D4ED8] border-[#2563EB] dark:bg-[#2563eb2e] dark:text-[#60A5FA] dark:border-[#2563eb73]",
   amber: "bg-[#FEF3C7] text-[#B45309] border-[#F59E0B] dark:bg-[#f59e0b24] dark:text-[#F59E0B] dark:border-[#f59e0b73]",
-  green: "bg-[#DCFCE7] text-[#188A3C] border-[#22C55E] dark:bg-[#22c55e1f] dark:text-[#22C55E] dark:border-[#22c55e73]",
-  violet: "bg-[#EDE9FE] text-[#5B21B6] border-[#7C3AED] dark:bg-[#7c3aed2e] dark:text-[#7C3AED] dark:border-[#7c3aed73]",
-  red: "bg-[#FEE2E2] text-[#991B1B] border-[#DC2626] dark:bg-[#dc26262e] dark:text-[#DC2626] dark:border-[#dc262673]",
+  green: "bg-[#DCFCE7] text-[#15803D] border-[#22C55E] dark:bg-[#22c55e1f] dark:text-[#22C55E] dark:border-[#22c55e73]",
+  violet: "bg-[#EDE9FE] text-[#5B21B6] border-[#7C3AED] dark:bg-[#7c3aed2e] dark:text-[#A78BFA] dark:border-[#7c3aed73]",
+  red: "bg-[#FEE2E2] text-[#991B1B] border-[#DC2626] dark:bg-[#dc26262e] dark:text-[#F87171] dark:border-[#dc262673]",
 };
 
 // ---------------------------------------------------------------------------
@@ -180,7 +180,7 @@ export const agentStatusMotion: Record<string, string> = {
  * canonical status blue, not cyan/teal. Kept here so components stay free of
  * hex literals (token-gate scope).
  */
-export const runningLabelText = "text-[#1D4ED8] dark:text-[#2563EB]";
+export const runningLabelText = "text-[#1D4ED8] dark:text-[#60A5FA]";
 
 /**
  * Liveness-blue badge recipe — the shared "Live" / "Running" pill treatment

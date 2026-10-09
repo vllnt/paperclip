@@ -210,7 +210,7 @@
      `in_queue` is the BLOCKED shape recoloured to the in_progress blue
      (replaces the bespoke teal "covered" state). Light values here; the
      `.dark` block below overrides the hues that need a mode-specific value. */
-  --status-task-icon-backlog: var(--status-neutral); /* foreground at 50% — 4.0:1 light, 5.3:1 dark */
+  --status-task-icon-backlog: var(--status-neutral); /* foreground at 60% — 5.7:1 light, 7.4:1 dark */
   --status-task-icon-todo: #cc7a00;       /* amber darkened — clears 3:1 */
   --status-task-icon-in_progress: var(--color-blue-600); /* matches nav dots and live labels */
   --status-task-icon-in_review: var(--status-task-in_review);     /* #7c3aed (light) */
@@ -439,8 +439,10 @@
   --sidebar-ring: var(--link);
   --bubble-agent: var(--muted);
   /* Neutral statuses (backlog, cancelled, idle) read as quiet ink, not grey.
-     50% foreground is 4.0:1 (light) / 5.3:1 (dark) on the background. */
-  --status-neutral: color-mix(in srgb, var(--foreground) 50%, var(--background));
+     It is also the text colour of "Cancelled", so it must clear AA (4.5:1):
+     60% foreground is 5.7:1 (light) / 7.4:1 (dark) on the background and
+     5.0:1 / 6.1:1 on a hover fill. 56% would fail on the light hover fill. */
+  --status-neutral: color-mix(in srgb, var(--foreground) 60%, var(--background));
 }
 
 .streamlined-task-detail-surface {
