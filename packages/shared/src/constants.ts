@@ -553,7 +553,6 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "cancelled",
   "invalid_status",
   "invalid_assignee",
-  "reassigned",
   "dispatch_skipped",
   "timeout_exceeded",
   "max_attempts_exhausted",

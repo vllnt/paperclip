@@ -6623,6 +6623,8 @@ export async function readIssueCommentRunLogText(run: {
  * The fields that clear an issue's monitor because its assignee agent changes.
  * A monitor and its note belong to the agent that scheduled them, so release and
  * checkout clear it the way a PATCH reassignment does. Null when nothing is armed.
+ * The persisted reason is `invalid_assignee` so a rolled-back image can still
+ * read the execution state; the activity details say "reassigned".
  */
 function monitorClearedForAssigneeChange(
   issue: typeof issues.$inferSelect,
@@ -6632,7 +6634,7 @@ function monitorClearedForAssigneeChange(
   if (!policy?.monitor && !issue.monitorNextCheckAt) return null;
   if (issue.assigneeAgentId === nextAssigneeAgentId) return null;
   return {
-    ...buildIssueMonitorClearedPatch({ issue, policy, clearReason: "reassigned" }),
+    ...buildIssueMonitorClearedPatch({ issue, policy, clearReason: "invalid_assignee" }),
     monitorNotes: null,
   };
 }

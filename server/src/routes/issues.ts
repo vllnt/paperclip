@@ -309,6 +309,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  monitorClearedByReassignment,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -14366,7 +14367,11 @@ export function issueRoutes(
           details: {
             identifier: issue.identifier,
             previousNextCheckAt: previousMonitor.nextCheckAt,
-            reason: nextMonitor.clearReason ?? "manual",
+            reason:
+              nextMonitor.clearReason === "invalid_assignee" &&
+              monitorClearedByReassignment(existing, issue)
+                ? "reassigned"
+                : nextMonitor.clearReason ?? "manual",
             notes: previousMonitor.notes,
           },
         });
@@ -15278,7 +15283,12 @@ export function issueRoutes(
         action: "issue.checked_out",
         entityType: "issue",
         entityId: issue.id,
-        details: { agentId: req.body.agentId },
+        details: {
+          agentId: req.body.agentId,
+          ...(updated && monitorClearedByReassignment(issue, updated)
+            ? { monitorCleared: "reassigned" }
+            : {}),
+        },
       });
 
       if (
@@ -15346,6 +15356,9 @@ export function issueRoutes(
       action: "issue.released",
       entityType: "issue",
       entityId: released.id,
+      ...(monitorClearedByReassignment(existing, released)
+        ? { details: { monitorCleared: "reassigned" } }
+        : {}),
     });
 
     res.json(released);

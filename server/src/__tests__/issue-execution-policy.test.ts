@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, monitorClearedByReassignment, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -1795,7 +1795,7 @@ describe("issue execution policy transitions", () => {
 
         expect(result.patch.executionPolicy).toBeNull();
         expect(result.patch.monitorNextCheckAt).toBeNull();
-        expect(result.patch.executionState).toMatchObject({ monitor: { status: "cleared", clearReason: "reassigned" } });
+        expect(result.patch.executionState).toMatchObject({ monitor: { status: "cleared", clearReason: "invalid_assignee" } });
       });
 
       it("keeps the wait when the same agent stays assigned", () => {
@@ -2149,5 +2149,20 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
     });
+  });
+});
+
+describe("monitorClearedByReassignment", () => {
+  const armed = new Date("2026-04-11T12:30:00.000Z");
+
+  it.each([
+    ["moved to another agent", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: qaAgentId, monitorNextCheckAt: null }, true],
+    ["released", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: null, monitorNextCheckAt: null }, true],
+    ["same agent keeps the wait", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, false],
+    ["no wait was armed", { assigneeAgentId: coderAgentId, monitorNextCheckAt: null }, { assigneeAgentId: qaAgentId, monitorNextCheckAt: null }, false],
+    ["wait cleared without a reassignment", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: coderAgentId, monitorNextCheckAt: null }, false],
+    ["first assignment of an unassigned issue", { assigneeAgentId: null, monitorNextCheckAt: armed }, { assigneeAgentId: qaAgentId, monitorNextCheckAt: null }, false],
+  ])("%s", (_label, before, after, expected) => {
+    expect(monitorClearedByReassignment(before, after)).toBe(expected);
   });
 });

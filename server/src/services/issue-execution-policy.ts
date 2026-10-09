@@ -1068,14 +1068,16 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       : existingState;
   // A monitor belongs to the agent that scheduled it: its note and wake target
   // that agent. Moving the issue to another agent clears it, unless the same
-  // request schedules a monitor for the new assignee.
+  // request schedules a monitor for the new assignee. The persisted reason is
+  // `invalid_assignee`: a rolled-back image rejects any value outside its enum
+  // and then drops the whole execution state. Activity details say "reassigned".
   const assigneeAgentChanged =
     !input.monitorExplicitlyUpdated &&
     Boolean(input.issue.assigneeAgentId) &&
     assigneeAgentId !== input.issue.assigneeAgentId;
   const invalidReason = input.policy?.monitor
     ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ??
-      (assigneeAgentChanged ? "reassigned" : null)
+      (assigneeAgentChanged ? "invalid_assignee" : null)
     : null;
 
   let targetMonitorState = currentMonitorState;
@@ -1224,6 +1226,23 @@ export function buildIssueMonitorRescheduledPatch(input: {
     monitorNextCheckAt: input.nextCheckAt,
     monitorWakeRequestedAt: null,
   };
+}
+
+/**
+ * True when an issue update took an armed monitor away because the assignee
+ * agent changed. The persisted clear reason is the readable `invalid_assignee`;
+ * activity details use this to say "reassigned".
+ */
+export function monitorClearedByReassignment(
+  before: { assigneeAgentId: string | null; monitorNextCheckAt?: Date | string | null },
+  after: { assigneeAgentId: string | null; monitorNextCheckAt?: Date | string | null },
+): boolean {
+  return (
+    Boolean(before.monitorNextCheckAt) &&
+    !after.monitorNextCheckAt &&
+    Boolean(before.assigneeAgentId) &&
+    before.assigneeAgentId !== after.assigneeAgentId
+  );
 }
 
 export function buildIssueMonitorClearedPatch(input: {

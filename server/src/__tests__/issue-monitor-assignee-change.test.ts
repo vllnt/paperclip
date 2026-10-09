@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, createDb, issues } from "@paperclipai/db";
+import { ISSUE_EXECUTION_MONITOR_CLEAR_REASONS } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -73,8 +74,10 @@ describeEmbeddedPostgres("issue monitor and assignee changes", () => {
     expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
     expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
       status: "cleared",
-      clearReason: "reassigned",
+      clearReason: "invalid_assignee",
     });
+    const persisted = parseIssueExecutionState(issue.executionState)?.monitor?.clearReason;
+    expect(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).toContain(persisted);
   }
 
   it("clears the previous agent's wait when another agent checks the issue out after a release", async () => {
