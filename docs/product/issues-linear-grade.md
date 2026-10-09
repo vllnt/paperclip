@@ -189,7 +189,8 @@ one open issue per origin kind.
 
 - Same function as the agent workspace renderer, so a human and an agent get the same name for
   the same task: `PAP-123-fix-login-redirect`. It honours the project's `branchTemplate`.
-  The renderer moves to `packages/shared`; `workspace-runtime.ts` imports it. No behaviour change.
+  The service reuses the runtime's own `renderWorkspaceTemplate` and `sanitizeBranchName`
+  (now exported), so the two cannot drift. No behaviour change in the runtime.
 - Case is kept (`PAP-123-…`) because that is what existing agent branches use; matching is
   case-insensitive. Renaming the title changes the proposal, never the matching.
 - Shown in the issue header with a copy button and the command `git switch -c <name>`.
@@ -241,6 +242,8 @@ Rules:
   redelivery is absorbed by the existing `connection_event_deliveries` receipt. No unique
   index is added in slice 1 (existing duplicates would fail it on a live table).
 - Unlink sets `suppressed` so automatic matching does not re-add it; a manual link clears it.
+  A shared SQL condition hides suppressed rows from the work product list, the decision queue
+  and the workspace close check, so an unlinked pull request is gone everywhere.
 
 ### 6.4 Status automation
 
@@ -266,11 +269,13 @@ Guards, in order. Any failing guard leaves status alone and records why in
    its own status; the next signal re-checks.
 5. A pending merge confirmation names this PR (`request_confirmation`) → defer to the
    existing sweep and the woken assignee.
-6. Execution policy has review/approval stages → go through
-   `applyIssueExecutionPolicyTransition`; if it does not allow `done`, move to `in_review`
-   instead. Gates are never skipped.
-7. Compare-and-set on `statusVersion`. If a person or agent changed the status after the
-   automation's last move, automation stops touching that issue (`suspended: manual_change`).
+6. The task has an execution policy or a review policy → link only (`gated`). The policy
+   engine only lets its own participants advance a stage, and the review policy reads who moved
+   the task into `in_review`, so a system actor must not enter either. Slice 2 can teach
+   automation to hand over to the policy engine.
+7. Manual change. `statusVersion` only moves on assignee changes, so it cannot detect a status
+   edit. Instead each move records `applied {from, to, at}`; if the status is no longer `to`,
+   someone changed it, and automation stops touching that task (`manual_change`).
 
 Each move writes activity `issue.git_status_automated` with `_previous.status`, actor
 `system:git-link`, and the PR. No comment is posted (comments wake agents).
@@ -315,7 +320,7 @@ numbers are anchored by the production image build).
 
 | # | Slice | Contents | Unlocks |
 |---|---|---|---|
-| 1 | Git links | Branch name; PR auto-link (explicit, Cloud relay, plugin poll); guarded status automation, dark by default; API, OpenAPI, CLI, MCP, web | Leave GitHub Issues for PR tracking |
+| 1 | Git links | Branch name; PR auto-link (explicit link and Cloud relay events; the plugin poll for Tailnet-only deployments follows as 1b); guarded status automation, off by default; API, OpenAPI, CLI, MCP, web | Leave GitHub Issues for PR tracking |
 | 2 | Git depth | Per-project automation config, target branches with regex and a "no action" override (Linear), draft handling; commit and trailer linking; checks and review state in the panel; "ready for merge" state; re-check when a run ends; optional "copy branch also assigns me and starts the task" (Linear's personal toggle); unique index on a new link table | Trust to turn automation on everywhere |
 | 3 | Auto-assignment | Project assignment settings; lead default; rules; capacity and model aware pools; override semantics | No manual hand-off |
 | 4 | Intake and triage | Triage queue, templates and forms, due dates and SLAs, duplicate detection (#40), GitHub issues into triage | Real intake |
@@ -325,7 +330,11 @@ numbers are anchored by the production image build).
 | 8 | Insights | Cycle time, throughput, burn-up, agent and human load | Measure |
 
 Slice 1 is deliberately free of schema changes and of edits to the busiest files
-(`routes/issues.ts`, `cli/.../issue.ts`, `shared/src/index.ts` keep one-line registrations).
+(`routes/issues.ts` and `cli/.../issue.ts` are untouched; `shared/src/index.ts`, `app.ts` and
+`cli/src/index.ts` take one-line registrations).
+
+Found while building, kept: the switch lives in `instance_settings.general` (no new table);
+`normalizeGeneralSettings` whitelists keys, so a new setting must be added there as well.
 
 ## 8. Slice 1 proof plan
 
@@ -349,8 +358,9 @@ RED first, then GREEN:
   slice 2 with per-project control.
 - On merge, should agent-owned tasks go straight to `done`, or wake the assignee for
   post-merge checks? Slice 1 keeps `done` guarded by 6.4 rules 4-6; revisit with data.
-- Plugin poll needs a new narrow host call in the plugin SDK. If it grows, it ships as a
-  stacked part 1b so the core PR is not blocked.
+- The plugin poll (anthm is Tailnet-only, so it is the only automatic source there) needs a
+  new narrow host call in the plugin SDK. It ships as slice 1b so the core PR is not blocked.
+  Until then, pull requests link there by hand, through an agent, or through the CLI.
 - Branch case: kept as the agent default. A lowercase option can come with templates.
 
 Coordination: #22 (API coverage matrix: add rows when it lands), #33-#38 (CLI/API parity:
