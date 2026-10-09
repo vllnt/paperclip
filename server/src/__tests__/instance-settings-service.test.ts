@@ -16,6 +16,18 @@ describe("instance settings service", () => {
     expect(settings.general.companyEnvironmentDefaults).toEqual(defaults);
   });
 
+  it("keeps the git status automation switch off unless it was stored, and carries it through when it was", async () => {
+    const load = async (general: Record<string, unknown>) => {
+      const row = { id: "settings", defaultEnvironmentId: null, general, experimental: {}, createdAt: new Date(), updatedAt: new Date() };
+      const db = { select: () => ({ from: () => ({ where: () => Promise.resolve([row]) }) }) };
+      return (await instanceSettingsService(db as never).get()).general;
+    };
+
+    expect((await load({})).gitStatusAutomation).toBeUndefined();
+    expect((await load({ gitStatusAutomation: true })).gitStatusAutomation).toBe(true);
+    expect((await load({ gitStatusAutomation: false })).gitStatusAutomation).toBe(false);
+  });
+
   it("keeps chat connectors opt-in across legacy storage and patches without disabling Apps", () => {
     for (const stored of [undefined, {}, { enableApps: true }, { enableConferenceRoomChat: true }]) {
       expect(normalizeExperimentalSettings(stored).enableChatConnectors).toBe(false);

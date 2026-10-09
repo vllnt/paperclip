@@ -18,6 +18,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { gitLinkLockKey, issueGitLinkService, type PullRequestSignal } from "../services/issue-git-links.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { workProductService } from "../services/work-products.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -480,6 +481,25 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
 
       expect((await issueRow(issueId)).status).toBe("in_progress");
       expect(result.automation[0]).toMatchObject({ applied: null, deferred: "manual_change" });
+    });
+
+    it("follows the stored instance setting when no switch is injected", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 12);
+      const settings = instanceSettingsService(db);
+      const defaultService = issueGitLinkService(db);
+
+      try {
+        await defaultService.recordPullRequestSignal(company.id, signal(company.prefix));
+        expect((await issueRow(issueId)).status).toBe("todo");
+
+        await settings.updateGeneral({ gitStatusAutomation: true });
+        await defaultService.recordPullRequestSignal(company.id, signal(company.prefix, { updatedAt: "2026-10-09T11:00:00.000Z" }));
+        expect((await issueRow(issueId)).status).toBe("in_review");
+        expect((await defaultService.getView(issueId, company.id)).statusAutomation.enabled).toBe(true);
+      } finally {
+        await settings.updateGeneral({ gitStatusAutomation: false });
+      }
     });
 
     it("links but never changes status while the switch is off", async () => {
