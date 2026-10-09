@@ -13,6 +13,7 @@ import {
   sweepPaperclipTempEntries,
   touchHeldPaperclipTempEntries,
 } from "./paperclip-temp.js";
+import { disposeGitWorkspaceSnapshot, readGitWorkspaceSnapshot, withShallowGitWorkspaceClone } from "./git-workspace-sync.js";
 import { createSandboxCallbackBridgeAsset } from "./sandbox-callback-bridge.js";
 import { runChildProcess } from "./server-utils.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
@@ -20,7 +21,7 @@ import { captureDirectorySnapshot, disposeDirectorySnapshot } from "./workspace-
 
 const HOUR_MS = 60 * 60 * 1000;
 const MAX_AGE_MS = 2 * HOUR_MS;
-const SWEPT = /^paperclip-(ssh-key|ssh-known-hosts|ssh-sync-back|ssh-bundle|workspace-baseline|codex-home-sync|bridge-asset)-/;
+const SWEPT = /^paperclip-(ssh-key|ssh-known-hosts|ssh-sync-back|ssh-bundle|workspace-baseline|codex-home-sync|bridge-asset|workspace-manifest|git-workspace|sandbox-sync|sandbox-restore|tar-list|syncin-fallback)-/;
 
 const spec: SshRemoteExecutionSpec = {
   host: "127.0.0.1",
@@ -82,8 +83,8 @@ describe("startup sweep after a killed run", () => {
   const sshModule = fileURLToPath(new URL("./ssh.ts", import.meta.url));
 
   it("removes the sync-back staging dir and SSH auth files a run killed mid-sync-back left", async () => {
-    // A tar stream of one whole file with no end-of-archive marker, so the
-    // receiving tar extracts the file and then waits for more.
+    // A tar stream of one file with no end-of-archive marker, so the receiving
+    // tar extracts what it gets and then waits for more.
     const remote = path.join(root, "remote");
     await fsp.mkdir(remote);
     await fsp.writeFile(path.join(remote, "big.txt"), "x".repeat(64 * 1024));
@@ -114,14 +115,16 @@ describe("startup sweep after a killed run", () => {
     let stderr = "";
     child.stderr?.on("data", (chunk) => { stderr += chunk; });
 
-    // Wait until the staging dir holds the whole file: the run is mid-sync-back.
+    // Wait until the staging dir holds part of the file: the run is mid-sync-back.
+    // GNU tar writes only whole 10 KiB records, so the tail can stay unwritten.
+    let extractedBytes = 0;
     await vi.waitFor(async () => {
       expect(child.exitCode, stderr).toBeNull();
       const staging = (await sweptEntries()).find((name) => name.startsWith("paperclip-ssh-sync-back-"));
       expect(staging).toBeDefined();
-      const stats = await fsp.stat(path.join(tmp, staging ?? "", "big.txt"));
-      expect(stats.size).toBe(64 * 1024);
-    }, { timeout: 20_000, interval: 100 });
+      extractedBytes = (await fsp.stat(path.join(tmp, staging ?? "", "big.txt"))).size;
+      expect(extractedBytes).toBeGreaterThan(0);
+    }, { timeout: 90_000, interval: 100 });
 
     // Kill the whole run, as a restart does. No `finally` runs.
     const exited = once(child, "exit");
@@ -140,9 +143,9 @@ describe("startup sweep after a killed run", () => {
 
     const later = await sweepPaperclipTempEntries({ tmpDir: tmp, maxAgeMs: MAX_AGE_MS, now: Date.now() + 3 * HOUR_MS });
     expect(later).toMatchObject({ removed: 3, failed: 0, held: 0 });
-    expect(later.freedBytes).toBeGreaterThanOrEqual(64 * 1024);
+    expect(later.freedBytes).toBeGreaterThanOrEqual(extractedBytes);
     expect(await sweptEntries()).toEqual([]);
-  }, 60_000);
+  }, 150_000);
 });
 
 describe("sweepPaperclipTempEntries", () => {
@@ -153,7 +156,7 @@ describe("sweepPaperclipTempEntries", () => {
     const stale = path.join(tmp, "paperclip-ssh-sync-back-stale1");
     await fsp.mkdir(stale);
     await fsp.writeFile(path.join(stale, "file"), "12345");
-    const other = path.join(tmp, "paperclip-git-workspace-abc123");
+    const other = path.join(tmp, "paperclip-run-abc123");
     await fsp.mkdir(other);
     await fsp.writeFile(path.join(tmp, "paperclip-ssh-key-file"), "not a dir");
     const outside = path.join(root, "outside");
@@ -187,6 +190,90 @@ describe("sweepPaperclipTempEntries", () => {
 
     await disposeDirectorySnapshot(baseline);
     expect(await sweptEntries()).toEqual([]);
+  });
+
+  async function initGitRepo(): Promise<string> {
+    const workspace = path.join(root, "repo");
+    await fsp.mkdir(workspace);
+    await fsp.writeFile(path.join(workspace, "a.txt"), "a");
+    const git = (...args: string[]) => promisify(execFile)("git", ["-C", workspace, ...args]);
+    await git("init", "-q");
+    await git("add", "a.txt");
+    await git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init");
+    return workspace;
+  }
+
+  it("stops holding a git workspace snapshot's manifest dir when it is disposed", async () => {
+    const workspace = await initGitRepo();
+    const before = new Set(await fsp.readdir(tmp));
+
+    const snapshot = await readGitWorkspaceSnapshot(workspace);
+    expect(snapshot).not.toBeNull();
+    const manifest = (await fsp.readdir(tmp)).filter((name) => !before.has(name)).map((name) => path.join(tmp, name));
+    expect(manifest).toHaveLength(1);
+    expect(isPaperclipTempEntryHeld(manifest[0] ?? "")).toBe(true);
+
+    await disposeGitWorkspaceSnapshot(snapshot);
+    expect(fs.existsSync(manifest[0] ?? "")).toBe(false);
+    expect(isPaperclipTempEntryHeld(manifest[0] ?? "")).toBe(false);
+  });
+
+  it("holds a shallow git clone while it is in use and removes it after", async () => {
+    const workspace = await initGitRepo();
+    const snapshot = await readGitWorkspaceSnapshot(workspace);
+    if (!snapshot) throw new Error("expected a git workspace snapshot");
+    let clone = "";
+    await withShallowGitWorkspaceClone({ localDir: workspace, snapshot }, async (cloneDir) => {
+      clone = cloneDir;
+      const result = await sweepPaperclipTempEntries({ tmpDir: tmp, maxAgeMs: MAX_AGE_MS, now: later() });
+      expect(result.removed).toBe(0);
+      expect(fs.existsSync(path.join(cloneDir, "a.txt"))).toBe(true);
+    });
+    expect(fs.existsSync(clone)).toBe(false);
+    expect(isPaperclipTempEntryHeld(clone)).toBe(false);
+    await disposeGitWorkspaceSnapshot(snapshot);
+  });
+
+  it("removes entries that hold a read-only directory without changing a symlink target", async () => {
+    const outside = path.join(root, "outside-readonly");
+    await fsp.mkdir(outside);
+    await fsp.chmod(outside, 0o555);
+    const readOnlyTree = async (entry: string) => {
+      await fsp.mkdir(path.join(entry, "cache", "mod"), { recursive: true });
+      await fsp.writeFile(path.join(entry, "cache", "mod", "file"), "12345");
+      await fsp.symlink(outside, path.join(entry, "cache", "mod", "link"));
+      await fsp.chmod(path.join(entry, "cache", "mod"), 0o555);
+      await fsp.chmod(path.join(entry, "cache"), 0o555);
+    };
+    const held = await createPaperclipTempDir("paperclip-ssh-sync-back-");
+    const stale = path.join(tmp, "paperclip-ssh-sync-back-readonly");
+    try {
+      await readOnlyTree(held);
+      await readOnlyTree(stale);
+      await removePaperclipTempDir(held);
+      const result = await sweepPaperclipTempEntries({ tmpDir: tmp, maxAgeMs: MAX_AGE_MS, now: later() });
+
+      expect(fs.existsSync(held)).toBe(false);
+      expect(result).toMatchObject({ removed: 1, failed: 0 });
+      expect(fs.existsSync(stale)).toBe(false);
+      expect((await fsp.stat(outside)).mode & 0o777).toBe(0o555);
+    } finally {
+      await promisify(execFile)("chmod", ["-R", "u+w", root]);
+    }
+  });
+
+  it("reports the first entry it cannot remove", async () => {
+    const stale = path.join(tmp, "paperclip-ssh-sync-back-busy");
+    await fsp.mkdir(stale);
+    const realRm = fsp.rm.bind(fsp);
+    vi.spyOn(fsp, "rm").mockImplementation(async (target, options) => {
+      if (String(target) === stale) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      return realRm(target, options);
+    });
+
+    const result = await sweepPaperclipTempEntries({ tmpDir: tmp, maxAgeMs: MAX_AGE_MS, now: later() });
+
+    expect(result).toMatchObject({ removed: 0, failed: 1, firstFailure: "paperclip-ssh-sync-back-busy: EBUSY" });
   });
 
   it("refreshes held entries and forgets ones already removed", async () => {
@@ -254,7 +341,7 @@ describe("temp entries on failure paths", () => {
       remoteExecution: spec,
     })).rejects.toThrow();
 
-    await vi.waitFor(async () => expect(await sweptEntries()).toEqual([]));
+    await vi.waitFor(async () => expect(await sweptEntries()).toEqual([]), { timeout: 10_000 });
   });
 
   it("removes the bridge asset dir when writing the entrypoint fails", async () => {

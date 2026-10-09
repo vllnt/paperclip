@@ -1486,11 +1486,15 @@ Environment overrides:
 - `PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS=<hours>` sets the age at which the temp
   sweep removes a per-run temp entry (`paperclip-ssh-key-*`,
   `paperclip-ssh-sync-back-*`, `paperclip-workspace-baseline-*`, and similar)
-  that a dead process left in the OS temp directory. The default is `2`; values
-  below `1` use `1`. The sweep runs on startup, never removes an entry a live run
-  holds, and logs `event: "paperclip_tmp_sweep"` with the count and bytes freed.
+  that a dead process left in the OS temp directory. The default is `2`. Values
+  between `0` and `1` use `1`; zero, negative and non-numeric values use the
+  default. The sweep runs on startup, never removes an entry a live run holds,
+  and logs `event: "paperclip_tmp_sweep"` with the count and bytes freed, and the
+  first removal failure (`firstFailure`) when one occurs.
 - `PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES=<minutes>` sets how often the temp sweep
   runs after startup. The default is `60`. A value of `0` sweeps on startup only.
+  Other values are kept between `1` and `1440`; negative and non-numeric values
+  use the default.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,

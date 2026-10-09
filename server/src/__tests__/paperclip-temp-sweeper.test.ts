@@ -36,6 +36,14 @@ describe("temp sweep config parsing", () => {
     expect(loadConfig()).toMatchObject({ tempSweepMaxAgeHours: 2, tempSweepIntervalMinutes: 60 });
   });
 
+  it("keeps a nonzero interval between 1 minute and 1 day", () => {
+    vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "0.001");
+    expect(loadConfig()).toMatchObject({ tempSweepIntervalMinutes: 1 });
+    // 100000 minutes overflows setInterval, which would then fire every 1 ms.
+    vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "100000");
+    expect(loadConfig()).toMatchObject({ tempSweepIntervalMinutes: 1440 });
+  });
+
   it("reads explicit values", () => {
     vi.stubEnv("PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS", "6");
     vi.stubEnv("PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES", "15");

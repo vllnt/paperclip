@@ -293,20 +293,22 @@ export function loadConfig(): Config {
       : 7;
   // The temp sweep removes per-run temp entries that a dead process left in
   // the OS temp directory once no process has changed them for this many
-  // hours. Values below 1 use 1; a non-positive or non-numeric value uses 2.
+  // hours. Values between 0 and 1 use 1; zero, a negative or a non-numeric value
+  // uses 2.
   const tempSweepMaxAgeHoursEnv = process.env.PAPERCLIP_TMP_SWEEP_MAX_AGE_HOURS?.trim();
   const tempSweepMaxAgeHoursRaw = Number(tempSweepMaxAgeHoursEnv);
   const tempSweepMaxAgeHours =
     tempSweepMaxAgeHoursEnv && Number.isFinite(tempSweepMaxAgeHoursRaw) && tempSweepMaxAgeHoursRaw > 0
       ? Math.max(tempSweepMaxAgeHoursRaw, 1)
       : 2;
-  // The sweep also runs on this period. 0 sweeps on startup only; a negative or
-  // non-numeric value uses 60.
+  // The sweep also runs on this period. 0 sweeps on startup only; other values
+  // are kept between 1 and 1440 (one day, well inside the timer limit); a
+  // negative or non-numeric value uses 60.
   const tempSweepIntervalMinutesEnv = process.env.PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES?.trim();
   const tempSweepIntervalMinutesRaw = Number(tempSweepIntervalMinutesEnv);
   const tempSweepIntervalMinutes =
     tempSweepIntervalMinutesEnv && Number.isFinite(tempSweepIntervalMinutesRaw) && tempSweepIntervalMinutesRaw >= 0
-      ? tempSweepIntervalMinutesRaw
+      ? tempSweepIntervalMinutesRaw === 0 ? 0 : Math.min(Math.max(tempSweepIntervalMinutesRaw, 1), 24 * 60)
       : 60;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,

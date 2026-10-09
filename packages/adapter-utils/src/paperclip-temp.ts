@@ -28,6 +28,12 @@ export const SWEPT_PAPERCLIP_TEMP_PREFIXES = [
   "paperclip-workspace-baseline-",
   "paperclip-codex-home-sync-",
   "paperclip-bridge-asset-",
+  "paperclip-workspace-manifest-",
+  "paperclip-git-workspace-",
+  "paperclip-sandbox-sync-",
+  "paperclip-sandbox-restore-",
+  "paperclip-tar-list-",
+  "paperclip-syncin-fallback-",
 ] as const;
 
 /** How often a process refreshes the change time of the entries it holds. */
@@ -45,6 +51,8 @@ export interface PaperclipTempSweepResult {
   /** Entries some process changed within the age limit. */
   recent: number;
   failed: number;
+  /** The first removal failure, as `<entry name>: <error code>`. */
+  firstFailure?: string;
 }
 
 // Kept on globalThis so two loaded copies of this module share one registry.
@@ -92,10 +100,38 @@ export async function createPaperclipTempDir(prefix: string): Promise<string> {
  */
 export async function removePaperclipTempDir(dir: string): Promise<void> {
   try {
-    await fs.rm(dir, { recursive: true, force: true });
+    await removeTree(dir);
   } finally {
     heldEntries().delete(dir);
     syncTouchTimer();
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+}
+
+// An extracted workspace can hold a read-only directory (for example a Go
+// module cache). A non-root process cannot remove the files in it, so on a
+// permission error make the entry's own directories writable and retry. It
+// skips symlinks; nothing else writes to the entry while it is removed.
+async function makeDirectoriesWritable(dir: string): Promise<void> {
+  const stats = await fs.lstat(dir).catch(() => null);
+  if (!stats?.isDirectory()) return;
+  await fs.chmod(dir, (stats.mode & 0o7777) | 0o700).catch(() => undefined);
+  for (const child of await fs.readdir(dir).catch(() => [])) {
+    await makeDirectoriesWritable(path.join(dir, child));
+  }
+}
+
+async function removeTree(entry: string): Promise<void> {
+  try {
+    await fs.rm(entry, { recursive: true, force: true });
+  } catch (error) {
+    const code = errorCode(error);
+    if (code !== "EACCES" && code !== "EPERM") throw error;
+    await makeDirectoriesWritable(entry);
+    await fs.rm(entry, { recursive: true, force: true });
   }
 }
 
@@ -113,7 +149,7 @@ export async function touchHeldPaperclipTempEntries(): Promise<void> {
   const now = new Date();
   await Promise.all([...held].map(async (entry) => {
     await fs.utimes(entry, now, now).catch((error: unknown) => {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") held.delete(entry);
+      if (errorCode(error) === "ENOENT") held.delete(entry);
     });
   }));
   syncTouchTimer();
@@ -170,11 +206,12 @@ export async function sweepPaperclipTempEntries(options: {
     }
     const bytes = await entryBytes(entry);
     try {
-      await fs.rm(entry, { recursive: true, force: true });
+      await removeTree(entry);
       result.removed += 1;
       result.freedBytes += bytes;
-    } catch {
+    } catch (error) {
       result.failed += 1;
+      result.firstFailure ??= `${name}: ${errorCode(error) ?? "unknown"}`;
     }
   }
   return result;

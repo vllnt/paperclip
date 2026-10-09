@@ -785,8 +785,12 @@ async function finalizePreparedRuntime(input: {
           diskBacked: true,
         }),
     );
-  const finalHostSha256 = directorySnapshotSha256(finalSnapshot);
-  await disposeDirectorySnapshot(finalSnapshot);
+  let finalHostSha256: string;
+  try {
+    finalHostSha256 = directorySnapshotSha256(finalSnapshot);
+  } finally {
+    await disposeDirectorySnapshot(finalSnapshot);
+  }
   const stamp = finalizedWorkspaceStamp({
     descriptor: input.descriptor,
     hostSha256: finalHostSha256,

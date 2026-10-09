@@ -5,7 +5,6 @@ import {
   createReadStream,
   promises as fs,
 } from "node:fs";
-import os from "node:os";
 import { workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -50,6 +49,7 @@ import {
 } from "./sync-operation-schedule.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 import { withWorkspaceRestoreDiagnostics } from "./workspace-restore-diagnostics.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
@@ -752,11 +752,11 @@ export function sandboxExecutionSessionMatches(saved: unknown, current: SandboxR
 }
 
 async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const dir = await createPaperclipTempDir(prefix);
   try {
     return await fn(dir);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(dir).catch(() => undefined);
   }
 }
 
