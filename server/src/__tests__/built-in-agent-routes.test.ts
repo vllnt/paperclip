@@ -439,4 +439,217 @@ describe("built-in agent routes", () => {
     expect(mockAccessService.decide).not.toHaveBeenCalled();
     expect(mockBuiltInAgentService.reset).not.toHaveBeenCalled();
   });
+
+  describe("agent caller provisioning an existing built-in agent", () => {
+    const agentCaller = {
+      type: "agent",
+      agentId: "99999999-9999-4999-8999-999999999999",
+      companyId,
+      runId: "run-1",
+      source: "agent_jwt",
+    };
+
+    function decideByAction(configureAllowed: boolean) {
+      mockAccessService.decide.mockImplementation(async ({ action }: { action: string }) => {
+        if (action === "agent_config:update" && !configureAllowed) {
+          return { allowed: false, action, reason: "deny_no_grant", explanation: "Missing permission: agents:configure." };
+        }
+        return { allowed: true, action, reason: "allow_explicit_grant", explanation: "Allowed." };
+      });
+    }
+
+    it.each([
+      {
+        label: "adapter config",
+        body: { adapterType: "codex_local", adapterConfig: { model: "gpt-large" } },
+        fields: ["adapterConfig.model"],
+      },
+      { label: "adapter type", body: { adapterType: "claude_local" }, fields: ["adapterType"] },
+      {
+        label: "budget",
+        body: { adapterType: "codex_local", budgetMonthlyCents: 9_999_999 },
+        fields: ["budgetMonthlyCents"],
+      },
+    ])("denies a changed $label without agents:configure and logs it", async ({ body, fields }) => {
+      mockBuiltInAgentService.get.mockResolvedValue(
+        builtInState({ agent: { ...builtInState().agent, runtimeConfig: {}, budgetMonthlyCents: 1_000 } }),
+      );
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields });
+      expect(mockBuiltInAgentService.provision).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: agentCaller.agentId,
+        action: "agent.self_config_update_denied",
+        entityId: agentId,
+        details: expect.objectContaining({ surface: "built_in_provision", fields, builtInAgentKey: "briefs" }),
+      }));
+    });
+
+    it("still provisions when the body changes no protected field", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(
+        builtInState({ agent: { ...builtInState().agent, runtimeConfig: {}, budgetMonthlyCents: 1_000 } }),
+      );
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send({ adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" }, budgetMonthlyCents: 1_000 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
+    });
+
+    it("still provisions a protected change for an agent holding agents:configure", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(
+        builtInState({ agent: { ...builtInState().agent, runtimeConfig: {}, budgetMonthlyCents: 1_000 } }),
+      );
+      decideByAction(true);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send({ adapterType: "codex_local", budgetMonthlyCents: 9_999_999 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
+    });
+
+    it.each([
+      {
+        label: "adapter config",
+        body: { adapterType: "codex_local", adapterConfig: { model: "gpt-large", dangerouslyBypassApprovalsAndSandbox: true } },
+        fields: ["adapterConfig.dangerouslyBypassApprovalsAndSandbox", "adapterConfig.model"],
+      },
+      {
+        label: "budget",
+        body: { adapterType: "codex_local", budgetMonthlyCents: 9_999_999 },
+        fields: ["budgetMonthlyCents"],
+      },
+    ])("denies a first-time provision with $label from an agent and logs it against the company", async ({ body, fields }) => {
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState({ agent: null }));
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields });
+      expect(mockBuiltInAgentService.provision).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        entityType: "company",
+        entityId: companyId,
+        action: "agent.self_config_update_denied",
+        details: expect.objectContaining({ surface: "built_in_first_provision", fields, builtInAgentKey: "briefs" }),
+      }));
+    });
+
+    it("still lets an agent first-provision a built-in agent with no protected settings", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState({ agent: null }));
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send({ adapterType: "codex_local" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
+    });
+
+    it("still first-provisions protected settings for an agent holding agents:configure", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState({ agent: null }));
+      decideByAction(true);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send({ adapterType: "codex_local", budgetMonthlyCents: 9_999_999 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.provision).toHaveBeenCalled();
+    });
+
+    function engineerBuiltInState() {
+      return builtInState({ agent: { ...builtInState().agent, role: "engineer" } });
+    }
+
+    it("denies a reset that would change the stored role without agents:configure, and logs it", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(engineerBuiltInState());
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/reset`)
+        .send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields: ["role"] });
+      expect(mockBuiltInAgentService.reset).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.self_config_update_denied",
+        entityId: agentId,
+        details: expect.objectContaining({ surface: "built_in_reset", fields: ["role"], builtInAgentKey: "briefs" }),
+      }));
+    });
+
+    it("still resets when the stored role already matches the default, and when the reset leaves the agent row out", async () => {
+      decideByAction(false);
+      const app = await createApp(agentCaller);
+
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState());
+      const matching = await request(app).post(`/api/companies/${companyId}/built-in-agents/briefs/reset`).send({});
+      expect(matching.status, JSON.stringify(matching.body)).toBe(200);
+
+      mockBuiltInAgentService.get.mockResolvedValue(engineerBuiltInState());
+      const instructionsOnly = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/reset`)
+        .send({ resources: ["instructions"] });
+      expect(instructionsOnly.status, JSON.stringify(instructionsOnly.body)).toBe(200);
+      expect(mockBuiltInAgentService.reset).toHaveBeenCalledTimes(2);
+    });
+
+    it("still resets a changed role for an agent holding agents:configure", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(engineerBuiltInState());
+      decideByAction(true);
+      const app = await createApp(agentCaller);
+
+      const res = await request(app).post(`/api/companies/${companyId}/built-in-agents/briefs/reset`).send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.reset).toHaveBeenCalled();
+    });
+
+    it("keeps a board caller unchanged", async () => {
+      mockBuiltInAgentService.get.mockResolvedValue(builtInState());
+      decideByAction(false);
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        companyIds: [companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/built-in-agents/briefs/provision`)
+        .send({ budgetMonthlyCents: 9_999_999 });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockBuiltInAgentService.get).not.toHaveBeenCalled();
+    });
+  });
 });

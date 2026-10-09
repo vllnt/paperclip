@@ -68,6 +68,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
 
 // A company import can arrive one of two ways on the import + preview routes:
@@ -372,6 +373,38 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     if (actorAgent.role !== "ceo") {
       throw forbidden(`Only CEO agents can manage ${capability}`);
     }
+  }
+
+  /**
+   * The safe import route cannot overwrite an agent, but it creates agents with
+   * the package's adapter, runtime caps, budget, and permissions. A CEO agent
+   * that imports agents therefore needs a company-wide `agents:configure`, as
+   * it does to create an agent with those settings directly. Board callers and
+   * imports that leave agents out are unchanged.
+   */
+  async function assertAgentCallerMayImportAgents(
+    req: Request,
+    companyId: string,
+    include: { agents?: boolean } | undefined,
+  ) {
+    if (req.actor.type !== "agent" || include?.agents === false) return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target: { id: randomUUID(), companyId },
+      entity: { type: "company", id: companyId },
+      fields: ["importedAgents"],
+      surface: "company_import",
+    });
   }
 
   router.get("/", async (req, res) => {
@@ -1163,6 +1196,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     if (body.collisionStrategy === "replace") {
       throw forbidden("Safe import route does not allow replace collision strategy");
     }
+    await assertAgentCallerMayImportAgents(req, companyId, body.include);
     const actor = getActorInfo(req);
     const result = await portability.importBundle(body, req.actor.type === "board" ? req.actor.userId : null, {
       mode: "agent_safe",
