@@ -5,6 +5,7 @@ import {
   buildHarnessTargetAgentView,
   classifyQuotaFailure,
   listHarnessTargets,
+  overridesForHarnessTarget,
   readQuotaBackoffMaxMinutes,
   reclassifyProviderQuotaResult,
   resolveCooldownUntil,
@@ -215,6 +216,17 @@ describe("harness targets", () => {
     expect(selectHarnessTarget(solo, new Map([["claude_local:claude-opus-5-5", until]]), NOW))
       .toMatchObject({ kind: "primary", heldUntil: until });
     expect(selectHarnessTarget(solo, new Map(), NOW)).toMatchObject({ kind: "primary", heldUntil: null });
+  });
+});
+
+describe("overridesForHarnessTarget", () => {
+  const overrides = { model: "claude-opus-5-5", env: { A: "1" }, extraArgs: ["--x"], workspaceStrategy: { type: "project_primary" } };
+
+  it("keeps every override for the primary and drops model and env overrides for a fallback", () => {
+    expect(overridesForHarnessTarget(overrides, { target: "primary" })).toBe(overrides);
+    expect(overridesForHarnessTarget(overrides, null)).toBe(overrides);
+    expect(overridesForHarnessTarget(overrides, { target: "fallback" })).toEqual({ workspaceStrategy: { type: "project_primary" } });
+    expect(overridesForHarnessTarget(undefined, { target: "fallback" })).toEqual({});
   });
 });
 

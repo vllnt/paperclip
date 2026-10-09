@@ -8,6 +8,7 @@ import {
   checkRunHarnessCompatibility,
   classifyQuotaFailure,
   harnessFallbackService,
+  overridesForHarnessTarget,
   primaryHarnessDispatch,
   readClaimedHarnessDispatch,
   reclassifyProviderQuotaResult,
@@ -21964,7 +21965,7 @@ export function heartbeatService(
       });
       const mergedConfig = {
         ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
+        ...overridesForHarnessTarget(issueAssigneeOverrides?.adapterConfig, claimedHarnessDispatch),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
         ...(useIsolatedTaskDirectory ? { workspaceStrategy: { type: "project_primary" } } : {}),

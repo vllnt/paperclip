@@ -173,6 +173,15 @@ describeEmbeddedPostgres("agent fallbacks routes", () => {
     expect(res.body).toMatchObject({ details: { code: "harness_model_incompatible" } });
   });
 
+  it("refuses to hire a Codex agent on an Anthropic model", async () => {
+    const { companyId } = await seed();
+    const res = await request(createApp(db, boardActor(companyId)))
+      .post(`/api/companies/${companyId}/agent-hires`)
+      .send({ name: "Codex Builder", role: "engineer", adapterType: "codex_local", adapterConfig: { model: "claude-opus-5-5" } });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body).toMatchObject({ details: { code: "harness_model_incompatible" } });
+  });
+
   it("refuses plaintext credentials in fallback env", async () => {
     const { companyId, agentId } = await seed();
     const res = await request(createApp(db, boardActor(companyId)))

@@ -270,6 +270,32 @@ export function selectHarnessTarget(
 
 const CARRIED_ENGINE_ADAPTERS = new Set(["claude_local", "codex_local"]);
 
+/** Keys that select a run's model, command line or environment. */
+const RUN_TARGET_OVERRIDE_KEYS = new Set([
+  "model", "effort", "modelReasoningEffort", "reasoningEffort", "thinking", "variant",
+  "env", "extraArgs", "args", "command", "provider",
+]);
+
+/**
+ * An issue's per-assignee adapter overrides, without the keys that choose the
+ * model or environment, when the run executes on a fallback target. Those
+ * overrides were written for the primary harness: a per-issue Anthropic model
+ * would be refused on Codex, and an env override would replace the fallback's
+ * own credentials.
+ *
+ * @param overrides - The issue's adapterConfig overrides, if any.
+ * @param dispatch - The dispatch the run was claimed with.
+ * @returns The overrides to merge into the run config.
+ */
+export function overridesForHarnessTarget(
+  overrides: Record<string, unknown> | null | undefined,
+  dispatch: { target: "primary" | "fallback" } | null,
+): Record<string, unknown> {
+  if (!overrides) return {};
+  if (dispatch?.target !== "fallback") return overrides;
+  return Object.fromEntries(Object.entries(overrides).filter(([key]) => !RUN_TARGET_OVERRIDE_KEYS.has(key)));
+}
+
 /**
  * The agent as a fallback target runs it. A fallback keeps the agent's
  * harness-agnostic keys (instructions, prompt, cwd, timeouts, skills) and the

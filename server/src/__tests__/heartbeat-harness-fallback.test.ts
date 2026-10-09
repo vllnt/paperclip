@@ -328,6 +328,19 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     expect(await pending(companyId, "harness_fallback")).not.toBeNull();
   });
 
+  it("does not apply an issue's primary model override to a fallback run", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: { model: "claude-sonnet-5" } } }).where(eq(issues.id, issueId));
+    scripts.claude_local = [{ kind: "usage_limit" }];
+
+    await assign(agentId, issueId);
+    const fallbackRun = await runPending(companyId, "harness_fallback");
+
+    expect(invocations[0]).toMatchObject({ adapterType: "claude_local", model: "claude-sonnet-5" });
+    expect(fallbackRun).toMatchObject({ status: "succeeded", executedModel: "gpt-5.5" });
+    expect(invocations.at(-1)).toMatchObject({ adapterType: "codex_local", model: "gpt-5.5" });
+  });
+
   it("starts a fallback whose credential is a secret reference, binding it to the agent", async () => {
     const { companyId, agentId, issueId } = await seed({ fallbacks: [] });
     const secret = await secretService(db).create(companyId, {
