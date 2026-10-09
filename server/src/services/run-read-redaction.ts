@@ -42,12 +42,57 @@ function patternPass(value: object): Record<string, unknown> {
 }
 
 const ENV_OBJECT_KEY = /^(env|environment|envVars|environmentVariables)$/i;
-const PEM_BLOCK = /-----BEGIN [^-\n]+-----[\s\S]*?-----END [^-\n]+-----/g;
-// scheme://userinfo@host: the user part can itself be a token, so drop all of it.
-const URL_USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/gi;
+// scheme://userinfo@host: the user part can itself be a token, so drop all of
+// it. The lookbehind lets a scheme start only where a run of scheme characters
+// starts, so a long run without "://" is tried once, not once per position.
+const URL_USERINFO = /(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/gi;
 
-function redactSecretShapedText(text: string): string {
-  return text.replace(PEM_BLOCK, REDACTED_EVENT_VALUE).replace(URL_USERINFO, `$1${REDACTED_EVENT_VALUE}@`);
+const PEM_BEGIN = "-----BEGIN ";
+const PEM_END = "-----END ";
+const PEM_DASHES = "-----";
+
+/** A PEM label: one or more characters, no dash and no newline. */
+function pemLabelEnd(text: string, from: number): number {
+  const end = text.indexOf(PEM_DASHES, from);
+  if (end <= from) return -1;
+  for (let index = from; index < end; index += 1) {
+    if (text[index] === "-" || text[index] === "\n") return -1;
+  }
+  return end;
+}
+
+/**
+ * Replaces each `-----BEGIN <label>----- … -----END <label>-----` block, the
+ * shortest one from each start, in one forward scan: a lazy regex retries the
+ * rest of the text from every start, which is quadratic on many headers.
+ */
+function redactPemBlocks(text: string): string {
+  let output = "";
+  let position = 0;
+  for (let begin = text.indexOf(PEM_BEGIN); begin >= 0; begin = text.indexOf(PEM_BEGIN, begin + 1)) {
+    if (begin < position) continue;
+    const headerEnd = pemLabelEnd(text, begin + PEM_BEGIN.length);
+    if (headerEnd < 0) continue;
+    let blockEnd = -1;
+    for (let end = text.indexOf(PEM_END, headerEnd + PEM_DASHES.length); end >= 0; end = text.indexOf(PEM_END, end + 1)) {
+      const labelEnd = pemLabelEnd(text, end + PEM_END.length);
+      if (labelEnd >= 0) {
+        blockEnd = labelEnd + PEM_DASHES.length;
+        break;
+      }
+    }
+    // No end line after this header means none after any later header either.
+    if (blockEnd < 0) break;
+    output += text.slice(position, begin) + REDACTED_EVENT_VALUE;
+    position = blockEnd;
+    begin = blockEnd - 1;
+  }
+  return position === 0 ? text : output + text.slice(position);
+}
+
+/** PEM blocks and URL userinfo in one string, in time linear in its length. */
+export function redactSecretShapedText(text: string): string {
+  return redactPemBlocks(text).replace(URL_USERINFO, `$1${REDACTED_EVENT_VALUE}@`);
 }
 
 /**
