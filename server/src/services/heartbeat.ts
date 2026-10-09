@@ -28,7 +28,7 @@ import { AGENT_CHAT_DIRECTIVE, isConversation, isConversationExecutionWake, isWa
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
+import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
@@ -563,6 +563,8 @@ import {
 import {
   buildSelfReblockWakeParkedState,
   createWakeQueue,
+  DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+  DEFERRED_WAKE_SWEEP_RECHECK_MS,
   decideSelfReblockWakeLimit,
   deriveSelfReblockWakeMarker,
   isSelfReblockWakeOwner,
@@ -570,9 +572,11 @@ import {
   SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY,
   SELF_REBLOCK_WAKE_PAYLOAD_KEY,
   SELF_REBLOCK_WAKE_WINDOW_MS,
+  selectDeferredWakesToPromote,
   selfReblockWakeWindowStart,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
+  type OrphanedDeferredWakeRow,
   type PostCommitEffect as WakeQueuePostCommitEffect,
   type ReleaseRecoveryBlockedNoticeKind,
   type RunSnapshot as WakeQueueRunSnapshot,
@@ -19603,6 +19607,7 @@ export function heartbeatService(
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       await startNextQueuedRunForAgent(run.agentId);
+      await redeliverDeferredWakesForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
@@ -19731,6 +19736,286 @@ export function heartbeatService(
         await repark(tx as unknown as Db, wake);
       }
     });
+  }
+
+  // Process-wide counters for deferred-wake redelivery. They reset on restart;
+  // `getDeferredWakeStats` pairs them with durable counts read from the queue.
+  const deferredWakeSweepMetrics = {
+    passes: 0,
+    completionPasses: 0,
+    examined: 0,
+    promoted: 0,
+    retired: 0,
+    stillDeferred: 0,
+    skippedHeld: 0,
+    skippedNotInvokable: 0,
+    failed: 0,
+    lastPassAt: null as Date | null,
+  };
+  // The completion trigger runs after a run frees a slot. Promotion queues a run
+  // whose start calls `startNextQueuedRunForAgent` again, so one pass per agent.
+  const deferredWakeCompletionPassesInFlight = new Set<string>();
+
+  /**
+   * The holds that mean "do not wake this issue" and need more than a column to
+   * prove: an active subtree pause hold, an execution blocker awaiting an
+   * operator, and an operator Stop. An operator Stop never promotes old queued
+   * work by itself; the next explicit wake adopts it.
+   */
+  async function readDeferredWakeHold(candidate: Pick<OrphanedDeferredWakeRow, "companyId" | "issueId">) {
+    if (await treeControlSvc.getActivePauseHoldGate(candidate.companyId, candidate.issueId)) {
+      return "pause_hold" as const;
+    }
+    if (await getExecutionBlocker(db, candidate.companyId, candidate.issueId)) {
+      return "execution_blocker" as const;
+    }
+    const [latest] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, candidate.companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${candidate.issueId}`,
+      ))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1);
+    if (
+      latest &&
+      (isAcknowledgedNativeReassignmentStop(latest) ||
+        (latest.status === "cancelled" &&
+          (parseObject(latest.resultJson?.executionCancellation).state === "acknowledged" ||
+            isAcknowledgedNativeStop(latest))))
+    ) {
+      return "operator_stop" as const;
+    }
+    return null;
+  }
+
+  /**
+   * An orphaned wake on an issue that never had a run the drain can anchor to is
+   * re-admitted through ordinary admission, which applies every gate again.
+   * One transaction holds a per-wake lock and retires the parked receipt only
+   * after the re-admitted wake is durable under a key derived from it, so a
+   * crash or a concurrent pass can never admit the wake twice.
+   */
+  async function readmitDeferredWakeWithoutAnchor(wake: typeof agentWakeupRequests.$inferSelect) {
+    const promotionKey = `deferred-wake-anchor-missing:${wake.id}`;
+    await db.transaction(async (tx) => {
+      const locks = await tx.execute(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${promotionKey}, 0)) as acquired`,
+      );
+      if (!locks[0]?.acquired) return;
+      const readmission = () => tx
+        .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.idempotencyKey, promotionKey)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!(await readmission())) {
+        const { [DEFERRED_WAKE_CONTEXT_KEY]: deferredContext, ...payload } = parseObject(wake.payload);
+        const context = parseObject(deferredContext);
+        await enqueueWakeup(wake.agentId, {
+          source: (wake.source ?? "automation") as WakeupOptions["source"],
+          triggerDetail: (wake.triggerDetail ?? "system") as WakeupOptions["triggerDetail"],
+          // A parked receipt's own reason is the deferral; the wake's reason is in its context.
+          reason: readNonEmptyString(context.wakeReason) ?? wake.reason,
+          payload: { ...payload, deferredWakeRedelivery: { mode: "anchor_missing", fromWakeId: wake.id } },
+          contextSnapshot: context,
+          requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+          requestedByActorId: wake.requestedByActorId,
+          idempotencyKey: promotionKey,
+        }).catch((err) => {
+          logger.warn({ err, queueId: wake.id }, "anchorless deferred wake was not re-admitted");
+        });
+      }
+      const readmitted = await readmission();
+      if (readmitted) {
+        const now = new Date();
+        await tx.update(agentWakeupRequests).set({
+          status: "cancelled",
+          reason: "issue_deferred_wake_readmitted",
+          runId: readmitted.runId,
+          finishedAt: now,
+          updatedAt: now,
+        }).where(and(
+          eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.companyId, wake.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
+      }
+    });
+  }
+
+  /**
+   * Re-drives one orphaned wake through the same release admission that promotes
+   * it when a holder finishes, so liveness, pause holds, invokability and
+   * terminal-task rules apply exactly as they do on a normal release. The anchor
+   * run confers no ownership and suppresses recovery; see `anchorRunOnly`.
+   */
+  async function redriveOrphanedDeferredWake(candidate: OrphanedDeferredWakeRow) {
+    const anchor = await wakeQueue.findParkedWakeAnchorRun({
+      companyId: candidate.companyId,
+      issueId: candidate.issueId,
+    });
+    if (anchor) {
+      await releaseIssueExecutionAndPromote(anchor, { suppressImmediateRecovery: true, anchorRunOnly: true });
+    } else {
+      const [wake] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, candidate.wakeId),
+        eq(agentWakeupRequests.companyId, candidate.companyId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      if (wake) await readmitDeferredWakeWithoutAnchor(wake);
+    }
+    const [after] = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, candidate.wakeId));
+    if (!after || after.status === "deferred_issue_execution") return "stillDeferred" as const;
+    return after.runId ? ("promoted" as const) : ("retired" as const);
+  }
+
+  /**
+   * Safety net for deferred wakes nothing will promote. A wake is parked behind
+   * its issue's execution lock and promoted when the holder releases; several
+   * paths clear that lock without the drain (the stale-lock sweeper, the
+   * claim-time stale-run cancel, a reaped holder), and the older recovery only
+   * saw comment-shaped wakes of an agent that had already run the issue. This
+   * finds every wake whose lock is free, skips held work, and promotes in
+   * priority then FIFO order, at most one per issue and one per free agent slot.
+   * Idempotent: an optimistic claim on the wake plus the drain's own
+   * compare-and-set mean concurrent passes can start at most one run per wake.
+   */
+  async function sweepDeferredWakes(opts: {
+    agentId?: string;
+    /** `0` for the run-completion trigger; the periodic sweep waits `DEFERRED_WAKE_SWEEP_MIN_AGE_MS`. */
+    minAgeMs?: number;
+    recheckMs?: number;
+    maxPromotions?: number;
+    now?: Date;
+  } = {}) {
+    const result = {
+      scanned: 0,
+      promoted: 0,
+      retired: 0,
+      stillDeferred: 0,
+      skippedHeld: 0,
+      skippedNotInvokable: 0,
+      skippedCapacity: 0,
+      failed: 0,
+    };
+    if ((await getSchedulingSuppression()).suppressed) return result;
+    const now = opts.now ?? new Date();
+    deferredWakeSweepMetrics.passes += 1;
+    deferredWakeSweepMetrics.lastPassAt = now;
+
+    const orphans = await wakeQueue.listOrphanedDeferredWakes({
+      now,
+      minAgeMs: opts.minAgeMs ?? DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+      recheckMs: opts.recheckMs ?? DEFERRED_WAKE_SWEEP_RECHECK_MS,
+      ...(opts.agentId ? { agentId: opts.agentId } : {}),
+      requestedAtGte: await getWorktreeExecutionCutoff(),
+    });
+    result.scanned = orphans.length;
+    deferredWakeSweepMetrics.examined += orphans.length;
+    if (orphans.length === 0) return result;
+
+    const freeSlotsByAgent = new Map<string, number>();
+    for (const agentId of new Set(orphans.map((orphan) => orphan.agentId))) {
+      const agent = await getAgent(agentId);
+      if (!agent) continue;
+      const running = await countRunningRunsForAgent(agentId);
+      freeSlotsByAgent.set(agentId, Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - running));
+    }
+    const selected = selectDeferredWakesToPromote(orphans, freeSlotsByAgent, {
+      ...(opts.maxPromotions !== undefined ? { maxTotal: opts.maxPromotions } : {}),
+    });
+    result.skippedCapacity = new Set(orphans.map((orphan) => orphan.issueId)).size - selected.length;
+
+    for (const candidate of selected) {
+      try {
+        const claimed = await wakeQueue.claimDeferredWakeExamination({
+          companyId: candidate.companyId,
+          wakeId: candidate.wakeId,
+          observedUpdatedAt: candidate.observedUpdatedAt,
+          now: new Date(),
+        });
+        if (!claimed) continue;
+        const agent = await getAgent(candidate.agentId);
+        if (!agent || !(await getAgentInvokability(agent)).invokable) {
+          result.skippedNotInvokable += 1;
+          continue;
+        }
+        if (await readDeferredWakeHold(candidate)) {
+          result.skippedHeld += 1;
+          continue;
+        }
+        result[await redriveOrphanedDeferredWake(candidate)] += 1;
+      } catch (err) {
+        result.failed += 1;
+        logger.warn({ err, queueId: candidate.wakeId }, "failed to re-deliver an orphaned deferred wake");
+      }
+    }
+
+    deferredWakeSweepMetrics.promoted += result.promoted;
+    deferredWakeSweepMetrics.retired += result.retired;
+    deferredWakeSweepMetrics.stillDeferred += result.stillDeferred;
+    deferredWakeSweepMetrics.skippedHeld += result.skippedHeld;
+    deferredWakeSweepMetrics.skippedNotInvokable += result.skippedNotInvokable;
+    deferredWakeSweepMetrics.failed += result.failed;
+    if (result.promoted > 0 || result.failed > 0) {
+      logger.warn({ ...result }, "re-delivered orphaned deferred issue-execution wakes");
+    }
+    return result;
+  }
+
+  /**
+   * Run-completion trigger: a run just freed one of this agent's slots, so
+   * promote its oldest (priority-aware) orphaned deferred wake now instead of
+   * waiting for the periodic sweep. Best effort; the periodic sweep is the net.
+   */
+  async function redeliverDeferredWakesForAgent(agentId: string) {
+    if (deferredWakeCompletionPassesInFlight.has(agentId)) return;
+    deferredWakeCompletionPassesInFlight.add(agentId);
+    try {
+      deferredWakeSweepMetrics.completionPasses += 1;
+      await sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
+    } catch (err) {
+      logger.warn({ err, agentId }, "failed to re-deliver deferred wakes after a run completed");
+    } finally {
+      deferredWakeCompletionPassesInFlight.delete(agentId);
+    }
+  }
+
+  /**
+   * Per-agent deferred-queue health for the API: how many wakes are parked, how
+   * long the oldest has waited, and how many were promoted recently. The sweep
+   * counters are process-wide since the last restart.
+   */
+  async function getDeferredWakeStats(companyId: string, now = new Date()) {
+    const perAgent = await wakeQueue.getDeferredWakeAgentStats({ companyId, now });
+    const agentStats = perAgent.map((row) => ({
+      agentId: row.agentId,
+      agentName: row.agentName,
+      deferredCount: row.deferredCount,
+      oldestDeferredAt: row.oldestDeferredAt,
+      oldestDeferredAgeSeconds: row.oldestDeferredAt
+        ? Math.max(0, Math.round((now.getTime() - row.oldestDeferredAt.getTime()) / 1000))
+        : null,
+      promotedLast24h: row.promotedLast24h,
+    }));
+    const oldest = agentStats
+      .map((row) => row.oldestDeferredAt)
+      .filter((at): at is Date => at !== null)
+      .sort((left, right) => left.getTime() - right.getTime())[0] ?? null;
+    return {
+      generatedAt: now,
+      deferredTotal: agentStats.reduce((sum, row) => sum + row.deferredCount, 0),
+      promotedLast24h: agentStats.reduce((sum, row) => sum + row.promotedLast24h, 0),
+      oldestDeferredAt: oldest,
+      oldestDeferredAgeSeconds: oldest ? Math.max(0, Math.round((now.getTime() - oldest.getTime()) / 1000)) : null,
+      agents: agentStats,
+      sweep: { ...deferredWakeSweepMetrics },
+    };
   }
 
   async function resumeQueuedRuns() {
@@ -19865,6 +20150,13 @@ export function heartbeatService(
         logger.error({ err, runId: run.id }, "failed to retry interrupted comment queue");
       });
     }
+
+    // Every deferred wake above waits for a specific trigger. Any other wake
+    // whose issue lock is already free has no run left to promote it, so
+    // re-deliver it here instead of leaving it parked indefinitely.
+    await sweepDeferredWakes().catch((err) => {
+      logger.error({ err }, "failed to sweep orphaned deferred wakes");
+    });
 
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
@@ -26973,6 +27265,7 @@ export function heartbeatService(
             });
         }
         await startNextQueuedRunForAgent(run.agentId);
+        await redeliverDeferredWakesForAgent(run.agentId);
       }
     }
   }
@@ -30252,6 +30545,7 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
         await startNextQueuedRunForAgent(run.agentId);
+        await redeliverDeferredWakesForAgent(run.agentId);
       }
       return cancelled;
     } finally {
@@ -30759,6 +31053,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    sweepDeferredWakes,
+    getDeferredWakeStats,
 
     scheduleBoundedRetry: async (
       runId: string,

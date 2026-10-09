@@ -193,6 +193,18 @@ New comments received during an execution hold retain their individual deferred 
 
 The conversation groups repeated empty pre-start reconciliation cancellations into a neutral waiting notice. Started runs, actual startup failures, and run history remain inspectable. No historical run records are deleted.
 
+### Deferred wakes are always re-delivered
+
+A wake that arrives while another run holds the issue's execution lock is parked as `deferred_issue_execution`. The release of that lock promotes it. Some paths clear the lock without that release: the stale-lock sweeper, a claim-time stale-run cancel and a reaped holder. A wake parked behind one of them has no run left to promote it. Paperclip re-delivers such a wake by itself, so a parked wake can no longer stall an issue indefinitely.
+
+- **When.** The periodic recovery pass (`resumeQueuedRuns`, also at startup) re-delivers a wake parked for at least two minutes. When a run completes, fails or is cancelled, Paperclip checks that agent's wakes at once, with no age gate.
+- **What is eligible.** The issue has no `executionRunId`. No queued, running or scheduled-retry run exists for it. The agent is not paused, and the issue is not hidden.
+- **What is never woken.** An active subtree pause hold, an execution blocker that awaits an operator, an operator Stop and an agent that is not invokable all keep the wake parked. The wake resumes when the hold clears. Durable chat input, queued-comment interrupts and limit-parked self-reblock wakes keep their own recovery.
+- **Order and capacity.** The order is issue priority, then FIFO. Each issue gives its oldest wake only. An agent receives at most as many wakes as it has free run slots (`maxConcurrentRuns` minus its running runs). The rest wait for the next pass.
+- **Same rules as a normal release.** Promotion uses the release admission of a finished holder, so comment liveness, terminal-task rules and invokability apply unchanged. An issue with no finished run to anchor to is re-admitted through ordinary admission under a key derived from the wake id.
+- **Idempotent.** An optimistic claim on the wake and the promotion's own compare-and-set mean concurrent passes start at most one run per wake.
+- **Visibility.** `GET /api/companies/:companyId/deferred-wakes` returns, per agent, `deferredCount`, `oldestDeferredAt`, `oldestDeferredAgeSeconds` and `promotedLast24h`, plus the sweep counters since the server started (`promoted`, `retired`, `stillDeferred`, `skippedHeld`, `failed`). A growing `oldestDeferredAgeSeconds` for an agent that has free capacity is a stall.
+
 Workspace contention (`workspace_busy`) displays **Waiting for workspace** and
 continues automatically when the workspace is available. Internal scheduling
 attempts remain in the run log without conversation cancellation markers,
