@@ -21,6 +21,9 @@ import {
   WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
 } from "./workspace-restore-merge.js";
 
+/** What a released lock leaves in the lock root, in `readdir` order. */
+const PERMANENT_LOCK_FILES = [expect.stringMatching(/^[0-9a-f]{64}\.lock\.queue\.sqlite$/), expect.stringMatching(/^[0-9a-f]{64}\.lock\.sqlite$/)];
+
 describe("workspace restore merge", () => {
   const cleanupDirs: string[] = [];
 
@@ -394,10 +397,10 @@ describe("workspace restore merge", () => {
 
       expect((await stat(lockRootDir)).mode & 0o777).toBe(0o700);
       expect(entriesDuringLock.filter((name) => name.endsWith(".owner.json"))).toHaveLength(1);
+      // The lock and its admission queue are permanent; waiter files are not.
       const entriesAfterRelease = await readdir(lockRootDir);
-      expect(entriesAfterRelease).toHaveLength(1);
-      expect(entriesAfterRelease[0]).toMatch(/\.lock\.sqlite$/);
-      expect((await stat(path.join(lockRootDir, entriesAfterRelease[0]!))).mode & 0o777).toBe(0o600);
+      expect(entriesAfterRelease).toEqual(PERMANENT_LOCK_FILES);
+      for (const name of entriesAfterRelease) expect((await stat(path.join(lockRootDir, name))).mode & 0o777).toBe(0o600);
     });
 
     it("classifies the real lock-timeout error by its stable code, never by the message text", async () => {
@@ -475,7 +478,7 @@ describe("workspace restore merge", () => {
         expect(contender).not.toHaveBeenCalled();
         expect((await readdir(lockRoot)).filter((name) => name.endsWith(".owner.json"))).toHaveLength(1);
       });
-      expect(await readdir(lockRoot)).toEqual([expect.stringMatching(/\.lock\.sqlite$/)]);
+      expect(await readdir(lockRoot)).toEqual(PERMANENT_LOCK_FILES);
     });
 
     it("delivers the timeout when the diagnostic owner read stalls and ignores its late rejection", async () => {
@@ -1072,6 +1075,6 @@ describe("parallel restores into one shared project workspace", () => {
 
     expect(beforeApply).toHaveBeenCalledTimes(1);
     expect(afterApply).toHaveBeenCalledTimes(1);
-    expect(await readdir(lockRoot)).toEqual([expect.stringMatching(/\.lock\.sqlite$/)]);
+    expect(await readdir(lockRoot)).toEqual(PERMANENT_LOCK_FILES);
   });
 });

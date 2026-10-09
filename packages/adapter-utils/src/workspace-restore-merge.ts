@@ -149,9 +149,8 @@ async function hashFile(filePath: string): Promise<string> {
 // skip exactly these names.
 const MERGE_STAGING_PREFIX = ".paperclip-merge-";
 const UUID_GROUP_LENGTHS = [8, 4, 4, 4, 12];
-const MERGE_STAGING_NAME = new RegExp(
-  `^${MERGE_STAGING_PREFIX.replaceAll(".", "\\.")}${UUID_GROUP_LENGTHS.map((length) => `[0-9a-f]{${length}}`).join("-")}$`,
-);
+const UUID_SOURCE = UUID_GROUP_LENGTHS.map((length) => `[0-9a-f]{${length}}`).join("-");
+const MERGE_STAGING_NAME = new RegExp(`^${MERGE_STAGING_PREFIX.replaceAll(".", "\\.")}${UUID_SOURCE}$`);
 /** The tar `--exclude` glob for the merge staging names a snapshot walk skips. */
 export const MERGE_STAGING_TAR_EXCLUDE = `${MERGE_STAGING_PREFIX}${UUID_GROUP_LENGTHS.map((length) => "[0-9a-f]".repeat(length)).join("-")}`;
 
@@ -372,6 +371,148 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
   }
 }
 
+function isSqliteBusy(error: unknown): boolean {
+  const code = (error as { errcode?: number } | null)?.errcode;
+  return typeof code === "number" && (code & 0xff) === 5;
+}
+
+// Let SQLite create and manage every descriptor for these inodes. On POSIX,
+// closing a raw fs.open descriptor could release another connection's locks.
+// The parent is private (0700), including while a new file is chmodded.
+async function openLockRootDatabase(filePath: string): Promise<DatabaseSync> {
+  const stats = await fs.lstat(filePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (stats && (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1)) {
+    throw new Error("Directory merge lock database is not a plain, unshared file.");
+  }
+  const database = new DatabaseSync(filePath, { allowExtension: false });
+  try {
+    await fs.chmod(filePath, 0o600);
+    // Never block the event loop while another async operation holds a lock.
+    database.exec("PRAGMA busy_timeout=0;");
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}
+
+// First-come admission. Contenders that each retry the lock every 50 ms win in
+// random order, so newer restores could keep overtaking an older one until its
+// wait expired. Each contender instead takes a ticket in `<lock>.queue.sqlite`,
+// and only the oldest live ticket tries the lock. Tickets order attempts only:
+// the lock database stays the sole authority for mutual exclusion, so a lost
+// or stale ticket can delay a contender but never admit two.
+//
+// A contender holds the SQLite lock of its own `<lock>.waiter-<uuid>.sqlite`
+// before it takes a ticket and until it gives the ticket up. The OS releases
+// that lock if the contender crashes, so others prove a ticket dead by
+// locking its file, never from PIDs, ages, or clocks.
+const ADMISSION_PROBE_INTERVAL_MS = 1_000;
+const WAITER_TOKEN = new RegExp(`^${UUID_SOURCE}$`);
+
+function waiterFilePath(lockDir: string, token: string): string {
+  return `${lockDir}.waiter-${token}.sqlite`;
+}
+
+// Opening creates a missing file, which is then unlocked: missing and unlocked
+// both mean the ticket's contender left or died.
+async function waiterIsLive(lockDir: string, token: string): Promise<boolean> {
+  const probe = await openLockRootDatabase(waiterFilePath(lockDir, token));
+  try {
+    probe.exec("BEGIN IMMEDIATE;");
+    probe.exec("ROLLBACK;");
+    return false;
+  } catch (error) {
+    if (isSqliteBusy(error)) return true;
+    throw error;
+  } finally { probe.close(); }
+}
+
+// Best effort: the next contender removes a ticket whose waiter file is
+// unlocked, so a busy or failing queue only delays that cleanup.
+async function removeOwnTicket(queue: DatabaseSync, seq: number): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      queue.prepare("DELETE FROM tickets WHERE seq = ?").run(seq);
+      return;
+    } catch (error) {
+      if (!isSqliteBusy(error)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+interface DirectoryMergeAdmission {
+  /** True once no live contender holds an older ticket. A busy queue answers false. */
+  isNext(): Promise<boolean>;
+  /** Gives up the ticket. Never throws. */
+  leave(): Promise<void>;
+}
+
+function joinDirectoryMergeAdmission(lockDir: string): DirectoryMergeAdmission {
+  const token = randomUUID();
+  let waiter: DatabaseSync | null = null;
+  let queue: DatabaseSync | null = null;
+  let seq: number | null = null;
+  let left = false;
+  let watched = { token: "", since: 0 };
+  return {
+    async isNext() {
+      try {
+        waiter ??= await openLockRootDatabase(waiterFilePath(lockDir, token));
+        if (!waiter.isTransaction) waiter.exec("BEGIN IMMEDIATE;");
+        queue ??= await openLockRootDatabase(`${lockDir}.queue.sqlite`);
+        if (seq === null) {
+          queue.exec("CREATE TABLE IF NOT EXISTS tickets (seq INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL UNIQUE);");
+          const ticket = queue.prepare("INSERT INTO tickets (token) VALUES (?) RETURNING seq").get(token);
+          if (!ticket) throw new Error("Directory merge admission ticket was not created.");
+          seq = Number(ticket.seq);
+        }
+        // Probe a ticket only after it has stayed oldest for a while, except
+        // right after removing a dead one: crashes are rare, handoffs are not.
+        let probeNow = false;
+        while (true) {
+          const older = queue.prepare("SELECT seq, token FROM tickets WHERE seq < ? ORDER BY seq LIMIT 1").get(seq);
+          if (!older) return true;
+          const olderToken = String(older.token);
+          const now = performance.now();
+          if (!probeNow) {
+            if (watched.token !== olderToken) {
+              watched = { token: olderToken, since: now };
+              return false;
+            }
+            if (now - watched.since < ADMISSION_PROBE_INTERVAL_MS) return false;
+          }
+          watched = { token: olderToken, since: now };
+          const valid = WAITER_TOKEN.test(olderToken);
+          if (valid && await waiterIsLive(lockDir, olderToken)) return false;
+          queue.prepare("DELETE FROM tickets WHERE seq = ? AND token = ?").run(Number(older.seq), olderToken);
+          if (valid) await fs.rm(waiterFilePath(lockDir, olderToken), { force: true });
+          probeNow = true;
+        }
+      } catch (error) {
+        if (isSqliteBusy(error)) return false;
+        throw error;
+      }
+    },
+    async leave() {
+      if (left) return;
+      left = true;
+      try {
+        if (queue && seq !== null) await removeOwnTicket(queue, seq);
+      } finally {
+        queue?.close();
+        // Closing ends the waiter file's lock; the file is no longer needed.
+        waiter?.close();
+        await fs.rm(waiterFilePath(lockDir, token), { force: true }).catch(() => undefined);
+      }
+    },
+  };
+}
+
 async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryMergeLockOperation, waitMs: number = LOCK_WAIT_MS): Promise<() => Promise<void>> {
   const startedAt = performance.now();
   const deadline = Date.now() + waitMs;
@@ -396,31 +537,21 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
   // is permanent: unlinking it would let contenders lock different inodes.
   // node:sqlite is already required for workspace manifests; no native add-on
   // or external flock command is needed on macOS, Linux, or Windows.
-  const databaseStat = await fs.lstat(databasePath).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  });
-  if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink() || databaseStat.nlink !== 1)) {
-    throw new Error("Directory merge lock database is not a plain, unshared file.");
-  }
-  // Let SQLite create and manage every descriptor for this inode. On POSIX,
-  // closing a raw fs.open descriptor could release another connection's locks.
-  // The parent is private (0700), including while a new file is chmodded.
-  const database = new DatabaseSync(databasePath, { allowExtension: false });
+  const database = await openLockRootDatabase(databasePath);
+  const admission = joinDirectoryMergeAdmission(lockDir);
   try {
-    await fs.chmod(databasePath, 0o600);
-    // Never block the event loop while another async operation holds the lock.
-    database.exec("PRAGMA busy_timeout=0;");
     while (true) {
-      try {
-        database.exec("BEGIN IMMEDIATE;");
-        break;
-      } catch (error) {
-        const code = (error as { errcode?: number }).errcode;
-        if (typeof code !== "number" || (code & 0xff) !== 5) throw error; // SQLITE_BUSY
-        await waitForLock(ownerPath);
+      if (await admission.isNext()) {
+        try {
+          database.exec("BEGIN IMMEDIATE;");
+          break;
+        } catch (error) {
+          if (!isSqliteBusy(error)) throw error;
+        }
       }
+      await waitForLock(ownerPath);
     }
+    await admission.leave();
 
     // Old processes do not participate in the SQLite protocol. Never infer
     // that a legacy owner is dead from PID existence, age, or missing metadata.
@@ -450,6 +581,7 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
       }
     };
   } catch (error) {
+    await admission.leave();
     database.close();
     throw error;
   }

@@ -1,8 +1,9 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { access, link, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -104,6 +105,76 @@ describe("directory merge lock process lifetime", () => {
     await exited;
     await expect(withDirectoryMergeLock(target, async () => "released", env)).resolves.toBe("released");
   }, 15_000);
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  async function queuedTickets(lock: string): Promise<number> {
+    try {
+      const database = new DatabaseSync(`${lock}.queue.sqlite`, { readOnly: true });
+      try { return Number(database.prepare("SELECT COUNT(*) AS n FROM tickets").get()?.n ?? 0); } finally { database.close(); }
+    } catch { return 0; }
+  }
+  async function until(condition: () => Promise<boolean>, what: string): Promise<void> {
+    for (let waited = 0; !(await condition()); waited += 20) {
+      if (waited > 10_000) throw new Error(`Timed out waiting for ${what}`);
+      await sleep(20);
+    }
+  }
+
+  it("admits waiting restores in arrival order and times none out while the lock is released regularly", async () => {
+    const { target, env } = await fixture();
+    const count = 12;
+    const order: number[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let markHolding!: () => void;
+    const holding = new Promise<void>((resolve) => { markHolding = resolve; });
+    const first = withDirectoryMergeLock(target, async () => { markHolding(); await gate; }, env);
+    await holding;
+    const waiters: Promise<void>[] = [];
+    for (let index = 0; index < count; index += 1) {
+      // Uneven gaps spread the waiters' retry timers, so a contender that
+      // simply polls the lock does not accidentally win in arrival order.
+      await sleep(80 + (index * 13) % 40);
+      waiters.push(withDirectoryMergeLock(target, async () => { order.push(index); await sleep(100); }, env, undefined, 20_000));
+    }
+    await sleep(100);
+    release();
+
+    const results = await Promise.allSettled([first, ...waiters]);
+
+    expect(results.map((result) => result.status)).toEqual(Array(count + 1).fill("fulfilled"));
+    expect(order).toEqual(Array.from({ length: count }, (_, index) => index));
+  }, 60_000);
+
+  it("does not let a waiter killed in the queue block the contenders behind it", async () => {
+    const { target, env, lock } = await fixture();
+    const lockRoot = path.dirname(lock);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let markHolding!: () => void;
+    const holding = new Promise<void>((resolve) => { markHolding = resolve; });
+    const first = withDirectoryMergeLock(target, async () => { markHolding(); await gate; }, env);
+    await holding;
+    const doomed = spawn(process.execPath, ["--import", loader, "--eval", `
+      import { withDirectoryMergeLock } from ${JSON.stringify(module)};
+      withDirectoryMergeLock(${JSON.stringify(target)}, async () => undefined, undefined, undefined, 60000).catch(() => process.exit(1));
+    `], { env, stdio: "ignore" });
+    children.push(doomed);
+    await until(async () => (await queuedTickets(lock)) === 1, "the child's ticket");
+    const exited = once(doomed, "exit");
+    doomed.kill("SIGKILL");
+    await exited;
+    const entered = vi.fn(async () => undefined);
+    const behind = withDirectoryMergeLock(target, entered, env, undefined, 20_000);
+    await until(async () => (await queuedTickets(lock)) === 2, "the contender's ticket");
+    release();
+
+    await Promise.all([first, behind]);
+
+    expect(entered).toHaveBeenCalledTimes(1);
+    expect(await queuedTickets(lock)).toBe(0);
+    expect((await readdir(lockRoot)).filter((name) => name.includes(".waiter-"))).toEqual([]);
+  }, 30_000);
 
   it("releases ownership when the protected operation throws", async () => {
     const { target, env } = await fixture();
