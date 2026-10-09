@@ -23,7 +23,7 @@ export const issueStatusIcon: Record<string, string> = {
   in_progress: "text-blue-600 border-blue-600 dark:text-blue-400 dark:border-blue-400",
   in_review: "text-violet-600 border-violet-600 dark:text-violet-400 dark:border-violet-400",
   done: "text-green-600 border-green-600 dark:text-green-400 dark:border-green-400",
-  cancelled: "text-neutral-500 border-neutral-500",
+  cancelled: "text-status-neutral border-status-neutral",
   blocked: "text-red-600 border-red-600 dark:text-red-400 dark:border-red-400",
 };
 
@@ -36,7 +36,7 @@ export const issueStatusText: Record<string, string> = {
   in_progress: "text-blue-600 dark:text-blue-400",
   in_review: "text-violet-600 dark:text-violet-400",
   done: "text-green-600 dark:text-green-400",
-  cancelled: "text-neutral-500",
+  cancelled: "text-status-neutral",
   blocked: "text-red-600 dark:text-red-400",
 };
 
@@ -54,7 +54,7 @@ export const issueStatusTextDefault = "text-muted-foreground";
 export type BrandChipColor = "gray" | "blue" | "amber" | "green" | "violet" | "red";
 
 export const brandChipBadge: Record<BrandChipColor, string> = {
-  gray: "bg-[#F5F3F0] text-[#52585D] border-[#A8AEB2] dark:bg-[#6e696024] dark:text-[#9A958A] dark:border-[#9e958a73]",
+  gray: "bg-muted text-muted-foreground border-status-neutral",
   blue: "bg-[#DBEAFE] text-[#1D4ED8] border-[#2563EB] dark:bg-[#2563eb2e] dark:text-[#2563EB] dark:border-[#2563eb73]",
   amber: "bg-[#FEF3C7] text-[#B45309] border-[#F59E0B] dark:bg-[#f59e0b24] dark:text-[#F59E0B] dark:border-[#f59e0b73]",
   green: "bg-[#DCFCE7] text-[#188A3C] border-[#22C55E] dark:bg-[#22c55e1f] dark:text-[#22C55E] dark:border-[#22c55e73]",
@@ -161,7 +161,7 @@ export const agentStatusColorDefault: AgentBadgeColor = "gray";
 
 /** Heartbeat-capsule fill (solid) per colour name. gray darkens in dark mode. */
 export const agentStatusCapsule: Record<AgentBadgeColor, string> = {
-  gray: "bg-[#A8AEB2] dark:bg-[#6E6960]",
+  gray: "bg-status-neutral",
   blue: "bg-[#2563EB]",
   amber: "bg-[#F59E0B]",
   red: "bg-[#DC2626]",
@@ -294,10 +294,10 @@ export const agentStatusDot: Record<string, string> = {
   idle: "bg-yellow-400",
   pending_approval: "bg-amber-400",
   error: "bg-red-400",
-  archived: "bg-neutral-400",
+  archived: "bg-status-neutral",
 };
 
-export const agentStatusDotDefault = "bg-neutral-400";
+export const agentStatusDotDefault = "bg-status-neutral";
 
 // ---------------------------------------------------------------------------
 // Priority colors
@@ -341,8 +341,8 @@ export const externalObjectStatusIcon: Record<string, string> = {
   merged: "text-violet-600 border-violet-600 dark:text-violet-400 dark:border-violet-400",
   failed: "text-red-600 border-red-600 dark:text-red-400 dark:border-red-400",
   blocked: "text-red-600 border-red-600 dark:text-red-400 dark:border-red-400",
-  closed: "text-neutral-500 border-neutral-500",
-  archived: "text-neutral-500 border-neutral-500",
+  closed: "text-status-neutral border-status-neutral",
+  archived: "text-status-neutral border-status-neutral",
   auth_required: "text-amber-600 border-amber-600 dark:text-amber-400 dark:border-amber-400",
   unreachable: "text-red-600 border-red-600 dark:text-red-400 dark:border-red-400",
 };

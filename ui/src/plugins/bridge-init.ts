@@ -555,8 +555,8 @@ function PluginSdkStatusBadge({ label, status }: PluginStatusBadgeProps) {
     ok: "border-emerald-300 bg-emerald-50 text-emerald-700",
     warning: "border-amber-300 bg-amber-50 text-amber-800",
     error: "border-red-300 bg-red-50 text-red-700",
-    info: "border-slate-300 bg-slate-50 text-slate-700",
-    pending: "border-slate-300 bg-slate-50 text-slate-600",
+    info: "border-border bg-muted text-foreground",
+    pending: "border-border bg-muted text-muted-foreground",
   }[status];
   return createElement(
     "span",
