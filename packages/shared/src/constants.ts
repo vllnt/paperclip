@@ -757,6 +757,7 @@ export const SECRET_BINDING_TARGET_TYPES = [
   "run",
   "tool_connection",
   "system",
+  "storage_destination",
 ] as const;
 export type SecretBindingTargetType = (typeof SECRET_BINDING_TARGET_TYPES)[number];
 
