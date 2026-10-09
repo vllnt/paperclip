@@ -1104,6 +1104,7 @@ export type {
   IssueWakeDiagnosticWakeRequest,
   IssueWakeDiagnosticsResponse,
   IssueSubtreeDiagnosticNode,
+  IssueSubtreeDiagnosticLastRun,
   IssueSubtreeDiagnosticEdge,
   IssueSubtreeDiagnosticsResponse,
   IssueBlockerAttention,

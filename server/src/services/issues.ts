@@ -2017,6 +2017,16 @@ type IssueSubtreeDiagnosticsWakeRequestRow =
 type IssueSubtreeDiagnosticsActivityRow = IssueWakeDiagnosticsActivityRow & {
   issueId: string;
 };
+type IssueSubtreeDiagnosticsLastRunRow = {
+  issueId: string;
+  id: string;
+  status: string;
+  agentId: string;
+  startedAt: Date | string | null;
+  finishedAt: Date | string | null;
+  createdAt: Date | string;
+  errorCode: string | null;
+};
 type IssueSubtreeDiagnosticsBlockerResultRow =
   IssueSubtreeDiagnosticsBlockerRow & {
     rowNumber: number | string;
@@ -8876,6 +8886,7 @@ export function issueService(db: Db) {
       const truncatedBlockerIssueIds = new Set<string>();
       const truncatedWakeIssueIds = new Set<string>();
       const truncatedActivityIssueIds = new Set<string>();
+      const lastRunByIssueId = new Map<string, IssueSubtreeDiagnosticsLastRunRow>();
 
       if (nodeIds.length > 0) {
         const nodeIdValues = sql.join(
@@ -9028,11 +9039,35 @@ export function issueService(db: Db) {
           rows.push(normalized);
           activityRecordsByIssueId.set(normalized.issueId, rows);
         }
+
+        // Latest run per node, one batched query. Runs link to an issue through
+        // their context snapshot (heartbeat_runs_company_ctx_issue_created_idx).
+        const rawLastRunRows = Array.from(
+          await db.execute(sql`
+          SELECT DISTINCT ON (run.context_snapshot ->> 'issueId')
+            run.context_snapshot ->> 'issueId' AS "issueId",
+            run.id,
+            run.status,
+            run.agent_id AS "agentId",
+            run.started_at AS "startedAt",
+            run.finished_at AS "finishedAt",
+            run.created_at AS "createdAt",
+            run.error_code AS "errorCode"
+          FROM heartbeat_runs run
+          WHERE run.company_id = ${issue.companyId}
+            AND (run.context_snapshot ->> 'issueId') IN (${nodeIdValues})
+          ORDER BY run.context_snapshot ->> 'issueId', run.created_at DESC, run.id DESC
+        `),
+        ) as IssueSubtreeDiagnosticsLastRunRow[];
+        for (const row of rawLastRunRows) {
+          lastRunByIssueId.set(row.issueId, row);
+        }
       }
 
       return {
         nodes,
         blockersByIssueId,
+        lastRunByIssueId,
         readinessByIssueId: readiness,
         wakeRequestsByIssueId,
         activityRecordsByIssueId,
