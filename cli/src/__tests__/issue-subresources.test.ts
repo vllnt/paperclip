@@ -120,6 +120,79 @@ describe("issue subresource commands", () => {
     ]);
   });
 
+  it("lists company recovery actions and sends execution reconciliation on resolve", async () => {
+    const RUN_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse([
+      {
+        id: APPROVAL_ID,
+        status: "escalated",
+        kind: "stranded_assigned_issue",
+        ownerType: "board",
+        ownerAgentId: null,
+        ownerUserId: null,
+        attemptCount: 3,
+        maxAttempts: 3,
+        createdAt: "2026-10-09T00:00:00.000Z",
+        nextAction: "Review",
+        issue: { id: ISSUE_ID, identifier: "PC-7", title: "Stuck", status: "blocked" },
+      },
+    ])));
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run(["issue", "recovery-actions:list", "--company-id", COMPANY_ID, "--status", "active,escalated", "--limit", "5"]);
+    expect(String(log.mock.calls[0]?.[0])).toContain("identifier=PC-7");
+    expect(String(log.mock.calls[0]?.[0])).toContain("attempts=3/3");
+    await run(["issue", "recovery-actions:list", "--company-id", COMPANY_ID]);
+
+    const evidence = "The provider process was stopped and the change landed.";
+    await run([
+      "issue", "recovery:resolve", ISSUE_ID,
+      "--outcome", "restored",
+      "--source-issue-status", "todo",
+      "--reconciliation-run-id", RUN_ID,
+      "--provider-stopped",
+      "--action-outcome", "completed",
+      "--outcome-evidence", evidence,
+    ]);
+
+    expect(fetchMock.mock.calls.map((call) => [call[1]?.method ?? "GET", call[0]])).toEqual([
+      ["GET", `http://localhost:3100/api/companies/${COMPANY_ID}/recovery-actions?status=active%2Cescalated&limit=5`],
+      ["GET", `http://localhost:3100/api/companies/${COMPANY_ID}/recovery-actions`],
+      ["POST", `http://localhost:3100/api/issues/${ISSUE_ID}/recovery-actions/resolve`],
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body))).toEqual({
+      outcome: "restored",
+      sourceIssueStatus: "todo",
+      executionReconciliation: {
+        runId: RUN_ID,
+        providerStopped: true,
+        actionOutcome: "completed",
+        outcomeEvidence: evidence,
+      },
+    });
+  });
+
+  it("rejects an execution reconciliation without --provider-stopped before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("process.exit");
+    }) as never);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run([
+      "issue", "recovery:resolve", ISSUE_ID,
+      "--outcome", "restored",
+      "--source-issue-status", "todo",
+      "--reconciliation-run-id", "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "--action-outcome", "completed",
+      "--outcome-evidence", "The provider process was stopped and the change landed.",
+    ])).rejects.toThrow("process.exit");
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("wraps document and work product endpoints", async () => {
     const fetchMock = vi
       .fn()
