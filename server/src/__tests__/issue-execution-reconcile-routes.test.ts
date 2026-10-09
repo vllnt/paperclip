@@ -344,6 +344,22 @@ describeEmbeddedPostgres("POST /issues/:id/execution/reconcile", () => {
     await expectUnchanged(issueId, companyId);
   });
 
+  it("rejects a read-only board member of the company without changing anything", async () => {
+    const { companyId, issueId } = await seedStackedHolds();
+    const response = await request(issueApp({
+      type: "board",
+      source: "session",
+      userId: "viewer-user",
+      companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: "viewer" }],
+      isInstanceAdmin: false,
+    }))
+      .post(`/api/issues/${issueId}/execution/reconcile`)
+      .send({ outcome: "none", note: NOTE });
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    await expectUnchanged(issueId, companyId);
+  });
+
   it("refuses a stale expectedRunId without changing anything", async () => {
     const { companyId, issueId, runIds } = await seedStackedHolds();
     const response = await request(issueApp())
