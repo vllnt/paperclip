@@ -16,6 +16,7 @@ import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { MERGE_STAGING_TAR_EXCLUDE, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
   appendResourceProbe,
+  createResourceProbeMarker,
   parseResourceProbeOutput,
   splitResourceProbeOutput,
   type ResourceProbeReading,
@@ -1847,8 +1848,9 @@ export async function ensureSshWorkspaceReady(
     const result = await runSshCommand(config, command);
     return { remoteCwd: result.stdout.trim(), resourceProbe: null };
   }
-  const result = await runSshCommand(config, appendResourceProbe(command));
-  const { head, probe } = splitResourceProbeOutput(result.stdout);
+  const marker = createResourceProbeMarker();
+  const result = await runSshCommand(config, appendResourceProbe(command, marker));
+  const { head, probe } = splitResourceProbeOutput(result.stdout, marker);
   return {
     remoteCwd: head.trim(),
     resourceProbe: probe === null ? null : parseResourceProbeOutput(probe),

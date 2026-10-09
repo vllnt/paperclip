@@ -2,8 +2,9 @@
 // The output comes from a host Paperclip does not control, so the parser reads
 // only tagged lines, range-checks every number, and never keeps raw text.
 
-/** Separates a driver command's own stdout from the probe's lines. */
-export const RESOURCE_PROBE_MARKER = "__paperclip_rc__";
+import { randomBytes } from "node:crypto";
+
+const RESOURCE_PROBE_MARKER_PATTERN = /^__paperclip_rc_[0-9a-f]{16}__$/;
 /** Probe output above this size is discarded rather than parsed. */
 export const RESOURCE_PROBE_MAX_OUTPUT_BYTES = 16 * 1024;
 
@@ -26,27 +27,46 @@ export const RESOURCE_PROBE_SCRIPT = [
 ].join("; ");
 
 /**
+ * Creates the line that separates a command's own stdout from the probe's.
+ * It is random per command, so no workspace path or command output can
+ * contain it by chance.
+ *
+ * @returns A marker for one {@link appendResourceProbe} and {@link splitResourceProbeOutput} pair.
+ */
+export function createResourceProbeMarker(): string {
+  return `__paperclip_rc_${randomBytes(8).toString("hex")}__`;
+}
+
+/**
  * Appends the probe to a command so it runs only after the command succeeds,
  * can never change its exit status, and prints at most
  * {@link RESOURCE_PROBE_MAX_OUTPUT_BYTES} on the worker, so the caller's
  * output buffer is never exceeded.
  *
  * @param command - A command whose stdout the caller still reads before the marker.
+ * @param marker - From {@link createResourceProbeMarker}; anything else throws, because it is put into shell text.
  * @param probeScript - The probe to run; tests substitute their own.
  * @returns The chained command.
  */
-export function appendResourceProbe(command: string, probeScript: string = RESOURCE_PROBE_SCRIPT): string {
-  return `${command} && { printf '\\n${RESOURCE_PROBE_MARKER}\\n'; { { ${probeScript}; } 2>/dev/null | head -c ${RESOURCE_PROBE_MAX_OUTPUT_BYTES}; } 2>/dev/null; true; }`;
+export function appendResourceProbe(
+  command: string,
+  marker: string,
+  probeScript: string = RESOURCE_PROBE_SCRIPT,
+): string {
+  if (!RESOURCE_PROBE_MARKER_PATTERN.test(marker)) throw new Error("invalid resource probe marker");
+  return `${command} && { printf '\\n${marker}\\n'; { { ${probeScript}; } 2>/dev/null | head -c ${RESOURCE_PROBE_MAX_OUTPUT_BYTES}; } 2>/dev/null; true; }`;
 }
 
 /**
  * Splits stdout of a command built by {@link appendResourceProbe} at the
  * first marker, so nothing the probe prints can change the command's output.
  *
+ * @param stdout - The command's stdout.
+ * @param marker - The marker the command was built with.
  * @returns `head` is the command's own output; `probe` is null when the marker is absent.
  */
-export function splitResourceProbeOutput(stdout: string): { head: string; probe: string | null } {
-  const markerLine = `\n${RESOURCE_PROBE_MARKER}\n`;
+export function splitResourceProbeOutput(stdout: string, marker: string): { head: string; probe: string | null } {
+  const markerLine = `\n${marker}\n`;
   const index = stdout.indexOf(markerLine);
   if (index < 0) return { head: stdout, probe: null };
   return { head: stdout.slice(0, index), probe: stdout.slice(index + markerLine.length) };

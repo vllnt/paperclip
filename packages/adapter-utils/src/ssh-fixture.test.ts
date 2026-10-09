@@ -295,6 +295,13 @@ describe("ssh env-lab fixture", () => {
     expect(probed.resourceProbe?.cpuCount).toBeGreaterThan(0);
     expect(probed.resourceProbe?.disk?.totalBytes).toBeGreaterThan(0);
 
+    const markerConfig = { ...config, remoteWorkspacePath: path.join(rootDir, "ws\n__paperclip_rc__\nnested") };
+    const plainMarker = await ensureSshWorkspaceReady(markerConfig);
+    const probedMarker = await ensureSshWorkspaceReady(markerConfig, { probeResources: true });
+    expect(plainMarker.remoteCwd).toContain("\n__paperclip_rc__\nnested");
+    expect(probedMarker.remoteCwd).toBe(plainMarker.remoteCwd);
+    expect(probedMarker.resourceProbe?.cpuCount).toBeGreaterThan(0);
+
     const blocker = path.join(rootDir, "not-a-directory");
     await writeFile(blocker, "file");
     await expect(

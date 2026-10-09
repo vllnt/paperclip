@@ -5,9 +5,9 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import {
-  RESOURCE_PROBE_MARKER,
   RESOURCE_PROBE_MAX_OUTPUT_BYTES,
   appendResourceProbe,
+  createResourceProbeMarker,
   parseDfPortableLine,
   parseProcLoadavg,
   parseProcMeminfo,
@@ -111,38 +111,63 @@ describe("probe line parsers", () => {
 
 describe("appendResourceProbe", () => {
   it("round-trips through splitResourceProbeOutput", () => {
-    const stdout = `/home/worker/ws\n\n${RESOURCE_PROBE_MARKER}\n${LINUX_PROBE_OUTPUT}\n`;
-    const { head, probe } = splitResourceProbeOutput(stdout);
+    const marker = createResourceProbeMarker();
+    const stdout = `/home/worker/ws\n\n${marker}\n${LINUX_PROBE_OUTPUT}\n`;
+    const { head, probe } = splitResourceProbeOutput(stdout, marker);
     expect(head.trim()).toBe("/home/worker/ws");
     expect(parseResourceProbeOutput(probe ?? "").cpuCount).toBe(8);
-    expect(splitResourceProbeOutput("/home/worker/ws\n")).toEqual({ head: "/home/worker/ws\n", probe: null });
+    expect(splitResourceProbeOutput("/home/worker/ws\n", marker)).toEqual({ head: "/home/worker/ws\n", probe: null });
+  });
+
+  it("uses a new marker for each command and rejects a marker it did not create", () => {
+    const first = createResourceProbeMarker();
+    expect(first).toMatch(/^__paperclip_rc_[0-9a-f]{16}__$/);
+    expect(createResourceProbeMarker()).not.toBe(first);
+    expect(() => appendResourceProbe("pwd", "__paperclip_rc__")).toThrow();
+    expect(() => appendResourceProbe("pwd", "x'; touch injected; '")).toThrow();
   });
 
   it("keeps the command's stdout and exit status in a real shell", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-resource-probe-"));
     const target = path.join(root, "workspace");
     const quoted = `'${target}'`;
+    const marker = createResourceProbeMarker();
     const { stdout } = await execFileAsync("sh", [
       "-c",
-      appendResourceProbe(`mkdir -p ${quoted} && cd ${quoted} && pwd`),
+      appendResourceProbe(`mkdir -p ${quoted} && cd ${quoted} && pwd`, marker),
     ]);
-    const { head, probe } = splitResourceProbeOutput(stdout);
+    const { head, probe } = splitResourceProbeOutput(stdout, marker);
     expect(path.basename(head.trim())).toBe("workspace");
     const reading = parseResourceProbeOutput(probe ?? "");
     expect(reading.cpuCount).toBeGreaterThan(0);
     expect(reading.disk?.totalBytes).toBeGreaterThan(0);
 
     await expect(
-      execFileAsync("sh", ["-c", appendResourceProbe("cd /nonexistent-paperclip-probe-dir && pwd")]),
+      execFileAsync("sh", ["-c", appendResourceProbe("cd /nonexistent-paperclip-probe-dir && pwd", marker)]),
     ).rejects.toMatchObject({ code: expect.any(Number) });
+  });
+
+  it("keeps a workspace path that contains a marker-like line", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-resource-probe-"));
+    const target = path.join(root, "ws\n__paperclip_rc__\nnested");
+    const quoted = `'${target}'`;
+    const marker = createResourceProbeMarker();
+    const { stdout } = await execFileAsync("sh", [
+      "-c",
+      appendResourceProbe(`mkdir -p ${quoted} && cd ${quoted} && pwd`, marker),
+    ]);
+    const { head, probe } = splitResourceProbeOutput(stdout, marker);
+    expect(head.endsWith("ws\n__paperclip_rc__\nnested\n")).toBe(true);
+    expect(parseResourceProbeOutput(probe ?? "").cpuCount).toBeGreaterThan(0);
   });
 
   it("cuts oversized probe output on the host and still succeeds", async () => {
     const flood = "i=0; while [ $i -lt 20000 ]; do echo rc:noise-line-of-text-$i; i=$((i+1)); done";
-    const { stdout } = await execFileAsync("sh", ["-c", appendResourceProbe("echo /ws", flood)], {
+    const marker = createResourceProbeMarker();
+    const { stdout } = await execFileAsync("sh", ["-c", appendResourceProbe("echo /ws", marker, flood)], {
       maxBuffer: 128 * 1024,
     });
-    const { head, probe } = splitResourceProbeOutput(stdout);
+    const { head, probe } = splitResourceProbeOutput(stdout, marker);
     expect(head.trim()).toBe("/ws");
     expect(Buffer.byteLength(probe ?? "")).toBe(RESOURCE_PROBE_MAX_OUTPUT_BYTES);
   });
@@ -154,17 +179,19 @@ describe("appendResourceProbe", () => {
   });
 
   it("ignores a marker printed by the probe itself", async () => {
-    const spoof = `printf '\\n${RESOURCE_PROBE_MARKER}\\n/spoofed\\n'`;
-    const { stdout } = await execFileAsync("sh", ["-c", appendResourceProbe("echo /ws", spoof)]);
-    expect(splitResourceProbeOutput(stdout).head.trim()).toBe("/ws");
+    const marker = createResourceProbeMarker();
+    const spoof = `printf '\\n${marker}\\n/spoofed\\n'`;
+    const { stdout } = await execFileAsync("sh", ["-c", appendResourceProbe("echo /ws", marker, spoof)]);
+    expect(splitResourceProbeOutput(stdout, marker).head.trim()).toBe("/ws");
   });
 
   it("succeeds when every probe command fails", async () => {
+    const marker = createResourceProbeMarker();
     const { stdout } = await execFileAsync("sh", [
       "-c",
-      appendResourceProbe("echo /ws", "false; /nonexistent-paperclip-binary; exit 3"),
+      appendResourceProbe("echo /ws", marker, "false; /nonexistent-paperclip-binary; exit 3"),
     ]);
-    const { head, probe } = splitResourceProbeOutput(stdout);
+    const { head, probe } = splitResourceProbeOutput(stdout, marker);
     expect(head.trim()).toBe("/ws");
     expect(parseResourceProbeOutput(probe ?? "").disk).toBeNull();
   });

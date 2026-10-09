@@ -8,6 +8,7 @@ import {
 } from "@paperclipai/db";
 import {
   appendResourceProbe,
+  createResourceProbeMarker,
   parseResourceProbeOutput,
   splitResourceProbeOutput,
   type ResourceProbeReading,
@@ -376,12 +377,13 @@ export function resourceCapacityService(
     try {
       const parsed = await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment);
       if (parsed.driver !== "ssh") return;
+      const marker = createResourceProbeMarker();
       const result = await runSshCommand(
         parsed.config,
-        appendResourceProbe(`cd ${shellQuote(parsed.config.remoteWorkspacePath)}`),
+        appendResourceProbe(`cd ${shellQuote(parsed.config.remoteWorkspacePath)}`, marker),
         { timeoutMs: SWEEP_COMMAND_TIMEOUT_MS },
       );
-      const { probe } = splitResourceProbeOutput(result.stdout);
+      const { probe } = splitResourceProbeOutput(result.stdout, marker);
       if (probe === null) errorClass = "unparseable";
       else reading = readingFromProbe(parseResourceProbeOutput(probe));
     } catch (error) {
