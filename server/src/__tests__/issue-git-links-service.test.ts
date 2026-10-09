@@ -364,7 +364,9 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
       const first = await svc.recordPullRequestSignal(company.id, signal(company.prefix));
       const productId = first.links[0]!.workProductId;
 
-      expect(await svc.unlinkPullRequest(issueId, company.id, productId)).toBe(true);
+      expect(await svc.unlinkPullRequest(issueId, company.id, productId)).toBe("unlinked");
+      expect(await svc.unlinkPullRequest(issueId, company.id, productId)).toBe("already_unlinked");
+      expect(await svc.unlinkPullRequest(issueId, company.id, randomUUID())).toBe("not_found");
       const auto = await svc.recordPullRequestSignal(company.id, signal(company.prefix, { updatedAt: "2026-10-09T11:00:00.000Z" }));
       expect(auto.links[0]).toMatchObject({ skipped: "suppressed" });
       expect((await svc.getView(issueId, company.id)).pullRequests).toEqual([]);
@@ -548,6 +550,70 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
       expect(b.automation[0]).toMatchObject({ deferred: "gated" });
       expect((await issueRow(withPolicy)).status).toBe("todo");
       expect((await issueRow(withReview)).status).toBe("todo");
+    });
+  });
+
+  describe("linking by reference", () => {
+    const resolved = (overrides: Record<string, unknown> = {}) => async () => ({
+      state: "open" as const,
+      headRef: "feature/unrelated",
+      headSha: "abc",
+      workProductState: "open" as const,
+      draft: false,
+      baseRef: "main",
+      ...overrides,
+    });
+
+    it("reads the pull request from GitHub and links it, closing by default", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 4);
+      const svc = issueGitLinkService(db, { statusAutomationEnabled: async () => true, resolvePullRequestDetails: resolved() });
+
+      const result = await svc.linkPullRequest(issueId, company.id, { repository: "Acme/App", number: 7 }, "agent");
+
+      expect(result.links[0]).toMatchObject({ issueId, created: true });
+      const [product] = await productsFor(issueId);
+      expect(product).toMatchObject({ externalId: "acme/app#pull/7", url: "https://github.com/acme/app/pull/7" });
+      expect(product!.metadata).toMatchObject({ headRef: "feature/unrelated", baseRef: "main", state: "open", git: { linkedBy: "manual", closes: true, verified: true } });
+      expect((await issueRow(issueId)).status).toBe("in_review");
+    });
+
+    it("links a merged pull request as merged", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 4);
+      const svc = issueGitLinkService(db, { statusAutomationEnabled: async () => false, resolvePullRequestDetails: resolved({ workProductState: "merged", state: "open" }) });
+
+      await svc.linkPullRequest(issueId, company.id, { repository: "acme/app", number: 7, closes: false }, "manual");
+
+      const [product] = await productsFor(issueId);
+      expect(product).toMatchObject({ status: "merged" });
+      expect(product!.metadata).toMatchObject({ state: "merged", git: { closes: false } });
+    });
+
+    it("still links when GitHub cannot be read, but treats the state as unconfirmed", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 4);
+      const svc = issueGitLinkService(db, {
+        statusAutomationEnabled: async () => true,
+        resolvePullRequestDetails: async () => ({ state: "unknown" as const, headRef: null, headSha: null }),
+      });
+
+      const result = await svc.linkPullRequest(issueId, company.id, { repository: "acme/app", number: 7 }, "agent");
+
+      expect(result.links).toHaveLength(1);
+      expect((await productsFor(issueId))[0]!.metadata).toMatchObject({ git: { verified: false } });
+      expect(result.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect((await issueRow(issueId)).status).toBe("todo");
+    });
+
+    it("refuses a task from another company", async () => {
+      const a = await seedCompany();
+      const b = await seedCompany();
+      const issueB = await seedIssue(b, 1);
+      const svc = issueGitLinkService(db, { statusAutomationEnabled: async () => true, resolvePullRequestDetails: resolved() });
+
+      await expect(svc.linkPullRequest(issueB, a.id, { repository: "acme/app", number: 7 }, "manual")).rejects.toThrow(/not found/i);
+      expect(await db.select().from(issueWorkProducts)).toEqual([]);
     });
   });
 
