@@ -1,3 +1,4 @@
+import { linkedWorkProductCondition } from "./work-product-visibility.js";
 import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -1372,6 +1373,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         eq(issueWorkProducts.companyId, workspace.companyId),
         eq(issueWorkProducts.type, "pull_request"),
         eq(issueWorkProducts.issueId, workspace.sourceIssueId),
+        linkedWorkProductCondition(),
       ))
       .orderBy(desc(issueWorkProducts.updatedAt))
       .limit(100);

@@ -18,6 +18,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { gitLinkLockKey, issueGitLinkService, type PullRequestSignal } from "../services/issue-git-links.js";
+import { workProductService } from "../services/work-products.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -370,9 +371,11 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
       const auto = await svc.recordPullRequestSignal(company.id, signal(company.prefix, { updatedAt: "2026-10-09T11:00:00.000Z" }));
       expect(auto.links[0]).toMatchObject({ skipped: "suppressed" });
       expect((await svc.getView(issueId, company.id)).pullRequests).toEqual([]);
+      expect((await workProductService(db).listForIssue(issueId)).filter((p) => p.type === "pull_request")).toEqual([]);
 
       await svc.recordPullRequestSignal(company.id, signal(company.prefix, { updatedAt: "2026-10-09T12:00:00.000Z", source: "manual" }), { manualIssueId: issueId });
       expect((await svc.getView(issueId, company.id)).pullRequests).toHaveLength(1);
+      expect((await workProductService(db).listForIssue(issueId)).filter((p) => p.type === "pull_request")).toHaveLength(1);
     });
   });
 
