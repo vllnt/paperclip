@@ -25,8 +25,10 @@ import type {
   IssueThreadInteraction,
   IssueTreeControlPreview,
   IssueTreeHold,
+  IssueGitView,
   IssueWatchdog,
   IssueWorkProduct,
+  LinkIssuePullRequest,
   RunnerGoalActionAccepted,
   RunnerGoalActionRequest,
   RunnerGoalProjection,
@@ -596,6 +598,11 @@ export const issuesApi = {
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),
   unlinkApproval: (id: string, approvalId: string) =>
     api.delete<{ ok: true }>(`/issues/${id}/approvals/${approvalId}`),
+  getGit: (id: string) => api.get<IssueGitView>(`/issues/${id}/git`),
+  linkPullRequest: (id: string, data: LinkIssuePullRequest) =>
+    api.post<IssueGitView>(`/issues/${id}/git/pull-requests`, data),
+  unlinkPullRequest: (id: string, workProductId: string) =>
+    api.delete<void>(`/issues/${id}/git/pull-requests/${workProductId}`),
   listWorkProducts: (id: string, options?: { refreshPullRequests?: boolean }) =>
     api.get<IssueWorkProduct[]>(
       `/issues/${id}/work-products${options?.refreshPullRequests ? "?refreshPullRequests=true" : ""}`,
