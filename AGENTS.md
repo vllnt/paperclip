@@ -102,8 +102,8 @@ When you are creating a plan file in the repository itself, new plan documents b
 6. Attach inspectable generated artifacts.
 When your task produces a user-inspectable deliverable file, follow the Paperclip skill's "Generated Artifacts and Work Products" workflow before final disposition. In this repo, prefer the self-contained skill helper at `skills/paperclip/scripts/paperclip-upload-artifact.sh` so the file is available through the Paperclip API, create/update an artifact work product when the file is the deliverable, link the uploaded artifact in the final issue comment, and then set status. Do not rely on local filesystem paths as the only access path. If an important file intentionally remains workspace-only, create/update a work product with `metadata.resourceRef.kind: "workspace_file"` and a workspace-relative path, then name that work product and path in the final comment. Treat browse/search as a fallback for recovering workspace files, not the preferred deliverable path. See `doc/AGENT-ARTIFACTS.md` for details and `.mp4`/`.webm` examples.
 
-7. Name the three data paths correctly.
-This repo has three separate data paths. Do not confuse them. Match a change to a path by its file path, not by the word "observability" or "telemetry" alone.
+7. Name the four data paths correctly.
+This repo has four separate data paths. Do not confuse them. Match a change to a path by its file path, not by the word "observability" or "telemetry" alone.
 
 - **Telemetry** is the Paperclip first-party event system. It is opt-out and it sends data to a Paperclip endpoint by default. Its paths are:
   - `packages/shared/src/telemetry/`
@@ -119,12 +119,18 @@ This repo has three separate data paths. Do not confuse them. Match a change to 
   - `doc/run-log-events.md`
   - `packages/db/src/schema/heartbeat_run_events.ts`
   - the append path `appendRunEvent` in `server/src/services/heartbeat.ts`
+- **The company archive** is a company-directed export of that company's own run history: runs, run events, transcripts, costs and activity. Every record passes the read-time redaction module. Content leaves the instance only to a board user of the company, or to a destination that the company's board configured. Its paths are:
+  - `doc/company-archive.md`
+  - `packages/shared/src/company-archive.ts`
+  - `server/src/services/run-read-redaction.ts`
+  - each `server/src/services/company-archive*.ts` file and `server/src/routes/company-archive.ts`
 
 Apply a review level that matches the path:
 
 - **Telemetry change (strict review).** The author updates the generated contract first. The author updates `packages/shared/src/telemetry/README.md` in the same pull request. The author requests a privacy review. Reason: a Telemetry event goes to a Paperclip endpoint by default, so a mistake sends data immediately.
 - **Observability change (lighter review).** The operator endpoint gate stays in place. The no-operation behaviour stays when no endpoint is set. A privacy review is not necessary while the change stays inside the closed span-attribute allowlist.
 - **Run-log change (no extra review).** A run-log change needs neither review level above, because the data stays in the instance database.
+- **Company archive change (privacy review).** A change that adds an entity or a field to the archive, or weakens redaction, needs a privacy review. The author updates `doc/company-archive.md` in the same pull request and raises the record `v` when a meaning changes. The archive does not use the Telemetry contract. Reason: archived content leaves the instance and can outlive the instance.
 
 **Exclusion.** The word "observability" in a file such as `server/src/services/recovery-observability.ts` names a different concept. Apply this rule by path, not by word match.
 

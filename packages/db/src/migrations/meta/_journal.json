@@ -2059,6 +2059,13 @@
       "when": 1791426069667,
       "tag": "0295_slimy_shard",
       "breakpoints": true
+    },
+    {
+      "idx": 296,
+      "version": "7",
+      "when": 1791570824741,
+      "tag": "0296_worthless_dazzler",
+      "breakpoints": true
     }
   ]
 }
