@@ -65,13 +65,23 @@ function issueTableNames(source: string): string[] {
   return ["issues", ...aliases.filter(Boolean)];
 }
 
-/** Counts direct inserts into the issues table: builder inserts, chunked inserts and raw SQL. */
+/** `.insert(<table>)`, optionally `schema.`-qualified; group 1 is the table identifier. */
+const BUILDER_INSERT = /\.insert\(\s*(?:schema\.)?([A-Za-z_$][\w$]*)\s*\)/g;
+/** `insertRowsInChunks(<tx>, <table>, ...)`; group 1 is the table identifier. */
+const CHUNKED_INSERT = /insertRowsInChunks\([^,()]+,\s*([A-Za-z_$][\w$]*)\s*,/g;
+
+/**
+ * Counts direct inserts into the issues table: builder inserts, chunked inserts and raw SQL.
+ * Fixed patterns capture whatever identifier is inserted into, and a set lookup decides whether it is the
+ * issues table, so no regex is ever built from file text.
+ */
 export function countDirectIssueInserts(source: string): number {
+  const tableNames = new Set(issueTableNames(source));
   let count = 0;
-  for (const name of issueTableNames(source)) {
-    const escaped = name.replace(/[$]/g, "\\$");
-    count += (source.match(new RegExp(`\\.insert\\(\\s*(?:schema\\.)?${escaped}\\s*\\)`, "g")) ?? []).length;
-    count += (source.match(new RegExp(`insertRowsInChunks\\([^,()]+,\\s*${escaped}\\s*,`, "g")) ?? []).length;
+  for (const pattern of [BUILDER_INSERT, CHUNKED_INSERT]) {
+    for (const match of source.matchAll(pattern)) {
+      if (tableNames.has(match[1] ?? "")) count += 1;
+    }
   }
   count += (source.match(/\binsert\s+into\s+"?issues"?\s*\(/gi) ?? []).length;
   return count;
@@ -106,6 +116,14 @@ describe("every direct insert into issues is either the covered create path or a
     expect(countDirectIssueInserts("await insertRowsInChunks(tx, issues, rows);")).toBe(1);
     expect(countDirectIssueInserts("await db.execute(sql`INSERT INTO issues (id) VALUES (${id})`);")).toBe(1);
     expect(countDirectIssueInserts("await tx.insert(issueComments).values(row);")).toBe(0);
+  });
+
+  it("matches table names exactly, including `$` aliases and schema-qualified tables", () => {
+    expect(countDirectIssueInserts('import { issues as $issues } from "@paperclipai/db";\nawait tx.insert($issues).values(row);')).toBe(1);
+    expect(countDirectIssueInserts("await insertRowsInChunks(tx, issues, rows);\nawait insertRowsInChunks(tx, issuesArchive, rows);")).toBe(1);
+    expect(countDirectIssueInserts("await tx.insert(schema.issues).values(row);")).toBe(1);
+    expect(countDirectIssueInserts("await tx.insert(issuesArchive).values(row);\nawait tx.insert(myissues).values(row);")).toBe(0);
+    expect(countDirectIssueInserts('import { issues as rows } from "@paperclipai/db";\nawait tx.insert(rows).values(row);\nawait tx.insert(rowsCopy).values(row);')).toBe(1);
   });
 });
 
