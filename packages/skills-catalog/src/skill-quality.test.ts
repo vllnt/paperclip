@@ -343,3 +343,13 @@ describe("estimateTokens", () => {
     expect(check({ skillMd }).metrics.estimatedTokens).toBe(estimateTokens(skillMd));
   });
 });
+
+describe("checkSkillQuality on adversarial lines", () => {
+  it("reads a heading line with a long whitespace run and a line separator in linear time", () => {
+    const hostile = `#${"\t".repeat(100_000)}x\u2028y`;
+    const started = performance.now();
+    const report = check({ skillMd: buildSkill({ body: `# Title\n\n${hostile}\n` }) });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(report.metrics.estimatedTokens).toBeGreaterThan(0);
+  });
+});

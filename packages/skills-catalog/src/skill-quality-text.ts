@@ -13,7 +13,7 @@ export interface RuleSentence {
 }
 
 const FENCE_PATTERN = /^\s*(```|~~~)/;
-const HEADING_PATTERN = /^\s{0,3}#{1,6}\s+(.*)$/;
+const HEADING_PATTERN = /^\s{0,3}#{1,6}\s+(\S.*)?$/;
 const RULE_PATTERN =
   /\b(must|never|always|do not|don't|should not|shouldn't|cannot|can't|avoid|required|forbidden|mandatory)\b/i;
 const REASON_PATTERN =
