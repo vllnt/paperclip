@@ -374,25 +374,26 @@ export interface DeferredWakeAgentStats {
 }
 
 /**
- * Counters for the deferred-wake redelivery sweep since the server last
- * started. They are process-wide, not durable.
+ * Counters for the deferred-wake redelivery sweep for ONE company since the
+ * server last started. They never include another company's activity, and
+ * they are not durable.
  */
 export interface DeferredWakeSweepCounters {
-  passes: number;
-  /** Passes triggered by a run completing, a subset of `passes`. */
-  completionPasses: number;
-  /** Orphaned wakes read: parked with no run left to promote them. */
+  /** This company's orphaned wakes read: parked with no run left to promote them. */
   examined: number;
   promoted: number;
-  /** Cancelled or failed by the drain's rules instead of started. */
+  /** Retired by admission instead of started (for example, skipped as final). */
   retired: number;
-  /** Left parked after the drain declined to promote them. */
+  /** Left parked after admission declined to start them yet. */
   stillDeferred: number;
   /** Not woken: a pause hold, an execution blocker or an operator Stop. */
   skippedHeld: number;
+  /** Not woken: a company, agent or project budget hard stop. */
+  skippedBudget: number;
   skippedNotInvokable: number;
   failed: number;
-  lastPassAt: Date | null;
+  /** When the sweep last read one of this company's orphaned wakes. */
+  lastExaminedAt: Date | null;
 }
 
 export interface DeferredWakeStats {

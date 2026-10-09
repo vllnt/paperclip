@@ -14,6 +14,17 @@ export const DEFERRED_WAKE_SWEEP_MIN_AGE_MS = 2 * 60 * 1000;
 export const DEFERRED_WAKE_SWEEP_RECHECK_MS = 60 * 1000;
 /** Upper bound on wakes read per pass, so one backlog cannot monopolise a tick. */
 export const DEFERRED_WAKE_SWEEP_BATCH_LIMIT = 100;
+/**
+ * Upper bound on wakes re-delivered per pass. The first pass after a deploy
+ * sees every wake that was stranded before it; they drain over several passes
+ * (30 seconds apart by default) instead of one burst of runs and holds checks.
+ */
+export const DEFERRED_WAKE_SWEEP_MAX_PER_PASS = 20;
+
+/** A caller may ask for fewer wakes per pass, never for more than the cap. */
+export function sweepPromotionBudget(requested?: number): number {
+  return Math.max(0, Math.min(requested ?? DEFERRED_WAKE_SWEEP_MAX_PER_PASS, DEFERRED_WAKE_SWEEP_MAX_PER_PASS));
+}
 
 const ISSUE_PRIORITY_RANK: Readonly<Record<string, number>> = {
   critical: 0,

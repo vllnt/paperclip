@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   compareDeferredWakes,
+  DEFERRED_WAKE_SWEEP_MAX_PER_PASS,
   issuePriorityRank,
   selectDeferredWakesToPromote,
+  sweepPromotionBudget,
   type OrphanedDeferredWake,
 } from "./deferred-wake-sweep.js";
 
@@ -22,6 +24,38 @@ function wake(
 
 const ids = (wakes: readonly OrphanedDeferredWake[]) => wakes.map((entry) => entry.wakeId);
 const slots = (entries: Record<string, number>) => new Map(Object.entries(entries));
+
+describe("sweepPromotionBudget", () => {
+  it("bounds a pass to the cap, so the first pass after a deploy cannot start a burst of runs", () => {
+    expect(DEFERRED_WAKE_SWEEP_MAX_PER_PASS).toBe(20);
+    expect(sweepPromotionBudget()).toBe(20);
+    expect(sweepPromotionBudget(1_000)).toBe(20);
+  });
+
+  it("lets a caller ask for fewer, never a negative number", () => {
+    expect(sweepPromotionBudget(5)).toBe(5);
+    expect(sweepPromotionBudget(0)).toBe(0);
+    expect(sweepPromotionBudget(-3)).toBe(0);
+  });
+
+  it("drains a stranded backlog over several passes", () => {
+    const backlog = Array.from({ length: 45 }, (_, index) => wake(`w${index}`, { minutesAgo: 100 - index }));
+    const remaining = new Set(backlog.map((entry) => entry.wakeId));
+    let passes = 0;
+    while (remaining.size > 0) {
+      const pass = selectDeferredWakesToPromote(
+        backlog.filter((entry) => remaining.has(entry.wakeId)),
+        slots({ "agent-a": 1_000 }),
+        { maxTotal: sweepPromotionBudget() },
+      );
+      expect(pass.length).toBeGreaterThan(0);
+      expect(pass.length).toBeLessThanOrEqual(DEFERRED_WAKE_SWEEP_MAX_PER_PASS);
+      for (const entry of pass) remaining.delete(entry.wakeId);
+      passes += 1;
+    }
+    expect(passes).toBe(3);
+  });
+});
 
 describe("issuePriorityRank", () => {
   it("ranks critical before high before medium before low", () => {

@@ -6,6 +6,8 @@ import { DEFERRED_WAKE_SWEEP_BATCH_LIMIT, type OrphanedDeferredWake } from "../d
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
 const PROMOTED_WAKE_REASON = "issue_execution_promoted";
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+/** A closed task is not revived by an old parked wake. */
+const CLOSED_ISSUE_STATUSES = ["done", "cancelled"] as const;
 /** An agent in one of these states is held, not broken: its wakes wait for it to resume. */
 const HELD_AGENT_STATUSES = ["paused", "terminated", "pending_approval"] as const;
 
@@ -25,14 +27,24 @@ export type ListOrphanedDeferredWakesInput = {
 export type OrphanedDeferredWakeRow = OrphanedDeferredWake & {
   /** The row's `updated_at` as read, the token `claimDeferredWakeExamination` compares against. */
   observedUpdatedAt: Date;
+  /** The issue's project, which scopes a project budget hard stop. */
+  projectId: string | null;
 };
+
+/** `payload.issueId` as a uuid, or null when it is not one, so the join can use the issue primary key. */
+const wakeIssueId = sql`(case when ${agentWakeupRequests.payload} ->> 'issueId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' then (${agentWakeupRequests.payload} ->> 'issueId')::uuid end)`;
 
 /**
  * Deferred wakes whose issue lock is free: nothing holds `executionRunId` and no
  * queued, running or scheduled-retry run exists for the issue. Such a wake has no
  * run left to drain it. Held work is excluded here where a column proves it (a
- * held agent, a hidden issue, a wake owned by another sweep); the caller checks
- * the holds that need more than a column (pause holds, execution blockers).
+ * closed task, a held agent, a hidden issue, a wake owned by another sweep); the
+ * caller checks the holds that need more than a column (pause holds, execution
+ * blockers, budgets). A closed task is excluded because an old parked wake must
+ * not revive it; the release of the task's next run retires the wake.
+ *
+ * The scan starts from the partial index on deferred wakes, a set of a few rows,
+ * and reaches each issue through its primary key.
  */
 export async function listOrphanedDeferredWakes(
   db: Db,
@@ -47,14 +59,12 @@ export async function listOrphanedDeferredWakes(
       observedUpdatedAt: agentWakeupRequests.updatedAt,
       issueId: issues.id,
       issuePriority: issues.priority,
+      projectId: issues.projectId,
     })
     .from(agentWakeupRequests)
     .innerJoin(
       issues,
-      and(
-        eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload} ->> 'issueId'`,
-      ),
+      and(eq(issues.id, wakeIssueId), eq(issues.companyId, agentWakeupRequests.companyId)),
     )
     .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
     .innerJoin(
@@ -70,6 +80,7 @@ export async function listOrphanedDeferredWakes(
         input.requestedAtGte ? gte(agentWakeupRequests.requestedAt, input.requestedAtGte) : undefined,
         isNull(issues.executionRunId),
         isNull(issues.hiddenAt),
+        notInArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
         notInArray(agents.status, [...HELD_AGENT_STATUSES]),
         // Owned by other recovery: a queued-comment interrupt resumes on its own
         // sweep, a limit-parked self-reblock wake waits out its window there, and

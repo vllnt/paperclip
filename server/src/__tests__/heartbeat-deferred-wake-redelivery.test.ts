@@ -22,6 +22,7 @@ import {
   issueRecoveryActions,
   issueTreeHolds,
   issues,
+  projects,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -131,6 +132,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     await db.delete(environments);
     await db.delete(workspaceOperations);
     await db.delete(executionWorkspaces);
+    await db.delete(projects);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
         await db.transaction(async (tx) => {
@@ -181,7 +183,14 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
 
   async function seedIssue(
     companyId: string,
-    input: { assigneeAgentId: string; title?: string; priority?: string; status?: string; executionRunId?: string },
+    input: {
+      assigneeAgentId: string;
+      title?: string;
+      priority?: string;
+      status?: string;
+      executionRunId?: string;
+      projectId?: string;
+    },
   ) {
     const issueId = randomUUID();
     await db.insert(issues).values({
@@ -192,6 +201,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       priority: input.priority ?? "medium",
       assigneeAgentId: input.assigneeAgentId,
       responsibleUserId: "responsible-user",
+      ...(input.projectId ? { projectId: input.projectId } : {}),
       ...(input.executionRunId ? { executionRunId: input.executionRunId, executionLockedAt: new Date() } : {}),
     });
     return issueId;
@@ -274,6 +284,41 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       where id = ${wake!.id}
     `);
     return wake!.id;
+  }
+
+  /**
+   * Runs the sweep while another transaction holds the issue row lock, then lets
+   * that transaction change the world under the lock and commit. The sweep's
+   * admission waits on the same lock, so it observes the committed change, as it
+   * would if a release drain, an operator or a new run got the lock first. The
+   * order is forced by the lock, not by timing.
+   */
+  async function sweepWhileIssueLockHeld(
+    issueId: string,
+    changeUnderLock: (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => Promise<void>,
+  ) {
+    let lockTaken!: () => void;
+    const lockTakenPromise = new Promise<void>((resolve) => (lockTaken = resolve));
+    let proceed!: () => void;
+    const proceedPromise = new Promise<void>((resolve) => (proceed = resolve));
+    const lockTx = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      lockTaken();
+      await proceedPromise;
+      await changeUnderLock(tx);
+    });
+    await lockTakenPromise;
+    const sweep = heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+    // The sweep is committed to the lock order once a backend waits on a lock.
+    expect(
+      await waitForCondition(async () => {
+        const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock'`);
+        return Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0) > 0;
+      }, 10_000),
+    ).toBe(true);
+    proceed();
+    await lockTx;
+    return sweep;
   }
 
   async function wakeRow(wakeId: string) {
@@ -669,5 +714,262 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       )
       .orderBy(asc(heartbeatRuns.createdAt));
     expect(promoted.map((run) => run.issueId)).toEqual([criticalIssueId, lowIssueId]);
+  });
+
+  describe("closed tasks", () => {
+    it.each(["done", "cancelled"])(
+      "never revives a %s task from an old parked wake, with or without a finished run",
+      async (status) => {
+        const companyId = await seedCompany();
+        const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
+        const anchorlessIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, status, title: "Closed, never ran" });
+        const anchoredIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, status, title: "Closed, has a run" });
+        await seedRun(companyId, agentId, anchoredIssueId, { status: "succeeded" });
+        const wakeIds = [
+          await seedDeferredWake(companyId, agentId, anchorlessIssueId, { ageMs: 40 * MINUTE_MS }),
+          await seedDeferredWake(companyId, agentId, anchoredIssueId, { ageMs: 40 * MINUTE_MS }),
+        ];
+
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+        await heartbeat.sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
+        await heartbeat.drainActiveRunExecutions();
+
+        for (const wakeId of wakeIds) {
+          const wake = await wakeRow(wakeId);
+          expect(wake.status).toBe("deferred_issue_execution");
+          expect(wake.runId).toBeNull();
+        }
+        expect(await runsForIssue(anchorlessIssueId)).toHaveLength(0);
+        // Only the finished run seeded before the sweep; nothing new was queued.
+        expect(await runsForIssue(anchoredIssueId)).toHaveLength(1);
+      },
+    );
+
+    it("rechecks the task status under the issue lock, after the sweep has already read it as open", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+      const wakeId = await seedDeferredWake(companyId, agentId, issueId, { ageMs: 30 * MINUTE_MS });
+
+      const result = await sweepWhileIssueLockHeld(issueId, async (tx) => {
+        await tx.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, issueId));
+      });
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(result.failed).toBe(0);
+      const wake = await wakeRow(wakeId);
+      expect(wake.status).toBe("deferred_issue_execution");
+      expect(wake.runId).toBeNull();
+      expect(await runsForIssue(issueId)).toHaveLength(0);
+    });
+  });
+
+  describe("racing the release drain and other writers", () => {
+    it("starts no second run when a release drain promotes the wake after the sweep read it", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+      const wakeId = await seedDeferredWake(companyId, agentId, issueId, { ageMs: 30 * MINUTE_MS });
+      const drainedRunId = randomUUID();
+
+      const result = await sweepWhileIssueLockHeld(issueId, async (tx) => {
+        // What a release drain commits when it promotes the parked wake: the same
+        // row becomes the run's wake and a queued run is created, in one commit.
+        await tx.insert(heartbeatRuns).values({
+          id: drainedRunId,
+          companyId,
+          agentId,
+          status: "queued",
+          invocationSource: "automation",
+          wakeupRequestId: wakeId,
+          contextSnapshot: { issueId, wakeReason: SEEDED_WAKE_REASON },
+        });
+        await tx
+          .update(agentWakeupRequests)
+          .set({ status: "queued", reason: "issue_execution_promoted", runId: drainedRunId })
+          .where(eq(agentWakeupRequests.id, wakeId));
+      });
+
+      expect(result.failed).toBe(0);
+      // Exactly one run for the wake, the drain's. The sweep added none.
+      const runs = await runsForSeededWake(issueId);
+      expect(runs.map((run) => run.id)).toEqual([drainedRunId]);
+      // And no receipt is left parked for the issue: no second deferred wake.
+      const parked = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      expect(parked).toEqual([]);
+      expect((await wakeRow(wakeId)).runId).toBe(drainedRunId);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(1);
+    });
+
+    it("leaves the original wake parked, and adds none, when a live run takes the issue first", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
+      const otherAgentId = await seedAgent(companyId, { name: "Author", maxConcurrentRuns: 3 });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+      const wakeId = await seedDeferredWake(companyId, agentId, issueId, { ageMs: 30 * MINUTE_MS });
+      const liveRunId = randomUUID();
+
+      const result = await sweepWhileIssueLockHeld(issueId, async (tx) => {
+        await tx.insert(heartbeatRuns).values({
+          id: liveRunId,
+          companyId,
+          agentId: otherAgentId,
+          status: "queued",
+          invocationSource: "on_demand",
+          contextSnapshot: { issueId, wakeReason: "seeded_live_run" },
+        });
+      });
+
+      expect(result.failed).toBe(0);
+      const wake = await wakeRow(wakeId);
+      expect(wake.status).toBe("deferred_issue_execution");
+      expect(wake.runId).toBeNull();
+      expect(wake.coalescedCount).toBe(0);
+      // The live run's own release will promote it. Nothing else was parked or started.
+      const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(receipts.map((receipt) => receipt.id)).toEqual([wakeId]);
+      expect((await runsForIssue(issueId)).map((run) => run.id)).toEqual([liveRunId]);
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, liveRunId));
+    });
+  });
+
+  describe("budget hard stops", () => {
+    it("leaves a budget-blocked wake parked and untouched, creates no run row, and resumes with the budget", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
+      const projectId = randomUUID();
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Over budget",
+        pausedAt: new Date(),
+        pauseReason: "budget",
+      });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId, projectId });
+      // A finished run exists, so release admission would claim the parked wake.
+      await seedRun(companyId, agentId, issueId, { status: "succeeded" });
+      const wakeId = await seedDeferredWake(companyId, agentId, issueId, { ageMs: 30 * MINUTE_MS });
+      const before = await wakeRow(wakeId);
+      const runsBefore = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+
+      const blocked = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(blocked).toMatchObject({ skippedBudget: 1, promoted: 0, failed: 0 });
+      const after = await wakeRow(wakeId);
+      expect(after.status).toBe("deferred_issue_execution");
+      expect(after.runId).toBeNull();
+      expect(after.payload).toEqual(before.payload);
+      // No run row was created, so none can be cancelled later at claim time.
+      const runsAfter = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(runsAfter.map((run) => run.id).sort()).toEqual(runsBefore.map((run) => run.id).sort());
+      expect((await heartbeat.getDeferredWakeStats(companyId)).sweep.skippedBudget).toBeGreaterThanOrEqual(1);
+
+      // The budget is raised: the same wake now starts.
+      await db.update(projects).set({ pausedAt: null, pauseReason: null }).where(eq(projects.id, projectId));
+      const resumed = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.drainActiveRunExecutions();
+      expect(resumed.promoted).toBe(1);
+      expect((await runsForSeededWake(issueId)).length).toBe(1);
+    });
+  });
+
+  describe("tenant isolation of the stats", () => {
+    it("reports sweep counters for the requested company only", async () => {
+      const companyA = await seedCompany();
+      const companyB = await seedCompany();
+      const agentA = await seedAgent(companyA, { name: "ReviewerA", maxConcurrentRuns: 3 });
+      const agentB = await seedAgent(companyB, { name: "ReviewerB", maxConcurrentRuns: 3 });
+      const issueA = await seedIssue(companyA, { assigneeAgentId: agentA });
+      // Company B has a wake that the sweep will never read (a closed task).
+      const issueB = await seedIssue(companyB, { assigneeAgentId: agentB, status: "done" });
+      await seedDeferredWake(companyA, agentA, issueA, { ageMs: 30 * MINUTE_MS });
+      await seedDeferredWake(companyB, agentB, issueB, { ageMs: 30 * MINUTE_MS });
+
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+
+      const statsA = await heartbeat.getDeferredWakeStats(companyA);
+      const statsB = await heartbeat.getDeferredWakeStats(companyB);
+      expect(statsA.sweep).toMatchObject({ examined: 1, promoted: 1, failed: 0 });
+      expect(statsA.sweep.lastExaminedAt).toBeInstanceOf(Date);
+      expect(statsB.sweep).toMatchObject({ examined: 0, promoted: 0, skippedHeld: 0, skippedBudget: 0, failed: 0, lastExaminedAt: null });
+      for (const stats of [statsA, statsB]) {
+        // Process-wide fields would leak activity across companies.
+        expect(stats.sweep).not.toHaveProperty("passes");
+        expect(stats.sweep).not.toHaveProperty("completionPasses");
+        expect(stats.sweep).not.toHaveProperty("lastPassAt");
+      }
+      expect(statsB.agents.map((agent) => agent.agentId)).toEqual([agentB]);
+    });
+  });
+
+  describe("bounded passes", () => {
+    it("re-delivers a backlog over several passes, within each agent's free run slots", async () => {
+      const companyId = await seedCompany();
+      let releaseRuns!: () => void;
+      const runsGate = new Promise<void>((resolve) => (releaseRuns = resolve));
+      mockAdapterExecute.mockImplementation(async () => {
+        await runsGate;
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "done", provider: "test", model: "test-model" };
+      });
+      const slotsPerAgent = 3;
+      const agentIds: string[] = [];
+      for (let index = 0; index < 3; index += 1) {
+        agentIds.push(await seedAgent(companyId, { name: `Backlog${index}`, maxConcurrentRuns: slotsPerAgent }));
+      }
+      // 3 agents x 4 stranded wakes: 12 orphans, 9 free slots. The pass is capped
+      // at 4 (the default cap of 20 is covered by the unit tests of the budget).
+      for (const agentId of agentIds) {
+        for (let n = 0; n < 4; n += 1) {
+          const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+          await seedDeferredWake(companyId, agentId, issueId, { ageMs: (60 - n) * MINUTE_MS });
+        }
+      }
+      const parked = async () =>
+        (await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")))).length;
+
+      const first = await heartbeat.sweepDeferredWakes({ maxPromotions: 4 });
+      expect(first).toMatchObject({ scanned: 12, promoted: 4, failed: 0 });
+      expect(await parked()).toBe(8);
+      const perAgent = await db
+        .select({ agentId: heartbeatRuns.agentId, n: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = ${SEEDED_WAKE_REASON}`))
+        .groupBy(heartbeatRuns.agentId);
+      for (const row of perAgent) expect(row.n).toBeLessThanOrEqual(slotsPerAgent);
+
+      // The next pass continues with what is left, within the slots still free.
+      const second = await heartbeat.sweepDeferredWakes({ recheckMs: 0, maxPromotions: 4 });
+      expect(second.promoted).toBeLessThanOrEqual(4);
+      expect(second.promoted).toBeGreaterThan(0);
+      const perAgentAfter = await db
+        .select({ agentId: heartbeatRuns.agentId, n: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = ${SEEDED_WAKE_REASON}`))
+        .groupBy(heartbeatRuns.agentId);
+      for (const row of perAgentAfter) expect(row.n).toBeLessThanOrEqual(slotsPerAgent);
+
+      releaseRuns();
+      await heartbeat.drainActiveRunExecutions();
+    });
+  });
+
+  it("indexes parked wakes with a narrow partial index", async () => {
+    const rows = (await db.execute(
+      sql`select indexdef from pg_indexes where indexname = 'agent_wakeup_requests_deferred_requested_idx'`,
+    )) as unknown as Array<{ indexdef: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.indexdef).toMatch(/\(requested_at\)/);
+    expect(rows[0]!.indexdef).toContain("deferred_issue_execution");
   });
 });

@@ -58,11 +58,13 @@ export {
 export type { SelfReblockWakeMarker } from "./domain/self-reblock-wake.js";
 export {
   DEFERRED_WAKE_SWEEP_BATCH_LIMIT,
+  DEFERRED_WAKE_SWEEP_MAX_PER_PASS,
   DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
   DEFERRED_WAKE_SWEEP_RECHECK_MS,
   compareDeferredWakes,
   issuePriorityRank,
   selectDeferredWakesToPromote,
+  sweepPromotionBudget,
 } from "./domain/deferred-wake-sweep.js";
 export type { OrphanedDeferredWake } from "./domain/deferred-wake-sweep.js";
 export type {

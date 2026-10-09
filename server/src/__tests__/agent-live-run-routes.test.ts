@@ -678,16 +678,15 @@ describe("agent live run routes", () => {
         },
       ],
       sweep: {
-        passes: 3,
-        completionPasses: 1,
         examined: 2,
         promoted: 0,
         retired: 0,
         stillDeferred: 0,
         skippedHeld: 2,
+        skippedBudget: 0,
         skippedNotInvokable: 0,
         failed: 0,
-        lastPassAt: generatedAt,
+        lastExaminedAt: generatedAt,
       },
     });
 
@@ -703,6 +702,9 @@ describe("agent live run routes", () => {
       agents: [{ agentId: "agent-1", deferredCount: 2, oldestDeferredAgeSeconds: 2280, promotedLast24h: 5 }],
       sweep: { skippedHeld: 2 },
     });
+    // Only this company's counters: nothing process-wide that another company moves.
+    expect(res.body.sweep).not.toHaveProperty("passes");
+    expect(res.body.sweep).not.toHaveProperty("lastPassAt");
     expect(res.headers["cache-control"]).toContain("no-store");
   });
 
