@@ -94,7 +94,7 @@ The preview server binds `0.0.0.0` and accepts any Host, so a tailnet or LAN add
 
 ### Precompressed UI assets
 
-`vite build` writes a `.br` (Brotli) and a `.gz` (gzip) file next to every script, stylesheet, SVG and JSON file in `assets/` that is at least 1 KB and compresses smaller. The server (`server/src/middleware/precompressed-static.ts`) sends the Brotli file to clients that accept it, the gzip file to the rest of the clients that accept gzip, and the plain file otherwise, with `Vary: Accept-Encoding`. The app therefore does not depend on a reverse proxy to compress its own bundle: the 6.4 MB entry chunk is about 1.3 MB on the wire. Range requests and files without a sibling get the plain file. `index.html` and the service worker are not precompressed. The compression adds about 9 s to the UI build.
+`vite build` writes a `.br` (Brotli) and a `.gz` (gzip) file next to every script, stylesheet, SVG and JSON file in `assets/` that is at least 1 KB and compresses smaller. The server (`server/src/middleware/precompressed-static.ts`) sends the Brotli file to clients that accept it, the gzip file to the rest of the clients that accept gzip, and the plain file otherwise, with `Vary: Accept-Encoding`. The app therefore does not depend on a reverse proxy to compress its own bundle: the 6.4 MB entry chunk is about 1.3 MB on the wire. Range requests and files without a sibling get the plain file. The server reads the list of precompressed files when it starts, so restart it after rebuilding the UI to serve the new copies; until then new files go out uncompressed. `index.html` and the service worker are not precompressed. The compression adds about 9 s to the UI build.
 
 ## Storybook
 
