@@ -105,12 +105,42 @@ export class PaperclipApiClient {
     this.apiKey = apiKey?.trim() || undefined;
   }
 
+  /**
+   * GET a streaming response (for example NDJSON) and return its body without
+   * buffering it. Errors and auth recovery behave like the JSON methods.
+   */
+  async getStream(path: string, accept = "application/x-ndjson"): Promise<ReadableStream<Uint8Array>> {
+    const response = await this.send(path, { method: "GET", headers: { accept } }, undefined);
+    if (!response?.body) {
+      throw new ApiRequestError(response?.status ?? 404, "Streaming response had no body", undefined, null);
+    }
+    return response.body;
+  }
+
   private async request<T>(
     path: string,
     init: RequestInit,
     opts?: RequestOptions,
-    hasRetriedAuth = false,
   ): Promise<T | null> {
+    const response = await this.send(path, init, opts);
+    if (!response || response.status === 204) {
+      return null;
+    }
+
+    const text = await response.text();
+    if (!text.trim()) {
+      return null;
+    }
+
+    return safeParseJson(text) as T;
+  }
+
+  private async send(
+    path: string,
+    init: RequestInit,
+    opts?: RequestOptions,
+    hasRetriedAuth = false,
+  ): Promise<Response | null> {
     const url = buildUrl(this.apiBase, path);
     const method = String(init.method ?? "GET").toUpperCase();
 
@@ -160,22 +190,13 @@ export class PaperclipApiClient {
         });
         if (recoveredToken) {
           this.setApiKey(recoveredToken);
-          return this.request<T>(path, init, opts, true);
+          return this.send(path, init, opts, true);
         }
       }
       throw apiError;
     }
 
-    if (response.status === 204) {
-      return null;
-    }
-
-    const text = await response.text();
-    if (!text.trim()) {
-      return null;
-    }
-
-    return safeParseJson(text) as T;
+    return response;
   }
 }
 
