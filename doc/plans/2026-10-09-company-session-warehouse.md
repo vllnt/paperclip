@@ -637,6 +637,11 @@ item resolved. Remaining:
 | B2 | The reaper race still breaks the incremental guarantee for W1 export consumers; the W3 sweep does not help them. Satisfied by landing F3 or an export-side reconciliation | F3 built as its own PR (#65): `setRunStatusIfRunning` compare-and-set, regression test red before and green after. W1 (#61) merges after #65 |
 | New | CLI `--resume` neither keeps nor validates `--until` | `export.header` records `requestedUntil`; resume reuses it when omitted and refuses a different one (tested) |
 
+**Round 4** (Codex `gpt-6-astra`, narrow closure check, verdict **APPROVE**).
+B2 resolved by F3 (#65): the reaper's detached-process write and its process-loss
+path are both compare-and-set, so no reaper write reopens a terminal run by id.
+`--until` resume resolved.
+
 A separate code review (Claude code-reviewer, round 1 of W1 code) found 11
 defects, all fixed with tests: unreadable run logs and event pages no longer
 stop the export (`run.omission`); the first page is queried before the 200 is
