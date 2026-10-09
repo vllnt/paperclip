@@ -72,6 +72,20 @@ const CLAUDE_USAGE = {
   billingType: "metered_api",
 };
 
+const OPENAI_USAGE = {
+  inputTokens: 1000,
+  cachedInputTokens: 800,
+  outputTokens: 50,
+  rawInputTokens: 1000,
+  rawCachedInputTokens: 800,
+  rawOutputTokens: 50,
+  usageSource: "per_run",
+  provider: "openai",
+  biller: "openai",
+  model: "gpt-6-astra",
+  billingType: "subscription_included",
+};
+
 describe("deriveRunUsageRecord", () => {
   it.each(["queued", "running", "scheduled_retry"])("returns null for the non-terminal status %s", (status) => {
     expect(deriveRunUsageRecord(makeInput({ run: makeRun({ status }) }))).toBeNull();
@@ -187,19 +201,85 @@ describe("deriveRunUsageRecord", () => {
     expect(record).toMatchObject({ usageQuality: "derived", usageBasis: "session_delta" });
   });
 
-  it("marks Codex usage as declared until its basis is verified", () => {
-    const direct = deriveRunUsageRecord(makeInput({
-      adapterType: "codex_local",
-      run: makeRun({ usageJson: { ...CLAUDE_USAGE, usageSource: undefined } }),
-    }));
-    const viaRunner = deriveRunUsageRecord(makeInput({
-      adapterType: "paperclip_runner",
-      run: makeRun({ driverKind: "codex_app_server", usageJson: CLAUDE_USAGE }),
-    }));
+  describe("Codex", () => {
+    it("treats codex_local usage as measured per-run counts, even when a resume reuses the session id", () => {
+      const resumed = deriveRunUsageRecord(makeInput({
+        adapterType: "codex_local",
+        run: makeRun({
+          sessionIdBefore: "session-1",
+          usageJson: { ...OPENAI_USAGE, inputTokens: 440670, cachedInputTokens: 400000, rawInputTokens: 440670 },
+        }),
+      }));
 
-    expect(direct?.usageQuality).toBe("declared");
-    expect(viaRunner?.usageQuality).toBe("declared");
-    expect(viaRunner?.driverKind).toBe("codex_app_server");
+      expect(resumed).toMatchObject({
+        usageQuality: "measured",
+        usageBasis: "per_run",
+        sessionReused: true,
+        inputTokens: 40670,
+        cacheReadTokens: 400000,
+      });
+    });
+
+    it("keeps the app-server runner path declared, because only the CLI path was verified", () => {
+      const viaRunner = deriveRunUsageRecord(makeInput({
+        adapterType: "paperclip_runner",
+        run: makeRun({ driverKind: "codex_app_server", usageJson: OPENAI_USAGE }),
+      }));
+
+      expect(viaRunner?.usageQuality).toBe("declared");
+      expect(viaRunner?.driverKind).toBe("codex_app_server");
+    });
+
+    it("keeps Anthropic counts as reported when a codex_local run streams from an Anthropic model", () => {
+      const record = deriveRunUsageRecord(makeInput({
+        adapterType: "codex_local",
+        run: makeRun({ usageJson: CLAUDE_USAGE }),
+      }));
+
+      expect(record).toMatchObject({ inputTokens: 1200, cacheReadTokens: 30000, usageQuality: "measured" });
+    });
+  });
+
+  describe("token classes by provider", () => {
+    it.each(["openai", "xai"])("stores %s input without its cached part, so the classes do not overlap", (provider) => {
+      const record = deriveRunUsageRecord(makeInput({
+        adapterType: "codex_local",
+        run: makeRun({ usageJson: { ...OPENAI_USAGE, provider } }),
+      }));
+
+      expect(record).toMatchObject({
+        provider,
+        inputTokens: 200,
+        cacheReadTokens: 800,
+        outputTokens: 50,
+        usageQuality: "measured",
+      });
+    });
+
+    it("keeps the counts of a provider that has no rule as reported", () => {
+      const other = deriveRunUsageRecord(makeInput({ run: makeRun({ usageJson: { ...OPENAI_USAGE, provider: "mystery" } }) }));
+      const none = deriveRunUsageRecord(makeInput({ run: makeRun({ usageJson: { ...OPENAI_USAGE, provider: undefined } }) }));
+
+      expect(other).toMatchObject({ inputTokens: 1000, cacheReadTokens: 800 });
+      expect(none).toMatchObject({ inputTokens: 1000, cacheReadTokens: 800 });
+    });
+
+    it("keeps the reported counts and marks the run declared when the cached part is larger than the input", () => {
+      const record = deriveRunUsageRecord(makeInput({
+        adapterType: "codex_local",
+        run: makeRun({ usageJson: { ...OPENAI_USAGE, inputTokens: 100, cachedInputTokens: 800 } }),
+      }));
+
+      expect(record).toMatchObject({ inputTokens: 100, cacheReadTokens: 800, usageQuality: "declared" });
+    });
+
+    it("subtracts nothing when only one of the two counts is present", () => {
+      const record = deriveRunUsageRecord(makeInput({
+        run: makeRun({ usageJson: { provider: "openai", inputTokens: 1000, outputTokens: 5 } }),
+      }));
+
+      expect(record).toMatchObject({ inputTokens: 1000, cacheReadTokens: null });
+    });
   });
 
   it("ignores negative, fractional and non-finite token values", () => {
