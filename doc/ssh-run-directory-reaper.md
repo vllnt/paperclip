@@ -75,28 +75,63 @@ Nothing outside `runs/<runId>` is deleted, and no link is followed.
 
 ## Races
 
-A run directory is `runs/<runId>` under one root on one host. The only code that
-makes that path (`prepareRemoteManagedRuntime`, called from
-`prepareAdapterExecutionTargetRuntime`) takes the run id of the run that owns the
-lease, so only leases of the same run can use the directory. A lease of another
-run on the same root uses its own `runs/<otherId>`, and the reaper does not wait
-for it; if it did, nothing could be reaped on a worker that is always busy. The
-claim is therefore keyed by host, port, user, root, and run id.
+A run directory is `runs/<runId>` under one root on one host. A lease of another
+run on the same root, even with the same host and `providerLeaseId`, uses its own
+`runs/<otherId>`, and the reaper does not wait for it; if it did, nothing could
+be reaped on a worker that is always busy. The claim is therefore keyed by host,
+port, user, root, and run id. That is sound because of one invariant, which three
+things keep true:
+
+1. **One builder, one segment.** `sshRunDirectory` is the only code that makes the
+   path, and it throws for a run id that is not one plain path segment (empty,
+   `.`, `..`, or containing `/` or NUL). Distinct ids never share a directory.
+2. **A run prepares only its own id on the target's root.** The heartbeat acquires
+   the run's lease with `heartbeatRunId: run.id`, builds the target from that
+   lease's `remoteCwd`, and gives the adapter `runId: run.id`. The other callers
+   of `prepareAdapterExecutionTargetRuntime` pass their own base
+   (`agent-files/<agent>/<run>`, which nests the run directory away from
+   `<root>/.paperclip-runtime/runs/`) or `syncWorkspace: false` (no run
+   directory). The reaper acts only on a lease whose run id is a UUID with a
+   finished `heartbeat_runs` row, and refuses any other id, such as the login
+   flows' `claude-login-<uuid>`.
+3. **Tests.** `remote-managed-runtime.test.ts` pins the builder,
+   `ssh-run-directory-callers.test.ts` fails when a new file starts preparing a
+   remote runtime without review, and `ssh-run-directory-reaper.test.ts` keeps a
+   live lease of another run on the same host and root from keeping this
+   directory.
+
+If a flow ever needs two run ids on one directory, key the claim on the directory
+instead of the run.
 
 - **Claim.** A short transaction locks every lease row of the directory (same
   key), in id order, and only then decides, so two replicas or two sweeps that
   reach the same directory through different lease rows cannot both win: the
   second waits, then sees the first one's claim. The claim also fails while any
   lease of the run is `active`, `retained`, or `pending_cleanup`. It is recorded
-  in the lease's `metadata.sshRunDirectory` (`state: "reaping"`). The reaper
-  checks for a busy lease once more after the claim and before the remote delete,
-  and gives the claim back if one appeared.
+  in the lease's `metadata.sshRunDirectory` (`state: "reaping"`) with an owner
+  token. The reaper checks for a busy lease once more after the claim and before
+  the remote delete, and gives the claim back if one appeared.
+- **Owner and renewal.** While it works, the owner renews the claim every minute
+  (`renewedAt`). A claim is stale when it was not renewed for 15 minutes, so a
+  removal that outlasts that window keeps its claim while the server lives, and a
+  dead owner's claim expires. Before the delete and before recording the outcome,
+  the owner checks under the same row locks that no other lease row of the
+  directory holds a live claim, so a reaper that stalled and was replaced through
+  a sibling lease row neither deletes nor records. A remote command that fails or
+  times out after it was sent does not give the claim back, because it may still
+  run on the worker: the claim stops being renewed, expires, and the sweep tries
+  again.
 - **Acquire.** When an SSH lease starts for a run, it checks for a fresh claim on
   that run after its own lease is visible. If there is one, the new lease fails
   and the run must start again. Between the two checks, one side always sees the
   other.
-- **Crash.** A claim older than 15 minutes (a server died mid-removal) is
+- **Crash.** A claim not renewed for 15 minutes (a server died mid-removal) is
   reclaimed by the next sweep.
+- **Residual.** A server frozen for more than 15 minutes after it sent the delete
+  can lose its claim while the command still runs on the worker. Then two reapers
+  may delete one directory of a finished run. The run id is never prepared again
+  (a retry gets a new id), so nothing live is under it; closing this fully means
+  renaming the directory on the worker before deleting it.
 
 On the worker, the script resolves the root once, then enters `runs/<runId>`
 and compares the physical path (`pwd -P`) with the expected one. Everything after

@@ -40,8 +40,17 @@ const REMOTE_ADDITIONAL_SOURCE_HEAVY_DIR_EXCLUDES = [
  * A synced SSH run works in `<remoteRoot>/.paperclip-runtime/runs/<runId>/workspace`.
  * Nothing else writes under `runs/<runId>`, so that directory holds only the
  * run's own copy of the workspace.
+ *
+ * This is the only place that builds the path, and the run id is one plain
+ * path segment, so two run ids never share a directory. The reaper's claim
+ * relies on that: it looks only at leases of the directory's own run. An id
+ * such as `..` or `a/../b` would alias another run's directory, so it throws.
  */
 export function sshRunDirectory(remoteRoot: string, runId: string): string {
+  // Anything else is one segment named by the id, so it aliases nothing.
+  if (runId === "" || runId === "." || runId === ".." || runId.includes("/") || runId.includes("\0")) {
+    throw new Error("An SSH run directory name must be one plain path segment.");
+  }
   return path.posix.join(remoteRoot, ".paperclip-runtime", "runs", runId);
 }
 

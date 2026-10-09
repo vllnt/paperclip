@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { and, asc, eq, inArray, isNotNull, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -31,8 +32,12 @@ const SWEEP_TIME_BUDGET_MS = 4 * 60 * 1000;
 // Older leases are history: their directories were reaped or are decided.
 const SWEEP_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_REMOVAL_ATTEMPTS = 5;
-// A claim older than a whole removal plus slack belongs to a server that died.
+// A claim whose owner has not renewed it for a whole removal plus slack belongs
+// to a server that died or stalled.
 const REAP_CLAIM_STALE_MS = REAP_TIMEOUT_MS + 5 * 60 * 1000;
+// The owner renews its claim this often while it works, so a removal that runs
+// longer than the timeout above still holds the claim as long as its owner lives.
+const REAP_CLAIM_RENEW_MS = 60 * 1000;
 
 function minutesFromEnv(name: string, fallbackMinutes: number): number {
   const configured = Number(process.env[name]);
@@ -85,6 +90,17 @@ const SKIPPED: ReapReport = { outcome: "skipped", bytesFreed: 0 };
 export interface SshRunDirectoryReaperHooks {
   /** After the directory is claimed and before the remote delete starts. */
   beforeRemoteDelete?: () => Promise<void>;
+  /** Stands in for the remote delete. */
+  reapRemote?: typeof reapSshRunDirectory;
+}
+
+/** What a service instance can be given; the defaults are the production values. */
+export interface SshRunDirectoryReaperOptions {
+  hooks?: SshRunDirectoryReaperHooks;
+  /** Test seam: the time claims are stamped and judged against. */
+  clock?: () => Date;
+  /** Test seam: how often a claim owner renews. 0 turns renewal off. */
+  claimRenewMs?: number;
 }
 
 function previousDecision(lease: EnvironmentLease): Record<string, unknown> | null {
@@ -133,24 +149,34 @@ function leasesOfDirectory(key: RunDirectoryKey) {
   );
 }
 
-// Takes the one claim on a directory. Two leases of the same directory can be
+const claimDecision = sql`${environmentLeases.metadata} -> 'sshRunDirectory'`;
+
+// When the claim's owner last showed it was alive: its latest renewal, or the
+// claim itself if it never renewed. Judging a claim by this and not by when it
+// was taken is what lets a removal outlast the stale window while its owner
+// lives, and lets a dead owner's claim expire.
+const claimAliveAt = sql`coalesce(${claimDecision} ->> 'renewedAt', ${claimDecision} ->> 'claimedAt')::timestamptz`;
+
+// Takes the one claim on a directory, and returns the owner token that proves
+// it, or null if someone else holds it. Two leases of the same directory can be
 // released at the same time (two servers, two sweeps), and a check followed by
 // an update of the caller's own row would let both win. So a short transaction
 // first locks every lease row of the directory, in a fixed order, and decides
 // only then: the second contender waits for the first to commit and then sees
 // its claim. The claim also fails while any lease of the run is busy.
-async function claimRunDirectory(db: Db, lease: EnvironmentLease, key: RunDirectoryKey, context: ReapContext): Promise<boolean> {
-  const claim = { state: "reaping", claimedAt: context.now.toISOString(), trigger: context.trigger, attempts: previousAttempts(lease) };
+async function claimRunDirectory(db: Db, lease: EnvironmentLease, key: RunDirectoryKey, context: ReapContext): Promise<string | null> {
+  const owner = randomUUID();
+  const claimedAt = context.now.toISOString();
+  const claim = { state: "reaping", owner, claimedAt, renewedAt: claimedAt, trigger: context.trigger, attempts: previousAttempts(lease) };
   const staleBefore = new Date(context.now.getTime() - REAP_CLAIM_STALE_MS).toISOString();
-  const decision = sql`${environmentLeases.metadata} -> 'sshRunDirectory'`;
-  return await db.transaction(async (tx) => {
+  const claimed = await db.transaction(async (tx) => {
     await tx.select({ id: environmentLeases.id }).from(environmentLeases)
       .where(leasesOfDirectory(key)).orderBy(asc(environmentLeases.id)).for("update");
     const [held] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
       leasesOfDirectory(key),
       ne(environmentLeases.id, lease.id),
-      sql`${decision} ->> 'state' = 'reaping'`,
-      sql`(${decision} ->> 'claimedAt')::timestamptz > ${staleBefore}::timestamptz`,
+      sql`${claimDecision} ->> 'state' = 'reaping'`,
+      sql`${claimAliveAt} > ${staleBefore}::timestamptz`,
     )).limit(1);
     if (held) return false;
     const [busy] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
@@ -159,21 +185,84 @@ async function claimRunDirectory(db: Db, lease: EnvironmentLease, key: RunDirect
       inArray(environmentLeases.status, [...BUSY_LEASE_STATUSES]),
     )).limit(1);
     if (busy) return false;
-    const claimed = await tx.update(environmentLeases).set({
+    const taken = await tx.update(environmentLeases).set({
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ sshRunDirectory: claim })}::jsonb`,
       updatedAt: new Date(),
     }).where(and(
       eq(environmentLeases.id, lease.id),
-      sql`(${decision} is null
-        or ${decision} ->> 'reason' = 'rm_failed'
-        or (${decision} ->> 'state' = 'reaping' and (${decision} ->> 'claimedAt')::timestamptz < ${staleBefore}::timestamptz))`,
+      sql`(${claimDecision} is null
+        or ${claimDecision} ->> 'reason' = 'rm_failed'
+        or (${claimDecision} ->> 'state' = 'reaping' and ${claimAliveAt} < ${staleBefore}::timestamptz))`,
     )).returning({ id: environmentLeases.id });
-    return claimed.length > 0;
+    return taken.length > 0;
+  });
+  return claimed ? owner : null;
+}
+
+const ownsClaim = (leaseId: string, owner: string) => and(
+  eq(environmentLeases.id, leaseId),
+  sql`${claimDecision} ->> 'state' = 'reaping'`,
+  sql`${claimDecision} ->> 'owner' = ${owner}`,
+);
+
+/** A claim on a directory, held by one owner token. */
+interface HeldClaim {
+  owner: string;
+  /**
+   * Confirms that this owner is still the only live holder of the directory,
+   * and renews the claim in the same step. False once another reaper took the
+   * claim over, whichever lease row of the directory it took it on.
+   */
+  hold: () => Promise<boolean>;
+}
+
+// Under the directory's row locks, in the same order as the claim: the claim is
+// ours only if our row still carries our token and no other row of the
+// directory holds a live claim. A reaper that was paused past the stale window
+// can find that another one took over through a sibling lease row; its own row
+// still shows its token, so the siblings must be looked at too. When the claim
+// is ours the renewal is written in the same transaction, so nobody can take it
+// between the check and the renewal.
+async function reassertClaim(db: Db, lease: EnvironmentLease, key: RunDirectoryKey, owner: string, now: Date): Promise<boolean> {
+  const staleBefore = new Date(now.getTime() - REAP_CLAIM_STALE_MS).toISOString();
+  return await db.transaction(async (tx) => {
+    await tx.select({ id: environmentLeases.id }).from(environmentLeases)
+      .where(leasesOfDirectory(key)).orderBy(asc(environmentLeases.id)).for("update");
+    const [rival] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      leasesOfDirectory(key),
+      ne(environmentLeases.id, lease.id),
+      sql`${claimDecision} ->> 'state' = 'reaping'`,
+      sql`${claimAliveAt} > ${staleBefore}::timestamptz`,
+    )).limit(1);
+    if (rival) return false;
+    const renewed = await tx.update(environmentLeases)
+      .set({ metadata: sql`jsonb_set(${environmentLeases.metadata}, '{sshRunDirectory,renewedAt}', to_jsonb(${now.toISOString()}::text))` })
+      .where(ownsClaim(lease.id, owner))
+      .returning({ id: environmentLeases.id });
+    return renewed.length > 0;
   });
 }
 
-// Gives the claim back, restoring what was decided before it.
-async function releaseClaim(db: Db, lease: EnvironmentLease): Promise<void> {
+// Renews the claim while its owner works, so a removal that runs longer than
+// the stale window keeps it. If another reaper took the claim over, this finds
+// out and `lost()` turns true. A failed write is retried on the next tick.
+function keepClaimAlive(claim: HeldClaim, everyMs: number): { stop: () => void; lost: () => boolean } {
+  let lost = false;
+  if (!(everyMs > 0)) return { stop: () => undefined, lost: () => lost };
+  let renewing = false;
+  const timer = setInterval(() => {
+    if (renewing) return;
+    renewing = true;
+    void claim.hold()
+      .then((held) => { if (!held) lost = true; }, () => undefined)
+      .finally(() => { renewing = false; });
+  }, everyMs);
+  timer.unref?.();
+  return { stop: () => clearInterval(timer), lost: () => lost };
+}
+
+// Gives the claim back, restoring what was decided before it. Only its owner can.
+async function releaseClaim(db: Db, lease: EnvironmentLease, owner: string): Promise<void> {
   const before = previousDecision(lease);
   await db
     .update(environmentLeases)
@@ -183,7 +272,7 @@ async function releaseClaim(db: Db, lease: EnvironmentLease): Promise<void> {
         : sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'sshRunDirectory'`,
       updatedAt: new Date(),
     })
-    .where(and(eq(environmentLeases.id, lease.id), sql`${environmentLeases.metadata} -> 'sshRunDirectory' ->> 'state' = 'reaping'`));
+    .where(ownsClaim(lease.id, owner));
 }
 
 /**
@@ -200,8 +289,8 @@ export async function assertRunDirectoryNotBeingRemoved(db: Db, runId: string, e
     .where(and(
       eq(environmentLeases.heartbeatRunId, runId),
       ne(environmentLeases.id, exceptLeaseId),
-      sql`${environmentLeases.metadata} -> 'sshRunDirectory' ->> 'state' = 'reaping'`,
-      sql`(${environmentLeases.metadata} -> 'sshRunDirectory' ->> 'claimedAt')::timestamptz > ${staleBefore}::timestamptz`,
+      sql`${claimDecision} ->> 'state' = 'reaping'`,
+      sql`${claimAliveAt} > ${staleBefore}::timestamptz`,
     ))
     .limit(1);
   if (claim) throw new Error("This run's workspace directory is being removed. Start the run again.");
@@ -220,14 +309,19 @@ function trustedRunRoot(lease: EnvironmentLease, remoteRoot: string, configuredR
     normalized(lease.metadata?.remoteWorkspacePath) === configured;
 }
 
-async function recordDecision(db: Db, leaseId: string, record: Record<string, unknown>): Promise<void> {
-  await db
+// Writes what was decided for a lease's directory. With an owner token it writes
+// only while that owner still holds the claim, and says whether it did: a reaper
+// whose claim was taken over must not overwrite the new owner's record.
+async function recordDecision(db: Db, leaseId: string, record: Record<string, unknown>, owner?: string): Promise<boolean> {
+  const rows = await db
     .update(environmentLeases)
     .set({
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ sshRunDirectory: record })}::jsonb`,
       updatedAt: new Date(),
     })
-    .where(eq(environmentLeases.id, leaseId));
+    .where(owner ? ownsClaim(leaseId, owner) : eq(environmentLeases.id, leaseId))
+    .returning({ id: environmentLeases.id });
+  return rows.length > 0;
 }
 
 // Removes the run directory of one released SSH lease when it is safe to. It
@@ -237,8 +331,10 @@ async function reapLease(
   environment: Pick<Environment, "id" | "driver" | "config">,
   lease: EnvironmentLease,
   context: ReapContext,
-  hooks?: SshRunDirectoryReaperHooks,
+  serviceOptions: SshRunDirectoryReaperOptions = {},
 ): Promise<ReapReport> {
+  const hooks = serviceOptions.hooks;
+  const clock = serviceOptions.clock ?? (() => new Date());
   const runId = lease.heartbeatRunId;
   const remoteRoot = typeof lease.metadata?.remoteCwd === "string" ? lease.metadata.remoteCwd : null;
   if (lease.provider !== "ssh" || lease.leasePolicy !== "ephemeral" || !runId || !remoteRoot) return SKIPPED;
@@ -289,18 +385,36 @@ async function reapLease(
     const key: RunDirectoryKey = {
       host: parsed.config.host, port: parsed.config.port, username: parsed.config.username, root: remoteRoot, runId,
     };
-    if (!await claimRunDirectory(db, lease, key, context)) return SKIPPED;
+    const owner = await claimRunDirectory(db, lease, key, context);
+    if (!owner) return SKIPPED;
+    const claim: HeldClaim = { owner, hold: () => reassertClaim(db, lease, key, owner, clock()) };
+    const renewal = keepClaimAlive(claim, serviceOptions.claimRenewMs ?? REAP_CLAIM_RENEW_MS);
+    let remoteStarted = false;
     try {
       await hooks?.beforeRemoteDelete?.();
-      if (await hasBusyLease(db, runId, lease.id)) {
-        await releaseClaim(db, lease);
+      // Delete only while the claim is still ours and no lease has appeared.
+      if (renewal.lost() || !await claim.hold()) {
+        logger.warn({ leaseId: lease.id, runId }, "kept a finished SSH run directory: its claim was taken over before the delete");
         return SKIPPED;
       }
-      const result = await reapSshRunDirectory({ spec: parsed.config, remoteRoot, runId, timeoutMs: REAP_TIMEOUT_MS });
-      return await recordResult(db, lease, runId, run.agentId, remoteRoot, result, context);
+      if (await hasBusyLease(db, runId, lease.id)) {
+        await releaseClaim(db, lease, owner);
+        return SKIPPED;
+      }
+      remoteStarted = true;
+      const result = await (hooks?.reapRemote ?? reapSshRunDirectory)({
+        spec: parsed.config, remoteRoot, runId, timeoutMs: REAP_TIMEOUT_MS,
+      });
+      return await recordResult(db, lease, runId, run.agentId, remoteRoot, result, context, claim);
     } catch (error) {
-      await releaseClaim(db, lease).catch(() => undefined);
+      // After the command was sent, a failure here says nothing about the
+      // worker: an SSH timeout does not stop a delete that already runs there.
+      // So the claim is not given back. It stops being renewed and expires, and
+      // only then can a lease or another reaper use the directory again.
+      if (!remoteStarted) await releaseClaim(db, lease, owner).catch(() => undefined);
       throw error;
+    } finally {
+      renewal.stop();
     }
   } catch {
     // Log a constant kind only: an SSH error can carry host or credential detail.
@@ -320,18 +434,27 @@ async function recordResult(
   remoteRoot: string,
   result: SshRunDirectoryReapResult,
   context: ReapContext,
+  claim: HeldClaim,
 ): Promise<ReapReport> {
   const at = context.now.toISOString();
   const base = { leaseId: lease.id, environmentId: lease.environmentId, trigger: context.trigger };
+  // Only the claim's owner records the outcome. If the claim was taken over
+  // while the delete ran, the new owner records its own, and ours is dropped so
+  // the same directory is not reported twice.
+  const record = async (decision: Record<string, unknown>) => {
+    if (await claim.hold() && await recordDecision(db, lease.id, decision, claim.owner)) return true;
+    logger.warn({ leaseId: lease.id, runId }, "dropped the outcome of a finished SSH run directory removal: its claim was taken over");
+    return false;
+  };
   if (result.outcome === "absent") {
-    await recordDecision(db, lease.id, { state: "absent", at, trigger: context.trigger });
+    if (!await record({ state: "absent", at, trigger: context.trigger })) return SKIPPED;
     return { outcome: "absent", bytesFreed: 0 };
   }
   if (result.outcome === "removed") {
     const preservedBundle = result.preserved.length > 0 ? sshPreservedBundlePath(remoteRoot, runId) : undefined;
-    await recordDecision(db, lease.id, {
+    if (!await record({
       state: "removed", at, trigger: context.trigger, bytesFreed: result.bytesFreed, preserved: result.preserved,
-    });
+    })) return SKIPPED;
     await logActivity(db, {
       companyId: lease.companyId, actorType: "system", actorId: REAPER_ACTOR_ID, action: REAPED_ACTION,
       entityType: "heartbeat_run", entityId: runId, runId, agentId,
@@ -343,16 +466,21 @@ async function recordResult(
   }
   const reason = result.outcome === "symlink" ? "symlink" : result.reason;
   const bytes = result.outcome === "kept" ? result.bytes : 0;
-  return await recordKept(db, lease, runId, agentId, reason, bytes, context);
+  return await recordKept(db, lease, runId, agentId, reason, bytes, context, claim);
 }
 
 async function recordKept(
   db: Db, lease: EnvironmentLease, runId: string, agentId: string, reason: string, bytes: number, context: ReapContext,
+  claim?: HeldClaim,
 ): Promise<ReapReport> {
   const attempts = reason === "rm_failed" ? previousAttempts(lease) + 1 : undefined;
-  await recordDecision(db, lease.id, {
+  const recorded = (!claim || await claim.hold()) && await recordDecision(db, lease.id, {
     state: "kept", reason, at: context.now.toISOString(), trigger: context.trigger, bytes, ...(attempts ? { attempts } : {}),
-  });
+  }, claim?.owner);
+  if (!recorded) {
+    logger.warn({ leaseId: lease.id, runId }, "dropped the outcome of a finished SSH run directory removal: its claim was taken over");
+    return SKIPPED;
+  }
   // A directory that cannot be removed is retried; say so only the first time.
   if (attempts === undefined || attempts === 1) {
     await logActivity(db, {
@@ -371,12 +499,13 @@ async function recordKept(
  * run's terminal status was; the sweep removes the ones that release-time
  * removal missed.
  */
-export function sshRunDirectoryReaperService(db: Db, serviceOptions: { hooks?: SshRunDirectoryReaperHooks } = {}) {
+export function sshRunDirectoryReaperService(db: Db, serviceOptions: SshRunDirectoryReaperOptions = {}) {
   let sweeping = false;
+  const clock = serviceOptions.clock ?? (() => new Date());
   return {
     /** Never throws. */
     async reapReleasedLease(environment: Pick<Environment, "id" | "driver" | "config">, lease: EnvironmentLease): Promise<void> {
-      await reapLease(db, environment, lease, { trigger: "lease_release", now: new Date() }, serviceOptions.hooks);
+      await reapLease(db, environment, lease, { trigger: "lease_release", now: clock() }, serviceOptions);
     },
 
     async sweep(options: {
@@ -387,11 +516,11 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: { hooks?: S
       if (sweeping) return summary;
       sweeping = true;
       try {
-        const now = options.now ?? new Date();
+        const now = options.now ?? clock();
         const readDisk = options.readDiskUsagePercent
           ?? ((config: SshConnectionConfig, remoteRoot: string) => readSshDiskUsagePercent({ spec: config, remoteRoot }));
         const finishedAt = sql`coalesce(${environmentLeases.releasedAt}, ${environmentLeases.updatedAt})`;
-        const decision = sql`${environmentLeases.metadata} -> 'sshRunDirectory'`;
+        const decision = claimDecision;
         const staleClaimBefore = new Date(now.getTime() - REAP_CLAIM_STALE_MS).toISOString();
         const candidates = await db
           .select()
@@ -406,7 +535,7 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: { hooks?: S
             sql`${finishedAt} > ${new Date(now.getTime() - SWEEP_LOOKBACK_MS).toISOString()}::timestamptz`,
             sql`(${decision} is null
               or (${decision} ->> 'reason' = 'rm_failed' and coalesce((${decision} ->> 'attempts')::int, 0) < ${MAX_REMOVAL_ATTEMPTS})
-              or (${decision} ->> 'state' = 'reaping' and (${decision} ->> 'claimedAt')::timestamptz < ${staleClaimBefore}::timestamptz))`,
+              or (${decision} ->> 'state' = 'reaping' and ${claimAliveAt} < ${staleClaimBefore}::timestamptz))`,
           ))
           .orderBy(asc(finishedAt))
           .limit(SWEEP_BATCH);
@@ -426,7 +555,7 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: { hooks?: S
             }
             return pressureByHost.get(key) ? sshRunReaperPressureMinAgeMs() : sshRunReaperMinAgeMs();
           };
-          const report = await reapLease(db, environment, lease, { trigger: "sweep", now, minAgeMs }, serviceOptions.hooks);
+          const report = await reapLease(db, environment, lease, { trigger: "sweep", now, minAgeMs }, serviceOptions);
           if (report.outcome === "skipped") continue;
           summary.examined += 1;
           summary.bytesFreed += report.bytesFreed;

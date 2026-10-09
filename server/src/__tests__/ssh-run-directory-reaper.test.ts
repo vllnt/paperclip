@@ -467,13 +467,153 @@ describeReaper("SSH run directory reaper", () => {
     expect(active).toHaveLength(0);
   });
 
-  it("does not let a live lease of another run on the same root keep this run's directory, and leaves that run's directory alone", async () => {
+  // The claim looks only at the leases of the directory's own run. That is sound
+  // because a run directory is named by one run id and a run prepares only its
+  // own (the builder is pinned in remote-managed-runtime.test.ts, its callers in
+  // ssh-run-directory-callers.test.ts). This test shows the scenario a reviewer
+  // can worry about: a live lease of ANOTHER run that names the very same host
+  // and root, down to the same `providerLeaseId`. It is not the same directory.
+  it("does not let a live lease of another run on the same host and root keep this run's directory, and leaves that run's directory alone", async () => {
     const run = await releasedRun("failed");
     const live = await startRun({ status: "running" });
+    const [liveLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, live.leaseId));
+
+    // Same host, port, user, root and provider reference; only the run differs.
+    expect(liveLease!.providerLeaseId).toBe(run.lease.providerLeaseId);
+    expect(liveLease!.metadata).toMatchObject({ remoteCwd: run.lease.metadata?.remoteCwd, host: run.lease.metadata?.host });
+    expect(liveLease!.heartbeatRunId).toBe(live.runId);
+    expect(live.runDir).not.toBe(run.runDir);
 
     await sshRunDirectoryReaperService(db).reapReleasedLease(environment, run.lease);
 
     expect(await exists(run.runDir)).toBe(false);
     expect(await exists(live.runDir)).toBe(true);
+    expect(await leaseMetadata(live.leaseId)).not.toHaveProperty("sshRunDirectory");
   });
+
+  it("names a run's directory by the run id its lease was acquired for", async () => {
+    const run = await startRun({ status: "running" });
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, run.leaseId));
+
+    // The reaper decides a directory by `heartbeatRunId` and the recorded root.
+    // Both must name the directory the run's own prepare would create.
+    expect(lease!.heartbeatRunId).toBe(run.runId);
+    expect(sshRunDirectory(String(lease!.metadata?.remoteCwd), lease!.heartbeatRunId!)).toBe(run.runDir);
+  });
+
+  // Claim fencing. A claim is held by an owner token that the owner renews while
+  // it works. Judged by its last renewal, it outlives the stale window as long as
+  // its owner lives, and expires when the owner dies or stalls.
+  function steppedClock() {
+    let at = Date.now();
+    return { now: () => new Date(at), advance: (ms: number) => { at += ms; } };
+  }
+  const BEYOND_STALE_WINDOW_MS = 20 * 60 * 1000;
+  const renewedAtOf = async (leaseId: string) =>
+    new Date(String(((await leaseMetadata(leaseId)).sshRunDirectory as { renewedAt?: string } | undefined)?.renewedAt ?? 0)).getTime();
+
+  function gated() {
+    let open!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    const arrived = new Promise<void>((resolve) => { reached = resolve; });
+    return { open, arrived, hook: async () => { reached(); await gate; } };
+  }
+
+  it("keeps its claim past the stale window while its owner is still deleting, so no second reaper can take it", async () => {
+    const run = await releasedRun("failed");
+    const other = await siblingReleasedLease(run);
+    const clock = steppedClock();
+    const first = gated();
+    const owner = sshRunDirectoryReaperService(db, { clock: clock.now, claimRenewMs: 20, hooks: { beforeRemoteDelete: first.hook } });
+    const rival = sshRunDirectoryReaperService(db, { clock: clock.now });
+
+    const reaping = owner.reapReleasedLease(environment, run.lease);
+    await first.arrived;
+    clock.advance(BEYOND_STALE_WINDOW_MS);
+    await vi.waitFor(async () => expect(await renewedAtOf(run.leaseId)).toBeGreaterThanOrEqual(clock.now().getTime()), { timeout: 10_000, interval: 20 });
+
+    // Another reaper, well past the window, reaches the directory by a sibling lease row and by the sweep.
+    await rival.reapReleasedLease(environment, other);
+    await rival.sweep({ readDiskUsagePercent: async () => 10 });
+
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await leaseMetadata(other.id)).not.toHaveProperty("sshRunDirectory");
+    first.open();
+    await reaping;
+    expect(await exists(run.runDir)).toBe(false);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(1);
+  }, 60_000);
+
+  it("lets a second reaper take over a claim that its owner stopped renewing (the failure the renewal prevents)", async () => {
+    const run = await releasedRun("failed");
+    const other = await siblingReleasedLease(run);
+    const clock = steppedClock();
+    const first = gated();
+    const owner = sshRunDirectoryReaperService(db, { clock: clock.now, claimRenewMs: 0, hooks: { beforeRemoteDelete: first.hook } });
+
+    const reaping = owner.reapReleasedLease(environment, run.lease);
+    await first.arrived;
+    clock.advance(BEYOND_STALE_WINDOW_MS);
+    await sshRunDirectoryReaperService(db, { clock: clock.now }).reapReleasedLease(environment, other);
+
+    // Without renewal the first claim is stale, so the second reaper deletes while the first still waits to.
+    expect(await exists(run.runDir)).toBe(false);
+    first.open();
+    await reaping;
+  }, 60_000);
+
+  it("stops a reaper whose claim was taken over: it neither deletes nor records", async () => {
+    const run = await releasedRun("failed");
+    const other = await siblingReleasedLease(run);
+    const clock = steppedClock();
+    const first = gated();
+    const second = gated();
+    const stalled = sshRunDirectoryReaperService(db, { clock: clock.now, claimRenewMs: 0, hooks: { beforeRemoteDelete: first.hook } });
+    const takeover = sshRunDirectoryReaperService(db, { clock: clock.now, claimRenewMs: 0, hooks: { beforeRemoteDelete: second.hook } });
+
+    const stalledRun = stalled.reapReleasedLease(environment, run.lease);
+    await first.arrived;
+    // The first owner stalls past the window. The second takes over through the sibling lease row and is about to delete.
+    clock.advance(BEYOND_STALE_WINDOW_MS);
+    const takeoverRun = takeover.reapReleasedLease(environment, other);
+    await second.arrived;
+
+    // The stalled owner wakes. Its own row still carries its token, but the directory has a live claim of another.
+    first.open();
+    await stalledRun;
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(0);
+    expect(await leaseMetadata(run.leaseId)).not.toMatchObject({ sshRunDirectory: { state: "removed" } });
+
+    second.open();
+    await takeoverRun;
+    expect(await exists(run.runDir)).toBe(false);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(1);
+    expect(await leaseMetadata(other.id)).toMatchObject({ sshRunDirectory: { state: "removed" } });
+  }, 60_000);
+
+  it("keeps the claim when the remote command fails after it was sent, and lets it expire before anyone else deletes", async () => {
+    const run = await releasedRun("failed");
+    const other = await siblingReleasedLease(run);
+    const clock = steppedClock();
+    const failing = sshRunDirectoryReaperService(db, {
+      clock: clock.now,
+      hooks: { reapRemote: async () => { throw new Error("ssh timed out"); } },
+    });
+
+    await failing.reapReleasedLease(environment, run.lease);
+
+    // The command may still run on the worker, so the claim is not given back.
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "reaping" } });
+    await sshRunDirectoryReaperService(db, { clock: clock.now }).reapReleasedLease(environment, other);
+    expect(await exists(run.runDir)).toBe(true);
+    await expect(runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: run.runId, persistedExecutionWorkspace: null }))
+      .rejects.toThrow(/being removed/);
+
+    // Once nobody renewed it for the whole window, the sweep finishes the job.
+    clock.advance(BEYOND_STALE_WINDOW_MS);
+    await sshRunDirectoryReaperService(db, { clock: clock.now }).sweep({ readDiskUsagePercent: async () => 10 });
+    expect(await exists(run.runDir)).toBe(false);
+  }, 60_000);
 });
