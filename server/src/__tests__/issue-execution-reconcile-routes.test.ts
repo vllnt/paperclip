@@ -9,6 +9,7 @@ import {
   agents,
   authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueRecoveryActions,
@@ -24,6 +25,7 @@ import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
   deliverReconciledExecutions,
+  reconcileExecutionHolds,
   settleUnrecoverableExecutions,
 } from "../services/execution-recovery-resolution.js";
 
@@ -137,6 +139,26 @@ describeEmbeddedPostgres("POST /issues/:id/execution/reconcile", () => {
       startedAt: new Date(),
     });
     return { companyId, coderId, issueId };
+  }
+
+  /** A session board member of one company, with the membership row the authorization service reads. */
+  async function seedMember(companyId: string, role: "owner" | "operator" | "viewer") {
+    const userId = `member-${role}-${randomUUID().slice(0, 8)}`;
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: userId,
+      membershipRole: role,
+      status: "active",
+    });
+    return {
+      type: "board",
+      source: "session",
+      userId,
+      companyIds: [companyId],
+      memberships: [{ companyId, status: "active", membershipRole: role }],
+      isInstanceAdmin: false,
+    };
   }
 
   /** Two provider failures, each settled by the real automatic disposition. */
@@ -340,23 +362,106 @@ describeEmbeddedPostgres("POST /issues/:id/execution/reconcile", () => {
     }))
       .post(`/api/issues/${issueId}/execution/reconcile`)
       .send({ outcome: "none", note: NOTE });
-    expect([403, 404]).toContain(response.status);
+    // Another company's issue answers exactly like a missing one.
+    const missing = await request(issueApp({
+      type: "board",
+      source: "session",
+      userId: "outsider",
+      companyIds: [otherCompanyId],
+      memberships: [{ companyId: otherCompanyId, status: "active", membershipRole: "owner" }],
+      isInstanceAdmin: false,
+    }))
+      .post(`/api/issues/${randomUUID()}/execution/reconcile`)
+      .send({ outcome: "none", note: NOTE });
+    expect(response.status, JSON.stringify(response.body)).toBe(404);
+    expect(missing.status).toBe(404);
+    expect(response.body).toEqual(missing.body);
     await expectUnchanged(issueId, companyId);
+  });
+
+  it("delivers only the continuation it just reconciled, never another company's pending one", async () => {
+    // Company B's operator reconciled its issue, but its continuation is still waiting
+    // for the delivery sweep.
+    const other = await seedStackedHolds();
+    await reconcileExecutionHolds({
+      db,
+      companyId: other.companyId,
+      issueId: other.issueId,
+      outcome: "none",
+      note: NOTE,
+      actorId: "other-company-operator",
+    });
+    const mine = await seedStackedHolds();
+    const memberOfMine = await seedMember(mine.companyId, "operator");
+
+    const response = await request(issueApp(memberOfMine))
+      .post(`/api/issues/${mine.issueId}/execution/reconcile`)
+      .send({ outcome: "none", note: NOTE });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+    const mineState = await snapshot(mine.issueId, mine.companyId);
+    expect(mineState.continuationWakes).toHaveLength(1);
+    const otherState = await snapshot(other.issueId, other.companyId);
+    expect(otherState.continuationWakes).toHaveLength(0);
+    expect(otherState.continuationRuns).toHaveLength(0);
+    expect(
+      otherState.holds.filter((hold) => hold.evidence.continuationDelivery === "pending"),
+    ).toHaveLength(1);
+  });
+
+  it("still delivers its own continuation when another company has a large pending backlog", async () => {
+    // The sweep reads the first 25 pending actions of every company. A scoped
+    // delivery must find this issue's action even behind a backlog of foreign ones.
+    const other = await seedStackedHolds();
+    await reconcileExecutionHolds({
+      db,
+      companyId: other.companyId,
+      issueId: other.issueId,
+      outcome: "none",
+      note: NOTE,
+      actorId: "other-company-operator",
+    });
+    const [pendingTemplate] = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.sourceIssueId, other.issueId),
+      sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+    ));
+    for (let index = 0; index < 30; index += 1) {
+      await db.insert(issueRecoveryActions).values({
+        companyId: other.companyId,
+        sourceIssueId: other.issueId,
+        kind: pendingTemplate!.kind,
+        ownerType: pendingTemplate!.ownerType,
+        returnOwnerAgentId: pendingTemplate!.returnOwnerAgentId,
+        cause: pendingTemplate!.cause,
+        status: "resolved",
+        outcome: pendingTemplate!.outcome,
+        fingerprint: `backlog-${index}-${randomUUID()}`,
+        evidence: pendingTemplate!.evidence,
+        nextAction: pendingTemplate!.nextAction,
+        createdAt: new Date(Date.UTC(2026, 8, 1, 0, index)),
+        updatedAt: new Date(Date.UTC(2026, 8, 1, 0, index)),
+      });
+    }
+    const mine = await seedStackedHolds();
+
+    const response = await request(issueApp(await seedMember(mine.companyId, "operator")))
+      .post(`/api/issues/${mine.issueId}/execution/reconcile`)
+      .send({ outcome: "none", note: NOTE });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.continuation.status).not.toBe("pending");
+    expect((await snapshot(mine.issueId, mine.companyId)).continuationWakes).toHaveLength(1);
+    expect((await snapshot(other.issueId, other.companyId)).continuationWakes).toHaveLength(0);
   });
 
   it("rejects a read-only board member of the company without changing anything", async () => {
     const { companyId, issueId } = await seedStackedHolds();
-    const response = await request(issueApp({
-      type: "board",
-      source: "session",
-      userId: "viewer-user",
-      companyIds: [companyId],
-      memberships: [{ companyId, status: "active", membershipRole: "viewer" }],
-      isInstanceAdmin: false,
-    }))
+    const response = await request(issueApp(await seedMember(companyId, "viewer")))
       .post(`/api/issues/${issueId}/execution/reconcile`)
       .send({ outcome: "none", note: NOTE });
+    // Denied by the viewer role itself, not for lack of a membership.
     expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.error).toBe("Viewer access is read-only");
     await expectUnchanged(issueId, companyId);
   });
 

@@ -9155,7 +9155,13 @@ export function issueRoutes(
         workspaceRepairNote: req.body.workspaceRepairNote,
         actorId: actor.actorId,
       });
-      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      // Deliver only the continuation this request created; the durable sweep
+      // delivers everything else, so this request never acts on another
+      // company's pending continuations.
+      await deliverReconciledExecutions(db, heartbeat.wakeup, {
+        companyId: issue.companyId,
+        actionIds: [result.continuationActionId],
+      });
       const [continuation] = await db
         .select()
         .from(heartbeatRuns)
