@@ -21,6 +21,7 @@ import { PluginLauncherProvider } from "./plugins/launchers";
 import { startPerfMeasureReaper } from "./lib/perf-measure-reaper";
 import { getOrCreatePaperclipReactRoot } from "./lib/react-root";
 import { startServiceWorkerUpdates } from "./lib/service-worker-updates";
+import { installStaleChunkReload } from "./lib/stale-chunk-reload";
 import "@mdxeditor/editor/style.css";
 import "./index.css";
 
@@ -30,6 +31,8 @@ initPluginBridge(React, ReactDOM);
 // DevTools performance tracks and never clears them; on a long-lived tab they
 // accumulate into millions of native objects (GBs). Reap them periodically.
 startPerfMeasureReaper();
+
+installStaleChunkReload();
 
 // Parked SPA tabs never navigate, so beyond registering the worker this also
 // re-checks /sw.js on tab focus and hourly, and applies a discovered update

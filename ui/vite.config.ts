@@ -5,6 +5,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { createUiDevWatchOptions } from "./src/lib/vite-watch";
 import { createApiProxy } from "./src/lib/vite-api-proxy";
 import { serviceWorkerBuildIdPlugin } from "./src/lib/vite-sw-build-id";
+import { bundleBudgetPlugin } from "./src/lib/vite-bundle-budget";
 import { readBrowserBuildCommit } from "./src/lib/vite-build-commit";
 
 const apiProxy = createApiProxy();
@@ -15,9 +16,34 @@ export default defineConfig(({ mode }) => ({
       readBrowserBuildCommit(__dirname),
     ),
   },
-  plugins: [react(), tailwindcss(), serviceWorkerBuildIdPlugin()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    serviceWorkerBuildIdPlugin(),
+    bundleBudgetPlugin(path.resolve(__dirname, "bundle-budget.json")),
+  ],
   build: {
     minify: "esbuild",
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          minSize: 20_000,
+          groups: [
+            {
+              name: "react-vendor",
+              test: /node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom|@tanstack)[\\/]/,
+              priority: 40,
+            },
+            { name: "icons", test: /node_modules[\\/]lucide-react[\\/]/, priority: 30 },
+            {
+              name: "app-core",
+              test: /[\\/]ui[\\/]src[\\/](lib|hooks|context|api|i18n|components[\\/]ui)[\\/]/,
+              priority: 10,
+            },
+          ],
+        },
+      },
+    },
   },
   esbuild:
     mode === "production"
