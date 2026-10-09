@@ -214,8 +214,10 @@ export function registerGoalCommands(program: Command): void {
 
 function describeDue(daysLeft: number | null): string {
   if (daysLeft === null) return "no date";
-  if (daysLeft < 0) return `${-daysLeft} days overdue`;
-  return daysLeft === 0 ? "due today" : `${daysLeft} days left`;
+  if (daysLeft === 0) return "due today";
+  const days = Math.abs(daysLeft);
+  const unit = days === 1 ? "day" : "days";
+  return daysLeft > 0 ? `${days} ${unit} left` : `${days} ${unit} overdue`;
 }
 
 function printFocus(focus: CompanyFocus): void {

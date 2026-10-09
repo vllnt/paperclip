@@ -7590,10 +7590,15 @@ export function issueRoutes(
     const directGoalPromise = issue.goalId
       ? goalsSvc.getById(issue.goalId)
       : Promise.resolve(null);
-    const [project, directGoal] = await Promise.all([
+    // A stored id can point into another company; treat such a row as absent.
+    const inIssueCompany = <T extends { companyId: string }>(row: T | null | undefined): T | null =>
+      row && row.companyId === issue.companyId ? row : null;
+    const [storedProject, storedGoal] = await Promise.all([
       projectPromise,
       directGoalPromise,
     ]);
+    const project = inIssueCompany(storedProject);
+    const directGoal = inIssueCompany(storedGoal);
 
     if (directGoal) {
       return { project, goal: directGoal };
@@ -7601,7 +7606,7 @@ export function issueRoutes(
 
     const projectGoalId = project?.goalId ?? project?.goalIds[0] ?? null;
     if (projectGoalId) {
-      const projectGoal = await goalsSvc.getById(projectGoalId);
+      const projectGoal = inIssueCompany(await goalsSvc.getById(projectGoalId));
       return { project, goal: projectGoal };
     }
 

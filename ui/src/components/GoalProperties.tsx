@@ -17,7 +17,8 @@ import { Button } from "@/components/ui/button";
 
 interface GoalPropertiesProps {
   goal: Goal;
-  onUpdate?: (data: Record<string, unknown>) => void;
+  /** May return a promise; a rejection puts the target date field back to the saved value. */
+  onUpdate?: (data: Record<string, unknown>) => void | Promise<unknown>;
 }
 
 function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -83,7 +84,13 @@ function PickerButton({
  * keystroke (typing a year passes through 0002, 0020, ...), so saving on change would write
  * wrong dates.
  */
-function TargetDateInput({ value, onCommit }: { value: string | null; onCommit: (value: string | null) => void }) {
+function TargetDateInput({
+  value,
+  onCommit,
+}: {
+  value: string | null;
+  onCommit: (value: string | null) => void | Promise<unknown>;
+}) {
   const [draft, setDraft] = useState(value ?? "");
   const saved = useRef(value ?? "");
   useEffect(() => {
@@ -92,8 +99,17 @@ function TargetDateInput({ value, onCommit }: { value: string | null; onCommit: 
   }, [value]);
   const commit = () => {
     if (draft === saved.current) return;
+    const previous = saved.current;
+    // Browsers allow years longer than four digits; the server stores only YYYY-MM-DD.
+    if (draft && !/^\d{4}-\d{2}-\d{2}$/.test(draft)) {
+      setDraft(previous);
+      return;
+    }
     saved.current = draft;
-    onCommit(draft || null);
+    Promise.resolve(onCommit(draft || null)).catch(() => {
+      saved.current = previous;
+      setDraft(previous);
+    });
   };
   return (
     <input
@@ -112,6 +128,10 @@ function TargetDateInput({ value, onCommit }: { value: string | null; onCommit: 
 
 export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
   const { selectedCompanyId } = useCompany();
+  /** The page reports a failed save; a picker has nothing to put back, so it only avoids an unhandled rejection. */
+  const save = (data: Record<string, unknown>): void => {
+    void Promise.resolve(onUpdate?.(data)).catch(() => undefined);
+  };
 
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId!),
@@ -148,7 +168,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
             <PickerButton
               current={goal.status}
               options={GOAL_STATUSES}
-              onChange={(status) => onUpdate({ status })}
+              onChange={(status) => save({ status })}
             >
               <StatusBadge status={goal.status} />
             </PickerButton>
@@ -162,7 +182,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
             <PickerButton
               current={goal.level}
               options={GOAL_LEVELS}
-              onChange={(level) => onUpdate({ level })}
+              onChange={(level) => save({ level })}
             >
               <span className="text-sm capitalize">{goal.level}</span>
             </PickerButton>
@@ -173,7 +193,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
 
         <PropertyRow label="Kind">
           {onUpdate ? (
-            <PickerButton current={goal.kind} options={GOAL_KINDS} onChange={(kind) => onUpdate({ kind })}>
+            <PickerButton current={goal.kind} options={GOAL_KINDS} onChange={(kind) => save({ kind })}>
               <span className="text-sm">{label(goal.kind)}</span>
             </PickerButton>
           ) : (
@@ -187,7 +207,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
               current={goal.horizon ?? "none"}
               options={[...GOAL_HORIZONS, "none"]}
               optionLabel={horizonLabel}
-              onChange={(horizon) => onUpdate({ horizon: horizon === "none" ? null : horizon })}
+              onChange={(horizon) => save({ horizon: horizon === "none" ? null : horizon })}
             >
               <span className="text-sm">{horizonLabel(goal.horizon ?? "none")}</span>
             </PickerButton>
@@ -208,7 +228,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
           {onUpdate ? (
             <InlineEditor
               value={goal.successCriteria ?? ""}
-              onSave={(successCriteria) => onUpdate({ successCriteria: successCriteria.trim() || null })}
+              onSave={(successCriteria) => save({ successCriteria: successCriteria.trim() || null })}
               className="text-sm"
               placeholder="How you know it is done"
               nullable

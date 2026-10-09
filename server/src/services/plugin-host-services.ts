@@ -2948,7 +2948,7 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         requireInCompany("Goal", await goals.getById(params.goalId), companyId);
-        return (await goals.update(params.goalId, params.patch as any)) as Goal;
+        return (await goals.update(params.goalId, params.patch)) as Goal;
       },
     },
 

@@ -13,6 +13,7 @@ import { agentRoutes } from "../routes/agents.js";
 import { goalRoutes } from "../routes/goals.js";
 import { issueRoutes } from "../routes/issues.js";
 import { goalFocusService } from "../services/goal-focus.js";
+import { goalService } from "../services/goals.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -299,7 +300,7 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
   });
 
   describe("agents", () => {
-    it("put tasks that serve the focus first in the inbox and say which goal they serve", async () => {
+    it("put tasks that serve the focus first in the inbox, after critical work, and say which goal they serve", async () => {
       const company = await seedCompany();
       const agentId = await seedAgent(company.id);
       const focusGoal = await seedGoal(company.id, { title: "Land PRs", horizon: "short" });
@@ -312,9 +313,9 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       const res = await request(app(agentActor(company.id, agentId))).get("/api/agents/me/inbox-lite");
 
       expect(res.status).toBe(200);
-      expect(res.body.map((row: { id: string }) => row.id)).toEqual([viaMilestone.id, none.id, high.id]);
-      expect(res.body[0]).toMatchObject({ focusGoalId: focusGoal.id });
-      expect(res.body[1]).toMatchObject({ focusGoalId: null });
+      expect(res.body.map((row: { id: string }) => row.id)).toEqual([none.id, viaMilestone.id, high.id]);
+      expect(res.body[0]).toMatchObject({ focusGoalId: null, priority: "critical" });
+      expect(res.body[1]).toMatchObject({ focusGoalId: focusGoal.id });
     });
 
     it("keep the normal inbox order when there is no focus", async () => {
@@ -348,6 +349,75 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       });
       expect(servingRes.body.goal).toMatchObject({ id: focusGoal.id, horizon: "short", kind: "goal", targetDate: "2026-10-16" });
       expect(otherRes.body.companyFocus).toMatchObject({ issueFocusGoalId: null });
+    });
+  });
+
+  describe("review fixes", () => {
+    it("keeps a goal in its company and validates updates that bypass the route", async () => {
+      const mine = await seedCompany();
+      const theirs = await seedCompany();
+      const goal = await seedGoal(mine.id, { title: "Stay" });
+      const svc = goalService(db as Db);
+
+      const moved = await svc.update(goal.id, { companyId: theirs.id, title: "Renamed" } as never);
+      expect(moved).toMatchObject({ companyId: mine.id, title: "Renamed" });
+      await expect(svc.update(goal.id, { horizon: "soon" } as never)).rejects.toThrow(/horizon/i);
+      await expect(svc.update(goal.id, { targetDate: "20266-10-09" } as never)).rejects.toThrow(/date/i);
+    });
+
+    it("rejects the year 0000, which Postgres cannot store", async () => {
+      const company = await seedCompany();
+
+      const res = await request(app(board(company.id))).post(`/api/companies/${company.id}/goals`).send({ title: "x", targetDate: "0000-01-01" });
+
+      expect(res.status).toBe(400);
+    });
+
+    it("tags only the focus goals it lists, so agents never see a focus goal id that is not in the focus", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      const goalsByDay = [];
+      for (let day = 10; day <= 20; day += 1) {
+        goalsByDay.push(await seedGoal(company.id, { title: `Push ${day}`, horizon: "short", targetDate: `2026-10-${day}` }));
+      }
+      const latest = goalsByDay.at(-1)!;
+      const earliest = goalsByDay[0]!;
+      const late = await seedIssue(company, { assigneeAgentId: agentId, goalId: latest.id });
+      const early = await seedIssue(company, { assigneeAgentId: agentId, goalId: earliest.id });
+
+      const focus = await goalFocusService(db as Db, { now: () => NOW }).getFocus(company.id);
+      const inbox = await request(app(agentActor(company.id, agentId))).get("/api/agents/me/inbox-lite");
+      const context = await request(app(agentActor(company.id, agentId))).get(`/api/issues/${late.id}/heartbeat-context`);
+
+      expect(focus.goals).toHaveLength(10);
+      expect(focus.goals.some((g) => g.id === latest.id)).toBe(false);
+      expect(inbox.body.find((row: { id: string }) => row.id === late.id).focusGoalId).toBeNull();
+      expect(inbox.body.find((row: { id: string }) => row.id === early.id).focusGoalId).toBe(earliest.id);
+      expect(context.body.companyFocus.issueFocusGoalId).toBeNull();
+    });
+
+    it("bounds the success criteria agents receive", async () => {
+      const company = await seedCompany();
+      await seedGoal(company.id, { horizon: "short", successCriteria: "x".repeat(2000) });
+
+      const focus = await goalFocusService(db as Db, { now: () => NOW }).getFocus(company.id);
+
+      expect(focus.goals[0]!.successCriteria!.length).toBeLessThanOrEqual(280);
+    });
+
+    it("never shows another company's goal in the heartbeat context", async () => {
+      const mine = await seedCompany();
+      const theirs = await seedCompany();
+      const agentId = await seedAgent(mine.id);
+      const foreign = await seedGoal(theirs.id, { title: "Secret plan", horizon: "short", successCriteria: "secret" });
+      const issue = await seedIssue(mine, { assigneeAgentId: agentId, goalId: foreign.id });
+
+      const res = await request(app(agentActor(mine.id, agentId))).get(`/api/issues/${issue.id}/heartbeat-context`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.goal).toBeNull();
+      expect(JSON.stringify(res.body)).not.toContain("Secret plan");
+      expect(res.body.companyFocus).toMatchObject({ goals: [], issueFocusGoalId: null });
     });
   });
 });

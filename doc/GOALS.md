@@ -37,8 +37,12 @@ Agents see the focus in two places:
 - `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`: the focus goals with their
   progress, days left, success criteria and open milestones, a short `guidance` text, and
   `issueFocusGoalId`, which says whether the current task serves the focus.
-- `GET /api/agents/me/inbox-lite` lists tasks that serve a focus goal first, each with
-  `focusGoalId`. The order inside each group does not change.
+- `GET /api/agents/me/inbox-lite` lists critical tasks first (an incident outranks the
+  focus), then tasks that serve a focus goal, then the rest. Each task has `focusGoalId`. The
+  order inside each group does not change.
+
+At most 10 focus goals and 5 milestones each are listed, and `successCriteria` is cut to 280
+characters in what agents receive, because agents read the focus on every run.
 
 The guidance tells agents to work the focus first, finish and land work in review before
 starting new work, and ask the board through an approval if the focus needs more agents, runs

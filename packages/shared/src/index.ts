@@ -1244,6 +1244,7 @@ export type {
   CompanyFocus,
   CompanyFocusGoal,
   CompanyFocusMilestone,
+  IssueCompanyFocus,
   Approval,
   ApprovalComment,
   BudgetPolicy,

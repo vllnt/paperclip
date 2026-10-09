@@ -112,6 +112,43 @@ describe("GoalProperties planning fields", () => {
     expect(onUpdate.mock.calls).toEqual([[{ targetDate: "2026-11-01" }]]);
   });
 
+  it("never sends a date the server cannot store, and puts the saved date back", async () => {
+    const onUpdate = vi.fn();
+    await render(goal, onUpdate);
+    const input = container.querySelector<HTMLInputElement>('input[type="date"]')!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "20266-10-09");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    act(() => { input.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); });
+
+    expect(onUpdate).not.toHaveBeenCalled();
+    expect(input.value).toBe("2026-10-16");
+  });
+
+  it("puts the saved date back when the save fails, and lets the user try again", async () => {
+    const onUpdate = vi.fn().mockRejectedValueOnce(new Error("Invalid goal update")).mockResolvedValue(undefined);
+    await render(goal, onUpdate);
+    const input = container.querySelector<HTMLInputElement>('input[type="date"]')!;
+    const enter = async (value: string) => {
+      act(() => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => {
+        input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    };
+
+    await enter("2026-10-20");
+    expect(input.value).toBe("2026-10-16");
+
+    await enter("2026-10-20");
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+    expect(onUpdate).toHaveBeenLastCalledWith({ targetDate: "2026-10-20" });
+  });
+
   it("offers no editing controls when read only", async () => {
     await render({ ...goal, horizon: null, targetDate: null, successCriteria: null, kind: "milestone" });
 
