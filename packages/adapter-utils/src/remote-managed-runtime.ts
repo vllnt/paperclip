@@ -160,6 +160,8 @@ export async function reapSshRunDirectory(input: {
   remoteRoot: string;
   runId: string;
   timeoutMs?: number;
+  /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
+  testHooks?: { afterChecks?: string; afterConfine?: string };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -168,28 +170,42 @@ export async function reapSshRunDirectory(input: {
   if (!path.posix.isAbsolute(root) || root === "/" || path.posix.normalize(root) !== root || root.endsWith("/")) {
     throw new Error("Refusing to reap an SSH run directory under a root that is not a normalized absolute path.");
   }
-  const runtimeDir = path.posix.join(root, ".paperclip-runtime");
-  const runsDir = path.posix.join(runtimeDir, "runs");
-  const runDir = sshRunDirectory(root, input.runId);
-  const preservedDir = path.posix.join(runtimeDir, "preserved");
-  const bundle = sshPreservedBundlePath(root, input.runId);
-  const marker = path.posix.join(runDir, SSH_RUN_RESTORED_MARKER);
+  // `/tmp` or `/home` is a place many things live, not a runtime base.
+  if (root.split("/").filter(Boolean).length < 2) {
+    throw new Error("Refusing to reap an SSH run directory under a root that is too shallow to be a runtime base.");
+  }
   const q = shellQuote;
+  const hook = (line: string | undefined) => (line ? [line] : []);
   const script = [
-    `for dir in ${[runtimeDir, runsDir, runDir].map(q).join(" ")}; do`,
+    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
+    // The root is resolved once. Everything below is compared with this physical path.
+    'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
+    'runtime="$root/.paperclip-runtime"; runs="$runtime/runs"; preserved="$runtime/preserved"',
+    'for dir in "$runtime" "$runs" "$runs/$id"; do',
     '  if [ -L "$dir" ]; then echo symlink; exit 0; fi',
     '  if [ ! -d "$dir" ]; then echo absent; exit 0; fi',
     "done",
-    `run=${q(runDir)}; ws="$run/workspace"; preserved=${q(preservedDir)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
-    `list="$run/.paperclip-reap-refs"; bundle=${q(bundle)}`,
-    `if [ -d "$preserved" ] && [ ! -L "$preserved" ]; then find "$preserved" -maxdepth 1 -type f -name '*.bundle' -mtime +${PRESERVED_BUNDLE_RETENTION_DAYS} -exec rm -f -- {} + 2>/dev/null || true; fi`,
-    'kb=$(du -sk "$run" 2>/dev/null | cut -f1); kb=${kb:-0}',
+    ...hook(input.testHooks?.afterChecks),
+    // Confine. A check on a path says nothing about the next use of that path,
+    // since another process can swap a parent in between. So enter the run
+    // directory, prove that the directory entered is the expected physical one,
+    // and from here on use only paths relative to it: the working directory is
+    // an inode, not a path, and no later swap of a parent can redirect it.
+    'cd "$runs" 2>/dev/null || { echo absent; exit 0; }',
+    'if [ "$(pwd -P)" != "$canon/.paperclip-runtime/runs" ]; then echo symlink; exit 0; fi',
+    'if [ -L "$id" ]; then echo symlink; exit 0; fi',
+    'cd "$id" 2>/dev/null || { echo absent; exit 0; }',
+    'if [ "$(pwd -P)" != "$canon/.paperclip-runtime/runs/$id" ]; then echo symlink; exit 0; fi',
+    ...hook(input.testHooks?.afterConfine),
+    'ws=workspace; list=.paperclip-reap-refs; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"',
+    'kb=$(du -sk . 2>/dev/null | cut -f1); kb=${kb:-0}',
     'keep() { echo "kept $1 $kb"; exit 0; }',
     // A repository config the agent planted must not run commands here.
     'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
-    `if [ -f ${q(marker)} ] && [ ! -L ${q(marker)} ]; then`,
-    "  :",
+    'had_marker=0',
+    'if [ -f "$marker" ] && [ ! -L "$marker" ]; then',
+    "  had_marker=1",
     "else",
     '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then keep not_git_backed; fi',
     '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
@@ -232,34 +248,44 @@ export async function reapSshRunDirectory(input: {
     '    esac',
     '  done < "$list.trees"',
     // Uncommitted work: a snapshot commit of what git tracks or would track.
+    // The index file is named relative to the repository, which is `-C workspace`.
     '  if [ -n "$(G status --porcelain 2>/dev/null)" ]; then',
-    '    idx="$run/.paperclip-reap-index"; rm -f "$idx"',
+    '    idx=../.paperclip-reap-index; rm -f .paperclip-reap-index',
     '    if [ -n "$head" ]; then GIT_INDEX_FILE="$idx" G read-tree HEAD || keep preserve_failed; fi',
     '    GIT_INDEX_FILE="$idx" G add -A || keep preserve_failed',
     '    tree_id=$(GIT_INDEX_FILE="$idx" G write-tree) || keep preserve_failed',
     '    if [ -n "$head" ]; then snap=$(G commit-tree "$tree_id" -p "$head" -m "Paperclip preserved worktree") || keep preserve_failed; else snap=$(G commit-tree "$tree_id" -m "Paperclip preserved worktree") || keep preserve_failed; fi',
-    '    rm -f "$idx"',
+    '    rm -f .paperclip-reap-index',
     '    add_ref worktree "$snap"',
     '  fi',
     '  if [ -s "$list" ]; then',
-    '    mkdir -p "$preserved" 2>/dev/null || keep preserve_failed',
-    '    if [ -L "$preserved" ] || [ ! -d "$preserved" ]; then keep preserve_failed; fi',
-    '    tmp="$preserved/.$$.tmp.bundle"; rm -f "$tmp"',
     '    set --; while IFS= read -r r; do set -- "$@" "$r"; done < "$list"',
     '    if [ -n "$seed" ]; then set -- "$@" "^$seed"; fi',
-    '    G bundle create "$tmp" "$@" >/dev/null 2>&1 || { rm -f "$tmp"; keep preserve_failed; }',
-    '    size=$(du -k "$tmp" 2>/dev/null | cut -f1); size=${size:-0}',
-    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f "$tmp"; keep preserve_failed; fi`,
-    '    G bundle verify "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; keep preserve_failed; }',
-    '    mv -f "$tmp" "$bundle" || { rm -f "$tmp"; keep preserve_failed; }',
+    // Written inside the confined directory first, then moved into the
+    // preserved directory, which is confined the same way.
+    '    G bundle create ../.paperclip-reap.bundle "$@" >/dev/null 2>&1 || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
+    '    size=$(du -k .paperclip-reap.bundle 2>/dev/null | cut -f1); size=${size:-0}',
+    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
+    '    mkdir -p "$preserved" 2>/dev/null || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
+    '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && mv -f -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle" ) || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
+    '    G bundle verify "$bundle" >/dev/null 2>&1 || { keep preserve_failed; }',
     '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
     "  fi",
     "fi",
+    `( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && find . -maxdepth 1 -type f -name '*.bundle' -mtime +${PRESERVED_BUNDLE_RETENTION_DAYS} -exec rm -f -- {} + ) 2>/dev/null || true`,
     // Directories without owner rwx (a Go module cache, say) would stop rm -rf.
-    `find "$run" -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null || true`,
-    'if find "$run" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null && rmdir -- "$run" 2>/dev/null; then',
+    // chmod -R does not follow links.
+    'chmod -R u+rwx -- . 2>/dev/null || true',
+    // Empty the directory we are inside, then remove the marker, then the
+    // directory itself from its parent, which must still be the real `runs`.
+    'if find . -mindepth 1 -maxdepth 1 ! -name .paperclip-restored -exec rm -rf -- {} + 2>/dev/null \\',
+    '  && rm -f -- .paperclip-restored \\',
+    '  && ( cd .. 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/runs" ] && rmdir -- "$id" 2>/dev/null ); then',
     '  echo "removed $kb"',
     "else",
+    // A failed removal keeps a restored directory removable. A directory that
+    // had no marker never gets one, so the next attempt saves its state again.
+    '  if [ "$had_marker" = 1 ]; then : > .paperclip-restored 2>/dev/null || true; fi',
     '  keep rm_failed',
     "fi",
   ].join("\n");

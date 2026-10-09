@@ -66,8 +66,37 @@ The directory stays, with a reason in the activity entry and in the lease's
   verify; or `.git` is a link or a file; or the start commit is unknown.
 - `rm_failed`: the removal failed. It is retried up to 5 times.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
+- `root_mismatch`: the root recorded on the lease is not the root the environment
+  is configured with now (or the lease did not record that root), or it is too
+  shallow to be a runtime base, such as `/tmp`. The reaper never deletes under a
+  root the environment does not own.
 
 Nothing outside `runs/<runId>` is deleted, and no link is followed.
+
+## Races
+
+A run directory is only ever used by leases of its own run, so the reaper claims
+it for the run.
+
+- **Claim.** One SQL statement checks that no other lease of the run is `active`,
+  `retained`, or `pending_cleanup` and records a claim in the lease's
+  `metadata.sshRunDirectory` (`state: "reaping"`). The reaper checks for such a
+  lease once more after the claim and before the remote delete, and gives the
+  claim back if one appeared.
+- **Acquire.** When an SSH lease starts for a run, it checks for a fresh claim on
+  that run after its own lease is visible. If there is one, the new lease fails
+  and the run must start again. Between the two checks, one side always sees the
+  other.
+- **Crash.** A claim older than 15 minutes (a server died mid-removal) is
+  reclaimed by the next sweep.
+
+On the worker, the script resolves the root once, then enters `runs/<runId>`
+and compares the physical path (`pwd -P`) with the expected one. Everything after
+that is relative to that directory, which is an inode and not a path, so a parent
+swapped for a link afterwards cannot redirect a delete. A swap before that point
+is detected by the comparison and reported as `symlink`. Saving the bundle into
+`preserved/` is confined the same way. The git commands that save state still run
+against `workspace/` inside the run directory, which the agent controls.
 
 ## Records
 

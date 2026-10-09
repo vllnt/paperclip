@@ -38,7 +38,7 @@ import {
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { environmentService } from "./environments.js";
-import { sshRunDirectoryReaperService } from "./ssh-run-directory-reaper.js";
+import { assertRunDirectoryNotBeingRemoved, sshRunDirectoryReaperService } from "./ssh-run-directory-reaper.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
@@ -1195,7 +1195,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       }
 
       const { remoteCwd } = await ensureSshWorkspaceReady(parsed.config);
-      return await environmentsSvc.acquireLease({
+      const lease = await environmentsSvc.acquireLease({
         companyId: input.companyId,
         environmentId: input.environment.id,
         executionWorkspaceId: input.executionWorkspaceId,
@@ -1215,6 +1215,15 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           remoteCwd,
         },
       });
+      // The lease is visible now. A reaper that claimed this run directory
+      // before it was must not delete under a run that is about to use it.
+      if (input.heartbeatRunId) {
+        await assertRunDirectoryNotBeingRemoved(db, input.heartbeatRunId, lease.id).catch(async (error) => {
+          await environmentsSvc.releaseLease(lease.id, "failed", { failureReason: "The workspace directory of this run is being removed." }).catch(() => undefined);
+          throw error;
+        });
+      }
+      return lease;
     },
 
     async releaseRunLease(input) {

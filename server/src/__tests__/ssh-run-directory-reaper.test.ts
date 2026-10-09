@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agentTaskSessions,
@@ -286,5 +286,101 @@ describeReaper("SSH run directory reaper", () => {
     expect((await readdir(runsDir)).sort()).toEqual(before);
     expect(await exists(sibling.runDir)).toBe(true);
     expect(await readFile(path.join(keep, "keep.txt"), "utf8")).toBe("keep\n");
+  });
+  // A lease the way the release leaves it: released, its run finished.
+  async function releasedRun(status = "failed") {
+    const run = await startRun({ status });
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 10 * HOUR_MS) }).where(eq(environmentLeases.id, run.leaseId));
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, run.leaseId));
+    return { ...run, lease: row as unknown as Parameters<ReturnType<typeof sshRunDirectoryReaperService>["reapReleasedLease"]>[1] };
+  }
+
+  it("keeps a directory whose recorded root is not the environment's configured root", async () => {
+    const run = await startRun({ status: "failed" });
+    const otherRoot = path.join(fixtureRoot, "other-root");
+    const otherRunDir = sshRunDirectory(otherRoot, run.runId);
+    await mkdir(path.join(otherRunDir, "workspace"), { recursive: true });
+    await writeFile(path.join(otherRunDir, "workspace", "theirs.txt"), "not ours\n");
+    await writeFile(path.join(otherRunDir, ".paperclip-restored"), "");
+    // A stale or corrupted lease names a root the environment does not own.
+    await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ remoteCwd: otherRoot })}::jsonb` }).where(eq(environmentLeases.id, run.leaseId));
+
+    await runtime.releaseRunLeases(run.runId);
+
+    await vi.waitFor(async () => expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1), { timeout: 15_000, interval: 100 });
+    expect((await activityFor(run.runId, "environment.ssh_run_directory_kept"))[0]!.details).toMatchObject({ reason: "root_mismatch" });
+    expect(await readFile(path.join(otherRunDir, "workspace", "theirs.txt"), "utf8")).toBe("not ours\n");
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(0);
+  });
+
+  it.each(["/tmp", "/var"])("keeps a directory whose recorded root is the shallow path %s", async (shallow) => {
+    const run = await startRun({ status: "failed" });
+    await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ remoteCwd: shallow })}::jsonb` }).where(eq(environmentLeases.id, run.leaseId));
+
+    await runtime.releaseRunLeases(run.runId);
+
+    await vi.waitFor(async () => expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1), { timeout: 15_000, interval: 100 });
+    expect((await activityFor(run.runId, "environment.ssh_run_directory_kept"))[0]!.details).toMatchObject({ reason: "root_mismatch" });
+    expect(await exists(run.runDir)).toBe(true);
+  });
+
+  it("rechecks for a live lease after claiming the directory and before it deletes", async () => {
+    const run = await releasedRun("failed");
+    const service = sshRunDirectoryReaperService(db, {
+      hooks: {
+        // The decision to delete has been made. Now a lease for the run appears.
+        beforeRemoteDelete: async () => {
+          await db.insert(environmentLeases).values({
+            companyId, environmentId: environment.id, heartbeatRunId: run.runId, status: "pending_cleanup", leasePolicy: "ephemeral",
+            provider: "ssh", providerLeaseId: `ssh://late/${randomUUID()}`, metadata: { remoteCwd: sshConfig.remoteWorkspacePath },
+          });
+        },
+      },
+    });
+
+    await service.reapReleasedLease(environment, run.lease);
+
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(0);
+    // The claim is given back, so a later pass can decide again.
+    expect(await leaseMetadata(run.leaseId)).not.toHaveProperty("sshRunDirectory");
+  });
+
+  it("refuses a new lease for a run whose directory is being removed", async () => {
+    const run = await releasedRun("failed");
+    await db.update(environmentLeases).set({
+      metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ sshRunDirectory: { state: "reaping", claimedAt: new Date().toISOString(), trigger: "sweep" } })}::jsonb`,
+    }).where(eq(environmentLeases.id, run.leaseId));
+
+    await expect(runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: run.runId, persistedExecutionWorkspace: null }))
+      .rejects.toThrow(/being removed/);
+
+    const leases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.heartbeatRunId, run.runId), eq(environmentLeases.status, "active")));
+    expect(leases).toHaveLength(0);
+    expect(await exists(run.runDir)).toBe(true);
+  });
+
+  it("reclaims a directory whose earlier claim went stale", async () => {
+    const run = await releasedRun("failed");
+    await db.update(environmentLeases).set({
+      metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ sshRunDirectory: { state: "reaping", claimedAt: new Date(Date.now() - 3 * HOUR_MS).toISOString(), trigger: "sweep" } })}::jsonb`,
+    }).where(eq(environmentLeases.id, run.leaseId));
+
+    const summary = await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+    expect(summary.removed).toBeGreaterThanOrEqual(1);
+    expect(await exists(run.runDir)).toBe(false);
+  });
+
+  it("does not reclaim a claim that is still fresh", async () => {
+    const run = await releasedRun("failed");
+    await db.update(environmentLeases).set({
+      metadata: sql`${environmentLeases.metadata} || ${JSON.stringify({ sshRunDirectory: { state: "reaping", claimedAt: new Date().toISOString(), trigger: "lease_release" } })}::jsonb`,
+    }).where(eq(environmentLeases.id, run.leaseId));
+
+    await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+    expect(await exists(run.runDir)).toBe(true);
   });
 });

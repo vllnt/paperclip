@@ -1852,3 +1852,66 @@ describe("SSH run directory reaper", () => {
     expect(percent).toBeLessThanOrEqual(100);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 });
+
+describe("SSH run directory reaper path swaps", () => {
+  afterEach(drainFixtureTeardowns);
+  afterAll(drainFixtureTeardowns);
+
+  // A host with a restored run directory, and a decoy `runs` directory elsewhere
+  // that holds a same-named run directory with its own restored marker.
+  async function swapSetup(label: string) {
+    const rootDir = await createFixtureRootDir();
+    const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), label);
+    if (!started) return null;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const root = started.workspaceDir;
+    const runId = randomUUID();
+    const runDir = sshRunDirectory(root, runId);
+    await mkdir(path.join(runDir, "workspace"), { recursive: true });
+    await writeFile(path.join(runDir, "workspace", "own.txt"), "own\n");
+    await writeFile(path.join(runDir, SSH_RUN_RESTORED_MARKER), "");
+    const runsDir = path.dirname(runDir);
+    const decoyRuns = path.join(rootDir, "decoy-runs");
+    await mkdir(path.join(decoyRuns, runId), { recursive: true });
+    await writeFile(path.join(decoyRuns, runId, "victim.txt"), "must survive\n");
+    await writeFile(path.join(decoyRuns, runId, SSH_RUN_RESTORED_MARKER), "");
+    const canary = path.join(rootDir, "hook-ran");
+    // Move the real `runs` aside and put a link to the decoy in its place.
+    const swap = `mv '${runsDir}' '${runsDir}.moved' && ln -s '${decoyRuns}' '${runsDir}' && : > '${canary}'`;
+    return { rootDir, spec, root, runId, runDir, runsDir, decoyRuns, canary, swap };
+  }
+
+  it("does not delete through a parent that is swapped for a link after the checks", async () => {
+    const host = await swapSetup("SSH reaper swap after checks");
+    if (!host) return;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: host.runId, testHooks: { afterChecks: host.swap },
+    });
+
+    await expect(stat(host.canary)).resolves.toBeTruthy();
+    expect(result.outcome).toBe("symlink");
+    await expect(readFile(path.join(host.decoyRuns, host.runId, "victim.txt"), "utf8")).resolves.toBe("must survive\n");
+    await expect(stat(path.join(host.decoyRuns, host.runId, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("deletes only the run directory it confined itself to when a parent is swapped during the removal", async () => {
+    const host = await swapSetup("SSH reaper swap after confine");
+    if (!host) return;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: host.runId, testHooks: { afterConfine: host.swap },
+    });
+
+    await expect(stat(host.canary)).resolves.toBeTruthy();
+    expect(["removed", "kept"]).toContain(result.outcome);
+    await expect(readFile(path.join(host.decoyRuns, host.runId, "victim.txt"), "utf8")).resolves.toBe("must survive\n");
+    await expect(stat(path.join(host.decoyRuns, host.runId, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("refuses a root that is too shallow to be a runtime base", async () => {
+    const spec = { host: "ssh.invalid", port: 22, username: "paperclip", remoteWorkspacePath: "/tmp", remoteCwd: "/tmp", privateKey: "x", knownHosts: "x", strictHostKeyChecking: true } as never;
+    await expect(reapSshRunDirectory({ spec, remoteRoot: "/tmp", runId: randomUUID() })).rejects.toThrow(/not deep enough|too shallow/);
+  });
+});
