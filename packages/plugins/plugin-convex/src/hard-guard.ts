@@ -1,8 +1,12 @@
 import type { ConvexDeployment } from "./contracts.js";
 
 /** Words that mark a deployment as production-like. A name, reference or preview identifier with one of these as a whole word is never deleted. */
-const MARKERS = new Set(["prod", "production", "staging", "main", "master", "release", "releases"]);
-const words = (value: string | null): string[] => (value ? value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean) : []);
+const MARKERS = new Set(["prod", "prd", "production", "preprod", "preproduction", "staging", "stage", "stg", "main", "master", "release", "releases"]);
+/** Words of a value: split on punctuation, on a capital after a lowercase letter, and between letters and digits (`releaseCandidate`, `staging2`). */
+const words = (value: string | null): string[] => (value
+  ? value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([A-Za-z])([0-9])/g, "$1 $2").replace(/([0-9])([A-Za-z])/g, "$1 $2")
+    .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+  : []);
 
 /**
  * The hard delete guard. It runs inside every delete and expiry path, after and independent of grants and company config: no setting can

@@ -19,3 +19,16 @@ export function parseCiPreview(source: string | null, identifier: string | null)
   const pr = number(groups?.pr);
   return pr === null ? null : { pr, run: number(groups?.run), attempt: number(groups?.attempt) ?? 0 };
 }
+
+export interface CiEntry extends CiPreview { /** Last deploy (or creation) time in ms. */ at: number }
+
+/**
+ * Whether `newer` replaces `older` for the same pull request. With run numbers on both, the later run (or the later attempt of the same run)
+ * replaces; with none on either, a preview made at least `minAgeMs` later replaces. Mixed numbered and unnumbered previews are never compared.
+ */
+export function supersedes(newer: CiEntry, older: CiEntry, minAgeMs: number): boolean {
+  if (newer.pr !== older.pr) return false;
+  if (newer.run !== null && older.run !== null) return newer.run > older.run || (newer.run === older.run && newer.attempt > older.attempt);
+  if (newer.run === null && older.run === null) return newer.at - older.at >= minAgeMs;
+  return false;
+}

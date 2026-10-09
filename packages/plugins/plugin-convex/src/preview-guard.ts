@@ -43,8 +43,7 @@ const sameRef = (ref: string, identifier: string) => ref === identifier || (norm
 const sameNumber = (number: number, identifier: string, bare: boolean) =>
   [`pr-${number}`, `pr${number}`, `pr_${number}`, ...(bare ? [String(number)] : [])].includes(identifier.toLowerCase());
 /** A bare number (`42`) protects an open pull request but is not accepted as evidence that a finished one belongs to the preview. */
-const matchesPull = (pr: PullRequestRef, identifier: string, evidence: boolean, prNumber: number | null) =>
-  prNumber === pr.number || sameRef(pr.headRef, identifier) || sameNumber(pr.number, identifier, !evidence);
+const matchesPull = (pr: PullRequestRef, identifier: string, evidence: boolean) => sameRef(pr.headRef, identifier) || sameNumber(pr.number, identifier, !evidence);
 
 const once = <T>(cache: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> => {
   let pending = cache.get(key);
@@ -80,7 +79,9 @@ export async function assessPreview(input: GuardInput): Promise<PreviewAssessmen
   const repo = project.repository;
   const cache = input.cache ?? newGuardCache();
   try {
-    const open = (await once(cache.open, repo, () => github.openPullRequests(repo, token))).find(pr => matchesPull(pr, identifier, false, prNumber));
+    const openList = await once(cache.open, repo, () => github.openPullRequests(repo, token));
+    // A pull request number read by the company's pattern wins; names and `pr-<n>` forms only add protection when it finds nothing open.
+    const open = (prNumber === null ? undefined : openList.find(pr => pr.number === prNumber)) ?? openList.find(pr => matchesPull(pr, identifier, false));
     if (open) return keep(`Preview ${identifier} belongs to open pull request #${open.number}.`, open.number);
     const matched = (await once(cache.branches, repo, () => github.branchNames(repo, token))).filter(name => sameRef(name, identifier));
     let lastCommitAt: number | null = null;
@@ -95,7 +96,8 @@ export async function assessPreview(input: GuardInput): Promise<PreviewAssessmen
     }
     let finished: PullRequestRef | null = null;
     try {
-      const closed = (await once(cache.closed, repo, () => github.recentClosedPullRequests(repo, token))).filter(pr => matchesPull(pr, identifier, true, prNumber));
+      // Evidence that a pull request owns this preview comes from the pattern's number alone when there is one, never from a branch name that happens to match.
+      const closed = (await once(cache.closed, repo, () => github.recentClosedPullRequests(repo, token))).filter(pr => (prNumber === null ? matchesPull(pr, identifier, true) : pr.number === prNumber));
       finished = closed.find(pr => pr.state === "merged") ?? closed[0] ?? null;
     } catch { /* positive evidence only: without it the "branch gone and idle" rule below still needs the full branch list */ }
     const idleMs = now - (deployment.lastDeployTime ?? deployment.createTime ?? now);

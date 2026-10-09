@@ -10,7 +10,7 @@ const dev = (name: string, reference: string, ageDays: number | null, extra: Rec
   lastDeployTime: ageDays === null ? null : NOW - ageDays * DAY, createTime: NOW - ((ageDays ?? 0) + 1) * DAY, ...extra,
 });
 const config = (devPolicy: Record<string, unknown> = {}, reaper: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
-  baseConfig({ reaper: { enabled: true, dev: { enabled: true, ...devPolicy }, ...reaper }, ...extra });
+  baseConfig({ reaper: { enabled: true, dev: { enabled: true, onlyPatterns: ["dev/*"], ...devPolicy }, ...reaper }, ...extra });
 const report = (f: Fixture) => f.h.performAction<any>("reaper.report", {}, member(COMPANY_A));
 const deleted = (f: Fixture) => f.convex.deletes().map(call => decodeURIComponent(call.url.split("/deployments/")[1].replace("/delete", ""))).sort();
 const closed = (f: Fixture, name: string, number: number, extra: Record<string, unknown> = {}) => {
@@ -118,13 +118,13 @@ describe("dev policy", () => {
 
   it("is a plan only until both the reaper and the dev policy are enabled, and in a dry run or dryRunOnly", async () => {
     const seed = (f: Fixture) => f.convex.add(dev("old", "dev/ship-1-a", 30));
-    const reaperOff = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { dev: { enabled: true } } }) } });
+    const reaperOff = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { dev: { enabled: true, onlyPatterns: ["dev/*"] } } }) } });
     seed(reaperOff);
     await reaperOff.h.runJob("convex-reaper");
     expect(reaperOff.convex.deletes()).toHaveLength(0);
     expect((await report(reaperOff)).projects[0].dev.delete.map((item: any) => item.name)).toEqual(["old"]);
 
-    const devOff = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true } }) } });
+    const devOff = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true, dev: { onlyPatterns: ["dev/*"] } } }) } });
     seed(devOff);
     await devOff.h.runJob("convex-reaper");
     expect(devOff.convex.deletes()).toHaveLength(0);
@@ -294,14 +294,16 @@ describe("superseded override stays tied to the blocking pull request", () => {
 describe("configuration", () => {
   it("accepts the new settings and rejects bad ones", async () => {
     const { parseConfig } = await import("../src/config.js");
-    const parsed = parseConfig({ reaper: { dev: { enabled: true, maxAgeDays: 14, protect: ["dev/a*"], onlyPatterns: ["dev/ship-*"], maxDeletes: 5 }, pullRequestPattern: "^pr(?<pr>\\d+)-", supersededMinAgeMinutes: 90 } });
+    const parsed = parseConfig({ reaper: { dev: { enabled: true, maxAgeDays: 14, protect: ["dev/a*"], onlyPatterns: ["dev/ship-*"], maxDeletes: 5 }, pullRequestPattern: "^pr(?<pr>\\d+)-x$", supersededMinAgeMinutes: 90 } });
     expect(parsed.reaper.dev).toEqual({ enabled: true, maxAgeDays: 14, protect: ["dev/a*"], onlyPatterns: ["dev/ship-*"], maxDeletes: 5 });
     expect(parsed.reaper.supersededMinAgeMinutes).toBe(90);
     expect(parseConfig({}).reaper.dev).toEqual({ enabled: false, maxAgeDays: 7, protect: [], onlyPatterns: [], maxDeletes: 20 });
     for (const bad of [
       { reaper: { dev: { maxAgeDays: 0 } } }, { reaper: { dev: { maxAgeDays: 91 } } }, { reaper: { dev: { protect: "dev/a" } } },
       { reaper: { dev: { onlyPatterns: [5] } } }, { reaper: { dev: { maxDeletes: 0 } } }, { reaper: { dev: { enabled: "yes" } } },
-      { reaper: { pullRequestPattern: "no named group" } }, { reaper: { pullRequestPattern: "(?<pr>[" } }, { reaper: { pullRequestPattern: "x".repeat(300) } },
+      { reaper: { pullRequestPattern: "no named group" } }, { reaper: { pullRequestPattern: "(?<pr>\\d+)" } }, { reaper: { pullRequestPattern: "^(?<pr>\\d+)-x" } },
+      { reaper: { pullRequestPattern: "^(?<pr>\\d+)(a+)+$" } }, { reaper: { pullRequestPattern: "^(?<pr>\\d+)(?:-(\\w+){2,})$" } },
+      { reaper: { dev: { protect: ["*alice*"] } } }, { reaper: { dev: { onlyPatterns: ["dev/*-pinned"] } } }, { reaper: { dev: { protect: ["a**"] } } }, { reaper: { pullRequestPattern: "(?<pr>[" } }, { reaper: { pullRequestPattern: "x".repeat(300) } },
       { reaper: { supersededMinAgeMinutes: 5 } },
     ]) expect(() => parseConfig(bad as Record<string, unknown>), JSON.stringify(bad)).toThrow();
   });
@@ -314,5 +316,114 @@ describe("configuration", () => {
     expect(parsed.reaper.dev.maxAgeDays).toBe(7);
     expect(parsed.reaper.pullRequestPattern).toContain("(?<pr>");
     expect(parsed.projects[0].repository).toBe("org/app");
+  });
+});
+
+describe("review fixes (PR #46)", () => {
+  const PATTERN = "^pr(?<pr>\\d+)-run(?<run>\\d+)-s(?<shard>\\d+)-a(?<attempt>\\d+)$";
+  const ci = (pr: number, run: number, shard: number, attempt: number, hoursAgo: number) =>
+    deployment(`pr${pr}-run${run}-s${shard}-a${attempt}`, { previewIdentifier: `pr${pr}-run${run}-s${shard}-a${attempt}`, lastDeployTime: NOW - hoursAgo * HOUR, createTime: NOW - (hoursAgo + 0.2) * HOUR });
+
+  it("deletes only what the allow list names, so a person's second dev deployment and unnamed pools are safe", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config({ onlyPatterns: ["dev/ship-*", "dev/issue-*"] }) } });
+    f.convex.add(dev("agent-1", "dev/ship-1-a", 30), dev("alice-second", "dev/alice-perf", 90), dev("pool", "dev/paperclip-agents", 90), dev("no-ref", "dev/ignored", 90, { reference: null }));
+    await f.h.runJob("convex-reaper");
+    expect(deleted(f)).toEqual(["agent-1"]);
+  });
+
+  it("deletes no dev deployment until an allow list is configured, and lists what it would need to decide", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true, dev: { enabled: true } } }) } });
+    f.convex.add(dev("agent-1", "dev/ship-1-a", 30), dev("alice-second", "dev/alice-perf", 90));
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deletes()).toHaveLength(0);
+    const entry = (await report(f)).projects[0].dev;
+    expect(entry.delete).toEqual([]);
+    expect(entry.skipped.map((item: any) => item.name).sort()).toEqual(["agent-1", "alice-second"]);
+    expect(entry.skipped[0].reason).toMatch(/allow list/i);
+  });
+
+  it("shares one dev deletion cap across all projects in a run", async () => {
+    const projects = [{ convexProjectId: "100", name: "a", repository: "org/a" }, { convexProjectId: "200", name: "b", repository: "org/b" }];
+    const f = await setup({ configs: { [COMPANY_A]: config({ maxDeletes: 3 }, {}, { projects }) } });
+    for (let i = 0; i < 4; i++) f.convex.add(dev(`a-${i}`, `dev/ship-${i}-a`, 30), dev(`b-${i}`, `dev/ship-${i}-b`, 30, { projectId: 200 }));
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deletes()).toHaveLength(3);
+  });
+
+  it("does not delete a dev deployment whose name hides a production word behind a digit or a capital", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config() } });
+    f.convex.add(dev("a", "dev/staging2", 30), dev("b", "dev/releaseCandidate", 30), dev("c", "dev/ship-1-ok", 30));
+    await f.h.runJob("convex-reaper");
+    expect(deleted(f)).toEqual(["c"]);
+  });
+
+  it("never uses the preview deploy key for dev deployments, not even for the first read", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config({}, {}, { projects: [{ convexProjectId: "100", name: "app", repository: "org/app", token: ref("s-project"), previewDeployKey: ref("s-preview") }] }) } });
+    f.convex.validTokens.add(PREVIEW_KEY);
+    f.convex.add(dev("old", "dev/ship-1-a", 30));
+    await f.h.runJob("convex-reaper");
+    expect(deleted(f)).toEqual(["old"]);
+    expect(f.convex.calls.map(call => call.authorization)).not.toContain(`Bearer ${PREVIEW_KEY}`);
+  });
+
+  it("takes the pull request from the pattern alone, so an unrelated closed pull request with the same branch name is not evidence", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config({}, { pullRequestPattern: "^pr(?<pr>\\d+)-x$" }) } });
+    f.convex.add(deployment("pr123-x", { previewIdentifier: "pr123-x", lastDeployTime: NOW - 50 * HOUR }));
+    f.github.pulls.push({ number: 77, ref: "pr123-x", state: "closed", merged: true });
+    const result = await f.h.executeTool<{ data?: any }>("convex_delete_preview", { name: "pr123-x", dryRun: true }, run("janitor"));
+    expect(result.data.evidence.prState).toBe("none");
+    expect(result.data.reason).toMatch(/branch is gone/i);
+  });
+
+  it("re-checks idle time and run order on the fresh records before deleting a superseded preview", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config({}, { pullRequestPattern: PATTERN }) } });
+    f.convex.add(ci(4320, 100, 1, 1, 0.1), ci(4320, 101, 1, 1, 0.05), ci(4320, 90, 1, 1, 5));
+    f.github.pulls.push({ number: 4320, ref: "feature/x" });
+    const { service } = f.runtime;
+    const { config: cfg, reserved } = await service.requireConnected(COMPANY_A);
+    const reaper = { kind: "reaper" as const, companyId: COMPANY_A };
+    // Redeployed six minutes ago: in use, so not deleted even though the plan once called it superseded.
+    await expect(service.deletePreview(reaper, cfg, reserved, "pr4320-run100-s1-a1", { dryRun: false, supersededBy: { name: "pr4320-run101-s1-a1", pr: 4320 } })).rejects.toThrow(/idle|recent|in use/i);
+    // The "newer" preview is really older (run 90): not a replacement.
+    await expect(service.deletePreview(reaper, cfg, reserved, "pr4320-run101-s1-a1", { dryRun: false, supersededBy: { name: "pr4320-run90-s1-a1", pr: 4320 } })).rejects.toThrow(/newer preview/i);
+    expect(f.convex.deletes()).toHaveLength(0);
+  });
+
+  it("only compares run numbers with run numbers, and times with times", async () => {
+    const pattern = "^pr(?<pr>\\d+)(?:-run(?<run>\\d+))?-s(?<shard>\\d+)$";
+    const f = await setup({ configs: { [COMPANY_A]: config({}, { pullRequestPattern: pattern }) } });
+    const make = (name: string, hoursAgo: number) => deployment(name, { previewIdentifier: name, lastDeployTime: NOW - hoursAgo * HOUR, createTime: NOW - (hoursAgo + 0.2) * HOUR });
+    // PR 4320 mixes named runs with an unnumbered one: only run 3 is older than run 5; the unnumbered one is never compared.
+    f.convex.add(make("pr4320-run5-s1", 9), make("pr4320-s1", 4), make("pr4320-run3-s1", 6));
+    // PR 4321 has no run numbers: the older one is replaced by one made at least the minimum age later.
+    f.convex.add(make("pr4321-s1", 8), make("pr4321-s2", 2));
+    f.github.pulls.push({ number: 4320, ref: "a" }, { number: 4321, ref: "b" });
+    await f.h.runJob("convex-reaper");
+    expect(deleted(f)).toEqual(["pr4320-run3-s1", "pr4321-s1"]);
+  });
+
+  it("reports a delete as unverified, not failed, when the follow-up read cannot tell", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config() } });
+    f.convex.add(dev("old", "dev/ship-1-a", 30));
+    f.convex.flakyAfterDelete.add("old");
+    await f.h.runJob("convex-reaper");
+    expect((await report(f)).projects[0].dev.deleted).toEqual(["old"]);
+    expect(f.h.activity.some(item => item.metadata?.outcome === "deleted-unverified")).toBe(true);
+  });
+
+  it("lets an expiry the plugin set keep following redeploys on a preview the hard guard now covers, but never schedules one", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true } }) } });
+    f.convex.add(deployment("feat-stage-x", { lastDeployTime: NOW - 10 * HOUR, expiresAt: NOW + 26 * HOUR }));
+    await f.h.ctx.state.set({ scopeKind: "company", scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" }, { "feat-stage-x": NOW + 26 * HOUR });
+    f.clock.now += 10 * HOUR;
+    f.convex.deployments.get("feat-stage-x")!.lastDeployTime = f.clock.now - HOUR;
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deployments.get("feat-stage-x")?.expiresAt).toBe(f.clock.now - HOUR + 36 * HOUR);
+    // An agent can extend it too, but cannot shorten it.
+    const tool = (hours: number) => f.h.executeTool<{ data?: any; error?: string }>("convex_set_preview_expiry", { name: "feat-stage-x", hours }, run("janitor"));
+    expect((await tool(100)).data.expiresAt).toBe(f.clock.now + 100 * HOUR);
+    expect((await tool(40)).error).toMatch(/production, staging, main or release/i);
+    f.convex.add(deployment("feat-release-y", { expiresAt: null }));
+    expect((await f.h.executeTool<{ error?: string }>("convex_set_preview_expiry", { name: "feat-release-y", hours: 100 }, run("janitor"))).error).toMatch(/production, staging, main or release/i);
   });
 });

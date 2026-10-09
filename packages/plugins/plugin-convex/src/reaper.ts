@@ -1,6 +1,6 @@
 import { HOUR_MS, type ConnectionConfig, type ConvexDeployment, type ProjectMapping, type ReaperDevReport, type ReaperProjectReport, type ReaperReport } from "./contracts.js";
 import { classifyDeployment } from "./classify.js";
-import { parseCiPreview } from "./ci-previews.js";
+import { parseCiPreview, supersedes, type CiEntry } from "./ci-previews.js";
 import { ConvexApiError } from "./convex-client.js";
 import { decideDev } from "./dev-policy.js";
 import { hardDeleteBlock } from "./hard-guard.js";
@@ -38,6 +38,8 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
   const now = service.d.now();
   const budget: DeletionBudget = { left: config.guards.maxDeletesPerRun, max: config.guards.maxDeletesPerRun };
   const cache = newGuardCache();
+  // One dev allowance for the whole pass, across every project, like the preview allowance.
+  const devBudget: DeletionBudget = { left: config.reaper.dev.maxDeletes, max: config.reaper.dev.maxDeletes };
   const seen = new Set<string>();
   let listedAll = true;
   const managed = await service.managedExpiries(companyId);
@@ -48,7 +50,7 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
     const entry: ReaperProjectReport = { convexProjectId: project.convexProjectId, name: project.name, previews: 0, delete: [], setExpiry: [], kept: 0, deleted: [], expirySet: [], failed: [], skipped: [] };
     report.projects.push(entry);
     // Dev deployments are handled on their own: a problem there (for example a token that cannot list them) never stops the preview pass.
-    entry.dev = await reapDev(service, { config, reserved, companyId, project, index, actor, dryRun, now });
+    entry.dev = await reapDev(service, { config, reserved, companyId, project, index, actor, dryRun, now, budget: devBudget });
     let listed = false;
     try {
       const token = await service.listToken(config, companyId, project, index);
@@ -65,18 +67,20 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
           entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: `classified ${environment}: ${reason}` });
           continue;
         }
-        const hardBlock = hardDeleteBlock(deployment);
-        if (hardBlock) {
-          // Never deleted and never given an expiry (an expiry is a delayed delete), whatever the grants or config say.
-          entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: hardBlock });
-          continue;
-        }
         const lastDeploy = deployment.lastDeployTime ?? deployment.createTime ?? now;
         const deadline = lastDeploy + config.reaper.ttlHours * HOUR_MS;
         const current = deployment.expiresAt;
         // An expiry the plugin set follows a later deploy; one a person chose never moves later. Moving a deadline later deletes nothing, so it needs no GitHub.
         const ours = current !== null && managed[deployment.name] !== undefined && Math.abs(managed[deployment.name] - current) <= EXPIRY_TOLERANCE_MS;
         const extend = ours && deadline - now >= MIN_PLANNED_LEAD_MS && current < deadline - EXPIRY_TOLERANCE_MS;
+        const hardBlock = hardDeleteBlock(deployment);
+        if (hardBlock) {
+          // Never deleted, and never given or shortened an expiry (an expiry is a delayed delete), whatever the grants or config say.
+          // An expiry the plugin already set may still move later: that postpones a deletion.
+          if (extend) { entry.kept += 1; entry.setExpiry.push({ name: deployment.name, from: current, to: deadline }); }
+          else entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: hardBlock });
+          continue;
+        }
 
         let assessment: PreviewAssessment | null = null;
         let unreadable: string | null = null;
@@ -167,37 +171,32 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
   return report;
 }
 
-interface CiEntry { name: string; pr: number; run: number | null; attempt: number; at: number }
-
 /**
  * Older runs of a pull request that a newer run's preview has replaced, by preview name. CI makes one preview per run, shard and attempt, so
- * every shard of the newest run stays. With a run number the order is (run, attempt); without one, a preview is replaced only by one made
- * at least the minimum age after it. A preview must also have been idle for that long, so a run that is still using it is not cut off.
+ * every shard of the newest run stays (equal shards do not replace each other). A preview must also have been idle for the minimum age, so a
+ * run that is still using it is not cut off. The ordering rule is shared with the delete-time check (`supersedes`).
  */
 function planSuperseded(previews: ConvexDeployment[], project: ProjectMapping, config: ConnectionConfig, now: number): Map<string, { name: string; pr: number }> {
   const out = new Map<string, { name: string; pr: number }>();
   const pattern = config.reaper.pullRequestPattern;
   if (!pattern) return out;
   const minAge = config.reaper.supersededMinAgeMinutes * 60_000;
-  const entries: CiEntry[] = [];
+  const entries: Array<CiEntry & { name: string }> = [];
   for (const deployment of previews) {
     if (deployment.projectId !== project.convexProjectId || classifyDeployment(deployment, project).environment !== "preview" || hardDeleteBlock(deployment)) continue;
     const parsed = parseCiPreview(pattern, deployment.previewIdentifier);
     if (parsed) entries.push({ name: deployment.name, ...parsed, at: deployment.lastDeployTime ?? deployment.createTime ?? now });
   }
-  const order = (a: CiEntry, b: CiEntry) => (a.run !== null && b.run !== null ? a.run - b.run || a.attempt - b.attempt : a.at - b.at);
+  const latest = (a: CiEntry & { name: string }, b: CiEntry & { name: string }) => ((a.run !== null && b.run !== null ? a.run - b.run || a.attempt - b.attempt : 0) || a.at - b.at || a.name.localeCompare(b.name)) > 0 ? a : b;
   for (const mine of entries) {
-    const newest = entries.filter(other => other.pr === mine.pr).reduce((best, other) => (order(other, best) > 0 ? other : best), mine);
-    // `newest` starts as `mine` and only moves to a strictly newer entry, so equal shards of the newest run are never replaced.
-    if (newest.name === mine.name) continue;
-    if (!(mine.run !== null && newest.run !== null) && newest.at - mine.at < minAge) continue;
     if (now - mine.at < minAge) continue;
-    out.set(mine.name, { name: newest.name, pr: mine.pr });
+    const replacements = entries.filter(other => other.name !== mine.name && supersedes(other, mine, minAge));
+    if (replacements.length) out.set(mine.name, { name: replacements.reduce(latest).name, pr: mine.pr });
   }
   return out;
 }
 
-interface DevPass { config: ConnectionConfig; reserved: Set<string>; companyId: string; project: ProjectMapping; index: number; actor: Actor; dryRun: boolean; now: number }
+interface DevPass { config: ConnectionConfig; reserved: Set<string>; companyId: string; project: ProjectMapping; index: number; actor: Actor; dryRun: boolean; now: number; budget: DeletionBudget }
 
 const DEV_CREDENTIAL = "Listing dev deployments needs a Team Access Token (or a project token that can list them); a preview deploy key cannot.";
 
@@ -206,7 +205,7 @@ const DEV_CREDENTIAL = "Listing dev deployments needs a Team Access Token (or a 
  * pass started by the schedule or a board user: an agent that starts a pass only sees the plan.
  */
 async function reapDev(service: ConvexService, pass: DevPass): Promise<ReaperDevReport> {
-  const { config, reserved, companyId, project, index, actor, dryRun, now } = pass;
+  const { config, reserved, companyId, project, index, actor, dryRun, now, budget } = pass;
   const out: ReaperDevReport = { listed: 0, delete: [], deleted: [], kept: 0, failed: [], skipped: [], executed: false };
   try {
     const token = await service.listToken(config, companyId, project, index);
@@ -220,6 +219,7 @@ async function reapDev(service: ConvexService, pass: DevPass): Promise<ReaperDev
       else {
         const decision = decideDev(deployment, config.reaper.dev, now);
         if (decision.delete) out.delete.push({ name: deployment.name, previewIdentifier: deployment.reference, reason: decision.reason });
+        else if (decision.listed) out.skipped.push({ name: deployment.name, previewIdentifier: deployment.reference, reason: decision.reason });
         else out.kept += 1;
       }
     }
@@ -229,7 +229,6 @@ async function reapDev(service: ConvexService, pass: DevPass): Promise<ReaperDev
   }
   if (dryRun || !config.reaper.dev.enabled || actor.kind === "agent") return out;
   out.executed = true;
-  const budget: DeletionBudget = { left: config.reaper.dev.maxDeletes, max: config.reaper.dev.maxDeletes };
   for (const item of out.delete) {
     if (budget.left <= 0) { out.skipped.push({ ...item, reason: `Dev deletion limit of ${budget.max} reached for this run.` }); continue; }
     try {

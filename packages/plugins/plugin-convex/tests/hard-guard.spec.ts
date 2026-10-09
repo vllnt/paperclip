@@ -30,6 +30,10 @@ describe("hardDeleteBlock", () => {
     expect(block({ previewIdentifier: `feat/${word}` })).toMatch(/production, staging, main or release/);
   });
 
+  it.each(["staging2", "prod1", "release2026-10", "releaseCandidate", "mainBranch", "prodDb", "preprod", "PRD", "stage", "stg", "Production2"])("blocks %s, where the word is joined to a digit or a capital letter", value => {
+    expect(block({ name: "ok-name", reference: `dev/${value}`, previewIdentifier: null }), value).toMatch(/production, staging, main or release/);
+  });
+
   it("matches whole words only, so ordinary names that contain the letters pass", () => {
     for (const name of ["maintenance-page", "domain-fix", "released-notes-ui", "reproduction", "stagingly"]) expect(block({ name, previewIdentifier: name, reference: `preview/${name}` }), name).toBeNull();
   });

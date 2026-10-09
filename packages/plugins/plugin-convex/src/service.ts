@@ -8,7 +8,7 @@ import {
 import { ConvexApiError, ConvexClient } from "./convex-client.js";
 import { isGranted, hasAnyGrant, type AgentIdentity } from "./grants.js";
 import { GitHubReader } from "./github-reader.js";
-import { parseCiPreview } from "./ci-previews.js";
+import { parseCiPreview, supersedes, type CiEntry } from "./ci-previews.js";
 import { decideDev } from "./dev-policy.js";
 import { hardDeleteBlock } from "./hard-guard.js";
 import { reaperDeadline } from "./policy.js";
@@ -217,13 +217,13 @@ export class ConvexService {
   // --- deployments ---
 
   /** Re-fetches a deployment from Convex at call time and decides everything from that fresh record. */
-  async resolveTarget(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string): Promise<Target> {
+  async resolveTarget(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, options: { previewKey?: boolean } = {}): Promise<Target> {
     if (typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) throw new Refusal("Provide a Convex deployment name.");
     // One message for "does not exist", "not reachable" and "belongs to someone else", so names of other companies cannot be probed.
     const unavailable = () => new Refusal("This Convex deployment is not available for this company.");
     let deployment: ConvexDeployment | null;
     try {
-      deployment = await this.withCredential(config, actor.companyId, null, token => this.d.convex.getDeployment(token, name));
+      deployment = await this.withCredential(config, actor.companyId, null, token => this.d.convex.getDeployment(token, name), options);
     } catch (error) {
       if (error instanceof ConvexApiError && [401, 403, 404].includes(error.status)) throw unavailable();
       throw error;
@@ -272,10 +272,11 @@ export class ConvexService {
     const target = await this.resolveTarget(actor, config, reserved, name);
     this.requirePreview(target);
     this.requireGrant(actor, config, target.environment, "lifecycle");
-    const hardBlock = hardDeleteBlock(target.deployment);
-    if (hardBlock) throw new Refusal(hardBlock);
     const now = this.d.now();
     const expiresAt = options.expiryAt ?? now + hours * HOUR_MS;
+    // The hard guard stops an expiry from being scheduled or shortened. Moving an existing deadline later postpones a deletion, so it stays allowed.
+    const hardBlock = hardDeleteBlock(target.deployment);
+    if (hardBlock && !(target.deployment.expiresAt !== null && expiresAt > target.deployment.expiresAt)) throw new Refusal(hardBlock);
     if (expiresAt - now > MAX_PREVIEW_TTL_HOURS * HOUR_MS) throw new Refusal(`A preview expiry can be at most ${MAX_PREVIEW_TTL_HOURS} hours (7 days) from now.`);
     if (expiresAt - now < MIN_EXPIRY_LEAD_MS) throw new Refusal("A preview expiry must be at least 30 minutes from now.");
     // An expiry is a scheduled deletion. Setting one sooner than the preview already has, sooner than the reaper's own deadline for it, or
@@ -361,10 +362,10 @@ export class ConvexService {
     try { await this.withCredential(config, companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.getDeployment(token, name), { previewKey }); return false; }
     catch (error) { return error instanceof ConvexApiError && error.status === 404; }
   }
-  /** After a delete Convex accepted: is the deployment still there? Only an answer that shows it exists counts; an error says nothing. */
-  private async stillExists(config: ConnectionConfig, companyId: string, target: Target, name: string, previewKey: boolean): Promise<boolean> {
-    try { return (await this.withCredential(config, companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.getDeployment(token, name), { previewKey })) !== null; }
-    catch { return false; }
+  /** After a delete Convex accepted: is the deployment still there? Only a 404 proves it is gone and only a deployment proves it is not. */
+  private async existence(config: ConnectionConfig, companyId: string, target: Target, name: string, previewKey: boolean): Promise<"exists" | "gone" | "unknown"> {
+    try { return (await this.withCredential(config, companyId, { project: target.project, index: target.projectIndex }, token => this.d.convex.getDeployment(token, name), { previewKey })) ? "exists" : "unknown"; }
+    catch (error) { return error instanceof ConvexApiError && error.status === 404 ? "gone" : "unknown"; }
   }
 
   /**
@@ -392,22 +393,36 @@ export class ConvexService {
       if (unanswered) throw new ConvexApiError((error as ConvexApiError).status, "Convex did not confirm the deletion. Check the deployment before retrying.");
       throw error;
     }
-    if (await this.stillExists(config, actor.companyId, target, name, previewKey)) {
+    const existence = await this.existence(config, actor.companyId, target, name, previewKey);
+    if (existence === "exists") {
       await this.audit(actor, `Convex ${noun} delete failed`, { ...record, outcome: "still-exists" }, name);
       throw new ConvexApiError(0, "Convex accepted the delete but the deployment still exists. Check it before retrying.");
     }
-    await this.audit(actor, `Convex ${noun} deleted`, { ...record, outcome: "deleted", after: null }, name);
+    // Convex accepted the delete. When the follow-up read could not say either way, that is recorded instead of claiming a confirmation.
+    await this.audit(actor, `Convex ${noun} deleted`, { ...record, outcome: existence === "gone" ? "deleted" : "deleted-unverified", after: null }, name);
     return finish(true);
   }
 
-  /** A newer preview of the same pull request must exist at the moment an older one is deleted as superseded. */
+  /**
+   * A preview of an open pull request is deleted as superseded only if, on the records fetched now, a newer preview of the same pull request exists
+   * and this one has been idle for the minimum age. A run that redeployed into it since the plan was made keeps it.
+   */
   private async requireNewerPreview(actor: Actor, config: ConnectionConfig, reserved: Set<string>, target: Target, newer: { name: string; pr: number }): Promise<void> {
     const gone = () => new Refusal("The newer preview of this pull request is not available any more, so the older one was kept.");
     if (newer.name === target.deployment.name) throw gone();
     let sibling: Target;
     try { sibling = await this.resolveTarget(actor, config, reserved, newer.name); } catch { throw gone(); }
     if (sibling.environment !== "preview" || sibling.project.convexProjectId !== target.project.convexProjectId) throw gone();
-    if (parseCiPreview(config.reaper.pullRequestPattern, sibling.deployment.previewIdentifier)?.pr !== newer.pr) throw gone();
+    const now = this.d.now();
+    const minAge = config.reaper.supersededMinAgeMinutes * 60_000;
+    const entry = (deployment: ConvexDeployment): CiEntry | null => {
+      const parsed = parseCiPreview(config.reaper.pullRequestPattern, deployment.previewIdentifier);
+      return parsed ? { ...parsed, at: deployment.lastDeployTime ?? deployment.createTime ?? now } : null;
+    };
+    const mine = entry(target.deployment);
+    const theirs = entry(sibling.deployment);
+    if (!mine || !theirs || mine.pr !== newer.pr || !supersedes(theirs, mine, minAge)) throw gone();
+    if (now - mine.at < minAge) throw new Refusal("This preview was deployed recently and may be in use, so it was kept.");
   }
 
   async deletePreview(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, options: {
@@ -456,7 +471,7 @@ export class ConvexService {
    */
   async deleteDev(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, options: { dryRun: boolean; budget?: DeletionBudget }) {
     if (actor.kind === "agent") throw new Refusal("Agents cannot delete dev deployments. Dev deployments are personal; deleting one is a board action or a Decision.");
-    const target = await this.resolveTarget(actor, config, reserved, name);
+    const target = await this.resolveTarget(actor, config, reserved, name, { previewKey: false });
     if (target.environment !== "dev") throw new Refusal(`Only dev deployments are deleted by the dev policy; this one is classified ${target.environment}.`);
     const hardBlock = hardDeleteBlock(target.deployment);
     if (hardBlock) throw new Refusal(hardBlock);

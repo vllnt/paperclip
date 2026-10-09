@@ -94,14 +94,18 @@ function grant(raw: unknown, index: number): Grant {
 
 function patterns(value: unknown, path: string): string[] {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > 100 || value.some(item => typeof item !== "string" || !item.trim() || item.length > 200)) {
-    throw new ConfigError(`${path} must be a list of at most 100 reference patterns (exact names, or a prefix ending in *).`);
+  if (!Array.isArray(value) || value.length > 100 || value.some(item => typeof item !== "string" || !item.trim() || item.length > 200 || /\*(?!$)/.test(item.trim()))) {
+    throw new ConfigError(`${path} must be a list of at most 100 reference patterns: exact names, or a prefix ending in * (a * anywhere else is not allowed).`);
   }
   return [...new Set((value as string[]).map(item => item.trim()))];
 }
 function prPattern(value: unknown): string | null {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string" || value.length > 200 || !value.includes("(?<pr>")) throw new ConfigError('reaper.pullRequestPattern must be a regular expression of at most 200 characters with a named group (?<pr>...).');
+  // It must describe the whole identifier, so a number inside an unrelated branch name is never read as a pull request.
+  if (!value.startsWith("^") || !value.endsWith("$") || value.endsWith("\\$")) throw new ConfigError("reaper.pullRequestPattern must start with ^ and end with $.");
+  // A repeated group can make a regular expression take exponential time on a long name. Use simple classes such as \\d+ instead.
+  if (/\)[*+]|\)\{/.test(value)) throw new ConfigError("reaper.pullRequestPattern must not repeat a group; use simple classes such as \\d+.");
   try { compilePattern(value); } catch { throw new ConfigError("reaper.pullRequestPattern is not a valid regular expression."); }
   return value;
 }
