@@ -1,5 +1,5 @@
 import { AgentIdentity } from "@/components/AgentIdentity";
-import { useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { Link } from "@/lib/router";
 import {
   DndContext,
@@ -23,12 +23,14 @@ import { PriorityIcon } from "./PriorityIcon";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { Identity } from "./Identity";
 import type { Issue, IssueStatus } from "@paperclipai/shared";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, RotateCw } from "lucide-react";
 import { isSuccessfulRunHandoffRequired } from "../lib/successful-run-handoff";
 import { collectSubtreeLiveCounts } from "../lib/liveIssueIds";
 import { cn } from "../lib/utils";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 
 export const KANBAN_BOARD_HIGH_VOLUME_THRESHOLD = 100;
 export const KANBAN_COLUMN_PAGE_SIZE_OPTIONS = [10, 25, 50] as const;
@@ -155,15 +157,25 @@ interface KanbanBoardProps {
   collapsedStatuses?: string[];
   initialVisibleCount?: number;
   revealIncrement?: number;
+  /** Columns whose tasks have not arrived yet; they render placeholders, not "0". */
+  loadingStatuses?: readonly IssueStatus[];
+  /** Columns whose tasks failed to load; they render an error with a retry. */
+  failedStatuses?: readonly IssueStatus[];
+  onRetryFailedColumns?: () => void;
   onUpdateIssue: (id: string, data: Record<string, unknown>) => void;
 }
 
+type KanbanColumnState = "ready" | "loading" | "failed";
+
+const KANBAN_LOADING_CARD_COUNT = 3;
+
 /* ── Droppable Column ── */
 
-function KanbanColumn({
+const KanbanColumn = memo(function KanbanColumn({
   status,
+  state = "ready",
   issues,
-  agents,
+  agentById,
   liveIssueIds,
   subtreeLiveCounts,
   compactCards = false,
@@ -171,58 +183,95 @@ function KanbanColumn({
   visibleCount,
   revealIncrement,
   onShowMore,
+  onRetry,
 }: {
   status: IssueStatus;
+  state?: KanbanColumnState;
   issues: Issue[];
-  agents?: Agent[];
+  agentById: ReadonlyMap<string, Agent>;
   liveIssueIds?: Set<string>;
   subtreeLiveCounts?: ReadonlyMap<string, number>;
   compactCards?: boolean;
   collapsed?: boolean;
   visibleCount: number;
   revealIncrement: number;
-  onShowMore: () => void;
+  onShowMore: (status: IssueStatus) => void;
+  onRetry?: () => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: status });
 
-  const isEmpty = issues.length === 0;
-  const visibleIssues = collapsed ? [] : issues.slice(0, visibleCount);
-  const hiddenCount = Math.max(issues.length - visibleIssues.length, 0);
+  const visibleIssues = collapsed || state !== "ready" ? [] : issues.slice(0, visibleCount);
+  // dnd-kit rebuilds its sortable context, re-rendering every card in the
+  // column, whenever `items` changes identity; keep it stable while the ids are.
+  const sortableIdsKey = visibleIssues.map((issue) => issue.id).join("\u0000");
+  const sortableIds = useMemo(() => (sortableIdsKey ? sortableIdsKey.split("\u0000") : []), [sortableIdsKey]);
+  const hiddenCount = state === "ready" ? Math.max(issues.length - visibleIssues.length, 0) : 0;
   const nextRevealCount = Math.min(revealIncrement, hiddenCount);
   const tone = getKanbanColumnTone(status);
+  const countLabel = state === "ready" ? String(issues.length) : state === "failed" ? "–" : null;
+  const stateTitle = state === "loading" ? "loading" : state === "failed" ? "failed to load" : issues.length;
 
   if (collapsed) {
     return (
       <div
         ref={setNodeRef}
+        data-kanban-status={status}
+        data-kanban-state={state}
         className={cn(
           "flex min-h-(--sz-220px) w-(--sz-52px) shrink-0 flex-col items-center rounded-md border px-1.5 py-2 transition-colors",
           tone.rail,
           isOver && tone.railOver,
         )}
-        title={`${statusLabel(status)}: ${issues.length}`}
+        title={`${statusLabel(status)}: ${stateTitle}`}
       >
         <StatusIcon status={status} />
         <span className={cn("mt-2 [writing-mode:vertical-rl] rotate-180 text-(length:--text-nano) font-semibold uppercase tracking-wide", tone.header)}>
           {statusLabel(status)}
         </span>
-        <Badge variant="ghost" className={cn("mt-auto bg-background px-1.5 text-(length:--text-nano) tabular-nums", tone.header)}>
-          {issues.length}
-        </Badge>
+        <div className="mt-auto flex flex-col items-center gap-1">
+          {state === "failed" && onRetry ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              title={`Retry loading ${statusLabel(status).toLowerCase()} tasks`}
+              aria-label={`Retry loading ${statusLabel(status).toLowerCase()} tasks`}
+              onClick={onRetry}
+            >
+              <RotateCw />
+            </Button>
+          ) : null}
+          {countLabel === null ? (
+            <Skeleton className="h-4 w-6" />
+          ) : (
+            <Badge variant="ghost" data-kanban-count className={cn("bg-background px-1.5 text-(length:--text-nano) tabular-nums", tone.header)}>
+              {countLabel}
+            </Badge>
+          )}
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col shrink-0 min-w-(--sz-260px) w-(--sz-260px)">
+    <div
+      data-kanban-status={status}
+      data-kanban-state={state}
+      aria-busy={state === "loading" || undefined}
+      className="flex flex-col shrink-0 min-w-(--sz-260px) w-(--sz-260px)"
+    >
       <div className="flex items-center gap-2 px-3 py-2 mb-1">
         <StatusIcon status={status} />
         <span className={cn("text-xs font-semibold uppercase tracking-wide", tone.header)}>
           {statusLabel(status)}
         </span>
-        <span className={cn("ml-auto text-xs tabular-nums", tone.count)}>
-          {issues.length}
-        </span>
+        {countLabel === null ? (
+          <Skeleton className="ml-auto h-3 w-5" />
+        ) : (
+          <span data-kanban-count className={cn("ml-auto text-xs tabular-nums", tone.count)}>
+            {countLabel}
+          </span>
+        )}
       </div>
       <div
         ref={setNodeRef}
@@ -231,16 +280,31 @@ function KanbanColumn({
           isOver ? tone.bodyOver : tone.body,
         )}
       >
+        {state === "loading"
+          ? Array.from({ length: KANBAN_LOADING_CARD_COUNT }, (_, index) => (
+            <Skeleton key={index} className={cn("w-full", compactCards ? "h-14" : "h-20")} />
+          ))
+          : null}
+        {state === "failed" ? (
+          <div role="alert" className="flex flex-col items-center gap-2 px-2 py-4 text-center text-xs text-muted-foreground">
+            <span>Couldn’t load {statusLabel(status).toLowerCase()} tasks.</span>
+            {onRetry ? (
+              <Button type="button" variant="outline" size="xs" onClick={onRetry}>
+                Retry
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
         {/* Hidden cards are intentionally excluded from sort targets until revealed. */}
         <SortableContext
-          items={visibleIssues.map((i) => i.id)}
+          items={sortableIds}
           strategy={verticalListSortingStrategy}
         >
           {visibleIssues.map((issue) => (
             <KanbanCard
               key={issue.id}
               issue={issue}
-              agents={agents}
+              assigneeAgent={issue.assigneeAgentId ? agentById.get(issue.assigneeAgentId) : undefined}
               isLive={liveIssueIds?.has(issue.id)}
               subtreeLiveCount={subtreeLiveCounts?.get(issue.id) ?? 0}
               compact={compactCards}
@@ -252,12 +316,12 @@ function KanbanColumn({
           <button
             type="button"
             className="mt-1 flex w-full items-center justify-center rounded-md border border-dashed border-border bg-background/70 px-2 py-2 text-xs font-medium text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
-            onClick={onShowMore}
+            onClick={() => onShowMore(status)}
           >
             Show {nextRevealCount} more
           </button>
         ) : null}
-        {issues.length > 0 && (hiddenCount > 0 || issues.length >= visibleCount) ? (
+        {state === "ready" && issues.length > 0 && (hiddenCount > 0 || issues.length >= visibleCount) ? (
           <p className="px-1 pt-1 text-(length:--text-micro) text-muted-foreground">
             Showing {visibleIssues.length} of {issues.length}
           </p>
@@ -265,13 +329,14 @@ function KanbanColumn({
       </div>
     </div>
   );
-}
+});
 
 /* ── Draggable Card ── */
 
-function KanbanCard({
+// Memoized: a live update re-renders only the cards whose issue changed.
+const KanbanCard = memo(function KanbanCard({
   issue,
-  agents,
+  assigneeAgent,
   isLive,
   subtreeLiveCount = 0,
   isOverlay,
@@ -279,7 +344,7 @@ function KanbanCard({
   className,
 }: {
   issue: Issue;
-  agents?: Agent[];
+  assigneeAgent?: Agent;
   isLive?: boolean;
   subtreeLiveCount?: number;
   isOverlay?: boolean;
@@ -298,11 +363,6 @@ function KanbanCard({
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
-  };
-
-  const agentName = (id: string | null) => {
-    if (!id || !agents) return null;
-    return agents.find((a) => a.id === id)?.name ?? null;
   };
 
   return (
@@ -365,20 +425,33 @@ function KanbanCard({
         <div className="flex items-center gap-2 min-w-0">
           {/* PAP-411: priority UI hidden behind SHOW_TASK_PRIORITY_UI. */}
           {SHOW_TASK_PRIORITY_UI && <PriorityIcon priority={issue.priority} />}
-          {issue.assigneeAgentId && (() => {
-            const name = agentName(issue.assigneeAgentId);
-            return name ? (
-              <AgentIdentity agent={agents?.find((agent) => agent.id === issue.assigneeAgentId) ?? { id: issue.assigneeAgentId, name }} size="xs" />
-            ) : (
-              <span className="text-xs text-muted-foreground font-mono">
-                {issue.assigneeAgentId.slice(0, 8)}
-              </span>
-            );
-          })()}
+          {issue.assigneeAgentId && (assigneeAgent?.name ? (
+            <AgentIdentity agent={assigneeAgent} size="xs" />
+          ) : (
+            <span className="text-xs text-muted-foreground font-mono">
+              {issue.assigneeAgentId.slice(0, 8)}
+            </span>
+          ))}
         </div>
       </Link>
     </Card>
   );
+});
+
+const NO_STATUSES: readonly IssueStatus[] = [];
+
+// Module-level so dnd-kit keeps one sensor (and one drag context) across
+// renders instead of rebuilding them, which would re-render every card.
+const POINTER_SENSOR_OPTIONS = { activationConstraint: { distance: 5 } };
+
+function resolveColumnState(
+  status: IssueStatus,
+  loadingStatuses: readonly IssueStatus[],
+  failedStatuses: readonly IssueStatus[],
+): KanbanColumnState {
+  if (failedStatuses.includes(status)) return "failed";
+  if (loadingStatuses.includes(status)) return "loading";
+  return "ready";
 }
 
 /* ── Main Board ── */
@@ -391,6 +464,9 @@ export function KanbanBoard({
   collapsedStatuses = [],
   initialVisibleCount = KANBAN_COLUMN_INITIAL_VISIBLE_LIMIT,
   revealIncrement = KANBAN_COLUMN_REVEAL_INCREMENT,
+  loadingStatuses = NO_STATUSES,
+  failedStatuses = NO_STATUSES,
+  onRetryFailedColumns,
   onUpdateIssue,
 }: KanbanBoardProps) {
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -403,7 +479,7 @@ export function KanbanBoard({
   const collapsedStatusSet = useMemo(() => new Set(collapsedStatuses), [collapsedStatuses]);
 
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+    useSensor(PointerSensor, POINTER_SENSOR_OPTIONS)
   );
 
   const columnIssues = useMemo(() => {
@@ -428,6 +504,24 @@ export function KanbanBoard({
     () => collectSubtreeLiveCounts(issues, liveIssueIds ?? new Set<string>()),
     [issues, liveIssueIds],
   );
+
+  const agentById = useMemo(
+    () => new Map((agents ?? []).map((agent) => [agent.id, agent])),
+    [agents],
+  );
+
+  const showMore = useCallback((status: IssueStatus) => {
+    setVisibleState((current) => {
+      const counts = current.paginationKey === paginationKey ? current.counts : {};
+      return {
+        paginationKey,
+        counts: {
+          ...counts,
+          [status]: (counts[status] ?? initialVisibleCount) + revealIncrement,
+        },
+      };
+    });
+  }, [initialVisibleCount, paginationKey, revealIncrement]);
 
   function handleDragStart(event: DragStartEvent) {
     setActiveId(event.active.id as string);
@@ -463,39 +557,39 @@ export function KanbanBoard({
       onDragEnd={handleDragEnd}
     >
       <div className="flex gap-3 overflow-x-auto pb-4 -mx-2 px-2">
-        {boardStatuses.map((status) => (
-          <KanbanColumn
-            key={status}
-            status={status}
-            issues={columnIssues[status] ?? []}
-            agents={agents}
-            liveIssueIds={liveIssueIds}
-            subtreeLiveCounts={subtreeLiveCounts}
-            compactCards={compactCards}
-            // Compact mode (any lane explicitly collapsed) also collapses
-            // empty lanes to the same labeled rail, so an empty In Progress
-            // reads like the other rails instead of a lone expanded column.
-            collapsed={collapsedStatusSet.has(status) || (collapsedStatusSet.size > 0 && columnIssues[status].length === 0)}
-            visibleCount={visibleCountByStatus[status] ?? initialVisibleCount}
-            revealIncrement={revealIncrement}
-            onShowMore={() => {
-              setVisibleState((current) => {
-                const counts = current.paginationKey === paginationKey ? current.counts : {};
-                return {
-                  paginationKey,
-                  counts: {
-                    ...counts,
-                    [status]: (counts[status] ?? initialVisibleCount) + revealIncrement,
-                  },
-                };
-              });
-            }}
-          />
-        ))}
+        {boardStatuses.map((status) => {
+          const state = resolveColumnState(status, loadingStatuses, failedStatuses);
+          return (
+            <KanbanColumn
+              key={status}
+              status={status}
+              state={state}
+              issues={columnIssues[status] ?? []}
+              agentById={agentById}
+              liveIssueIds={liveIssueIds}
+              subtreeLiveCounts={subtreeLiveCounts}
+              compactCards={compactCards}
+              // Compact mode (any lane explicitly collapsed) also collapses
+              // empty lanes to the same labeled rail, so an empty In Progress
+              // reads like the other rails instead of a lone expanded column.
+              // A lane that is still loading or failed is not known to be empty.
+              collapsed={collapsedStatusSet.has(status) || (collapsedStatusSet.size > 0 && state === "ready" && columnIssues[status].length === 0)}
+              visibleCount={visibleCountByStatus[status] ?? initialVisibleCount}
+              revealIncrement={revealIncrement}
+              onShowMore={showMore}
+              onRetry={onRetryFailedColumns}
+            />
+          );
+        })}
       </div>
       <DragOverlay>
         {activeIssue ? (
-          <KanbanCard issue={activeIssue} agents={agents} isOverlay compact={compactCards} />
+          <KanbanCard
+            issue={activeIssue}
+            assigneeAgent={activeIssue.assigneeAgentId ? agentById.get(activeIssue.assigneeAgentId) : undefined}
+            isOverlay
+            compact={compactCards}
+          />
         ) : null}
       </DragOverlay>
     </DndContext>

@@ -413,10 +413,15 @@ export function registerWriteIdentity(
   }
 
   /**
-   * An `--admin` merge goes ahead only for the head SHA the caller expects and
-   * only when every required check on it concluded `success` (read with the
-   * App's read-only token). Without required checks, every reported check must
-   * have concluded successfully.
+   * An `--admin` merge goes ahead only for the head SHA the caller expects,
+   * only on a base branch whose classic protection binds administrators and
+   * requires at least one check, and only when every required check on that
+   * head concluded `success` (read with the App's read-only token). GitHub's
+   * branch read never includes `enforce_admins` (that needs the Administration
+   * permission); it reports administrators as bound by
+   * `required_status_checks.enforcement_level: "everyone"`. When administrators
+   * are not bound, `--admin` skips every rule of the branch; without a required
+   * check, nothing bounds what is merged.
    */
   async function adminMergeEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, pullRequest: number | null | undefined, expectedHeadSha: string | null | undefined) {
     expectedHeadSha = expectedHeadSha?.toLowerCase() ?? null;
@@ -433,6 +438,24 @@ export function registerWriteIdentity(
       throw new Denied(`Pull request #${pullRequest} head is ${headSha.slice(0, 12)}, not the expected ${expectedHeadSha.slice(0, 12)}.`, evidence);
     }
     const base = encodeURIComponent(String(pr.base.ref));
+    const elsewhere = "Merge it without --admin (gh pr merge) or in the GitHub web UI";
+    // Only classic protection that binds administrators holds --admin to its rules: ruleset bypass actors are hidden from the read-only token.
+    let branch: any;
+    try { branch = (await github.request<any>(`/repos/${repository}/branches/${base}`, token)).data; } catch {
+      throw new Denied("Paperclip cannot read the base branch protection, so it cannot tell whether --admin would bypass it; an admin merge is refused.", evidence);
+    }
+    const protection = branch?.protection;
+    // enforcement_level "everyone" is how the branch read reports enforce_admins. An explicit level decides; enforce_admins counts
+    // only when the level is absent, and enforce_admins reported off always refuses: contradictory data fails closed.
+    const level = protection?.required_status_checks?.enforcement_level, enforceAdmins = protection?.enforce_admins?.enabled;
+    evidence.enforcementLevel = typeof level === "string" ? level : null;
+    if (typeof enforceAdmins === "boolean") evidence.enforceAdmins = enforceAdmins;
+    const bound = typeof level === "string" ? level === "everyone" : enforceAdmins === true;
+    if (protection?.enabled !== true || enforceAdmins === false || !bound) {
+      const state = [`branch protection ${protection?.enabled === true ? "on" : "off"}`, `enforcement_level ${evidence.enforcementLevel ?? "not reported"}`,
+        ...(typeof enforceAdmins === "boolean" ? [`enforce_admins ${enforceAdmins ? "on" : "off"}`] : [])].join(", ");
+      throw new Denied(`The base branch lets administrators bypass its protection (${state}; Paperclip needs enforcement_level "everyone"), so --admin would skip its rules; an admin merge is refused. ${elsewhere}, or turn on "Do not allow bypassing the above settings" for the base branch.`, evidence);
+    }
     // Every page of rules, check runs and statuses is read, or the merge is refused.
     const pages = async <T>(read: (page: number) => Promise<{ items: T[]; next: boolean }>, what: string) => {
       try { return await allPages(read, what); } catch (error) {
@@ -445,8 +468,7 @@ export function registerWriteIdentity(
       const response = await github.request<any[]>(`/repos/${repository}/rules/branches/${base}?per_page=100&page=${page}`, token);
       return { items: Array.isArray(response.data) ? response.data : [], next: response.next };
     }, "branch rules");
-    const { data: branch } = await github.request<any>(`/repos/${repository}/branches/${base}`, token);
-    const classic = branch?.protection?.required_status_checks ?? {};
+    const classic = protection?.required_status_checks ?? {};
     const required = [
       ...(Array.isArray(rules) ? rules : []).filter(rule => rule?.type === "required_status_checks")
         .flatMap(rule => (rule.parameters?.required_status_checks ?? []) as Array<{ context?: unknown; integration_id?: unknown }>)
@@ -455,6 +477,9 @@ export function registerWriteIdentity(
       ...((classic.contexts ?? []) as unknown[]).map(context => ({ context, integrationId: null })),
     ].filter(check => typeof check.context === "string")
       .map(check => ({ context: String(check.context), integrationId: Number.isSafeInteger(check.integrationId) && Number(check.integrationId) > 0 ? Number(check.integrationId) : null }));
+    evidence.requiredChecks = [...new Set(required.map(check => check.context))];
+    // Reported checks are whatever happened to run on the head (a slow check may not have started), so they never stand in for required ones.
+    if (!required.length) throw new Denied(`The base branch requires no status check, so nothing bounds an admin merge; an admin merge is refused. ${elsewhere}, or require a status check on the base branch.`, { ...evidence, failing: [] });
     const all = await pages(async page => {
       const response = await github.request<{ check_runs?: any[] }>(`/repos/${repository}/commits/${headSha}/check-runs?per_page=100&page=${page}`, token);
       return { items: (response.data.check_runs ?? []).map(run => ({ id: Number(run.id) || 0, name: String(run.name), status: String(run.status), conclusion: run.conclusion ?? null, appId: Number.isSafeInteger(run.app?.id) ? Number(run.app.id) : null })), next: response.next };
@@ -472,13 +497,10 @@ export function registerWriteIdentity(
     }, "commit statuses")).map(status => ({ context: String(status.context), state: String(status.state) }));
     const checks = [...runs.map(run => ({ name: run.name, result: run.status === "completed" ? run.conclusion ?? "none" : run.status })),
       ...statuses.map(status => ({ name: status.context, result: status.state }))];
-    evidence.requiredChecks = [...new Set(required.map(check => check.context))];
     evidence.checks = checks;
     if (!checks.length) throw new Denied(`No check has reported on ${headSha.slice(0, 12)}; an admin merge needs green checks.`, { ...evidence, failing: [] });
-    const failing = required.length
-      ? required.filter(check => !runs.some(run => run.name === check.context && run.status === "completed" && run.conclusion === "success" && (check.integrationId === null || run.appId === check.integrationId))
-        && !(check.integrationId === null && statuses.some(status => status.context === check.context && status.state === "success"))).map(check => check.context)
-      : checks.filter(check => !["success", "neutral", "skipped"].includes(check.result)).map(check => check.name);
+    const failing = required.filter(check => !runs.some(run => run.name === check.context && run.status === "completed" && run.conclusion === "success" && (check.integrationId === null || run.appId === check.integrationId))
+      && !(check.integrationId === null && statuses.some(status => status.context === check.context && status.state === "success"))).map(check => check.context);
     if (failing.length) throw new Denied(`Required checks have not all succeeded on ${headSha.slice(0, 12)}: ${[...new Set(failing)].join(", ")}.`, { ...evidence, failing: [...new Set(failing)] });
     return evidence;
   }

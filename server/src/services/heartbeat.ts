@@ -63,7 +63,7 @@ import { buildExecutionContinuation, StaleExecutionContinuationError } from "./e
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
-import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, classifyWorkspaceRestoreFailure, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
   assertDurableChatWakeupReceipt,
@@ -878,6 +878,10 @@ export {
 };
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
+// A workspace restore or agent directory lock that no queue progress released
+// in time. Contention clears on its own, so the run is retried under the
+// bounded transient budget instead of ending as a plain `adapter_failed`.
+const WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE = "workspace_restore_lock_timeout";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
@@ -15765,6 +15769,7 @@ export function heartbeatService(
 
     const requiresIssueGate =
       isTransientSetupFailureCode(run.errorCode) ||
+      run.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE ||
       hasConversationContinuationPolicy(run.resultJson) ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -26496,12 +26501,15 @@ export function heartbeatService(
               : null;
           })
           .catch(() => null);
+        const restoreLockTimeoutFailure =
+          classifyWorkspaceRestoreFailure(err) === "restore_lock_timeout";
         const failureErrorCode =
           workspaceValidationFailure?.code ??
           configurationIncompleteFailure?.code ??
           nonRetryablePreflightFailureCode(err) ??
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
+          (restoreLockTimeoutFailure ? WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE : null) ??
           "adapter_failed";
         logger.error({ err, runId }, "heartbeat execution failed");
 
@@ -26546,6 +26554,9 @@ export function heartbeatService(
               ...(workspaceValidationFailure?.resultJson ??
                 configurationIncompleteFailure?.resultJson ??
                 {}),
+              ...(failureErrorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE
+                ? { workspaceRestoreFailure: "restore_lock_timeout" }
+                : {}),
               ...(!legacyAdapterEntered && run.runtimeMode !== "native"
                 ? {
                     executionRecovery: {
@@ -26615,10 +26626,21 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
-          await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-            livenessRun,
-            agent,
-          );
+          if (livenessRun.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE) {
+            // Only this branch tolerates a scheduling error; the other keeps
+            // propagating it as it always did.
+            await scheduleBoundedRetryForRun(livenessRun, agent).catch((retryError) => {
+              logger.warn(
+                { err: retryError, runId: livenessRun.id },
+                "failed to schedule a retry after a workspace restore lock timeout",
+              );
+            });
+          } else {
+            await scheduleInteractionContinuationInfrastructureRetryIfEligible(
+              livenessRun,
+              agent,
+            );
+          }
           await releaseIssueExecutionAndPromote(livenessRun, {
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a

@@ -490,6 +490,9 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "claude_transient_upstream",
   "provider_quota",
   "timeout",
+  // A restore or agent directory lock timeout is contention that clears itself,
+  // so it keeps the continuation recovery `adapter_failed` already received.
+  "workspace_restore_lock_timeout",
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([

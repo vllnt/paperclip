@@ -157,6 +157,73 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     });
   });
 
+  it("collapses a burst of issue activity into one immediate and one trailing issue-list refresh", () => {
+    vi.useFakeTimers();
+    try {
+      const invalidations: unknown[] = [];
+      const queryClient = {
+        invalidateQueries: (input: unknown) => {
+          invalidations.push(input);
+        },
+        getQueryData: () => undefined,
+      };
+      const listRefreshes = () =>
+        invalidations.filter((input) =>
+          JSON.stringify(input) === JSON.stringify({ queryKey: queryKeys.issues.list("company-1") })).length;
+      const emit = (entityId: string) =>
+        __liveUpdatesTestUtils.invalidateActivityQueries(
+          queryClient as never,
+          "company-1",
+          { entityType: "issue", entityId, action: "issue.updated", details: null },
+          { userId: null, agentId: null },
+        );
+
+      emit("issue-1");
+      expect(listRefreshes()).toBe(1);
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.listMineByMe("company-1") });
+
+      // Agents keep working: many more events inside the window.
+      for (let index = 2; index <= 10; index += 1) {
+        vi.advanceTimersByTime(200);
+        emit(`issue-${index}`);
+      }
+      expect(listRefreshes()).toBe(1);
+      // Per-issue detail queries still refresh on every event.
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.detail("issue-10") });
+
+      vi.advanceTimersByTime(1_200);
+      expect(listRefreshes()).toBe(2);
+      // Activity keeps going in the next window: one more refresh at its end.
+      emit("issue-11");
+      vi.advanceTimersByTime(3_000);
+      expect(listRefreshes()).toBe(3);
+
+      // Once the activity stops, no further refreshes are scheduled.
+      vi.advanceTimersByTime(10_000);
+      expect(listRefreshes()).toBe(3);
+
+      // A later lone event refreshes immediately, then once more after the
+      // server's short list cache has expired, and then stops.
+      emit("issue-12");
+      expect(listRefreshes()).toBe(4);
+      vi.advanceTimersByTime(3_000);
+      expect(listRefreshes()).toBe(5);
+      vi.advanceTimersByTime(10_000);
+      expect(listRefreshes()).toBe(5);
+
+      // Another company is not held back by this company's window.
+      __liveUpdatesTestUtils.invalidateActivityQueries(
+        queryClient as never,
+        "company-2",
+        { entityType: "issue", entityId: "issue-x", action: "issue.updated", details: null },
+        { userId: null, agentId: null },
+      );
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.list("company-2") });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("still refreshes comments when a comment activity event arrives", () => {
     const invalidations: unknown[] = [];
     const queryClient = {
