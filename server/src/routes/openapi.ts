@@ -4866,7 +4866,30 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createGoalSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/goals/focus",
+  tags: ["goals"],
+  summary: "Get the company's current focus",
+  description:
+    "Active short-horizon goals, nearest target date first, with progress and open milestones. Agents read this to choose what to " +
+    "work on; it also appears as `companyFocus` in an issue's heartbeat context.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/goals/progress",
+  tags: ["goals"],
+  summary: "Get progress for every goal in a company",
+  description:
+    "Keyed by goal ID. Counts tasks linked to the goal or any goal below it; cancelled, hidden and conversation tasks do not count.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -4887,7 +4910,7 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(updateGoalSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 422: r.unprocessable },
 });
 
 registry.registerPath({

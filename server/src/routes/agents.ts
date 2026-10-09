@@ -1,3 +1,4 @@
+import { orderByFocus, readFocusIndex } from "../services/goal-focus.js";
 import { validateAiGatewayKey } from "../services/ai-gateway.js";
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { connectionIntentService } from "../services/connection-intents.js";
@@ -4249,7 +4250,7 @@ export function agentRoutes(
     ]);
 
     res.json(
-      eligibleRows.map((issue) => ({
+      orderByFocus(eligibleRows.map((issue) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
@@ -4264,7 +4265,7 @@ export function agentRoutes(
         dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
         unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
         unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
-      })),
+      })), await readFocusIndex(db, req.actor.companyId)),
     );
   });
 

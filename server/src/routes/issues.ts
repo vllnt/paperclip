@@ -1,3 +1,4 @@
+import { readCompanyFocusForIssue } from "../services/goal-focus.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -8545,6 +8546,7 @@ export function issueRoutes(
       continuationSummary,
       currentExecutionWorkspace,
       activeRecoveryAction,
+      companyFocus,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -8565,6 +8567,7 @@ export function issueRoutes(
       ),
       currentExecutionWorkspacePromise,
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      readCompanyFocusForIssue(db, issue.companyId, issue.goalId),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -8657,8 +8660,13 @@ export function issueRoutes(
             status: goal.status,
             level: goal.level,
             parentId: goal.parentId,
+            kind: goal.kind,
+            horizon: goal.horizon,
+            targetDate: goal.targetDate,
+            successCriteria: goal.successCriteria,
           }
         : null,
+      companyFocus,
       commentCursor,
       wakeComment: safeWakeComment,
       attachments: attachments.map((a) => ({
