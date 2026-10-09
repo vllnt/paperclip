@@ -267,6 +267,7 @@ import {
   readNativeWorkspaceSyncReference,
   recordNativeFinalizationFailure,
   type NativeRestartRecoveryClaim,
+  type NativeRuntimeResolution,
   rebindNativeSessionCheckpoint,
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
@@ -2118,14 +2119,14 @@ export function computeProviderQuotaRetrySchedule(input: {
  */
 export function isProviderQuotaUsefulActionCandidate(input: {
   outcome: string;
-  native: boolean;
+  runtimeKind: NativeRuntimeResolution["kind"];
   outputTokens: number;
   errorCode: string | null;
   resultJson: Record<string, unknown> | null;
 }) {
   return (
     input.outcome === "failed" &&
-    !input.native &&
+    input.runtimeKind !== "native" &&
     input.outputTokens === 0 &&
     readHeartbeatRunErrorFamily({
       errorCode: input.errorCode,
@@ -18751,7 +18752,8 @@ export function heartbeatService(
    */
   async function withProviderQuotaUsefulActionMarker(input: {
     run: typeof heartbeatRuns.$inferSelect;
-    native: boolean;
+    // Typed from the resolution so the stale string run.runtimeMode cannot be passed.
+    runtimeKind: NativeRuntimeResolution["kind"];
     outcome: string;
     errorCode: string | null;
     outputTokens: number;
@@ -25990,7 +25992,7 @@ export function heartbeatService(
         const persistedResultJson = await withProviderQuotaUsefulActionMarker({
           run,
           // The in-memory run predates native selection; use the resolution.
-          native: nativeRuntimeResolution.kind === "native",
+          runtimeKind: nativeRuntimeResolution.kind,
           outcome,
           errorCode: runErrorCode,
           outputTokens: normalizedUsage?.outputTokens ?? 0,

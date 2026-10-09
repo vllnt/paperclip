@@ -81,7 +81,7 @@ describe("computeProviderQuotaRetrySchedule", () => {
 
 describe("isProviderQuotaUsefulActionCandidate", () => {
   const base = {
-    outcome: "failed", native: false, outputTokens: 0,
+    outcome: "failed", runtimeKind: "legacy" as const, outputTokens: 0,
     errorCode: "provider_quota", resultJson: { errorFamily: "provider_quota" },
   };
 
@@ -90,7 +90,7 @@ describe("isProviderQuotaUsefulActionCandidate", () => {
   });
 
   it.each([
-    ["a native run", { native: true }],
+    ["a native run", { runtimeKind: "native" as const }],
     ["model output", { outputTokens: 1 }],
     ["a timed-out run", { outcome: "timed_out" }],
     ["another failure family", { errorCode: "codex_transient_upstream", resultJson: { errorFamily: "transient_upstream" } }],
