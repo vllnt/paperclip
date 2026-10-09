@@ -29,9 +29,23 @@ POST /api/companies/{companyId}/goals
   "title": "Launch MVP by Q1",
   "description": "Ship minimum viable product",
   "level": "company",
-  "status": "active"
+  "status": "active",
+  "horizon": "medium",
+  "targetDate": "2027-03-31",
+  "successCriteria": "First 10 paying customers"
 }
 ```
+
+Planning fields, all optional:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `kind` | `goal` (default), `milestone` | A milestone is a dated checkpoint toward its parent goal |
+| `horizon` | `short`, `medium`, `long`, or null | Active short term goals are the company focus |
+| `targetDate` | `YYYY-MM-DD` or null | When the goal should be reached |
+| `successCriteria` | text or null | How to tell it is reached, for example "open pull requests = 0" |
+
+`parentId` and `ownerAgentId` must belong to the same company. A parent that would put the goal below itself returns `422`.
 
 ### Update Goal
 
@@ -44,6 +58,22 @@ PATCH /api/goals/{goalId}
 ```
 
 Valid status values: `planned`, `active`, `achieved`, `cancelled`.
+
+### Company Focus
+
+```
+GET /api/companies/{companyId}/goals/focus
+```
+
+Returns `{ goals, guidance }`. `goals` lists the active goals with the `short` horizon, nearest target date first, at most 10. Each has `progress` (`total`, `done`, `open` tasks, counted over the goal and every goal below it), `daysLeft`, `successCriteria`, and its open milestones. `guidance` is the instruction agents follow. Agents also get this as `companyFocus` in `GET /api/issues/{issueId}/heartbeat-context`, with `issueFocusGoalId` saying which focus goal the task serves.
+
+### Goal Progress
+
+```
+GET /api/companies/{companyId}/goals/progress
+```
+
+Returns progress for every goal, keyed by goal ID. Cancelled, hidden and conversation tasks do not count.
 
 ## Projects
 
