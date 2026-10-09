@@ -2,8 +2,9 @@
 name: para-memory-files
 description: >
   Use a file-based PARA memory system to store, retrieve, and organize durable
-  knowledge across sessions. Trigger on saving facts, daily notes, entity
-  records, weekly synthesis, recall, tacit user patterns, or plan memory.
+  knowledge across sessions. Use when saving facts, daily notes, or entity
+  records, recalling past context, running weekly synthesis, or recording
+  tacit user patterns.
 ---
 
 # PARA Memory Files
@@ -77,7 +78,7 @@ Memory does not survive session restarts. Files do.
 
 - Want to remember something -> WRITE IT TO A FILE.
 - "Remember this" -> update `$AGENT_HOME/memory/YYYY-MM-DD.md` or the relevant entity file.
-- Learn a lesson -> update AGENTS.md, TOOLS.md, or the relevant skill file.
+- Learn a lesson -> update AGENTS.md (or TOOLS.md, if this agent has one) or the relevant skill file. New agents are created with AGENTS.md only.
 - Make a mistake -> document it so future-you does not repeat it.
 - On-disk text files are always better than holding it in temporary context.
 
@@ -97,4 +98,4 @@ Vectors + BM25 + reranking finds things even when the wording differs.
 
 ## Planning
 
-Keep plans in timestamped files in `plans/` at the project root (outside personal memory so other agents can access them). Use `qmd` to search plans. Plans go stale -- if a newer plan exists, do not confuse yourself with an older version. If you notice staleness, update the file to note what it is supersededBy.
+A plan for a Paperclip issue is that issue's `plan` document (see the `paperclip` skill), not a memory file, so the assignee, reviewers, and other agents read the same revision. Outside an issue, keep a plan in a timestamped file in `plans/` at the project root (outside personal memory so other agents can access it) and search it with `qmd`. Plans go stale: if a newer plan exists, do not work from the older one, and if you notice staleness, update the old file to note what it is supersededBy.
