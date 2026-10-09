@@ -30,6 +30,10 @@ export class FakeConvex {
   failDeleteFor = new Set<string>();
   /** Deletes the deployment, then answers 502, as a proxy that drops the response could. */
   dropDeleteResponseFor = new Set<string>();
+  /** Answers 200 to a delete but keeps the deployment, as a backend that only queued the deletion could. */
+  keepAfterDelete = new Set<string>();
+  /** Project list requests for these deployment types answer 403 (a token that may not list them). */
+  listDenied = new Set<string>();
   /** GET answers with this name instead of the requested one. */
   answerAs = new Map<string, string>();
 
@@ -74,11 +78,13 @@ export class FakeConvex {
       const name = decodeURIComponent(match[1]);
       if (this.failDeleteFor.has(name)) return fail(500, "InternalError");
       if (this.dropDeleteResponseFor.has(name)) { this.deployments.delete(name); return fail(502, "BadGateway"); }
+      if (this.keepAfterDelete.has(name)) return bare(200);
       return this.deployments.delete(name) ? bare(200) : fail(404, "DeploymentNotFound");
     }
     match = /^\/projects\/([^/]+)\/list_deployments$/.exec(v1);
     if (match) {
       const type = parsed.searchParams.get("deploymentType");
+      if (type && this.listDenied.has(type)) return fail(403, "Forbidden");
       return json(200, [...this.deployments.values()].filter(item => String(item.projectId) === match![1] && (!type || item.deploymentType === type)));
     }
     match = /^\/teams\/([^/]+)\/list_deployments$/.exec(v1);

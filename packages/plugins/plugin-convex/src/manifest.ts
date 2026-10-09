@@ -59,6 +59,14 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "object", additionalProperties: false, properties: {
           enabled: { type: "boolean" }, ttlHours: { type: "integer", minimum: 3, maximum: 168 },
           quota: { type: "integer", minimum: 1 }, alertPercent: { type: "integer", minimum: 1, maximum: 100 },
+          dev: {
+            type: "object", additionalProperties: false, properties: {
+              enabled: { type: "boolean" }, maxAgeDays: { type: "integer", minimum: 1, maximum: 90 }, maxDeletes: { type: "integer", minimum: 1, maximum: 100 },
+              protect: { type: "array", items: { type: "string", maxLength: 200 }, maxItems: 100 }, onlyPatterns: { type: "array", items: { type: "string", maxLength: 200 }, maxItems: 100 },
+            },
+          },
+          pullRequestPattern: { type: "string", maxLength: 200 },
+          supersededMinAgeMinutes: { type: "integer", minimum: 15, maximum: 1440 },
         },
       },
     },

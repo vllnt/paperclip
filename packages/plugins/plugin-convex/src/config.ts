@@ -1,3 +1,4 @@
+import { compilePattern } from "./ci-previews.js";
 import {
   CAPABILITIES, ENVIRONMENT_CLASSES, PRESETS, PRODUCTION_WRITE_CAPABILITIES,
   type Capability, type ConnectionConfig, type EnvironmentClass, type Grant, type ProjectMapping, type SecretRef,
@@ -91,6 +92,20 @@ function grant(raw: unknown, index: number): Grant {
   return { agentId, role, environments, capabilities: [...capabilities], approval };
 }
 
+function patterns(value: unknown, path: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 100 || value.some(item => typeof item !== "string" || !item.trim() || item.length > 200)) {
+    throw new ConfigError(`${path} must be a list of at most 100 reference patterns (exact names, or a prefix ending in *).`);
+  }
+  return [...new Set((value as string[]).map(item => item.trim()))];
+}
+function prPattern(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.length > 200 || !value.includes("(?<pr>")) throw new ConfigError('reaper.pullRequestPattern must be a regular expression of at most 200 characters with a named group (?<pr>...).');
+  try { compilePattern(value); } catch { throw new ConfigError("reaper.pullRequestPattern is not a valid regular expression."); }
+  return value;
+}
+
 /** Parses the company config strictly. Anything unexpected throws, so a typo can never widen access. */
 export function parseConfig(raw: Record<string, unknown> | null | undefined): ConnectionConfig {
   const source = raw ?? {};
@@ -104,6 +119,7 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Co
   if (!Array.isArray(grants) || grants.length > 200) throw new ConfigError("grants must be a list of at most 200 entries.");
   const guards = isRecord(source.guards) ? source.guards : {};
   const reaper = isRecord(source.reaper) ? source.reaper : {};
+  const dev = isRecord(reaper.dev) ? reaper.dev : {};
   return {
     teamId: source.teamId === undefined || source.teamId === null ? null : id(source.teamId, "teamId"),
     teamToken: secretRef(source.teamToken, "teamToken"),
@@ -121,6 +137,15 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Co
       ttlHours: bounded(reaper.ttlHours, "reaper.ttlHours", 36, 3, 168),
       quota: bounded(reaper.quota, "reaper.quota", 300, 1, 100_000),
       alertPercent: bounded(reaper.alertPercent, "reaper.alertPercent", 80, 1, 100),
+      dev: {
+        enabled: flag(dev.enabled, "reaper.dev.enabled", false),
+        maxAgeDays: bounded(dev.maxAgeDays, "reaper.dev.maxAgeDays", 7, 1, 90),
+        protect: patterns(dev.protect, "reaper.dev.protect"),
+        onlyPatterns: patterns(dev.onlyPatterns, "reaper.dev.onlyPatterns"),
+        maxDeletes: bounded(dev.maxDeletes, "reaper.dev.maxDeletes", 20, 1, 100),
+      },
+      pullRequestPattern: prPattern(reaper.pullRequestPattern),
+      supersededMinAgeMinutes: bounded(reaper.supersededMinAgeMinutes, "reaper.supersededMinAgeMinutes", 60, 15, 1440),
     },
   };
 }
