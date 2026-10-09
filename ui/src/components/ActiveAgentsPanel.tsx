@@ -1,11 +1,12 @@
 import { AgentIdentity } from "@/components/AgentIdentity";
-import { memo, useMemo } from "react";
+import { memo, useEffect, useMemo } from "react";
 import { Link } from "@/lib/router";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import type { Issue } from "@paperclipai/shared";
 import { heartbeatsApi, type LiveRunForIssue } from "../api/heartbeats";
 import type { TranscriptEntry } from "../adapters";
 import { issuesApi } from "../api/issues";
+import { readLiveRunCardCount, writeLiveRunCardCount } from "../lib/live-run-card-count";
 import { queryKeys } from "../lib/queryKeys";
 import { cn, relativeTime } from "../lib/utils";
 import { Clock3 } from "lucide-react";
@@ -32,6 +33,54 @@ const runStatusLabels: Record<string, string> = {
   cancelled: "Cancelled",
   interrupted: "Interrupted",
 };
+
+const RUN_GRID_CLASSES = "grid grid-cols-1 items-start gap-2 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4";
+
+// With no recorded count, reserve one row of the grid above: 1 card on a phone,
+// 2 from `sm`, 4 from `xl`. That never reserves more than a company with a
+// single run will fill, and a company with more runs grows by whole rows only.
+const FIRST_ROW_CLASSES = ["", "hidden sm:block", "hidden xl:block", "hidden xl:block"];
+
+/**
+ * Stands in for the run cards while the runs load, sized like the content that
+ * replaces it so the page below does not move: the card count of the last
+ * finished load, or one row when that is unknown.
+ */
+function LiveRunsPlaceholder({
+  knownCardCount,
+  cardLimit,
+  showMoreLink,
+  gridClassName,
+  emptyMessage,
+}: {
+  knownCardCount: number | null;
+  cardLimit: number;
+  showMoreLink: boolean;
+  gridClassName?: string;
+  emptyMessage: string;
+}) {
+  if (knownCardCount === 0) {
+    return (
+      <div data-testid="active-agents-loading-empty" aria-busy="true" className="rounded-xl border border-border p-4">
+        <p aria-hidden="true" className="invisible text-sm">{emptyMessage}</p>
+      </div>
+    );
+  }
+  const count = Math.min(knownCardCount ?? DASHBOARD_RUN_CARD_LIMIT, cardLimit);
+  return (
+    <>
+      <div data-testid="active-agents-loading" aria-busy="true" className={cn(RUN_GRID_CLASSES, gridClassName)}>
+        {Array.from({ length: count }, (_, index) => (
+          <Skeleton
+            key={index}
+            className={cn("h-32 w-full", knownCardCount === null && FIRST_ROW_CLASSES[index])}
+          />
+        ))}
+      </div>
+      {showMoreLink ? <div data-testid="active-agents-loading-link" aria-hidden="true" className="mt-3 h-4" /> : null}
+    </>
+  );
+}
 
 interface ActiveAgentsPanelProps {
   companyId: string;
@@ -98,6 +147,11 @@ export function ActiveAgentsPanel({
   }, [dedupeLinkedTasks, runs]);
   const visibleRuns = useMemo(() => cardRuns.slice(0, cardLimit), [cardLimit, cardRuns]);
   const hiddenRunCount = Math.max(0, cardRuns.length - visibleRuns.length);
+  const knownCardCount = useMemo(() => readLiveRunCardCount(companyId, queryScope), [companyId, queryScope]);
+  const loadedCardCount = liveRuns === undefined ? null : visibleRuns.length;
+  useEffect(() => {
+    if (loadedCardCount !== null) writeLiveRunCardCount(companyId, queryScope, loadedCardCount);
+  }, [companyId, loadedCardCount, queryScope]);
   const visibleIssueIds = useMemo(
     () => [...new Set(visibleRuns.map((run) => run.issueId).filter((issueId): issueId is string => Boolean(issueId)))],
     [visibleRuns],
@@ -136,27 +190,19 @@ export function ActiveAgentsPanel({
         {title}
       </h3>
       {liveRunsPending ? (
-        // The server returns at least `minRunCount` runs, so a company with run
-        // history shows a full row of cards and the link under them. Reserving
-        // that space keeps the content below from jumping down when they arrive.
-        <>
-          <div
-            data-testid="active-agents-loading"
-            aria-busy="true"
-            className={cn("grid grid-cols-1 items-start gap-2 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4", gridClassName)}
-          >
-            {Array.from({ length: Math.min(cardLimit, DASHBOARD_RUN_CARD_LIMIT) }, (_, index) => (
-              <Skeleton key={index} className="h-32 w-full" />
-            ))}
-          </div>
-          {showMoreLink ? <div data-testid="active-agents-loading-link" aria-hidden="true" className="mt-3 h-4" /> : null}
-        </>
+        <LiveRunsPlaceholder
+          knownCardCount={knownCardCount}
+          cardLimit={cardLimit}
+          showMoreLink={showMoreLink}
+          gridClassName={gridClassName}
+          emptyMessage={emptyMessage}
+        />
       ) : runs.length === 0 ? (
         <div className="rounded-xl border border-border p-4">
           <p className="text-sm text-muted-foreground">{emptyMessage}</p>
         </div>
       ) : (
-        <div className={cn("grid grid-cols-1 items-start gap-2 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4", gridClassName)}>
+        <div className={cn(RUN_GRID_CLASSES, gridClassName)}>
           {visibleRuns.map((run) => (
             <AgentRunCard
               key={run.id}
