@@ -339,13 +339,16 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       const keepsManual = previous?.linkedBy === "manual" && !previous.suppressed && !explicit;
       const linkedBy: IssueGitLinkedBy = keepsManual ? "manual" : evidence ? evidence.linkedBy : previous?.linkedBy ?? "manual";
       const closes = keepsManual ? previous!.closes : evidence ? evidence.closes : previous?.closes ?? false;
-      const verified = unresolved
+      // A head branch in another repository (a fork) never drives status, however the pull
+      // request was linked: anyone can open a fork pull request with any branch name or text.
+      // A branch-name match alone proves nothing; only a person's or agent's own link is
+      // trusted while the head repository is unknown.
+      const headInRepository = signal.headRepository ? sameRepository(signal.headRepository, signal.repository) : null;
+      const verified = unresolved || headInRepository === false
         ? false
-        : linkedBy === "manual" || linkedBy === "workspace_branch" || adoptedByHand
+        : headInRepository === true || linkedBy === "manual" || adoptedByHand
           ? true
-          : signal.headRepository
-            ? sameRepository(signal.headRepository, signal.repository)
-            : previous?.verified ?? false;
+          : previous?.verified ?? false;
       const baseRef = signal.baseRef ?? stringField(asRecord(existing?.metadata), "baseRef");
       const baseIsDefault = signal.baseRef
         ? signal.defaultBranch
@@ -566,7 +569,7 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
 
     let effective = signal;
     const enrich = options.enrich;
-    const untrustedTarget = [...targets.values()].some((e) => !e || (e.linkedBy !== "manual" && e.linkedBy !== "workspace_branch"));
+    const untrustedTarget = [...targets.values()].some((e) => !e || e.linkedBy !== "manual");
     const draftUnknown = signal.draft === undefined && signal.state === "open";
     if (enrich && ((!signal.headRepository && untrustedTarget) || draftUnknown)) {
       try {
@@ -710,6 +713,8 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       url: `https://github.com/${repository}/pull/${input.number}`,
       headRef: details.headRef,
       baseRef: details.baseRef ?? null,
+      headRepository: details.headRepository ?? null,
+      defaultBranch: details.defaultBranch ?? null,
       state: state === "merged" || state === "closed" ? "closed" : "open",
       merged: state === "merged",
       draft: state === "draft" || details.draft === true,

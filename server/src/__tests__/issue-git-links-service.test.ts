@@ -245,9 +245,7 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
       expect(await db.select().from(issueWorkProducts)).toEqual([]);
     });
 
-    it("links through the branch of an agent's execution workspace even when the name has no identifier", async () => {
-      const company = await seedCompany();
-      const issueId = await seedIssue(company, 3);
+    async function seedWorkspace(company: { id: string }, issueId: string, branchName: string) {
       const projectId = randomUUID();
       await db.insert(projects).values({ id: projectId, companyId: company.id, name: "App" });
       await db.insert(executionWorkspaces).values({
@@ -257,17 +255,69 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
         mode: "isolated_workspace",
         strategyType: "git_worktree",
         name: "ws",
-        branchName: "odd/custom-branch",
+        branchName,
       });
+    }
+
+    it("links through the branch of an agent's execution workspace even when the name has no identifier", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 3);
+      await seedWorkspace(company, issueId, "odd/custom-branch");
 
       const result = await service().recordPullRequestSignal(
         company.id,
-        signal(company.prefix, { headRef: "odd/custom-branch", headRepository: null }),
+        signal(company.prefix, { headRef: "odd/custom-branch", headRepository: "acme/app" }),
       );
 
       expect(result.links[0]).toMatchObject({ issueId });
       const [product] = await productsFor(issueId);
       expect(product!.metadata).toMatchObject({ git: { linkedBy: "workspace_branch", verified: true, closes: true } });
+      expect((await issueRow(issueId)).status).toBe("in_review");
+    });
+
+    it("never lets a fork pull request that copies a workspace branch name move the task", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 3);
+      await seedWorkspace(company, issueId, "odd/custom-branch");
+      const svc = service();
+
+      const opened = await svc.recordPullRequestSignal(
+        company.id,
+        signal(company.prefix, { headRef: "odd/custom-branch", headRepository: "mallory/app" }),
+      );
+      const merged = await svc.recordPullRequestSignal(
+        company.id,
+        signal(company.prefix, { headRef: "odd/custom-branch", headRepository: "mallory/app", state: "closed", merged: true, updatedAt: "2026-10-09T12:00:00.000Z" }),
+      );
+
+      const [product] = await productsFor(issueId);
+      expect(product!.metadata).toMatchObject({ git: { linkedBy: "workspace_branch", verified: false } });
+      expect(opened.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect(merged.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect((await issueRow(issueId)).status).toBe("todo");
+    });
+
+    it("treats a workspace branch match as unverified until the head repository is known", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 3);
+      await seedWorkspace(company, issueId, "odd/custom-branch");
+      const lean = signal(company.prefix, { headRef: "odd/custom-branch", headRepository: null, source: "cloud_event" });
+
+      const unknown = await service().recordPullRequestSignal(company.id, lean);
+      expect(unknown.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+
+      const fork = await issueGitLinkService(db, {
+        statusAutomationEnabled: async () => true,
+        enrich: async () => ({ headRepository: "mallory/app", defaultBranch: "main" }),
+      }).recordPullRequestSignal(company.id, { ...lean, updatedAt: "2026-10-09T11:00:00.000Z" });
+      expect(fork.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect((await issueRow(issueId)).status).toBe("todo");
+
+      const same = await issueGitLinkService(db, {
+        statusAutomationEnabled: async () => true,
+        enrich: async () => ({ headRepository: "acme/app", defaultBranch: "main" }),
+      }).recordPullRequestSignal(company.id, { ...lean, updatedAt: "2026-10-09T12:00:00.000Z" });
+      expect(same.automation[0]).toMatchObject({ applied: { from: "todo", to: "in_review" } });
     });
 
     it("applies closing words, refs words and skip tokens from the title and body", async () => {
@@ -625,6 +675,22 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
 
       expect(result.links).toHaveLength(1);
       expect((await productsFor(issueId))[0]!.metadata).toMatchObject({ git: { verified: false } });
+      expect(result.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
+      expect((await issueRow(issueId)).status).toBe("todo");
+    });
+
+    it("links a fork pull request by hand but never lets it move the task", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 4);
+      const svc = issueGitLinkService(db, {
+        statusAutomationEnabled: async () => true,
+        resolvePullRequestDetails: resolved({ headRepository: "mallory/app", defaultBranch: "main" }),
+      });
+
+      const result = await svc.linkPullRequest(issueId, company.id, { repository: "acme/app", number: 7 }, "agent");
+
+      expect(result.links[0]).toMatchObject({ issueId, created: true });
+      expect((await productsFor(issueId))[0]!.metadata).toMatchObject({ git: { linkedBy: "manual", verified: false } });
       expect(result.automation[0]).toMatchObject({ applied: null, deferred: "unverified" });
       expect((await issueRow(issueId)).status).toBe("todo");
     });

@@ -7,9 +7,11 @@ import {
   connectionEventDeliveries,
   connectionGrants,
   createDb,
+  executionWorkspaces,
   externalObjects,
   issueWorkProducts,
   issues,
+  projects,
   toolApplications,
   toolConnections,
 } from "@paperclipai/db";
@@ -36,7 +38,9 @@ describeEmbeddedPostgres.sequential("GitHub connection events link pull requests
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(issueWorkProducts);
+    await db.delete(executionWorkspaces);
     await db.delete(issues);
+    await db.delete(projects);
     await db.delete(connectionEventDeliveries);
     await db.delete(externalObjects);
     await db.delete(connectionGrants);
@@ -138,6 +142,29 @@ describeEmbeddedPostgres.sequential("GitHub connection events link pull requests
     await githubConnectionEventService(db, { connector: connectorFor([merged]), gitLinks }).pollOnce();
     expect((await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId)))[0]).toMatchObject({ status: "merged" });
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("done");
+  });
+
+  it("never moves a task for a fork pull request that copies an agent workspace branch name", async () => {
+    const { companyId, grantId, prefix } = await seedCompany("GLG");
+    const issueId = await seedIssue(companyId, prefix, 12);
+    const projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "App" });
+    await db.insert(executionWorkspaces).values({
+      companyId, projectId, sourceIssueId: issueId, mode: "isolated_workspace", strategyType: "git_worktree",
+      name: "ws", branchName: "agent/retry-fix",
+    });
+    const forkEnrich = async () => ({ headRepository: "mallory/app", defaultBranch: "main", title: "Totally legit", draft: false });
+    const gitLinks = issueGitLinkService(db, { statusAutomationEnabled: async () => true, enrich: forkEnrich });
+    const opened = leasedEvent([`${grantId}_101`], { headRef: "agent/retry-fix" });
+    const merged = leasedEvent([`${grantId}_101`], { headRef: "agent/retry-fix", state: "closed", merged: true, updatedAt: "2026-10-09T11:00:00.000Z" }, "closed");
+
+    await githubConnectionEventService(db, { connector: connectorFor([opened]), gitLinks }).pollOnce();
+    await githubConnectionEventService(db, { connector: connectorFor([merged]), gitLinks }).pollOnce();
+
+    const products = await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    expect(products).toHaveLength(1);
+    expect(products[0]!.metadata).toMatchObject({ git: { linkedBy: "workspace_branch", verified: false } });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("todo");
   });
 
   it("links but leaves status alone while the switch is off", async () => {
