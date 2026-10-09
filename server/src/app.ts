@@ -69,6 +69,7 @@ import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
 import { issueDuplicateRoutes } from "./routes/issue-duplicates.js";
 import { createDuplicateDetection } from "./services/duplicate-detection-factory.js";
+import { setIssueCreatedListener } from "./services/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
 import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
@@ -842,9 +843,9 @@ export async function createApp(
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
   const duplicateDetection = createDuplicateDetection(db);
+  setIssueCreatedListener((event) => void duplicateDetection.checkAfterCreate(event));
   api.use(issueDuplicateRoutes(db, duplicateDetection));
   api.use(issueRoutes(db, opts.storageService, {
-    duplicateDetection,
     chatRunRetries: chatChannels,
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,

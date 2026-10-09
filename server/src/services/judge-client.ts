@@ -19,6 +19,8 @@ const DEFAULT_TIMEOUT_MS = 4_000;
 const DEFAULT_DAILY_CALL_CAP = 5_000;
 const CACHE_MAX_ENTRIES = 5_000;
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const KEY_MEMO_TTL_MS = 30_000;
+const MAX_TRANSPORTS = 50;
 
 /** A yes/no question answered with P(true). Abstains when P falls strictly inside `abstainBand`. */
 export interface JudgePredicateQuestion {
@@ -97,7 +99,8 @@ export type JudgeOutcome =
   | { ok: false; reason: JudgeFailureReason; inputHash: string };
 
 export interface JudgeClient {
-  isConfigured(): boolean;
+  /** True when the company has a usable gateway key. Resolves false on any lookup failure. */
+  isAvailable(companyId: string): Promise<boolean>;
   /** Never throws: any failure comes back as `{ ok: false }` so callers fall back to deterministic checks. */
   ask(request: JudgeRequest): Promise<JudgeOutcome>;
 }
@@ -132,8 +135,13 @@ export interface JudgeCache {
   set(key: string, value: { answers: Readonly<Record<string, JudgeAnswer>>; modelId: string }): void;
 }
 
+/** Company secret that holds that company's AI Gateway key. There is no process-wide key. */
+export const JUDGE_API_KEY_SECRET_NAME = "AI_GATEWAY_API_KEY";
+
+/** Resolves a company's gateway key, or undefined when the company has none. May throw. */
+export type JudgeKeyResolver = (companyId: string) => Promise<string | undefined>;
+
 export interface JudgeConfig {
-  apiKey: string | undefined;
   timeoutMs: number;
   dailyCallCap: number;
   zeroDataRetention: boolean;
@@ -164,14 +172,13 @@ function nonNegativeInteger(raw: string | undefined, fallback: number): number {
 }
 
 /**
- * Reads judge settings from the environment.
+ * Reads judge settings from the environment. The gateway key is not one of them: each company's key
+ * lives in that company's secrets.
  * @param env - Environment to read; defaults to `process.env`.
- * @returns The key (when set), timeout, per-company daily call cap and zero-data-retention flag.
+ * @returns Timeout, per-company daily call cap and zero-data-retention flag.
  */
 export function readJudgeConfig(env: NodeJS.ProcessEnv = process.env): JudgeConfig {
-  const apiKey = env.AI_GATEWAY_API_KEY?.trim();
   return {
-    apiKey: apiKey ? apiKey : undefined,
     timeoutMs: nonNegativeInteger(env.PAPERCLIP_JUDGE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS,
     dailyCallCap: nonNegativeInteger(env.PAPERCLIP_JUDGE_DAILY_CALL_CAP, DEFAULT_DAILY_CALL_CAP),
     zeroDataRetention: env.PAPERCLIP_JUDGE_ZERO_DATA_RETENTION === "true",
@@ -374,25 +381,54 @@ function describeFailure(error: unknown): Record<string, unknown> {
 /**
  * Creates the decision-model client.
  *
- * Order of checks per call: missing key, content-hash cache, per-company daily cap, then one
- * gateway request under a hard timeout. Every failure returns `{ ok: false }`; nothing throws.
+ * Order of checks per call: the company's own key, content-hash cache, per-company daily cap, then
+ * one gateway request under a hard timeout. A company without a key never reaches the gateway.
+ * Every failure returns `{ ok: false }`; nothing throws.
+ *
+ * Keys are looked up per company and kept in memory for `keyTtlMs` only, so revoking or rotating a
+ * company's secret takes effect within that window. A missing key is never remembered.
  */
 export function createJudgeClient(options: {
   config: JudgeConfig;
   usage: JudgeUsageStore;
+  resolveApiKey: JudgeKeyResolver;
   cache?: JudgeCache;
-  transport?: JudgeTransport;
+  /** Builds the transport for one key. Defaults to the AI Gateway. Replace it in tests. */
+  transportFor?: (apiKey: string) => JudgeTransport;
+  keyTtlMs?: number;
+  now?: () => number;
 }): JudgeClient {
-  const { config, usage } = options;
+  const { config, usage, resolveApiKey } = options;
   const cache = options.cache ?? createJudgeCache();
-  const transport =
-    options.transport ??
-    (config.apiKey
-      ? createGatewayTransport({ apiKey: config.apiKey, zeroDataRetention: config.zeroDataRetention })
-      : null);
+  const keyTtlMs = options.keyTtlMs ?? KEY_MEMO_TTL_MS;
+  const now = options.now ?? Date.now;
+  const transports = new Map<string, JudgeTransport>();
+  const keys = new Map<string, { apiKey: string; expiresAt: number }>();
 
-  async function callWithTimeout(request: JudgeRequest): Promise<RawDecision> {
-    if (!transport) throw new Error("judge transport is not configured");
+  function transportFor(apiKey: string): JudgeTransport {
+    const known = transports.get(apiKey);
+    if (known) return known;
+    if (transports.size >= MAX_TRANSPORTS) transports.clear();
+    const created =
+      options.transportFor?.(apiKey) ??
+      createGatewayTransport({ apiKey, zeroDataRetention: config.zeroDataRetention });
+    transports.set(apiKey, created);
+    return created;
+  }
+
+  async function keyFor(companyId: string): Promise<string | undefined> {
+    const memo = keys.get(companyId);
+    if (memo && memo.expiresAt > now()) return memo.apiKey;
+    const apiKey = (await withTimeout(resolveApiKey(companyId), config.timeoutMs))?.trim();
+    if (!apiKey) {
+      keys.delete(companyId);
+      return undefined;
+    }
+    keys.set(companyId, { apiKey, expiresAt: now() + keyTtlMs });
+    return apiKey;
+  }
+
+  async function callWithTimeout(transport: JudgeTransport, request: JudgeRequest): Promise<RawDecision> {
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<never>((_, reject) => {
@@ -411,10 +447,24 @@ export function createJudgeClient(options: {
   }
 
   return {
-    isConfigured: () => transport !== null,
+    async isAvailable(companyId) {
+      try {
+        return (await keyFor(companyId)) !== undefined;
+      } catch {
+        return false;
+      }
+    },
     async ask(request) {
       const inputHash = hashJudgeInput(request);
-      if (!transport) return { ok: false, reason: "no_key", inputHash };
+      let apiKey: string | undefined;
+      try {
+        apiKey = await keyFor(request.companyId);
+      } catch (error) {
+        logger.warn({ companyId: request.companyId, ...describeFailure(error) }, "judge key lookup failed");
+        return { ok: false, reason: error instanceof JudgeTimeoutError ? "timeout" : "error", inputHash };
+      }
+      if (!apiKey) return { ok: false, reason: "no_key", inputHash };
+      const transport = transportFor(apiKey);
 
       const cacheKey = `${request.companyId}:${inputHash}`;
       const hit = cache.get(cacheKey);
@@ -431,7 +481,7 @@ export function createJudgeClient(options: {
 
       const startedAt = Date.now();
       try {
-        const raw = await callWithTimeout(request);
+        const raw = await callWithTimeout(transport, request);
         const answers: Record<string, JudgeAnswer> = {};
         for (const [id, question] of Object.entries(request.questions)) {
           const answer = interpretAnswer(question, raw.answers[id], raw.confidence[id]);

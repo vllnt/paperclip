@@ -24,6 +24,7 @@ describe.skipIf(!live)("judge client against the live Vercel AI Gateway", () => 
   const client = createJudgeClient({
     config: readJudgeConfig(),
     usage: { reserve: async () => true },
+    resolveApiKey: async () => process.env.AI_GATEWAY_API_KEY,
   });
 
   it("scores an obvious duplicate high and an unrelated pair low", async () => {

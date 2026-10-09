@@ -20,7 +20,7 @@ import {
   type ScoredPair,
 } from "./duplicate-cascade.js";
 import { DUPLICATE_DESCRIPTION_MAX_CHARS, prepareIssueText, type IssueText } from "./duplicate-lexical.js";
-import type { JudgeClient } from "./judge-client.js";
+import { JUDGE_API_KEY_SECRET_NAME, type JudgeClient } from "./judge-client.js";
 
 const CANDIDATE_POOL_SIZE = 10;
 const ROUTINE_ORIGIN_KIND = "routine_execution";
@@ -64,6 +64,12 @@ export interface CreatedIssueForCheck {
   createdAt: Date;
 }
 
+/** Identifies a newly created issue. The check loads everything else itself. */
+export interface CreatedIssueRef {
+  id: string;
+  companyId: string;
+}
+
 export interface DuplicateLabelActor {
   type: "user" | "agent";
   id: string;
@@ -74,6 +80,8 @@ export interface DuplicateDetectionDeps {
   judge: JudgeClient;
   /** Posts a system-authored comment inside the caller's transaction. */
   postSystemComment: (issueId: string, body: string, tx: DbTransaction) => Promise<{ id: string }>;
+  /** Waits before each retry when the new issue is not visible yet. Default 1s, 5s, 20s. */
+  retryDelaysMs?: readonly number[];
 }
 
 function oneLine(text: string, max: number): string {
@@ -114,6 +122,7 @@ export function buildDuplicateComment(
 const AFTER_CREATE_CONCURRENCY = 3;
 const AFTER_CREATE_MAX_PENDING = 100;
 const AFTER_CREATE_DEADLINE_MS = 30_000;
+const DEFAULT_VISIBILITY_RETRY_DELAYS_MS = [1_000, 5_000, 20_000] as const;
 
 /**
  * Runs jobs with limited concurrency and a bounded wait list. A job that finds the list full is
@@ -313,10 +322,63 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
     });
   }
 
-  async function checkNow(issue: CreatedIssueForCheck): Promise<void> {
+  async function loadIssue(ref: CreatedIssueRef): Promise<CreatedIssueForCheck | null> {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        title: issues.title,
+        description: issues.description,
+        parentId: issues.parentId,
+        originKind: issues.originKind,
+        originId: issues.originId,
+        createdAt: issues.createdAt,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, ref.id), eq(issues.companyId, ref.companyId)));
+    return row ?? null;
+  }
+
+  const skipNotedOn = new Map<string, string>();
+
+  async function noteSkippedForMissingKey(companyId: string): Promise<void> {
+    const today = new Date().toISOString().slice(0, 10);
+    if (skipNotedOn.get(companyId) === today) return;
+    skipNotedOn.set(companyId, today);
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: DETECTOR_ACTOR_ID,
+      action: "duplicate_detection.skipped",
+      entityType: "company",
+      entityId: companyId,
+      details: {
+        reason: "missing_secret",
+        secretName: JUDGE_API_KEY_SECRET_NAME,
+        message: `Duplicate detection is on but this company has no "${JUDGE_API_KEY_SECRET_NAME}" secret, so new issues are not checked. Add the secret or set the mode to off.`,
+      },
+    });
+  }
+
+  const retryDelays = deps.retryDelaysMs ?? DEFAULT_VISIBILITY_RETRY_DELAYS_MS;
+
+  async function checkNow(ref: CreatedIssueRef, attempt: number): Promise<void> {
     try {
-      const mode = await getMode(issue.companyId);
+      const mode = await getMode(ref.companyId);
       if (mode === "off") return;
+      if (!(await judge.isAvailable(ref.companyId))) {
+        await noteSkippedForMissingKey(ref.companyId);
+        return;
+      }
+      const issue = await loadIssue(ref);
+      if (!issue) {
+        const delay = retryDelays[attempt];
+        if (delay !== undefined) {
+          setTimeout(() => void runBounded(() => checkNow(ref, attempt + 1)), delay).unref();
+        }
+        return;
+      }
       const result = await score(
         {
           companyId: issue.companyId,
@@ -364,7 +426,7 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
       });
     } catch (error) {
       logger.warn(
-        { err: error instanceof Error ? error.message : String(error), issueId: issue.id, companyId: issue.companyId },
+        { err: error instanceof Error ? error.message : String(error), issueId: ref.id, companyId: ref.companyId },
         "duplicate check after create failed",
       );
     }
@@ -412,12 +474,14 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
     /**
      * Runs after an issue is created, off the request path, through a small bounded queue so bulk
      * creates cannot flood the database or the gateway. Excess work is dropped, never queued without
-     * bound. Records every scored pair in the ledger and, in `comment` mode, posts one idempotent
+     * bound. A company without its own gateway key is skipped, with one activity note a day. If the
+     * issue is not visible yet (its transaction is still open), the check retries a few times, then
+     * gives up. Records every scored pair in the ledger and, in `comment` mode, posts one idempotent
      * comment per issue for pairs that clear the alert threshold. Only older candidates are
      * considered, so only the newer issue of a pair is commented on. Never throws into the caller.
      */
-    checkAfterCreate(issue: CreatedIssueForCheck): Promise<void> {
-      return runBounded(() => checkNow(issue));
+    checkAfterCreate(ref: CreatedIssueRef): Promise<void> {
+      return runBounded(() => checkNow(ref, 0));
     },
 
     /** Ledger rows for one issue, newest first, with the candidate's identifier and title. */

@@ -17,7 +17,8 @@ Reads a JSON export of labelled pairs:
      "b": { "title": "...", "description": "..." }, "label": "duplicate" | "keep_both" | true | false }]
 
 Reports precision and recall by threshold for tier 1 alone and for tier 1 + Jev, and whether the
-0.9 precision target for comments is met. Needs AI_GATEWAY_API_KEY unless --tier1-only is set.
+0.9 precision target for comments is met. Needs AI_GATEWAY_API_KEY in the environment (a calibration run has no company, so it uses one
+explicit key; the server itself reads each company's own secret) unless --tier1-only is set.
 Issue text is sent to the AI Gateway, truncated and redacted exactly as in production.`;
 
 const CONCURRENCY = 8;
@@ -36,12 +37,17 @@ async function main(): Promise<void> {
 
   const pairs = parseLabelledPairs(JSON.parse(await readFile(file, "utf8")));
   const config = readJudgeConfig();
-  if (!tier1Only && !config.apiKey) {
+  const apiKey = process.env.AI_GATEWAY_API_KEY?.trim();
+  if (!tier1Only && !apiKey) {
     console.error("AI_GATEWAY_API_KEY is not set. Set it, or pass --tier1-only.");
     process.exitCode = 2;
     return;
   }
-  const judge = createJudgeClient({ config, usage: { reserve: async () => true } });
+  const judge = createJudgeClient({
+    config,
+    usage: { reserve: async () => true },
+    resolveApiKey: async () => apiKey,
+  });
 
   const scored: ScoredLabelledPair[] = new Array(pairs.length);
   let next = 0;

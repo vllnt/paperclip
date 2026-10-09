@@ -58,11 +58,11 @@ function judgeAnswering(probability: number | null, abstained = false): JudgeCli
     inputHash: "hash",
     cached: false,
   };
-  return { isConfigured: () => true, ask: vi.fn(async () => outcome) };
+  return { isAvailable: async () => true, ask: vi.fn(async () => outcome) };
 }
 
 function judgeFailing(reason: "no_key" | "cap_exceeded" | "timeout" | "error"): JudgeClient & { ask: ReturnType<typeof vi.fn> } {
-  return { isConfigured: () => false, ask: vi.fn(async () => ({ ok: false as const, reason, inputHash: "hash" })) };
+  return { isAvailable: async () => false, ask: vi.fn(async () => ({ ok: false as const, reason, inputHash: "hash" })) };
 }
 
 describe("lexical helpers", () => {

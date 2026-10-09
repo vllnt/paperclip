@@ -43,6 +43,13 @@ Per company, board only (`PATCH /api/companies/:companyId`, field `duplicateDete
 | `suggest` | adds Jev scoring | scores and records the ledger | yes |
 | `comment` | same as `suggest` | also posts one comment on the newer issue | yes |
 
+A company also needs its own gateway key: create a company secret named `AI_GATEWAY_API_KEY`
+(Secrets page or API). There is no server-wide key, so each company controls and can revoke its own
+credential. A company in `suggest` or `comment` mode without that secret is **skipped**: the
+after-create check does nothing, the `similar` API answers from the free tiers with
+`degradedReason: "no_key"`, and one `duplicate_detection.skipped` activity entry a day says why. Deleting
+or replacing the secret takes effect within about 30 seconds (keys are kept in memory that long).
+
 Roll out in this order: `suggest` → label real pairs → run the calibration script → `comment` only if
 precision at 0.9 is at least 0.9.
 
@@ -82,8 +89,10 @@ candidates and comment on or link an existing issue instead of creating another 
 
 ## After-create check and the ledger
 
-When `POST /api/companies/:companyId/issues` creates an issue, the response is sent first and the
-check runs afterwards. It records every scored pair in `issue_duplicate_pairs`: both issue ids, the
+Every newly inserted issue triggers the check from inside the issue service: the main create route,
+child creation (`POST /issues/:id/children`), accepted-plan decomposition, and issues made by routines,
+watchdogs, chat, email and the runtime. A create that resolves to an existing issue does not. The check
+runs after the create returns, never inside it. It records every scored pair in `issue_duplicate_pairs`: both issue ids, the
 lexical score, the Jev probability, the verdict, the model id Jev reported, a SHA-256 of the exact
 input sent, and any later label. It stores **no issue text and no provider response**.
 
@@ -112,7 +121,6 @@ inflate precision.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AI_GATEWAY_API_KEY` | unset | Vercel AI Gateway key. Unset means tier 2 is off everywhere (fail open). |
 | `PAPERCLIP_JUDGE_DAILY_CALL_CAP` | `5000` | Model calls per company per UTC day. `0` disables model calls. |
 | `PAPERCLIP_JUDGE_TIMEOUT_MS` | `4000` | Hard timeout per model request. |
 | `PAPERCLIP_JUDGE_ZERO_DATA_RETENTION` | `false` | `true` sends the gateway's `zeroDataRetention` option. Tested 2026-10-09 with the Paperclip gateway key: every request returned a gateway 500, so it was not usable and all checks fell back to tier 1. Leave it `false` unless the gateway team has zero-data-retention enabled for Jev, and re-test with the live smoke test first. |
@@ -142,8 +150,11 @@ content sent to an external model provider** (Vercel AI Gateway, then TypeSafe).
 
 ## Limits
 
-- The after-create check runs for issues created through `POST /companies/:companyId/issues`. Issues made
-  by routines, plugins, chat or imports are not checked, but the `similar` API works for any caller.
+- Company import (bulk insert) is not checked. Everything else that inserts through the issue service is.
+  That includes system-made issues (routines, watchdogs), so expect more checks and, in `comment` mode,
+  the occasional comment on a system issue. The bounded queue and the daily cap limit the load.
+- An issue created inside a transaction that is still open is retried at 1, 5 and 20 seconds until it is
+  visible, then dropped. A rolled-back create is never checked.
 - `pg_trgm` treats letters by the database locale. On a UTF-8 locale accented letters count as letters; on a
   `C` locale they split words. Compare `SELECT datctype FROM pg_database WHERE datname = current_database()`
   with your expectations for non-English titles. The offline calibration mirrors UTF-8 behavior.

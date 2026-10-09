@@ -13,6 +13,7 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueDuplicateRoutes } from "../routes/issue-duplicates.js";
+import { companyService } from "../services/companies.js";
 import { duplicateDetectionService } from "../services/duplicate-detection.js";
 import { issueService } from "../services/issues.js";
 import { trigramSimilarity } from "../services/duplicate-lexical.js";
@@ -41,14 +42,15 @@ function judgeAnswering(probability: number): JudgeClient & { ask: ReturnType<ty
     inputHash: "hash",
     cached: false,
   };
-  return { isConfigured: () => true, ask: vi.fn(async () => outcome) };
+  return { isAvailable: async () => true, ask: vi.fn(async () => outcome) };
 }
 
-function serviceFor(db: Db, judge: JudgeClient) {
+function serviceFor(db: Db, judge: JudgeClient, overrides: { retryDelaysMs?: readonly number[] } = {}) {
   const issuesSvc = issueService(db);
   return duplicateDetectionService({
     db,
     judge,
+    ...overrides,
     postSystemComment: (issueId, body, tx) => issuesSvc.addComment(issueId, body, {}, { authorType: "system" }, tx),
   });
 }
@@ -195,17 +197,7 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
     }
 
     function asCreated(row: typeof issues.$inferSelect) {
-      return {
-        id: row.id,
-        companyId: row.companyId,
-        identifier: row.identifier,
-        title: row.title,
-        description: row.description,
-        parentId: row.parentId,
-        originKind: row.originKind,
-        originId: row.originId,
-        createdAt: row.createdAt,
-      };
+      return { id: row.id, companyId: row.companyId };
     }
 
     it("does nothing while the company is off", async () => {
@@ -334,12 +326,83 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       expect(result).toMatchObject({ recommendation: "create", degradedReason: "error", candidates: [] });
     });
 
+    it("skips a company without its own gateway key and notes it once a day", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "No key");
+      await setMode(pg.db, companyId, "comment");
+      const { created } = await seedPair(companyId, new Date("2026-10-01T00:00:00Z"));
+      const judge = { isAvailable: async () => false, ask: vi.fn() };
+      const svc = serviceFor(pg.db, judge);
+
+      await svc.checkAfterCreate(asCreated(created));
+      await svc.checkAfterCreate(asCreated(created));
+
+      expect(judge.ask).not.toHaveBeenCalled();
+      expect(await pg.db.select().from(issueDuplicatePairs)).toHaveLength(0);
+      expect(await pg.db.select().from(issueComments)).toHaveLength(0);
+      const notes = await pg.db
+        .select()
+        .from(activityLog)
+        .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "duplicate_detection.skipped")));
+      expect(notes).toHaveLength(1);
+      expect(notes[0]?.details).toMatchObject({ reason: "missing_secret", secretName: "AI_GATEWAY_API_KEY" });
+    });
+
+    it("does not note anything for a company that is off, even without a key", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Off no key");
+      const { created } = await seedPair(companyId, new Date("2026-10-01T00:00:00Z"));
+      await serviceFor(pg.db, { isAvailable: async () => false, ask: vi.fn() }).checkAfterCreate(asCreated(created));
+      expect(await pg.db.select().from(activityLog).where(eq(activityLog.action, "duplicate_detection.skipped"))).toHaveLength(0);
+    });
+
+    it("waits for an issue that is not visible yet, then checks it", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Late commit");
+      await setMode(pg.db, companyId, "suggest");
+      await seedIssue(pg.db, companyId, { title: "Remove songtrivia client compatibility barrels" });
+      const lateId = randomUUID();
+      const judge = judgeAnswering(0.95);
+      const svc = serviceFor(pg.db, judge, { retryDelaysMs: [30, 30, 30] });
+
+      await svc.checkAfterCreate({ id: lateId, companyId });
+      expect(judge.ask).not.toHaveBeenCalled();
+      await seedIssue(pg.db, companyId, { id: lateId, createdAt: new Date("2026-10-02T00:00:00Z") });
+
+      const deadline = Date.now() + 3_000;
+      let pairs: Array<typeof issueDuplicatePairs.$inferSelect> = [];
+      while (Date.now() < deadline && pairs.length === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        pairs = await pg.db.select().from(issueDuplicatePairs).where(eq(issueDuplicatePairs.issueId, lateId));
+      }
+      expect(pairs).toHaveLength(1);
+    });
+
+    it("gives up quietly when the issue never appears", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Rolled back");
+      await setMode(pg.db, companyId, "suggest");
+      const judge = judgeAnswering(0.95);
+      const svc = serviceFor(pg.db, judge, { retryDelaysMs: [5, 5] });
+      await expect(svc.checkAfterCreate({ id: randomUUID(), companyId })).resolves.toBeUndefined();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(judge.ask).not.toHaveBeenCalled();
+      expect(await pg.db.select().from(issueDuplicatePairs)).toHaveLength(0);
+    });
+
+    it("never loads an issue through another company's reference", async () => {
+      const mine = await seedCompanyWithBoardAccess(pg.db, "Mine");
+      const theirs = await seedCompanyWithBoardAccess(pg.db, "Theirs");
+      await setMode(pg.db, theirs.companyId, "suggest");
+      const { created } = await seedPair(mine.companyId, new Date("2026-10-01T00:00:00Z"));
+      const judge = judgeAnswering(0.95);
+      await serviceFor(pg.db, judge, { retryDelaysMs: [] }).checkAfterCreate({ id: created.id, companyId: theirs.companyId });
+      expect(judge.ask).not.toHaveBeenCalled();
+      expect(await pg.db.select().from(issueDuplicatePairs)).toHaveLength(0);
+    });
+
     it("fails open: a failing model leaves lexical-only ledger rows and never throws", async () => {
       const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Fail");
       await setMode(pg.db, companyId, "comment");
       const { created } = await seedPair(companyId, new Date("2026-10-01T00:00:00Z"));
       const failing: JudgeClient = {
-        isConfigured: () => true,
+        isAvailable: async () => true,
         ask: async () => ({ ok: false, reason: "timeout", inputHash: "h" }),
       };
       await expect(serviceFor(pg.db, failing).checkAfterCreate(asCreated(created))).resolves.toBeUndefined();
@@ -351,18 +414,22 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
     it("never throws into the caller when the database fails", async () => {
       const svc = serviceFor(pg.db, judgeAnswering(0.5));
       await expect(
-        svc.checkAfterCreate({
-          id: randomUUID(),
-          companyId: "not-a-uuid",
-          identifier: null,
-          title: TITLE,
-          description: null,
-          parentId: null,
-          originKind: "manual",
-          originId: null,
-          createdAt: new Date(),
-        }),
+        svc.checkAfterCreate({ id: randomUUID(), companyId: "not-a-uuid" }),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  describe("company responses", () => {
+    it("read the duplicate detection mode back from get, list and update", async () => {
+      const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Rollout");
+      const companiesSvc = companyService(pg.db);
+      expect((await companiesSvc.getById(companyId))?.duplicateDetectionMode).toBe("off");
+
+      const updated = await companiesSvc.update(companyId, { duplicateDetectionMode: "comment" });
+      expect(updated?.duplicateDetectionMode).toBe("comment");
+      expect((await companiesSvc.getById(companyId))?.duplicateDetectionMode).toBe("comment");
+      const listed = (await companiesSvc.list()).find((company) => company.id === companyId);
+      expect(listed?.duplicateDetectionMode).toBe("comment");
     });
   });
 
@@ -376,7 +443,7 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       const svc = serviceFor(pg.db, judgeAnswering(0.95));
       const [row] = await pg.db.select().from(issues).where(eq(issues.id, created));
       if (!row) throw new Error("seed failed");
-      await svc.checkAfterCreate({ ...row, parentId: row.parentId });
+      await svc.checkAfterCreate({ id: row.id, companyId: row.companyId });
       const [pair] = await pg.db.select().from(issueDuplicatePairs);
       if (!pair) throw new Error("expected a pair");
 
@@ -476,7 +543,7 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       const svc = serviceFor(pg.db, judgeAnswering(0.95));
       const [row] = await pg.db.select().from(issues).where(eq(issues.id, created));
       if (!row) throw new Error("seed failed");
-      await svc.checkAfterCreate(row);
+      await svc.checkAfterCreate({ id: row.id, companyId: row.companyId });
       const [pair] = await pg.db.select().from(issueDuplicatePairs);
       if (!pair) throw new Error("expected a pair");
 
