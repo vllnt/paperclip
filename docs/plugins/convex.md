@@ -4,7 +4,7 @@ Design and slice plan for `vllnt.paperclip-convex` (`packages/plugins/plugin-con
 It lets agents of any company manage Convex deployments, with access decided per
 **environment class** and per **agent**, enforced on the server.
 
-Status: slice 1 is implemented in this PR. Slices 2 and 3 are specified here and ship as stacked PRs.
+Status: slice 1 is implemented in this PR (the "1" rows below). Slices 2 and 3 are specified here and ship as stacked PRs.
 
 Why it exists: a Convex team has a deployment quota (300). A team that leaks preview deployments hits
 `DeploymentQuotaReached`, and every backend CI job then fails. Agents need to see, trim and
@@ -32,6 +32,10 @@ Facts that shaped the design:
   team's retention entitlement; `null` clears it.
 - Team `list_deployments` is cursor-paginated (limit 100). Project `list_deployments` is not paginated.
 - Deployment audit events carry `clientIp` and `clientUserAgent`; treat them as PII.
+- Deploy keys carry an `allowedActions` list (for example `deployment:logs:view`, `deployment:metrics:view`, `deployment:data:view`,
+  `deployment:env:view`, `deployment:deploy`). Slice 2 uses it to mint the cheapest key per capability instead of a broad one.
+- Every list response is projected through an allowlist (`src/projection.ts`), so a field Convex adds later, or one that holds key
+  material, cannot reach an agent.
 - The Health page (failure rate, cache hit rate, scheduler lag, function metrics) and Insights have **no documented API**. Slice 1
   reports only what the documented APIs return and lists the rest under `unavailable`. They are UNSTABLE spikes for slice 2.
 
@@ -52,8 +56,8 @@ All tool names are `convex_<name>`. Slice column: 1 implemented here, 2 and 3 sp
 | `get_deployment` | Mgmt `GET /deployments/{name}` (type, reference, previewIdentifier, lastDeployTime, expiresAt, class, region) | meta-read | R | L | 1 |
 | `quota` | Mgmt `GET /teams/{team_id}/list_deployments` (paginated count vs quota) | meta-read | R | N | 1 |
 | `list_custom_domains` | Mgmt `GET /deployments/{name}/custom_domains` | meta-read | R | N | 1 |
-| `list_deploy_keys` | Mgmt `GET /deployments/{name}/list_deploy_keys`, `GET /projects/{id}/list_preview_deploy_keys` (metadata only, key material is dropped) | meta-read | R | L | 1 |
-| `list_audit_events` | Deployment `GET /list_audit_log_events` (IP and user agent removed unless `data-read-pii`); Mgmt `GET /teams/{team_id}/list_audit_log_events` | meta-read | R | L / H | 1 |
+| `list_deploy_keys` | Mgmt `GET /deployments/{name}/list_deploy_keys` (allowlisted metadata: id, name, times, creator, `allowedActions`; key material is dropped). `GET /projects/{id}/list_preview_deploy_keys` is slice 2 | meta-read | R | L | 1 |
+| `list_audit_events` | Deployment `GET /list_audit_log_events` (action, time, actor kind; client IP, user agent and free-form metadata only with `data-read-pii`). The team-level Mgmt `GET /teams/{team_id}/list_audit_log_events` is slice 2 | logs-read | R | L / H | 1 |
 | `list_classes_regions` | Mgmt `GET /teams/{team_id}/list_deployment_classes`, `list_deployment_regions` | meta-read | R | N | 1 |
 
 ### Health and usage
@@ -220,9 +224,23 @@ Company plugin config (instance administrator writes it; every secret field is a
 }
 ```
 
-`github` accepts either `token` (fine-grained, read-only: Metadata, Pull requests, Contents) or `appId` + `privateKey`
-(reuse the company's GitHub App key secret; installation tokens are minted per repository with read permissions only).
+`github.token` is a fine-grained, read-only token (Metadata, Pull requests, Contents) on the mapped repositories. Reusing the
+company's GitHub App key to mint per-repository read tokens is planned for slice 2; slice 1 needs no App coupling.
 
-Actions (`POST /api/plugins/vllnt.paperclip-convex/actions/<key>`, body `{companyId, params}`, board users only): `status`,
-`connection.connect`, `connection.disconnect`, `deployments.list`, `deployments.delete-preview`, `reaper.run`, `reaper.report`.
-CLI: `paperclipai convex status|connect`, `paperclipai convex deployments list|reap|delete-preview`.
+Actions (`POST /api/plugins/vllnt.paperclip-convex/actions/<key>`, body `{companyId, params}`, board users only; contracts in OpenAPI):
+`status`, `connection.connect`, `connection.disconnect`, `deployments.list`, `deployments.delete-preview`, `reaper.run`, `reaper.report`.
+`connection.*`, `deployments.delete-preview` and a live `reaper.run` need an instance administrator. Config is written with the standard
+plugin config API (`paperclipai plugin config:set vllnt.paperclip-convex -C <company> ...`), which only an instance administrator may call.
+CLI: `paperclipai convex status|connect|report`, `paperclipai convex deployments list|reap [--dry-run]|delete-preview <name> [--dry-run]`.
+
+### Reaper rules
+
+Hourly job `convex-reaper` (also `reaper.run` and the `convex_reap_previews` tool). For each connected company and mapped project it lists previews and:
+
+1. keeps anything classified staging or production, anything with an open PR or a recently active branch, and anything it cannot check;
+2. deletes previews whose PR is closed or merged, or whose branch is gone and whose last deploy is older than `guards.activityHours`;
+3. sets `expiresAt = lastDeployTime + ttlHours` on kept previews, shortening only. When that moment is less than an hour away (a guarded preview that has been idle),
+   the reaper does not schedule it, because Convex would delete a guarded preview. It only gives a preview without any expiry `now + ttlHours`;
+4. counts all team deployments against `reaper.quota` and raises an issue (once a day) and an activity entry at `reaper.alertPercent`.
+
+It is a dry run until `reaper.enabled` is true. When GitHub cannot be read for a project, it changes nothing in that project.
