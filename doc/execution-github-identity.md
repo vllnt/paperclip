@@ -335,36 +335,52 @@ every launcher command, so a helper found through it (`git-remote-*`,
 `git-receive-pack`) never runs with the credential.
 
 **A push with a credential is sealed.** Once the broker has answered, the push
-does not run as typed. It runs in a git directory of its own, made for it and
-under the launcher's private directory: its config is written by the launcher
-(the one URL the broker was told about, no push settings, no hooks), it holds a
-copy of the refs the push names (HEAD, branches, tags and the destination's
-remote-tracking refs, as they are then), and the checkout's objects are its
-alternate. The command is `git -c core.hooksPath=<empty> -c
+does not run as typed. Its destination and its refs are arguments, not names that
+git looks up. The command is `git -c core.hooksPath=<empty> -c
 push.followTags=false -c push.recurseSubmodules=no -c protocol.ext.allow=never
-push <options> --no-verify --no-follow-tags --no-recurse-submodules -- <remote
-or URL> <refspecs>`, with an environment that holds only the credential, `PATH`,
-the locale and what git needs, and none of the checkout's steering (`GIT_DIR`,
-`GIT_EXEC_PATH`, `GIT_TRACE*`, `GIT_SSH`, object and index paths, `HOME`). What
-the checkout's config, hooks, remote names, refspecs or environment say after
-the check, even in the instant git starts, cannot reach it: the URL, the refs and
-the settings are the launcher's. Before it starts, the refs it names are checked
-again in that directory against the report the broker answered, and the push
-URLs and commits are read again in the checkout; a difference stops it.
+push <options> --no-verify --no-follow-tags --no-recurse-submodules -- <the
+URL> <object>:<full ref>…`: the URL is the one the broker was told about and is
+the literal target (never the remote's name), and each refspec is the object
+(a tag object stays a tag object) and the full name it goes to, or `:<full name>`
+to delete. The commits are read again and must be the ones in the report the
+broker answered. `--force-with-lease` becomes `--force-with-lease=<full
+ref>:<commit>` for each ref: the commit the checkout last saw of the remote's
+branch, which is what git compares with, or the commit that was named. The
+environment holds only the credential, `PATH`, the locale and what git needs, and
+none of the checkout's steering (`GIT_DIR`, `GIT_EXEC_PATH`, `GIT_TRACE*`,
+`GIT_SSH`, object and index paths); `HOME` is the private directory.
+
+The git directory it runs in is made for it, under the launcher's private
+directory. It holds nothing the push resolves: no remote, no refs, no push
+settings, no hooks. It has the checkout's objects as an alternate (and the
+shallow boundary), and its config, which the launcher makes read-only (as is the
+directory). What the checkout's config, hooks, remote names, refspecs, refs or
+environment say after the check, even in the instant git starts, cannot reach the
+destination or the refs: they are in the arguments. A process of the same user
+that finds the private directory can still make its config writable again and add
+settings such as a `url.*.insteadOf` rewrite before git reads it; the read-only
+mode makes a plain write fail and narrows nothing else. That is the same
+boundary as reading the credential from the running command's environment (see
+the limits below).
 
 A push that cannot be reduced to one URL and a list of refs is refused, with the
 reason: `--all`, `--mirror`, `--tags`, `--follow-tags`, `--prune`, `--signed`,
 `--receive-pack`, `--exec`, any option that is not listed, a destination with
 more than one push URL, and a push without refspecs when the repository's config
 (`push.default`, `remote.<name>.push`, `mirror`) decides what it sends. Name one
-remote and the branches. These options are forwarded: `-f`/`--force`,
-`--force-with-lease[=…]`, `--force-if-includes`, `-n`, `-q`, `-v`, `-u`,
-`-d`/`--delete`, `-o`/`--push-option`, `--atomic`, `--porcelain`, `--progress`,
-`--thin` and the IPv4/IPv6 switches. A push without refspecs sends the current
-branch to the branch of the same name, which is what the broker was told; git
-itself would stop for want of an upstream. After the push, the launcher does in
-the checkout what git does for a push to a configured remote: it moves or deletes
-the remote-tracking refs the push changed, and `-u` records the upstream. The
+remote and the branches. A refspec with a pattern, or one whose destination
+cannot be written as a full name (a source that is not a branch or tag and has no
+`refs/` destination), is refused too. These options are forwarded:
+`-f`/`--force`, `--force-if-includes`, `-n`, `-q`, `-v`, `-o`/`--push-option`,
+`--atomic`, `--porcelain`, `--progress`, `--thin` and the IPv4/IPv6 switches; `-d`
+and `--delete` become deletions in the refspecs, and `-u` and
+`--force-with-lease` are done as described. A push without refspecs sends the
+current branch to the branch of the same name, which is what the broker was told;
+git itself would stop for want of an upstream. Because the push goes to a URL,
+git does not do what it does for a configured remote, so the launcher does it in
+the checkout after a push that succeeded (not after `-n`): it moves or deletes the
+remote-tracking refs of the branches the push changed, and `-u` records the
+upstream. If the push fails, the tracking refs stay as they were. The
 checkout's own hooks (a `pre-push` hook, `core.hooksPath`) do not run for a
 push that holds a credential. Fetches and pulls keep the earlier check only:
 their remote, refs and commits are read again right before they run.

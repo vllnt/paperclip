@@ -1029,10 +1029,12 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     // Review r4: the push that runs with the credential is sealed. A stand-in for the real git applies the attacker's change at
     // the last moment, as the child starts (after every check the launcher makes), and records the child's arguments and
     // environment.
-    async function childShim(r: GithubLike, actions: string[][] = []) {
+    // `privateConfig` is text appended to the push child's own private git config as it starts, after chmod (a plain write is
+    // tried first and its outcome kept in private.json).
+    async function childShim(r: GithubLike, actions: string[][] = [], privateConfig = "") {
       const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
       const dir = path.join(r.root, "real");
-      await writeFile(path.join(dir, "plan.json"), JSON.stringify({ repo: r.repo, actions }));
+      await writeFile(path.join(dir, "plan.json"), JSON.stringify({ repo: r.repo, actions, privateConfig }));
       await writeFile(path.join(dir, "git"), `#!/usr/bin/env node
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -1048,6 +1050,14 @@ if (args.includes("push")) {
     const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
     for (const key of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|CONFIG_(COUNT|KEY_.*|VALUE_.*))$/.test(key)) delete env[key];
     for (const action of plan.actions) spawnSync(REAL, action, { cwd: plan.repo, env, stdio: "ignore" });
+    if (plan.privateConfig && process.env.GIT_DIR) {
+      const file = path.join(process.env.GIT_DIR, "config");
+      let plain = "written";
+      try { fs.appendFileSync(file, "# a plain write\\n"); } catch (error) { plain = error.code; }
+      fs.writeFileSync(path.join(__dirname, "private.json"), JSON.stringify({ plain }));
+      fs.chmodSync(file, 0o600);
+      fs.appendFileSync(file, plan.privateConfig);
+    }
   }
 }
 const result = spawnSync(REAL, args, { stdio: "inherit" });
@@ -1138,7 +1148,84 @@ process.exit(result.status === null ? 1 : result.status);
       expect(child!.env.GIT_DIR).toMatch(/push-[^/]+\/git$/);
       expect(Object.keys(child!.env).filter(key => /^GIT_(EXEC_PATH|TRACE.*|ASKPASS|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|WORK_TREE|NAMESPACE|TEMPLATE_DIR|SSH)$/.test(key))).toEqual([]);
       expect(child!.args).toEqual(expect.arrayContaining(["--no-verify", "--no-follow-tags", "--no-recurse-submodules"]));
-      expect(child!.args.slice(-3)).toEqual(["--", "origin", "feature/x"]);
+      // The URL is the literal target, and the ref is the object and its full name: nothing is resolved from config or refs.
+      expect(child!.args.slice(-3)).toEqual(["--", r.bare, `${tip}:refs/heads/feature/x`]);
+      expect(child!.args).not.toContain("origin");
+    }, 60_000);
+
+    // Review r5: the push child's own private config is the agent's UID's to write too.
+    it("sends the push to the captured URL, with the captured refs, even when the child's private config is rewritten as it starts", async () => {
+      const r = await githubLike();
+      const attacker = await bareRepository(r, "attacker.git");
+      const evilHooks = path.join(r.root, "evil-hooks");
+      await mkdir(evilHooks);
+      await writeFile(path.join(evilHooks, "pre-push"), `#!/bin/sh\nprintenv GH_TOKEN > ${path.join(r.root, "stolen")}\nexit 0\n`, { mode: 0o755 });
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      r.git("branch", "other");
+      const shim = await childShim(r, [], [
+        `[remote "origin"]`, `\turl = ${attacker}`, `\tpushurl = ${attacker}`, `[remote "${r.bare}"]`, `\turl = ${attacker}`,
+        `[core]`, `\thooksPath = ${evilHooks}`, `[push]`, `\tfollowTags = true`, `\tdefault = matching`, ``,
+      ].join("\n"));
+      const result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.onGitHub("other")).toThrow();
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+      expect(await readFile(path.join(r.root, "stolen"), "utf8").catch(() => null)).toBeNull();
+      // Defence in depth: a plain write to the read-only config is refused (the owner can still chmod it, as the test does).
+      if (process.getuid && process.getuid() !== 0) expect(JSON.parse(await readFile(path.join(r.root, "real", "private.json"), "utf8")).plain).toBe("EACCES");
+      expect((await shim.children()).at(-1)!.args.slice(-2)).toEqual([r.bare, `${tip}:refs/heads/feature/x`]);
+    }, 60_000);
+
+    it("gives the child an explicit expected commit for --force-with-lease, and keeps one that was named", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "1\n");
+      r.git("commit", "-a", "-m", "one");
+      expect((await r.push("-u", "origin", "feature/x")).code).toBe(0);
+      const shim = await childShim(r);
+      r.git("commit", "--amend", "--allow-empty", "-m", "one again");
+      const again = r.tip();
+      const seen = r.git("rev-parse", "refs/remotes/origin/feature/x");
+      expect((await r.push("--force-with-lease", "origin", "feature/x")).code).toBe(0);
+      let child = (await shim.children()).at(-1)!;
+      expect(child.args.slice(-2)).toEqual([r.bare, `${again}:refs/heads/feature/x`]);
+      expect(child.args).toContain(`--force-with-lease=refs/heads/feature/x:${seen}`);
+      expect(child.args).not.toContain("--force-with-lease");
+      // A value that was named is kept (resolved to a commit).
+      r.git("commit", "--amend", "--allow-empty", "-m", "one more time");
+      const third = r.tip();
+      expect((await r.push(`--force-with-lease=feature/x:${again}`, "origin", "feature/x")).code).toBe(0);
+      child = (await shim.children()).at(-1)!;
+      expect(child.args).toContain(`--force-with-lease=refs/heads/feature/x:${again}`);
+      expect(r.onGitHub("feature/x")).toBe(third);
+    }, 120_000);
+
+    it("pushes an annotated tag as the tag object, and deletes by name with a colon", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      r.git("tag", "-a", "v1", "-m", "release one");
+      const tag = r.git("rev-parse", "refs/tags/v1");
+      expect((await r.push("origin", "v1")).code).toBe(0);
+      expect(r.sys(r.bare, "rev-parse", "refs/tags/v1")).toBe(tag);
+      expect(r.sys(r.bare, "cat-file", "-t", "refs/tags/v1")).toBe("tag");
+      expect((await r.push("origin", ":feature/x")).code).toBe(0);
+      expect(() => r.onGitHub("feature/x")).toThrow();
+    }, 60_000);
+
+    it.each([
+      ["a pattern", "refs/heads/*:refs/heads/*"],
+      ["a source that is not a ref and has no full destination", "HEAD~1:renamed"],
+      ["a destination that is not whole", "feature/x:refs/heads/a b"],
+    ])("refuses a refspec with %s: it cannot be written as an object and a full name", async (_label, refspec) => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const before = r.onGitHub("feature/x");
+      const result = await r.push("origin", refspec);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("cannot run with a GitHub credential");
+      expect(r.onGitHub("feature/x")).toBe(before);
     }, 60_000);
 
     it.each([

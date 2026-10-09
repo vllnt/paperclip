@@ -337,20 +337,24 @@ function remoteRefs(env, globalArgs, url) {
     return { tips, heads, defaultTip };
   } catch { return null; }
 }
-// A push that runs with a credential goes to one URL and sends one list of refs, both fixed before it starts, and it
-// runs in a git directory of its own: config that this launcher writes (that URL, no push settings, no hooks), a copy of
-// the refs it names, and the checkout's objects as an alternate. What the checkout's config, hooks, remote names,
-// refspecs and environment say after the check cannot reach it. A push that cannot be reduced to that is refused.
-const PUSH_SHORT = { f: '--force', n: '--dry-run', q: '--quiet', v: '--verbose', u: '--set-upstream', d: '--delete', 4: '--ipv4', 6: '--ipv6' };
+// A push that runs with a credential goes to one URL and sends one list of refs, both fixed before it starts. The URL is
+// the literal target and every ref is <object>:<full name>, so nothing the child resolves comes from config or refs that a
+// process of the agent's could change. It runs in a git directory of its own (nothing but the checkout's objects as an
+// alternate, its shallow boundary, and a config that this launcher wrote and then made read-only), without hooks.
+// What the checkout's config, hooks, remote names, refspecs and environment say after the check cannot reach it. A push
+// that cannot be reduced to that is refused.
+const PUSH_SHORT = { f: '--force', n: '--dry-run', q: '--quiet', v: '--verbose', 4: '--ipv4', 6: '--ipv6' };
 const PUSH_LONG = ['--force', '--dry-run', '--quiet', '--verbose', '--progress', '--no-progress', '--porcelain', '--atomic', '--no-atomic', '--thin', '--no-thin',
-  '--force-if-includes', '--no-force-if-includes', '--delete', '--set-upstream', '--ipv4', '--ipv6', '--no-force-with-lease'];
+  '--force-if-includes', '--no-force-if-includes', '--ipv4', '--ipv6', '--no-force-with-lease'];
 // The sealed push does these itself, whatever was asked.
 const PUSH_FORCED = ['--no-verify', '--verify', '--no-follow-tags', '--no-recurse-submodules'];
-// The options a sealed push forwards, and its arguments; a problem names what cannot be reduced (--all, --mirror, --tags,
-// --follow-tags, --prune, --signed, --receive-pack and any option not listed).
+// The options a sealed push forwards, its arguments, and the ones it turns into something explicit: --delete and -d become
+// deletions in the refspecs, -u is done after the push, and --force-with-lease becomes an expected value per ref. A problem
+// names what cannot be reduced (--all, --mirror, --tags, --follow-tags, --prune, --signed, --receive-pack and any option
+// not listed).
 function sealedOptions(pushArgs) {
-  const flags = [], rest = [];
-  let upstream = false;
+  const flags = [], rest = [], leases = [];
+  let upstream = false, deleting = false, dryRun = false;
   const missing = { problem: 'an option is missing its value' };
   for (let at = 0; at < pushArgs.length; at++) {
     const arg = pushArgs[at];
@@ -369,9 +373,12 @@ function sealedOptions(pushArgs) {
         flags.push('--push-option=' + value);
         continue;
       }
-      if (name === '--force-with-lease' || (PUSH_LONG.includes(name) && attached === undefined)) {
+      if (name === '--force-with-lease') { leases.push(attached); continue; }
+      if (name === '--delete' && attached === undefined) { deleting = true; continue; }
+      if (name === '--set-upstream' && attached === undefined) { upstream = true; continue; }
+      if (PUSH_LONG.includes(name) && attached === undefined) {
         flags.push(arg);
-        if (name === '--set-upstream') upstream = true;
+        if (name === '--dry-run') dryRun = true;
         continue;
       }
       return { problem: 'the option ' + name.slice(0, 40) + ' sends refs that cannot be listed' };
@@ -383,12 +390,14 @@ function sealedOptions(pushArgs) {
         flags.push('--push-option=' + value);
         break;
       }
+      if (arg[i] === 'd') { deleting = true; continue; }
+      if (arg[i] === 'u') { upstream = true; continue; }
       if (!PUSH_SHORT[arg[i]]) return { problem: 'the option -' + arg[i] + ' sends refs that cannot be listed' };
       flags.push(PUSH_SHORT[arg[i]]);
-      if (arg[i] === 'u') upstream = true;
+      if (arg[i] === 'n') dryRun = true;
     }
   }
-  return { flags, rest, upstream };
+  return { flags, rest, leases, upstream, deleting, dryRun };
 }
 // A sealed push's whole environment: nothing of the checkout's own steering (GIT_DIR, GIT_EXEC_PATH, GIT_TRACE*, GIT_SSH,
 // object and index paths…) is carried over, only what a credentialed command needs.
@@ -399,7 +408,69 @@ function sealedEnv(env, home, gitDir) {
   return { ...sealed, PATH: originalPath.join(path.delimiter), HOME: home, GIT_DIR: gitDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
     GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1' };
 }
-const MAX_SEALED_REFS = 20000;
+// A ref as the child is given it: whole, with no characters that git refuses or that could be taken for something else.
+const WHOLE_REF = /^refs\/[^\s~^:?*\[\\]+$/;
+// The refspecs of a sealed push as <object>:<full name> (or :<full name> to delete), the options that came from the
+// push's own, and the refs it moves for the checkout's remote-tracking refs and -u. The commits must be those that the
+// broker was told about. A problem names what cannot be written whole.
+function sealedRefspecs(env, globalArgs, specs, options, authorized, name) {
+  const read = (...args) => (gitOutput(env, globalArgs, args) || '').trim();
+  const shas = authorized.shas || [];
+  const refspecs = [], updates = [];
+  const unnamed = { problem: 'a ref it names cannot be written as a full name' };
+  const changed = { problem: 'the commits it names are not the ones that the broker was told' };
+  let used = 0;
+  for (const raw of specs) {
+    const force = raw.startsWith('+') ? '+' : '';
+    const body = force ? raw.slice(1) : raw;
+    if (raw === 'tag' || body.startsWith('^') || /[*?[]/.test(body)) return { problem: 'the refspec ' + raw.slice(0, 60) + ' cannot be listed' };
+    const colon = body.indexOf(':');
+    let source = colon < 0 ? body : body.slice(0, colon), destination = colon < 0 ? '' : body.slice(colon + 1);
+    if (options.deleting) { if (colon >= 0 || !body) return unnamed; source = ''; destination = body; }
+    if (!source) {
+      // A deletion names the ref it deletes; a name without refs/ is a branch.
+      const full = destination.startsWith('refs/') ? destination : 'refs/heads/' + destination;
+      if (!destination || !WHOLE_REF.test(full)) return unnamed;
+      refspecs.push(':' + full);
+      updates.push({ destination: full, sha: null, local: null });
+      continue;
+    }
+    // The object is what the ref is (a tag object stays one), the commit is what the broker was told.
+    const object = read('rev-parse', '--verify', '-q', source);
+    const commit = read('rev-parse', '--verify', '-q', source + '^{commit}');
+    const named = read('rev-parse', '--symbolic-full-name', source).split('\n').filter(Boolean);
+    const full = named.length === 1 && /^refs\/(heads|tags)\//.test(named[0]) ? named[0] : '';
+    if (!/^[0-9a-f]{40,64}$/.test(object) || !commit || commit !== shas[used]) return changed;
+    used += 1;
+    // A branch goes to a branch and a tag to a tag, as git does for a name without refs/; no name goes to the source's own.
+    const target = !destination ? full : destination.startsWith('refs/') ? destination : full ? full.slice(0, full.indexOf('/', 5) + 1) + destination : '';
+    if (!WHOLE_REF.test(target) || target.split('/').some(part => part === '' || part === '.' || part === '..')) return unnamed;
+    refspecs.push(force + object + ':' + target);
+    updates.push({ destination: target, sha: object, local: full.startsWith('refs/heads/') ? full : null });
+  }
+  if (used !== shas.length) return changed;
+  // --force-with-lease as an expected old value per ref: what the checkout last saw of the remote's branch, which is what
+  // git compares with, or the value that was named.
+  const flags = [...options.flags];
+  for (const lease of options.leases) {
+    const colon = lease === undefined ? -1 : lease.indexOf(':');
+    const ref = lease === undefined ? '' : colon < 0 ? lease : lease.slice(0, colon);
+    const asked = ref ? [ref.startsWith('refs/') ? ref : 'refs/heads/' + ref] : updates.map(update => update.destination);
+    for (const target of asked) {
+      let expected = '';
+      if (colon >= 0) {
+        const value = lease.slice(colon + 1);
+        expected = value ? read('rev-parse', '--verify', '-q', value) : '';
+        if (value && !expected) return { problem: 'the value that ' + target.slice(0, 60) + ' is expected to have cannot be read' };
+      } else if (name && target.startsWith('refs/heads/')) {
+        expected = read('rev-parse', '--verify', '-q', 'refs/remotes/' + name + '/' + target.slice(11));
+      } else return { problem: 'the value that ' + target.slice(0, 60) + ' is expected to have is not known (name it: --force-with-lease=<ref>:<commit>)' };
+      if (!WHOLE_REF.test(target)) return unnamed;
+      flags.push('--force-with-lease=' + target + ':' + expected);
+    }
+  }
+  return { refspecs, flags, updates };
+}
 // The command, environment and private git directory of the sealed push, or { problem }. authorized is the report that the
 // broker answered with a credential: the sealed push must send exactly what it described, to the one URL it listed.
 function sealedPush(env, globalArgs, pushArgs, authorized, scratch) {
@@ -418,7 +489,9 @@ function sealedPush(env, globalArgs, pushArgs, authorized, scratch) {
   if (authorized.implicitPush) return { problem: 'repository configuration decides which refs it sends' };
   const name = where.configured.length ? where.target : null;
   // Without refspecs git pushes the current branch (the broker was told so: it saw HEAD), and a deletion names its refs.
-  const specs = positional.length > 1 || options.flags.includes('--delete') ? positional.slice(1) : ['HEAD'];
+  const specs = positional.length > 1 || options.deleting ? positional.slice(1) : ['HEAD'];
+  const planned = sealedRefspecs(env, globalArgs, specs, options, authorized, name);
+  if (planned.problem) return planned;
   const { spawnSync } = require('node:child_process');
   try {
     const root = fs.mkdtempSync(path.join(scratch, 'push-'));
@@ -428,10 +501,6 @@ function sealedPush(env, globalArgs, pushArgs, authorized, scratch) {
     const run = args => spawnSync(git, args, { env: sealed, encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'ignore', 'ignore'] }).status === 0;
     const format = (gitOutput(env, globalArgs, ['rev-parse', '--show-object-format']) || 'sha1').trim();
     if (!/^sha(1|256)$/.test(format) || !run(['init', '-q', '--bare', '--template=', '--object-format=' + format])) return { problem: 'its private git directory cannot be made' };
-    const config = path.join(gitDir, 'config');
-    const set = (key, value) => run(['config', '--file', config, key, value]);
-    if (!set('core.hooksPath', hooks)) return { problem: 'its private git directory cannot be made' };
-    if (name && !(set('remote.' + name + '.url', url) && set('remote.' + name + '.fetch', '+refs/heads/*:refs/remotes/' + name + '/*'))) return { problem: 'its private git directory cannot be made' };
     // The checkout's objects, and its shallow boundary (what a push of a shallow checkout leaves out).
     const place = what => (gitOutput(env, globalArgs, ['rev-parse', '--path-format=absolute', '--git-path', what]) || '').trim();
     const objects = place('objects');
@@ -441,51 +510,36 @@ function sealedPush(env, globalArgs, pushArgs, authorized, scratch) {
     fs.writeFileSync(path.join(gitDir, 'objects', 'info', 'alternates'), [objects, ...more].join('\n') + '\n');
     const shallow = place('shallow');
     if (shallow && fs.existsSync(shallow)) fs.copyFileSync(shallow, path.join(gitDir, 'shallow'));
-    // The refs the push can name, as they are now: HEAD, branches, tags and the destination's remote-tracking refs.
-    const listed = gitOutput(env, globalArgs, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads', 'refs/tags', ...(name ? ['refs/remotes/' + name] : [])]);
-    if (listed === null) return { problem: 'the refs of this checkout cannot be read in full' };
-    const lines = listed.split('\n').filter(Boolean);
-    if (lines.length > MAX_SEALED_REFS) return { problem: 'this checkout has too many refs to copy' };
-    const tracking = new Map();
-    for (const line of lines) {
-      const match = /^([0-9a-f]{40,64}) (refs\/(?:heads|tags|remotes)\/\S+)$/.exec(line);
-      if (!match || match[2].split('/').some(part => part === '' || part === '.' || part === '..')) return { problem: 'a ref of this checkout cannot be copied' };
-      fs.mkdirSync(path.dirname(path.join(gitDir, match[2])), { recursive: true });
-      fs.writeFileSync(path.join(gitDir, match[2]), match[1] + '\n');
-      if (name && match[2].startsWith('refs/remotes/')) tracking.set(match[2], match[1]);
-    }
-    const head = gitOutput(env, globalArgs, ['symbolic-ref', '-q', 'HEAD']);
-    const detached = (gitOutput(env, globalArgs, ['rev-parse', '--verify', '-q', 'HEAD']) || '').trim();
-    if (!head && !detached) return { problem: 'HEAD of this checkout cannot be read' };
-    fs.writeFileSync(path.join(gitDir, 'HEAD'), (head ? 'ref: ' + head.trim() : detached) + '\n');
-    // The push as the private directory will run it must be the push the broker was told about: same commits, refs and branch.
-    const target = name || url;
-    const view = pushReport(sealed, [], [...options.flags, '--', target, ...specs], 'unknown');
-    const same = ['shas', 'refs', 'currentBranch'].every(key => JSON.stringify(view[key] === undefined ? null : view[key]) === JSON.stringify(authorized[key] === undefined ? null : authorized[key]));
-    if (!same || JSON.stringify(view.pushUrls) !== JSON.stringify([url])) return { problem: 'the refs it names are not the ones that the broker was told' };
+    // Read-only from here. A process of the same user can undo that, so it narrows the window and does not close it: what
+    // matters is that the destination, the refs and the lease are in the arguments, and the config holds nothing of them.
+    const config = path.join(gitDir, 'config');
+    fs.chmodSync(config, 0o400);
+    fs.chmodSync(gitDir, 0o500);
+    process.prependOnceListener('exit', () => { try { fs.chmodSync(gitDir, 0o700); } catch {} });
     return {
       args: ['-c', 'core.hooksPath=' + hooks, '-c', 'push.followTags=false', '-c', 'push.recurseSubmodules=no', '-c', 'protocol.ext.allow=never',
-        'push', ...options.flags, '--no-verify', '--no-follow-tags', '--no-recurse-submodules', '--', target, ...specs],
-      env: sealed, gitDir, name, tracking, upstream: options.upstream,
+        'push', ...planned.flags, '--no-verify', '--no-follow-tags', '--no-recurse-submodules', '--', url, ...planned.refspecs],
+      env: sealed, gitDir, name, updates: planned.updates, upstream: options.upstream, dryRun: options.dryRun,
     };
   } catch { return { problem: 'its private git directory cannot be made' }; }
 }
-// What git does for a push to a configured remote, done in the checkout after the sealed push: the remote-tracking refs
-// the push moved, and the upstream that -u records.
-function sealedSync(env, globalArgs, plan) {
+// What git does for a push to a configured remote, done in the checkout after the sealed push (it went to a URL, so git
+// did none of it): the remote-tracking refs of the branches it moved or deleted, and the upstream that -u records.
+function sealedSync(env, globalArgs, plan, code) {
+  try { fs.chmodSync(plan.gitDir, 0o700); } catch {}
+  if (code !== 0 || plan.dryRun || !plan.name) return;
   try {
-    if (plan.name) {
-      const out = gitOutput(plan.env, [], ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/' + plan.name + '/']) || '';
-      const now = new Map();
-      for (const line of out.split('\n')) { const at = line.lastIndexOf(' '); if (at > 0) now.set(line.slice(0, at), line.slice(at + 1)); }
-      let commands = '';
-      for (const [ref, sha] of now) if (plan.tracking.get(ref) !== sha) commands += 'update ' + ref + ' ' + sha + '\n';
-      for (const ref of plan.tracking.keys()) if (!now.has(ref)) commands += 'delete ' + ref + '\n';
-      if (commands) gitRun(env, globalArgs, ['update-ref', '--stdin'], commands);
+    for (const update of plan.updates) {
+      if (!update.destination.startsWith('refs/heads/')) continue;
+      const tracking = 'refs/remotes/' + plan.name + '/' + update.destination.slice(11);
+      gitRun(env, globalArgs, update.sha ? ['update-ref', tracking, update.sha] : ['update-ref', '-d', tracking]);
     }
     if (plan.upstream) {
-      const recorded = gitOutput(plan.env, [], ['config', '--file', path.join(plan.gitDir, 'config'), '--get-regexp', '^branch\\..*\\.(remote|merge)$']) || '';
-      for (const line of recorded.split('\n')) { const at = line.indexOf(' '); if (at > 0) gitRun(env, globalArgs, ['config', line.slice(0, at), line.slice(at + 1)]); }
+      for (const update of plan.updates) {
+        if (!update.local) continue;
+        gitRun(env, globalArgs, ['config', 'branch.' + update.local.slice(11) + '.remote', plan.name]);
+        gitRun(env, globalArgs, ['config', 'branch.' + update.local.slice(11) + '.merge', update.destination]);
+      }
     }
   } catch {}
 }
@@ -890,7 +944,7 @@ async function main() {
   });
   const reviewing = program === 'gh' && args[0] === 'pr' && args[1] === 'review' && args.some(arg => SELF_REVIEW_VERDICTS[arg]);
   let result = sealedPlan ? await run(sealedPlan.args, false, sealedPlan.env) : await run(args, reviewing);
-  if (sealedPlan) sealedSync(env, argv.slice(0, gitAt), sealedPlan);
+  if (sealedPlan) sealedSync(env, argv.slice(0, gitAt), sealedPlan, result.code);
   if (reviewing && result.code !== 0 && /own pull request/i.test(result.stderr)) {
     const fallback = selfReviewFallbackArgs(args, scratch);
     if (fallback) {
