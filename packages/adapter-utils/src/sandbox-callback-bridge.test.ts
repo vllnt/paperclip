@@ -22,6 +22,7 @@ import {
   syncSandboxCallbackBridgeEntrypoint,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
+  SandboxBridgeEnvelopeTooLargeError,
 } from "./sandbox-callback-bridge.js";
 import type { SandboxCallbackBridgeQueueClient } from "./sandbox-callback-bridge.js";
 import { createHttp2BridgeServer } from "./http2-bridge-server.js";
@@ -1629,6 +1630,18 @@ describe("sandbox callback bridge", () => {
     },
   );
 
+  it("bounds a read that passes no limit by the client's default ceiling", async () => {
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner: createExecRunner(),
+      remoteCwd: os.tmpdir(),
+      maxReadBytes: 1_000,
+    });
+    const { filePath: smallPath, content: small } = await writeEnvelopeFixture(900);
+    await expect(client.readTextFile(smallPath)).resolves.toBe(small);
+    const { filePath } = await writeEnvelopeFixture(600_000);
+    await expect(client.readTextFile(filePath)).rejects.toBeInstanceOf(SandboxBridgeEnvelopeTooLargeError);
+  });
+
   it("reads an empty file and still enforces the size limit", async () => {
     const client = createCommandManagedSandboxCallbackBridgeQueueClient({
       runner: createExecRunner(),
@@ -2754,6 +2767,82 @@ describe("sandbox callback bridge", () => {
     expect(writeAttempts).toBeGreaterThanOrEqual(2);
     // The recovery removed the request file only after the 503 write landed.
     expect(requestRemovals).toContain(requestPath);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("answers an oversized queued envelope on the recovery path with 413 without reading it whole", async () => {
+    // The first read hangs, so the loop's request catch runs the recovery pass.
+    // The queued envelope is far over the worker's envelope limit. The recovery
+    // read must pass that limit (an unbounded read would load the whole file),
+    // and the request gets a terminal 413 under its file-name ID.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+    const maxBodyBytes = 1_024;
+    const envelopeLimit = 6 * maxBodyBytes + 64 * 1024;
+    const queueDir = "/virtual-bridge/queue";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-oversized.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+    const oversized = `${JSON.stringify({ id: "spoofed-id", method: "POST", path: "/api/x", query: "", headers: {}, body: "x".repeat(envelopeLimit * 4) })}\n`;
+    const requestBodies = new Map([[requestPath, oversized]]);
+    const readLimits: Array<number | undefined> = [];
+    const responseWrites: Array<{ path: string; status: number; id: string }> = [];
+    let readCalls = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)) : [],
+      readTextFile: async (remotePath, maxBytes) => {
+        readCalls += 1;
+        readLimits.push(maxBytes);
+        if (readCalls === 1) return await new Promise<string>(() => {});
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        // Like the real readers: refuse before loading a file over the limit.
+        if (maxBytes !== undefined && Buffer.byteLength(body) > maxBytes) throw new SandboxBridgeEnvelopeTooLargeError();
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        const parsed = JSON.parse(body.trim());
+        responseWrites.push({ path: remotePath, status: parsed.status, id: parsed.id });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      maxBodyBytes,
+      iterationTimeoutMs: 200,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async () => ({ status: 200, body: "ok" }),
+    });
+
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 3_000);
+
+    expect(readLimits.every((limit) => limit !== undefined && limit <= envelopeLimit)).toBe(true);
+    expect(responseWrites.filter((write) => write.path === responsePath)).toEqual([
+      { path: responsePath, status: 413, id: "req-oversized" },
+    ]);
+    expect(requestBodies.has(requestPath)).toBe(false);
 
     await worker.stop({ drainTimeoutMs: 10 });
   });

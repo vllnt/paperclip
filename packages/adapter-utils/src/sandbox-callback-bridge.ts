@@ -90,6 +90,14 @@ const REMOTE_WRITE_BASE64_CHUNK_SIZE = 32 * 1024;
 // `base64 < file` read of a multi-megabyte request envelope silently lost its
 // head. 512 KiB encodes to about 710 KB of base64 output, under every cap.
 const REMOTE_READ_CHUNK_BYTES = 512 * 1024;
+
+/** A queued envelope larger than the reader's limit; the bridge answers it with 413, never reads it whole. */
+export class SandboxBridgeEnvelopeTooLargeError extends Error {
+  constructor() {
+    super("Bridge envelope exceeded the configured size limit.");
+    this.name = "SandboxBridgeEnvelopeTooLargeError";
+  }
+}
 export const SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT = "paperclip-bridge-server.mjs";
 const SANDBOX_EXEC_CHANNEL_ENV = "PAPERCLIP_SANDBOX_EXEC_CHANNEL";
 const SANDBOX_EXEC_CHANNEL_BRIDGE = "bridge";
@@ -565,7 +573,7 @@ export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallb
       const file = await fs.open(remotePath, "r");
       try {
         const stat = await file.stat();
-        if (stat.size > maxBytes) throw new Error("Bridge envelope exceeded the configured size limit.");
+        if (stat.size > maxBytes) throw new SandboxBridgeEnvelopeTooLargeError();
         const bytes = Buffer.alloc(Math.min(stat.size, maxBytes) + 1);
         let length = 0;
         while (length < bytes.length) {
@@ -676,7 +684,10 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
   remoteCwd: string;
   timeoutMs?: number | null;
   shellCommand?: "bash" | "sh" | null;
+  /** Ceiling for a `readTextFile` call that passes no limit. Defaults to the default envelope limit. */
+  maxReadBytes?: number;
 }): SandboxCallbackBridgeQueueClient {
+  const defaultMaxReadBytes = input.maxReadBytes ?? sandboxBridgeEnvelopeLimit(DEFAULT_BRIDGE_MAX_BODY_BYTES);
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
   const runChecked = async (action: string, script: string) =>
@@ -719,7 +730,9 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const result = await runChecked(`size ${remotePath}`, `wc -c < ${shellQuote(remotePath)}`);
       return Number(result.stdout.trim());
     },
-    readTextFile: async (remotePath, maxBytes) => {
+    readTextFile: async (remotePath, requestedMaxBytes) => {
+      // Never read an unbounded remote file into host memory.
+      const maxBytes = requestedMaxBytes ?? defaultMaxReadBytes;
       // Read in slices. Each command prints one base64 slice and then the
       // file's total size on its own last line, so a slice the provider cut
       // short (from either end) fails here instead of decoding to a corrupt
@@ -737,9 +750,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         if (!Number.isSafeInteger(totalBytes) || totalBytes < 0) {
           throw new Error(`Bridge read of ${remotePath} returned no file size; the provider truncated command output.`);
         }
-        if (maxBytes !== undefined && totalBytes > maxBytes) {
-          throw new Error("Bridge envelope exceeded the configured size limit.");
-        }
+        if (totalBytes > maxBytes) throw new SandboxBridgeEnvelopeTooLargeError();
         const slice = Buffer.from(lines.join("").replace(/\s+/g, ""), "base64");
         const expected = Math.max(0, Math.min(REMOTE_READ_CHUNK_BYTES, totalBytes - offset));
         if (slice.length !== expected) {
@@ -1428,9 +1439,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
       const responsePath = path.posix.join(directories.responsesDir, fileName);
       const requestId = fileName.replace(/\.json$/i, "") || randomUUID();
       let responseId = requestId;
+      let responseStatus = 503;
+      let responseError = message;
       try {
         const raw = await withTimeout(
-          input.client.readTextFile(requestPath),
+          input.client.readTextFile(requestPath, maxEnvelopeBytes),
           iterationTimeoutMs,
           `Sandbox callback bridge read pending request ${requestId}`,
         );
@@ -1439,14 +1452,22 @@ export async function startSandboxCallbackBridgeWorker(input: {
           responseId = parsed.id;
         }
       } catch (error) {
+        if (error instanceof SandboxBridgeEnvelopeTooLargeError) {
+          // An oversized envelope can never be served: answer it with the same
+          // terminal 413 as the request loop, under its file-name request ID,
+          // instead of keeping a file every later pass would refuse again.
+          responseStatus = 413;
+          responseError = "Bridge request envelope exceeded the configured size limit.";
+        } else {
         // The read or the parse failed, most likely on the same dead channel that
         // triggered this recovery. Keep the request file, so a later recovery pass
         // can still read it and deliver a terminal 503. A remove here drops the
         // request and strands the caller until its own deadline.
-        console.warn(
-          `[paperclip] sandbox callback bridge could not read pending request ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        continue;
+          console.warn(
+            `[paperclip] sandbox callback bridge could not read pending request ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          continue;
+        }
       }
       // Write the 503 first, then remove the request file only after the write
       // lands. Retry a transient failure, bounded by the per-iteration timeout,
@@ -1463,9 +1484,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
           await withTimeout(
             writeBridgeResponse(input.client, requestPath, responsePath, {
               id: responseId,
-              status: 503,
+              status: responseStatus,
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ error: message }),
+              body: JSON.stringify({ error: responseError }),
               completedAt: new Date().toISOString(),
             }, {
               requireRequestPath: false,
