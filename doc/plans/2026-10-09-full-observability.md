@@ -1,7 +1,7 @@
 # Full observability: usage, cost, waste, bottlenecks and closed feedback loops
 
 Date: 2026-10-09
-Status: Phase 1 (data inventory and slice plan). No code written yet.
+Status: Phase 1 (data inventory and slice plan) plus Track C (context visibility, section 7.9, slices C1-C5). No code written yet.
 Branch: `feat/full-observability`
 
 ## 1. Goal and constraints
@@ -11,11 +11,12 @@ what every run consumed and what it achieved, per run, routine, agent, issue,
 project and company, so bottlenecks and waste are found from data and every change
 is measured afterwards: **data, finding, decision, change, measured result**.
 
-Why now (operator evidence from anthm, 2026-10-09, not independently measured here):
-about 950 runs a day with about 30% failing in bursts (server restarts, worker disk
-full, restore-lock timeouts, provider quota, Convex `DeploymentQuotaReached`); the
-core skill is about 16k tokens loaded on every run (about 15M tokens a day); no view
-joins agent effort to outcomes (runs, PRs, CI cycles, review rounds, merges).
+Why now (operator reports from a busy production company, not independently measured
+here): hundreds of runs a day with a large share failing in bursts (server restarts,
+worker disk full, restore-lock timeouts, provider quota, external-service quota); a
+large always-loaded skill that every run pays for; no view joins agent effort to
+outcomes (runs, PRs, CI cycles, review rounds, merges), and no view shows how the
+context window fills over a session or what a skill or system prompt costs in it.
 
 Constraints, all binding:
 
@@ -49,9 +50,10 @@ with it is the consumer's responsibility; the export carries ids, numbers and en
   `file:line` from `main` at `a91d77cc4`. Items I could not confirm in code are marked
   **UNVERIFIED**.
 - **Not measured: any live data.** The only local instance (`~/.paperclip/instances/default`)
-  holds zero runs, agents or issues, and I have no access to anthm. The operator's
-  figures (950 runs/day, 30% failed, 15M tokens/day) are cited, not reproduced.
-  Appendix A is a set of 12 read-only SQL queries for the operator to run on anthm;
+  holds zero runs, agents or issues in its database, its on-disk run logs are tiny
+  (no file over 4 KB, none with a usage, compaction or skill marker), and I have no
+  access to a production company. The operator's reports are cited, not reproduced.
+  Appendix A is a set of 12 read-only SQL queries for an operator to run on a real company;
   all 12 were executed against a freshly migrated empty schema to prove they parse and
   every column exists (that proves syntax, not results). **A1, A5 and A7 should run
   before any token rollup is trusted** (section 5).
@@ -102,7 +104,7 @@ with it is the consumer's responsibility; the export carries ids, numbers and en
 - **Human wait:** `issue_thread_interactions.resolved_at - created_at`; indexes are per issue only.
 - **Review rounds (internal):** `issue_execution_decisions` (stage `review|approval`, outcome).
 - **Work products:** `issue_work_products` (`pull_request` type, statuses `merged|closed|...`) with PR state refreshed on read; **`merged_at` is reduced to a boolean and discarded** (`github-external-object-provider.ts:199`). No open or merge timestamps stored. `metadata.git` does not exist on `main`; PR #45 adds it and hides unlinked rows via `linkedWorkProductCondition()`.
-- **GitHub plugin:** the one-minute poll lists issues only and drops PRs (`github.ts:287-290`). PRs arrive only by webhook (`sync.ts:518-563`), which anthm has off. `check_run` payloads are used to find a PR number and the conclusion is dropped. CI checks and reviews are read live for merge gating and never persisted. Runner minutes: no code at all.
+- **GitHub plugin:** the one-minute poll lists issues only and drops PRs (`github.ts:287-290`). PRs arrive only by webhook (`sync.ts:518-563`), which many installs leave off. `check_run` payloads are used to find a PR number and the conclusion is dropped. CI checks and reviews are read live for merge gating and never persisted. Runner minutes: no code at all.
 - **Plugin SDK host APIs:** `ctx.metrics.write` (stored as `plugin_logs` rows with `level='metric'`, not query-friendly), `ctx.telemetry.track` (forwards to the external telemetry client; not persisted), `ctx.entities`, `ctx.db`, `ctx.events.emit`. No outcome-reporting API.
 - **Plugin company scoping is not enforced by the host.** Plugins are instance-wide and `ensurePluginAvailableForCompany` is a documented no-op (`plugin-host-services.ts:803-808`); `ensureCompanyId` only checks the id is present (`:767-770`).
 
@@ -126,7 +128,7 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 | 11 | Per-routine cost and outcome | **Derivable** | routine to issue (`origin_id`) to runs and `cost_events.issue_id`. No endpoint. | Persist `routine_id` on the record, resolved with the existing resolver logic | 1a / 2 |
 | 12 | Issue lifecycle timings (created, first run, in review, done) | **Partial** | See 3.3. In-review needs `activity_log` parsing; `status_decisions` is native-runtime only. | One normalizing reader over `activity_log` (see section 9; no history table exists and none is planned elsewhere). Known shapes: `details.status` with `details._previous.status`, `details.changes.status.{from,to}` (both read by `issue-review-policy.ts`), plus `issue.git_status_automated` rows after #45. Other writers (`issue.stalled_review_decided`, plugin updates) are **not audited**; verify with A12 on real rows | 2 |
 | 13 | External outcomes: PR opened/merged, CI cycles, runner minutes, review rounds | **Missing** | See 3.3. | PR lifecycle timestamps first (3a), then `outcome_events` through a shared plugin host call (3b) | 3 |
-| 14 | Convex deployment outcomes | **Missing** | No Convex plugin on `main` (PR #42 open). | Same host call, after #42 | 3 |
+| 14 | Deploy-platform outcomes (Convex first) | **Missing** | No Convex plugin on `main` (PR #42 open). | Same host call, after #42 | 3 |
 | 15 | Interruptions by cause (deploy, backup, crash) | **Partial** | `server_shutdown_interrupted` (graceful signal, `heartbeat.ts:15348-15431`) versus `process_lost` (`:19524`), `restartKind hot\|hard\|graceful` in the native recovery event. No boot or shutdown record, so deploy vs restart vs crash vs backup cannot be told apart. | `server_boot_events` (instance-level, section 7.6) plus the classifier | 1a / 6 |
 | 16 | Failure cause taxonomy | **Partial** | `error_code` is free text with about 150 distinct literals (reviewer count 153; `heartbeat_runs.ts:68`) and no enum. Liveness is a closed set of 7 (`constants.ts:931-939`). `recovery-observability.ts` has its own cause groups. Convex quota has no code. | Shared closed `RUN_FAILURE_CAUSES` plus a pure classifier (error code, error family, status, signal, stderr excerpt patterns); unmapped codes surfaced | 1a |
 | 17 | Turn count, tool calls, tool errors per run | **Partial** | Native: `tool.execution.*` with duration and exit code in the run log. Gateway tools: `tool_call_events` (row above). Legacy CLI tools: only in UI parsers (`claude-local/ui/parse-stdout.ts:74-117`); pi's server parser discards them. `num_turns` appears nowhere in code; Claude's raw result event, already stored in `result_json`, is expected to carry it (UNVERIFIED, A6). | Count in the adapter parsers; fixture-verify the Claude result keys | 1b-1d |
@@ -143,6 +145,13 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
 | 28 | Interventions (changes tied to measured impact) | **Missing** | No concept. `agent_config_revisions`, `company_skill_versions`, `agent_instruction_revisions` exist as raw material. | Derived "changes" view plus impact on read | 6 |
 | 29 | Privacy | **Gap to avoid** | `adapter.invoke` stores the full `prompt` and `context` in the run log (`claude-local/execute.ts:955-962`); no key rule matches `prompt`. Not copied into the new record. Reported, not fixed here (F2). | Allowlist-only builder | all |
 | 30 | Provider-side retry and no-work runs | **Partial** | Deferral cancellations (`workspace_busy`, `ai_connection_busy`, `heartbeat.ts:16423,16474`) are terminal runs that never started provider work; counting them as "failed runs" overstates failure. | `provider_work_started` flag on the record | 1a |
+| 31 | Context fill per turn (how a session's context grows) | **Missing** | The server parser keeps only the final usage (`claude-local/parse.ts:76-89` ignores per-assistant-message `usage`); the UI parser reads result-level usage only (`ui/parse-stdout.ts:125-128`). ACP `usage_update` (`used`, `size`) is shown live (`TaskChatUsageReadout.tsx:11-13`); whether it is persisted is **UNVERIFIED**. Native and Codex events carry cumulative and run-delta spend, not fill (`runnerd-codex-transport.ts:1706-1709`). | Per-adapter pure `parseContextSamples` over the stored NDJSON, on read (7.9) | C1 |
+| 32 | Compaction and truncation events | **Partial** | Runner emits `context.compacted` v1 with `reason`, `preTokens`, `postTokens`, `sameSession` (`provider-events.ts:755-764`). Claude's documented `system` / `compact_boundary` (`compact_metadata.trigger`, `pre_tokens`) has no handler anywhere in the repo. | Parse both into the context record and timeline | C1 |
+| 33 | Model context window | **Partial** | Only ACP `size` is seen. Claude `modelUsage[].contextWindow` is **UNVERIFIED** (no fixture). | Store when reported, else `unknown`; never guess a window | C1 |
+| 34 | Context composition at invoke time | **Partial** | Claude records `promptMetrics` chars (bootstrap, wake, handoff, task context, heartbeat prompt) in `adapter.invoke` (`claude-local/execute.ts:923-961`, `adapter-utils/types.ts:159`). Instructions and skill-listing sizes are not recorded. Instructions are injected only on a fresh Claude session (`execute.ts:931`). | One `context.composition` run event at invoke, estimated tokens (7.9) | C1 |
+| 35 | Skill impact on context | **Missing** | Footprint (row 21) lists skills but no token size and no load counts. UI knows a `Skill` tool name (`tool-taxonomy.test.ts:97`); the server does not count it. | Token sizes from the #51 counter; loads counted by the worker | C3 |
+| 36 | System-prompt impact per agent | **Missing** | `agent_instruction_revisions` holds the content; nothing measures it against context or cost. | Baseline budget and share of first-turn context | C2 |
+| 37 | Token delta on instruction, skill and model changes | **Missing** | Audit actions exist (`agent.instructions_*`, `agent.skills_synced`, `agent.updated`, `agent.config_rolled_back`, `company.skill_version_created\|updated\|file_updated`) with no size information. | Delta computed on read from revision rows | C4 |
 
 ## 5. Data-quality findings to settle before any rollup is trusted
 
@@ -155,7 +164,7 @@ Verdicts: **Missing** (no source), **Partial** (some source, wrong shape or loss
    (`paperclip-runner/src/drivers/codex/codex-usage-baseline.ts:1-45`). The token plan
    observed one reused session's counter growing across 3,607 runs. If the CLI is
    cumulative on resume, **Codex token totals are overcounted** for every resumed
-   session, on anthm too. Appendix A7 answers this directly (about 100% non-decreasing
+   session, on any install that resumes Codex sessions. Appendix A7 answers this directly (about 100% non-decreasing
    pairs per session means cumulative; about 50% means per-run). Until then the record
    marks Codex rows `usage_quality='declared'` and panels show a caveat. If A7 shows
    cumulative, the parser basis is fixed in its own bug-fix PR with a regression test,
@@ -277,7 +286,7 @@ Deploy vs restart vs crash vs backup needs an outside marker: 7.6.
 
 ### 7.4 Query service first, rollups only when evidence demands them
 
-At about 950 runs a day a company produces about 350,000 rows a year, and the stated
+At 1,000 runs a day a company produces about 365,000 rows a year, and the stated
 scale target is millions. Hourly and daily views are `date_trunc` queries over the record
 behind the same API contract. Plan: slice 2 ships the query service with the index plan
 and records `EXPLAIN (ANALYZE)` for every panel query against a synthetic 5-million-row
@@ -304,7 +313,7 @@ Phased: **3a** persists PR lifecycle timestamps on the work product through the 
   - `ctx.outcomes.report(event)` for `ci.run.completed`, `review.submitted`, `deployment.completed`, in the same SDK change.
   - PR events use **per-kind idempotency keys** (`repo#number:opened`, `:merged`, `:closed`, `:head:<sha12>`), not one key per snapshot, so a repeated or later snapshot of the same PR is a no-op.
 - **Company scoping is not enforced by the plugin host** (3.3). The `companyId` in a plugin payload is plugin-supplied and unchecked. The outcome handler must (1) require the capability, (2) verify the company exists, (3) verify every `issue_id` and `run_id` in the event belongs to that company (the host has an `inCompany` pattern at `:827`) and reject on mismatch, and (4) bound every field. Panels stay company-filtered regardless. Residual risk, stated plainly: a trusted instance-level plugin can still inject false events for an issue it names correctly; every event carries its `source` plugin id so the panel can show provenance. The Linear-grade link handler applies the same checks (agreed).
-- **GitHub on anthm (no webhooks):** the PR listing does not exist on `main` (`github.ts:287-290` drops PRs). The Linear-grade session owns writing it (ETag per repo and page, cached in plugin state) in the `github-sync` job and messages before the first edit to `sync.ts`. I add check-run fetching on top, only for PRs whose head moved. If the outcome work lands first, they reuse mine. CI cycles = distinct completed workflow runs per PR; runner minutes from the run timing endpoint where the repo uses hosted runners (**UNVERIFIED** for anthm's runners).
+- **GitHub without webhooks:** the PR listing does not exist on `main` (`github.ts:287-290` drops PRs). The Linear-grade session owns writing it (ETag per repo and page, cached in plugin state) in the `github-sync` job and messages before the first edit to `sync.ts`. I add check-run fetching on top, only for PRs whose head moved. If the outcome work lands first, they reuse mine. CI cycles = distinct completed workflow runs per PR; runner minutes from the run timing endpoint where the repo uses hosted runners (**UNVERIFIED** for self-hosted runners).
 - **Merge-time fix** (`github-external-object-provider.ts:199` discards `merged_at`): PR #45 edits the same `pullRequestSnapshot` data and `PullRequestMergeDetails`, so 3a waits and rebases on #45.
 - **Work-product reads** (linked PRs per issue) count only rows where `linkedWorkProductCondition()` holds (added by #45, which hides unlinked rows).
 - **Efficiency metrics** attribute to a merged PR the runs on its issue up to `merged_at`: tokens per merged PR, runs per merged PR, CI cycles per PR, review rounds per PR, merges per hour. Sub-issue trees reuse the existing tree recursion in a later pass.
@@ -347,6 +356,74 @@ Instance setting with defaults: records 400 days, `server_boot_events` kept. A d
 - A canary test puts unique strings in the prompt, context, stdout, stderr, instruction text and skill content, runs the builder and the worker, and asserts none appears in any new table or in `result_json.observability`.
 - A column-contract test fails if any new text column lacks a closed enum or the identifier charset and length cap.
 
+### 7.9 Track C: context visibility (sessions, composition, skills, system prompts)
+
+Requirement (operator, 2026-10-09): see how each session's context changes over turns,
+what a skill adds to context, and what an agent's system prompt costs in tokens and
+context, in the web UI, through the API and through the CLI.
+
+**Three quantities, never mixed.**
+
+- *Spend*: tokens billed for a run. Already in the usage record.
+- *Context fill*: tokens in the model's window at one API turn, that turn's `input + cache_read + cache_write`. Per turn; it peaks, and compaction lowers it.
+- *Composition*: what the always-loaded part of the context is made of at invoke time (instructions, skill listing, wake and task prompt, session handoff). Measured by estimate.
+
+**One counter, named and flagged.** The only counter is `estimateTokens` in
+`packages/skills-catalog/src/skill-quality-text.ts` (lean-skills PR #51): UTF-8 bytes
+divided by 4, rounded. It is an **estimate, not a tokenizer**. Every number from it is
+stored and returned with `basis: "estimated"` and `tokenizer: "bytes_div_4"`; every number
+a provider reported is `basis: "reported"`. The two are never summed into one field. #51
+exports `checkSkillQuality` (whose `metrics.estimatedTokens` counts the whole SKILL.md) but
+does not export `estimateTokens` from the package index. Composition needs per-file and
+description-only counts, so I ask lean-skills for a one-line index export rather than copy
+the function (section 9). The `countTokens` option of the quality check and the
+`tokenizer` field already leave room for a real tokenizer later (D9). The reader sees how
+good the estimate is: `calibration = median(reported first-turn context / estimated
+composition)` per adapter and model, computed on read from two stored fields.
+
+**Sources by adapter.** Only what the repo or the vendor documents is claimed; the rest is
+marked, and the first step of C1 is to capture real fixtures that settle it.
+
+| Adapter lane | Context fill per turn | Compaction | Window | Status |
+|---|---|---|---|---|
+| `claude_local` | `assistant` events carry `message.usage` (documented `BetaMessage`). One API turn can emit several assistant events that share `message.id`, so dedupe by id. | `system` / `compact_boundary` with `compact_metadata {trigger: manual\|auto, pre_tokens}` (documented) | `modelUsage[].contextWindow` (**UNVERIFIED**) | **UNVERIFIED in this repo**: no fixture, the parser ignores per-message usage, and no local run log holds one |
+| ACPX and ACP lanes | `usage_update` status events: `used`, `size` | none seen | `size` | live in the UI; persistence in the run log **UNVERIFIED** |
+| `paperclip_runner` (native) | spend deltas only (`usage.reported`: `cumulative`, `runDelta`) | `context.compacted` v1: `reason`, `preTokens`, `postTokens`, `sameSession` | not carried | spend and compaction available, fill is not |
+| `codex_local` CLI | `turn.completed` totals only | none parsed | none | spend only |
+| gemini, cursor, opencode, pi, kimi, hermes, openclaw | none per turn | none | none | `none` |
+
+The API returns `availability` (`full` fill and window, `partial` fill without window or
+compaction, `spend_only`, `none`) and a closed-enum `reason`. An unsupported adapter reads
+"not available for this adapter", never an empty chart that looks like zero.
+
+**Storage.**
+
+- **Timeline: not stored.** Derived on read from the run's NDJSON through an optional pure per-adapter `parseContextSamples(lines)` (numbers and enums only), capped at 2,000 points and downsampled. If the log was pruned (section 9) the response says `log_pruned`.
+- **Summary: sibling table `run_context_records`**, one row per run: `company_id`, unique `run_id`, `agent_id`, `finished_at` (as in 7.1), its own `schema_version`, `adapter_type`, `model`, `availability`, `window_tokens`, `turns`, `first_turn_context_tokens`, `peak_context_tokens`, `final_context_tokens`, `compactions_auto`, `compactions_manual`, `session_resumed`, `composition` (jsonb, at most 40 parts: kind enum, tokens, count, `ref` = `skillKey@versionId` or revision id) and `skill_loads` (jsonb, at most 50). The **same worker pass** as 7.2 writes it (same lock, lookback, settle delay, backfill and `--rederive`). It is a separate table with its own `schema_version` so adding context fields never bumps the usage record's version, which would move the prune-guard constant in section 9. Retention follows 7.7. The privacy canary and column-contract tests of 7.8 cover it.
+- **Composition is captured at invoke time**, once, fail-open, as one `context.composition` row through the existing `appendRunEvent`, just before `adapter.invoke` (about `heartbeat.ts:23651`). It cannot be derived afterwards because the instructions bundle and skill set may change before the worker runs. Parts: `instructions` (bytes of the resolved bundle files, revision id), one `skill_listing` part per skill (`skillKey@versionId`, description tokens, always loaded), and the adapter's existing numeric `promptMetrics` (bootstrap, wake, handoff, task context, heartbeat prompt; flagged as character-based). The worker reads an allowlist of numeric keys only; the full prompt that `adapter.invoke` also carries (F2) is never read. The event is added to the allowlist in `doc/run-log-events.md`. One extra append per run is small next to the hundreds a native run already writes; each append locks the run row, which the C1 test measures.
+- **Fresh versus resumed sessions.** Claude injects the instructions file only on a fresh session (`execute.ts:931`), and later turns read it back from cache. `session_resumed` is stored, so the system-prompt cost view counts the write on fresh sessions and the cheaper read on resumed ones, instead of charging every run the same.
+- Runs from before this ships have no composition event. Their `availability` shows what can still be derived (`spend_only`); nothing is invented.
+
+**Skill impact** (C3), per `skillKey@versionId`, from records and the revision tables, never from content:
+
+- *Always-on tokens*: the description in the listing (estimate).
+- *On-demand tokens*: the body plus the reference files that were loaded (estimate over the version's files).
+- *Loads*: `Skill` tool calls counted by the worker from the NDJSON through the adapter parser (the tool name exists in the UI taxonomy; the input key is **UNVERIFIED** until fixtures exist).
+- *Runs exposed* and *share*: always-on tokens divided by the run's reported first-turn context.
+- *Version-change delta*: estimator over consecutive `company_skill_versions`, plus the read-time before/after comparison of 7.6 (equal windows, minimum sample, overlapping changes listed as confounders). It never claims causality.
+
+**System-prompt impact** (C2), per agent: instruction tokens (estimate, from the revision each run used), the **baseline budget** (instructions, skill listing and fixed wake preamble; mean of recent composition events), its share of reported first-turn context, and a run-cost allocation `run cost × share` labeled `estimated` because it is an allocation, not a measurement. Trend by day.
+
+**Audit token deltas** (C4): for the existing actions `agent.instructions_bundle_updated`, `agent.instructions_file_updated`, `agent.instructions_file_deleted`, `agent.instructions_path_updated`, `agent.skills_synced`, `agent.updated` (model or adapter keys), `agent.config_rolled_back` (`routes/agents.ts`) and `company.skill_version_created`, `company.skill_updated`, `company.skill_file_updated` (`routes/company-skills.ts`), return `contextDelta {beforeTokens, afterTokens, delta, basis}` computed **on read** from `agent_instruction_revisions`, `agent_config_revisions` and the skill version rows. A model or adapter change shows the old and new window where known. There is no write-path change in the 20-plus activity writers and no stored delta to go stale. How an activity row maps to its revision (an id in `details`, or agent id plus `created_at`) is read from the writers first in C4 and is its first open item.
+
+**Surfaces and permissions** (parity in section 8). The run context follows the run-read check (same company; the check `GET /heartbeat-runs/:id` uses). The agent budget and skill impact aggregate across runs, so they use the shared guard of 7.8. Every response carries counts, enums and ids only.
+
+**Deliberately not in v1.**
+
+- Claude's exact `/context` report (`SDKContextUsage`: categories, per-skill tokens, memory files, MCP tools). Anthropic computes it with token-counting requests that do not appear in the message stream, and it exists only when `/context` is issued. An opt-in, sampled probe is D10.
+- Codex per-turn fill: the normalized usage event has no last-turn usage or window (`runnerd-codex-transport.ts:1706-1709`). Adding them is a runner protocol change with Rust-side schema and validators, so it is the linked follow-up C5 (D11).
+- Splitting growth into tool results, comments and history: providers do not report it. Growth between consecutive turns minus that turn's output approximates tool results and new messages (row 18), as a later pass.
+
 ## 8. Slice plan (stacked PRs)
 
 Stack order is the dependency order. Each PR is independently reviewable, carries its
@@ -370,6 +447,11 @@ no run-path change**.
 | **3c / 5b** | Bottlenecks, Efficiency panels, each in the PR that adds its API | 3a / 3b | M each |
 | **6** | **Changes view + impact on read + Jev export + anomaly flags;** `server_boot_events` and the AGENTS.md exception | 2 (3a/3b for outcome metrics) | L |
 | **7 (optional)** | Worker free-bytes sampling at the existing `statfsSync` point and workspace bytes; tokens-per-tool-result approximation | operator go-ahead (D5), #44 | M |
+| **C1** | **Run context (Track C, 7.9):** first step is to capture real fixtures (Appendix B) and settle the UNVERIFIED rows; `run_context_records` (migration), the `context.composition` invoke event, the worker pass, `parseContextSamples` for Claude, ACP/ACPX and runner events, `GET /heartbeat-runs/:runId/context`, `paperclipai run context <runId>`, and the Context section on run detail (timeline chart, compactions, peak against window, composition). All three surfaces in this PR. | 1a, 2 (guard, parity test) | L |
+| **C2** | **Agent context budget:** `GET /agents/:agentId/context-budget`, `paperclipai agent context-budget <agentId>`, an AgentDetail card (baseline budget, share of first-turn context, cost allocation, estimator calibration, trend). | C1 | M |
+| **C3** | **Skill impact:** `GET /companies/:companyId/skills/:skillId/impact`, `paperclipai skill impact <skillId>`, a skill-page panel (always-on, on-demand, loads, version-change delta). | C1, lean-skills #51 (`estimateTokens` export) | M |
+| **C4** | **Audit token deltas:** `contextDelta` on activity entries and on `GET /changes` rows for instruction, skill-version, skill-sync and model or adapter changes; Audit hub badge; the CLI prints it. The before/after impact join stays in 6. | C2, C3 (shared estimator helper) | M |
+| **C5 (linked follow-up)** | Codex per-turn context fill (last-turn usage and window in the runner's usage event, schema and validators); Claude `/context` probe if D10 is accepted. | C1, D10, D11 | M |
 
 Parity contract per panel (API is the source; CLI and UI are thin):
 
@@ -384,6 +466,12 @@ Parity contract per panel (API is the source; CLI and UI are thin):
 | Bottlenecks (queue, lock, status time, CI, review) | `GET /bottlenecks` | `bottlenecks` | 3b |
 | Changes and impact | `GET /changes`, `GET /changes/:id/impact` | `changes`, `impact` | 6 |
 | Jev export | `GET /export` | `export` | 6 |
+| Run context (timeline, compactions, composition); UI: run detail, Context section | `GET /heartbeat-runs/:runId/context` | `run context <runId>`, next to `run events` and `run log` (`cli/src/commands/client/run.ts`) | C1 |
+| Agent context budget; UI: AgentDetail card | `GET /agents/:agentId/context-budget` | `agent context-budget <agentId>` | C2 |
+| Skill impact; UI: skill page panel | `GET /companies/:companyId/skills/:skillId/impact` | `skill impact <skillId>` | C3 |
+| Token delta on audit entries; UI: Audit hub badge | `contextDelta` field on the activity list and `GET /changes` | `changes` and `activity` print it | C4 |
+
+The Track C routes (full paths, not under the `/companies/:companyId/observability` prefix in the header) sit next to the resource they describe (run, agent, skill), not under `/observability`, because that is where a reader already is and where permissions already apply. The OpenAPI route test and the parity test of PR 2 cover them. The CLI already has an unrelated top-level `context` command (`cli/src/commands/client/context.ts`, the client profile); the new subcommands do not collide with it.
 
 Every CLI command accepts `--json` and date filters (the existing `cost` CLI lacks them, a known gap not repeated here). The health status appears as a chip in the Usage panel so it has a UI client.
 
@@ -403,6 +491,9 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 | **Jev session** | judgement on top of this data | Export contract in 7.6; ids, numbers and enums only. I could not map the Jev session id to a live session, so no message was sent. |
 | **Migrations** | `0296` is claimed twice (#40 `0296_clear_lord_tyger`, #31 `0296_tricky_unicorn`) | Mine take the next free number at rebase and are regenerated then; the SQL is additive and uses `IF NOT EXISTS`, so reordering is safe. |
 | **Adding MCP tools** | fails the production image check (capability contract needs the external corpus) | No MCP tools; agents use the REST API and CLI. |
+| **Lean-default-skills, PR #51 (Track C)** | the token counter: `estimateTokens` (bytes / 4) in `skill-quality-text.ts`, not exported from `packages/skills-catalog/src/index.ts`; `checkSkillQuality` is exported | Ask them for a one-line index export of `estimateTokens`. Until it lands, C3 waits; if they decline, C3 adds that one export after #51 merges. No second counter, no copy. I edit none of their files before then. |
+| **Session-warehouse track (Track C)** | the prune guard in the row above | Track C also consumes run events and NDJSON (`context.composition`, per-turn usage, `context.compacted`). Add a second constant `RUN_CONTEXT_RECORD_EVENTS_CONSUMED_VERSION` (exported with the first); a run finished after C1 ships may be pruned only when its `run_context_records` row is at that version, or when it has no composition event. After pruning, the timeline answers `log_pruned` by design. `run_context_records` can join the archive as a second entity file (`kind: "observability.context_record"`) through `listContextRecordsAfter`, shipped in C1; their choice. |
+| **Runner protocol (`packages/paperclip-runner`)** | the normalized usage event lacks last-turn usage and window | Only C5 touches it, with the schema, validators and Rust side together. Not in C1-C4. |
 
 ## 10. Verification per slice
 
@@ -413,6 +504,14 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 - **Reconciliation:** over a backfilled window, `sum(cost_micros) / 10000` matches `sum(cost_cents)` of `cost_events` within rounding, and token sums match `usage_json` normalized totals; differences are reported by the backfill, not hidden.
 - **UI:** real browser at desktop and mobile widths, zero console errors, `pnpm check:token-gates`, `DESIGN.md` token-only rule.
 - **Scale:** `EXPLAIN (ANALYZE)` on each panel query against a synthetic 5M-row record table in a throwaway embedded database.
+- **Track C:**
+  - Per-adapter `parseContextSamples` from captured real fixtures: dedupe by `message.id`, compaction rows, window, and the `availability` degrade path when per-message usage is absent.
+  - `context.composition` is bounded, numeric, fail-open and passes the canary (a prompt-only string never reaches the event or either table). A measurement of the extra append's lock cost on a native-sized run.
+  - The worker pass writes `run_context_records` idempotently; version replace and `--rederive` behave as for the usage record.
+  - Estimator identity: the server imports the skills-catalog function and a test asserts one implementation (no `/ 4` byte counter elsewhere).
+  - Each of the four Track C routes: two-company isolation, agent-within-permission read, and CLI mocked-fetch tests for URL and flags.
+  - Audit deltas: for each listed action, before and after tokens match a hand-computed fixture, including a delete and a model change.
+  - UI: desktop and mobile, zero console errors, `pnpm check:token-gates`, empty, unavailable (`none`, `log_pruned`) and loading states each have a visible message.
 - Local gaps on this host (no `cargo`, so no full build; known pre-existing failures) are recorded in `local-test-setup` and will be reported, not hidden.
 
 ## 11. Decisions for the operator
@@ -422,15 +521,18 @@ Every CLI command accepts `--json` and date filters (the existing `cost` CLI lac
 | D1 | Retention default: records 400 days | Accept. Cheap, and covers a year-over-year view without rollups. |
 | D2 | Shared host call with the Linear-grade track | **Settled** with that session (7.5). |
 | D3 | Add a versioned price catalog for an "API-equivalent" dollar estimate (Codex cost is always null today)? | Yes, small and flagged `estimated`; tokens stay the primary metric. Without it, Codex cost panels are blank. |
-| D4 | GitHub polling load on anthm (PR list plus check-runs, conditional requests) | Accept with a per-repo budget and a visible "last synced" in the panel. |
+| D4 | GitHub polling load (PR list plus check-runs, conditional requests) | Accept with a per-repo budget and a visible "last synced" in the panel. |
 | D5 | Worker disk sampling (PR 7): wanted now? | After PR 2. The classifier already names disk failures; sampling adds the early warning at a point (`workspace-manifest.ts:15-26`) that already checks free space. |
-| D6 | Build materialized rollups now (as originally asked) or gate them on `EXPLAIN` evidence at 5M rows? | Gate on evidence. 350k rows a year per company does not need them, and the design requirements are written down (7.4) for when it does. Say so if you want them built regardless. |
+| D6 | Build materialized rollups now (as originally asked) or gate them on `EXPLAIN` evidence at 5M rows? | Gate on evidence. About 365k rows a year per busy company does not need them, and the design requirements are written down (7.4) for when it does. Say so if you want them built regardless. |
 | D7 | Interventions as a table now, or derived from existing revision tables? | Derived first (7.6); add the table only for manual entries or frozen results. |
-| D8 | Codex usage basis: run A7 on anthm first. If cumulative, fix the parser basis as its own bug-fix PR before showing Codex rollups without a caveat. | Run A7 this week; it decides whether anthm's Codex token totals are inflated. |
+| D8 | Codex usage basis: run A7 on a production company first. If cumulative, fix the parser basis as its own bug-fix PR before showing Codex rollups without a caveat. | Run A7 this week; it decides whether Codex token totals are inflated. |
+| D9 | Token counter for Track C: keep the shared bytes / 4 estimate (flagged `estimated`, with a calibration metric against provider-reported tokens), or add a real tokenizer dependency? | Keep the estimate. No new dependency, and the calibration metric shows its error from real data. Revisit only if calibration is poor. |
+| D10 | Claude exact `/context` probe (per-category and per-skill tokens from the provider): add an opt-in, sampled probe per agent? | Defer. It adds a step to sampled runs and exists only on request; ship the estimate and calibration first (C5 if wanted). |
+| D11 | Codex per-turn context fill needs last-turn usage and window in the runner's usage event (a protocol change across Rust and TypeScript). | Separate follow-up (C5) after C1 shows the gap on real data; do not widen C1. |
 | F1 | Follow-up (not in this feature): retention for `heartbeat_run_events` and NDJSON logs, which grow without bound | **Handed to the session-warehouse track** as an opt-in "prune after verified archive" step, with the guard in section 9. Not pruning on the strength of "a record exists": 1b and 1d read `adapter.invoke`, `usage.reported` and `run.performance.span` events, so only a record at the event-consuming schema version makes them safe to delete. |
 | F2 | Follow-up: `adapter.invoke` persists prompt and context in the run log | Separate privacy issue; this feature does not depend on it. |
 
-## Appendix A. Read-only measurement queries for anthm
+## Appendix A. Read-only measurement queries for a production company
 
 Run on the production database with a read-only role. All are `SELECT` only and
 return counts and distributions, never content. Use the results to confirm
@@ -448,7 +550,7 @@ from heartbeat_runs r join agents a on a.id = r.agent_id
 where r.created_at > now() - interval '7 days'
 group by 1 order by 2 desc;
 
--- A2. Daily run volume and failure share (checks "~950 runs/day, ~30% failed")
+-- A2. Daily run volume and failure share (checks the reported volume and failure rate)
 select date_trunc('day', created_at) d, count(*) runs,
        count(*) filter (where status in ('failed','timed_out')) failed,
        count(*) filter (where status = 'interrupted') interrupted,
@@ -539,3 +641,36 @@ where entity_type = 'issue' and created_at > now() - interval '14 days'
   and ((details ? 'status') or ((details -> 'changes') ? 'status') or ((details -> '_previous') ? 'status'))
 group by 1, 2, 3, 4 order by n desc;
 ```
+
+## Appendix B. Read-only shape checks on the run-log directory (Track C)
+
+These settle the rows marked UNVERIFIED in 7.9 before C1 writes a parser. They print
+**counts of files only**, never content. Run them on a production company's run-log
+directory (`RUN_LOG_BASE_PATH`, default `<instance>/data/run-logs`). `-uu` is needed because
+ignore files can hide the logs.
+
+```sh
+cd "$RUN_LOG_BASE_PATH"
+for p in 'cache_read_input_tokens' 'cache_creation_input_tokens' 'compact_boundary' \
+         'contextWindow' 'usage_update' 'context.compacted' 'token_count'; do
+  printf '%s: ' "$p"; rg -uu -l -F "$p" . | wc -l
+done
+printf 'Skill tool_use: '; rg -uu -l -F 'name\":\"Skill\"' . | wc -l
+```
+
+What each count decides:
+
+| Marker | Decides |
+|---|---|
+| `cache_read_input_tokens` or `cache_creation_input_tokens` in files that also hold `"type":"assistant"` events | Claude per-message usage is in the stored stream, so the context timeline is derivable for `claude_local` |
+| `compact_boundary` | Claude compaction rows exist in practice |
+| `contextWindow` | the window is available from the result event |
+| `usage_update` | ACP context fill is persisted, not only live |
+| `context.compacted` | runner compaction events are persisted |
+| `token_count` | any Codex per-turn signal is stored |
+| `Skill` tool_use | skill loads are countable, and the input key is then read from one fixture |
+
+A zero for a marker means that signal is `spend_only` or `none` for that adapter until an
+adapter change adds it; the API reports that through `availability`, not as an empty chart.
+On the development machine that wrote this plan every marker returned 0, but its logs are
+tiny (no file over 4 KB), so that result proves nothing about production.
