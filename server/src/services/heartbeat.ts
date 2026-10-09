@@ -16915,17 +16915,44 @@ export function heartbeatService(
   }
 
   /**
-   * The runs `maxDailyRuns` counts for a company: started in the current UTC
-   * day and no longer queued or waiting to retry. The cap check and the run
-   * stats both use it, so they never disagree.
+   * The single definition of how many runs `maxDailyRuns` counts, per agent,
+   * in one UTC day. The cap check (`getHeartbeatDailyCapBlock`) and the run
+   * stats (`runStats`) both call it, so what automation reads from the stats
+   * is exactly what the cap enforces. Any exemption from the count (a run the
+   * cap should not charge) belongs here and nowhere else.
+   *
+   * Counted: runs started in the day that are not queued or waiting to retry.
+   *
+   * @param companyId - the company whose runs are counted.
+   * @param options.agentId - count one agent; omit to count every agent that has runs.
+   * @param options.excludeRunId - a run to leave out (the run being admitted).
+   * @param options.window - the UTC day; defaults to the current one.
+   * @returns counted runs per agent ID; an agent with none is absent.
    */
-  function dailyRunCapConditions(companyId: string, window = currentUtcDayWindow()) {
-    return [
+  async function computeDailyRunUsage(
+    companyId: string,
+    options: {
+      agentId?: string;
+      excludeRunId?: string | null;
+      window?: { start: Date; end: Date };
+    } = {},
+    client: Pick<Db, "select"> = db,
+  ): Promise<Map<string, number>> {
+    const window = options.window ?? currentUtcDayWindow();
+    const conditions = [
       eq(heartbeatRuns.companyId, companyId),
       gte(heartbeatRuns.startedAt, window.start),
       lt(heartbeatRuns.startedAt, window.end),
       notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
+      ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
     ];
+    const rows = await client
+      .select({ agentId: heartbeatRuns.agentId, total: sql<number>`count(*)::integer` })
+      .from(heartbeatRuns)
+      .where(and(...conditions))
+      .groupBy(heartbeatRuns.agentId);
+    return new Map(rows.map((row) => [row.agentId, Number(row.total)]));
   }
 
   async function getHeartbeatDailyCapBlock(
@@ -16942,18 +16969,12 @@ export function heartbeatService(
     const checkCostCap = options.checkCostCap ?? true;
     const { start, end } = currentUtcDayWindow();
     if (checkRunCap && policy.maxDailyRuns !== null) {
-      const conditions = [
-        ...dailyRunCapConditions(agent.companyId, { start, end }),
-        eq(heartbeatRuns.agentId, agent.id),
-      ];
-      if (options.excludeRunId) {
-        conditions.push(sql`${heartbeatRuns.id} <> ${options.excludeRunId}`);
-      }
-      const [row] = await client
-        .select({ total: sql<number>`count(*)::integer` })
-        .from(heartbeatRuns)
-        .where(and(...conditions));
-      const observed = Number(row?.total ?? 0);
+      const usage = await computeDailyRunUsage(
+        agent.companyId,
+        { agentId: agent.id, excludeRunId: options.excludeRunId, window: { start, end } },
+        client,
+      );
+      const observed = usage.get(agent.id) ?? 0;
       if (observed >= policy.maxDailyRuns) {
         return {
           reason: "heartbeat.daily_run_limit",
@@ -30932,7 +30953,7 @@ export function heartbeatService(
         ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
       ];
       const capWindow = currentUtcDayWindow();
-      const [statusRows, errorRows, todayRows, agentRows] = await Promise.all([
+      const [statusRows, errorRows, runsToday, agentRows] = await Promise.all([
         db
           .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, count: sql<number>`count(*)::integer` })
           .from(heartbeatRuns)
@@ -30945,16 +30966,7 @@ export function heartbeatService(
           .groupBy(heartbeatRuns.errorCode)
           .orderBy(desc(sql`count(*)`), asc(heartbeatRuns.errorCode))
           .limit(20),
-        db
-          .select({ agentId: heartbeatRuns.agentId, count: sql<number>`count(*)::integer` })
-          .from(heartbeatRuns)
-          .where(
-            and(
-              ...dailyRunCapConditions(companyId, capWindow),
-              ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
-            ),
-          )
-          .groupBy(heartbeatRuns.agentId),
+        computeDailyRunUsage(companyId, { agentId: input.agentId, window: capWindow }),
         db
           .select()
           .from(agents)
@@ -30996,7 +31008,6 @@ export function heartbeatService(
         addCounts(agentCounts, row.status, count);
         perAgent.set(row.agentId, agentCounts);
       }
-      const runsToday = new Map(todayRows.map((row) => [row.agentId, Number(row.count)]));
 
       const agentStats = agentRows
         .filter((agent) => agent.status !== "terminated" || perAgent.has(agent.id))

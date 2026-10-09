@@ -6886,7 +6886,8 @@ registry.registerPath({
   summary: "List heartbeat runs for a company",
   description:
     "Newest first. `status` and `errorCode` take comma-separated values. `since` and `until` (ISO 8601) bound the " +
-    "run's creation time; `until` is exclusive. `limit` is 1-1000. `summary=true` returns lighter rows.",
+    "run's creation time; `until` is exclusive, and an empty or inverted window returns 400. `limit` is 1-1000. " +
+    "`summary=true` returns lighter rows.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: z.object({
@@ -6909,8 +6910,9 @@ registry.registerPath({
   summary: "Get heartbeat run stats and daily cap usage for a company",
   description:
     "Counts runs created in the window (default: the last 24 hours, at most 90 days) by status, the top error " +
-    "codes, and for each agent its runs today against `runtimeConfig.heartbeat.maxDailyRuns`. `runsToday` counts " +
-    "exactly what the cap counts: runs started in the current UTC day that are not queued or waiting to retry.",
+    "codes, and for each agent its runs today against `runtimeConfig.heartbeat.maxDailyRuns`. `runsToday` is the " +
+    "value the daily cap itself compares against the limit (one shared function), so `capReached` matches whether " +
+    "the next wake is allowed.",
   request: { params: z.object({ companyId: z.string() }), query: heartbeatRunStatsQuerySchema },
   responses: { 200: r.ok(heartbeatRunStatsSchema), 400: r.badRequest, 401: r.unauthorized },
 });

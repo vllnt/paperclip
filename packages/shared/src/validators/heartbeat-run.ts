@@ -21,8 +21,11 @@ const isoDateTime = z.string().datetime({ offset: true });
 
 /**
  * Filters for `GET /api/companies/:companyId/heartbeat-runs`. `since` and
- * `until` bound the run's creation time. `limit` and `summary` keep their
- * existing lenient parsing in the route, so unknown keys pass through.
+ * `until` bound the run's creation time as the half-open window
+ * `[since, until)`. A window that is empty or inverted is a 400, not an empty
+ * result: `--since <future> --until <past>` must not read as "no failures".
+ * `limit` and `summary` keep their existing lenient parsing in the route, so
+ * unknown keys pass through.
  */
 export const heartbeatRunListQuerySchema = z
   .object({
@@ -32,7 +35,16 @@ export const heartbeatRunListQuerySchema = z
     since: isoDateTime.optional(),
     until: isoDateTime.optional(),
   })
-  .passthrough();
+  .passthrough()
+  .superRefine((value, ctx) => {
+    if (value.since && value.until && new Date(value.since).getTime() >= new Date(value.until).getTime()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["since"],
+        message: "since must be earlier than until",
+      });
+    }
+  });
 
 export type HeartbeatRunListQuery = z.infer<typeof heartbeatRunListQuerySchema>;
 

@@ -23,7 +23,8 @@ Newest first. Filters:
 | `limit` | 1-1000. Without it, every matching run is returned. |
 | `summary` | `true` returns lighter rows. |
 
-An unknown status or a malformed time or agent ID returns `400`.
+An unknown status, a malformed time or agent ID, or an empty or inverted window (`since` not earlier than `until`)
+returns `400`.
 
 ## Run Stats and Daily Cap Usage
 
@@ -52,6 +53,7 @@ Counts runs created in the window (default: the last 24 hours; at most 90 days).
 
 - `terminal` counts finished runs: succeeded, interrupted, failed, cancelled and timed out.
 - `unsuccessful` counts failed, cancelled and timed-out runs.
-- `runsToday` counts exactly what `runtimeConfig.heartbeat.maxDailyRuns` counts: runs started in the current UTC
-  day (`dailyCapWindow`) that are not queued or waiting to retry. `maxDailyRuns` is `null` when the agent has no
-  cap.
+- `runsToday` is the number the daily cap compares against `maxDailyRuns`. The cap check and the stats call one
+  function, so they agree by construction: today that is runs started in the current UTC day (`dailyCapWindow`)
+  that are not queued or waiting to retry, and any exemption from the cap lands in both. `maxDailyRuns` is `null`
+  when the agent has no cap.

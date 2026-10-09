@@ -1,10 +1,20 @@
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, companies, companyMemberships, createDb, heartbeatRuns } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import {
+  activityLog,
+  agents,
+  agentWakeupRequests,
+  companies,
+  companyMemberships,
+  createDb,
+  heartbeatRuns,
+} from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
+import { heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -122,6 +132,7 @@ describeEmbeddedPostgres("heartbeat run list filters and stats", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(agentWakeupRequests);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companyMemberships);
@@ -151,6 +162,22 @@ describeEmbeddedPostgres("heartbeat run list filters and stats", () => {
     expect(await list(`status=failed&since=${encodeURIComponent(dayStart.toISOString())}`)).toHaveLength(1);
     expect(await list(`agentId=${capped.id}&until=${encodeURIComponent(dayStart.toISOString())}`)).toHaveLength(1);
     expect(await list("")).toHaveLength(7);
+  });
+
+  it("rejects an empty or inverted creation-time window on the list with 400", async () => {
+    const { company } = await seed(db);
+    const app = createApp(db, boardKeyActor(company.id));
+    const future = encodeURIComponent(new Date(Date.now() + 24 * HOUR).toISOString());
+    const past = encodeURIComponent(new Date(Date.now() - 24 * HOUR).toISOString());
+    const sameInstant = encodeURIComponent("2026-10-08T12:00:00.000Z");
+    for (const query of [`since=${future}&until=${past}`, `since=${sameInstant}&until=${sameInstant}`]) {
+      const res = await request(app).get(`/api/companies/${company.id}/heartbeat-runs?${query}`);
+      expect(res.status, `${query}: ${JSON.stringify(res.body)}`).toBe(400);
+      expect(JSON.stringify(res.body)).toContain("since must be earlier than until");
+    }
+    // A valid half-open window still works.
+    const ok = await request(app).get(`/api/companies/${company.id}/heartbeat-runs?since=${past}&until=${future}`);
+    expect(ok.status).toBe(200);
   });
 
   it("rejects unknown statuses, malformed times and malformed agent IDs with 400", async () => {
@@ -185,6 +212,37 @@ describeEmbeddedPostgres("heartbeat run list filters and stats", () => {
       capReached: true,
     });
     expect(byId.get(uncapped.id)).toMatchObject({ runsToday: 2, maxDailyRuns: null, remainingToday: null, capReached: false });
+  });
+
+  it("reports runsToday equal to the usage the daily cap enforces for the same fixture", async () => {
+    // Capped has maxDailyRuns 3 and three counted runs today plus one queued run.
+    // The stats and the cap share one counting function, so the cap's observed
+    // count (read from the skipped wakeup it produces) equals the stats' runsToday.
+    const { company, capped, uncapped } = await seed(db);
+    // A queued run isn't counted by the cap, and a wake would coalesce onto it.
+    await db.delete(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, capped.id), eq(heartbeatRuns.status, "queued")));
+    const stats = await request(createApp(db, boardKeyActor(company.id))).get(
+      `/api/companies/${company.id}/heartbeat-runs/stats`,
+    );
+    expect(stats.status, JSON.stringify(stats.body)).toBe(200);
+    const cappedStats = stats.body.agents.find((agent: { agentId: string }) => agent.agentId === capped.id);
+
+    const wake = await heartbeatService(db).wakeup(capped.id, { source: "on_demand", triggerDetail: "manual" });
+    expect(wake).toBeNull();
+    const [skipped] = await db
+      .select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason, payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, capped.id), eq(agentWakeupRequests.status, "skipped")));
+    expect(skipped).toMatchObject({ reason: "heartbeat.daily_run_limit" });
+    const heartbeatSkip = (skipped?.payload as { heartbeatSkip?: { observed: number; limit: number } }).heartbeatSkip;
+
+    expect(cappedStats.capReached).toBe(true);
+    expect(cappedStats.runsToday).toBe(heartbeatSkip?.observed);
+    expect(cappedStats.maxDailyRuns).toBe(heartbeatSkip?.limit);
+
+    // An agent without a cap is never reported as reached.
+    const uncappedStats = stats.body.agents.find((agent: { agentId: string }) => agent.agentId === uncapped.id);
+    expect(uncappedStats).toMatchObject({ maxDailyRuns: null, capReached: false });
   });
 
   it("defaults the stats window to the last 24 hours and narrows to one agent", async () => {
