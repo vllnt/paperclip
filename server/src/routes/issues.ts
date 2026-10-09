@@ -36,6 +36,7 @@ import {
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
+import type { DuplicateDetectionService } from "../services/duplicate-detection.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -3486,6 +3487,7 @@ export function issueRoutes(
   db: Db,
   storage: StorageService,
   opts: {
+    duplicateDetection?: Pick<DuplicateDetectionService, "checkAfterCreate">;
     chatRunRetries?: Pick<
       ChatChannelService,
       "prepareFailedChatRunRetry" | "processFailedChatRunRetry"
@@ -12085,6 +12087,17 @@ export function issueRoutes(
         referencedIssueIdentifiers: referenceSummary.outbound.map(
           (item) => item.issue.identifier ?? item.issue.id,
         ),
+      });
+      void opts.duplicateDetection?.checkAfterCreate({
+        id: issue.id,
+        companyId,
+        identifier: issue.identifier,
+        title: issue.title,
+        description: issue.description,
+        parentId: issue.parentId,
+        originKind: issue.originKind,
+        originId: issue.originId,
+        createdAt: issue.createdAt,
       });
     },
   );
