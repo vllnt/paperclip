@@ -1533,6 +1533,174 @@ describe("IssuesList", () => {
     });
   });
 
+  it("keeps the task-list skeleton and error off a board whose columns loaded", async () => {
+    localStorage.setItem(
+      "paperclip:test-issues:company-1",
+      JSON.stringify({ viewMode: "board" }),
+    );
+    const todoIssue = createIssue({ id: "issue-todo", title: "Loaded todo card", status: "todo" });
+    mockIssuesApi.list.mockImplementation((_companyId, filters) => {
+      if (filters?.status === "todo") return Promise.resolve([todoIssue]);
+      return Promise.resolve([]);
+    });
+
+    // The parent's task-list query is still pending and has already failed
+    // once, e.g. rejected by the server's concurrent-request cap.
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[]}
+        isLoading
+        error={new Error("Too many concurrent issue-list requests for this actor/client")}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Loaded todo card");
+      expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
+        loadingStatuses: [],
+        failedStatuses: [],
+      }));
+    });
+    expect(container.querySelector("[data-slot='skeleton']")).toBeNull();
+    expect(container.textContent).not.toContain("Too many concurrent issue-list requests");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("reports loading and failed board columns instead of showing them as empty, and retries failed ones", async () => {
+    localStorage.setItem(
+      "paperclip:test-issues:company-1",
+      JSON.stringify({ viewMode: "board" }),
+    );
+    const doneIssue = createIssue({ id: "issue-done", title: "Recovered done card", status: "done" });
+    let rejectDone = true;
+    let releaseBacklog!: (issues: Issue[]) => void;
+    const backlogPending = new Promise<Issue[]>((resolve) => {
+      releaseBacklog = resolve;
+    });
+    mockIssuesApi.list.mockImplementation((_companyId, filters) => {
+      if (filters?.status === "backlog") return backlogPending;
+      if (filters?.status === "done") {
+        return rejectDone
+          ? Promise.reject(new Error("Too many concurrent issue-list requests for this actor/client"))
+          : Promise.resolve([doneIssue]);
+      }
+      return Promise.resolve([]);
+    });
+
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
+        loadingStatuses: ["backlog"],
+        failedStatuses: ["done"],
+      }));
+    });
+    expect(container.querySelector("[data-slot='skeleton']")).toBeNull();
+
+    rejectDone = false;
+    await act(async () => {
+      releaseBacklog([]);
+      const props = mockKanbanBoard.mock.lastCall?.[0] as { onRetryFailedColumns?: () => void };
+      props.onRetryFailedColumns?.();
+    });
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Recovered done card");
+      expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
+        loadingStatuses: [],
+        failedStatuses: [],
+      }));
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("keeps the board's cards while a new search loads, but never across companies", async () => {
+    localStorage.setItem(
+      "paperclip:test-issues:company-1",
+      JSON.stringify({ viewMode: "board" }),
+    );
+    const todoIssue = createIssue({ id: "issue-todo", title: "Company one todo card", status: "todo" });
+    mockIssuesApi.list.mockImplementation((_companyId, filters) => {
+      // Searches and the second company never answer within the test.
+      if (filters?.q || _companyId !== "company-1") return new Promise(() => undefined);
+      if (filters?.status === "todo") return Promise.resolve([todoIssue]);
+      return Promise.resolve([]);
+    });
+    const boardList = (search: string) => (
+      <IssuesList
+        issues={[]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        initialSearch={search}
+        onUpdateIssue={() => undefined}
+      />
+    );
+
+    const { root, queryClient } = renderWithQueryClient(boardList(""), container);
+    const rerender = (search: string) => act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <TooltipProvider>{boardList(search)}</TooltipProvider>
+        </QueryClientProvider>,
+      );
+    });
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Company one todo card");
+    });
+
+    rerender("needle");
+    await waitForAssertion(() => {
+      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", expect.objectContaining({
+        status: "todo",
+        q: "needle",
+      }), { signal: expect.any(AbortSignal) });
+    });
+    await flush();
+    expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
+      loadingStatuses: [],
+      issues: [expect.objectContaining({ id: "issue-todo" })],
+    }));
+
+    companyState.selectedCompanyId = "company-2";
+    try {
+      rerender("needle");
+      await waitForAssertion(() => {
+        expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
+          issues: [],
+          loadingStatuses: expect.arrayContaining(["todo", "done"]),
+        }));
+      });
+      expect(container.textContent).not.toContain("Company one todo card");
+    } finally {
+      companyState.selectedCompanyId = "company-1";
+    }
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("caps the first paint for large issue lists", async () => {
     const manyIssues = Array.from({ length: 220 }, (_, index) =>
       createIssue({
