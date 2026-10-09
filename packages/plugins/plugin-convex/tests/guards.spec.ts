@@ -87,6 +87,20 @@ describe("agents need a grant", () => {
     expect(result.error).toMatch(/grant/i);
   });
 
+  it("grants per environment: a preview-only reader cannot read production, staging or dev", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"), deployment("happy-prod", { deploymentType: "prod", isDefault: true, previewIdentifier: null }),
+      deployment("staging-app"), deployment("dev-sam", { deploymentType: "dev", reference: "dev/sam", previewIdentifier: null }));
+    const reader = run("preview-reader");
+    expect((await f.h.executeTool<{ data?: any }>("convex_get_deployment", { name: "feat-x" }, reader)).data.environment).toBe("preview");
+    for (const name of ["happy-prod", "staging-app", "dev-sam"]) {
+      expect((await f.h.executeTool<{ error?: string }>("convex_get_deployment", { name }, reader)).error, name).toMatch(/no grant/i);
+      expect((await f.h.executeTool<{ error?: string }>("convex_deployment_health", { name }, reader)).error, name).toMatch(/no grant/i);
+    }
+    const listed = await f.h.executeTool<{ data?: any }>("convex_list_deployments", {}, reader);
+    expect(listed.data.deployments.map((item: any) => item.name)).toEqual(["feat-x"]);
+  });
+
   it("matches a grant by role", async () => {
     const f = await setup({ configs: { [COMPANY_A]: baseConfig({ grants: [{ role: "devops", preset: "janitor", environments: ["preview"] }] }) } });
     eligible(f);
