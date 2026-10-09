@@ -45,9 +45,14 @@ unlinked. Linking it again by hand undoes that.
 
 ### Fork pull requests
 
-A pull request whose head branch is in another repository is **unverified**. It links, and the
-panel labels it, but status automation ignores it. A pull request is also unverified when its
-origin could not be read. A person can link it by hand to confirm it.
+A pull request whose head branch is in another repository is **unverified**, however it was
+linked: by branch name, by an agent workspace branch name, by text, or by hand. It links, and the
+panel labels it, but status automation ignores it. Anyone can open a fork pull request with any
+branch name or text, so none of those prove where it came from.
+
+While the head repository is unknown, Paperclip reads it from GitHub. If it still cannot tell,
+the link stays unverified, except a link a person or agent made by hand, which is trusted until
+GitHub shows the head is a fork.
 
 ## Status automation
 
