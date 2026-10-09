@@ -11,6 +11,7 @@ import {
   createIssueThreadInteractionSchema,
   createIssueTreeHoldSchema,
   createIssueWorkProductSchema,
+  type CompanyIssueRecoveryActionListItem,
   type FeedbackTrace,
   type HeartbeatRun,
   linkIssueApprovalSchema,
@@ -146,6 +147,17 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+  reconciliationRunId?: string;
+  providerStopped?: boolean;
+  actionOutcome?: string;
+  outcomeEvidence?: string;
+  workspaceRepairEvidence?: string;
+}
+
+interface IssueRecoveryListOptions extends BaseClientOptions {
+  companyId?: string;
+  status?: string;
+  limit?: string;
 }
 
 interface InteractionAcceptOptions extends BaseClientOptions {
@@ -519,6 +531,51 @@ export function registerIssueCommands(program: Command): void {
 
   addCommonClientOptions(
     issue
+      .command("recovery-actions:list")
+      .description("List recovery actions across a company, newest first (default: open actions)")
+      .option("-C, --company-id <id>", "Company ID")
+      .option("--status <csv>", "Comma-separated statuses: active, escalated, resolved, cancelled (default active,escalated)")
+      .option("--limit <n>", "Maximum rows, 1-200 (default 50)")
+      .action(async (opts: IssueRecoveryListOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const params = new URLSearchParams();
+          if (opts.status) params.set("status", opts.status);
+          if (opts.limit) params.set("limit", opts.limit);
+          const query = params.toString();
+          const rows =
+            (await ctx.api.get<CompanyIssueRecoveryActionListItem[]>(
+              `${apiPath`/api/companies/${ctx.companyId}/recovery-actions`}${query ? `?${query}` : ""}`,
+            )) ?? [];
+          if (ctx.json || rows.length === 0) {
+            printOutput(rows, { json: ctx.json });
+            return;
+          }
+          for (const row of rows) {
+            console.log(
+              formatInlineRecord({
+                identifier: row.issue.identifier ?? row.issue.id,
+                id: row.id,
+                status: row.status,
+                kind: row.kind,
+                issueStatus: row.issue.status,
+                owner: row.ownerAgentId ?? row.ownerUserId ?? row.ownerType,
+                attempts: row.maxAttempts === null ? String(row.attemptCount) : `${row.attemptCount}/${row.maxAttempts}`,
+                createdAt: String(row.createdAt),
+                title: row.issue.title,
+                nextAction: row.nextAction,
+              }),
+            );
+          }
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
       .command("recovery:resolve")
       .description("Resolve an issue recovery action")
       .argument("<issueId>", "Issue ID")
@@ -526,14 +583,34 @@ export function registerIssueCommands(program: Command): void {
       .requiredOption("--source-issue-status <status>", "todo, done, or in_review for restored outcomes; blocked is only valid for blocked outcomes")
       .option("--action-id <id>", "Specific recovery action ID")
       .option("--resolution-note <text>", "Resolution note")
+      .option("--reconciliation-run-id <id>", "Execution reconciliation: the stopped run ID (board only)")
+      .option("--provider-stopped", "Execution reconciliation: confirm the provider process is stopped")
+      .option("--action-outcome <outcome>", "Execution reconciliation: completed, not_performed, or mixed")
+      .option("--outcome-evidence <text>", "Execution reconciliation: evidence for the action outcome (20-12000 chars)")
+      .option("--workspace-repair-evidence <text>", "Execution reconciliation: optional workspace repair evidence (20-12000 chars)")
       .action(async (issueId: string, opts: IssueRecoveryResolveOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const reconciling =
+            opts.reconciliationRunId !== undefined ||
+            opts.providerStopped !== undefined ||
+            opts.actionOutcome !== undefined ||
+            opts.outcomeEvidence !== undefined ||
+            opts.workspaceRepairEvidence !== undefined;
           const payload = resolveIssueRecoveryActionSchema.parse({
             actionId: opts.actionId,
             outcome: opts.outcome,
             sourceIssueStatus: opts.sourceIssueStatus,
             resolutionNote: opts.resolutionNote,
+            executionReconciliation: reconciling
+              ? {
+                  runId: opts.reconciliationRunId,
+                  providerStopped: opts.providerStopped,
+                  actionOutcome: opts.actionOutcome,
+                  outcomeEvidence: opts.outcomeEvidence,
+                  workspaceRepairEvidence: opts.workspaceRepairEvidence,
+                }
+              : undefined,
           });
           const result = await ctx.api.post(apiPath`/api/issues/${issueId}/recovery-actions/resolve`, payload);
           printOutput(result, { json: ctx.json });
