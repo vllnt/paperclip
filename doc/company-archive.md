@@ -99,6 +99,21 @@ the run detail, events and log endpoints use:
 - activity: payload pattern redaction of `details`, then the same two steps
   (the activity list endpoint returns rows unredacted).
 
+Every exported record then gets one more pass, because stored rows are not all
+redacted at write time (some event writers skip it):
+
+- secret-named keys, bearer and authorization text, JWT-shaped values and
+  command secrets, on every key and string (event payloads keep their
+  read-time result, so native span names survive);
+- every `env` object again with the write path's env rule
+  (`redactEnvForLogs`: key names containing key, token, secret, password,
+  passwd, authorization or cookie);
+- PEM blocks and URL userinfo (`scheme://user:pass@host`) in every string.
+
+`adapter.invoke` events carry the adapter `env` and the full `prompt`. The
+prompt is the company's own content and is exported like the run events API
+shows it.
+
 The `redaction` field of `export.header` names the policy version. Redaction is
 pattern based: a secret in a shape it does not know is not removed.
 

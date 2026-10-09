@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
+import { redactEnvForLogs } from "@paperclipai/adapter-utils/server-utils";
 import { redactCurrentUserValue, type CurrentUserRedactionOptions } from "../log-redaction.js";
-import { redactEventPayload, sanitizeRecord } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, redactEventPayload, sanitizeRecord } from "../redaction.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 
@@ -40,6 +41,38 @@ function patternPass(value: object): Record<string, unknown> {
   return sanitizeRecord(value as Record<string, unknown>);
 }
 
+const ENV_OBJECT_KEY = /^(env|environment|envVars|environmentVariables)$/i;
+const PEM_BLOCK = /-----BEGIN [^-\n]+-----[\s\S]*?-----END [^-\n]+-----/g;
+// scheme://userinfo@host: the user part can itself be a token, so drop all of it.
+const URL_USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/gi;
+
+function redactSecretShapedText(text: string): string {
+  return text.replace(PEM_BLOCK, REDACTED_EVENT_VALUE).replace(URL_USERINFO, `$1${REDACTED_EVENT_VALUE}@`);
+}
+
+/**
+ * The write path redacts adapter `env` by key name (`redactEnvForLogs`) and
+ * some writers skip it, so exports apply the same key rule to every `env`
+ * object again, plus secret-shaped values in every string: PEM blocks and URL
+ * userinfo.
+ */
+function archiveValuePass(value: unknown, parentKey?: string): unknown {
+  if (typeof value === "string") return redactSecretShapedText(value);
+  if (Array.isArray(value)) return value.map((entry) => archiveValuePass(entry));
+  if (value === null || typeof value !== "object" || value instanceof Date) return value;
+  const record = value as Record<string, unknown>;
+  if (parentKey !== undefined && ENV_OBJECT_KEY.test(parentKey)) {
+    const strings = Object.fromEntries(Object.entries(record).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+    const redacted = { ...record, ...redactEnvForLogs(strings) };
+    return Object.fromEntries(Object.entries(redacted).map(([key, entry]) => [key, archiveValuePass(entry, key)]));
+  }
+  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [key, archiveValuePass(entry, key)]));
+}
+
+function exportPass(value: object): Record<string, unknown> {
+  return archiveValuePass(patternPass(value)) as Record<string, unknown>;
+}
+
 /**
  * @param db database handle
  * @param deps optional shared registry and settings reader (routes pass theirs)
@@ -68,14 +101,15 @@ export function createRunReadRedaction(db: Db, deps: RunReadRedactionDeps = {}) 
         run,
         event,
         logContent: (value) => redactSecrets(value),
-        exportRun: (value) => patternPass(run(value)),
+        exportRun: (value) => exportPass(run(value)),
         exportEvent: (value) => {
           // The payload already went through redactEventPayload, which keeps
-          // native span names a second generic pass would mask.
+          // native span names a second generic pass would mask; the env and
+          // value pass leaves those names alone.
           const { payload, ...rest } = event(value);
-          return { ...patternPass(rest), payload: payload ?? null };
+          return { ...exportPass(rest), payload: payload ? archiveValuePass(payload) as Record<string, unknown> : null };
         },
-        exportValue: (value) => patternPass(run(value)),
+        exportValue: (value) => exportPass(run(value)),
       };
     },
   };

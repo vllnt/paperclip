@@ -38,6 +38,9 @@ const PAYLOAD_SECRET = "payload-api-key-canary-91c2";
 const FOREIGN_CANARY = "foreign-company-canary-55d0";
 // Written by "direct writers" that skip write-time redaction.
 const BEARER_CANARY = "bearer-canary-0f9e8d7c6b5a4932";
+const ENV_CANARY = "aws-env-canary-6d1c";
+const USERINFO_CANARY = "userinfo-canary-93ab";
+const PEM_CANARY = "pem-canary-11fe";
 
 describeEmbeddedPostgres("company archive export", () => {
   let stopDb: (() => Promise<void>) | null = null;
@@ -165,6 +168,7 @@ describeEmbeddedPostgres("company archive export", () => {
       logLines: [
         JSON.stringify({ ts: "2026-10-09T10:00:00.000Z", stream: "stdout", chunk: `tool printed ${REGISTERED_SECRET} and café 漢字`, seq: 1 }),
         JSON.stringify({ ts: "2026-10-09T10:00:00.500Z", stream: "stderr", chunk: `curl -H "Authorization: Bearer ${BEARER_CANARY}"`, seq: 2 }),
+        JSON.stringify({ ts: "2026-10-09T10:00:00.700Z", stream: "stdout", chunk: `git clone https://x-access-token:${USERINFO_CANARY}@github.com/acme/app and postgres://app:${USERINFO_CANARY}@db.example.com/app`, seq: 3 }),
         "{\"ts\":\"2026-10-09T10:00:01.000Z\",\"stream\":\"stdout\",\"chunk\":\"torn",
       ],
     });
@@ -188,6 +192,16 @@ describeEmbeddedPostgres("company archive export", () => {
         message: `retry failed: Authorization: Bearer ${BEARER_CANARY}`,
         payload: null,
       },
+      {
+        companyId: company.companyId,
+        runId,
+        agentId: company.agentId,
+        seq: 3,
+        eventType: "adapter.invoke",
+        message: "invoke",
+        // Stored by a writer that skipped write-time env redaction.
+        payload: { env: { AWS_SECRET_ACCESS_KEY: ENV_CANARY, PATH: "/usr/bin" } },
+      },
     ]);
     await db.insert(costEvents).values({
       companyId: company.companyId,
@@ -209,7 +223,11 @@ describeEmbeddedPostgres("company archive export", () => {
       entityType: "issue",
       entityId: randomUUID(),
       runId,
-      details: { token: PAYLOAD_SECRET, summary: `mentions ${REGISTERED_SECRET}` },
+      details: {
+        token: PAYLOAD_SECRET,
+        summary: `mentions ${REGISTERED_SECRET}`,
+        note: `-----BEGIN CERTIFICATE-----\n${PEM_CANARY}\n-----END CERTIFICATE-----`,
+      },
     });
 
     const records = await collect({ companyId: company.companyId });
@@ -217,6 +235,12 @@ describeEmbeddedPostgres("company archive export", () => {
     expect(serialized).not.toContain(REGISTERED_SECRET);
     expect(serialized).not.toContain(PAYLOAD_SECRET);
     expect(serialized).not.toContain(BEARER_CANARY);
+    expect(serialized).not.toContain(ENV_CANARY);
+    expect(serialized).not.toContain(USERINFO_CANARY);
+    expect(serialized).not.toContain(PEM_CANARY);
+    // Harmless env values and the URL hosts stay readable.
+    expect(serialized).toContain("/usr/bin");
+    expect(serialized).toContain("@github.com/acme/app");
     expect(serialized).not.toContain("paperclipSecretRedactions");
     expect(serialized).toContain(REDACTED_EVENT_VALUE);
 
@@ -224,14 +248,14 @@ describeEmbeddedPostgres("company archive export", () => {
     expect(event?.data).toMatchObject({ seq: 1, payload: { apiKey: REDACTED_EVENT_VALUE, note: "kept" } });
     const transcript = records.filter((record) => record.kind === "transcript");
     expect(transcript[0]?.data).toMatchObject({ line: 1, chunk: `tool printed ${REDACTED_EVENT_VALUE} and café 漢字` });
-    expect(transcript[2]?.data).toMatchObject({ line: 3, raw: expect.stringContaining("torn") });
+    expect(transcript[3]?.data).toMatchObject({ line: 4, raw: expect.stringContaining("torn") });
     expect(records.find((record) => record.kind === "cost_event")?.data).toMatchObject({ model: "gpt-test" });
     expect(records.find((record) => record.kind === "activity")?.data).toMatchObject({
       details: { token: REDACTED_EVENT_VALUE },
     });
     expect(records.find((record) => record.kind === "run.end")?.data).toMatchObject({
-      counts: { run: 1, events: 2, transcript: 3, costs: 1, activity: 1 },
-      marks: { eventMaxSeq: 2, costCount: 1, activityCount: 1, logBytes: null },
+      counts: { run: 1, events: 3, transcript: 4, costs: 1, activity: 1 },
+      marks: { eventMaxSeq: 3, costCount: 1, activityCount: 1, logBytes: null },
     });
   });
 

@@ -71,7 +71,14 @@ secret-named keys, bearer and authorization text, JWT-shaped values and
 command secrets, on every key and string leaf. Event payloads keep the
 `redactEventPayload` result (a second generic pass would mask native span
 names). The routes keep their current output exactly; only exported records
-get the extra pass. Transcript lines are redacted per decoded record, never per
+get the extra pass. The pass also applies the write path's own env rule
+(`redactEnvForLogs`, key names containing key, token, secret, password,
+passwd, authorization or cookie) to every `env` object again, because
+`adapter.invoke` events store the adapter `env` and the `prompt` in every
+event and not every writer redacts at write time. It also redacts PEM blocks
+and URL userinfo (`scheme://user:pass@host`) in every string. When the
+observability track widens the write-side rules, it does so in that shared
+function, so the export follows automatically. Transcript lines are redacted per decoded record, never per
 raw text page. Tests insert canaries through direct writers (event message,
 transcript line, cost row, activity details) and assert none survive. The
 archive records the redaction policy version, so a later strengthening can
@@ -453,6 +460,7 @@ indexes), and share the per-tick byte budget.
 |---|---|---|
 | Archive retention | The company, through bucket lifecycle rules or Object Lock on its own bucket. Paperclip never deletes archived objects (only its own probe objects). | documented, no code |
 | Instance prune after archive | **W6, opt-in per company, off by default.** Deletes `heartbeat_run_events` rows and run-log files (local and `RUN_LOG_S3_*` mirror) of runs that are (a) settled more than `pruneAfterDays` ago (minimum 30), (b) archived **and** deep-verified (`verifiedAt` set by a full GET + SHA-256 match against the manifest, done right before the delete), (c) have a `run_usage_records` row with `schema_version >= RUN_USAGE_RECORD_EVENTS_CONSUMED_VERSION`, and (d) once the observability context slice (C1) has shipped, have a `run_context_records` row with `schema_version >= RUN_CONTEXT_RECORD_EVENTS_CONSUMED_VERSION`, with no exception (its worker writes a record for every terminal run and its `--backfill` covers older runs; operators run that backfill before enabling prune). Both constants come from `packages/shared`. Fail closed: prune refuses to run when the usage table or constant is missing, and also when the database has a `run_context_records` table that the running build has no guard for. Whichever of W6 and C1 lands second wires condition (d) into the prune query, so an older build can never delete events and logs the context track still reads. The prune UI and `archive prune status` show how many eligible runs still lack either record. After a prune the observability run timeline reports `log_pruned` by design. Never prunes `heartbeat_runs`, `cost_events`, `activity_log` or revision tables. Pruned runs keep their row; the events and log endpoints then return 410 with the archive location. | W6 |
+| Retention of observability records (observability slice 1e) | Archive-then-prune for their tables too: once W7 archives `run_usage_records` and `run_context_records`, slice 1e deletes a record of a company with the archive on only after W7 has archived that `(runId, schema_version)` (W7 exposes the archived stream cursor per company). Companies without the archive keep 1e's plain retention. Until W7 ships, 1e applies as planned. W6 never relies on a record 1e may delete: W6 prunes at 30+ days, 1e at 400 days. | W7 + 1e |
 | Instance-wide retention without an archive | Out of scope (would delete data the company never received). Operators keep DB backups. | no |
 
 ## 10. Restore and import (later, not v1)
@@ -512,21 +520,25 @@ adds it):
 
 ## 13. Size and cost estimate
 
-No live data was measured: the local instance holds no runs and there is no
-access to a production instance. Inputs are the operator's figure from the
-observability plan (about 950 runs a day) and assumptions marked **A**.
+**Measured** (operator read-only check of the production instance, 2026-10-09):
+run logs grow about **142 MB a day** (853 MB in 6 days, 2,218 NDJSON files,
+largest 10 MB), all as local files on the instance host; the `RUN_LOG_S3_*`
+mirror is not used. That is about 370 logs a day at a mean of about 385 KB.
+The operator's earlier figure of about 950 runs a day includes runs that never
+wrote a log (cancelled or deferred before start). Items marked **A** are still
+assumptions.
 
 | Quantity | Value |
 |---|---|
-| Runs per day | 950 (operator figure) |
-| Raw transcript per run | A: median 200 KB, mean 600 KB (long native sessions dominate) |
-| Events per run | A: 300 rows at about 600 B as JSON |
+| Raw transcripts per day | 142 MB (measured) |
+| Events per day | A: no more than the transcripts (events are mostly short lifecycle and tool rows) |
 | Gzip ratio on NDJSON | A: 6x (JSON with repeated keys) |
-| Compressed bundle per run | about 0.13 MB (600 KB / 6 + 180 KB / 6 + small files) |
-| Per day / per year | about 125 MB / about 45 GB |
-| Storage cost after one year | AWS S3 Standard about $1/month; R2 about $0.70/month; OVH Standard below $1/month |
-| Requests | 7 PUT/HEAD per run, about 200k a month, about $1/month on AWS, free tier on R2 |
-| Backfill of one year | about 45 GB of egress from the instance, at most 256 MiB per minute by default (about 3 h) |
+| Compressed bundles per day | about 25 MB transcripts + up to 25 MB events and small files: **25-50 MB** |
+| Per year | **about 9-18 GB** |
+| Storage cost after one year | AWS S3 Standard about $0.20-0.40/month; R2 about $0.15-0.30/month; OVH Standard less |
+| Requests | 7 PUT/HEAD per run, about 370 runs a day: about 80k a month, about $0.40/month on AWS, free tier on R2 |
+| Backfill of the current history | 6 days of logs (853 MB raw) is about 150-300 MB compressed: minutes at the default 256 MiB-per-minute budget |
+| Largest single bundle | a 10 MB log compresses to about 2 MB; it stays a single PUT (multipart starts at 16 MiB) |
 
 Measure before enabling backfill on a production instance (read-only SQL):
 
