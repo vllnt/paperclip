@@ -267,14 +267,6 @@ async function getIssueWorkspaceRuntime(client: PaperclipApiClient, issueId: str
   };
 }
 
-const linkPullRequestToolSchema = z.object({
-  issueId: issueIdSchema,
-  url: z.string().url().max(2000).optional().describe("A github.com pull request URL"),
-  repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/).optional().describe("owner/name; use together with number"),
-  number: z.number().int().positive().optional().describe("Pull request number; use together with repository"),
-  closes: z.boolean().optional().describe("Whether merging this pull request completes the issue. Defaults to true"),
-});
-
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
   return [
     makeTool(
@@ -550,40 +542,6 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "Release an issue checkout",
       z.object({ issueId: issueIdSchema }),
       async ({ issueId }) => client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/release`, { body: {} }),
-    ),
-    makeTool(
-      "paperclipGetIssueGit",
-      "Get the branch name to use for an issue (the same one your workspace would create) and the pull requests linked to it, with how each was linked and what status automation did",
-      z.object({ issueId: issueIdSchema }),
-      async ({ issueId }) => client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/git`),
-    ),
-    makeTool(
-      "paperclipLinkPullRequest",
-      "Link a GitHub pull request to an issue you are assigned. Give either a url, or a repository and number. Pull requests named PAP-123-... or saying 'Fixes PAP-123' link themselves; use this when the branch or text does not say so",
-      linkPullRequestToolSchema,
-      async ({ issueId, url, repository, number, closes }) => {
-        const byUrl = url !== undefined;
-        const byReference = repository !== undefined && number !== undefined;
-        if (byUrl === byReference || (!byUrl && (repository !== undefined) !== (number !== undefined))) {
-          throw new Error("Give either a url, or a repository and number");
-        }
-        return client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/git/pull-requests`, {
-          body: {
-            ...(byUrl ? { url } : { repository, number }),
-            ...(closes === undefined ? {} : { closes }),
-          },
-        });
-      },
-    ),
-    makeTool(
-      "paperclipUnlinkPullRequest",
-      "Unlink a pull request from an issue; automatic matching will not link it again",
-      z.object({ issueId: issueIdSchema, workProductId: z.string().uuid() }),
-      async ({ issueId, workProductId }) =>
-        client.requestJson(
-          "DELETE",
-          `/issues/${encodeURIComponent(issueId)}/git/pull-requests/${encodeURIComponent(workProductId)}`,
-        ),
     ),
     makeTool(
       "paperclipAddComment",
