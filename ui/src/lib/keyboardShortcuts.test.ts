@@ -377,6 +377,10 @@ describe("hasBlockingShortcutDialog", () => {
 
   it("ignores closing dialogs and non-modal popovers", () => {
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "dialog-content", "data-state": "closed" }))).toBe(false);
+    // A closing dialog stays mounted for its exit animation, even with aria-modal.
+    expect(hasBlockingShortcutDialog(mount({ role: "dialog", "aria-modal": "true", "data-state": "closed" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(mount({ role: "alertdialog", "aria-modal": "true", "data-state": "closed" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(mount({ role: "alertdialog", "aria-modal": "true" }))).toBe(true);
     // Radix renders popover content (also role=dialog) inside a popper wrapper.
     const root = document.createElement("div");
     const wrapper = document.createElement("div");
