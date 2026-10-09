@@ -216,6 +216,32 @@ comment that claims a watcher when `monitorNextCheckAt` is null).
    `adapterConfig.systemPrompt` is read by no code.
 3. PR 3: connector and catalog skills, `first-task` skill, `para-memory-files`, deletion of the unloaded CEO assets.
 
+### 8.1 PR 3 outcome
+
+PR 3 edits live skills, not an opt-in release, so every company gets the change when it merges. No eval covers
+these skills, so the edits keep every rule and only fix triggers, defects and duplicated text.
+
+Done, measured with `checkSkillQuality` (bytes/4 estimate, 12 skills, 15,782 to 15,629 tokens, -1.0%):
+
+- Nine descriptions now say when to use the skill, in the third person, under 300 characters. This clears every
+  F6, F7 and F8 finding on those skills. Descriptions are always loaded, so they grew by 11 to 24 tokens each.
+- `para-memory-files`: issue plans point at the issue `plan` document, `TOOLS.md` is optional, and the description
+  no longer triggers on plan memory.
+- `agentmail` -15% (987 to 840) and `paperclip-converting-plans-to-tasks` -10% (1,879 to 1,693) with no rule
+  removed. `slack` -0.5%: its text is dense and not repeated.
+
+Not done, and why:
+
+- The audit estimated about -35% for this group. The measured result is -1.0%, because the large files were left
+  alone: `status-card-query` (1,607), `summarize-status` (2,232), and `first-task` (1,576).
+- `first-task` body: the onboarding flow has a runner e2e judge (`test:e2e:runner:judge-first-task`) that was not
+  run, and it persists approvals through `resolve-from-comment`. A wording change without that run is a risk for
+  every new company. A description-only change would gain nothing, because the skill is invoked by name.
+- Deleting `ceo/HEARTBEAT.md`, `SOUL.md` and `TOOLS.md`: only `ceo/AGENTS.md` is loaded
+  (`DEFAULT_AGENT_BUNDLE_FILES` in `default-agent-instructions.ts`), so they are unused. `MIGRATION.md` still gates
+  removing anything under `onboarding-assets/` on five compatibility tests that do not exist yet. Delete them in
+  the PR that adds those tests.
+
 ## 9. Risks and open decisions
 
 - Heuristic checks (rules without reasons, rule count) have false positives. Thresholds are configurable; the lint
