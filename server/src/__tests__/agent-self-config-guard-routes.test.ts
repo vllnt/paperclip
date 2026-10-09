@@ -662,6 +662,29 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       expect((await deniedActivity(db, agentId))[0]).toMatchObject({ details: { surface: "permissions", reason: "deny_scope" } });
     });
 
+    it("cannot change its own caps in a run made for an owner who holds agents:configure", async () => {
+      const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
+      const ownerId = `owner-${randomUUID()}`;
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: ownerId, membershipRole: "owner", status: "active" });
+      await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: ownerId, permissionKey: "agents:configure" });
+      const actor: Express.Request["actor"] = {
+        type: "agent",
+        agentId,
+        companyId,
+        source: "agent_jwt",
+        onBehalfOfUserId: ownerId,
+        onBehalfOfMemberships: [{ companyId, membershipRole: "owner", status: "active" }],
+      };
+
+      const res = await request(createApp(db, actor))
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { model: "large-model" } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", reason: "deny_scope" });
+      expect((await readAgent(db, agentId)).adapterConfig).toMatchObject({ model: "small-model" });
+    });
+
     it("cannot roll back its own config to a higher cap either", async () => {
       const { companyId, agentId } = await seedRootCeoWithDefaultGrant();
       await request(createApp(db, boardActor(companyId)))

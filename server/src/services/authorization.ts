@@ -725,7 +725,8 @@ export function authorizationService(db: Db | DbTransaction) {
     if (
       !(await scopeAllows(db, input.companyId, grant.scope, input.scope, {
         requireStructuredScope: input.permissionKey === "tasks:assign_scope",
-        requireExplicitAgentTarget: scopeBoolean(input.scope, "requireExplicitTargetGrant"),
+        requireExplicitAgentTarget:
+          input.principalType === "agent" && scopeBoolean(input.scope, "requireExplicitTargetGrant"),
       }))
     ) {
       return deny({
