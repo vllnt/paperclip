@@ -177,7 +177,9 @@ function collectChangedPaths(before: unknown, after: unknown, path: string, dept
  * dotted paths such as `runtimeConfig.heartbeat.maxDailyRuns` or
  * `adapterConfig.env.CODEX_HOME`. Every key under `runtimeConfig.heartbeat` is
  * protected: it holds the run caps, concurrency, daily cost cap, and timer
- * cadence, including their legacy aliases. Leaving `paused` is protected
+ * cadence, including their legacy aliases. `runtimeConfig.sessionCompaction`
+ * (the session run, token, and age limits, read outside `heartbeat`) is
+ * protected per key. Leaving `paused` is protected
  * because it is a resume, which already needs a grant.
  */
 export function collectAgentProtectedConfigChanges(
@@ -211,6 +213,13 @@ export function collectAgentProtectedConfigChanges(
     recordOrEmpty(beforeRuntimeConfig.heartbeat),
     recordOrEmpty(afterRuntimeConfig.heartbeat),
     "runtimeConfig.heartbeat",
+    1,
+    changed,
+  );
+  collectChangedPaths(
+    beforeRuntimeConfig.sessionCompaction,
+    afterRuntimeConfig.sessionCompaction,
+    "runtimeConfig.sessionCompaction",
     1,
     changed,
   );

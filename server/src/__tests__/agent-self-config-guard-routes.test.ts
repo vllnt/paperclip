@@ -226,6 +226,13 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       fields: ["runtimeConfig.heartbeat.maxConcurrentRuns"],
     },
     {
+      label: "runtimeConfig.sessionCompaction",
+      body: {
+        runtimeConfig: { ...STORED_RUNTIME_CONFIG, sessionCompaction: { maxRawInputTokens: 10_000_000 } },
+      },
+      fields: ["runtimeConfig.sessionCompaction.maxRawInputTokens"],
+    },
+    {
       label: "runtimeConfig.aiConnection",
       body: {
         runtimeConfig: {

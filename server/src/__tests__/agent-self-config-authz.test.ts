@@ -62,6 +62,16 @@ describe("agent self-config protected field diff", () => {
       .toEqual(["runtimeConfig.heartbeat.dailyRunLimit"]);
   });
 
+  it("flags session compaction limits set outside heartbeat", () => {
+    expect(changesFor({
+      runtimeConfig: {
+        aiConnection,
+        heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1 },
+        sessionCompaction: { maxRawInputTokens: 10_000_000, enabled: false },
+      },
+    })).toEqual(["runtimeConfig.sessionCompaction.enabled", "runtimeConfig.sessionCompaction.maxRawInputTokens"]);
+  });
+
   it("flags a role change and leaving paused, but not other status changes", () => {
     expect(changesFor({ role: "ceo", metadata: {} })).toEqual(["role"]);
     expect(changesFor({ status: "paused" })).toEqual([]);
