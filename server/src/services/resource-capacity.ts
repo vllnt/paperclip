@@ -399,9 +399,13 @@ export function resourceCapacityService(
   }
 
   /**
-   * Probes SSH environments that have an active lease or are not `ok`, one
-   * at a time. Each environment is claimed by compare-and-set on
-   * `next_sweep_at`, so several processes never probe it in one interval.
+   * Probes SSH environments that have an active lease or whose effective
+   * level is not `ok` (a stale `ok` reads as `unknown`), one at a time. Each
+   * environment is claimed by compare-and-set on `next_sweep_at`, so several
+   * processes never probe it in one interval. The probe resolves secrets
+   * under the company of the environment's latest lease, so an environment
+   * that was never leased is claimed but not probed: it stays `unknown`
+   * until its first run's lease-acquire probe.
    *
    * @returns The number of environments probed.
    */
@@ -418,8 +422,11 @@ export function resourceCapacityService(
     ]);
     const leasedIds = new Set(leased.map((row) => row.environmentId));
     const candidates = sshEnvironments
-      .map((environment) => ({ environment, level: targets.get(environmentTargetKey(environment.id))?.level ?? null }))
-      .filter(({ environment, level }) => leasedIds.has(environment.id) || level === "low" || level === "critical");
+      .map((environment) => ({
+        environment,
+        level: toSnapshot(targets.get(environmentTargetKey(environment.id)) ?? null, now).level,
+      }))
+      .filter(({ environment, level }) => leasedIds.has(environment.id) || level !== "ok");
     let probed = 0;
     for (const { environment, level } of candidates) {
       try {
@@ -430,7 +437,7 @@ export function resourceCapacityService(
           .onConflictDoNothing();
         const claimed = await db
           .update(resourceCapacityTargets)
-          .set({ nextSweepAt: new Date(now.getTime() + sweepIntervalMs(level ?? "unknown")) })
+          .set({ nextSweepAt: new Date(now.getTime() + sweepIntervalMs(level)) })
           .where(
             and(
               eq(resourceCapacityTargets.targetKey, targetKey),

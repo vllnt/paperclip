@@ -12,7 +12,11 @@ import {
   resourceCapacitySamples,
   resourceCapacityTargets,
 } from "@paperclipai/db";
-import { RESOURCE_CAPACITY_STALE_AFTER_MS, type ResourceCapacityReading } from "@paperclipai/shared";
+import {
+  RESOURCE_CAPACITY_STALE_AFTER_MS,
+  type EnvironmentLeaseStatus,
+  type ResourceCapacityReading,
+} from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -237,27 +241,55 @@ describeEmbeddedPostgres("resource capacity service", () => {
     expect((await db.select().from(resourceCapacitySamples)).length).toBe(2);
   });
 
-  it("sweeps leased or degraded SSH environments once per interval and records a failed probe", async () => {
+  it("sweeps SSH environments that are leased or not ok, once per interval, and records a failed probe", async () => {
     const port = await closedLoopbackPort();
     const leased = await createEnvironment("ssh", "leased", port);
-    const idle = await createEnvironment("ssh", "idle", port);
+    const releasedUnread = await createEnvironment("ssh", "released-unread", port);
+    const releasedOk = await createEnvironment("ssh", "released-ok", port);
+    const neverLeased = await createEnvironment("ssh", "never-leased", port);
     const companyId = await createCompany("Sweep", [leased.id]);
-    await db.insert(environmentLeases).values({ companyId, environmentId: leased.id, provider: "ssh" });
-
+    const active = "active" satisfies EnvironmentLeaseStatus;
+    const released = "released" satisfies EnvironmentLeaseStatus;
+    await db.insert(environmentLeases).values([
+      { companyId, environmentId: leased.id, provider: "ssh", status: active },
+      { companyId, environmentId: releasedUnread.id, provider: "ssh", status: released },
+      { companyId, environmentId: releasedOk.id, provider: "ssh", status: released },
+    ]);
+    const now = new Date();
     const first = resourceCapacityService(db, { hostname: "test-host" });
     const second = resourceCapacityService(db, { hostname: "test-host" });
-    const now = new Date();
+    await first.recordReading({
+      targetKey: environmentTargetKey(releasedOk.id),
+      targetKind: "environment",
+      environmentId: releasedOk.id,
+      source: "lease_acquire",
+      reading: reading(100),
+      now,
+    });
+
     const probed = await Promise.all([first.sweepSshEnvironments(now), second.sweepSshEnvironments(now)]);
 
-    expect(probed[0]! + probed[1]!).toBe(1);
-    const targets = await db.select().from(resourceCapacityTargets);
-    expect(targets.map((target) => target.environmentId)).toEqual([leased.id]);
-    expect(targets[0]).toMatchObject({ latestStatus: "failed", level: "unknown" });
-    expect(targets[0]!.nextSweepAt!.getTime()).toBeGreaterThan(now.getTime());
-    const [sample] = await samples(environmentTargetKey(leased.id));
-    expect(sample).toMatchObject({ status: "failed", errorClass: "unavailable" });
+    expect(probed[0]! + probed[1]!).toBe(2);
+    for (const environment of [leased, releasedUnread]) {
+      const [target] = await db
+        .select()
+        .from(resourceCapacityTargets)
+        .where(eq(resourceCapacityTargets.environmentId, environment.id));
+      expect(target).toMatchObject({ latestStatus: "failed", level: "unknown" });
+      expect(target!.nextSweepAt!.getTime()).toBeGreaterThan(now.getTime());
+      expect(await samples(environmentTargetKey(environment.id))).toMatchObject([
+        { status: "failed", errorClass: "unavailable" },
+      ]);
+    }
+    expect(await samples(environmentTargetKey(releasedOk.id))).toMatchObject([{ source: "lease_acquire", status: "ok" }]);
+    const [unresolvable] = await db
+      .select()
+      .from(resourceCapacityTargets)
+      .where(eq(resourceCapacityTargets.environmentId, neverLeased.id));
+    expect(unresolvable).toMatchObject({ latestSampledAt: null });
+    expect(unresolvable!.nextSweepAt!.getTime()).toBeGreaterThan(now.getTime());
+    expect(await samples(environmentTargetKey(neverLeased.id))).toEqual([]);
     expect(await first.sweepSshEnvironments(now)).toBe(0);
-    expect(idle.id).not.toBe(leased.id);
   }, 30_000);
 
   it("shows a company only the environments its agents run on", async () => {
