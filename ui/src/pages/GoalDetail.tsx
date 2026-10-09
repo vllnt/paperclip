@@ -20,7 +20,7 @@ import { cn, projectUrl } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Plus, SlidersHorizontal } from "lucide-react";
-import type { Goal, Project } from "@paperclipai/shared";
+import { GOAL_TEXT_MAX_LENGTH, type Goal, type Project } from "@paperclipai/shared";
 
 interface GoalPropertiesToggleButtonProps {
   panelVisible: boolean;
@@ -163,6 +163,7 @@ export function GoalDetail() {
         <InlineEditor
           value={goal.title}
           onSave={(title) => updateGoal.mutate({ title })}
+          maxLength={GOAL_TEXT_MAX_LENGTH}
           as="h2"
           className="text-xl font-bold"
         />

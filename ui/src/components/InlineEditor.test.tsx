@@ -77,6 +77,23 @@ describe("InlineEditor", () => {
     container.remove();
   });
 
+  it("limits the single-line editor to maxLength", () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(<InlineEditor value="Ship v2" onSave={vi.fn()} maxLength={280} />);
+    });
+    act(() => {
+      container.querySelector("span")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(container.querySelector("textarea")?.maxLength).toBe(280);
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("calls onSave with empty string when nullable and the field is cleared (single-line)", () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     const root = createRoot(container);

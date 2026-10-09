@@ -1,9 +1,10 @@
 import { useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { GOAL_STATUSES, GOAL_LEVELS, GOAL_HORIZONS, type GoalHorizon } from "@paperclipai/shared";
+import { GOAL_STATUSES, GOAL_LEVELS, GOAL_HORIZONS, GOAL_TEXT_MAX_LENGTH, type GoalHorizon } from "@paperclipai/shared";
 import { GOAL_HORIZON_LABELS } from "../lib/goal-dates";
 import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
+import { useToastActions } from "../context/ToastContext";
 import { goalsApi } from "../api/goals";
 import { assetsApi } from "../api/assets";
 import { queryKeys } from "../lib/queryKeys";
@@ -40,6 +41,7 @@ export function NewGoalDialog() {
   const { newGoalOpen, newGoalDefaults, closeNewGoal } = useDialog();
   const { selectedCompanyId, selectedCompany } = useCompany();
   const queryClient = useQueryClient();
+  const { pushToast } = useToastActions();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [status, setStatus] = useState("planned");
@@ -72,6 +74,9 @@ export function NewGoalDialog() {
       queryClient.invalidateQueries({ queryKey: queryKeys.goals.list(selectedCompanyId!) });
       reset();
       closeNewGoal();
+    },
+    onError: (error: Error) => {
+      pushToast({ title: "Goal not created", body: error.message, tone: "error" });
     },
   });
 
@@ -168,6 +173,7 @@ export function NewGoalDialog() {
           <input
             className="w-full text-lg font-semibold bg-transparent outline-none placeholder:text-muted-foreground/50"
             placeholder="Goal title"
+            maxLength={GOAL_TEXT_MAX_LENGTH}
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             onKeyDown={(e) => {

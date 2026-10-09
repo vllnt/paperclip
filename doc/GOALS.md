@@ -57,16 +57,21 @@ block has only the keys it had before planning fields, and the inbox keeps its o
 `focusGoalId`. The task's `goal` block adds `kind` only for a milestone, and `horizon`,
 `targetDate` and `successCriteria` only when set.
 
-**The focus is small.** At most 10 focus goals and 5 milestones each are listed. Goal titles,
-milestone titles and `successCriteria` are cut to 280 characters in what agents receive, so the
-whole `companyFocus` holds at most about 30,000 characters of text. JSON escaping can make it
-longer for text full of quotes or control characters, and only the board writes that text. A
-goal title can be at most 2,000 characters, the length of a company mission.
+**Goal text is short.** A goal's title and `successCriteria` can each be at most 280
+characters. A longer one is refused with 422, for the board and agents alike, in the API, the
+CLI and the web app; put anything longer in the description. When the onboarding seed's mission
+has a longer first line, the goal title is cut and the description keeps the whole mission.
 
-The task's own `goal` block in the heartbeat context is cut the same way: its title and
-`successCriteria` are at most 280 characters. Agents may still edit ordinary goals, including the
-company's default goal that tasks with no goal and no project show, so this cut keeps any goal
-text an agent writes short in every other agent's context.
+Goals written before this limit can be longer, so agents get them cut to 280 characters at a
+grapheme boundary (an emoji or an accented letter is never split), ending with "…":
+
+- in the company focus and the task's own `goal` block in the heartbeat context;
+- from `GET /api/companies/{id}/goals`, `GET /api/goals/{id}` and every goal title in
+  `GET /api/issues/{id}`, which the agent tools call. Board users get the stored text.
+
+**The focus is small.** At most 10 focus goals and 5 milestones each are listed, so the whole
+`companyFocus` holds at most about 30,000 characters of text. JSON escaping can make it longer
+for text full of quotes or control characters, and only the board writes that text.
 
 The guidance tells agents to work the focus first, finish and land work in review before
 starting new work, and ask the board through an approval if the focus needs more agents, runs
