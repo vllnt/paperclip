@@ -95,7 +95,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX } from "../services/issue-assignment-wakeup.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -2883,6 +2883,29 @@ export function agentRoutes(
     });
   }
 
+  const agentCreationRateLimiter = createInviteRateLimiter({ windowMs: 60_000, maxRequests: 30 });
+
+  /**
+   * Route middleware for the agent create and hire routes. They authorize the
+   * caller and write several rows per request, so each actor gets a bounded
+   * number of requests per company per minute. Runs before validation and
+   * authorization. Answers 429 with `Retry-After` when the limit is spent.
+   */
+  function limitAgentCreation(req: Request, res: Response, next: NextFunction) {
+    const actor = req.actor.type === "agent"
+      ? `agent:${req.actor.agentId ?? req.actor.keyId ?? "unknown"}`
+      : `user:${req.actor.userId ?? req.actor.source ?? "board"}`;
+    const result = agentCreationRateLimiter.consume(`${req.params.companyId}:${actor}`);
+    res.setHeader("X-RateLimit-Limit", String(result.limit));
+    res.setHeader("X-RateLimit-Remaining", String(result.remaining));
+    if (!result.allowed) {
+      res.setHeader("Retry-After", String(result.retryAfterSeconds));
+      next(tooManyRequests("Too many agent creation requests", { retryAfterSeconds: result.retryAfterSeconds }));
+      return;
+    }
+    next();
+  }
+
   /**
    * An agent that creates or hires an agent may not give it settings it could
    * not set on an existing agent. There is no target to compare with, so the
@@ -4652,7 +4675,7 @@ export function agentRoutes(
   // adapter-config secret lands in the activity log.
   const hireFingerprint = (body: unknown): string => sha256Digest(body);
 
-  router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
+  router.post("/companies/:companyId/agent-hires", limitAgentCreation, validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
@@ -4984,7 +5007,7 @@ export function agentRoutes(
     res.status(outcome.status).json(outcome.body);
   });
 
-  router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
+  router.post("/companies/:companyId/agents", limitAgentCreation, validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
 

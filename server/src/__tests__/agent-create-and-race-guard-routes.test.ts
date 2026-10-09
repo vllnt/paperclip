@@ -271,6 +271,33 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
     expect(await deniedForCompany(companyId)).toHaveLength(0);
   });
 
+  it("rate-limits agent creation per actor and company across the create and hire routes", async () => {
+    const companyId = await seedCompany();
+    const creatorId = await seedAgent(companyId);
+    const otherId = await seedAgent(companyId);
+    const creatorApp = createApp(db, agentActor(companyId, creatorId));
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const res = await request(creatorApp).post(`/api/companies/${companyId}/agents`).send({});
+      expect(res.status).toBe(400);
+    }
+
+    const blockedHire = await request(creatorApp).post(`/api/companies/${companyId}/agent-hires`).send({});
+    expect(blockedHire.status, JSON.stringify(blockedHire.body)).toBe(429);
+    expect(Number(blockedHire.headers["retry-after"])).toBeGreaterThan(0);
+    expect(blockedHire.headers["x-ratelimit-remaining"]).toBe("0");
+
+    const otherAgent = await request(createApp(db, agentActor(companyId, otherId)))
+      .post(`/api/companies/${companyId}/agents`)
+      .send({});
+    expect(otherAgent.status).toBe(400);
+
+    const board = await request(createApp(db, boardActor(companyId)))
+      .post(`/api/companies/${companyId}/agents`)
+      .send({});
+    expect(board.status).toBe(400);
+  });
+
   /**
    * Holds a board update to the agent row open in a transaction, sends the
    * agent's request (which has already read the old row by the time it needs
