@@ -13,12 +13,16 @@ connection releases the lock; the operating system also releases it when the
 process exits or crashes. Independent targets use different files and can
 proceed concurrently.
 
-A workspace restore waits up to 10 minutes. Parallel runs on one project
-workspace restore into it one at a time, and one merge of a large tree can hold
-the lock for more than 30 seconds, so a restore must wait for the whole queue
-ahead of it. Set `PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS` (1 second to 1
-hour) to change the wait. Other writers keep the 30-second limit. A timeout
-still fails the run with `restore_lock_timeout` and the owner diagnostics below.
+Parallel runs on one project workspace, or on one agent's directory, take the
+lock one at a time, and one merge of a large tree can hold it for more than 30
+seconds. A workspace restore and the agent directory lifecycle lock therefore
+time out only after 10 minutes **without queue progress**. Each time a ticket
+ahead of a contender leaves, its budget starts again, so a deep queue of healthy
+holders never times out a contender, while a stuck holder or a stuck head of
+the queue still does. Set `PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS` (1 second
+to 1 hour) to change that budget. Other writers, such as credential files, keep
+a 30-second budget with the same rule. A timeout still fails the run with
+`restore_lock_timeout` and the owner diagnostics below.
 Contenders are admitted in arrival order. Each takes a ticket in
 `<hash>.lock.queue.sqlite`, and only the oldest live ticket tries the lock, so
 a newer restore cannot overtake an older one. The tickets order attempts only;

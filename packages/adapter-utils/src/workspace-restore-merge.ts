@@ -446,6 +446,8 @@ async function removeOwnTicket(queue: DatabaseSync, seq: number): Promise<void> 
 }
 
 interface DirectoryMergeAdmission {
+  /** Tickets older than this contender's, as of the last `isNext()` call. */
+  readonly ahead: number;
   /** True once no live contender holds an older ticket. A busy queue answers false. */
   isNext(): Promise<boolean>;
   /** Gives up the ticket. Never throws. */
@@ -459,7 +461,9 @@ function joinDirectoryMergeAdmission(lockDir: string): DirectoryMergeAdmission {
   let seq: number | null = null;
   let left = false;
   let watched = { token: "", since: 0 };
+  let ahead = Number.POSITIVE_INFINITY;
   return {
+    get ahead() { return ahead; },
     async isNext() {
       try {
         waiter ??= await openLockRootDatabase(waiterFilePath(lockDir, token));
@@ -471,6 +475,7 @@ function joinDirectoryMergeAdmission(lockDir: string): DirectoryMergeAdmission {
           if (!ticket) throw new Error("Directory merge admission ticket was not created.");
           seq = Number(ticket.seq);
         }
+        ahead = Number(queue.prepare("SELECT COUNT(*) AS n FROM tickets WHERE seq < ?").get(seq)?.n ?? 0);
         // Probe a ticket only after it has stayed oldest for a while, except
         // right after removing a dead one: crashes are rare, handoffs are not.
         let probeNow = false;
@@ -515,11 +520,17 @@ function joinDirectoryMergeAdmission(lockDir: string): DirectoryMergeAdmission {
 
 async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryMergeLockOperation, waitMs: number = LOCK_WAIT_MS): Promise<() => Promise<void>> {
   const startedAt = performance.now();
-  const deadline = Date.now() + waitMs;
+  // `waitMs` bounds the time without queue progress, not the whole wait: FIFO
+  // admission means a contender only waits for the finite set of tickets ahead
+  // of it, so a queue of healthy holders never times it out, while a stuck
+  // holder or head still does. Each ticket that leaves restarts the budget.
+  let deadline = Date.now() + waitMs;
   const databasePath = `${lockDir}.sqlite`;
   const ownerPath = `${lockDir}.owner.json`;
-  async function waitForLock(diagnosticOwnerPath: string) {
-    if (Date.now() >= deadline) {
+  async function waitForLock(diagnosticOwnerPath: string, progressed = false) {
+    const now = Date.now();
+    if (progressed) deadline = now + waitMs;
+    if (now >= deadline) {
       const timeoutError: NodeJS.ErrnoException & { workspaceRestoreLock?: Record<string, string | number | boolean> } = new Error(
         `Timed out waiting for workspace restore lock at ${lockDir}`,
       );
@@ -540,6 +551,7 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
   const database = await openLockRootDatabase(databasePath);
   const admission = joinDirectoryMergeAdmission(lockDir);
   try {
+    let lastAhead: number | null = null;
     while (true) {
       if (await admission.isNext()) {
         try {
@@ -549,7 +561,9 @@ async function acquireDirectoryMergeLock(lockDir: string, operation?: DirectoryM
           if (!isSqliteBusy(error)) throw error;
         }
       }
-      await waitForLock(ownerPath);
+      const progressed = lastAhead !== null && admission.ahead < lastAhead;
+      lastAhead = admission.ahead;
+      await waitForLock(ownerPath, progressed);
     }
     await admission.leave();
 
@@ -896,7 +910,9 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   return [...conflicts].sort();
 }
 
-function workspaceRestoreLockWaitMs(): number {
+/** How long a workspace restore waits without queue progress before its lock
+ * times out: 10 minutes, or `PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS` (1 s to 1 h). */
+export function workspaceRestoreLockWaitMs(): number {
   const configured = Number(process.env.PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS);
   return Number.isFinite(configured) && configured >= 1000 ? Math.min(configured, 60 * 60_000) : WORKSPACE_RESTORE_LOCK_WAIT_MS;
 }

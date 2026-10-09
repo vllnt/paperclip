@@ -146,6 +146,54 @@ describe("directory merge lock process lifetime", () => {
     expect(order).toEqual(Array.from({ length: count }, (_, index) => index));
   }, 60_000);
 
+  it("lets a deep queue of progressing holders finish although it waits longer than one budget", async () => {
+    const { target, env } = await fixture();
+    const budgetMs = 1_000;
+    const holdMs = 400;
+    const depth = 6;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let markHolding!: () => void;
+    const holding = new Promise<void>((resolve) => { markHolding = resolve; });
+    const first = withDirectoryMergeLock(target, async () => { markHolding(); await gate; }, env);
+    await holding;
+    const finished: number[] = [];
+    const waiters: Promise<void>[] = [];
+    for (let index = 0; index < depth; index += 1) {
+      await sleep(60);
+      waiters.push(withDirectoryMergeLock(target, async () => { finished.push(index); await sleep(holdMs); }, env, undefined, budgetMs));
+    }
+    release();
+
+    const started = performance.now();
+    const results = await Promise.allSettled([first, ...waiters]);
+
+    // The last waiter queued behind depth * holdMs of work, far past one budget.
+    expect(performance.now() - started).toBeGreaterThan(budgetMs);
+    expect(results.map((result) => result.status)).toEqual(Array(depth + 1).fill("fulfilled"));
+    expect(finished).toEqual(Array.from({ length: depth }, (_, index) => index));
+  }, 30_000);
+
+  it("still times out a waiter whose queue makes no progress", async () => {
+    const { target, env } = await fixture();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let markHolding!: () => void;
+    const holding = new Promise<void>((resolve) => { markHolding = resolve; });
+    const stuck = withDirectoryMergeLock(target, async () => { markHolding(); await gate; }, env);
+    await holding;
+    const head = withDirectoryMergeLock(target, async () => "head", env, undefined, 30_000);
+    await sleep(100);
+    const started = performance.now();
+
+    await expect(withDirectoryMergeLock(target, async () => "behind", env, undefined, 700)).rejects.toMatchObject({ code: WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE });
+
+    expect(performance.now() - started).toBeLessThan(2_500);
+    release();
+    await expect(head).resolves.toBe("head");
+    await stuck;
+  }, 30_000);
+
   it("does not let a waiter killed in the queue block the contenders behind it", async () => {
     const { target, env, lock } = await fixture();
     const lockRoot = path.dirname(lock);
