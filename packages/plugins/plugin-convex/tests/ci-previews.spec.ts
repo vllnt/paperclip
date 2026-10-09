@@ -22,6 +22,8 @@ describe("compileTemplate", () => {
     ["[-run{run}]{pr}", /next to each other/],
     ["pr{pr}[{run}]", /next to each other/],
     ["pr{pr}-{run}{shard}", /next to each other/],
+    ["pr{pr}[-x]{run}", /next to each other/],
+    ["pr{pr}[-x1]{run}", /next to each other/],
     // a template of digits only would turn any all-digit name into a pull request
     ["{pr}", /letter/],
     ["-{pr}", /letter/],
@@ -30,7 +32,7 @@ describe("compileTemplate", () => {
     expect(() => compileTemplate(template)).toThrow(message);
   });
 
-  it.each(["pr{pr}", "pr-{pr}", "pr{pr}-run{run}", "pr{pr}[-run{run}]-s{shard}-a{attempt}", "preview-{pr}-r{run}"])("accepts %j", template => {
+  it.each(["pr{pr}", "pr-{pr}", "pr{pr}-run{run}", "pr{pr}[-run{run}]-s{shard}-a{attempt}", "preview-{pr}-r{run}", "pr{pr}[-x]-{run}"])("accepts %j", template => {
     expect(() => compileTemplate(template)).not.toThrow();
   });
 
