@@ -10,9 +10,10 @@ import { isGranted, hasAnyGrant, type AgentIdentity } from "./grants.js";
 import { GitHubReader } from "./github-reader.js";
 import { assessPreview, recheckCache, Refusal, type GuardCache, type PreviewAssessment } from "./preview-guard.js";
 
+const SECRET_TTL_MS = 60_000;
 const registryKey = { scopeKind: "instance" as const, namespace: "connection", stateKey: "projects" };
 const disconnectedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "connection", stateKey: "disconnected" });
-const deletionKey = (companyId: string, runId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "deletions", stateKey: runId });
+const deletionKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "deletions", stateKey: "runs" });
 type Registry = Record<string, string>;
 
 export const MAX_LIST = 200;
@@ -106,18 +107,22 @@ export class ConvexService {
 
   // --- credentials: resolved per operation, never stored, logged or returned ---
 
-  /** One operation (a tool call or a reaper pass) holds one parsed config, so each secret is resolved at most once per operation (the host limits secret resolution per minute). */
-  private resolved = new WeakMap<ConnectionConfig, Map<string, Promise<string>>>();
-  private resolveSecret(config: ConnectionConfig, ref: SecretRef, companyId: string, configPath: string): Promise<string> {
-    let memo = this.resolved.get(config);
-    if (!memo) { memo = new Map(); this.resolved.set(config, memo); }
-    const known = memo.get(configPath);
-    if (known) return known;
-    const pending = this.d.ctx.secrets.resolve(ref, { companyId, configPath });
-    memo.set(configPath, pending);
-    pending.catch(() => memo!.delete(configPath));
-    return pending;
+  /**
+   * Resolved secrets are kept in memory for a minute, per company and secret, because the host limits secret resolution per minute and a
+   * reaper pass or a few tool calls would otherwise exhaust it. A credential Convex rejects with 401 is dropped at once.
+   */
+  private secrets = new Map<string, { value: Promise<string>; expires: number }>();
+  private resolveSecret(_config: ConnectionConfig, ref: SecretRef, companyId: string, configPath: string): Promise<string> {
+    const key = `${companyId}:${ref.secretId}`;
+    const now = this.d.now();
+    const known = this.secrets.get(key);
+    if (known && known.expires > now) return known.value;
+    const value = this.d.ctx.secrets.resolve(ref, { companyId, configPath });
+    this.secrets.set(key, { value, expires: now + SECRET_TTL_MS });
+    value.catch(() => { if (this.secrets.get(key)?.value === value) this.secrets.delete(key); });
+    return value;
   }
+  private forgetSecret(companyId: string, ref: SecretRef) { this.secrets.delete(`${companyId}:${ref.secretId}`); }
   /** Listing needs a project token or the team token; a preview deploy key cannot list. */
   async listToken(config: ConnectionConfig, companyId: string, project: ProjectMapping, index: number): Promise<string> {
     if (project.token) return this.resolveSecret(config, project.token, companyId, `projects.${index}.token`);
@@ -125,9 +130,9 @@ export class ConvexService {
     throw new Refusal("No credential is configured to list this Convex project.");
   }
   /** Credentials that may act on a deployment by name, cheapest first. They are resolved lazily, so the common case resolves one. */
-  private credentialCandidates(config: ConnectionConfig, companyId: string, scope: { project: ProjectMapping; index: number } | null): Array<() => Promise<string>> {
-    const out: Array<() => Promise<string>> = [];
-    const add = (ref: SecretRef | null, path: string) => { if (ref) out.push(() => this.resolveSecret(config, ref, companyId, path)); };
+  private credentialCandidates(config: ConnectionConfig, companyId: string, scope: { project: ProjectMapping; index: number } | null): Array<{ ref: SecretRef; load: () => Promise<string> }> {
+    const out: Array<{ ref: SecretRef; load: () => Promise<string> }> = [];
+    const add = (ref: SecretRef | null, path: string) => { if (ref) out.push({ ref, load: () => this.resolveSecret(config, ref, companyId, path) }); };
     const projects = scope ? [scope] : config.projects.map((project, index) => ({ project, index }));
     for (const { project, index } of projects) {
       add(project.previewDeployKey, `projects.${index}.previewDeployKey`);
@@ -140,9 +145,13 @@ export class ConvexService {
   async withCredential<T>(config: ConnectionConfig, companyId: string, scope: { project: ProjectMapping; index: number } | null, use: (token: string) => Promise<T>): Promise<T> {
     let failure: unknown = null;
     for (const candidate of this.credentialCandidates(config, companyId, scope)) {
-      try { return await use(await candidate()); }
+      try { return await use(await candidate.load()); }
       catch (error) {
-        if (error instanceof ConvexApiError && [401, 403, 404].includes(error.status)) { failure = error; continue; }
+        if (error instanceof ConvexApiError && [401, 403, 404].includes(error.status)) {
+          if (error.status === 401) this.forgetSecret(companyId, candidate.ref);
+          failure = error;
+          continue;
+        }
         throw error;
       }
     }
@@ -154,7 +163,8 @@ export class ConvexService {
   }
   async githubToken(config: ConnectionConfig, companyId: string): Promise<string | null> {
     if (!config.githubToken) return null;
-    try { return await this.resolveSecret(config, config.githubToken, companyId, "github.token"); } catch { return null; }
+    try { return await this.resolveSecret(config, config.githubToken, companyId, "github.token"); }
+    catch { throw new Refusal("The GitHub token could not be read from Paperclip secrets, so the preview was kept."); }
   }
 
   // --- caller checks ---
@@ -250,10 +260,16 @@ export class ConvexService {
     const expiresAt = options.expiryAt ?? now + hours * HOUR_MS;
     if (expiresAt - now > MAX_PREVIEW_TTL_HOURS * HOUR_MS) throw new Refusal(`A preview expiry can be at most ${MAX_PREVIEW_TTL_HOURS} hours (7 days) from now.`);
     if (expiresAt - now < MIN_EXPIRY_LEAD_MS) throw new Refusal("A preview expiry must be at least 30 minutes from now.");
-    const deletesSoon = !options.viaReaper && expiresAt - now < config.guards.activityHours * HOUR_MS;
+    // An expiry is a scheduled deletion. Setting one sooner than the preview already has, sooner than the reaper's own deadline for it, or
+    // sooner than the activity window is a deletion and follows the deletion guards. Extending an expiry (up to 7 days) is not.
+    const { deployment } = target;
+    const lastActivity = deployment.lastDeployTime ?? deployment.createTime ?? now;
+    const floor = Math.max(deployment.expiresAt ?? 0, lastActivity + config.reaper.ttlHours * HOUR_MS, now + config.guards.activityHours * HOUR_MS);
+    const deletesSoon = !options.viaReaper && expiresAt < floor;
     if (deletesSoon) {
+      await this.requireRunAllowance(actor, config.guards.maxDeletesPerRun);
       const assessment = await this.assess(actor.companyId, target);
-      if (assessment.blocked) throw new Refusal(`${assessment.blocked} An expiry sooner than ${config.guards.activityHours} hours deletes the preview, so it follows the deletion guards.`);
+      if (assessment.blocked) throw new Refusal(`${assessment.blocked} An expiry sooner than this preview's current deadline deletes it earlier, so it follows the deletion guards.`);
     }
     const record = { deployment: name, environment: target.environment, capability: "lifecycle", before: { expiresAt: target.deployment.expiresAt }, after: { expiresAt }, countsAsDeletion: deletesSoon };
     if (dryRun || config.guards.dryRunOnly) {
@@ -266,13 +282,26 @@ export class ConvexService {
     return { dryRun: false, name, expiresAt, previousExpiresAt: target.deployment.expiresAt };
   }
 
+  /** Per-run deletion counts for a company, in one record. Entries older than three days are dropped whenever the record is written. */
+  private async deletionRuns(companyId: string): Promise<Record<string, { count: number; at: string }>> {
+    const stored = await this.d.ctx.state.get(deletionKey(companyId));
+    return stored && typeof stored === "object" && !Array.isArray(stored) ? { ...(stored as Record<string, { count: number; at: string }>) } : {};
+  }
+  /** Fails fast, before any network call, when the run has no deletions left. The reservation below is the authoritative check. */
+  private async requireRunAllowance(actor: Actor, max: number): Promise<void> {
+    if (actor.kind !== "agent") return;
+    if (Number((await this.deletionRuns(actor.companyId))[actor.runId]?.count ?? 0) >= max) throw new Refusal(`This run reached its limit of ${max} deletions.`);
+  }
   /** Reserves one deletion for a tool run. The count survives a worker restart, so a run cannot exceed its cap by crashing. */
   private reserveRunDeletion(actor: Actor & { kind: "agent" }, max: number): Promise<void> {
     return this.serialize(`deletions:${actor.companyId}`, async () => {
-      const key = deletionKey(actor.companyId, actor.runId);
-      const used = Number((await this.d.ctx.state.get(key) as { count?: number } | null)?.count ?? 0);
+      const runs = await this.deletionRuns(actor.companyId);
+      const used = Number(runs[actor.runId]?.count ?? 0);
       if (used >= max) throw new Refusal(`This run reached its limit of ${max} deletions.`);
-      await this.d.ctx.state.set(key, { count: used + 1, at: new Date(this.d.now()).toISOString() });
+      const now = this.d.now();
+      for (const [runId, entry] of Object.entries(runs)) if (now - Date.parse(entry.at) > 3 * 24 * HOUR_MS) delete runs[runId];
+      runs[actor.runId] = { count: used + 1, at: new Date(now).toISOString() };
+      await this.d.ctx.state.set(deletionKey(actor.companyId), runs);
     });
   }
 
@@ -290,6 +319,10 @@ export class ConvexService {
   }
 
   async deletePreview(actor: Actor, config: ConnectionConfig, reserved: Set<string>, name: string, options: { dryRun: boolean; budget?: DeletionBudget; cache?: GuardCache; requireReapEvidence?: boolean }) {
+    if (!options.dryRun && !config.guards.dryRunOnly) {
+      if (options.budget && options.budget.left <= 0) throw new Refusal(`Deletion limit of ${options.budget.max} reached for this run.`);
+      await this.requireRunAllowance(actor, config.guards.maxDeletesPerRun);
+    }
     const target = await this.resolveTarget(actor, config, reserved, name);
     this.requirePreview(target);
     this.requireGrant(actor, config, target.environment, "lifecycle");

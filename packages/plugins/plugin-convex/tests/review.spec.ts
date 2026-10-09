@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { COMPANY_A, COMPANY_B, GITHUB_TOKEN, PREVIEW_KEY, PROJECT_TOKEN, TEAM_TOKEN, admin, baseConfig, member, ref, run, setup, type Fixture } from "./fixture.js";
+import { COMPANY_A, COMPANY_B, GITHUB_TOKEN, PREVIEW_KEY, PROJECT_TOKEN, TEAM_TOKEN, admin, baseConfig, member, ref, run, secretValues, setup, type Fixture } from "./fixture.js";
 import { HOUR, NOW, deployment } from "./fakes.js";
 import { newGuardCache } from "../src/preview-guard.js";
 
@@ -22,7 +22,7 @@ describe("an expiry that deletes soon follows the deletion guards (review #1)", 
     f.convex.add(deployment("feat-open"), deployment("feat-busy"));
     f.github.pulls.push({ number: 12, ref: "feat-open" });
     f.github.branches.set("feat-busy", new Date(NOW - 2 * HOUR).toISOString());
-    expect((await expire(f, "feat-open", 0.5)).error).toMatch(/open pull request #12.*deletes the preview/i);
+    expect((await expire(f, "feat-open", 0.5)).error).toMatch(/open pull request #12.*deletes it earlier/i);
     expect((await expire(f, "feat-busy", 1)).error).toMatch(/recent activity/i);
     expect(f.convex.mutations()).toHaveLength(0);
   });
@@ -259,5 +259,161 @@ describe("board actions need the right administrator rights (review test gaps)",
     const actor = { type: "user" as const, userId: "u9", companyId: COMPANY_A, agentId: null, runId: null };
     await expect(f.h.performAction("deployments.list", { companyId: COMPANY_B }, { actor })).rejects.toThrow(/board user/i);
     await expect(f.h.performAction("status", { companyId: COMPANY_B }, { actor })).rejects.toThrow(/board user/i);
+  });
+});
+
+
+describe("round 2: an expiry is a scheduled deletion", () => {
+  const withExpiry = (f: Fixture, name: string, expiresAt: number | null, extra: Record<string, unknown> = {}) => f.convex.add(deployment(name, { expiresAt, ...extra }));
+
+  it("refuses to shorten the deadline of a guarded preview, even to a day or more, and still allows extending it", async () => {
+    const f = await setup();
+    withExpiry(f, "feat-open", NOW + 100 * HOUR, { lastDeployTime: NOW - 2 * HOUR });
+    f.github.pulls.push({ number: 12, ref: "feat-open" });
+    expect((await expire(f, "feat-open", 24)).error).toMatch(/open pull request #12/i);
+    expect((await expire(f, "feat-open", 48)).error).toMatch(/open pull request #12/i);
+    expect(f.convex.deployments.get("feat-open")?.expiresAt).toBe(NOW + 100 * HOUR);
+    expect((await expire(f, "feat-open", 150)).data.expiresAt).toBe(NOW + 150 * HOUR);
+  });
+
+  it("treats exactly the floor as free and anything below it as a deletion", async () => {
+    const f = await setup();
+    withExpiry(f, "feat-open", null, { lastDeployTime: NOW - 50 * HOUR });
+    f.github.pulls.push({ number: 12, ref: "feat-open" });
+    // The floor is now + the 24 hour activity window: the reaper's own deadline (lastDeploy + 36h) is already past.
+    expect((await expire(f, "feat-open", 23.9)).error).toMatch(/open pull request/i);
+    expect((await expire(f, "feat-open", 24)).data.expiresAt).toBe(NOW + 24 * HOUR);
+  });
+
+  it("will not shorten below the deadline the reaper set", async () => {
+    const f = await setup();
+    withExpiry(f, "feat-open", NOW + 26 * HOUR, { lastDeployTime: NOW - 10 * HOUR });
+    f.github.pulls.push({ number: 12, ref: "feat-open" });
+    expect((await expire(f, "feat-open", 25)).error).toMatch(/open pull request/i);
+  });
+
+  it("charges a shortening of a finished preview to the run cap before reading GitHub", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: baseConfig({ guards: { maxDeletesPerRun: 1 } }) } });
+    closed(f, "a");
+    closed(f, "b");
+    for (const name of ["a", "b"]) f.convex.deployments.get(name)!.expiresAt = NOW + 100 * HOUR;
+    expect((await expire(f, "a", 25)).data.expiresAt).toBe(NOW + 25 * HOUR);
+    const before = f.github.calls.length;
+    expect((await del(f, "b")).error).toMatch(/limit of 1 deletions/i);
+    expect((await expire(f, "b", 25)).error).toMatch(/limit of 1 deletions/i);
+    expect(f.github.calls.length).toBe(before);
+  });
+});
+
+describe("round 2: reaper scheduling", () => {
+  const enabled = () => baseConfig({ reaper: { enabled: true } });
+  it("keeps a two hour lead so a pass can see a redeploy before the deadline, and works for an agent through the viaReaper policy", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled() } });
+    // target = lastDeploy + 36h: 2.5h from now for "far", 1.5h from now for "near".
+    f.convex.add(deployment("far", { lastDeployTime: NOW - 33.5 * HOUR }), deployment("near", { lastDeployTime: NOW - 34.5 * HOUR }));
+    f.github.pulls.push({ number: 1, ref: "far" }, { number: 2, ref: "near" });
+    const result = await f.h.executeTool<{ data?: any; error?: string }>("convex_reap_previews", { dryRun: false }, run("janitor"));
+    expect(result.error).toBeUndefined();
+    expect(f.convex.deployments.get("far")?.expiresAt).toBe(NOW + 2.5 * HOUR);
+    expect(f.convex.deployments.get("near")?.expiresAt).toBe(NOW + 36 * HOUR);
+  });
+
+  it("still follows a redeploy when Convex returns the expiry at a slightly different precision", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled() } });
+    f.convex.add(deployment("ours", { lastDeployTime: NOW - 10 * HOUR }));
+    f.github.pulls.push({ number: 1, ref: "ours" });
+    await f.h.runJob("convex-reaper");
+    f.convex.deployments.get("ours")!.expiresAt! += 30_000;
+    f.clock.now += 10 * HOUR;
+    f.convex.deployments.get("ours")!.lastDeployTime = f.clock.now - HOUR;
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deployments.get("ours")?.expiresAt).toBe(f.clock.now - HOUR + 36 * HOUR);
+  });
+
+  it("forgets the managed expiry of deployments that no longer exist", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled() } });
+    const key = { scopeKind: "company" as const, scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" };
+    f.convex.add(deployment("keep", { lastDeployTime: NOW - 10 * HOUR }), deployment("gone", { lastDeployTime: NOW - 10 * HOUR }));
+    f.github.pulls.push({ number: 1, ref: "keep" }, { number: 2, ref: "gone" });
+    await f.h.runJob("convex-reaper");
+    expect(Object.keys(f.h.getState(key) as object).sort()).toEqual(["gone", "keep"]);
+    f.convex.deployments.delete("gone");
+    await f.h.runJob("convex-reaper");
+    expect(Object.keys(f.h.getState(key) as object)).toEqual(["keep"]);
+  });
+
+  it("runs two overlapping passes one after the other, so neither repeats nor erases the other's work", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: enabled() } });
+    for (let i = 0; i < 6; i++) {
+      f.convex.add(deployment(`p${i}`, { lastDeployTime: NOW - 10 * HOUR }));
+      f.github.pulls.push({ number: i + 1, ref: `p${i}` });
+    }
+    await Promise.all([1, 2].map(() => f.h.performAction("reaper.run", { dryRun: false }, admin(COMPANY_A))));
+    expect(f.convex.calls.filter(call => call.method === "PATCH")).toHaveLength(6);
+    const key = { scopeKind: "company" as const, scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" };
+    expect(Object.keys(f.h.getState(key) as object)).toHaveLength(6);
+  });
+});
+
+describe("round 2: secrets, counters and evidence", () => {
+  it("resolves a secret once a minute across tool calls, and drops one Convex rejects", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"));
+    f.clock.now += 61_000; // connecting warmed the cache
+    const resolve = f.h.ctx.secrets.resolve as unknown as { mock: { calls: unknown[] }; mockClear(): void };
+    resolve.mockClear();
+    const read = () => f.h.executeTool<{ data?: any; error?: string }>("convex_get_deployment", { name: "feat-x" }, run("observer"));
+    for (let i = 0; i < 5; i++) expect((await read()).error).toBeUndefined();
+    expect(resolve.mock.calls.length).toBe(1);
+    // The team token is rotated in Paperclip. Convex rejects the old value once, then the cache is dropped.
+    const rotated = "cvx_team_ROTATED_0123456789";
+    secretValues["s-team"] = rotated;
+    f.convex.validTokens.delete(TEAM_TOKEN);
+    f.convex.validTokens.add(rotated);
+    expect((await read()).error).toMatch(/not available/i);
+    expect((await read()).error).toBeUndefined();
+    secretValues["s-team"] = TEAM_TOKEN;
+    f.convex.validTokens.add(TEAM_TOKEN);
+  });
+
+  it("re-reads a secret after the minute is up", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"));
+    f.clock.now += 61_000; // connecting warmed the cache
+    const resolve = f.h.ctx.secrets.resolve as unknown as { mock: { calls: unknown[] }; mockClear(): void };
+    resolve.mockClear();
+    await f.h.executeTool("convex_get_deployment", { name: "feat-x" }, run("observer"));
+    f.clock.now += 61_000;
+    await f.h.executeTool("convex_get_deployment", { name: "feat-x" }, run("observer"));
+    expect(resolve.mock.calls.length).toBe(2);
+  });
+
+  it("says the GitHub token could not be read when its secret fails, not that none is configured", async () => {
+    const f = await setup();
+    closed(f, "feat-done");
+    delete secretValues["s-gh"];
+    try { expect((await del(f, "feat-done")).error).toMatch(/GitHub token could not be read/i); }
+    finally { secretValues["s-gh"] = GITHUB_TOKEN; }
+    expect(f.convex.deletes()).toHaveLength(0);
+  });
+
+  it("drops deletion counters of runs older than three days", async () => {
+    const f = await setup();
+    closed(f, "a");
+    closed(f, "b");
+    await del(f, "a", run("janitor", COMPANY_A, "old-run"));
+    f.clock.now += 4 * 24 * HOUR;
+    await del(f, "b", run("janitor", COMPANY_A, "new-run"));
+    const runs = f.h.getState({ scopeKind: "company", scopeId: COMPANY_A, namespace: "deletions", stateKey: "runs" }) as Record<string, unknown>;
+    expect(Object.keys(runs)).toEqual(["new-run"]);
+  });
+
+  it("does not take a bare number identifier as evidence that an unrelated closed pull request owns the preview", async () => {
+    const f = await setup();
+    f.convex.add(deployment("pr-42-preview", { previewIdentifier: "42", lastDeployTime: NOW - 50 * HOUR }));
+    f.github.pulls.push({ number: 42, ref: "some-other-branch", state: "closed", merged: true });
+    const result = await f.h.executeTool<{ data?: any }>("convex_delete_preview", { name: "pr-42-preview", dryRun: true }, run("janitor"));
+    expect(result.data.reason).toMatch(/branch is gone/i);
+    expect(result.data.evidence.prState).toBe("none");
   });
 });

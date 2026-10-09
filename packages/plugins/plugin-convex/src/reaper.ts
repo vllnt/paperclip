@@ -7,8 +7,8 @@ export const reportKey = (companyId: string) => ({ scopeKind: "company" as const
 /** Expiries the reaper set itself, by deployment name. Only these follow a redeploy; an expiry a person set is never moved later. */
 const managedKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, namespace: "reaper", stateKey: "managed-expiry" });
 const EXPIRY_TOLERANCE_MS = 5 * 60_000;
-/** An expiry sooner than this would make Convex delete a guarded preview within the hour, so it is never scheduled. */
-const MIN_PLANNED_LEAD_MS = HOUR_MS;
+/** An expiry sooner than this would make Convex delete a guarded preview before the next hourly pass could see a redeploy, so it is never scheduled. */
+const MIN_PLANNED_LEAD_MS = 2 * HOUR_MS;
 
 const safe = (error: unknown) => isShowable(error) ? error.message : "The Convex action failed.";
 
@@ -25,7 +25,12 @@ export interface ReaperOptions {
  * shortens the expiry of the rest to lastDeployTime + TTL, and reports the team's deployment count against the quota.
  * It is a dry run until the company sets `reaper.enabled`. Every deletion goes through the same guards as the tool.
  */
-export async function runReaper(service: ConvexService, companyId: string, options: ReaperOptions): Promise<ReaperReport> {
+export function runReaper(service: ConvexService, companyId: string, options: ReaperOptions): Promise<ReaperReport> {
+  // One pass per company at a time: the hourly job, a board run and an agent's tool call must not interleave their reads and writes of the managed-expiry record.
+  return service.serialize(`reaper:${companyId}`, () => reaperPass(service, companyId, options));
+}
+
+async function reaperPass(service: ConvexService, companyId: string, options: ReaperOptions): Promise<ReaperReport> {
   const { ctx } = service.d;
   const { config, reserved } = await service.requireConnected(companyId);
   const dryRun = options.dryRun === true || !config.reaper.enabled || config.guards.dryRunOnly;
@@ -34,6 +39,7 @@ export async function runReaper(service: ConvexService, companyId: string, optio
   const budget: DeletionBudget = { left: config.guards.maxDeletesPerRun, max: config.guards.maxDeletesPerRun };
   const cache = newGuardCache();
   const seen = new Set<string>();
+  let listedAll = true;
   const stored = await ctx.state.get(managedKey(companyId));
   const managed: Record<string, number> = stored && typeof stored === "object" && !Array.isArray(stored) ? { ...(stored as Record<string, number>) } : {};
   const report: ReaperReport = { at: new Date(now).toISOString(), trigger: options.trigger, dryRun, projects: [], quota: null, errors: [] };
@@ -43,8 +49,10 @@ export async function runReaper(service: ConvexService, companyId: string, optio
     const entry: ReaperProjectReport = { convexProjectId: project.convexProjectId, name: project.name, previews: 0, delete: [], setExpiry: [], kept: 0, deleted: [], expirySet: [], failed: [], skipped: [] };
     report.projects.push(entry);
     try {
+      listedAll = false;
       const token = await service.listToken(config, companyId, project, index);
       const previews = await service.d.convex.listProjectDeployments(token, project.convexProjectId, "preview");
+      listedAll = true;
       entry.previews = previews.length;
       for (const preview of previews) seen.add(preview.name);
       for (const deployment of previews) {
@@ -70,7 +78,7 @@ export async function runReaper(service: ConvexService, companyId: string, optio
         const target36 = lastDeploy + config.reaper.ttlHours * HOUR_MS;
         const current = deployment.expiresAt;
         // Shorten to lastDeployTime + TTL. Follow a later deploy only for an expiry this reaper set, never one a person chose.
-        const ours = managed[deployment.name] !== undefined && managed[deployment.name] === current;
+        const ours = managed[deployment.name] !== undefined && current !== null && Math.abs(managed[deployment.name] - current) <= EXPIRY_TOLERANCE_MS;
         if (target36 - now >= MIN_PLANNED_LEAD_MS) {
           if (current === null || current > target36 + EXPIRY_TOLERANCE_MS || (ours && current < target36 - EXPIRY_TOLERANCE_MS)) entry.setExpiry.push({ name: deployment.name, from: current, to: target36 });
         } else if (current === null) {
@@ -105,8 +113,8 @@ export async function runReaper(service: ConvexService, companyId: string, optio
   }
 
   if (!dryRun) {
-    // Forget deployments that no longer exist, so the record stays as small as the preview list. Skipped when any project failed to list.
-    if (report.projects.every(item => !item.error)) for (const name of Object.keys(managed)) if (!seen.has(name)) delete managed[name];
+    // Forget deployments that no longer exist, so the record stays as small as the preview list. Skipped when a project failed to list; a later problem, such as an unreadable GitHub repository, does not matter because the list is complete.
+    if (listedAll) for (const name of Object.keys(managed)) if (!seen.has(name)) delete managed[name];
     await ctx.state.set(managedKey(companyId), managed);
   }
 

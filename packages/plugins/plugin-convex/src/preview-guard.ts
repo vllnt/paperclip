@@ -38,8 +38,10 @@ export const recheckCache = (shared?: GuardCache): GuardCache => ({ open: new Ma
 /** Convex derives a preview identifier from a branch name; separators may differ (`feat/login` and `feat-login`). */
 const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 const sameRef = (ref: string, identifier: string) => ref === identifier || (normalize(identifier) !== "" && normalize(ref) === normalize(identifier));
-const sameNumber = (number: number, identifier: string) => [`pr-${number}`, `pr${number}`, `pr_${number}`, String(number)].includes(identifier.toLowerCase());
-const matchesPull = (pr: PullRequestRef, identifier: string) => sameRef(pr.headRef, identifier) || sameNumber(pr.number, identifier);
+const sameNumber = (number: number, identifier: string, bare: boolean) =>
+  [`pr-${number}`, `pr${number}`, `pr_${number}`, ...(bare ? [String(number)] : [])].includes(identifier.toLowerCase());
+/** A bare number (`42`) protects an open pull request but is not accepted as evidence that a finished one belongs to the preview. */
+const matchesPull = (pr: PullRequestRef, identifier: string, evidence = false) => sameRef(pr.headRef, identifier) || sameNumber(pr.number, identifier, !evidence);
 
 const once = <T>(cache: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> => {
   let pending = cache.get(key);
@@ -87,7 +89,7 @@ export async function assessPreview(input: GuardInput): Promise<PreviewAssessmen
     }
     let finished: PullRequestRef | null = null;
     try {
-      const closed = (await once(cache.closed, repo, () => github.recentClosedPullRequests(repo, token))).filter(pr => matchesPull(pr, identifier));
+      const closed = (await once(cache.closed, repo, () => github.recentClosedPullRequests(repo, token))).filter(pr => matchesPull(pr, identifier, true));
       finished = closed.find(pr => pr.state === "merged") ?? closed[0] ?? null;
     } catch { /* positive evidence only: without it the "branch gone and idle" rule below still needs the full branch list */ }
     const idleMs = now - (deployment.lastDeployTime ?? deployment.createTime ?? now);
