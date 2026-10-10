@@ -58,8 +58,9 @@ function forMode(mode: Mode, root: string, script: string): string {
 async function createRoot(options: { ignoreTerm?: boolean } = {}): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-remote-process-"));
   roots.push(root);
+  // The marker sits beside the entrypoint, so the source needs no path.
   const onTerm = options.ignoreTerm
-    ? `process.on("SIGTERM", () => require("node:fs").writeFileSync(${JSON.stringify(path.join(root, "term-received"))}, ""));\n`
+    ? 'process.on("SIGTERM", () => require("node:fs").writeFileSync(require("node:path").join(__dirname, "term-received"), ""));\n'
     : "";
   await writeFile(path.join(root, "entry.cjs"), `${onTerm}setInterval(() => {}, 1000);\n`);
   return root;
@@ -84,17 +85,17 @@ function stopScript(mode: Mode, root: string, identity: RemoteProcessIdentity | 
   return forMode(mode, root, buildRemoteProcessStopLines({ identity, argv, label: "test", nonceArg }).join("\n"));
 }
 
-// A `ps` on PATH that runs the real one, or fails with `fail`, or reports
-// another start time once `term-received` exists.
+// A `ps` on PATH (`<root>/bin/ps`) that runs the real one, or fails with
+// `fail`, or reports another start time once `<root>/term-received` exists.
 async function shimPs(root: string, behaviour: "fail" | "start-changes-after-term"): Promise<NodeJS.ProcessEnv> {
   const bin = path.join(root, "bin");
   await mkdir(bin, { recursive: true });
   const body = behaviour === "fail"
     ? "exit 1\n"
-    : `case "$*" in *lstart*) [ -e '${path.join(root, "term-received")}' ] && { echo 'Thu Jan  1 00:00:00 1970'; exit 0; } ;; esac\nexec '${REAL_PS}' "$@"\n`;
+    : 'case "$*" in *lstart*) [ -e "$(dirname "$0")/../term-received" ] && { echo \'Thu Jan  1 00:00:00 1970\'; exit 0; } ;; esac\nexec "$PAPERCLIP_TEST_REAL_PS" "$@"\n';
   await writeFile(path.join(bin, "ps"), `#!/bin/sh\n${body}`);
   await chmod(path.join(bin, "ps"), 0o755);
-  return { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` };
+  return { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, PAPERCLIP_TEST_REAL_PS: REAL_PS };
 }
 
 afterEach(async () => {
