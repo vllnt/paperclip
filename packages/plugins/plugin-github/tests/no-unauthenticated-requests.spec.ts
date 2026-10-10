@@ -119,6 +119,71 @@ describe("GitHubClient.request", () => {
     expect(requests).toEqual([{ method: "POST", url: "https://api.github.com/app-manifests/abcdefghij0123456789/conversions", authorization: undefined }]);
   });
 
+  describe("on the manifest conversion path, without a token", () => {
+    const path = "/app-manifests/abcdefghij0123456789/conversions";
+
+    it.each([
+      ["a GET", undefined, undefined],
+      ["a DELETE", undefined, "DELETE" as const],
+      ["a PATCH with the empty body", {}, "PATCH" as const],
+      ["a PUT with the empty body", {}, "PUT" as const],
+      ["a DELETE with the empty body", {}, "DELETE" as const],
+    ])("refuses %s", async (_name, body, method) => {
+      const { client, fetcher } = recordingFetch();
+
+      await expect(client.request(path, undefined, body, method)).rejects.toThrow(/without credentials/);
+
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a body with a field", { title: "x" }],
+      ["an array", []],
+      ["a string", "{}"],
+      ["null", null],
+    ])("refuses a POST with %s as the body", async (_name, body) => {
+      const { client, fetcher } = recordingFetch();
+
+      await expect(client.request(path, undefined, body)).rejects.toThrow(/without credentials/);
+      await expect(client.request(path, "   ", body, "POST")).rejects.toThrow(/without credentials/);
+
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["another endpoint", "/repos/org/repo/issues"],
+      ["a conversion path with a short code", "/app-manifests/short/conversions"],
+      ["a conversion path with a query", "/app-manifests/abcdefghij0123456789/conversions?x=1"],
+      ["a path below the conversion path", "/app-manifests/abcdefghij0123456789/conversions/extra"],
+    ])("refuses a POST with the empty body to %s", async (_name, other) => {
+      const { client, fetcher } = recordingFetch();
+
+      await expect(client.request(other, undefined, {})).rejects.toThrow(/without credentials/);
+
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it("refuses a POST with no body", async () => {
+      const { client, fetcher } = recordingFetch();
+
+      await expect(client.request(path, undefined, undefined, "POST")).rejects.toThrow(/without credentials/);
+
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it("sends a POST with the empty body, and nothing else, without credentials", async () => {
+      const { client, requests } = recordingFetch();
+
+      await client.request(path, undefined, {});
+      await client.request(path, "", {}, "POST");
+
+      expect(requests).toEqual([
+        { method: "POST", url: `https://api.github.com${path}`, authorization: undefined },
+        { method: "POST", url: `https://api.github.com${path}`, authorization: undefined },
+      ]);
+    });
+  });
+
   it("sends a request that has a token with that token", async () => {
     const { client, requests } = recordingFetch();
 
