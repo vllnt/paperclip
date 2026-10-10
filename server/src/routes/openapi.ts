@@ -140,6 +140,9 @@ import {
   workspaceRuntimeControlTargetSchema,
   // Environments
   createEnvironmentSchema,
+  listEnvironmentLeasesQuerySchema,
+  ENVIRONMENT_DRIVERS,
+  ENVIRONMENT_LEASE_STATUSES,
   cancelEnvironmentCustomImageSetupSessionSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageSetupSessionSchema,
@@ -8411,9 +8414,43 @@ registry.registerPath({
   method: "get",
   path: "/api/environments/{id}/leases",
   tags: ["environments"],
-  summary: "List leases for an environment",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "List leases for an environment, optionally filtered by status",
+  description:
+    "Board only. Returns only the leases of the caller's companies (the local board and instance admins see all). " +
+    "Lease metadata is redacted.",
+  request: { params: z.object({ id: z.string() }), query: listEnvironmentLeasesQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/environment-leases",
+  tags: ["environments"],
+  summary:
+    "List a company's environment leases across environments, most recently used first (default status active,pending_cleanup). " +
+    "Board only; lease metadata is redacted",
+  request: { params: z.object({ companyId: z.string() }), query: listEnvironmentLeasesQuerySchema },
+  responses: {
+    200: r.ok(
+      z.array(
+        z
+          .object({
+            id: z.string(),
+            companyId: z.string(),
+            environmentId: z.string().nullable(),
+            status: z.enum(ENVIRONMENT_LEASE_STATUSES),
+            environment: z
+              .object({ id: z.string(), name: z.string(), driver: z.enum(ENVIRONMENT_DRIVERS) })
+              .nullable()
+              .describe("Null for an orphan lease whose environment was deleted"),
+          })
+          .passthrough(),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registry.registerPath({
@@ -8421,6 +8458,9 @@ registry.registerPath({
   path: "/api/environment-leases/{leaseId}",
   tags: ["environments"],
   summary: "Get an environment lease",
+  description:
+    "Board only. A lease of a company the caller is not in returns 404, the same as a missing lease (the local " +
+    "board and instance admins can read any). Lease metadata is redacted.",
   request: { params: z.object({ leaseId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });

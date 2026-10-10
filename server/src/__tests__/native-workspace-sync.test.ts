@@ -1,4 +1,5 @@
 import { mkdtemp, readdir, rm, mkdir, writeFile, readFile, appendFile, symlink, stat } from "node:fs/promises";
+import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -150,6 +151,27 @@ describe("native workspace sync durable metadata", () => {
     expect(() =>
       nativeWorkspaceSyncInternals.descriptorPath("run-1", "../descriptor"),
     ).toThrow("native_workspace_sync_descriptor_digest_invalid");
+  });
+
+  it("removes the scratch baseline when copying a manifest fails", async () => {
+    const paperclipHome = await mkdtemp(path.join(os.tmpdir(), "paperclip-native-manifest-"));
+    cleanupDirs.push(paperclipHome);
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "manifest-test";
+    const workspace = path.join(paperclipHome, "workspace");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "a.txt"), "baseline");
+    const baseline = await captureDirectorySnapshot(workspace, { diskBacked: true });
+    const initial = serializeDirectorySnapshot(baseline);
+    if (initial.version !== 2) throw new Error("Expected a disk baseline");
+    const runId = "manifest-copy-fails";
+    await mkdir(path.dirname(nativeWorkspaceSyncInternals.durableSeedPaths(runId).workspaceArchivePath), { recursive: true });
+    vi.spyOn(fsPromises, "copyFile").mockRejectedValueOnce(Object.assign(new Error("no space"), { code: "ENOSPC" }));
+
+    await expect(nativeWorkspaceSyncInternals.persistSnapshotManifests(runId, { baseline, gitSnapshot: null }))
+      .rejects.toThrow("no space");
+
+    await expect(stat(path.dirname(initial.entries.filePath))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it.each(["corrupt", "symlink", "foreign"] as const)("persists compact v2 manifests and rejects %s recovery storage", async (tamper) => {
