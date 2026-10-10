@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   applySearchOperatorSuggestion,
-  buildSearchPathFromQuery,
   parseSearchQuery,
   readSearchFiltersFromParams,
   searchOperatorSuggestions,
+  searchQueryFromUrlParams,
 } from "./search-query-parser";
 
 const context = {
@@ -110,12 +110,6 @@ describe("parseSearchQuery", () => {
 });
 
 describe("search query URLs", () => {
-  it("builds /search paths with parsed filters", () => {
-    expect(buildSearchPathFromQuery("auth status:todo updated:>7d", context)).toBe(
-      "/search?q=auth&status=todo&updatedWithin=7d",
-    );
-  });
-
   it("reads filter params back from URLSearchParams", () => {
     const filters = readSearchFiltersFromParams(
       new URLSearchParams("q=auth&status=todo&status=blocked&priority=high&updatedWithin=7d"),
@@ -139,5 +133,52 @@ describe("search operator suggestions", () => {
   it("replaces only the current token when applying a suggestion", () => {
     expect(applySearchOperatorSuggestion("auth sta", "status:todo")).toBe("auth status:todo");
     expect(applySearchOperatorSuggestion("", "assignee:me")).toBe("assignee:me");
+  });
+});
+
+describe("launcher scope and sort tokens", () => {
+  it("reads scope: and sort: tokens out of the text", () => {
+    const parsed = parseSearchQuery("deploy scope:issues sort:updated");
+    expect(parsed.query).toBe("deploy");
+    expect(parsed.scope).toBe("issues");
+    expect(parsed.sort).toBe("updated");
+    expect(parsed.pills.map((pill) => pill.label)).toEqual(["scope:issues", "sort:updated"]);
+  });
+
+  it("leaves unknown scope and sort values as text", () => {
+    const parsed = parseSearchQuery("scope:routines sort:random");
+    expect(parsed.query).toBe("scope:routines sort:random");
+    expect(parsed.scope).toBeUndefined();
+    expect(parsed.sort).toBeUndefined();
+  });
+});
+
+describe("searchQueryFromUrlParams", () => {
+  it("turns an old /search URL into launcher text the parser reads back", () => {
+    const params = new URLSearchParams(
+      "q=deploy failed&scope=issues&sort=updated&status=todo&status=blocked&assigneeUserId=user-1&updatedWithin=7d&projectId=11111111-1111-4111-8111-111111111111",
+    );
+    const text = searchQueryFromUrlParams(params);
+    expect(text).toBe(
+      "deploy failed status:todo status:blocked assignee:me project:11111111-1111-4111-8111-111111111111 updated:>7d scope:issues sort:updated",
+    );
+    const parsed = parseSearchQuery(text, {
+      currentUserId: "user-1",
+      projects: [{ id: "11111111-1111-4111-8111-111111111111", name: "Alpha" }],
+    });
+    expect(parsed.query).toBe("deploy failed");
+    expect(parsed.filters).toEqual({
+      status: ["todo", "blocked"],
+      assigneeUserId: "user-1",
+      projectId: "11111111-1111-4111-8111-111111111111",
+      updatedWithin: "7d",
+    });
+    expect(parsed.scope).toBe("issues");
+    expect(parsed.sort).toBe("updated");
+  });
+
+  it("keeps defaults out of the text", () => {
+    expect(searchQueryFromUrlParams(new URLSearchParams("q=hello&scope=all&sort=relevance"))).toBe("hello");
+    expect(searchQueryFromUrlParams(new URLSearchParams(""))).toBe("");
   });
 });

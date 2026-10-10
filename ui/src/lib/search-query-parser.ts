@@ -1,29 +1,31 @@
 import {
+  COMPANY_SEARCH_SCOPES,
+  COMPANY_SEARCH_SORTS,
   COMPANY_SEARCH_UPDATED_WITHIN_OPTIONS,
   ISSUE_PRIORITIES,
   ISSUE_STATUSES,
   isUuidLike,
   normalizeAgentUrlKey,
+  type CompanySearchScope,
+  type CompanySearchSort,
   type IssuePriority,
   type IssueStatus,
 } from "@paperclipai/shared";
 import type { CompanySearchParams } from "@/api/search";
 
-const SEARCH_FILTER_PARAM_KEYS = [
-  "status",
-  "priority",
-  "assigneeAgentId",
-  "assigneeUserId",
-  "projectId",
-  "labelId",
-  "updatedWithin",
-  "updatedAfter",
-] as const;
-
 const OPEN_STATUSES: IssueStatus[] = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const CLOSED_STATUSES: IssueStatus[] = ["done", "cancelled"];
 
-export type SearchOperatorKey = "status" | "assignee" | "project" | "label" | "priority" | "updated" | "is";
+export type SearchOperatorKey =
+  | "status"
+  | "assignee"
+  | "project"
+  | "label"
+  | "priority"
+  | "updated"
+  | "is"
+  | "scope"
+  | "sort";
 
 export interface SearchOperatorPill {
   key: SearchOperatorKey;
@@ -47,6 +49,8 @@ export const SEARCH_OPERATOR_SUGGESTIONS: SearchOperatorSuggestion[] = [
   { token: "label:bug", label: "Label", description: "Filter by issue label" },
   { token: "priority:high", label: "High priority", description: "Filter by priority" },
   { token: "updated:>7d", label: "Recently updated", description: "Updated in the last 7 days" },
+  { token: "scope:issues", label: "Only tasks", description: "Limit results to one kind" },
+  { token: "sort:updated", label: "Newest first", description: "Order results by last update" },
 ];
 
 export interface SearchQueryParserContext {
@@ -70,6 +74,10 @@ export interface ParsedSearchQuery {
     | "updatedWithin"
     | "updatedAfter"
   >;
+  /** Result kind from a `scope:` token; absent means all kinds. */
+  scope?: CompanySearchScope;
+  /** Order from a `sort:` token; absent means relevance. */
+  sort?: CompanySearchSort;
   pills: SearchOperatorPill[];
 }
 
@@ -188,6 +196,8 @@ export function parseSearchQuery(input: string, context: SearchQueryParserContex
   const textParts: string[] = [];
   const filters: ParsedSearchQuery["filters"] = {};
   const pills: SearchOperatorPill[] = [];
+  let scope: CompanySearchScope | undefined;
+  let sort: CompanySearchSort | undefined;
 
   for (const token of tokenizeQuery(input)) {
     const match = /^([a-zA-Z]+):(.*)$/s.exec(token.value);
@@ -290,6 +300,20 @@ export function parseSearchQuery(input: string, context: SearchQueryParserContex
       continue;
     }
 
+    if (key === "scope" || key === "sort") {
+      const normalized = value.toLowerCase();
+      if (key === "scope" && (COMPANY_SEARCH_SCOPES as readonly string[]).includes(normalized)) {
+        scope = normalized as CompanySearchScope;
+      } else if (key === "sort" && (COMPANY_SEARCH_SORTS as readonly string[]).includes(normalized)) {
+        sort = normalized as CompanySearchSort;
+      } else {
+        appendText(textParts, token.raw);
+        continue;
+      }
+      pills.push({ key, value: normalized, label: operatorLabel(key, normalized) });
+      continue;
+    }
+
     if (key === "is") {
       if (value === "open") {
         filters.status = OPEN_STATUSES;
@@ -311,28 +335,10 @@ export function parseSearchQuery(input: string, context: SearchQueryParserContex
   return {
     query: textParts.join(" ").replace(/\s+/g, " ").trim(),
     filters,
+    ...(scope && scope !== "all" ? { scope } : {}),
+    ...(sort && sort !== "relevance" ? { sort } : {}),
     pills,
   };
-}
-
-function appendMulti(search: URLSearchParams, key: string, values: readonly string[] | undefined) {
-  for (const value of values ?? []) search.append(key, value);
-}
-
-export function clearSearchFilterParams(search: URLSearchParams) {
-  for (const key of SEARCH_FILTER_PARAM_KEYS) search.delete(key);
-}
-
-export function applySearchFiltersToParams(search: URLSearchParams, filters: ParsedSearchQuery["filters"]) {
-  clearSearchFilterParams(search);
-  appendMulti(search, "status", filters.status);
-  appendMulti(search, "priority", filters.priority);
-  if (filters.assigneeAgentId !== undefined) search.set("assigneeAgentId", filters.assigneeAgentId ?? "null");
-  if (filters.assigneeUserId !== undefined) search.set("assigneeUserId", filters.assigneeUserId);
-  if (filters.projectId !== undefined) search.set("projectId", filters.projectId);
-  if (filters.labelId !== undefined) search.set("labelId", filters.labelId);
-  if (filters.updatedWithin !== undefined) search.set("updatedWithin", filters.updatedWithin);
-  if (filters.updatedAfter !== undefined) search.set("updatedAfter", filters.updatedAfter);
 }
 
 function validValues<T extends string>(values: string[], allowed: readonly T[]): T[] {
@@ -376,53 +382,26 @@ export function hasSearchFilters(filters: ParsedSearchQuery["filters"]) {
   );
 }
 
-function nameForId<T extends { id: string; name: string }>(entries: readonly T[] | undefined, id: string) {
-  return entries?.find((entry) => entry.id === id)?.name ?? id.slice(0, 8);
-}
-
-export function searchFilterPills(
-  filters: ParsedSearchQuery["filters"],
-  context: SearchQueryParserContext = {},
-): SearchOperatorPill[] {
-  const pills: SearchOperatorPill[] = [];
-  for (const status of filters.status ?? []) {
-    pills.push({ key: "status", value: status, label: operatorLabel("status", status) });
-  }
-  for (const priority of filters.priority ?? []) {
-    pills.push({ key: "priority", value: priority, label: operatorLabel("priority", priority) });
-  }
-  if (filters.assigneeAgentId !== undefined) {
-    const value = filters.assigneeAgentId === null
-      ? "unassigned"
-      : nameForId(context.agents, filters.assigneeAgentId);
-    pills.push({ key: "assignee", value, label: operatorLabel("assignee", value) });
-  }
-  if (filters.assigneeUserId) {
-    const value = filters.assigneeUserId === context.currentUserId ? "me" : filters.assigneeUserId.slice(0, 8);
-    pills.push({ key: "assignee", value, label: operatorLabel("assignee", value) });
-  }
-  if (filters.projectId) {
-    const value = nameForId(context.projects, filters.projectId);
-    pills.push({ key: "project", value, label: operatorLabel("project", value) });
-  }
-  if (filters.labelId) {
-    const value = nameForId(context.labels, filters.labelId);
-    pills.push({ key: "label", value, label: operatorLabel("label", value) });
-  }
-  if (filters.updatedWithin) {
-    pills.push({ key: "updated", value: `>${filters.updatedWithin}`, label: operatorLabel("updated", `>${filters.updatedWithin}`) });
-  }
-  if (filters.updatedAfter) {
-    pills.push({ key: "updated", value: filters.updatedAfter, label: operatorLabel("updated", filters.updatedAfter) });
-  }
-  return pills;
-}
-
-export function buildSearchPathFromQuery(input: string, context: SearchQueryParserContext = {}) {
-  const parsed = parseSearchQuery(input, context);
-  const search = new URLSearchParams();
-  if (parsed.query.length > 0) search.set("q", parsed.query);
-  applySearchFiltersToParams(search, parsed.filters);
-  const qs = search.toString();
-  return qs ? `/search?${qs}` : "/search";
+/**
+ * Launcher text for an old `/search?...` URL: the free text plus operator
+ * tokens for its filters, scope and sort, so the launcher reads them back.
+ * `updatedAfter` has no operator and is dropped.
+ */
+export function searchQueryFromUrlParams(search: URLSearchParams): string {
+  const filters = readSearchFiltersFromParams(search);
+  const parts: string[] = [];
+  const text = search.get("q")?.trim();
+  if (text) parts.push(text);
+  for (const status of filters.status ?? []) parts.push(`status:${status}`);
+  for (const priority of filters.priority ?? []) parts.push(`priority:${priority}`);
+  if (filters.assigneeUserId) parts.push("assignee:me");
+  else if (filters.assigneeAgentId) parts.push(`assignee:${filters.assigneeAgentId}`);
+  if (filters.projectId) parts.push(`project:${filters.projectId}`);
+  if (filters.labelId) parts.push(`label:${filters.labelId}`);
+  if (filters.updatedWithin) parts.push(`updated:>${filters.updatedWithin}`);
+  const scope = search.get("scope");
+  if (scope && scope !== "all" && (COMPANY_SEARCH_SCOPES as readonly string[]).includes(scope)) parts.push(`scope:${scope}`);
+  const sort = search.get("sort");
+  if (sort && sort !== "relevance" && (COMPANY_SEARCH_SORTS as readonly string[]).includes(sort)) parts.push(`sort:${sort}`);
+  return parts.join(" ");
 }

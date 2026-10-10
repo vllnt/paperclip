@@ -51,6 +51,10 @@ const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
 }));
 
+const mockSearchApi = vi.hoisted(() => ({
+  search: vi.fn(),
+}));
+
 const mockAuthApi = vi.hoisted(() => ({
   getSession: vi.fn(),
 }));
@@ -82,6 +86,10 @@ vi.mock("@/lib/router", () => ({
 
 vi.mock("../api/issues", () => ({
   issuesApi: mockIssuesApi,
+}));
+
+vi.mock("../api/search", () => ({
+  searchApi: mockSearchApi,
 }));
 
 vi.mock("../api/agents", () => ({
@@ -206,6 +214,13 @@ function typeQuery(container: HTMLElement, value: string) {
   return input;
 }
 
+/** Search requests are debounced and fetched asynchronously; wait past both. */
+async function settleDebounce() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  });
+}
+
 function groupHeadings(container: HTMLElement) {
   return Array.from(container.querySelectorAll("section[aria-label]")).map((section) => section.getAttribute("aria-label"));
 }
@@ -237,6 +252,40 @@ function renderWithQueryClient(
   return { root, queryClient };
 }
 
+function searchResult(type: "issue" | "project" | "agent" | "artifact", id: string, title: string, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    type,
+    score: 1,
+    title,
+    href: `/PAP/${type === "issue" ? "issues" : `${type}s`}/${id}`,
+    matchedFields: ["title"],
+    sourceLabel: null,
+    snippet: null,
+    snippets: [],
+    updatedAt: null,
+    previewImageUrl: null,
+    ...extra,
+  };
+}
+
+function searchResponse(results: ReturnType<typeof searchResult>[], page: { offset?: number; hasMore?: boolean; total?: number } = {}) {
+  const issues = results.filter((result) => result.type === "issue").length;
+  return {
+    query: "",
+    normalizedQuery: "",
+    scope: "all",
+    sort: "relevance",
+    limit: 20,
+    offset: page.offset ?? 0,
+    results,
+    countsByType: { issue: page.total ?? issues, comment: 0, document: 0, artifact: 0, agent: 0, project: 0 },
+    filterOptionCounts: { status: {}, priority: {}, assigneeAgentId: {}, assigneeUserId: {}, projectId: {}, labelId: {}, updatedWithin: {} },
+    zeroResults: null,
+    hasMore: page.hasMore ?? false,
+  };
+}
+
 describe("CommandPalette", () => {
   let container: HTMLDivElement;
 
@@ -255,6 +304,8 @@ describe("CommandPalette", () => {
     mockProjectsApi.list.mockReset();
     mockInstanceSettingsApi.getExperimental.mockReset();
     mockAuthApi.getSession.mockReset();
+    mockSearchApi.search.mockReset();
+    mockSearchApi.search.mockImplementation(() => Promise.resolve(searchResponse([])));
     navigateState.navigate.mockReset();
     locationState.location.pathname = "/";
     locationState.location.search = "";
@@ -274,33 +325,6 @@ describe("CommandPalette", () => {
     window.localStorage.clear();
   });
 
-  it("includes routine execution issues in search queries", async () => {
-    const { root } = renderWithQueryClient(<CommandPalette />, container);
-
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
-    });
-
-    const setQueryButton = container.querySelector('button[aria-label="Set query"]');
-    expect(setQueryButton).not.toBeNull();
-
-    act(() => {
-      setQueryButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-
-    await waitForAssertion(() => {
-      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
-        q: "pull/3303",
-        limit: 10,
-        includeRoutineExecutions: true,
-      });
-    });
-
-    act(() => {
-      root.unmount();
-    });
-  });
-
   it("lists only the contextual actions the current page registers, under This view", async () => {
     const { root } = renderWithQueryClient(<CommandPalette />, container, undefined, {
       "issue.focus-comment": { run: vi.fn() },
@@ -312,7 +336,7 @@ describe("CommandPalette", () => {
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Create new task");
     });
-    expect(groupHeadings(container)[0]).toBe("This view");
+    expect(groupHeadings(container).slice(0, 2)).toEqual(["Create", "This view"]);
     expect(container.querySelector('section[aria-label="This view"]')?.textContent).toContain("Comment on this task");
     expect(container.textContent).not.toContain("Open file in this issue");
 
@@ -352,7 +376,7 @@ describe("CommandPalette", () => {
     openPalette();
 
     await waitForAssertion(() => {
-      expect(groupHeadings(container).slice(0, 3)).toEqual(["Navigate", "Create", "General"]);
+      expect(groupHeadings(container).slice(0, 3)).toEqual(["Create", "Navigate", "General"]);
     });
     const navigateGroup = container.querySelector('section[aria-label="Navigate"]');
     expect(navigateGroup?.textContent).toContain("Dashboard");
@@ -477,145 +501,10 @@ describe("CommandPalette", () => {
     openPalette();
 
     await waitForAssertion(() => {
-      expect(groupHeadings(container)[0]).toBe("Recent");
+      expect(groupHeadings(container).slice(0, 2)).toEqual(["Create", "Recent"]);
     });
     expect(container.querySelector('section[aria-label="Recent"]')?.textContent).toContain("Agents");
     expect(container.querySelector('section[aria-label="Navigate"]')?.textContent).not.toContain("Agents");
-
-    act(() => {
-      root.unmount();
-    });
-  });
-
-  it("offers a Search-all command when the query is non-empty and routes Enter to /search when no issues match", async () => {
-    mockIssuesApi.list.mockResolvedValue([]);
-    const { root } = renderWithQueryClient(<CommandPalette />, container);
-
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
-    });
-
-    const input = container.querySelector('input[aria-label="Command search"]') as HTMLInputElement;
-    expect(input).not.toBeNull();
-
-    act(() => {
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
-      nativeSetter.call(input, "auth flake");
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-
-    await waitForAssertion(() => {
-      const searchAllButton = container.querySelector(
-        'button[data-testid="command-search-all"]',
-      ) as HTMLButtonElement | null;
-      expect(searchAllButton).not.toBeNull();
-      expect(searchAllButton!.textContent).toContain("auth flake");
-    });
-
-    act(() => {
-      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    });
-
-    await waitForAssertion(() => {
-      expect(navigateState.navigate).toHaveBeenCalledWith("/search?q=auth+flake");
-    });
-
-    act(() => {
-      root.unmount();
-    });
-  });
-
-  it("promotes matching projects above the Tasks group when typing", async () => {
-    const projects = [
-      { id: "p1", urlKey: "mobile", name: "Mobile App", description: "iOS client", archivedAt: null },
-      { id: "p2", urlKey: "billing", name: "Billing Service", description: null, archivedAt: null },
-    ];
-    mockProjectsApi.list.mockResolvedValue(projects);
-    mockIssuesApi.list.mockImplementation((_companyId: string, opts?: { q?: string }) =>
-      Promise.resolve(opts?.q ? [{ id: "i1", identifier: "ENG-9", title: "Fix login" }] : []),
-    );
-
-    const { root } = renderWithQueryClient(<CommandPalette />, container, (queryClient) => {
-      // Seed the caches so the already-loaded data is available synchronously —
-      // this harness's flush model doesn't reliably propagate fresh async fetches.
-      queryClient.setQueryData(queryKeys.projects.list("company-1"), projects);
-      queryClient.setQueryData(queryKeys.issues.search("company-1", "mob", undefined, 10), [
-        { id: "i1", identifier: "ENG-9", title: "Fix login" },
-      ]);
-    });
-
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
-    });
-
-    const input = container.querySelector('input[aria-label="Command search"]') as HTMLInputElement;
-    act(() => {
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
-      nativeSetter.call(input, "mob");
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-
-    await waitForAssertion(() => {
-      const match = container.querySelector('button[data-testid="command-project-match"]');
-      expect(match).not.toBeNull();
-      expect(match!.textContent).toContain("Mobile App");
-    });
-
-    // Non-matching project is excluded from the typeahead results.
-    expect(container.textContent).not.toContain("Billing Service");
-
-    // The promoted project renders above the fold — before the Tasks group.
-    await waitForAssertion(() => {
-      const text = container.textContent ?? "";
-      expect(text).toContain("Fix login");
-      expect(text.indexOf("Mobile App")).toBeLessThan(text.indexOf("Fix login"));
-    });
-
-    // Selecting the promoted project navigates to its URL.
-    act(() => {
-      container
-        .querySelector('button[data-testid="command-project-match"]')!
-        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await waitForAssertion(() => {
-      expect(navigateState.navigate).toHaveBeenCalledWith("/projects/mobile");
-    });
-
-    act(() => {
-      root.unmount();
-    });
-  });
-
-  it("navigates to /search when the user clicks the Search-all command", async () => {
-    mockIssuesApi.list.mockResolvedValue([]);
-    const { root } = renderWithQueryClient(<CommandPalette />, container);
-
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
-    });
-
-    const input = container.querySelector('input[aria-label="Command search"]') as HTMLInputElement;
-    act(() => {
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
-      nativeSetter.call(input, "deflake");
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-
-    let searchAllButton: HTMLButtonElement | null = null;
-    await waitForAssertion(() => {
-      searchAllButton = container.querySelector(
-        'button[data-testid="command-search-all"]',
-      ) as HTMLButtonElement | null;
-      expect(searchAllButton).not.toBeNull();
-    });
-
-    act(() => {
-      searchAllButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-
-    await waitForAssertion(() => {
-      expect(navigateState.navigate).toHaveBeenCalledWith("/search?q=deflake");
-    });
 
     act(() => {
       root.unmount();
@@ -654,35 +543,21 @@ describe("CommandPalette", () => {
     });
   });
 
-  it("parses operators for lightweight issue search but keeps filters for command-enter handoff", async () => {
-    mockIssuesApi.list.mockResolvedValue([]);
+  it("puts Create new task first for an empty query and opens the new task dialog", async () => {
     const { root } = renderWithQueryClient(<CommandPalette />, container);
+    openPalette();
 
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
-    });
-
-    const input = container.querySelector('input[aria-label="Command search"]') as HTMLInputElement;
-    act(() => {
-      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
-      nativeSetter.call(input, "auth status:blocked updated:>7d");
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-
+    let first: Element | null = null;
     await waitForAssertion(() => {
-      expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
-        q: "auth",
-        limit: 10,
-        includeRoutineExecutions: true,
-      });
+      first = container.querySelector('section[aria-label="Create"] button');
+      expect(groupHeadings(container)[0]).toBe("Create");
+      expect(first?.textContent).toContain("Create new task");
     });
-
     act(() => {
-      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }));
+      first!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-
     await waitForAssertion(() => {
-      expect(navigateState.navigate).toHaveBeenCalledWith("/search?q=auth&status=blocked&updatedWithin=7d");
+      expect(dialogState.openNewIssue).toHaveBeenCalledTimes(1);
     });
 
     act(() => {
@@ -690,4 +565,140 @@ describe("CommandPalette", () => {
     });
   });
 
+  it("searches the company search endpoint with the text, filters, scope and sort", async () => {
+    const { root } = renderWithQueryClient(<CommandPalette />, container);
+    openPalette();
+    typeQuery(container, "auth status:blocked updated:>7d scope:issues sort:updated");
+    await settleDebounce();
+
+    await waitForAssertion(() => {
+      expect(mockSearchApi.search).toHaveBeenCalledWith("company-1", {
+        q: "auth",
+        status: ["blocked"],
+        updatedWithin: "7d",
+        scope: "issues",
+        sort: "updated",
+        limit: 20,
+        offset: 0,
+      });
+    });
+    expect(navigateState.navigate).not.toHaveBeenCalled();
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("groups results by kind with the best match first, and opens one", async () => {
+    mockSearchApi.search.mockImplementation(() => Promise.resolve(searchResponse([
+      searchResult("project", "p1", "Mobile App"),
+      searchResult("issue", "i1", "Fix mobile login", { issue: { identifier: "ENG-9" } }),
+      searchResult("project", "p2", "Mobile Web"),
+    ])));
+    const { root } = renderWithQueryClient(<CommandPalette />, container);
+    openPalette();
+    typeQuery(container, "mob");
+    await settleDebounce();
+
+    await waitForAssertion(() => {
+      expect(container.querySelectorAll('button[data-testid="command-search-result"]')).toHaveLength(3);
+    });
+    const headings = groupHeadings(container);
+    expect(headings.indexOf("Projects")).toBeLessThan(headings.findIndex((heading) => heading?.startsWith("Tasks")));
+    expect(container.querySelector('section[aria-label^="Tasks"]')?.textContent).toContain("ENG-9");
+
+    act(() => {
+      container.querySelector<HTMLButtonElement>('button[data-testid="command-search-result"]')!.click();
+    });
+    await waitForAssertion(() => {
+      expect(navigateState.navigate).toHaveBeenCalledWith("/PAP/projects/p1");
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("loads more than the first page of results", async () => {
+    const page = (offset: number, count: number, hasMore: boolean) =>
+      searchResponse(
+        Array.from({ length: count }, (_, index) => searchResult("issue", `i${offset + index}`, `Deploy task ${offset + index}`)),
+        { offset, hasMore, total: 30 },
+      );
+    mockSearchApi.search.mockImplementation((_companyId: string, params: { offset?: number }) =>
+      Promise.resolve(params.offset ? page(20, 10, false) : page(0, 20, true)));
+    const { root } = renderWithQueryClient(<CommandPalette />, container);
+    openPalette();
+    typeQuery(container, "deploy");
+    await settleDebounce();
+
+    let more: HTMLButtonElement | null = null;
+    await waitForAssertion(() => {
+      more = container.querySelector<HTMLButtonElement>('button[data-testid="command-search-more"]');
+      expect(more?.textContent).toContain("20 of 30");
+    });
+    act(() => {
+      more!.click();
+    });
+    await settleDebounce();
+
+    await waitForAssertion(() => {
+      expect(container.querySelectorAll('button[data-testid="command-search-result"]')).toHaveLength(30);
+    });
+    expect(mockSearchApi.search).toHaveBeenLastCalledWith("company-1", expect.objectContaining({ q: "deploy", offset: 20 }));
+    expect(container.querySelector('button[data-testid="command-search-more"]')).toBeNull();
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows a visible empty state that offers to create a task from the text", async () => {
+    const { root } = renderWithQueryClient(<CommandPalette />, container);
+    openPalette();
+    typeQuery(container, "qqxz nothing");
+    await settleDebounce();
+
+    let create: HTMLButtonElement | undefined;
+    await waitForAssertion(() => {
+      expect(container.querySelector('[data-testid="command-search-empty"]')?.textContent).toContain("qqxz nothing");
+      create = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Create task"));
+      expect(create).toBeDefined();
+    });
+    act(() => {
+      create!.click();
+    });
+    await waitForAssertion(() => {
+      expect(dialogState.openNewIssue).toHaveBeenCalledWith({ title: "qqxz nothing" });
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("surfaces search errors with a retry instead of hiding them", async () => {
+    mockSearchApi.search.mockImplementation(() => Promise.reject(new Error("Search is down")));
+    const { root } = renderWithQueryClient(<CommandPalette />, container);
+    openPalette();
+    typeQuery(container, "deploy");
+    await settleDebounce();
+
+    let retry: HTMLButtonElement | null = null;
+    await waitForAssertion(() => {
+      retry = container.querySelector<HTMLButtonElement>('button[data-testid="command-search-error"]');
+      expect(retry?.textContent).toContain("Search is down");
+    });
+    const calls = mockSearchApi.search.mock.calls.length;
+    act(() => {
+      retry!.click();
+    });
+    await waitForAssertion(() => {
+      expect(mockSearchApi.search.mock.calls.length).toBeGreaterThan(calls);
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
 });

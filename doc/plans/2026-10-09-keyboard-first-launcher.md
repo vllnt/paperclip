@@ -369,6 +369,40 @@ migration. Slice 4 needs none either, but it waits for `#40`.
   Cmd/Ctrl+K, type, arrow, Enter navigates; `g d` navigates; `?` shows a
   chord that comes from the catalog.
 
+### Slice 1b: the launcher replaces the search page and the sidebar New Task
+
+User request, 2026-10-10: "search page should be fully replace by cmd+k, and
+replace the search in sidebar by search with cmd+k like in best saas ui that
+open the launcher" and "remove the new task from sidebar, must be done via
+cmd+k". It lands as its own PR, stacked on slice 1, before slice 2a.
+
+- **Sidebar:** both sidebars replace the Search link and the New Task button
+  with one Search trigger: a button with "Search…" and the key hint (`⌘K` on
+  Apple platforms, `Ctrl K` elsewhere); icon only with a tooltip in the rail.
+  It opens the launcher, which is the only way to open it on touch devices.
+- **Create:** "Create new task" leads the launcher's first group with an
+  empty query. The `c` shortcut, the page buttons and the phone bottom bar's
+  New Task stay.
+- **Search:** the launcher queries `GET /companies/:companyId/search` (the
+  endpoint behind `paperclipai search`) with the typed text and filters.
+  Results are grouped by kind, groups ordered by their best result, with a
+  "Show more results" row (20 per page, up to the endpoint's offset limit).
+  `scope:` and `sort:` are new parser tokens. Loading, empty (with "Create
+  task" from the text and "without filters") and error (with Retry) states
+  are rows in the launcher. The selection follows the best row when results
+  arrive, so Enter opens the best match.
+- **Old links:** `/search?...` (with or without the company prefix) goes to
+  the dashboard with the launcher open, its text rebuilt from the link's
+  query, filters, scope and sort.
+- **Removed:** the search page, its filter bar, menu, sheet, chips, sort menu
+  and zero-results panel, `lib/search-filters.ts`, the catalog's `nav.search`
+  action, and parser helpers only the page used. The PR lists each search
+  page feature and where it went, including what was dropped (per-option
+  filter counts, the mobile filter sheet's result preview, preview images in
+  rows, the exact-identifier redirect, which Enter on the first row replaces).
+- **Parity:** no change. The search endpoint, `paperclipai search`, and task
+  creation through the API and CLI stay as they are.
+
 ### Slice 2: keyboard-only pages
 
 The inventory (section 2.3) is too large for one reviewable PR. It splits

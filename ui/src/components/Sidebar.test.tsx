@@ -6,7 +6,9 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Sidebar } from "./Sidebar";
+import { Sidebar as ProductionSidebar } from "./Sidebar.production";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CommandActionsProvider, useCommandActions } from "../context/CommandActionsContext";
 
 const mockHeartbeatsApi = vi.hoisted(() => ({
   liveRunsForCompany: vi.fn(),
@@ -116,6 +118,19 @@ vi.mock("./SidebarStarredProjects", () => ({
   SidebarStarredProjects: () => <div data-testid="sidebar-starred-projects" />,
 }));
 
+// The legacy shell (Sidebar.production) uses these production variants.
+vi.mock("./SidebarCompanyMenu.production", () => ({
+  SidebarCompanyMenu: () => <div>Company menu</div>,
+}));
+
+vi.mock("./SidebarAgents.production", () => ({
+  SidebarAgents: () => <div data-testid="sidebar-agents">Active agents</div>,
+}));
+
+vi.mock("./SidebarStarredProjects.production", () => ({
+  SidebarStarredProjects: () => <div data-testid="sidebar-starred-projects" />,
+}));
+
 // Stubbed so the "no agent names in the primary nav" assertion would catch a
 // regression that mounts the old per-agent chat rows alongside the Chat rail.
 
@@ -131,10 +146,17 @@ async function flushReact() {
   flushSync(() => {});
 }
 
+const NO_COMMAND_BINDINGS = {};
+
+function PaletteProbe() {
+  const { paletteOpen } = useCommandActions();
+  return <span data-palette-open={String(paletteOpen)} />;
+}
+
 describe("Sidebar", () => {
   let container: HTMLDivElement;
 
-  async function renderSidebar() {
+  async function renderSidebar(SidebarComponent: () => ReactNode = () => <Sidebar />) {
     const root = createRoot(container);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -143,9 +165,12 @@ describe("Sidebar", () => {
     flushSync(() => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <TooltipProvider>
-            <Sidebar />
-          </TooltipProvider>
+          <CommandActionsProvider globalBindings={NO_COMMAND_BINDINGS}>
+            <TooltipProvider>
+              <SidebarComponent />
+              <PaletteProbe />
+            </TooltipProvider>
+          </CommandActionsProvider>
         </QueryClientProvider>,
       );
     });
@@ -187,22 +212,45 @@ describe("Sidebar", () => {
     });
   });
 
-  it("shows Search as a nav item instead of a header icon", async () => {
-    // The header's spare width goes to the workspace name (which otherwise
-    // truncates at ~78px), so search lives in the nav list — still
-    // exactly one pointer affordance, just relocated.
-    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
-    const root = await renderSidebar();
+  for (const [shell, SidebarComponent] of [
+    ["streamlined", () => <Sidebar />],
+    ["production", () => <ProductionSidebar />],
+  ] as const) {
+    it(`opens the command launcher from the Search trigger and has no New Task button (${shell})`, async () => {
+      mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
+      const root = await renderSidebar(SidebarComponent);
 
-    expect(container.querySelector('a[aria-label="Open search"]')).toBeNull();
-    const navSearchLink = [...container.querySelectorAll("nav a")]
-      .find((anchor) => anchor.textContent?.trim() === "Search");
-    expect(navSearchLink?.getAttribute("href")).toBe("/search");
+      expect(container.querySelector('nav a[href="/search"]')).toBeNull();
+      expect(container.textContent).not.toContain("New Task");
+      const trigger = container.querySelector<HTMLButtonElement>('button[data-sidebar-search-trigger]');
+      expect(trigger).not.toBeNull();
+      expect(trigger!.textContent).toContain("Search");
+      expect(trigger!.textContent).toMatch(/⌘K|Ctrl K/);
+      expect(container.querySelector("[data-palette-open]")?.getAttribute("data-palette-open")).toBe("false");
 
-    flushSync(() => {
-      root.unmount();
+      flushSync(() => {
+        trigger!.click();
+      });
+      expect(container.querySelector("[data-palette-open]")?.getAttribute("data-palette-open")).toBe("true");
+
+      flushSync(() => {
+        root.unmount();
+      });
     });
-  });
+
+    it(`shows an icon-only Search trigger with an accessible name in the rail (${shell})`, async () => {
+      mockSidebar.collapsed = true;
+      mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
+      const root = await renderSidebar(SidebarComponent);
+
+      const trigger = container.querySelector<HTMLButtonElement>('button[data-sidebar-search-trigger]');
+      expect(trigger?.getAttribute("aria-label")).toMatch(/^Search \((⌘K|Ctrl K)\)$/);
+
+      flushSync(() => {
+        root.unmount();
+      });
+    });
+  }
 
   it("renders plugin sidebar launchers inside the Work section", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
@@ -236,7 +284,7 @@ describe("Sidebar", () => {
     });
     const root = await renderSidebar();
 
-    expect(container.textContent).toContain("New Task");
+    expect(container.textContent).not.toContain("New Task");
     expect(container.textContent).not.toContain("New Issue");
 
     const navLabels = [...container.querySelectorAll("nav a")].map((a) => a.textContent?.trim());

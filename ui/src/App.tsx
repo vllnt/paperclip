@@ -34,7 +34,7 @@ import { ProjectDetail } from "./pages/ProjectDetail";
 import { ProjectWorkspaceDetail } from "./pages/ProjectWorkspaceDetail";
 import { Workspaces } from "./pages/Workspaces";
 import { Issues } from "./pages/Issues";
-import { Search } from "./pages/Search";
+import { SearchRedirect } from "./pages/SearchRedirect";
 import { IssueDetail } from "./pages/IssueDetail";
 import { AgentChats } from "./pages/AgentChats";
 import { AgentChat } from "./pages/AgentChat";
@@ -306,7 +306,8 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       </Route>
       <Route path="issues" element={<Issues />} />
       <Route path="tasks" element={<Navigate to="/issues" replace />} />
-      <Route path="search" element={<Search />} />
+      {/* The command launcher replaced the search page; old links open it. */}
+      <Route path="search" element={<SearchRedirect />} />
       {mergedTasks ? (
         <>
           {/* Combined Inbox + Task List: the status presets are real views, not aliases of /issues. */}

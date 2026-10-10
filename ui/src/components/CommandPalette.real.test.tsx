@@ -17,12 +17,17 @@ import { CommandActionsProvider } from "../context/CommandActionsContext";
 // re-run the palette's effects forever.
 const stable = vi.hoisted(() => ({
   company: { selectedCompanyId: "company-1" },
+  dialog: { openNewIssue: () => {} },
   sidebar: { isMobile: false, setSidebarOpen: () => {} },
   navigate: () => {},
 }));
 
 vi.mock("../context/CompanyContext", () => ({
   useCompany: () => stable.company,
+}));
+
+vi.mock("../context/DialogContext", () => ({
+  useDialogActions: () => stable.dialog,
 }));
 
 vi.mock("../context/SidebarContext", () => ({
@@ -148,4 +153,5 @@ describe("CommandPalette with the real command components", () => {
     expect(pressCommandK(document.body).defaultPrevented).toBe(false);
     expect(combobox()).toBeNull();
   });
+
 });

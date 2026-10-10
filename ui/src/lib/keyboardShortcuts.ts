@@ -327,3 +327,15 @@ export function shouldOpenCommandLauncher({
   if (isComposing || defaultPrevented || hasOpenDialog) return false;
   return !isKeyboardShortcutTextInputTarget(target);
 }
+
+/** The launcher's key hint for a platform string: "⌘K" on Apple platforms, else "Ctrl K". */
+export function commandLauncherKeyHint(platform: string): string {
+  return /mac|iphone|ipad|ipod/i.test(platform) ? "⌘K" : "Ctrl K";
+}
+
+/** The launcher's key hint for the current browser. */
+export function currentCommandLauncherKeyHint(): string {
+  if (typeof navigator === "undefined") return "Ctrl K";
+  const withData = navigator as Navigator & { userAgentData?: { platform?: string } };
+  return commandLauncherKeyHint(withData.userAgentData?.platform || navigator.platform || "");
+}
