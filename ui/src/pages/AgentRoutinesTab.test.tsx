@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { useEffect } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,10 +8,14 @@ import type { RoutinesProps } from "./Routines";
 import { AgentRoutinesTab } from "./AgentRoutinesTab";
 
 const routinesRenderMock = vi.fn((props: RoutinesProps) => props);
+const routinesMountMock = vi.fn((agentId: string | undefined) => agentId);
 
 vi.mock("./Routines", () => ({
   Routines: (props: RoutinesProps) => {
     routinesRenderMock(props);
+    useEffect(() => {
+      routinesMountMock(props.fixedAssigneeAgentId);
+    }, []);
     return <div data-testid="routines-list" />;
   },
 }));
@@ -28,6 +33,7 @@ describe("AgentRoutinesTab", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     routinesRenderMock.mockClear();
+    routinesMountMock.mockClear();
   });
 
   afterEach(() => {
@@ -44,6 +50,12 @@ describe("AgentRoutinesTab", () => {
       fixedAssigneeAgentId: "agent-ceo",
       excludeRoutineIds: undefined,
     });
+  });
+
+  it("starts a fresh list for another agent, so no rows, draft or selection carry over", () => {
+    render(<AgentRoutinesTab agentId="agent-a" />);
+    flushSync(() => root!.render(<AgentRoutinesTab agentId="agent-b" />));
+    expect(routinesMountMock.mock.calls.map(([agentId]) => agentId)).toEqual(["agent-a", "agent-b"]);
   });
 
   it("puts a built-in agent's managed routine above the list and keeps it out of the list", () => {

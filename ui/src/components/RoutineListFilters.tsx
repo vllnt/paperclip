@@ -35,8 +35,8 @@ const TRIGGER_LABELS: Record<RoutineListTriggerFilter, string> = {
 };
 
 /**
- * Reads the routine filters from the page URL. Values the list API would refuse are ignored, and `q` is
- * cut to the API's limit, so a hand-edited link still shows a list.
+ * Reads the routine filters from the page URL. Values the list API would refuse are ignored, and `q` loses
+ * any NUL character and is cut to the API's limit, so a hand-edited link still shows a list.
  * @param params - The current URL search parameters.
  * @returns The filters, with `null` for each one that is not set.
  */
@@ -45,7 +45,7 @@ export function readRoutineUrlFilters(params: URLSearchParams): RoutineUrlFilter
   const trigger = params.get("trigger");
   const agentId = params.get("agent");
   return {
-    q: params.get("q")?.trim().slice(0, ROUTINE_LIST_QUERY_MAX_LENGTH).trim() ?? "",
+    q: params.get("q")?.split("\u0000").join("").trim().slice(0, ROUTINE_LIST_QUERY_MAX_LENGTH).trim() ?? "",
     status: ROUTINE_STATUSES.find((value) => value === status) ?? null,
     trigger: ROUTINE_LIST_TRIGGER_FILTERS.find((value) => value === trigger) ?? null,
     agentId: agentId && GUID_PATTERN.test(agentId) ? agentId : null,

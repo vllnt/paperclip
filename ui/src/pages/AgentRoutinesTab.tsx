@@ -18,7 +18,8 @@ export function AgentRoutinesTab({ agentId, builtInRoutine, managedRoutineId }: 
   return (
     <div className="space-y-6">
       {builtInRoutine}
-      <Routines embedded fixedAssigneeAgentId={agentId} excludeRoutineIds={excludeRoutineIds} />
+      {/* A key per agent: the agent page stays mounted across agents, and no list, draft or selection may carry over. */}
+      <Routines key={agentId} embedded fixedAssigneeAgentId={agentId} excludeRoutineIds={excludeRoutineIds} />
     </div>
   );
 }

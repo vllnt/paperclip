@@ -39,6 +39,8 @@ describe("routine URL filters", () => {
     const filters = readRoutineUrlFilters(new URLSearchParams(`agent=agent-1&q=${"x".repeat(250)}`));
     expect(filters.agentId).toBeNull();
     expect(filters.q).toHaveLength(200);
+    // The API refuses a NUL character, so the reader drops it.
+    expect(readRoutineUrlFilters(new URLSearchParams("q=week%00ly")).q).toBe("weekly");
   });
 
   it("builds the list query, and a fixed agent wins over the agent in the URL", () => {
