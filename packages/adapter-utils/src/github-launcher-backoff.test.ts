@@ -23,7 +23,8 @@ type Brokered = { response: { status: number; ok: boolean }; result: unknown } |
 type Call = { url: string; startedAt: number; endedAt: number };
 
 /** The launcher's brokerPost, unchanged, with a scripted `fetch`, the fake clock, and a chosen jitter. */
-function brokerPostWith(script: Behavior[] | ((call: number) => Behavior), jitter: number) {
+type Script = Behavior[] | ((call: number, url: string) => Behavior);
+function brokerPostWith(script: Script, jitter: number) {
   const source = githubLauncherSource();
   const start = source.indexOf("async function brokerPost("), end = source.indexOf("const clean = ");
   expect(start, "brokerPost is in the launcher source").toBeGreaterThan(0);
@@ -32,7 +33,7 @@ function brokerPostWith(script: Behavior[] | ((call: number) => Behavior), jitte
   const fetchStub = async (url: string) => {
     const call: Call = { url, startedAt: Date.now(), endedAt: 0 };
     calls.push(call);
-    const behavior = typeof script === "function" ? script(calls.length - 1) : script[Math.min(calls.length - 1, script.length - 1)]!;
+    const behavior = typeof script === "function" ? script(calls.length - 1, url) : script[Math.min(calls.length - 1, script.length - 1)]!;
     try {
       if (behavior === "timeout") {
         // The launcher's own limit (AbortSignal.timeout(10000)) fires after 10 s of waiting.
@@ -57,7 +58,7 @@ const direct = { PAPERCLIP_GITHUB_BROKER_URL: "http://broker.test", PAPERCLIP_GI
 const bridged = { ...direct, PAPERCLIP_API_BRIDGE_MODE: "1", PAPERCLIP_API_URL: "http://bridge.test" };
 
 /** Runs one brokerPost to its end on the fake clock. */
-async function run(script: Behavior[] | ((call: number) => Behavior), options: { jitter?: number; env?: Record<string, string> } = {}) {
+async function run(script: Script, options: { jitter?: number; env?: Record<string, string> } = {}) {
   const { brokerPost, calls } = brokerPostWith(script, options.jitter ?? 0.999999);
   const begun = Date.now();
   const settled = brokerPost(options.env ?? direct, "/runtime-tools/github/credentials", "{}").then(
@@ -148,13 +149,67 @@ describe("the launcher's retry of a busy or slow Paperclip server", () => {
     expect(result.error).toBeDefined();
   });
 
-  it("moves from a bridge that timed out to the broker route at once, and counts both in the same five tries", async () => {
-    const result = await run(["timeout"], { env: bridged });
+});
 
-    expect(result.calls[0]!.url).toBe("http://bridge.test/runtime-tools/github/credentials");
-    expect(result.calls[1]!.url).toBe("http://broker.test/runtime-tools/github/credentials");
-    expect(result.gaps[0]).toBe(0);
-    expect(result.calls).toHaveLength(5);
+// A sandbox reaches Paperclip through its run bridge; the broker URL (the server's public address) may not even resolve there.
+// A bridge that is slow or busy is still the route that works, so the launcher asks it again. It moves to the other route
+// only when the first cannot be reached at all.
+describe("which route the launcher asks again", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const BRIDGE = "http://bridge.test/runtime-tools/github/credentials", BROKER = "http://broker.test/runtime-tools/github/credentials";
+  /** The bridge says `onBridge` in order (the last one repeats); the broker never answers because its address does not resolve. */
+  const bridgeOnly = (onBridge: Behavior[]) => {
+    let seen = 0;
+    return (_call: number, url: string): Behavior => (url === BRIDGE ? onBridge[Math.min(seen++, onBridge.length - 1)]! : "refused");
+  };
+  const urlsOf = (calls: Call[]) => calls.map(call => call.url);
+
+  it("asks the bridge again after it timed out once, and gets its answer, with the broker unreachable", async () => {
+    const result = await run(bridgeOnly(["timeout", "ok"]), { env: bridged });
+
+    expect(result.value?.response.ok).toBe(true);
+    expect(urlsOf(result.calls)).toEqual([BRIDGE, BRIDGE]);
+  });
+
+  it("asks the bridge again after a 409, and never the broker", async () => {
+    const result = await run(bridgeOnly(["409", "409", "ok"]), { env: bridged });
+
+    expect(result.value?.response.ok).toBe(true);
+    expect(urlsOf(result.calls)).toEqual([BRIDGE, BRIDGE, BRIDGE]);
+  });
+
+  it("keeps to the bridge for every try when it never answers, and then says why", async () => {
+    const result = await run(bridgeOnly(["timeout"]), { env: bridged });
+
+    expect(new Set(urlsOf(result.calls))).toEqual(new Set([BRIDGE]));
+    expect(result.error?.message).toMatch(/credentials unavailable after \d tries over \d+ s/);
+  });
+
+  it("moves to the broker at once when the bridge cannot be reached, and the broker answers", async () => {
+    const result = await run((_call, url) => (url === BRIDGE ? "refused" : "ok"), { env: bridged });
+
+    expect(result.value?.response.ok).toBe(true);
+    expect(urlsOf(result.calls)).toEqual([BRIDGE, BROKER]);
+    expect(result.gaps).toEqual([0]);
+  });
+
+  it("asks the same route again when it times out after a move to it", async () => {
+    let broker = 0;
+    const result = await run((_call, url) => (url === BRIDGE ? "refused" : broker++ === 0 ? "timeout" : "ok"), { env: bridged });
+
+    expect(result.value?.response.ok).toBe(true);
+    expect(urlsOf(result.calls)).toEqual([BRIDGE, BROKER, BROKER]);
+  });
+
+  it("asks the broker again after it timed out, outside a sandbox, and never the API route", async () => {
+    let broker = 0;
+    const env = { ...direct, PAPERCLIP_API_URL: "http://api.test" };
+    const result = await run((_call, url) => (url === BROKER ? (broker++ === 0 ? "timeout" : "ok") : "refused"), { env });
+
+    expect(result.value?.response.ok).toBe(true);
+    expect(urlsOf(result.calls)).toEqual([BROKER, BROKER]);
   });
 });
 
