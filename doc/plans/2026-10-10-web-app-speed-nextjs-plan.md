@@ -1,7 +1,7 @@
 # Web app speed: every page fast by mouse and keyboard, and whether to move to Next.js
 
 Date: 2026-10-10
-Status: Plan only. No code ships with this pull request. Implementation starts after the plan is approved.
+Status: Evidence base. On 2026-10-10 the maintainers decided to migrate to Next.js; the plan is `doc/plans/2026-10-10-web-app-nextjs-migration.md`. This file's recommendation (section 0) is kept as the considered alternative. Its numbers (B0, B1) are the reference each migration slice is measured against, on the same machine.
 Branch: `docs/web-app-speed-nextjs-plan`
 Builds on: #50 (web-perf plan and the harness `tests/perf/web-app/`), #53, #54, #57, #68, #87 (open), #84 (merged), and the keyboard work in #86 (merged as `d47df97f0`, after B0) and #95 (open).
 
