@@ -837,6 +837,189 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(finalState?.status).toBe("archived");
   }, 30_000);
 
+  // A clean workspace with nothing ahead of its base holds no local-only work,
+  // so it waits only the retention (24 hours), not the 7-day cooldown.
+  describe("reaper retention without local-only work", () => {
+    const HOUR_MS = 60 * 60 * 1000;
+    const nowMs = Date.UTC(2026, 5, 1);
+
+    function reaper() {
+      return executionWorkspaceService(db, {
+        resolvePullRequestDetails: async (companyId, reference) =>
+          pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+          ?? { state: "unknown", headRef: null, headSha: null },
+        now: () => new Date(nowMs),
+        workspaceReaperCooldownDays: 7,
+        workspaceReaperNoLocalWorkRetentionHours: 24,
+      });
+    }
+
+    // A worktree whose HEAD is its base, for an issue that became terminal
+    // `hoursAgo` hours before the fixed clock.
+    async function seedNoLocalWork(options: { status?: "done" | "cancelled"; hoursAgo: number }) {
+      const seeded = await seedAncestryTerminalWorkspace({ updatedAt: new Date(nowMs - 400 * HOUR_MS) });
+      const terminalAt = new Date(nowMs - options.hoursAgo * HOUR_MS);
+      await db
+        .update(issues)
+        .set(options.status === "cancelled"
+          ? { status: "cancelled", cancelledAt: terminalAt, completedAt: null, updatedAt: terminalAt }
+          : { status: "done", completedAt: terminalAt, updatedAt: terminalAt })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      return seeded;
+    }
+
+    async function statusOf(executionWorkspaceId: string) {
+      const [row] = await db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return row?.status ?? null;
+    }
+
+    async function expectKept(seeded: { executionWorkspaceId: string; worktreePath: string }) {
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+      await expect(fs.stat(seeded.worktreePath)).resolves.toBeTruthy();
+    }
+
+    it.each(["cancelled", "done"] as const)(
+      "archives a %s issue's clean workspace with nothing ahead of its base after 24 hours and removes its worktree",
+      async (status) => {
+        const seeded = await seedNoLocalWork({ status, hoursAgo: 25 });
+
+        const sweep = await reaper().sweepTerminalWorkspaces();
+
+        expect(sweep).toMatchObject({ archived: 1, skippedCooldown: 0, cleanupFailed: 0 });
+        expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+        // The worktree itself is gone, not only the row.
+        await expect(fs.stat(seeded.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+        const entries = await db
+          .select({ action: activityLog.action, actorId: activityLog.actorId, details: activityLog.details })
+          .from(activityLog)
+          .where(eq(activityLog.entityId, seeded.executionWorkspaceId));
+        expect(entries).toEqual([{
+          action: "execution_workspace.issue_terminal_archived",
+          actorId: "workspace_terminality_reaper",
+          details: expect.objectContaining({ deliveryState: "merged_by_ancestry", noLocalWork: true }),
+        }]);
+      },
+      20_000,
+    );
+
+    it("keeps it inside the 24 hour retention", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 2 });
+
+      expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedCooldown: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps delivered work with commits for the 7 day cooldown", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs - 400 * HOUR_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs - 25 * HOUR_MS) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedCooldown: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+    }, 20_000);
+
+    it("keeps modified tracked files", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "# Changed\n", "utf8");
+
+      expect(await reaper().sweepTerminalWorkspaces())
+        .toMatchObject({ archived: 0, skippedUndelivered: 1, skippedDirty: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps untracked files", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      await fs.writeFile(path.join(seeded.worktreePath, "notes.txt"), "not committed\n", "utf8");
+
+      expect(await reaper().sweepTerminalWorkspaces())
+        .toMatchObject({ archived: 0, skippedUndelivered: 1, skippedUntracked: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps commits ahead of the base", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      await fs.writeFile(path.join(seeded.worktreePath, "work.txt"), "committed, never merged\n", "utf8");
+      await runGit(seeded.worktreePath, ["add", "work.txt"]);
+      await runGit(seeded.worktreePath, ["commit", "-m", "Local work"]);
+
+      expect(await reaper().sweepTerminalWorkspaces())
+        .toMatchObject({ archived: 0, skippedUndelivered: 1, skippedAheadOfBase: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps a workspace whose git status cannot be verified", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      const statusSpy = vi.spyOn(workspaceGitOperationScheduler, "run")
+        .mockRejectedValue(new Error("scan queue unavailable"));
+      try {
+        expect(await reaper().sweepTerminalWorkspaces())
+          .toMatchObject({ archived: 0, skippedUndelivered: 1, skippedUnverifiedStatus: 1 });
+      } finally {
+        statusSpy.mockRestore();
+      }
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps a workspace with an active run", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId, companyId: seeded.companyId, name: "Coder", role: "engineer", status: "active",
+        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId, status: "running" });
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, seeded.sourceIssueId));
+
+      expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedActiveRun: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps a workspace that a reopen is still consuming", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      await db
+        .update(executionWorkspaces)
+        .set({
+          metadata: {
+            [EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY]: true,
+            [EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY]: new Date(nowMs).toISOString(),
+          },
+          updatedAt: new Date(nowMs - 400 * HOUR_MS),
+        })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedReopened: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps a workspace that an open issue outside its tree still uses", async () => {
+      // Past the 7 day cooldown too, so only the open linked issue keeps it.
+      const seeded = await seedNoLocalWork({ status: "done", hoursAgo: 240 });
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        projectId: seeded.projectId,
+        identifier: `F-${randomUUID().slice(0, 8)}`,
+        title: "Follow-up that inherited the workspace",
+        status: "todo",
+        priority: "medium",
+        executionWorkspaceId: seeded.executionWorkspaceId,
+      });
+
+      expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedOpenLinkedIssue: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+  });
+
   describe("reaper cooldown", () => {
     const DAY_MS = 24 * 60 * 60 * 1000;
     const nowMs = Date.UTC(2026, 5, 1);

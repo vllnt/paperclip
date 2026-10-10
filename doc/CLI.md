@@ -1053,6 +1053,7 @@ npx paperclipai workspace get <execution-workspace-id>
 npx paperclipai workspace close-readiness <execution-workspace-id>
 npx paperclipai workspace operations <execution-workspace-id>
 npx paperclipai workspace update <execution-workspace-id> --payload-json '{...}'
+npx paperclipai workspace archive <execution-workspace-id>
 npx paperclipai workspace runtime-service <execution-workspace-id> start --payload-json '{...}'
 npx paperclipai workspace runtime-command <execution-workspace-id> run --payload-json '{...}'
 ```

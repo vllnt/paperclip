@@ -1483,6 +1483,20 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_WORKSPACE_REAPER_NO_LOCAL_WORK_RETENTION_HOURS=<hours>` sets the
+  shorter wait for a terminal workspace with no local-only work: no modified or
+  untracked files and no commits ahead of its base ref, whether or not the work
+  was delivered (a cancelled issue, or a task that committed nothing). Deleting
+  it loses nothing, and a reopen provisions a fresh workspace. It never waits
+  longer than the cooldown above. The default is `24`; `0` archives it on the
+  same sweep; a negative or non-numeric value falls back to the default. A
+  workspace with commits ahead of its base stays until a merge proves delivery.
+  The reaper also keeps a workspace that an open issue outside its issue tree
+  still uses. Its "skipped all candidates" log line counts each reason:
+  `skippedUnverifiedStatus`, `skippedDirty`, `skippedUntracked`,
+  `skippedAheadOfBase` and `skippedUnknownDelivery` (together
+  `skippedUndelivered`), `skippedOpenLinkedIssue`, `skippedActiveRun`,
+  `skippedReopened`, `skippedNonTerminalTree` and `skippedCooldown`.
 - `PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES=<minutes>` sets how long after a run
   finished the temp sweep keeps its per-run temp entries in the OS temp
   directory (`paperclip-ssh-key-<runId>-*`, `paperclip-ssh-sync-back-<runId>-*`,

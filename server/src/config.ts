@@ -76,6 +76,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  workspaceReaperNoLocalWorkRetentionHours: number;
   tempSweepRunGraceMinutes: number;
   tempSweepIntervalMinutes: number;
   serveUi: boolean;
@@ -291,6 +292,20 @@ export function loadConfig(): Config {
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
       : 7;
+  // A terminal workspace with no local-only work (no modified or untracked
+  // files and no commits ahead of its base ref) waits only this many hours,
+  // never longer than the cooldown above: deleting it loses nothing, and a
+  // reopen provisions a fresh workspace. A value of 0 archives it on the same
+  // sweep. A negative or non-numeric value falls back to the default of 24.
+  const workspaceReaperNoLocalWorkRetentionHoursEnv =
+    process.env.PAPERCLIP_WORKSPACE_REAPER_NO_LOCAL_WORK_RETENTION_HOURS?.trim();
+  const workspaceReaperNoLocalWorkRetentionHoursRaw = Number(workspaceReaperNoLocalWorkRetentionHoursEnv);
+  const workspaceReaperNoLocalWorkRetentionHours =
+    workspaceReaperNoLocalWorkRetentionHoursEnv
+      && Number.isFinite(workspaceReaperNoLocalWorkRetentionHoursRaw)
+      && workspaceReaperNoLocalWorkRetentionHoursRaw >= 0
+      ? workspaceReaperNoLocalWorkRetentionHoursRaw
+      : 24;
   // The temp sweep removes a per-run temp entry only after its run finished
   // this many minutes ago. Values between 0 and 1 use 1; zero, a negative or a
   // non-numeric value uses 15.
@@ -355,6 +370,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    workspaceReaperNoLocalWorkRetentionHours,
     tempSweepRunGraceMinutes,
     tempSweepIntervalMinutes,
     serveUi:

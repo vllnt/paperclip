@@ -47,6 +47,7 @@ export function registerWorkspaceCommands(program: Command): void {
   addIdGet(workspace, "close-readiness", "Check execution workspace close readiness", "execution-workspaces", "close-readiness");
   addIdGet(workspace, "operations", "List execution workspace operations", "execution-workspaces", "workspace-operations");
   addPatchJson(workspace, "update", "Update an execution workspace", "execution-workspaces");
+  addWorkspaceArchive(workspace);
   addRuntimeAction(workspace, "runtime-service", "Control an execution workspace runtime service", "execution-workspaces", "runtime-services");
   addRuntimeAction(workspace, "runtime-command", "Run an execution workspace runtime command", "execution-workspaces", "runtime-commands");
 
@@ -227,6 +228,32 @@ function addIdGet(parent: Command, name: string, description: string, resource: 
         try {
           const ctx = resolveCommandContext(opts);
           const result = await ctx.api.get(`/api/${resource}/${encodeURIComponent(id)}${suffix ? `/${suffix}` : ""}`);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+}
+
+// Archives an execution workspace as the board's close dialog does: it reads
+// close readiness first and refuses while that is blocked. The server checks
+// the same readiness again before it archives and deletes the workspace.
+function addWorkspaceArchive(parent: Command): void {
+  addCommonClientOptions(
+    parent
+      .command("archive")
+      .description("Archive an execution workspace and remove its worktree, unless close readiness is blocked")
+      .argument("<id>", "Execution workspace ID")
+      .action(async (id: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const workspacePath = `/api/execution-workspaces/${encodeURIComponent(id)}`;
+          const readiness = await ctx.api.get<{ state?: string; blockingReasons?: string[] }>(`${workspacePath}/close-readiness`);
+          if (readiness?.state === "blocked") {
+            throw new Error(`Workspace ${id} cannot be archived: ${(readiness.blockingReasons ?? []).join(" ")}`);
+          }
+          const result = await ctx.api.patch(workspacePath, { status: "archived" });
           printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
