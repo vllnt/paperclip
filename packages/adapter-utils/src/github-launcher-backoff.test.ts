@@ -113,32 +113,40 @@ describe("the launcher's retry of a busy or slow Paperclip server", () => {
     expect(result.value?.result).toEqual({ status: "available", env: {} });
   });
 
-  it("retries a request that timed out with the same growing pauses, and a later answer wins", async () => {
-    const result = await run(["timeout", "timeout", "timeout", "ok"]);
+  // On main, a request that timed out had the transport budget: three requests, pauses of 0.5 and 1 s, 31.5 s in all. A
+  // timed-out request may still be running on the server, so a command that nobody answers must not cost more requests or
+  // more waiting than that.
+  const TIMEOUT_STEPS = [500, 1000];
 
-    expect(result.calls).toHaveLength(4);
+  it("retries a request that timed out, twice at most, and a later answer wins", async () => {
+    const result = await run(["timeout", "timeout", "ok"]);
+
+    expect(result.calls).toHaveLength(3);
     expect(result.value?.response.ok).toBe(true);
     result.gaps.forEach((gap, at) => {
-      expect(gap, `pause ${at + 1}`).toBeGreaterThanOrEqual(BASE_STEPS[at]! * 0.5);
-      expect(gap, `pause ${at + 1}`).toBeLessThanOrEqual(BASE_STEPS[at]!);
+      expect(gap, `pause ${at + 1}`).toBeGreaterThanOrEqual(TIMEOUT_STEPS[at]! * 0.5);
+      expect(gap, `pause ${at + 1}`).toBeLessThanOrEqual(TIMEOUT_STEPS[at]!);
     });
   });
 
-  it("gives up after five timed-out requests, within a bounded time, with the clear error", async () => {
+  it("gives up after three timed-out requests, with no more requests and no more waiting than main, and the clear error", async () => {
     const result = await run(["timeout"], { jitter: 0.999999 });
 
-    expect(result.calls).toHaveLength(5);
-    // Five requests of 10 s each and the four pauses (15 s at most).
-    expect(result.elapsed).toBeLessThanOrEqual(65_000);
-    expect(result.error?.message).toMatch(/credentials unavailable after 5 tries over \d+ s/);
+    expect(result.calls).toHaveLength(3);
+    // Three requests of 10 s each and two pauses (1.5 s at most): what main spent.
+    expect(result.elapsed).toBeLessThanOrEqual(31_500);
+    expect(result.error?.message).toMatch(/credentials unavailable after 3 tries over \d+ s/);
     expect(result.error?.message).toMatch(/did not answer/);
   });
 
-  it("mixes 409s and timeouts in one budget of five tries", async () => {
+  it("mixes 409s and timeouts in one budget of five tries, of which three at most may be timeouts", async () => {
     const result = await run(["409", "timeout", "409", "timeout", "409", "ok"]);
 
     expect(result.calls).toHaveLength(5);
     expect(result.error?.message).toMatch(/after 5 tries/);
+    const timeouts = await run(["409", "timeout", "timeout", "timeout", "ok"]);
+    expect(timeouts.calls).toHaveLength(4);
+    expect(timeouts.error?.message).toMatch(/after 4 tries/);
   });
 
   it("keeps the small quick budget for other transport failures (connection refused)", async () => {
@@ -183,8 +191,8 @@ describe("which route the launcher asks again", () => {
   it("keeps to the bridge for every try when it never answers, and then says why", async () => {
     const result = await run(bridgeOnly(["timeout"]), { env: bridged });
 
-    expect(new Set(urlsOf(result.calls))).toEqual(new Set([BRIDGE]));
-    expect(result.error?.message).toMatch(/credentials unavailable after \d tries over \d+ s/);
+    expect(urlsOf(result.calls)).toEqual([BRIDGE, BRIDGE, BRIDGE]);
+    expect(result.error?.message).toMatch(/credentials unavailable after 3 tries over \d+ s/);
   });
 
   it("moves to the broker at once when the bridge cannot be reached, and the broker answers", async () => {
