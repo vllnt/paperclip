@@ -46,7 +46,11 @@ export interface AvailableCommandAction extends CommandActionDefinition {
 export interface CommandActionsValue {
   paletteOpen: boolean;
   setPaletteOpen: (open: boolean) => void;
-  openCommandPalette: () => void;
+  /** Opens the launcher, optionally with its search text filled in. */
+  openCommandPalette: (query?: string) => void;
+  /** The launcher's search text; cleared when it closes. */
+  paletteQuery: string;
+  setPaletteQuery: (query: string | ((current: string) => string)) => void;
   /** Available actions in catalog order. */
   actions: readonly AvailableCommandAction[];
   contextualIds: ReadonlySet<string>;
@@ -65,15 +69,18 @@ interface Registration {
 /** Imperative access for the layout shell, which renders the provider itself. */
 export interface CommandActionsHandle {
   run: (actionId: string) => boolean;
-  openCommandPalette: () => void;
+  openCommandPalette: (query?: string) => void;
 }
 
-type RegisterCommandActions = CommandActionsValue["register"];
+interface CommandActionsRegistry {
+  register: CommandActionsValue["register"];
+  openCommandPalette: (query?: string) => void;
+}
 
 const CommandActionsContext = createContext<CommandActionsValue | null>(null);
-// Pages only need the stable `register`; a separate context keeps them from
-// re-rendering whenever the palette opens or usage changes.
-const CommandActionsRegistryContext = createContext<RegisterCommandActions | null>(null);
+// Pages and the sidebar only need stable callbacks; a separate context keeps
+// them from re-rendering whenever the palette opens or usage changes.
+const CommandActionsRegistryContext = createContext<CommandActionsRegistry | null>(null);
 
 /** The newest page registration wins over older ones and over the global handlers. */
 function resolveBinding(
@@ -92,7 +99,12 @@ function resolveBinding(
 }
 
 function useCommandActionsController(globalBindings: CommandActionBindings): CommandActionsValue {
-  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteOpen, setPaletteOpenState] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const setPaletteOpen = useCallback((open: boolean) => {
+    setPaletteOpenState(open);
+    if (!open) setPaletteQuery("");
+  }, []);
   const [registrations, setRegistrations] = useState<Registration[]>([]);
   const nextTokenRef = useRef(0);
   const globalBindingsRef = useRef(globalBindings);
@@ -149,18 +161,23 @@ function useCommandActionsController(globalBindings: CommandActionBindings): Com
     return true;
   }, [registrations, storageKey]);
 
-  const openCommandPalette = useCallback(() => setPaletteOpen(true), []);
+  const openCommandPalette = useCallback((query?: string) => {
+    if (query !== undefined) setPaletteQuery(query);
+    setPaletteOpenState(true);
+  }, []);
 
   return useMemo(() => ({
     paletteOpen,
     setPaletteOpen,
     openCommandPalette,
+    paletteQuery,
+    setPaletteQuery,
     actions,
     contextualIds,
     usage,
     run,
     register,
-  }), [paletteOpen, openCommandPalette, actions, contextualIds, usage, run, register]);
+  }), [paletteOpen, setPaletteOpen, openCommandPalette, paletteQuery, actions, contextualIds, usage, run, register]);
 }
 
 /**
@@ -181,8 +198,9 @@ export function CommandActionsProvider({
   const value = useCommandActionsController(globalBindings);
   const { run, openCommandPalette, register } = value;
   useImperativeHandle(handleRef, () => ({ run, openCommandPalette }), [run, openCommandPalette]);
+  const registry = useMemo(() => ({ register, openCommandPalette }), [register, openCommandPalette]);
   return (
-    <CommandActionsRegistryContext.Provider value={register}>
+    <CommandActionsRegistryContext.Provider value={registry}>
       <CommandActionsContext.Provider value={value}>{children}</CommandActionsContext.Provider>
     </CommandActionsRegistryContext.Provider>
   );
@@ -200,7 +218,7 @@ export function useCommandActions(): CommandActionsValue {
  * the registration changes only when the set of available ids changes.
  */
 export function useRegisterCommandActions(bindings: CommandActionBindings): void {
-  const register = useContext(CommandActionsRegistryContext);
+  const register = useContext(CommandActionsRegistryContext)?.register;
   const bindingsRef = useRef(bindings);
   useLayoutEffect(() => {
     bindingsRef.current = bindings;
@@ -210,4 +228,9 @@ export function useRegisterCommandActions(bindings: CommandActionBindings): void
     if (!register || !idsKey) return undefined;
     return register(idsKey.split("\n"), () => bindingsRef.current);
   }, [register, idsKey]);
+}
+
+/** Opens the command launcher (optionally with search text); null outside a launcher provider. */
+export function useOpenCommandPalette(): ((query?: string) => void) | null {
+  return useContext(CommandActionsRegistryContext)?.openCommandPalette ?? null;
 }

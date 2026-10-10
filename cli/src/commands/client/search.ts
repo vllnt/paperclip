@@ -31,10 +31,14 @@ export function registerSearchCommand(program: Command): void {
       .addOption(new Option("--scope <scope>", "Limit results to one kind").choices(COMPANY_SEARCH_SCOPES))
       .option("--limit <n>", "Maximum results (1-50, default 20)")
       .option("--offset <n>", "Skip this many results (max 200)")
-      .action(async (queryParts: string[], opts: SearchOptions) => {
+      .action(async (queryParts: string[], opts: SearchOptions, command: Command) => {
+        const q = queryParts.join(" ");
+        // As in the board launcher: --scope only narrows a search, and the
+        // server matches nothing without words.
+        if (q.trim().length === 0) command.error("Search needs words: --scope only narrows a search.");
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
-          const params = new URLSearchParams({ q: queryParts.join(" ") });
+          const params = new URLSearchParams({ q });
           if (opts.scope) params.set("scope", opts.scope);
           if (opts.limit) params.set("limit", opts.limit);
           if (opts.offset) params.set("offset", opts.offset);

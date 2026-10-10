@@ -879,7 +879,7 @@ npx paperclipai activity issue <issue-id>
 
 ## Search Commands
 
-`search` uses the same company search as the board's command palette and `/search` page (`GET /api/companies/:companyId/search`).
+`search` uses the same company search as the board's Cmd/Ctrl+K launcher (`GET /api/companies/:companyId/search`). Like the launcher, it needs search words: `--scope` only narrows a search, so a blank query is refused without a request.
 
 ```sh
 npx paperclipai search <text...> --company-id <company-id> [--scope all|issues|comments|documents|artifacts|agents|projects] [--limit 20] [--offset 0] [--json]

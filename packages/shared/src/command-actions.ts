@@ -76,7 +76,6 @@ export const COMMAND_ACTIONS: readonly CommandActionDefinition[] = [
   navigate("nav.costs", "Costs", "/costs", "m", ["spend", "budget", "money", "usage", "billing"]),
   navigate("nav.skills", "Skills", "/skills", "k", ["capabilities", "tools"]),
   navigate("nav.settings", "Company settings", "/company/settings", "s", ["preferences", "configuration", "members"]),
-  navigate("nav.search", "Search", "/search", null, ["find", "full search"]),
   navigate("nav.apps", "Connectors", "/apps", null, ["apps", "integrations", "connections"]),
   navigate("nav.companies", "Companies", "/companies", null, ["switch company", "organizations"]),
   uiAction("create.task", "Create new task", "create", ["c"], ["create", "issue", "ticket", "add"]),

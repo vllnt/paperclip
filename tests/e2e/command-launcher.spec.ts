@@ -119,26 +119,24 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
       await page.keyboard.type("launcher");
       const taskRow = page.getByRole("option", { name: new RegExp(seed.issueTitle) });
       await expect(taskRow).toBeVisible();
+      // Company search ranks the task, then the agent, then the project.
       const selected = page.locator("[cmdk-item][aria-selected='true']");
-      await expect(selected).toContainText(seed.projectName);
-      await page.keyboard.press("ArrowDown");
       await expect(selected).toContainText(seed.issueTitle);
-      await page.keyboard.press("ArrowUp");
-      await expect(selected).toContainText(seed.projectName);
       await page.keyboard.press("ArrowDown");
+      await expect(selected).toContainText("Launcher Agent");
+      await page.keyboard.press("ArrowUp");
       await expect(selected).toContainText(seed.issueTitle);
       await page.keyboard.press("Enter");
       await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/issues/${seed.issueIdentifier}`));
 
-      // No local match: Enter hands the query to the full search page.
+      // No match: the launcher says so and stays open (the search page is gone).
       await openLauncher(page);
       await page.keyboard.type("qqxz nothing");
-      await page.keyboard.press("Enter");
-      await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/search\\?q=qqxz\\+nothing`));
+      await expect(page.getByTestId("command-search-empty")).toContainText("qqxz nothing");
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
 
-      // The cheatsheet lists the catalog chords. The search page focuses its
-      // own input on arrival; wait for that before moving focus off it.
-      await expect(page.getByRole("textbox", { name: "Search query" })).toBeFocused();
+      // The cheatsheet lists the catalog chords.
       await page.locator("#main-content").focus();
       await page.keyboard.press("?");
       const cheatsheet = page.getByRole("dialog", { name: "Keyboard shortcuts" });
@@ -154,6 +152,195 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
       await expect(lastRow).toBeInViewport();
       await page.keyboard.press("Escape");
       await expect(cheatsheet).toBeHidden();
+
+      expect(errors).toEqual([]);
+    });
+
+    test("searches from the sidebar Search trigger, loads more and opens a result", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      for (let index = 1; index <= 24; index += 1) {
+        await json(await request.post(`/api/companies/${seed.companyId}/issues`, {
+          data: { title: `Zircon rollout step ${index}`, status: "todo" },
+        }));
+      }
+      const errors = trackPageErrors(page);
+      await page.goto(`/${seed.prefix}/dashboard`);
+      await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "New Task", exact: true }).and(page.locator("aside button"))).toHaveCount(0);
+
+      if (viewport.name === "mobile") {
+        await page.getByRole("button", { name: "Open sidebar" }).click();
+      }
+      const trigger = page.locator("button[data-sidebar-search-trigger]");
+      await expect(trigger).toBeVisible();
+      await expect(trigger).toContainText(/⌘K|Ctrl K/);
+      await trigger.click();
+      const input = page.getByRole("combobox", { name: "Command launcher" });
+      await expect(input).toBeFocused();
+
+      await page.keyboard.type("zircon");
+      const results = page.getByTestId("command-search-result");
+      await expect(results).toHaveCount(20);
+      await page.getByTestId("command-search-more").click();
+      await expect(results).toHaveCount(24);
+
+      // Escape returns focus to the trigger. On phones the launcher closes the
+      // sidebar when it opens, so focus falls back to the page.
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      if (viewport.name === "mobile") await expect(page.locator("#main-content")).toBeFocused();
+      else await expect(trigger).toBeFocused();
+
+      await page.keyboard.press("ControlOrMeta+k");
+      await expect(input).toBeFocused();
+      await page.keyboard.type("zircon rollout step 7");
+      await expect(page.getByRole("option").first()).toContainText("Zircon rollout step 7");
+      await page.keyboard.press("Enter");
+      await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/issues/`));
+      await expect(page.locator("#main-content").getByText("Zircon rollout step 7").first()).toBeVisible();
+
+      expect(errors).toEqual([]);
+    });
+
+    test("creates a task from the launcher", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      const errors = trackPageErrors(page);
+      await page.goto(`/${seed.prefix}/dashboard`);
+      await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+      await page.locator("#main-content").focus();
+
+      await openLauncher(page);
+      await expect(page.getByRole("option").first()).toContainText("Create new task");
+      await page.keyboard.press("Enter");
+      await expect(page.getByPlaceholder("Task title")).toBeVisible();
+
+      expect(errors).toEqual([]);
+    });
+
+    test("opens an old /search link as the launcher with its query filled in", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      const errors = trackPageErrors(page);
+      await page.goto(`/${seed.prefix}/search?q=zircon&status=todo&sort=updated`);
+
+      await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/dashboard`));
+      const input = page.getByRole("combobox", { name: "Command launcher" });
+      await expect(input).toBeVisible();
+      await expect(input).toHaveValue("zircon status:todo sort:updated");
+
+      expect(errors).toEqual([]);
+    });
+
+    test("asks for words when only scope: or sort: is typed, then searches with them", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      const errors = trackPageErrors(page);
+      const searches: string[] = [];
+      page.on("request", (sent) => {
+        const url = new URL(sent.url());
+        if (/\/api\/companies\/[^/]+\/search$/.test(url.pathname)) searches.push(url.search);
+      });
+      await page.goto(`/${seed.prefix}/dashboard`);
+      await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+      await page.locator("#main-content").focus();
+
+      const input = await openLauncher(page);
+      await input.fill("scope:issues sort:updated");
+      await expect(page.getByTestId("command-search-hint")).toContainText("Add words or a filter");
+      // Past the debounce, still no request.
+      await page.waitForTimeout(500);
+      expect(searches).toEqual([]);
+
+      await input.fill("scope:issues sort:updated launcher keyboard");
+      await expect(page.getByTestId("command-search-hint")).toHaveCount(0);
+      await expect(page.getByRole("option").first()).toContainText(seed.issueTitle);
+      expect(searches).toHaveLength(1);
+      const params = new URLSearchParams(searches[0]);
+      expect([params.get("q"), params.get("scope"), params.get("sort")]).toEqual(["launcher keyboard", "issues", "updated"]);
+
+      expect(errors).toEqual([]);
+    });
+
+    test("does not open a result of the previous query while the next search loads", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      const quasarTitle = `Quasar beta ${randomUUID().slice(0, 8)}`;
+      const quasar = await json(await request.post(`/api/companies/${seed.companyId}/issues`, {
+        data: { title: quasarTitle, status: "todo" },
+      }));
+      const errors = trackPageErrors(page);
+      let release: () => void = () => {};
+      const held = new Promise<void>((done) => {
+        release = done;
+      });
+      await page.route(/\/api\/companies\/[^/]+\/search\?.*q=quasar/, async (route) => {
+        await held;
+        await route.continue();
+      });
+      await page.goto(`/${seed.prefix}/dashboard`);
+      await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+      await page.locator("#main-content").focus();
+
+      const input = await openLauncher(page);
+      await input.fill("launcher keyboard");
+      const oldRow = page.getByRole("option").filter({ hasText: seed.issueTitle });
+      await expect(oldRow).toHaveAttribute("aria-selected", "true");
+
+      // The next search is held, so the old row is still on screen. Enter
+      // must not open it.
+      const quasarRequest = page.waitForRequest(/q=quasar/);
+      await input.fill("quasar");
+      await quasarRequest;
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(300);
+      await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/dashboard$`));
+      await expect(input).toBeVisible();
+      await expect(oldRow).toHaveAttribute("aria-disabled", "true");
+      await expect(page.getByRole("status").filter({ hasText: "Searching…" })).toBeVisible();
+
+      release();
+      await expect(oldRow).toHaveCount(0);
+      await expect(page.getByRole("option").first()).toContainText(quasarTitle);
+      await page.keyboard.press("Enter");
+      await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/issues/${quasar.identifier}$`));
+      await expect(page.locator("#main-content").getByText(quasarTitle).first()).toBeVisible();
+
+      expect(errors).toEqual([]);
+    });
+
+    test("keeps a row chosen with the arrow keys when search results arrive late", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      await json(await request.post(`/api/companies/${seed.companyId}/issues`, {
+        data: { title: `Board cleanup ${randomUUID().slice(0, 8)}`, status: "todo" },
+      }));
+      const errors = trackPageErrors(page);
+      let release: () => void = () => {};
+      const held = new Promise<void>((done) => {
+        release = done;
+      });
+      await page.route(/\/api\/companies\/[^/]+\/search\?.*q=board/, async (route) => {
+        await held;
+        await route.continue();
+      });
+      await page.goto(`/${seed.prefix}/dashboard`);
+      await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+      await page.locator("#main-content").focus();
+
+      // "board" is inside "Keyboard shortcuts" and "Dashboard" and is a
+      // keyword of "Tasks". None is a strong match, so the task results rank
+      // above them once they arrive.
+      const input = await openLauncher(page);
+      await input.fill("board");
+      const selected = page.locator("[role='option'][aria-selected='true']");
+      await expect(selected).not.toContainText("Tasks");
+      await expect(page.getByRole("option").filter({ hasText: "Tasks" })).toBeVisible();
+      for (let press = 0; press < 5 && !(await selected.textContent())?.includes("Tasks"); press += 1) {
+        await page.keyboard.press("ArrowDown");
+      }
+      await expect(selected).toContainText("Tasks");
+
+      release();
+      await expect(page.getByRole("option").first()).toContainText("Board cleanup");
+      await expect(selected).toContainText("Tasks");
+      await page.keyboard.press("Enter");
+      await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/issues$`));
 
       expect(errors).toEqual([]);
     });
@@ -308,6 +495,7 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
           // so the launcher does not offer an action that would do nothing.
           await expect(page.getByRole("option", { name: /Open file in this issue/ })).toHaveCount(0);
         } else {
+          await page.keyboard.type("open file");
           await expect(page.getByRole("option").first()).toContainText("Open file in this issue");
           await page.keyboard.press("Enter");
           await expect(page.getByRole("dialog", { name: /Command/ })).toHaveCount(0);

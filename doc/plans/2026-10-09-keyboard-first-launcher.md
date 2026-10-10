@@ -101,7 +101,7 @@ Worst gaps, in priority order (paths under `ui/src/`):
 
 Other findings that the slices use:
 
-- **Search page:**
+- **Search page** (removed by #95, slice 1b):
   - The operator chips render only while the input has focus, so Tab
     removes them (`pages/Search.tsx:497-499`).
   - The page binds its own `/` handler on `window` (`:434-445`). It doesn't
@@ -285,6 +285,9 @@ With a query:
 3. **Search all for "..."**: always present. Cmd/Ctrl+Enter opens `/search`
    from any row. Enter with no match opens `/search`. Both are kept from
    today.
+   > **Replaced by #95 (slice 1b):** the `/search` page is gone. Search
+   > results show in the launcher, and a query with no match offers
+   > "Create task".
 4. **Quick filters**.
 
 The inner `Command` gets `shouldFilter={false}` (passed through a new
@@ -369,6 +372,40 @@ migration. Slice 4 needs none either, but it waits for `#40`.
   Cmd/Ctrl+K, type, arrow, Enter navigates; `g d` navigates; `?` shows a
   chord that comes from the catalog.
 
+### Slice 1b: the launcher replaces the search page and the sidebar New Task
+
+User request, 2026-10-10: "search page should be fully replace by cmd+k, and
+replace the search in sidebar by search with cmd+k like in best saas ui that
+open the launcher" and "remove the new task from sidebar, must be done via
+cmd+k". It lands as its own PR, stacked on slice 1, before slice 2a.
+
+- **Sidebar:** both sidebars replace the Search link and the New Task button
+  with one Search trigger: a button with "Search…" and the key hint (`⌘K` on
+  Apple platforms, `Ctrl K` elsewhere); icon only with a tooltip in the rail.
+  It opens the launcher, which is the only way to open it on touch devices.
+- **Create:** "Create new task" leads the launcher's first group with an
+  empty query. The `c` shortcut, the page buttons and the phone bottom bar's
+  New Task stay.
+- **Search:** the launcher queries `GET /companies/:companyId/search` (the
+  endpoint behind `paperclipai search`) with the typed text and filters.
+  Results are grouped by kind, groups ordered by their best result, with a
+  "Show more results" row (20 per page, up to the endpoint's offset limit).
+  `scope:` and `sort:` are new parser tokens. Loading, empty (with "Create
+  task" from the text and "without filters") and error (with Retry) states
+  are rows in the launcher. The selection follows the best row when results
+  arrive, so Enter opens the best match.
+- **Old links:** `/search?...` (with or without the company prefix) goes to
+  the dashboard with the launcher open, its text rebuilt from the link's
+  query, filters, scope and sort.
+- **Removed:** the search page, its filter bar, menu, sheet, chips, sort menu
+  and zero-results panel, `lib/search-filters.ts`, the catalog's `nav.search`
+  action, and parser helpers only the page used. The PR lists each search
+  page feature and where it went, including what was dropped (per-option
+  filter counts, the mobile filter sheet's result preview, preview images in
+  rows, the exact-identifier redirect, which Enter on the first row replaces).
+- **Parity:** no change. The search endpoint, `paperclipai search`, and task
+  creation through the API and CLI stay as they are.
+
 ### Slice 2: keyboard-only pages
 
 The inventory (section 2.3) is too large for one reviewable PR. It splits
@@ -439,6 +476,8 @@ into three PRs, in this order:
   The palette calls `/search` with a 150 ms debounce and cancels stale
   requests. It keeps `issuesApi.list({ q, includeRoutineExecutions: true })`
   for tasks, because that behaviour is tested today.
+  > **Replaced by #95 (slice 1b):** the `/search` page is gone. The launcher
+  > is the only search UI, so new kinds show there only.
 
 ### Slice 4: Jev intent suggestion (tier 2)
 
@@ -473,6 +512,9 @@ uses `createJudgeClient` and the company secret `AI_GATEWAY_API_KEY` from
 | Page actions (status, assign, approve, run) | "This view" rows (2c) | existing routes | existing commands; gaps get follow-ups (2c) |
 | Intent suggestion | "Suggested" row (4) | `POST /companies/:id/command-intent` (4) | `intent` (4) |
 
+> **Replaced by #95 (slice 1b):** web search is the launcher only; the
+> `/search` page is gone.
+
 ## 5. Tests and verification
 
 Every slice:
@@ -487,6 +529,7 @@ Every slice:
   - A timing test: 200 actions ranked in less than 2 ms (median of 50 runs).
 - **UI:** `CommandPalette.test.tsx` keeps all its current cases:
   - Search all, Cmd+Enter and empty Enter go to `/search`;
+    > **Replaced by #95:** these rows and keys went away with the page.
   - the quick-filter chips;
   - the project promotion;
   - `includeRoutineExecutions: true`;
@@ -521,7 +564,7 @@ Every slice:
 
 | Risk | Mitigation |
 | --- | --- |
-| Enter with a query opens a different row than today (cmdk sorted rows by its own score; now our order decides). | Tests pin the first row for each query shape. Cmd+Enter and empty Enter keep going to `/search`. Decision D3. |
+| Enter with a query opens a different row than today (cmdk sorted rows by its own score; now our order decides). | Tests pin the first row for each query shape. Cmd+Enter and empty Enter keep going to `/search` (**replaced by #95:** the page and these keys are gone). Decision D3. |
 | A new chord or bare key fires while the user types, or over a dialog. | Reuse `isKeyboardShortcutTextInputTarget` and `hasBlockingShortcutDialog`. Unit tests for both guards. |
 | Chords collide with page handlers (`IssueDetail` capture phase `g c`/`g f`, Inbox `a y r U`, `IssuesList` j/k). | The catalog test rejects collisions. `IssueDetail` keeps its capture-phase handler. |
 | Two layout shells (`Layout.tsx`, `Layout.production.tsx`) drift. | Both mount the same provider and palette. A test renders each shell. |
@@ -551,6 +594,8 @@ any of them.
   - **(a) Recommended:** Enter opens the best local match (action or
     entity). "Search all" stays one arrow key away, and Cmd/Ctrl+Enter always
     opens `/search`.
+    > **Replaced by #95:** Enter still opens the best match; the `/search`
+    > page and Cmd/Ctrl+Enter to it are gone.
   - **(b)** Keep "Search all" as the first row.
 - **D4. Frecency per browser** (localStorage, like the theme preference), or
   synced per user on the server. Recommended: per browser now; a sync can
