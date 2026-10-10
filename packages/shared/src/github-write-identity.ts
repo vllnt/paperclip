@@ -67,6 +67,20 @@ export const DEFAULT_GITHUB_WRITE_THROTTLE: Readonly<GitHubWriteThrottle> = Obje
 
 /** Branch names treated as a repository's default branch for `pushToMain`. */
 export const GITHUB_DEFAULT_BRANCH_NAMES: readonly string[] = ["main", "master"];
+/**
+ * Branch names agents never delete, force-push, rename or hard-reset, even
+ * when GitHub does not report them as the default or as protected. Compared
+ * case-insensitively. `main` and `master` are the usual defaults; `staging`
+ * and `production` are release branches (never delete SongTrivia `staging` or
+ * `Production`). GitHub's own answer still protects every other branch.
+ */
+export const GITHUB_PROTECTED_BRANCH_FLOOR: readonly string[] = ["main", "master", "staging", "production"];
+
+/** True when `name` is on {@link GITHUB_PROTECTED_BRANCH_FLOOR}. Accepts `refs/heads/NAME` or the bare name. */
+export function isProtectedBranchFloor(name: string): boolean {
+  const branch = name.replace(/^refs\/heads\//i, "");
+  return GITHUB_PROTECTED_BRANCH_FLOOR.includes(branch.toLowerCase());
+}
 
 export type GitHubUserSource = "run" | "app";
 export type GitHubPermissionLevel = "read" | "write" | "admin";
@@ -478,11 +492,19 @@ export interface GitHubCommandClass {
   /** Set when no toggle can allow the command; the reason says why. */
   denied?: string;
   /**
-   * The refusal protects the credential itself (another host, a git command or
-   * option Paperclip cannot read), so it applies whether or not the company has
-   * a write identity policy.
+   * The refusal applies whether or not the company has a write identity
+   * policy: it protects the credential itself (another host, a git command or
+   * option Paperclip cannot read), or refuses an operation agents never
+   * perform (see {@link AGENTS_NEVER}).
    */
   integrity?: true;
+  /**
+   * Branches (names without `refs/heads/`) this write deletes, force-updates,
+   * renames or hard-resets. Only GitHub knows whether one is the repository's
+   * default branch or a protected branch, so the server refuses the write
+   * unless it has read from GitHub that none of them is.
+   */
+  branchRewrites?: string[];
 }
 
 export interface GitHubCommandContext {
@@ -507,6 +529,30 @@ const RELEASE_TAG_DENIED = "Release tags (name@version) are created only by the 
 const BULK_TAG_DENIED = "Push tags by name: Paperclip cannot check a bulk tag push for release tags (name@version).";
 const isReleaseTag = (name: string) => name.includes("@");
 const decodePath = (value: string) => { try { return decodeURIComponent(value); } catch { return value; } };
+
+/**
+ * Operations agents never perform, whatever the company's policy and toggles:
+ * no token is handed out for them. Each refusal names the operation and its
+ * route (never its arguments), which the audit record keeps.
+ */
+const AGENTS_NEVER = {
+  repository: "archive, delete, rename, transfer or change the settings of a repository",
+  defaultBranch: "delete or force-push a default or protected branch",
+  protection: "change branch protection or rulesets",
+  hooks: "change webhooks",
+  secrets: "change secrets, variables or deploy keys",
+  deployments: "delete deployments, change or delete environments, or mark a deployment inactive",
+} as const;
+export type GitHubAgentsNever = keyof typeof AGENTS_NEVER;
+type AgentsNever = GitHubAgentsNever;
+/** The refusal of an operation agents never perform, naming its route. */
+export function gitHubAgentsNeverDenial(what: GitHubAgentsNever, route: string): string {
+  return `Denied: agents never ${AGENTS_NEVER[what]} (${route}). A person must do this on GitHub.`;
+}
+const neverByAgents = (base: GitHubCommandClass, what: AgentsNever, route: string): GitHubCommandClass =>
+  ({ ...base, denied: gitHubAgentsNeverDenial(what, route), integrity: true });
+/** A branch name that is, or may be, a default branch: gh fills `{branch}` and `:branch` from the checkout. */
+const mayBeDefaultBranch = (name: string) => /\{branch\}|:branch\b/.test(name) || isProtectedBranchFloor(name);
 
 /** git's global options that take the next argument as their value. */
 const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"]);
@@ -690,19 +736,26 @@ function isDefaultBranchRef(ref: string): boolean {
   return ref === "refs/heads/*" || GITHUB_DEFAULT_BRANCH_NAMES.some(name => ref === `refs/heads/${name}`);
 }
 
-/** The refspecs (positional arguments after the remote) and flags of `git push` argv, read exactly. */
-function gitPushRefspecs(pushArgs: readonly string[]): { refspecs: string[]; flags: Set<string> } {
-  const parsed = gitNetworkArguments("push", pushArgs)!;
-  return { refspecs: parsed.positional.slice(1), flags: parsed.flags };
+/** One destination ref of a `git push`, and whether the push may overwrite its history or delete it. */
+export interface GitPushUpdate {
+  ref: string;
+  /** `+refspec`, `--force`, `--force-with-lease`, `--mirror`, or refspecs from config Paperclip cannot see. */
+  force: boolean;
+  /** `--delete`, `:ref`, or a pattern under `--prune`/`--mirror` (or from config). */
+  delete: boolean;
+  /** The refspec comes from the checkout's config (no refspec on the command line). */
+  configured?: true;
 }
 
 /**
- * Destination refs of a `git push`, fully qualified. `refs/heads/*` and
- * `refs/tags/*` stand for "every branch" and "every tag". A ref Paperclip cannot
- * resolve counts as a branch of that name; with no branch known, as every branch.
+ * Destination refs of a `git push`, fully qualified, with how each is updated.
+ * `refs/heads/*` and `refs/tags/*` stand for "every branch" and "every tag". A
+ * ref Paperclip cannot resolve counts as a branch of that name; with no branch
+ * known, as every branch.
  */
-export function gitPushDestinations(pushArgs: readonly string[], context: GitHubCommandContext = {}): string[] {
-  const { refspecs, flags } = gitPushRefspecs(pushArgs);
+export function gitPushUpdates(pushArgs: readonly string[], context: GitHubCommandContext = {}): GitPushUpdate[] {
+  const parsed = gitNetworkArguments("push", pushArgs)!;
+  const refspecs = parsed.positional.slice(1), flags = parsed.flags;
   const resolve = (name: string) => context.refs?.[name] ?? `refs/heads/${name}`;
   const current = context.currentBranch ? `refs/heads/${context.currentBranch}` : "refs/heads/*";
   const qualify = (name: string, src: string) => {
@@ -718,24 +771,39 @@ export function gitPushDestinations(pushArgs: readonly string[], context: GitHub
     }
     return resolve(name);
   };
-  const destinations: string[] = [];
-  if (flags.has("--all") || flags.has("--branches") || flags.has("--mirror")) destinations.push("refs/heads/*");
-  // push.followTags sends tags with any refspec, unless --no-follow-tags turns it off for this push.
-  if (flags.has("--tags") || flags.has("--follow-tags") || flags.has("--mirror") || (context.followTags && !flags.has("--no-follow-tags"))) destinations.push("refs/tags/*");
+  const mirror = flags.has("--mirror");
+  // --force-with-lease (with or without a value) overwrites like --force; --force-if-includes alone does not.
+  const forceAll = mirror || flags.has("-f") || flags.has("--force") || flags.has("--force-with-lease") || parsed.values.has("--force-with-lease");
+  // --prune (and --mirror) delete the remote refs a pattern covers that the push does not send.
+  const prune = mirror || flags.has("--prune");
   const deleting = flags.has("--delete") || flags.has("-d");
+  const updates: GitPushUpdate[] = [];
+  const add = (ref: string, force: boolean, remove: boolean) => updates.push({ ref, force: force || forceAll, delete: remove || (prune && ref.endsWith("/*")) });
+  if (flags.has("--all") || flags.has("--branches") || mirror) add("refs/heads/*", false, false);
+  // push.followTags sends tags with any refspec, unless --no-follow-tags turns it off for this push.
+  if (flags.has("--tags") || flags.has("--follow-tags") || mirror || (context.followTags && !flags.has("--no-follow-tags"))) add("refs/tags/*", false, false);
   for (let index = 0; index < refspecs.length; index += 1) {
+    const forced = refspecs[index]!.startsWith("+");
     const spec = refspecs[index]!.replace(/^\+/, "");
-    if (spec === "tag" && index + 1 < refspecs.length) { destinations.push(`refs/tags/${refspecs[++index]}`); continue; }
+    if (spec === "tag" && index + 1 < refspecs.length) { add(`refs/tags/${refspecs[++index]}`, forced, deleting); continue; }
+    // A bare `:` (or `+:`) pushes every branch both sides have.
+    if (spec === ":") { add("refs/heads/*", forced, false); continue; }
     const colon = spec.indexOf(":");
     const src = deleting ? "" : colon < 0 ? spec : spec.slice(0, colon);
     const dst = deleting ? spec : colon < 0 || colon === spec.length - 1 ? src : spec.slice(colon + 1);
-    destinations.push(qualify(dst, src));
+    add(qualify(dst, src), forced, deleting || colon === 0);
   }
-  if (!refspecs.length && !flags.has("--tags") && !flags.has("--all") && !flags.has("--branches") && !flags.has("--mirror")) {
-    destinations.push(current);
-    if (context.implicitPush) destinations.push("refs/heads/*", "refs/tags/*");
+  if (!refspecs.length && !flags.has("--tags") && !flags.has("--all") && !flags.has("--branches") && !mirror) {
+    add(current, false, false);
+    // Config refspecs (remote.<name>.push, mirror, push.default) may force or prune; Paperclip cannot see them.
+    if (context.implicitPush) for (const ref of ["refs/heads/*", "refs/tags/*"]) updates.push({ ref, force: true, delete: true, configured: true });
   }
-  return [...new Set(destinations)];
+  return updates;
+}
+
+/** The destination refs of a `git push` ({@link gitPushUpdates}), each once. */
+export function gitPushDestinations(pushArgs: readonly string[], context: GitHubCommandContext = {}): string[] {
+  return [...new Set(gitPushUpdates(pushArgs, context).map(update => update.ref))];
 }
 
 function classifyGit(args: readonly string[], context: GitHubCommandContext): GitHubCommandClass {
@@ -775,17 +843,27 @@ function classifyGit(args: readonly string[], context: GitHubCommandContext): Gi
     return { ...write("push"), denied: `git push --recurse-submodules=${recursion.slice(0, 20)} pushes submodules to remotes Paperclip does not check; push each repository on its own.`, integrity: true };
   }
   if (subcommand === "push") {
-    const destinations = gitPushDestinations(args.slice(index + 1), context);
+    const updates = gitPushUpdates(args.slice(index + 1), context);
+    const destinations = [...new Set(updates.map(update => update.ref))];
     const tags = destinations.filter(ref => ref.startsWith("refs/tags/"));
     // Only a push made of deletions alone adds no commits; a deletion next to an update does not hide the update.
-    const { refspecs: refspecArgs, flags } = gitPushRefspecs(args.slice(index + 1));
-    const deletes = flags.has("--delete") || flags.has("-d") || (refspecArgs.length > 0 && refspecArgs.every(arg => /^\+?:/.test(arg)));
+    const deletes = updates.length > 0 && updates.every(update => update.delete);
     const result = write("push",
       ...(tags.length ? ["tagPush" as const] : []),
       ...(destinations.some(isDefaultBranchRef) ? ["pushToMain" as const] : []),
       // A deletion adds no commits; otherwise an unknown answer counts as a workflow change.
       ...(!deletes && context.touchesWorkflows !== false ? ["editWorkflows" as const] : []),
       ...wiki);
+    const destructive = updates.find(update => (update.force || update.delete) && (isDefaultBranchRef(update.ref) || isProtectedBranchFloor(update.ref)));
+    if (destructive) {
+      return neverByAgents(result, "defaultBranch", destructive.configured
+        ? "git push with the checkout's push config, which may force or prune every branch; push branches by name"
+        : `git push ${destructive.delete ? "deleting" : "force-pushing"} ${destructive.ref}`);
+    }
+    // Any other branch the push forces or deletes may be the default or a protected branch: the server asks GitHub.
+    const rewrites = [...new Set(updates.filter(update => (update.force || update.delete) && update.ref.startsWith("refs/heads/"))
+      .map(update => update.ref.slice("refs/heads/".length)))];
+    if (rewrites.length) result.branchRewrites = rewrites;
     if (tags.includes("refs/tags/*")) return { ...result, denied: BULK_TAG_DENIED };
     if (tags.some(ref => isReleaseTag(ref.slice("refs/tags/".length)))) return { ...result, denied: RELEASE_TAG_DENIED };
     return result;
@@ -967,6 +1045,94 @@ const GRAPHQL_PROJECT_MUTATIONS = new Set([
   "archiveProjectV2Item", "unarchiveProjectV2Item", "deleteProjectV2Item", "convertProjectV2DraftIssueItemToIssue", "updateProjectV2DraftIssue",
 ]);
 
+/**
+ * GraphQL mutations that are operations agents never perform. Refs are named
+ * by node ID, so `deleteRef`, `updateRef` and `updateRefs` could reach the
+ * default branch on any repository: use git push, which names the branch.
+ * GitHub's GraphQL API has no webhook, secret or variable mutations.
+ */
+const GRAPHQL_MUTATIONS_AGENTS_NEVER = new Map<string, AgentsNever>([
+  ...["archiveRepository", "unarchiveRepository", "updateRepository", "transferRepository"].map(name => [name, "repository"] as const),
+  ...["deleteRef", "updateRef", "updateRefs"].map(name => [name, "defaultBranch"] as const),
+  ...["createBranchProtectionRule", "updateBranchProtectionRule", "deleteBranchProtectionRule",
+    "createRepositoryRuleset", "updateRepositoryRuleset", "deleteRepositoryRuleset"].map(name => [name, "protection"] as const),
+  ...["deleteDeployment", "createDeploymentStatus", "createEnvironment", "updateEnvironment", "deleteEnvironment"].map(name => [name, "deployments"] as const),
+]);
+
+/**
+ * The operation agents never perform that a `gh api` REST write is, or null.
+ * Matched case-insensitively on the route as GitHub routes it; `repositories/ID`
+ * counts like `repos/OWNER/REPO`, and placeholders count as any value.
+ */
+function restWriteAgentsNever(route: string, method: string, request: GhApiRequest): GitHubCommandClass | null {
+  const label = (path: string) => `${method} ${path}`;
+  const organization = /^orgs\/[^/]+(?:\/(.*))?$/i.exec(route);
+  if (organization) {
+    const rest = organization[1] ?? "";
+    if (/^hooks(\/|$)/i.test(rest)) return neverByAgents(write("other"), "hooks", label("orgs/{org}/hooks"));
+    if (/^rulesets(\/|$)/i.test(rest)) return neverByAgents(write("other"), "protection", label("orgs/{org}/rulesets"));
+    const secrets = /^(actions|dependabot|codespaces)\/(secrets|variables)(\/|$)/i.exec(rest);
+    if (secrets) return neverByAgents(write("other"), "secrets", label(`orgs/{org}/${secrets[1]!.toLowerCase()}/${secrets[2]!.toLowerCase()}`));
+    return null;
+  }
+  const repository = /^(?:repos\/[^/]+\/[^/]+|repositories\/[^/]+)(?:\/(.*))?$/i.exec(route);
+  if (!repository) return null;
+  const rest = repository[1] ?? "";
+  const field = (name: string) => request.fields.filter(entry => entry.name === name);
+  // Values Paperclip cannot see: a body from a file or stdin, a typed field read from one or filled by gh from the
+  // checkout ({branch}, {repo}…), or a query string GitHub may read as parameters.
+  const opaque = request.input || (request.path ?? "").includes("?")
+    || request.fields.some(entry => entry.typed && (entry.value.startsWith("@") || GH_FILLED_PLACEHOLDER.test(entry.value)));
+  if (rest === "" || /^transfer$/i.test(rest)) return neverByAgents(write("other"), "repository", label(rest ? "repos/{owner}/{repo}/transfer" : "repos/{owner}/{repo}"));
+  // Branch names may hold slashes, which GitHub routes as they are (branches/release/1/protection).
+  if (/^branches\/.+\/protection(\/|$)/i.test(rest)) return neverByAgents(write("other"), "protection", label("repos/{owner}/{repo}/branches/{branch}/protection"));
+  if (/^rulesets(\/|$)/i.test(rest)) return neverByAgents(write("other"), "protection", label("repos/{owner}/{repo}/rulesets"));
+  if (/^tags\/protection(\/|$)/i.test(rest)) return neverByAgents(write("other"), "protection", label("repos/{owner}/{repo}/tags/protection"));
+  if (/^hooks(\/|$)/i.test(rest)) return neverByAgents(write("other"), "hooks", label("repos/{owner}/{repo}/hooks"));
+  const secrets = /^(actions|dependabot|codespaces)\/(secrets|variables)(\/|$)/i.exec(rest);
+  if (secrets) return neverByAgents(write("other"), "secrets", label(`repos/{owner}/{repo}/${secrets[1]!.toLowerCase()}/${secrets[2]!.toLowerCase()}`));
+  if (/^keys(\/|$)/i.test(rest)) return neverByAgents(write("other"), "secrets", label("repos/{owner}/{repo}/keys"));
+  if (/^environments(\/|$)/i.test(rest)) return neverByAgents(write("other"), "deployments", label("repos/{owner}/{repo}/environments"));
+  if (/^deployments\/[^/]+$/i.test(rest)) return neverByAgents(write("other"), "deployments", label("repos/{owner}/{repo}/deployments/{id}"));
+  // An inactive status deactivates the deployment (staging, Production); other states stay deployment approvals.
+  if (/^deployments\/[^/]+\/statuses$/i.test(rest) && (opaque || field("state").some(entry => entry.value.trim().toLowerCase() === "inactive"))) {
+    return neverByAgents(write("other", "deploymentApproval"), "deployments", label("repos/{owner}/{repo}/deployments/{id}/statuses with state inactive"));
+  }
+  const change = restBranchRewrite(rest, method, opaque, request);
+  if (change && mayBeDefaultBranch(change.branch)) {
+    return neverByAgents(change.kind === "rename" ? write("other") : write("push", "pushToMain"), "defaultBranch", label(change.kind === "rename"
+      ? "repos/{owner}/{repo}/branches/{default branch}/rename"
+      : `repos/{owner}/{repo}/git/refs/heads/{default branch}${change.kind === "force" ? " with force" : ""}`));
+  }
+  return null;
+}
+
+/**
+ * The branch a `gh api` REST write deletes, force-updates or renames, if any.
+ * `rest` is the route after `repos/OWNER/REPO/`. A ref update is forced unless
+ * `force` is absent or exactly `false`; a value Paperclip cannot read may force it.
+ */
+function restBranchRewrite(rest: string, method: string, opaque: boolean, request: GhApiRequest): { branch: string; kind: "delete" | "force" | "rename" } | null {
+  const rename = /^branches\/(.+)\/rename$/i.exec(rest);
+  if (rename) return { branch: decodePath(rename[1]!), kind: "rename" };
+  const head = /^git\/refs\/heads\/(.+)$/i.exec(rest);
+  if (!head) return null;
+  if (method === "DELETE") return { branch: decodePath(head[1]!), kind: "delete" };
+  const forced = opaque || request.fields.some(entry => entry.name === "force" && entry.value !== "false");
+  return forced ? { branch: decodePath(head[1]!), kind: "force" } : null;
+}
+
+/** The branch a `gh api` write (already classified, not refused) rewrites, as {@link GitHubCommandClass.branchRewrites}. */
+function ghApiBranchRewrites(request: GhApiRequest, endpoint: GhApiRoute): string[] {
+  const method = request.method ?? (request.fields.length || request.input ? "POST" : "GET");
+  const rest = /^(?:repos\/[^/]+\/[^/]+|repositories\/[^/]+)\/(.+)$/i.exec(endpoint.route ?? "")?.[1];
+  if (method === "GET" || method === "HEAD" || rest === undefined) return [];
+  const opaque = request.input || (request.path ?? "").includes("?")
+    || request.fields.some(entry => entry.typed && (entry.value.startsWith("@") || GH_FILLED_PLACEHOLDER.test(entry.value)));
+  const change = restBranchRewrite(rest, method, opaque, request);
+  return change ? [change.branch] : [];
+}
+
 /** A gh placeholder anywhere in a value, with gh's own pattern (`:branch-x` is filled too). */
 const GH_FILLED_PLACEHOLDER = /\{(owner|repo|branch)\}|:(owner|repo|branch)\b/;
 
@@ -983,7 +1149,19 @@ function ghApiClass(request: GhApiRequest, endpoint: GhApiRoute): GitHubCommandC
   }
   // gh treats any endpoint containing "://" as a full URL; only https://api.github.com is allowed.
   if (endpoint.route === null && (request.path ?? "").includes("://")) return { ...write("other"), denied: endpoint.problem!, integrity: true };
-  if (endpoint.problem || endpoint.route === null) return { ...write("other"), denied: endpoint.problem ?? "Paperclip cannot read this endpoint." };
+  // `gh api` switches to POST when fields or a body are sent without an explicit method.
+  const effective = request.method ?? (request.fields.length || request.input ? "POST" : "GET");
+  const writes = effective !== "GET" && effective !== "HEAD";
+  // Operations agents never perform are refused before anything else, also on a route Paperclip otherwise refuses.
+  const never = writes && endpoint.route !== null && endpoint.route !== "graphql" ? restWriteAgentsNever(endpoint.route, effective, request) : null;
+  if (never) return never;
+  // gh fills {owner}, {repo} and {branch} (or :branch…) from the checkout after this check, and a branch name may hold
+  // slashes (a branch named hooks/1 or heads/main), so a write's endpoint is written out beyond repos/{owner}/{repo}.
+  if (writes && GH_FILLED_PLACEHOLDER.test((endpoint.route ?? "").replace(/^repos\/[^/]+\/[^/]+(\/|$)/i, ""))) {
+    return { ...write("other"), denied: "Write the endpoint out instead of gh placeholders ({branch}, :branch…): gh fills them from the checkout, so Paperclip cannot check them.", integrity: true };
+  }
+  // A write Paperclip cannot route cannot be checked for those operations either, so it is refused for every company.
+  if (endpoint.problem || endpoint.route === null) return { ...write("other"), denied: endpoint.problem ?? "Paperclip cannot read this endpoint.", ...(writes ? { integrity: true as const } : {}) };
   const route = endpoint.route;
   const fields = new Map<string, string>();
   // A typed field read from a file or stdin (`-F name=@file`) is a value Paperclip cannot see.
@@ -993,27 +1171,36 @@ function ghApiClass(request: GhApiRequest, endpoint: GhApiRoute): GitHubCommandC
     fields.set(field.name, field.value);
   }
   if (route === "graphql") {
-    if (opaqueBody) return { ...write("other"), denied: "Pass the GraphQL query with -f query='...'; Paperclip cannot read a query or body from a file or stdin." };
+    // A request Paperclip cannot read may hold a mutation agents never perform: refused for every company.
+    if (opaqueBody) return { ...write("other"), denied: "Pass the GraphQL query with -f query='...'; Paperclip cannot read a query or body from a file or stdin.", integrity: true };
+    // gh fills placeholders in -F values after this check: a query sent that way could name any mutation.
+    if (request.fields.some(field => field.name === "query" && field.typed && GH_FILLED_PLACEHOLDER.test(field.value))) {
+      return { ...write("other"), denied: "Pass the GraphQL query with -f query='...': gh fills {owner}, {repo} and {branch} in a -F value, so Paperclip cannot check it.", integrity: true };
+    }
     const queries = request.fields.filter(field => field.name === "query").map(field => field.value);
     const documents = queries.length ? queries.map(parseGraphqlDocument) : [null];
-    if (documents.some(document => document === null)) return { ...write("other"), denied: "Paperclip cannot read this GraphQL document, so it cannot tell whether it changes anything." };
+    if (documents.some(document => document === null)) return { ...write("other"), denied: "Paperclip cannot read this GraphQL document, so it cannot tell whether it changes anything.", integrity: true };
     // Any mutation or subscription in the document can run (operationName picks one): it is a write.
     const changes = documents.flatMap(document => document!).filter(definition => definition.type === "mutation" || definition.type === "subscription");
     if (!changes.length) return read();
     if (changes.some(definition => definition.type === "subscription" || definition.spread || !definition.fields.length)) {
-      return { ...write("other"), denied: "Name each GraphQL mutation field directly (no subscriptions or fragments); Paperclip cannot check it otherwise." };
+      return { ...write("other"), denied: "Name each GraphQL mutation field directly (no subscriptions or fragments); Paperclip cannot check it otherwise.", integrity: true };
     }
     const fields = changes.flatMap(definition => definition.fields);
+    const forbidden = fields.find(field => GRAPHQL_MUTATIONS_AGENTS_NEVER.has(field));
+    if (forbidden) {
+      const what = GRAPHQL_MUTATIONS_AGENTS_NEVER.get(forbidden)!;
+      return neverByAgents(write("other"), what, `graphql ${forbidden}${what === "defaultBranch" ? ", which names its ref by node ID; use git push" : ""}`);
+    }
     const unfenced = [...new Set(fields.filter(field => !GRAPHQL_COMMENT_MUTATIONS.has(field) && !GRAPHQL_PROJECT_MUTATIONS.has(field)))];
+    // A mutation outside the fence may change anything its node ID names (settings, refs, collaborators): refused for every company.
     if (unfenced.length) {
-      return { ...write("other"), denied: `Paperclip cannot check the GraphQL mutation ${unfenced.slice(0, 5).join(", ")}: it names its target by node ID. Use the gh command or the REST endpoint (repos/OWNER/REPO/...), which carry the repository and privileged checks.` };
+      return { ...write("other"), denied: `Paperclip cannot check the GraphQL mutation ${unfenced.slice(0, 5).join(", ")}: it names its target by node ID. Use the gh command or the REST endpoint (repos/OWNER/REPO/...), which carry the repository and privileged checks.`, integrity: true };
     }
     if (fields.every(field => GRAPHQL_PROJECT_MUTATIONS.has(field))) return write("project");
     if (fields.every(field => GRAPHQL_COMMENT_MUTATIONS.has(field))) return write("comment");
     return { ...write("other"), denied: "Send comment and Project mutations in separate gh api graphql calls." };
   }
-  // `gh api` switches to POST when fields or a body are sent without an explicit method.
-  const effective = request.method ?? (request.fields.length || request.input ? "POST" : "GET");
   // Only GET and HEAD are reads; any other method, known or not, is a write. Rendering markdown only reads.
   if (effective === "GET" || effective === "HEAD" || route === "markdown" || route === "markdown/raw") return read();
   const repo = /^repos\/[^/]+\/[^/]+\//.exec(`${route}/`) ? route.split("/").slice(3).join("/") : null;
@@ -1097,6 +1284,16 @@ export function ghVerbIndex(args: readonly string[]): number {
   return parseGhCommand(args).verbIndex;
 }
 
+/**
+ * gh's own command groups (gh 2.97) that may write; its read-only groups are in
+ * the shared gh grammar. gh runs an alias or an extension for any other name.
+ */
+const GH_WRITE_GROUPS = new Set(["pr", "issue", "release", "workflow", "run", "project", "repo", "secret", "variable", "alias", "extension", "copilot",
+  "codespace", "discussion", "gist", "label", "cache", "gpg-key", "ssh-key", "agent-task", "preview", "skill"]);
+
+/** `gh repo` verbs agents never run: they archive, delete, rename, transfer or change the settings of a repository. */
+const GH_REPO_VERBS_AGENTS_NEVER = new Set(["archive", "unarchive", "delete", "rename", "edit", "transfer"]);
+
 function classifyGh(original: readonly string[]): GitHubCommandClass {
   // One grammar for gh argv, shared with the managed launcher (which embeds it).
   const command = parseGhCommand(original);
@@ -1111,10 +1308,22 @@ function classifyGh(original: readonly string[]): GitHubCommandClass {
   if (command.printsToken) return { ...read(), denied: "Paperclip does not hand GitHub credentials to commands that print them.", integrity: true };
   // Whatever the launcher may run without a managed credential is a read here, so a write is never one it runs that way.
   if (!ghCommandMayWrite(command)) return read();
-  if (group === "api") return ghApiClass(command.api!.request, command.api!.endpoint);
+  if (group === "api") {
+    const result = ghApiClass(command.api!.request, command.api!.endpoint);
+    const rewrites = result.denied ? [] : ghApiBranchRewrites(command.api!.request, command.api!.endpoint);
+    return rewrites.length ? { ...result, branchRewrites: rewrites } : result;
+  }
+  // An alias or an extension can run any gh command or program, and the Copilot CLI any command: Paperclip cannot check them.
+  if (!GH_WRITE_GROUPS.has(group)) {
+    return { ...write("other"), denied: `Denied: Paperclip does not know the gh command ${group.slice(0, 60)}, so it cannot check it: gh aliases and extensions do not run with GitHub access. Run the gh command itself.`, integrity: true };
+  }
+  if (group === "copilot") return { ...write("other"), denied: "Denied: Paperclip does not run the Copilot CLI with GitHub access: it cannot tell what it runs.", integrity: true };
   const verbIndex = command.verbIndex;
+  // gh <group> --help prints help and runs nothing.
+  if (verbIndex < 0 && args.length === 2 && (args[1] === "-h" || args[1] === "--help")) return read();
+  // A hidden verb may be one agents never run (gh repo archive), so the refusal applies to every company.
   if (verbIndex < 0) {
-    return { ...write("other"), denied: "Put the verb right after the gh command group (gh pr merge …, with -R OWNER/REPO first if needed): Paperclip cannot tell which command an option before it hides." };
+    return { ...write("other"), denied: "Put the verb right after the gh command group (gh pr merge …, with -R OWNER/REPO first if needed): Paperclip cannot tell which command an option before it hides.", integrity: true };
   }
   const verb = args[verbIndex];
   switch (group) {
@@ -1129,8 +1338,22 @@ function classifyGh(original: readonly string[]): GitHubCommandClass {
     }
     case "workflow": case "run": return write("other", "workflowDispatch");
     case "project": return write("project");
-    // `gh repo sync` updates a branch (by default the default branch) from its upstream.
-    case "repo": return verb === "sync" ? write("push", "pushToMain") : write("other");
+    case "repo": {
+      if (verb !== undefined && GH_REPO_VERBS_AGENTS_NEVER.has(verb)) return neverByAgents(write("other"), "repository", `gh repo ${verb}`);
+      if (verb === "deploy-key" && args[verbIndex + 1] !== "list") return neverByAgents(write("other"), "secrets", "gh repo deploy-key");
+      // `gh repo sync` updates a branch (by default the default branch) from its upstream; --force hard-resets it.
+      if (verb !== "sync") return write("other");
+      const force = args.some(arg => arg === "--force" || (arg.startsWith("--force=") && !/^--force=(false|f|0)$/i.test(arg)));
+      const branchAt = args.findIndex(arg => arg === "-b" || arg === "--branch");
+      const branch = branchAt > 0 ? args[branchAt + 1] : args.find(arg => /^(--branch=|-b.)/.test(arg))?.replace(/^(--branch=|-b=?)/, "");
+      if (force && (branch === undefined || mayBeDefaultBranch(branch))) return neverByAgents(write("push", "pushToMain"), "defaultBranch", "gh repo sync --force");
+      // A named branch may still be protected: the server asks GitHub.
+      return force ? { ...write("push", "pushToMain"), branchRewrites: [branch!] } : write("push", "pushToMain");
+    }
+    // Secrets and variables never change through an agent; their list and get verbs are reads.
+    case "secret": case "variable": return verb === "ls" ? read() : neverByAgents(write("other"), "secrets", `gh ${group} ${verb}`);
+    case "alias": return { ...write("other"), denied: "Denied: Paperclip does not create gh aliases for agents: it cannot tell what an alias runs. Run the gh command itself.", integrity: true };
+    case "extension": return { ...write("other"), denied: "Denied: Paperclip does not run gh extensions with GitHub access: it cannot tell what an extension runs.", integrity: true };
     default: return write("other");
   }
 }

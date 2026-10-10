@@ -1279,6 +1279,9 @@ export type {
   AgentRuntimeState,
   AgentTaskSession,
   AgentWakeupRequest,
+  DeferredWakeAgentStats,
+  DeferredWakeStats,
+  DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
   LiveEvent,
   DashboardRunActivityDay,
@@ -2820,3 +2823,4 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./duplicate-detection.js";

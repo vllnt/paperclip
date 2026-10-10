@@ -425,6 +425,9 @@ Notes:
 npx paperclipai issue list --company-id <company-id> [--status todo,in_progress] [--assignee-agent-id <agent-id>] [--match text]
 npx paperclipai issue get <issue-id-or-identifier>
 npx paperclipai issue create --company-id <company-id> --title "..." [--description "..."] [--status todo] [--priority high]
+npx paperclipai issue similar --company-id <company-id> --title "..." [--description "..."] [--parent-id <issue-id>]
+npx paperclipai issue duplicate-pairs <issue-id-or-identifier>
+npx paperclipai issue duplicate-label --company-id <company-id> <pair-id> duplicate|keep_both
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]
 npx paperclipai issue delete <issue-id> --yes
 npx paperclipai issue comment <issue-id> --body "..." [--attachment-id <id...>] [--reopen]

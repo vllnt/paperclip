@@ -1248,6 +1248,61 @@ function invalidateHeartbeatProgressQueries(
   }
 }
 
+// An issue-list invalidation refetches every company issue list at once (each
+// board column, the task list, inbox lists). Steady agent activity fills every
+// 300ms batcher window, so issue lists get their own longer window: the first
+// event refreshes them at once and always gets one trailing refresh; events
+// inside a window collapse into the next one. The server caches compact issue
+// lists for 2s after computing them, so the immediate refresh can be served a
+// response from before the change; the window is long enough that the trailing
+// refresh reads past that cache.
+const ISSUE_LIST_INVALIDATION_WINDOW_MS = 3_000;
+const issueListInvalidationWindows = new WeakMap<
+  QueryClient,
+  Map<string, { pending: boolean }>
+>();
+
+function invalidateCompanyIssueLists(
+  queryClient: QueryClient,
+  companyId: string,
+) {
+  queryClient.invalidateQueries({
+    queryKey: queryKeys.issues.list(companyId),
+  });
+  queryClient.invalidateQueries({
+    queryKey: queryKeys.issues.listMineByMe(companyId),
+  });
+  queryClient.invalidateQueries({
+    queryKey: queryKeys.issues.listTouchedByMe(companyId),
+  });
+  queryClient.invalidateQueries({
+    queryKey: queryKeys.issues.listUnreadTouchedByMe(companyId),
+  });
+}
+
+function scheduleCompanyIssueListInvalidation(
+  queryClient: QueryClient,
+  companyId: string,
+) {
+  const windows = issueListInvalidationWindows.get(queryClient) ?? new Map();
+  issueListInvalidationWindows.set(queryClient, windows);
+  const open = windows.get(companyId);
+  if (open) {
+    open.pending = true;
+    return;
+  }
+  const refresh = (trailingRefreshDue: boolean) => {
+    invalidateCompanyIssueLists(queryClient, companyId);
+    const window = { pending: trailingRefreshDue };
+    windows.set(companyId, window);
+    setTimeout(() => {
+      windows.delete(companyId);
+      if (window.pending) refresh(false);
+    }, ISSUE_LIST_INVALIDATION_WINDOW_MS);
+  };
+  refresh(true);
+}
+
 function invalidateActivityQueries(
   queryClient: ReturnType<typeof useQueryClient>,
   companyId: string,
@@ -1298,18 +1353,7 @@ function invalidateActivityQueries(
       // An ancestor hold or reparenting changes descendants' effective pause.
       queryClient.invalidateQueries({ queryKey: ["issues", "tree-control-state"] });
     }
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.list(companyId),
-    });
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.listMineByMe(companyId),
-    });
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.listTouchedByMe(companyId),
-    });
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.listUnreadTouchedByMe(companyId),
-    });
+    scheduleCompanyIssueListInvalidation(queryClient, companyId);
     if (entityId) {
       const selfCommentActivity =
         (action === "issue.comment_added" ||

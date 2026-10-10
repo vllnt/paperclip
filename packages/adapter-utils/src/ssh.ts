@@ -13,7 +13,7 @@ import {
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
-import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { MERGE_STAGING_TAR_EXCLUDE, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -414,7 +414,8 @@ async function createSshAuthArgs(
 }
 
 function tarExcludeArgs(exclude: string[] | undefined): string[] {
-  const combined = ["._*", ...(exclude ?? [])];
+  // A concurrent restore's staged file can vanish mid-archive and fail tar.
+  const combined = ["._*", MERGE_STAGING_TAR_EXCLUDE, ...(exclude ?? [])];
   return combined.flatMap((entry) => ["--exclude", entry]);
 }
 
@@ -968,6 +969,14 @@ async function exportGitWorkspaceFromSsh(input: {
     }
     await fs.rm(bundleDir, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+// Any git failure answers false, so the caller keeps integrating as before.
+async function localHistoryContains(localDir: string, commit: string): Promise<boolean> {
+  return await runLocalGit(localDir, ["merge-base", "--is-ancestor", commit, "HEAD"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).then(() => true, () => false);
 }
 
 async function integrateImportedGitHead(input: {
@@ -1743,6 +1752,12 @@ export async function restoreWorkspaceFromSshExecution(input: {
           onProgress: input.onProgress,
         })
         : null;
+      // A head the local history already contains integrates as a no-op, so a
+      // run without new commits needs no hook and an unchanged tree can skip
+      // the merge lock.
+      const headToIntegrate = importedHead && !(await localHistoryContains(input.localDir, importedHead))
+        ? importedHead
+        : null;
       // `stagingDir` is fresh and empty, so extract into it directly rather
       // than through a second staging copy.
       await extractDirectoryFromSsh({
@@ -1759,11 +1774,11 @@ export async function restoreWorkspaceFromSshExecution(input: {
         targetDir: input.localDir,
         // Git history advances via integrateImportedGitHead; the working tree
         // still comes from the remote file snapshot so dirty remote edits win.
-        beforeApply: importedHead
+        beforeApply: headToIntegrate
           ? async () => {
             await integrateImportedGitHead({
               localDir: input.localDir,
-              importedHead,
+              importedHead: headToIntegrate,
             });
           }
           : undefined,

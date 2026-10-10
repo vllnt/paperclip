@@ -64,6 +64,8 @@ import {
   restoreIssueDocumentRevisionSchema,
   upsertIssueFeedbackVoteSchema,
   upsertIssueWatchdogSchema,
+  findSimilarIssuesSchema,
+  labelDuplicatePairSchema,
   runnerGoalActionRequestSchema,
   // Project
   createProjectSchema,
@@ -1652,6 +1654,20 @@ const FORBIDDEN_RESPONSE = {
   },
 };
 
+// A path value that the database cannot parse (e.g. a malformed UUID) returns
+// 400 from the central error handler, so every operation with a path parameter
+// can answer 400.
+const BAD_REQUEST_RESPONSE = {
+  description: "Bad request",
+  content: {
+    "application/json": {
+      schema: { $ref: "#/components/schemas/Error" },
+    },
+  },
+};
+
+const PATH_PARAMETER_PATTERN = /\{[^}]+\}/;
+
 function operationKey(method: string, path: string) {
   return `${method.toUpperCase()} ${path}`;
 }
@@ -1769,6 +1785,13 @@ function applyDocumentFixups(document: any): any {
         if (!responses["403"]) {
           responses["403"] = FORBIDDEN_RESPONSE;
         }
+      }
+      if (PATH_PARAMETER_PATTERN.test(path)) {
+        const responses = (operation.responses ??= {}) as Record<
+          string,
+          unknown
+        >;
+        responses["400"] ??= BAD_REQUEST_RESPONSE;
       }
       if (CREATED_OPERATIONS.has(key)) {
         applyOperationStatusOverride(operation, "200", "201");
@@ -4091,6 +4114,50 @@ registry.registerPath({
   request: { params: z.object({ id: z.string() }) },
   responses: {
     200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issues/similar",
+  tags: ["issues"],
+  summary: "Check a draft issue for likely duplicates before creating it",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(findSimilarIssuesSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/duplicate-pairs",
+  tags: ["issues"],
+  summary: "List scored duplicate candidates recorded for an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issue-duplicate-pairs/{pairId}/label",
+  tags: ["issues"],
+  summary: "Label a scored duplicate pair as duplicate or keep both",
+  request: {
+    params: z.object({ companyId: z.string(), pairId: z.string() }),
+    body: jsonBody(labelDuplicatePairSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,

@@ -79,6 +79,8 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
+import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import {
@@ -713,6 +715,43 @@ export function buildHostServices(
   const secretsHandler = createPluginSecretsHandler({ db, pluginId });
   const companies = companyService(db);
   const agents = agentService(db);
+
+  /**
+   * Pausing or resuming an agent is board-only on the routes, and resuming one
+   * needs `agents:configure` for an agent caller. A plugin call started by an
+   * agent keeps that rule: the agent behind the call needs `agents:configure`
+   * for the target, so a plugin cannot resume a budget-paused agent (including
+   * the caller) for it. Board, user, and system calls keep their access.
+   */
+  async function assertAgentCallerMayChangeStatus(
+    agent: { id: string; companyId: string },
+    change: "pause" | "resume",
+  ) {
+    const caller = currentPluginHostCallAgent();
+    if (!caller) return;
+    await assertAgentProtectedChangeGranted({
+      actor: { type: "agent", agentId: caller.agentId, companyId: caller.companyId, runId: caller.runId, source: "agent_jwt" },
+      decide: (request) => authorizationService(db).decide(request),
+      recordDenial: async (details) => {
+        await logActivity(db, {
+          companyId: agent.companyId,
+          actorType: "agent",
+          actorId: caller.agentId,
+          agentId: caller.agentId,
+          runId: caller.runId,
+          action: "agent.self_config_update_denied",
+          entityType: "agent",
+          entityId: agent.id,
+          details,
+        });
+      },
+      target: agent,
+      fields: ["status"],
+      surface: "plugin_status_change",
+      details: { sourcePluginKey: pluginKey, change },
+    });
+  }
+
   const managedAgents = pluginManagedAgentService(db, {
     pluginId,
     pluginKey,
@@ -2891,6 +2930,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "pause");
         return (await agents.pause(params.agentId)) as Agent;
       },
       async resume(params) {
@@ -2898,6 +2938,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "resume");
         return (await agents.resume(params.agentId)) as Agent;
       },
       async invoke(params) {

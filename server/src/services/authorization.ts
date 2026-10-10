@@ -403,9 +403,11 @@ async function scopeAllows(
   companyId: string,
   grantScope: Record<string, unknown> | null,
   requestedScope: Record<string, unknown> | null | undefined,
-  options: { requireStructuredScope?: boolean } = {},
+  options: { requireStructuredScope?: boolean; requireExplicitAgentTarget?: boolean } = {},
 ) {
-  if (!grantScope || Object.keys(grantScope).length === 0) return !options.requireStructuredScope;
+  if (!grantScope || Object.keys(grantScope).length === 0) {
+    return !options.requireStructuredScope && !options.requireExplicitAgentTarget;
+  }
   if (!requestedScope) return false;
 
   const targetAssigneeAgentId =
@@ -439,6 +441,7 @@ async function scopeAllows(
     ]),
     ...prefixedScopeValues(grantScope, "agent:"),
   ];
+  if (options.requireExplicitAgentTarget && targetAgentIds.length === 0) return false;
   if (targetAgentIds.length > 0) {
     constrained = true;
     if (!scopeIncludesId(targetAgentIds, targetAssigneeAgentId)) return false;
@@ -722,6 +725,8 @@ export function authorizationService(db: Db | DbTransaction) {
     if (
       !(await scopeAllows(db, input.companyId, grant.scope, input.scope, {
         requireStructuredScope: input.permissionKey === "tasks:assign_scope",
+        requireExplicitAgentTarget:
+          input.principalType === "agent" && scopeBoolean(input.scope, "requireExplicitTargetGrant"),
       }))
     ) {
       return deny({

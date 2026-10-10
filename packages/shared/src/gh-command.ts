@@ -90,8 +90,10 @@ export function parseGhCommand(original: readonly string[]): GhCommand {
   if (problem !== null) return { problem, args: [], group: null, verbIndex: -1, hidesRepo: false, reads: false, printsToken: false, api: null };
   const group = args[0]!;
   const hidesRepo = group !== "api" && args.some(arg => /^-[A-Za-z]{2,}/.test(arg) && !arg.startsWith("--") && !arg.startsWith("-R") && arg.slice(1).includes("R"));
-  // Groups that never write, and each group's read verbs (any other verb writes).
-  const readGroups = ["auth", "browse", "completion", "config", "alias", "help", "status", "search", "version", "extension", "org", "attestation", "ruleset"];
+  // Groups that never write, and each group's read verbs (any other verb writes). `co` is gh's built-in alias for
+  // `pr checkout`; the help topics only print. gh runs an alias or extension for any other name, so it may write.
+  const readGroups = ["auth", "browse", "completion", "config", "help", "status", "search", "version", "org", "attestation", "ruleset", "co", "licenses",
+    "accessibility", "actions", "environment", "exit-codes", "formatting", "mintty", "reference", "telemetry"];
   const readVerbs = new Map<string, string[]>([
     ["pr", ["list", "view", "status", "diff", "checks", "checkout"]],
     ["issue", ["list", "view", "status"]],
@@ -105,6 +107,8 @@ export function parseGhCommand(original: readonly string[]): GhCommand {
     ["secret", ["list"]],
     ["variable", ["list", "get"]],
     ["gist", ["list", "view", "clone"]],
+    ["alias", ["list", "ls", "delete"]],
+    ["extension", ["list", "ls", "search", "browse", "install", "upgrade", "remove", "create"]],
   ]);
   const verbs = readVerbs.get(group);
   const verb = verbIndex >= 0 ? args[verbIndex] : undefined;

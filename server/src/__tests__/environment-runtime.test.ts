@@ -11,6 +11,7 @@ import {
   stopSshEnvLabFixture,
 } from "@paperclipai/adapter-utils/ssh";
 import {
+  activityLog,
   agents,
   builtInManagedResources,
   companies,
@@ -219,6 +220,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
     await db.delete(environmentLeases);
     await db.delete(issues);
+    // The SSH run directory reaper records activity against a run.
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);
@@ -1354,7 +1357,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.insert(environmentLeases).values({
       id: leaseId, companyId, environmentId: environment.id, heartbeatRunId: runId, status: "active",
       leasePolicy: "ephemeral", provider: "ssh", providerLeaseId: "ssh://ssh-user@ssh.invalid:22/srv/paperclip/workspace",
-      metadata: { driver: "ssh", remoteCwd: "/srv/paperclip/workspace", host: "ssh.invalid", port: 22, username: "ssh-user" },
+      // The acquire records the configured root next to the one it resolved.
+      metadata: { driver: "ssh", remoteWorkspacePath: "/srv/paperclip/workspace", remoteCwd: "/srv/paperclip/workspace", host: "ssh.invalid", port: 22, username: "ssh-user" },
     });
     const warn = vi.spyOn(logger, "warn");
     try {

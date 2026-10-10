@@ -2,7 +2,7 @@ import { TaskLinksProvider } from "@/plugins/task-links";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { startTransition, useDeferredValue, useEffect, useMemo, useState, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
-import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVisibilityRefetchInterval } from "@/lib/polling";
 import { accessApi } from "../api/access";
 import { useDialogActions } from "../context/DialogContext";
@@ -14,6 +14,7 @@ import { authApi } from "../api/auth";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { queryKeys } from "../lib/queryKeys";
 import { useIssueExternalObjectSummaries } from "../hooks/useIssueExternalObjects";
+import { ISSUE_BOARD_COLUMN_RESULT_LIMIT, useBoardColumnIssues } from "../hooks/useBoardColumnIssues";
 import {
   shouldBlurPageSearchOnEnter,
   shouldBlurPageSearchOnEscape,
@@ -100,7 +101,6 @@ import { deriveOriginatingActor, ISSUE_STATUSES, type Issue, type IssueStatus, t
 import { Badge } from "@/components/ui/badge";
 const ISSUE_SEARCH_DEBOUNCE_MS = 250;
 const ISSUE_SEARCH_RESULT_LIMIT = 200;
-const ISSUE_BOARD_COLUMN_RESULT_LIMIT = 200;
 type IssuesListNavEntry =
   | { type: "group"; key: string; collapsed: boolean }
   | { type: "issue"; issue: Issue; hasChildren: boolean; expanded: boolean; budgetOrdinal: number };
@@ -132,7 +132,6 @@ function findIssuesScrollContainer(element: HTMLElement | null): HTMLElement | n
   }
   return null;
 }
-const boardIssueStatuses = ISSUE_STATUSES;
 const issueStatusLabels: Record<IssueStatus, string> = {
   backlog: "Backlog",
   todo: "Todo",
@@ -707,6 +706,8 @@ function SubIssueProgressSummaryStrip({
 }
 
 // Mobile-only indent for nested task rows (desktop uses IssueRow treeGuides).
+const NO_ISSUES: Issue[] = [];
+
 const MOBILE_TREE_INDENT = ["", "pl-4 sm:pl-0", "pl-8 sm:pl-0", "pl-12 sm:pl-0", "pl-16 sm:pl-0"];
 
 export function IssuesList(props: IssuesListProps) {
@@ -924,31 +925,14 @@ function StreamlinedIssuesList({
     enabled: !!selectedCompanyId && normalizedIssueSearch.length > 0 && !searchWithinLoadedIssues,
     placeholderData: (previousData) => previousData,
   });
-  const boardIssueQueries = useQueries({
-    queries: boardIssueStatuses.map((status) => ({
-      queryKey: [
-        ...queryKeys.issues.list(selectedCompanyId ?? "__no-company__"),
-        "board-column",
-        status,
-        normalizedIssueSearch,
-        projectId ?? "__all-projects__",
-        searchFilters ?? {},
-        "compact",
-        ISSUE_BOARD_COLUMN_RESULT_LIMIT,
-        enableRoutineVisibilityFilter ? "with-routine-executions" : "without-routine-executions",
-      ],
-      queryFn: ({ signal }: { signal: AbortSignal }) =>
-        issuesApi.listCompact(selectedCompanyId!, {
-          ...searchFilters,
-          ...(normalizedIssueSearch.length > 0 ? { q: normalizedIssueSearch } : {}),
-          projectId,
-          status,
-          limit: ISSUE_BOARD_COLUMN_RESULT_LIMIT,
-          ...(enableRoutineVisibilityFilter ? { includeRoutineExecutions: true } : {}),
-        }, { signal }).then((rows) => rows as Issue[]),
-      enabled: !!selectedCompanyId && viewState.viewMode === "board" && !searchWithinLoadedIssues,
-      placeholderData: (previousData: Issue[] | undefined) => previousData,
-    })),
+  const boardQueriesActive = viewState.viewMode === "board" && !searchWithinLoadedIssues;
+  const boardColumns = useBoardColumnIssues({
+    companyId: selectedCompanyId,
+    enabled: boardQueriesActive,
+    search: normalizedIssueSearch,
+    projectId,
+    searchFilters,
+    includeRoutineExecutions: enableRoutineVisibilityFilter,
   });
   const { data: executionWorkspaces = [] } = useQuery({
     queryKey: selectedCompanyId
@@ -1153,26 +1137,10 @@ function StreamlinedIssuesList({
     return map;
   }, [issues]);
 
-  const boardIssues = useMemo(() => {
-    if (viewState.viewMode !== "board" || searchWithinLoadedIssues) return null;
-    const merged = new Map<string, Issue>();
-    let isPending = false;
-    for (const query of boardIssueQueries) {
-      isPending ||= query.isPending;
-      for (const issue of query.data ?? []) {
-        merged.set(issue.id, issue);
-      }
-    }
-    if (merged.size > 0) return [...merged.values()];
-    return isPending ? issues : [];
-  }, [boardIssueQueries, issues, searchWithinLoadedIssues, viewState.viewMode]);
-  const boardColumnLimitReached = useMemo(
-    () =>
-      viewState.viewMode === "board" &&
-      !searchWithinLoadedIssues &&
-      boardIssueQueries.some((query) => (query.data?.length ?? 0) === ISSUE_BOARD_COLUMN_RESULT_LIMIT),
-    [boardIssueQueries, searchWithinLoadedIssues, viewState.viewMode],
-  );
+  // Until a column answers, the board shows per-column placeholders rather
+  // than the task list's partial data.
+  const boardIssues = boardQueriesActive ? boardColumns.issues ?? NO_ISSUES : null;
+  const boardColumnLimitReached = boardQueriesActive && boardColumns.limitReached;
 
   const sourceIssues = useMemo(() => {
     const useRemoteSearch = normalizedIssueSearch.length > 0 && !searchWithinLoadedIssues;
@@ -1208,6 +1176,11 @@ function StreamlinedIssuesList({
   const externalObjectFilterLoading = hasExternalObjectStatusFilters
     && externalObjectSummariesLoading
     && !externalObjectSummariesReady;
+  // Board columns load on their own queries; when the board renders the loaded
+  // task list instead, the whole board waits on that list.
+  const boardLoadingStatuses = boardQueriesActive && !externalObjectFilterLoading
+    ? boardColumns.loadingStatuses
+    : isLoading || externalObjectFilterLoading ? ISSUE_STATUSES : undefined;
 
   const filtered = useMemo(() => {
     const filteredByControls = applyIssueFilters(
@@ -2018,8 +1991,10 @@ function StreamlinedIssuesList({
         )}
       />
 
-      {(isLoading || externalObjectFilterLoading) && <PageSkeleton variant="issues-list" />}
-      {error && <p className="text-sm text-destructive">{error.message}</p>}
+      {/* The board owns its loading and error states per column; the
+          list-shaped skeleton and the task-list error describe list data. */}
+      {viewState.viewMode !== "board" && (isLoading || externalObjectFilterLoading) && <PageSkeleton variant="issues-list" />}
+      {error && !boardQueriesActive && <p className="text-sm text-destructive">{error.message}</p>}
       {!searchWithinLoadedIssues && normalizedIssueSearch.length > 0 && searchedIssues.length === ISSUE_SEARCH_RESULT_LIMIT && (
         <p className="text-xs text-muted-foreground">
           Showing up to {ISSUE_SEARCH_RESULT_LIMIT} matches. Refine the search to narrow further.
@@ -2048,6 +2023,9 @@ function StreamlinedIssuesList({
           collapsedStatuses={boardCollapsedStatuses}
           initialVisibleCount={viewState.boardColumnPageSize}
           revealIncrement={viewState.boardColumnPageSize}
+          loadingStatuses={boardLoadingStatuses}
+          failedStatuses={boardQueriesActive ? boardColumns.failedStatuses : undefined}
+          onRetryFailedColumns={boardColumns.retryFailedColumns}
           onUpdateIssue={onUpdateIssue}
         />
       ) : (

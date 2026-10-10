@@ -205,7 +205,7 @@ describe("classifyGitHubCommand", () => {
     expect(classifyGitHubCommand("git", ["push"], { ...clean, currentBranch: "feat/a" })).toEqual(write("push"));
     expect(classifyGitHubCommand("git", ["push", "origin", "feat/a"], { touchesWorkflows: true })).toEqual(write("push", "editWorkflows"));
     expect(classifyGitHubCommand("git", ["push", "origin", "feat/a"], { touchesWorkflows: null })).toEqual(write("push", "editWorkflows"));
-    expect(classifyGitHubCommand("git", ["push", "origin", "--delete", "feat/a"])).toEqual(write("push"));
+    expect(classifyGitHubCommand("git", ["push", "origin", "--delete", "feat/a"])).toEqual({ ...write("push"), branchRewrites: ["feat/a"] });
   });
 
   it("denies release tags (name@version) and bulk tag pushes whatever the toggles", () => {
@@ -286,7 +286,7 @@ describe("classifyGitHubCommand", () => {
     [["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v1"], write("other", "release")],
     [["api", "repos/o/r/git/refs", "-f", "ref=refs/tags/v1", "-f", "sha=abc"], write("push", "tagPush")],
     [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", "sha=abc"], write("push", "pushToMain")],
-    [["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat"], write("push")],
+    [["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat"], { ...write("push"), branchRewrites: ["feat"] }],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "message=x", "-f", "content=eA=="], write("commit", "pushToMain")],
     [["api", "-X", "PUT", "repos/o/r/contents/README.md", "-f", "branch=docs", "-f", "message=x"], write("commit")],
     [["api", "-X", "PUT", "repos/o/r/contents/.github/workflows/ci.yml", "-f", "branch=docs"], write("commit", "editWorkflows")],
@@ -463,7 +463,7 @@ describe("security review round 2b (attack regressions)", () => {
     ]) {
       const result = mutation(body);
       expect(result.access, body).toBe("write");
-      expect(result.denied, body).toMatch(/cannot check the GraphQL mutation|no subscriptions or fragments|separate gh api graphql calls/);
+      expect(result.denied, body).toMatch(/cannot check the GraphQL mutation|no subscriptions or fragments|separate gh api graphql calls|^Denied: agents never/);
     }
     expect(mutation('mutation{resolveReviewThread(input:{threadId:"T"}){thread{id}}}')).toEqual(write("comment"));
     expect(mutation('mutation($i: AddCommentInput!) { c: addComment(input: $i) @include(if: true) { clientMutationId } }')).toEqual(write("comment"));
@@ -475,7 +475,8 @@ describe("security review round 2b (attack regressions)", () => {
     for (const path of ["repos/o/r/pulls/12/merge/", "repos/o/r//pulls/12/merge", "repos/o/r/./pulls/12/merge", "/repos/o/r/pulls/12/%6Derge"]) {
       expect(classifyGitHubCommand("gh", ["api", "-X", "PUT", path]), path).toEqual(write("pullRequest", "adminMerge"));
     }
-    expect(classifyGitHubCommand("gh", ["api", "-X", "DELETE", "repos/o/r/git/refs/heads/main/"])).toEqual(write("push", "pushToMain"));
+    // Deleting the default branch is an operation agents never perform (any spelling).
+    expect(classifyGitHubCommand("gh", ["api", "-X", "DELETE", "repos/o/r/git/refs/heads/main/"])).toMatchObject({ ...write("push", "pushToMain"), denied: expect.stringMatching(/^Denied: agents never/), integrity: true });
     expect(classifyGitHubCommand("gh", ["api", "-X", "PUT", "repos/o/r/pulls/12/../13/merge"]).denied).toMatch(/'\.\.'/);
     for (const args of [["api", "-X", "PUT", "repositories/123/pulls/12/merge"], ["api", "-X", "POST", "repositories/123/git/refs", "-f", "ref=refs/tags/v1"],
       ["api", "-X", "PUT", "repositories/123/contents/.github/workflows/x.yml"]]) {
@@ -507,8 +508,9 @@ describe("security review round 2b (attack regressions)", () => {
     expect(classifyGitHubCommand("gh", ["api", "--hostname", "github.localhost", "user"])).toMatchObject({ integrity: true });
     expect(classifyGitHubCommand("git", ["send-pack", "https://github.com/o/r"])).toMatchObject({ integrity: true });
     // Policy refusals (privileged checks Paperclip cannot make) are not integrity refusals.
-    expect(classifyGitHubCommand("gh", ["api", "graphql", "-f", 'query=mutation{mergePullRequest(input:{pullRequestId:"x"}){clientMutationId}}'])).not.toHaveProperty("integrity");
     expect(classifyGitHubCommand("git", ["push", "--tags", "origin"])).not.toHaveProperty("integrity");
+    // A GraphQL mutation outside the fence may change repository settings by node ID, so it is refused for every company.
+    expect(classifyGitHubCommand("gh", ["api", "graphql", "-f", 'query=mutation{mergePullRequest(input:{pullRequestId:"x"}){clientMutationId}}'])).toMatchObject({ integrity: true });
   });
 });
 
@@ -563,7 +565,9 @@ describe("security review round 2c (attack regressions)", () => {
       expect(classifyGitHubCommand("git", ["clone", ...args]).denied, args.join(" ")).toMatch(/does not know the git clone option/);
     }
     // Clustered flags with a value option last take the next argument, as git does.
-    expect(push("-fo", "ci.skip", "origin", "HEAD:refs/heads/main")).toEqual(write("push", "pushToMain"));
+    expect(push("-fo", "ci.skip", "origin", "HEAD:refs/heads/feat")).toEqual({ ...write("push"), branchRewrites: ["feat"] });
+    // -f in the cluster force-pushes: to the default branch, that is an operation agents never perform.
+    expect(push("-fo", "ci.skip", "origin", "HEAD:refs/heads/main")).toMatchObject({ ...write("push", "pushToMain"), denied: expect.stringMatching(/^Denied: agents never/), integrity: true });
     expect(gitNetworkArguments("push", ["-fo", "ci.skip", "origin", "main"])).toMatchObject({ positional: ["origin", "main"], flags: new Set(["-f"]) });
     expect(gitNetworkArguments("pull", ["-S", "origin", "main"])).toMatchObject({ positional: ["origin", "main"] });
     expect(gitNetworkArguments("clone", ["--depth=1", "-b", "release/1.0", "https://github.com/o/r", "dir"])).toMatchObject({ positional: ["https://github.com/o/r", "dir"] });
@@ -777,5 +781,348 @@ describe("parseGitHubDestination on hostile input", () => {
       expect(destination.kind).not.toBe("github");
     }
     expect(parseGitHubDestination("https://github.com/Anthm-FR/songtrivia.git", "git")).toMatchObject({ kind: "github", repository: "anthm-fr/songtrivia" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Operations agents never perform (2026-10-08: a `gh repo archive` archived a repository).
+// Each is refused for every company, with or without a write identity policy.
+// ---------------------------------------------------------------------------
+describe("operations agents never perform", () => {
+  const read = { access: "read", action: null, privileged: [] };
+  const write = (action: string, ...privileged: string[]) => ({ access: "write", action, privileged });
+  const sha = "a".repeat(40);
+  const gh = (...args: string[]) => classifyGitHubCommand("gh", args);
+  const graphql = (query: string, ...extra: string[]) => gh("api", "graphql", "-f", `query=${query}`, ...extra);
+  const never = (what: RegExp) => expect.objectContaining({ access: "write", denied: expect.stringMatching(new RegExp(`^Denied: agents never ${what.source}`)), integrity: true });
+  const repository = /archive, delete, rename, transfer or change the settings of a repository/;
+  const defaultBranch = /delete or force-push a default or protected branch/;
+  const protection = /change branch protection or rulesets/;
+  const hooks = /change webhooks/;
+  const secrets = /change secrets, variables or deploy keys/;
+  const deployments = /delete deployments, change or delete environments, or mark a deployment inactive/;
+
+  it.each([
+    [["repo", "archive", "--yes"], repository],
+    [["repo", "archive", "Anthm-FR/linkzic", "--yes"], repository],
+    [["-R", "o/r", "repo", "archive", "--yes"], repository],
+    [["repo", "-R", "o/r", "archive"], repository],
+    [["repo", "unarchive", "o/r", "--yes"], repository],
+    [["repo", "delete", "o/r", "--yes"], repository],
+    [["repo", "rename", "new-name", "--yes"], repository],
+    [["repo", "edit", "--visibility", "public", "--accept-visibility-change-consequences"], repository],
+    [["repo", "edit", "o/r", "--default-branch", "develop"], repository],
+    [["repo", "edit", "--description", "x"], repository],
+    [["repo", "transfer", "o/r", "other-owner"], repository],
+    [["repo", "deploy-key", "add", "key.pub", "--allow-write"], secrets],
+    [["repo", "deploy-key", "delete", "42"], secrets],
+    [["secret", "set", "TOKEN", "--body", "x"], secrets],
+    [["secret", "set", "TOKEN", "--org", "acme", "--body", "x"], secrets],
+    [["secret", "delete", "TOKEN"], secrets],
+    [["variable", "set", "NAME", "--body", "x"], secrets],
+    [["variable", "delete", "NAME", "--env", "production"], secrets],
+    [["repo", "sync", "--force"], defaultBranch],
+    [["repo", "sync", "o/fork", "--force", "--branch", "main"], defaultBranch],
+    [["repo", "sync", "--force=true", "-bmaster"], defaultBranch],
+  ])("refuses gh %j", (args, what) => {
+    expect(gh(...args)).toEqual(never(what));
+  });
+
+  it.each([
+    // The bare repository: archived, name, visibility, default_branch, a body Paperclip cannot see, or a deletion.
+    [["api", "-X", "PATCH", "repos/o/r", "-F", "archived=true"], repository],
+    [["api", "repos/o/r", "-X", "PATCH", "-F", "archived=true"], repository],
+    [["api", "repos/o/r", "-F", "archived=true", "--method", "PATCH"], repository],
+    [["api", "--method=PATCH", "repos/o/r", "-f", "name=renamed"], repository],
+    [["api", "-XPATCH", "repos/o/r", "-fvisibility=public"], repository],
+    [["api", "-iX", "PATCH", "repos/o/r", "-f", "default_branch=develop"], repository],
+    [["api", "-X", "PATCH", "repos/o/r", "--input", "settings.json"], repository],
+    [["api", "-X", "patch", "repos/o/r", "-f", "description=x"], repository],
+    [["api", "-X", "DELETE", "repos/o/r"], repository],
+    [["api", "-X", "DELETE", "/Repos/O/R/"], repository],
+    [["api", "--method", "DELETE", "https://api.github.com/repos/o/r"], repository],
+    [["api", "-X", "PATCH", "repositories/123", "-F", "archived=true"], repository],
+    [["api", "-X", "PATCH", "repos/{owner}/{repo}", "-F", "archived=true"], repository],
+    [["api", "repos/o/r/transfer", "-f", "new_owner=elsewhere"], repository],
+    // Branch protection and rulesets, repository and organization.
+    [["api", "-X", "PUT", "repos/o/r/branches/main/protection", "--input", "protection.json"], protection],
+    [["api", "-X", "DELETE", "repos/o/r/branches/main/protection"], protection],
+    [["api", "-X", "DELETE", "repos/o/r/branches/release%2F1/protection/required_status_checks"], protection],
+    [["api", "-X", "PUT", "repos/o/r/branches/release/1/protection", "--input", "protection.json"], protection],
+    [["api", "repos/o/r/rulesets", "-f", "name=x", "-f", "enforcement=active"], protection],
+    [["api", "-X", "PUT", "repos/o/r/rulesets/5", "-f", "enforcement=disabled"], protection],
+    [["api", "-X", "DELETE", "repos/o/r/rulesets/5"], protection],
+    [["api", "-X", "DELETE", "orgs/acme/rulesets/5"], protection],
+    // Webhooks.
+    [["api", "-X", "DELETE", "repos/o/r/hooks/7"], hooks],
+    [["api", "-X", "PATCH", "repos/o/r/hooks/7", "-F", "active=false"], hooks],
+    [["api", "-X", "PATCH", "repos/o/r/hooks/7/config", "-f", "url=https://x.example"], hooks],
+    [["api", "repos/o/r/hooks", "-f", "name=web"], hooks],
+    [["api", "-X", "DELETE", "orgs/acme/hooks/7"], hooks],
+    [["api", "--method", "PATCH", "orgs/acme/hooks/7", "-F", "active=false"], hooks],
+    // Secrets, variables and deploy keys, repository and organization.
+    [["api", "-X", "PUT", "repos/o/r/actions/secrets/TOKEN", "-f", "encrypted_value=x", "-f", "key_id=1"], secrets],
+    [["api", "-X", "DELETE", "repos/o/r/actions/secrets/TOKEN"], secrets],
+    [["api", "-X", "PATCH", "repos/o/r/actions/variables/NAME", "-f", "value=y"], secrets],
+    [["api", "-X", "DELETE", "repos/o/r/actions/variables/NAME"], secrets],
+    [["api", "repos/o/r/actions/variables", "-f", "name=NAME", "-f", "value=y"], secrets],
+    [["api", "-X", "DELETE", "repos/o/r/dependabot/secrets/TOKEN"], secrets],
+    [["api", "-X", "PUT", "repos/o/r/codespaces/secrets/TOKEN"], secrets],
+    [["api", "-X", "PUT", "orgs/acme/actions/secrets/TOKEN", "-f", "visibility=all"], secrets],
+    [["api", "-X", "DELETE", "orgs/acme/actions/variables/NAME"], secrets],
+    [["api", "-X", "PATCH", "orgs/acme/actions/variables/NAME", "-f", "value=y"], secrets],
+    [["api", "repos/o/r/keys", "-f", "key=ssh-ed25519 AAAA", "-F", "read_only=false"], secrets],
+    // Environments and deployments.
+    [["api", "-X", "DELETE", "repos/o/r/environments/production"], deployments],
+    [["api", "-X", "PUT", "repos/o/r/environments/staging"], deployments],
+    [["api", "-X", "PUT", "repos/o/r/environments/production/secrets/TOKEN"], deployments],
+    [["api", "repos/o/r/environments/production/deployment-branch-policies", "-f", "name=*"], deployments],
+    [["api", "-X", "DELETE", "repos/o/r/deployments/42"], deployments],
+    [["api", "-X", "POST", "repos/o/r/deployments/42/statuses", "-f", "state=inactive"], deployments],
+    [["api", "repos/o/r/deployments/42/statuses", "-F", "state=INACTIVE"], deployments],
+    [["api", "repos/o/r/deployments/42/statuses", "-F", "state=@state.txt"], deployments],
+    [["api", "-X", "POST", "repos/o/r/deployments/42/statuses", "--input", "status.json"], deployments],
+    // The default branch: deleted, renamed, or force-updated (any force but false, or a body Paperclip cannot see).
+    [["api", "-X", "DELETE", "repos/o/r/git/refs/heads/main"], defaultBranch],
+    [["api", "--method", "DELETE", "repos/o/r/git/refs/heads/master/"], defaultBranch],
+    [["api", "-X", "DELETE", "repos/o/r/git/refs/heads%2Fmain"], defaultBranch],
+    [["api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/{branch}"], defaultBranch],
+    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force=true"], defaultBranch],
+    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-f", "force=true"], defaultBranch],
+    [["api", "repos/o/r/git/refs/heads/main", "-X", "PATCH", "--input", "ref.json"], defaultBranch],
+    [["api", "-X", "POST", "repos/o/r/branches/main/rename", "-f", "new_name=trunk"], defaultBranch],
+    // Values Paperclip cannot see (review round): a query string, a typed value gh fills from the checkout, a force that is not exactly false.
+    [["api", "-X", "POST", "repos/o/r/deployments/9/statuses?state=inactive"], deployments],
+    [["api", "-X", "POST", "repos/o/r/deployments/9/statuses", "-F", "state={branch}"], deployments],
+    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main?force=true", "-f", `sha=${sha}`], defaultBranch],
+    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-f", "force=False"], defaultBranch],
+    [["api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force={branch}"], defaultBranch],
+    [["api", "-X", "DELETE", "repos/o/r/tags/protection/3"], protection],
+  ])("refuses gh %j", (args, what) => {
+    expect(gh(...args)).toEqual(never(what));
+  });
+
+  it("refuses GraphQL mutations agents never run, aliased, mixed or by any GraphQL spelling", () => {
+    for (const [query, what] of [
+      ['mutation{archiveRepository(input:{repositoryId:"R"}){clientMutationId}}', repository],
+      ['mutation{a: archiveRepository(input:{repositoryId:"R"}){clientMutationId}}', repository],
+      ['mutation{unarchiveRepository(input:{repositoryId:"R"}){clientMutationId}}', repository],
+      ['mutation{updateRepository(input:{repositoryId:"R",name:"x"}){clientMutationId}}', repository],
+      ['mutation{transferRepository(input:{repositoryId:"R",ownerId:"O"}){clientMutationId}}', repository],
+      ['mutation{deleteRef(input:{refId:"F"}){clientMutationId}}', defaultBranch],
+      ['mutation{updateRef(input:{refId:"F",oid:"a",force:true}){clientMutationId}}', defaultBranch],
+      ['mutation{updateRefs(input:{repositoryId:"R",refUpdates:[{name:"refs/heads/main",afterOid:"a",force:true}]}){clientMutationId}}', defaultBranch],
+      ['mutation{createBranchProtectionRule(input:{repositoryId:"R",pattern:"main"}){clientMutationId}}', protection],
+      ['mutation{deleteBranchProtectionRule(input:{branchProtectionRuleId:"B"}){clientMutationId}}', protection],
+      ['mutation{updateRepositoryRuleset(input:{repositoryRulesetId:"S",enforcement:DISABLED}){clientMutationId}}', protection],
+      ['mutation{deleteDeployment(input:{id:"D"}){clientMutationId}}', deployments],
+      ['mutation{createDeploymentStatus(input:{deploymentId:"D",state:INACTIVE}){clientMutationId}}', deployments],
+      ['mutation{deleteEnvironment(input:{id:"E"}){clientMutationId}}', deployments],
+      ['mutation{addComment(input:{subjectId:"I",body:"x"}){clientMutationId} archiveRepository(input:{repositoryId:"R"}){clientMutationId}}', repository],
+      ['query Q{viewer{login}} mutation M{deleteRef(input:{refId:"F"}){clientMutationId}}', defaultBranch],
+    ] as const) {
+      expect(graphql(query), query).toEqual(never(what));
+    }
+    for (const endpoint of ["https://api.github.com/graphql", "/GraphQL"]) {
+      expect(gh("api", endpoint, "-f", 'query=mutation{archiveRepository(input:{repositoryId:"R"}){clientMutationId}}'), endpoint).toEqual(never(repository));
+    }
+  });
+
+  it("refuses for every company the requests Paperclip cannot read, which could hide one of them", () => {
+    for (const args of [
+      ["api", "graphql", "-F", "query=@archive.graphql"],
+      ["api", "graphql", "--input", "-"],
+      ["api", "graphql", "-f", "query=mutation{archiveRepository(input:{repositoryId:\"R\"}){clientMutationId}"],
+      ["api", "graphql", "-f", 'query=mutation{...M} fragment M on Mutation{archiveRepository(input:{repositoryId:"R"}){clientMutationId}}'],
+      ["api", "-X", "PATCH", "repos/o/r/../r", "-F", "archived=true"],
+      ["api", "-X", "PATCH", "repos/o/r/%E0%A4%A", "-F", "archived=true"],
+      ["repo", "--yes", "archive"],
+      // gh fills placeholders after the check, and a branch may be named heads/main, hooks/1, repos/o/r or deleteRef.
+      ["api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/{branch}"],
+      ["api", "-X", "DELETE", "repos/{owner}/{repo}/{branch}"],
+      ["api", "-X", "DELETE", "repos/o/r/:branch"],
+      ["api", "-X", "PATCH", "{branch}", "-F", "archived=true"],
+      ["api", "graphql", "-F", 'query=mutation{addComment(input:{subjectId:"I",body:"x"}){clientMutationId} {branch}(input:{refId:"F"}){clientMutationId}}'],
+      // A GraphQL mutation outside the comment and Project fence names its target by node ID: any of them may change settings.
+      ["api", "graphql", "-f", 'query=mutation{updateRepositoryWebCommitSignoffSetting(input:{repositoryId:"R",webCommitSignoffRequired:false}){clientMutationId}}'],
+      ["api", "graphql", "-f", 'query=mutation{mergePullRequest(input:{pullRequestId:"x"}){clientMutationId}}'],
+    ]) {
+      expect(gh(...args), args.join(" ")).toMatchObject({ access: "write", denied: expect.any(String), integrity: true });
+    }
+  });
+
+  it.each([
+    // Deleting or force-pushing the default branch, in every spelling git accepts.
+    [["push", "origin", "--delete", "main"], {}],
+    [["push", "--delete", "origin", "master"], {}],
+    [["push", "-d", "origin", "main"], {}],
+    [["push", "origin", ":main"], {}],
+    [["push", "origin", ":refs/heads/main"], {}],
+    [["push", "origin", "+HEAD:main"], { currentBranch: "feature" }],
+    [["push", "origin", "+main"], {}],
+    [["push", "origin", "+feature:heads/main"], {}],
+    [["push", "-f", "origin", "main"], {}],
+    [["push", "-uf", "origin", "main"], {}],
+    [["push", "--force", "origin", "HEAD"], { currentBranch: "main" }],
+    [["push", "--force-with-lease", "origin", "main"], {}],
+    [["push", `--force-with-lease=main:${sha}`, "origin", "main"], {}],
+    [["push", "-f"], { currentBranch: "main" }],
+    [["push", "-f"], {}],
+    [["push", "--mirror", "origin"], {}],
+    [["push", "--all", "--force", "origin"], {}],
+    [["push", "--prune", "origin", "refs/heads/*:refs/heads/*"], {}],
+    [["push", "origin", "+:"], {}],
+    [["push", "--force", "origin", "refs/heads/*:refs/heads/*"], {}],
+    [["push", "origin", "+feature:refs/heads/master"], { refs: { feature: "refs/heads/feature" } }],
+    [["-c", "remote.origin.push=+refs/heads/*:refs/heads/*", "push"], { currentBranch: "feature", implicitPush: true }],
+  ] as const)("refuses git %j", (args, context) => {
+    expect(classifyGitHubCommand("git", args, { touchesWorkflows: false, ...context })).toEqual(never(defaultBranch));
+  });
+
+  it("still allows every legitimate agent write", () => {
+    const clean = { touchesWorkflows: false };
+    // Pull requests, issues, comments and Projects.
+    expect(gh("pr", "create", "--fill")).toEqual(write("pullRequest"));
+    expect(gh("pr", "edit", "3", "--title", "x", "--add-label", "bug")).toEqual(write("pullRequest"));
+    expect(gh("pr", "merge", "5", "--squash", "--delete-branch", "--match-head-commit", sha)).toEqual(write("pullRequest"));
+    expect(gh("pr", "merge", "5", "--admin", "--squash", "--match-head-commit", sha)).toEqual(write("pullRequest", "adminMerge"));
+    expect(gh("api", "-X", "PUT", "repos/o/r/pulls/5/merge", "-f", `sha=${sha}`)).toEqual(write("pullRequest", "adminMerge"));
+    expect(gh("pr", "comment", "5", "-b", "x")).toEqual(write("comment"));
+    expect(gh("pr", "review", "5", "--approve")).toEqual(write("comment"));
+    expect(gh("issue", "create", "-t", "x", "-b", "y")).toEqual(write("other"));
+    expect(gh("issue", "comment", "1", "-b", "x")).toEqual(write("comment"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/issues/1", "-f", "state=closed")).toEqual(write("other"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/pulls/3", "-f", "title=x")).toEqual(write("pullRequest"));
+    expect(gh("project", "item-edit", "--id", "I", "--project-id", "P", "--field-id", "F", "--text", "x")).toEqual(write("project"));
+    expect(graphql('mutation{updateProjectV2ItemFieldValue(input:{projectId:"P",itemId:"I",fieldId:"F",value:{text:"x"}}){clientMutationId}}')).toEqual(write("project"));
+    expect(graphql('mutation{addComment(input:{subjectId:"I",body:"x"}){clientMutationId}}')).toEqual(write("comment"));
+    // Repositories: creating or forking one, syncing without --force or a feature branch with it, and reads.
+    expect(gh("repo", "create", "o/new", "--private")).toEqual(write("other"));
+    expect(gh("repo", "fork", "o/r")).toEqual(write("other"));
+    expect(gh("repo", "sync")).toEqual(write("push", "pushToMain"));
+    // A named branch the sync hard-resets is checked against GitHub's default and protected branches by the server.
+    expect(gh("repo", "sync", "--branch", "feature", "--force")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["feature"] });
+    expect(gh("repo", "deploy-key", "list")).toEqual(write("other"));
+    // Placeholders stay usable where they decide nothing: GraphQL variables, a pull request's head, the repository of a read.
+    expect(gh("api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}")).toEqual(read);
+    expect(gh("api", "-X", "POST", "repos/{owner}/{repo}/pulls", "-F", "head={branch}", "-f", "base=main", "-f", "title=x")).toEqual(write("pullRequest"));
+    expect(gh("api", "repos/{owner}/{repo}/pulls")).toEqual(read);
+    // Help and the ls aliases of list are reads.
+    for (const args of [["secret", "ls"], ["variable", "ls"], ["repo", "--help"], ["pr", "-h"]]) expect(gh(...args), args.join(" ")).toEqual(read);
+    for (const args of [["repo", "view", "o/r"], ["secret", "list"], ["variable", "list"], ["variable", "get", "NAME"], ["ruleset", "list"],
+      ["api", "repos/o/r"], ["api", "repos/o/r/hooks"], ["api", "repos/o/r/actions/secrets"], ["api", "-X", "GET", "repos/o/r/branches/main/protection"],
+      ["api", "repos/o/r/rulesets"], ["api", "repos/o/r/environments"], ["api", "repos/o/r/deployments/42/statuses"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(read);
+    }
+    // Deployments: creating one, and statuses other than inactive, stay deployment approvals; so do pending deployments.
+    expect(gh("api", "-X", "POST", "repos/o/r/deployments", "-f", "ref=main")).toEqual(write("other", "deploymentApproval"));
+    expect(gh("api", "-X", "POST", "repos/o/r/deployments/42/statuses", "-f", "state=success")).toEqual(write("other", "deploymentApproval"));
+    expect(gh("api", "-X", "POST", "repos/o/r/actions/runs/77/pending_deployments", "-F", "environment_ids[]=1", "-f", "state=approved")).toEqual(write("other", "deploymentApproval"));
+    // Feature branches: deleted, renamed or force-updated through the API; the default branch updated without force.
+    expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/feature/x")).toEqual({ ...write("push"), branchRewrites: ["feature/x"] });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", `sha=${sha}`, "-F", "force=true")).toEqual({ ...write("push"), branchRewrites: ["feature"] });
+    expect(gh("api", "-X", "POST", "repos/o/r/branches/feature/rename", "-f", "new_name=feature-2")).toEqual({ ...write("other"), branchRewrites: ["feature"] });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`)).toEqual(write("push", "pushToMain"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force=false")).toEqual(write("push", "pushToMain"));
+    // git push: feature branches pushed, force-pushed (lease or not) and deleted; the default branch pushed without force.
+    const git = (args: string[], context: Record<string, unknown> = {}) => classifyGitHubCommand("git", args, { ...clean, ...context });
+    expect(git(["push", "-u", "origin", "feature/x"])).toEqual(write("push"));
+    // Forced or deleted feature branches name the branch for the server's protected-branch check.
+    const rewrites = (...branches: string[]) => ({ ...write("push"), branchRewrites: branches });
+    expect(git(["push", "--force-with-lease", "origin", "feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "--force-with-lease", "--force-if-includes", "origin", "HEAD"], { currentBranch: "feature/x" })).toEqual(rewrites("feature/x"));
+    expect(git(["push", "-f", "origin", "feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "origin", "+feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "-f"], { currentBranch: "feature/x" })).toEqual(rewrites("feature/x"));
+    expect(git(["push", "origin", "--delete", "feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "origin", ":feature/x"])).toEqual(rewrites("feature/x"));
+    expect(git(["push", "--prune", "origin", "feature/x"])).toEqual(write("push"));
+    expect(git(["push", "origin", "+feature/x", "main"])).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["feature/x"] });
+    expect(git(["push", "origin", "main"])).toEqual(write("push", "pushToMain"));
+    expect(git(["push", "--all", "origin"])).toEqual(write("push", "pushToMain"));
+    expect(git(["push", "origin", ":"])).toEqual(write("push", "pushToMain"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security review of PR #23 at 99d6cb10: gh aliases and extensions, and protected branches other than main/master.
+// ---------------------------------------------------------------------------
+describe("security review of the agents-never deny (round 2)", () => {
+  const read = { access: "read", action: null, privileged: [] };
+  const write = (action: string, ...privileged: string[]) => ({ access: "write", action, privileged });
+  const sha = "a".repeat(40);
+  const gh = (...args: string[]) => classifyGitHubCommand("gh", args);
+  const integrity = (pattern: RegExp) => expect.objectContaining({ access: "write", denied: expect.stringMatching(pattern), integrity: true });
+
+  it("M1: never creates a gh alias, and never runs one, an extension or the Copilot CLI with GitHub access", () => {
+    for (const args of [
+      ["alias", "set", "wipe", "repo archive --yes"],
+      ["alias", "set", "--shell", "wipe", "gh repo archive --yes"],
+      ["alias", "set", "--clobber", "x", "api -X DELETE repos/o/r/hooks/1"],
+      ["alias", "import", "aliases.yml"],
+      ["alias", "import", "-"],
+    ]) expect(gh(...args), args.join(" ")).toEqual(integrity(/does not create gh aliases/));
+    for (const args of [["extension", "exec", "wipe"], ["extension", "exec", "wipe", "--yes"], ["copilot"], ["copilot", "-p", "archive this repository"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(integrity(/with GitHub access: it cannot tell what/));
+    }
+    // gh runs an alias or an extension for a name it does not know: refused for every company, whatever its arguments.
+    for (const args of [["wipe"], ["wipe", "--yes"], ["-R", "o/r", "wipe"], ["wipe", "-R", "o/r"], ["deployment", "delete", "42"], ["image", "a.png"], ["Pr", "list"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(integrity(/does not know the gh command/));
+    }
+    // The launcher's own grammar: none of these runs without a managed credential either.
+    for (const args of [["wipe"], ["alias", "set", "x", "y"], ["alias", "import", "a.yml"], ["extension", "exec", "x"], ["copilot"]]) {
+      expect(ghCommandMayWrite(parseGhCommand(args)), args.join(" ")).toBe(true);
+    }
+  });
+
+  it("M1: keeps gh's reads and its own write groups working", () => {
+    for (const args of [["alias", "list"], ["alias", "ls"], ["alias", "delete", "x"], ["alias"], ["extension", "list"], ["extension", "search", "x"],
+      ["extension", "install", "owner/gh-x"], ["co", "12"], ["environment"], ["reference"], ["help", "repo"], ["version"], ["--version"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(read);
+    }
+    for (const args of [["label", "create", "bug"], ["gist", "create", "a.txt"], ["codespace", "list"], ["cache", "delete", "x"], ["discussion", "create"], ["skill", "install", "x"]]) {
+      expect(gh(...args), args.join(" ")).toEqual(write("other"));
+    }
+  });
+
+  it("M2: names every branch a write forces, deletes, renames or hard-resets, so the server checks it with GitHub", () => {
+    const git = (args: string[], context: Record<string, unknown> = {}) => classifyGitHubCommand("git", args, { touchesWorkflows: false, ...context });
+    expect(git(["push", "--force", "origin", "protected"])).toEqual({ ...write("push"), branchRewrites: ["protected"] });
+    expect(git(["push", "origin", "--delete", "protected"])).toEqual({ ...write("push"), branchRewrites: ["protected"] });
+    expect(git(["push", "origin", "+HEAD:develop", ":release/1", "feature"], { currentBranch: "feature" })).toEqual({ ...write("push"), branchRewrites: ["develop", "release/1"] });
+    expect(git(["push", "--force-with-lease=develop:" + sha, "origin", "develop"])).toEqual({ ...write("push"), branchRewrites: ["develop"] });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-f", "force=true")).toEqual({ ...write("push"), branchRewrites: ["develop"] });
+    expect(gh("api", "repos/o/r/git/refs/heads/develop", "-X", "PATCH", "--input", "ref.json")).toEqual({ ...write("push"), branchRewrites: ["develop"] });
+    expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/release%2F1")).toEqual({ ...write("push"), branchRewrites: ["release/1"] });
+    expect(gh("api", "-X", "POST", "repos/o/r/branches/develop/rename", "-f", "new_name=dev")).toEqual({ ...write("other"), branchRewrites: ["develop"] });
+    expect(gh("repo", "sync", "--force", "--branch", "develop")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["develop"] });
+    expect(gh("repo", "sync", "o/fork", "--force", "-bdevelop")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["develop"] });
+    // Plain updates of a branch rewrite nothing: GitHub's own protection applies to them.
+    expect(git(["push", "origin", "develop"])).toEqual(write("push"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`)).toEqual(write("push"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-F", "force=false")).toEqual(write("push"));
+    expect(gh("repo", "sync", "--branch", "develop")).toEqual(write("push", "pushToMain"));
+    // Refused writes carry nothing to check.
+    expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/main")).not.toHaveProperty("branchRewrites");
+  });
+
+  it("denies deletes, force-pushes and rewrites of staging and production by name, whatever GitHub reports", () => {
+    const git = (args: string[]) => classifyGitHubCommand("git", args, { touchesWorkflows: false });
+    const floor = /delete or force-push a default or protected branch/;
+    for (const branch of ["staging", "production", "Production", "STAGING", "Main"]) {
+      expect(git(["push", "--force", "origin", branch]).denied, branch).toMatch(floor);
+      expect(git(["push", "origin", "--delete", branch]).denied, `delete ${branch}`).toMatch(floor);
+      expect(git(["push", "origin", `:${branch}`]).denied, `:${branch}`).toMatch(floor);
+      expect(git(["push", "origin", `+HEAD:${branch}`]).denied, `+HEAD:${branch}`).toMatch(floor);
+      expect(gh("api", "-X", "DELETE", `repos/o/r/git/refs/heads/${encodeURIComponent(branch)}`).denied, `DELETE ${branch}`).toMatch(floor);
+      expect(gh("api", "--method", "DELETE", `https://api.github.com/repos/o/r/git/refs/heads/${branch}`).denied, `url ${branch}`).toMatch(floor);
+      expect(gh("api", "-X", "PATCH", `repos/o/r/git/refs/heads/${branch}`, "-f", `sha=${sha}`, "-f", "force=true").denied, `force ${branch}`).toMatch(floor);
+      expect(gh("api", "-X", "POST", `repos/o/r/branches/${branch}/rename`, "-f", "new_name=dev").denied, `rename ${branch}`).toMatch(floor);
+      expect(gh("repo", "sync", "--force", "--branch", branch).denied, `sync ${branch}`).toMatch(floor);
+    }
+    // A fast-forward push to those branches is still an ordinary write. Only the rewrite is refused.
+    expect(git(["push", "origin", "staging"])).toEqual(write("push"));
+    expect(git(["push", "origin", "production"])).toEqual(write("push"));
+    expect(gh("repo", "sync", "--branch", "staging")).toEqual(write("push", "pushToMain"));
   });
 });
