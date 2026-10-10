@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -426,6 +426,31 @@ describe("SSH control socket directory", () => {
       channel.done();
 
       expect(option.startsWith(`ControlPath=${unsafe}`)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+    }
+  });
+
+  it("follows a temp root that is a link (macOS /tmp), and checks where it points", async () => {
+    const target = await mkdtemp("/tmp/pt-");
+    const link = `${target}-link`;
+    cleanups.push(async () => {
+      await rm(link, { force: true });
+      await rm(target, { recursive: true, force: true });
+    });
+    await chmod(target, 0o700);
+    await symlink(target, link);
+    const previous = process.env.TMPDIR;
+    process.env.TMPDIR = link;
+    try {
+      const multiplex = openSshMultiplex(offline, "env-linked-root");
+      cleanups.push(() => multiplex.release());
+      const channel = await multiplex.channel(offline);
+      const option = channel.args.find((arg) => arg.startsWith("ControlPath="))!;
+      channel.done();
+
+      expect(option.startsWith(`ControlPath=${link}/paperclip-ssh-mux-`)).toBe(true);
     } finally {
       if (previous === undefined) delete process.env.TMPDIR;
       else process.env.TMPDIR = previous;

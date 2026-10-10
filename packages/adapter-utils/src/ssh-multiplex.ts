@@ -142,7 +142,8 @@ export function sshControlDirFits(dir: string): boolean {
 async function controlDirIsPrivate(root: string, dir: string): Promise<boolean> {
   const uid = process.getuid?.();
   if (uid === undefined) return false;
-  const [parent, own] = await Promise.all([fs.lstat(root), fs.lstat(dir)]);
+  // The root may be a link (macOS `/tmp`); what it points at is checked.
+  const [parent, own] = await Promise.all([fs.stat(root), fs.lstat(dir)]);
   const parentSafe = parent.isDirectory() && (parent.uid === uid || parent.uid === 0)
     && ((parent.mode & 0o002) === 0 || (parent.mode & 0o1000) !== 0);
   return parentSafe && own.isDirectory() && own.uid === uid && (own.mode & 0o777) === 0o700;
