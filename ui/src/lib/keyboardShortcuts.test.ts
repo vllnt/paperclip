@@ -9,6 +9,7 @@ import {
   isKeyboardShortcutTextInputTarget,
   resolveAttentionQueueKeyAction,
   resolveGoChordKeyAction,
+  shouldOpenCommandLauncher,
   resolveIssueDetailGoKeyAction,
   resolveInboxQuickArchiveKeyAction,
   resolveInboxUndoArchiveKeyAction,
@@ -411,3 +412,38 @@ describe("hasBlockingShortcutDialog", () => {
     expect(isInsideOpenModalDialog(document.createElement("button"))).toBe(false);
   });
 });
+
+describe("shouldOpenCommandLauncher", () => {
+  const base = {
+    key: "k",
+    metaKey: true,
+    ctrlKey: false,
+    altKey: false,
+    isComposing: false,
+    defaultPrevented: false,
+    target: document.body as EventTarget | null,
+    hasOpenDialog: false,
+  };
+
+  it("opens on Cmd+K or Ctrl+K from the page", () => {
+    expect(shouldOpenCommandLauncher(base)).toBe(true);
+    expect(shouldOpenCommandLauncher({ ...base, metaKey: false, ctrlKey: true, key: "K" })).toBe(true);
+  });
+
+  it("ignores other keys and Alt combinations", () => {
+    expect(shouldOpenCommandLauncher({ ...base, key: "j" })).toBe(false);
+    expect(shouldOpenCommandLauncher({ ...base, metaKey: false })).toBe(false);
+    expect(shouldOpenCommandLauncher({ ...base, altKey: true })).toBe(false);
+  });
+
+  it("leaves the key to text fields, editors, IME composition, other handlers and open modals", () => {
+    const editor = document.createElement("div");
+    editor.setAttribute("contenteditable", "true");
+    expect(shouldOpenCommandLauncher({ ...base, target: document.createElement("input") })).toBe(false);
+    expect(shouldOpenCommandLauncher({ ...base, target: editor })).toBe(false);
+    expect(shouldOpenCommandLauncher({ ...base, isComposing: true })).toBe(false);
+    expect(shouldOpenCommandLauncher({ ...base, defaultPrevented: true })).toBe(false);
+    expect(shouldOpenCommandLauncher({ ...base, hasOpenDialog: true })).toBe(false);
+  });
+});
+

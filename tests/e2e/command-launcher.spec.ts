@@ -64,7 +64,8 @@ function trackPageErrors(page: Page): string[] {
 
 async function openLauncher(page: Page) {
   await page.keyboard.press("ControlOrMeta+k");
-  const input = page.getByPlaceholder("Type a command or search tasks, agents, projects...");
+  // Screen readers get a named combobox (the browser computes the name).
+  const input = page.getByRole("combobox", { name: "Command launcher" });
   await expect(input).toBeFocused();
   return input;
 }
@@ -162,6 +163,17 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
       const errors = trackPageErrors(page);
       await page.goto(`/${seed.prefix}/issues/${seed.issueIdentifier}`);
       await expect(page.locator("#main-content").getByText(seed.issueTitle).first()).toBeVisible({ timeout: 30_000 });
+
+      // Inside the issue's editor the key belongs to the editor, not the launcher.
+      const editor = page.locator("#main-content [contenteditable='true']").first();
+      await editor.focus();
+      await expect(editor).toBeFocused();
+      await page.keyboard.press("ControlOrMeta+k");
+      // The launcher stays closed; the editor may run its own Cmd/Ctrl+K
+      // (its link dialog), which Escape closes.
+      await expect(page.getByRole("combobox", { name: "Command launcher" })).toHaveCount(0);
+      await page.keyboard.press("Escape");
+      await page.locator("#main-content").focus();
 
       await openLauncher(page);
       const thisView = page.getByRole("group", { name: "This view" });
