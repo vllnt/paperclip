@@ -150,6 +150,101 @@ export async function listOrphanedDeferredWakes(
 }
 
 /**
+ * Finalizes deferred wakes whose issue is done or cancelled and has no run left
+ * to release it. The orphan scan skips them so an old wake cannot revive a
+ * closed task, and with no execution lock and no live run nothing will ever
+ * promote or retire them, so without this they stay parked forever. A wake
+ * behind a run that still holds the task is left for that run's release, which
+ * may still deliver accepted feedback to a done child. Finalized wakes get the
+ * existing terminal status `cancelled`, the one a release uses for a wake that
+ * lost its authority. Wakes owned by another sweep are left to it.
+ *
+ * A run has no foreign key to its issue, so each issue is handled in its own
+ * transaction: lock the issue row (`FOR UPDATE`), re-check the issue and its
+ * runs in new statements, then cancel. A writer that inserts a run for the issue
+ * takes `FOR SHARE` on the row first, so a run committed before the lock is seen
+ * and a run inserted after it waits for this transaction to commit.
+ *
+ * @returns The finalized wakes.
+ */
+export async function retireClosedIssueDeferredWakes(
+  db: Db,
+  input: { now: Date; minAgeMs: number },
+): Promise<Array<{ id: string; companyId: string }>> {
+  const candidates = await db
+    .select({ wakeId: agentWakeupRequests.id, companyId: issues.companyId, issueId: issues.id })
+    .from(agentWakeupRequests)
+    .innerJoin(
+      issues,
+      and(eq(issues.id, wakeIssueId), eq(issues.companyId, agentWakeupRequests.companyId)),
+    )
+    .where(
+      and(
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+        inArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+        lte(agentWakeupRequests.requestedAt, new Date(input.now.getTime() - input.minAgeMs)),
+        sql`${agentWakeupRequests.payload} -> 'queuedCommentInterrupt' is null`,
+        sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}::text is null`,
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+      ),
+    );
+  const wakeIdsByIssue = new Map<string, { companyId: string; wakeIds: string[] }>();
+  for (const candidate of candidates) {
+    const entry = wakeIdsByIssue.get(candidate.issueId) ?? { companyId: candidate.companyId, wakeIds: [] };
+    entry.wakeIds.push(candidate.wakeId);
+    wakeIdsByIssue.set(candidate.issueId, entry);
+  }
+
+  const retired: Array<{ id: string; companyId: string }> = [];
+  for (const [issueId, { companyId, wakeIds }] of wakeIdsByIssue) {
+    const rows = await db.transaction(async (tx) => {
+      const [issue] = await tx
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+        .for("update");
+      if (
+        !issue ||
+        !(CLOSED_ISSUE_STATUSES as readonly string[]).includes(issue.status) ||
+        issue.executionRunId
+      ) {
+        return [];
+      }
+      const [liveRun] = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .limit(1);
+      if (liveRun) return [];
+      return tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          error: `The issue is ${issue.status}; this deferred wake will not run.`,
+          finishedAt: input.now,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            inArray(agentWakeupRequests.id, wakeIds),
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId });
+    });
+    retired.push(...rows);
+  }
+  return retired;
+}
+
+/**
  * Optimistic claim on one wake's examine cursor: the write succeeds only for the
  * pass that saw the row's current `updated_at`, so two concurrent passes cannot
  * both drive the same wake. It also moves the wake to the back of the recheck

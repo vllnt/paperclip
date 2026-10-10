@@ -20,6 +20,16 @@ describe("activity formatting", () => {
     expect(formatActivityVerb("issue.read_unmarked")).toBe("marked unread");
   });
 
+  it("names the provider quota cap exemption alarm", () => {
+    expect(formatActivityVerb("heartbeat.provider_quota_cap_exemption_exhausted"))
+      .toBe("spent the daily provider quota cap exemption for");
+  });
+
+  it("names the provider quota retry ceiling stop", () => {
+    expect(formatActivityVerb("heartbeat.provider_quota_exhausted"))
+      .toBe("stopped provider capacity retries on");
+  });
+
   it("formats blocker activity using linked issue identifiers", () => {
     const details = {
       addedBlockedByIssues: [
@@ -30,6 +40,10 @@ describe("activity formatting", () => {
 
     expect(formatActivityVerb("issue.blockers_updated", details)).toBe("added blocker PAP-22 to");
     expect(formatIssueActivityAction("issue.blockers_updated", details)).toBe("added blocker PAP-22");
+  });
+
+  it("names a deferred wake the sweep keeps holding", () => {
+    expect(formatActivityVerb("heartbeat.deferred_wake_held")).toBe("is holding a deferred wake on");
   });
 
   it("formats reviewer activity using agent names", () => {
@@ -68,6 +82,11 @@ describe("activity formatting", () => {
 
     expect(formatActivityVerb("issue.reviewers_updated", details, { agentMap })).toBe("updated reviewers on");
     expect(formatIssueActivityAction("issue.reviewers_updated", details, { agentMap })).toBe("updated reviewers");
+  });
+
+  it("labels a refused agent self-config change", () => {
+    expect(formatActivityVerb("agent.self_config_update_denied", { fields: ["runtimeConfig.heartbeat.maxDailyRuns"] }))
+      .toBe("was blocked from changing its own protected settings on");
   });
 
   it("formats monitor activity with direct verbs", () => {

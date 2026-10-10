@@ -16,6 +16,7 @@ npx paperclipai issue get <issue-id-or-identifier>
 
 # Create issue
 npx paperclipai issue create --title "..." [--description "..."] [--status todo] [--priority high]
+npx paperclipai issue similar --title "..." [--description "..."] [--parent-id <issue-id>]
 
 # Update issue
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]
@@ -97,6 +98,23 @@ npx paperclipai skills import owner/repo/path/to/skill --company-id <company-id>
 # Attach desired company skills to an agent after install/import
 npx paperclipai skills agent sync <agent-id> --skill github-pr-workflow --mode add --company-id <company-id>
 ```
+
+## Environment Lease Commands
+
+```sh
+# Leases of one environment (all statuses unless filtered)
+npx paperclipai environment leases <environment-id> [--status released,failed] [--json]
+
+# A company's leases across environments (default status: active,pending_cleanup)
+npx paperclipai environment leases:list [-C <company-id>] [--status active,expired] [--json]
+
+# One lease
+npx paperclipai environment lease <lease-id>
+```
+
+Lease statuses are `active`, `released`, `expired`, `failed`, `retained`, and
+`pending_cleanup`; `--status` takes a comma-separated list and an unknown value
+is rejected with `400`. These commands need board authentication.
 
 ## Approval Commands
 

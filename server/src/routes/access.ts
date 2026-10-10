@@ -2,6 +2,7 @@ import {
   createHash,
   generateKeyPairSync,
   randomBytes,
+  randomUUID,
   timingSafeEqual
 } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -94,6 +95,14 @@ import {
   resolveHumanInviteRole,
 } from "../services/company-member-roles.js";
 import { humanJoinGrantsFromDefaults } from "../services/invite-grants.js";
+import {
+  collectAgentProtectedConfigChanges,
+  collectNewAgentProtectedFields,
+} from "../services/agent-self-config-authz.js";
+import {
+  assertAgentProtectedChangeGranted,
+  type AgentProtectedChangeActivityActor,
+} from "./agent-protected-change-guard.js";
 import {
   collapseDuplicatePendingHumanJoinRequests,
   findReusableHumanJoinRequest,
@@ -3827,6 +3836,62 @@ export function accessRoutes(
         throw badRequest(joinDefaults.fatalErrors.join("; "));
       }
 
+      /**
+       * A replay on an approved join request rewrites the live agent's adapter
+       * config. The invite holder is that agent, so the replay must pass the
+       * same protected-field check as a direct agent config change. Board
+       * callers are judged by the same authorization rule as `PATCH /agents/:id`.
+       */
+      const replayActivityActor: AgentProtectedChangeActivityActor = req.actor.type === "agent"
+        ? {
+          actorType: "agent",
+          actorId: req.actor.agentId ?? "invite-agent",
+          agentId: req.actor.agentId ?? null,
+          runId: req.actor.runId ?? null,
+          agentApiKeyId: req.actor.keyId ?? null,
+        }
+        : {
+          actorType: "user",
+          actorId: req.actor.userId ?? (req.actor.type === "board" ? "board" : "invite-anon"),
+          agentId: null,
+          runId: null,
+          agentApiKeyId: null,
+        };
+      const assertReplayMayRewriteAgent = async (
+        targetAgent: NonNullable<Awaited<ReturnType<typeof agents.getById>>>,
+        joinRequestId: string,
+      ) => {
+        await assertAgentProtectedChangeGranted({
+          db,
+          access,
+          req,
+          activityActor: replayActivityActor,
+          target: targetAgent,
+          fields: collectAgentProtectedConfigChanges(targetAgent, {
+            ...targetAgent,
+            adapterType: adapterType ?? targetAgent.adapterType,
+            adapterConfig: {
+              ...(isPlainObject(targetAgent.adapterConfig) ? targetAgent.adapterConfig : {}),
+              ...(joinDefaults.normalized ?? {}),
+            },
+          }),
+          surface: "join_replay",
+          details: { inviteId: invite.id, joinRequestId },
+        });
+      };
+      if (
+        inviteAlreadyAccepted &&
+        requestType === "agent" &&
+        adapterType === "openclaw_gateway" &&
+        existingJoinRequestForInvite?.status === "approved" &&
+        existingJoinRequestForInvite.createdAgentId
+      ) {
+        const replayTargetAgent = await agents.getById(existingJoinRequestForInvite.createdAgentId);
+        if (replayTargetAgent) {
+          await assertReplayMayRewriteAgent(replayTargetAgent, existingJoinRequestForInvite.id);
+        }
+      }
+
       const persistedJoinDefaultsPayload =
         requestType === "agent"
           ? await prepareAgentDefaultsPayloadForJoinPersistence({
@@ -3989,6 +4054,7 @@ export function accessRoutes(
           ...existingAdapterConfig,
           ...(joinDefaults.normalized ?? {})
         };
+        await assertReplayMayRewriteAgent(existingAgent, created.id);
         const updatedAgent = await agents.update(created.createdAgentId, {
           adapterType,
           adapterConfig: nextAdapterConfig
@@ -4257,6 +4323,34 @@ export function accessRoutes(
           throw conflict(
             "Join request cannot be approved because this company has no active CEO"
           );
+        }
+
+        /**
+         * The requester chose the new agent's adapter config. A board approver
+         * sees and accepts it. An agent approver (`joins:approve`) may not
+         * create an agent with settings it could not set itself.
+         */
+        if (req.actor.type === "agent") {
+          await assertAgentProtectedChangeGranted({
+            db,
+            access,
+            req,
+            activityActor: {
+              actorType: "agent",
+              actorId: req.actor.agentId ?? "unknown-agent",
+              agentId: req.actor.agentId ?? null,
+              runId: req.actor.runId ?? null,
+              agentApiKeyId: req.actor.keyId ?? null,
+            },
+            target: { id: randomUUID(), companyId },
+            entity: { type: "company", id: companyId },
+            fields: collectNewAgentProtectedFields({
+              adapterType: existing.adapterType ?? "process",
+              adapterConfig: isPlainObject(existing.agentDefaultsPayload) ? existing.agentDefaultsPayload : {},
+            }),
+            surface: "join_approval",
+            details: { joinRequestId: requestId, inviteId: invite.id },
+          });
         }
 
         const agentName = deduplicateAgentName(

@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { createWorkspaceManifest, workspacePaths, WorkspaceNulParser, type WorkspacePaths } from "./workspace-manifest.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import { runWorkspaceGitProcess } from "./workspace-git-stream.js";
 
 export interface GitCommandResult {
@@ -73,21 +73,18 @@ export function setExpensiveWorkspaceGitExecutor(executor: ExpensiveWorkspaceGit
 export const GIT_ARCHIVE_EXCLUDES = [".git", ".git/*"] as const;
 
 /**
- * Identity flags for commits the sync machinery itself creates (the merge
- * commits that reconcile concurrent histories). Execution hosts are often
- * containers with no git config and no resolvable hostname, so git cannot
- * auto-detect an identity there and `commit-tree` hard-fails with "Author
- * identity unknown" — which fails the whole run at finalize. Passing the
- * identity per invocation keeps every deployment working without host
- * configuration; `GIT_AUTHOR_*` / `GIT_COMMITTER_*` environment variables
- * still take precedence over `-c` when an operator sets them.
+ * Fallback identity for commits the sync machinery itself creates (the merge
+ * and graft commits that reconcile concurrent histories). Execution hosts are
+ * often containers with no git config and no resolvable hostname, so git
+ * cannot auto-detect an identity there and `commit-tree` hard-fails with
+ * "Author identity unknown" — which fails the whole run at finalize. The
+ * fallback is used only when git has no effective identity; see
+ * `commitTreeWithSyncIdentity`.
  */
-export const GIT_SYNC_COMMIT_IDENTITY_ARGS = [
-  "-c",
-  "user.name=Paperclip",
-  "-c",
-  "user.email=noreply@paperclip.ing",
-] as const;
+export const GIT_SYNC_FALLBACK_IDENTITY = {
+  name: "Paperclip",
+  email: "noreply@paperclip.ing",
+} as const;
 
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
@@ -125,6 +122,60 @@ export async function runLocalGit(
   });
 }
 
+async function readGitConfigValue(localDir: string, key: string): Promise<string | null> {
+  try {
+    const result = await runLocalGit(localDir, ["config", "--get", key], { timeout: 10_000, maxBuffer: 16 * 1024 });
+    return result.stdout.trim() || null;
+  } catch {
+    // Exit 1 means "not set". Any other failure also falls back, which keeps
+    // the sync working exactly as it did before identities were honored.
+    return null;
+  }
+}
+
+function pairedIdentity(name: string | null | undefined, email: string | null | undefined) {
+  return name && email ? { name, email } : null;
+}
+
+/**
+ * Resolve the identity for a sync-created commit. The repository's effective
+ * identity (`GIT_AUTHOR_*` / `GIT_COMMITTER_*` / `EMAIL` environment, then
+ * `git config user.*` from local, global and system scope) wins, so pushed
+ * branches keep the identity the repository expects. Only when git has none
+ * does the Paperclip fallback apply. Author and committer always end up as a
+ * consistent pair: a role without its own identity takes the other role's.
+ */
+async function resolveSyncCommitIdentityEnv(localDir: string): Promise<NodeJS.ProcessEnv> {
+  const env = process.env;
+  const [configName, configEmail] = await Promise.all([
+    readGitConfigValue(localDir, "user.name"),
+    readGitConfigValue(localDir, "user.email"),
+  ]);
+  const author = pairedIdentity(env.GIT_AUTHOR_NAME || configName, env.GIT_AUTHOR_EMAIL || configEmail || env.EMAIL);
+  const committer = pairedIdentity(env.GIT_COMMITTER_NAME || configName, env.GIT_COMMITTER_EMAIL || configEmail || env.EMAIL);
+  const resolvedAuthor = author ?? committer ?? GIT_SYNC_FALLBACK_IDENTITY;
+  const resolvedCommitter = committer ?? author ?? GIT_SYNC_FALLBACK_IDENTITY;
+  return {
+    ...env,
+    GIT_AUTHOR_NAME: resolvedAuthor.name,
+    GIT_AUTHOR_EMAIL: resolvedAuthor.email,
+    GIT_COMMITTER_NAME: resolvedCommitter.name,
+    GIT_COMMITTER_EMAIL: resolvedCommitter.email,
+  };
+}
+
+/** `git commit-tree` for sync-created commits; message carries no trailers. */
+export async function commitTreeWithSyncIdentity(
+  localDir: string,
+  commitTreeArgs: string[],
+  options: { timeout?: number; maxBuffer?: number } = {},
+): Promise<GitCommandResult> {
+  return await runLocalGit(localDir, ["commit-tree", ...commitTreeArgs], {
+    ...options,
+    env: await resolveSyncCommitIdentityEnv(localDir),
+  });
+}
+
 async function runExpensiveWorkspaceGit(
   localDir: string,
   args: string[],
@@ -158,7 +209,7 @@ export async function disposeGitWorkspaceSnapshot(snapshot: GitWorkspaceSnapshot
   if (!ownedDirectory) return;
   ownedSnapshots.delete(snapshot);
   for (const repository of snapshot.repositories ?? []) await disposeGitWorkspaceSnapshot(repository.snapshot);
-  await fs.rm(ownedDirectory, { recursive: true, force: true });
+  await removePaperclipTempDir(ownedDirectory);
 }
 
 /** Snapshot deadlines include disk backpressure. Operators can allow up to 24h. */
@@ -275,7 +326,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
   } catch (error) {
     writer.close(false);
     for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
-    await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    await removePaperclipTempDir(path.dirname(writer.filePath));
     throw error;
   } finally { options.signal?.removeEventListener("abort", abort); }
 }
@@ -590,7 +641,7 @@ export async function withShallowGitWorkspaceClone<T>(
   },
   fn: (cloneDir: string) => Promise<T>,
 ): Promise<T> {
-  const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
+  const cloneDir = await createPaperclipTempDir("paperclip-git-workspace-");
   const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
   try {
     const originUrl = await readSanitizedOriginRemoteUrl(input.localDir);
@@ -653,7 +704,7 @@ export async function withShallowGitWorkspaceClone<T>(
       timeout: 10_000,
       maxBuffer: 16 * 1024,
     }).catch(() => undefined);
-    await fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(cloneDir).catch(() => undefined);
   }
 }
 
@@ -837,9 +888,9 @@ export async function createUnrelatedHistoryGraftCommit(input: {
     "",
     `(${input.syncLabel} graft ${input.importedHead.slice(0, 12)}: imported history shares no ancestor with ${input.currentHead.slice(0, 12)})`,
   ].join("\n");
-  const graftCommit = await runLocalGit(
+  const graftCommit = await commitTreeWithSyncIdentity(
     input.localDir,
-    [...GIT_SYNC_COMMIT_IDENTITY_ARGS, "commit-tree", importedTree, "-p", input.currentHead, "-m", message],
+    [importedTree, "-p", input.currentHead, "-m", message],
     {
       timeout: 60_000,
       maxBuffer: 64 * 1024,
@@ -940,11 +991,9 @@ export async function integrateImportedGitHead(input: {
       throw new Error("Failed to compute a merged git tree for workspace restore.");
     }
 
-    const mergeCommit = await runLocalGit(
+    const mergeCommit = await commitTreeWithSyncIdentity(
       input.localDir,
       [
-        ...GIT_SYNC_COMMIT_IDENTITY_ARGS,
-        "commit-tree",
         mergedTreeId,
         "-p",
         currentHead,

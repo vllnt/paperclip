@@ -137,7 +137,7 @@ const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string 
   queued: { icon: Clock, color: "text-yellow-600 dark:text-yellow-400" },
   scheduled_retry: { icon: Clock, color: "text-sky-600 dark:text-sky-400" },
   timed_out: { icon: Timer, color: "text-orange-600 dark:text-orange-400" },
-  cancelled: { icon: Slash, color: "text-neutral-500 dark:text-neutral-400" },
+  cancelled: { icon: Slash, color: "text-muted-foreground" },
 };
 
 const RUN_LOG_PAGE_BYTES = 256_000;
@@ -493,7 +493,7 @@ export function RunInvocationCard({
             {payload.prompt !== undefined && (
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Prompt</div>
-                <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap">
+                <pre className="bg-muted rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap">
                   {typeof payload.prompt === "string"
                     ? redactPathText(payload.prompt, censorUsernameInLogs)
                     : JSON.stringify(redactPathValue(payload.prompt, censorUsernameInLogs), null, 2)}
@@ -503,7 +503,7 @@ export function RunInvocationCard({
             {payload.context !== undefined && (
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Context</div>
-                <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap">
+                <pre className="bg-muted rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap">
                   {JSON.stringify(redactPathValue(payload.context, censorUsernameInLogs), null, 2)}
                 </pre>
               </div>
@@ -511,7 +511,7 @@ export function RunInvocationCard({
             {payload.env !== undefined && (
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Environment</div>
-                <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono">
+                <pre className="bg-muted rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono">
                   {formatEnvForDisplay(payload.env, censorUsernameInLogs)}
                 </pre>
               </div>
@@ -629,10 +629,10 @@ function WorkspaceOperationLogViewer({
             <div className="text-xs text-muted-foreground">No persisted log lines.</div>
           )}
           {chunks.length > 0 && (
-            <div className="max-h-64 overflow-y-auto rounded bg-neutral-100 p-2 font-mono text-xs dark:bg-neutral-950">
+            <div className="max-h-64 overflow-y-auto rounded bg-muted p-2 font-mono text-xs">
               {chunks.map((chunk, index) => (
                 <div key={`${chunk.ts}-${index}`} className="flex gap-2">
-                  <span className="shrink-0 text-neutral-500">
+                  <span className="shrink-0 text-muted-foreground">
                     {new Date(chunk.ts).toLocaleTimeString("en-US", { hour12: false })}
                   </span>
                   <span
@@ -728,7 +728,7 @@ function WorkspaceOperationsSection({
               {operation.stderrExcerpt && operation.stderrExcerpt.trim() && (
                 <div>
                   <div className="mb-1 text-xs text-red-700 dark:text-red-300">stderr excerpt</div>
-                  <pre className="rounded-md bg-red-50 p-2 text-xs whitespace-pre-wrap break-all text-red-800 dark:bg-neutral-950 dark:text-red-100">
+                  <pre className="rounded-md bg-red-50 p-2 text-xs whitespace-pre-wrap break-all text-red-800 dark:bg-muted dark:text-red-100">
                     {redactPathText(operation.stderrExcerpt, censorUsernameInLogs)}
                   </pre>
                 </div>
@@ -736,7 +736,7 @@ function WorkspaceOperationsSection({
               {operation.stdoutExcerpt && operation.stdoutExcerpt.trim() && (
                 <div>
                   <div className="mb-1 text-xs text-muted-foreground">stdout excerpt</div>
-                  <pre className="rounded-md bg-neutral-100 p-2 text-xs whitespace-pre-wrap break-all dark:bg-neutral-950">
+                  <pre className="rounded-md bg-muted p-2 text-xs whitespace-pre-wrap break-all">
                     {redactPathText(operation.stdoutExcerpt, censorUsernameInLogs)}
                   </pre>
                 </div>
@@ -1695,7 +1695,7 @@ function LatestRunCard({
         })
       : issuesById;
   const { task, runHref, rowHref } = resolveLatestRunNavigation(run, agentId, effectiveIssuesById);
-  const statusInfo = runStatusIcons[run.status] ?? { icon: Clock, color: "text-neutral-400" };
+  const statusInfo = runStatusIcons[run.status] ?? { icon: Clock, color: "text-muted-foreground" };
   const StatusIcon = statusInfo.icon;
 
   return (
@@ -3100,7 +3100,7 @@ function PromptEditorSkeleton() {
 /* ---- Runs Tab ---- */
 
 function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelected: boolean; agentId: string }) {
-  const statusInfo = runStatusIcons[run.status] ?? { icon: Clock, color: "text-neutral-400" };
+  const statusInfo = runStatusIcons[run.status] ?? { icon: Clock, color: "text-muted-foreground" };
   const StatusIcon = statusInfo.icon;
   const metrics = runMetrics(run);
   const summary = run.resultJson
@@ -3531,12 +3531,12 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 {claudeLoginResult && (
                   <>
                     {!!claudeLoginResult.stdout && (
-                      <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">
+                      <pre className="bg-muted rounded-md p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">
                         {claudeLoginResult.stdout}
                       </pre>
                     )}
                     {!!claudeLoginResult.stderr && (
-                      <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-3 text-xs font-mono text-red-700 dark:text-red-300 overflow-x-auto whitespace-pre-wrap">
+                      <pre className="bg-muted rounded-md p-3 text-xs font-mono text-red-700 dark:text-red-300 overflow-x-auto whitespace-pre-wrap">
                         {claudeLoginResult.stderr}
                       </pre>
                     )}
@@ -3690,7 +3690,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
       {run.stderrExcerpt && (
         <div className="space-y-1">
           <span className="text-xs font-medium text-red-600 dark:text-red-400">stderr</span>
-          <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-3 text-xs font-mono text-red-700 dark:text-red-300 overflow-x-auto whitespace-pre-wrap">{run.stderrExcerpt}</pre>
+          <pre className="bg-muted rounded-md p-3 text-xs font-mono text-red-700 dark:text-red-300 overflow-x-auto whitespace-pre-wrap">{run.stderrExcerpt}</pre>
         </div>
       )}
 
@@ -3698,7 +3698,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
       {run.stdoutExcerpt && !run.logRef && (
         <div className="space-y-1">
           <span className="text-xs font-medium text-muted-foreground">stdout</span>
-          <pre className="bg-neutral-100 dark:bg-neutral-950 rounded-md p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{run.stdoutExcerpt}</pre>
+          <pre className="bg-muted rounded-md p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{run.stdoutExcerpt}</pre>
         </div>
       )}
 
@@ -4310,7 +4310,7 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
           {run.stderrExcerpt && run.stderrExcerpt.trim() && (
             <div>
               <div className="text-xs text-red-700 dark:text-red-300 mb-1">stderr excerpt</div>
-              <pre className="bg-red-50 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap text-red-800 dark:text-red-100">
+              <pre className="bg-red-50 dark:bg-muted rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap text-red-800 dark:text-red-100">
                 {redactPathText(run.stderrExcerpt, censorUsernameInLogs)}
               </pre>
             </div>
@@ -4318,7 +4318,7 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
           {run.resultJson && (
             <div>
               <div className="text-xs text-red-700 dark:text-red-300 mb-1">adapter result JSON</div>
-              <pre className="bg-red-50 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap text-red-800 dark:text-red-100">
+              <pre className="bg-red-50 dark:bg-muted rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap text-red-800 dark:text-red-100">
                 {JSON.stringify(redactPathValue(run.resultJson, censorUsernameInLogs), null, 2)}
               </pre>
             </div>
@@ -4326,7 +4326,7 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
           {run.stdoutExcerpt && run.stdoutExcerpt.trim() && !run.resultJson && (
             <div>
               <div className="text-xs text-red-700 dark:text-red-300 mb-1">stdout excerpt</div>
-              <pre className="bg-red-50 dark:bg-neutral-950 rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap text-red-800 dark:text-red-100">
+              <pre className="bg-red-50 dark:bg-muted rounded-md p-2 text-xs overflow-x-auto whitespace-pre-wrap text-red-800 dark:text-red-100">
                 {redactPathText(run.stdoutExcerpt, censorUsernameInLogs)}
               </pre>
             </div>
@@ -4337,7 +4337,7 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
       {events.length > 0 && (
         <div>
           <div className="mb-2 text-xs font-medium text-muted-foreground">Events ({events.length})</div>
-          <div className="bg-neutral-100 dark:bg-neutral-950 rounded-lg p-3 font-mono text-xs space-y-0.5">
+          <div className="bg-muted rounded-lg p-3 font-mono text-xs space-y-0.5">
             {events.map((evt) => {
               const color = evt.color
                 ?? (evt.level ? levelColors[evt.level] : null)
@@ -4346,10 +4346,10 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
 
               return (
                 <div key={evt.id} className="flex gap-2">
-                  <span className="text-neutral-400 dark:text-neutral-600 shrink-0 select-none w-16">
+                  <span className="text-muted-foreground shrink-0 select-none w-16">
                     {new Date(evt.createdAt).toLocaleTimeString("en-US", { hour12: false })}
                   </span>
-                  <span className={cn("shrink-0 w-14", evt.stream ? (streamColors[evt.stream] ?? "text-neutral-500") : "text-neutral-500")}>
+                  <span className={cn("shrink-0 w-14", evt.stream ? (streamColors[evt.stream] ?? "text-muted-foreground") : "text-muted-foreground")}>
                     {evt.stream ? `[${evt.stream}]` : ""}
                   </span>
                   <span className={cn("break-all", color)}>
@@ -4425,7 +4425,7 @@ function KeysTab({ agentId, companyId }: { agentId: string; companyId?: string }
             API key created — copy it now, it will not be shown again.
           </p>
           <div className="flex items-center gap-2">
-            <code className="flex-1 bg-neutral-100 dark:bg-neutral-950 rounded px-3 py-1.5 text-xs font-mono text-green-700 dark:text-green-300 truncate">
+            <code className="flex-1 bg-muted rounded px-3 py-1.5 text-xs font-mono text-green-700 dark:text-green-300 truncate">
               {tokenVisible ? newToken : newToken.replace(/./g, "•")}
             </code>
             <Button

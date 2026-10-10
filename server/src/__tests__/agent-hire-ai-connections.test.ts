@@ -64,6 +64,15 @@ async function fixture(provider: "anthropic" | "openai", method: "api_key" | "su
   return { app, companyId, agentId, userId, binding, adapterType, account, runId: run!.id };
 }
 
+/**
+ * Saving the agent's own model is a protected self change, so the agent needs
+ * the same agents:configure grant (for itself) that its responsible user holds.
+ */
+async function grantSelfConfigure(f: { companyId: string; agentId: string }) {
+  await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, membershipRole: "member", status: "active" });
+  await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, permissionKey: "agents:configure", scope: { agentIds: [f.agentId] } });
+}
+
 function hired(response: request.Response) {
   expect(response.status, JSON.stringify(response.body)).toBe(201);
   return response.body.agent ?? response.body;
@@ -74,6 +83,7 @@ describe("agent-created hires use managed AI connections", () => {
     it.each([401, 403, 429, 503, null])(`${operation} changes API-key health only for a provider rejection (status: %s)`, async (status) => {
       const f = await fixture("anthropic", "api_key");
       await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+      await grantSelfConfigure(f);
       const original = getServerAdapter(f.adapterType);
       registerServerAdapter({ ...original, testEnvironment: async () => ({ adapterType: f.adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
       const network = vi.spyOn(globalThis, "fetch");
@@ -93,6 +103,7 @@ describe("agent-created hires use managed AI connections", () => {
   it.each(["test", "save"] as const)("%s marks a hello-test authentication rejection as needing attention and reconnect repairs the same default", async (operation) => {
     const f = await fixture("anthropic", "subscription");
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+    await grantSelfConfigure(f);
     const original = getServerAdapter(f.adapterType);
     registerServerAdapter({ ...original, testEnvironment: async () => ({
       adapterType: f.adapterType, status: "fail", testedAt: new Date().toISOString(),

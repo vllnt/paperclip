@@ -48,7 +48,8 @@ walk(workflowRoot, (filePath) => {
 walk(repoRoot, (filePath) => {
   if (!path.basename(filePath).startsWith("Dockerfile")) return;
   const source = fs.readFileSync(filePath, "utf8");
-  for (const match of source.matchAll(/^\s*FROM\s+node:([^\s]+)/gm)) {
+  // The image may carry a registry mirror prefix, e.g. public.ecr.aws/docker/library/node:<tag>.
+  for (const match of source.matchAll(/^\s*FROM\s+(?:\S*\/)?node:([^\s]+)/gm)) {
     if (!isNode24ImageTag(match[1])) failures.push(`${relative(filePath)}: Node base image must use the Node 24 major, found node:${match[1]}`);
   }
   for (const match of source.matchAll(/^\s*ARG\s+NODE_(?:MAJOR|VERSION)=([^\s]+)/gm)) {

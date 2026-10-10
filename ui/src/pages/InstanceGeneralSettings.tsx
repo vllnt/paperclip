@@ -300,7 +300,7 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
             ) : null}
           </div>
           {feedbackDataSharingPreference === "prompt" ? (
-            <div className="rounded-lg bg-accent/20 px-3 py-2 text-sm text-muted-foreground">
+            <div className="rounded-lg border border-border px-3 py-2 text-sm text-muted-foreground">
               No default is saved yet. The next thumbs up or thumbs down choice will ask once and
               then save the answer here.
             </div>
