@@ -429,22 +429,37 @@ any comment on the issue, an issue status change (read from the activity log, be
 below. A re-dispatch (#104) or a requeued wake is **not** progress. Without that rule, a
 loop of failed wakes would reset the clock for ever.
 
-**The hold-lift floor, bounded.** Nothing stores the time a hold ended, but the activity
-log records the actions that lift one. The progress clock never starts before the latest
-**hold-lift event** that falls inside the timeout window. Only these events count:
+**The hold-lift floor, bounded, and built on a real lift record.** Nothing stores the
+time a hold ended, and **the existing activity entries cannot tell a lift from an
+edit**. On `main`, `project.updated` carries only `changedKeys`
+(`routes/projects.ts:372-387`), `routine.updated` carries only the title
+(`routes/routines.ts:394-405`), and `company.updated` carries the request body with no
+previous state (`routes/companies.ts:1336-1348`). So this plan does **not** use those
+three entries. Instead, the shared module slice (#105 R1) adds a **lift record**: every
+writer that clears a pause on a company, project, routine or agent writes one activity
+entry, `scope.pause_lifted`, with `{ scopeType, scopeId, previousPausedAt,
+previousPauseReason }`, read from the old row inside the writer's own transaction. The
+writers to cover are the agent resume path (`agent.resumed` is already exact and stays),
+the project, routine and company update routes when the pause state goes from paused to
+not paused, and the budget resume path (`services/budgets.ts`). A source test lists the
+writers that set `paused_at` to null or `status` away from `paused`, and fails on an
+unlisted one.
 
-- `agent.resumed` for the assignee agent (exact);
-- `company.updated`, `project.updated` or `routine.updated` for the issue's company,
-  project or routine, **only if its `details` show that the pause state changed to not
-  paused**. S1 verifies the `details` shape on `main`. If the shape cannot identify a
-  lift, these three are dropped, and only "held now" and `agent.resumed` remain. The
-  known gap is then a tick that waited out a company, project or routine hold.
+The progress clock never starts before the latest lift record for the issue's assignee
+agent, routine, project or company that falls inside the timeout window. **Total bound:**
+the floor can never move the clock start later than `lastRealProgress + 2 x timeout`,
+where `lastRealProgress` is the latest progress event other than the floor. So a system
+that pauses and resumes a scope in a loop delays a close by at most two timeouts after
+the last real progress; a held scope stays exempt for as long as it is held. That
+residual is stated, not removed.
 
-An ordinary edit of a company or routine is **not** a lift event. So an object that is
-updated often cannot suppress detection: only a pause that is lifted often can, and a
-pause that is on is already an exemption. A test pins this: a routine edited every
-minute still becomes stale. The lookup uses the `(entity_type, entity_id)` index and a
-time bound. When #102 lands, its lift time replaces this approximation.
+An ordinary edit of a company or routine is **not** a lift. A test pins this: a routine
+edited every minute still becomes stale. A second test pins the total bound: a scope
+paused and resumed every minute still becomes stale once `2 x timeout` has passed. The
+lookup uses the `(entity_type, entity_id)` index and a time bound. **If the lift record
+is not built in R1, the fallback is `agent.resumed` only** (the known gap is a tick that
+waited out a company, project or routine hold); the reviewer chooses (Q31). When #102
+lands, its lift time replaces this approximation.
 
 **The clock source is the database clock.** The step reads `clock_timestamp()` once, at
 the start, and uses that one value for the whole decision. It never mixes in the
@@ -515,6 +530,19 @@ goes through #103's plan. This plan, #105 and #113 S1 add no second variant and 
 and no slice waits for another slice's code only for this helper. Until #103's plan
 defines it, the close step cannot be built, which is a dependency on the spec.
 
+**What #105 and this plan need from that variant** (requirements for #103 D1 to
+satisfy, not an API designed here): (1) it is **keyed by the issue, with the run
+optional**, because an idle open copy (state S4, no run) must be closable. The run-keyed
+form on `main` (`withIssueExecutionLockHeld`-style: the run first, then the issue) has no
+run to pass for S4. (2) It keeps `execution_run_id`, `execution_locked_at` and
+`checkout_run_id` as they were. (3) It runs in the caller's transaction. (4) It uses
+one fixed lock order, which D1 settles. `main` already has two: the helper takes the
+run, then the issue (`wake-queue/adapters/postgres.ts:1171-1207`), and the claim path
+takes the issue, then the wake, then the run (the comment in `claimQueuedRun`). The close
+below uses the helper's order, and S1 adds a two-connection interleaving test against the
+claim path. If #103 D1 ships the run-keyed form only, the S4 close cannot be built, and
+that is a request to #103, tracked as Q34.
+
 **The race it closes.** The heartbeat cancel ends a run and then runs
 `releaseIssueExecutionAndPromote`, which takes the issue's row lock **under its own,
 later transaction** and promotes the oldest deferred wake to a run. If the issue is
@@ -525,11 +553,22 @@ cancelled. A check made before the cancel does not prevent that.
 first, under the row lock that promotion also takes. A promotion that comes later sees
 a terminal issue and drops the wake. In order:
 
-1. **Lock.** In one database transaction, take the routine row lock if the caller is a
-   dispatch (dispatch already holds it), and then the issue row `FOR UPDATE` (with any
-   issue that references the same live runs, in id order) through the lock-preserving
-   variant above. The order is routine, then issue, then run, the same as the existing
-   paths, so it cannot deadlock with them.
+1. **Lock.** In one database transaction, in this order:
+   1. the routine row lock, if the caller is a dispatch (dispatch already holds it);
+   2. **the scope rows `FOR SHARE`**, in a fixed order (company, project, agent, then
+      routine, each by id): the issue's company, its project, its assignee agent and its
+      routine. A pause or resume writes one of these rows, so its `UPDATE` waits for the
+      close to commit, and a pause that committed before is seen by step 2. The writers
+      of pauses take no issue lock (`services/budgets.ts:214-297` updates the agent,
+      project or company row directly), so this is what protects the exemption check;
+   3. **the live runs of the issue, then the issue row `FOR UPDATE`**, through the
+      lock-preserving variant above (the run rows in id order, and none for an idle
+      copy). After the issue lock, the close reads the issue's live run set again. If it
+      differs from the set it locked, the transaction rolls back and the caller retries on
+      its next pass.
+   The ancestors of the issue are locked `FOR SHARE` too, so that a tree hold created
+   on an ancestor while the close runs is seen. The writer that creates a hold must take
+   `FOR UPDATE` on its root issue (a prerequisite below).
 2. **Re-validate under the lock.** All of these must hold, or the transaction rolls back
    and the caller does what it did before (a skipped or coalesced tick, or a 409):
    - the **binding** predicate that the caller passed (for #105: the issue is the
@@ -537,7 +576,8 @@ a terminal issue and drops the wake. In order:
    - **`status_version` equals `observed.statusVersion`**, and the other `observed`
      values equal the locked row (fail closed: any difference aborts);
    - no run of the issue is `running`;
-   - `stallExemption` returns `null`, evaluated now, **under the lock**;
+   - `stallExemption` returns `null`, evaluated now, **under the scope and issue locks**;
+     the held-scope part reads the pause state of the rows locked `FOR SHARE` in step 1;
    - the clock decision (6.1.2) holds, and the skew guard passes.
 3. **Close, in the same transaction:**
    - set the issue to `targetStatus` through the issue service, passing the transaction
@@ -601,7 +641,9 @@ and a source test (below).
 | Slack conversation wait and resume (`slack-conversation-lifecycle.ts:91`, `slack-conversation-state.ts:48`) | status `in_review`, `todo` | **Yes**: `:21-22`, and by the comment at `:44`. A caller of `resumeSlackConversation` at `chat-channels.ts:16319` is not verified |
 | Conversation turns (`agent-conversations.ts:259`, `:371`) | `conversation_state`, status, `status_version` | **Yes**: `:128-132` and `:291-296` |
 | Member archive (`access.ts:696`, `708`) | status, assignee | The lock at `:680` is on the membership row, not on `issues`. Both updates carry `status not in ('done','cancelled')` (`:688-692`), so they cannot move a closed issue |
-| Tree-hold release (`issue-tree-control.ts:981`) | restores `cancelled` issues to their snapshot status | **No lock seen.** It restores by design. S1 audit decides whether a close by this module can be undone by a release, and records the answer |
+| Tree-hold release (`issue-tree-control.ts:976-998`) | restores `cancelled` issues to their snapshot status | **No lock.** The update has no `FOR UPDATE`, so a restore can race a close. **Prerequisite:** the restore takes `FOR UPDATE` on each issue and re-checks the status before it writes, with an interleaving test |
+| Scope pause and resume: budget pause and resume (`budgets.ts:214-297`), agent pause and resume, the project, routine and company update routes | `paused_at`, `pause_reason`, `status` of the agent, project, company or routine | **None on `issues`.** Protected by the `FOR SHARE` on the scope rows in step 1 (a pause waits for the close, or is seen by it). The source test of the lift record lists these writers |
+| Tree-hold creation | `issue_tree_holds` rows | The insert takes a `KEY SHARE` lock on its root issue through the foreign key only. **Prerequisite:** the creator takes `FOR UPDATE` on the root issue, so a hold on an ancestor conflicts with the close's `FOR SHARE` on the ancestors |
 | Monitor claim, trigger and clear (`heartbeat.ts:11927`, `12153`, `12189`) | the monitor columns and execution state, not `status` | The monitor column is an exemption that is re-read under the close lock |
 | `cli/src/commands/worktree.ts:1334` | status | A local seeding command, not server runtime |
 
@@ -1142,7 +1184,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 
 | ID | Question | Recommendation |
 |---|---|---|
-| **Q1** | **For the reviewer.** Share the stall module with #105 and not with #102? | Yes. Define the exemption set, the progress clock and the atomic close step once, here (section 6.1). **#105 R1 builds `server/src/services/flow-stall.ts` first and #113 S1 reuses it.** No "whoever lands first". Share conventions with #102. Do not reuse #102's checker. Leave #104 alone until later. Whoever lands first creates the module |
+| **Q1** | **For the reviewer.** Share the stall module with #105 and not with #102? | Yes. Define the exemption set, the progress clock and the atomic close step once, here (section 6.1). **#105 R1 builds `server/src/services/flow-stall.ts` first and #113 S1 reuses it.** No "whoever lands first". Share conventions with #102. Do not reuse #102's checker. Leave #104 alone until later |
 | **Q2** | "No update for `N` minutes": the progress clock or `issues.updated_at`? | The progress clock. System writes touch `updated_at` |
 | **Q3** | **For the reviewer.** Event source for pull-request merges | S2 reads `external_objects` for a company on the core GitHub connection (it has the true merge time in `data.mergedAt`) and `issue_work_products` for a company on the plugin sync (no merge time). A generic event table is S3, only if needed |
 | **Q4** | What happens when the condition clears? | `comment` and resolve the firing. The issue stays open. `auto_close` is opt-in and closes only an untouched issue |
@@ -1164,7 +1206,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q20** | The existing task watchdog | Keep it. Add "watched by an active task watchdog" as an exemption for rule (a) |
 | **Q21** | A paused or archived routine as a routine-action target | The watchdog checks the routine and its project itself, and skips (section 7.2) |
 | **Q23** | **For the reviewer.** The atomic close contract on what `main` provides: **choice B**, the issue row lock plus a compare-and-set on `status_version`. The trigger of migration `0227_modern_pandemic.sql:146-158` bumps it on every status change, so no migration is needed | B (section 6.1.3). `main` lacks only a writer that does the compare. The shared module slice adds `expectedStatusVersion` to `issueService.update` and the compare in the close step. Values of the non-status fields are compared too, because some writers change them without a bump |
-| **Q24** | The clock source and the hold-lift floor | The database clock, a 5-minute skew guard, and a floor taken from `agent.resumed` and the `*.updated` entries of the company, project and routine (section 6.1.2). #102's lift time replaces it later |
+| **Q24** | The clock source and the hold-lift floor | The database clock, a 5-minute skew guard, and a floor taken from `agent.resumed` and the new `scope.pause_lifted` record, with a total bound of two timeouts (section 6.1.2). #102's lift time replaces it later |
 | **Q22** | A terminated or pending assignee at fire time | Take no action. Record `suppressed: assignee_unavailable` and put the rule in an error state that the rules page shows |
 | **Q25** | **For the reviewer.** Where is the exemption set derived from? | From the attention feed: the stall module calls the feed's readers, and a `Record<AttentionSourceKind, …>` table fails to compile when the feed gains a source (section 6.1.1) |
 | **Q26** | Rule (a) and its own output | A subject is never a `flow_watchdog` issue or the issue of an open firing. No opt-in in S1 (section 3.1) |
@@ -1172,10 +1214,10 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q28** | **For the reviewer.** Rule (d) and #106 | Use #106's measure function and definitions as they are. `provider_errors` is S1. `failed_rate` ships after #106's measure has landed (section 6.6) |
 | **Q29** | The routine pause race | An S2 prerequisite: `requireActive` is honoured by `dispatchRoutineRun` under the routine lock, set only by the watchdog (section 7.2) |
 | **Q30** | Off behavior | An instance flag `enableFlowWatchdog` (default off), and a company settings row with `enabled` (a missing row means off). Both are in the claim (section 5.3) |
-| **Q31** | The hold-lift floor | Only real lift events: `agent.resumed`, and the company, project or routine update entries that show an unpause. S1 verifies the `details` shape; if it cannot be read, those three are dropped (section 6.1.2) |
+| **Q31** | **For the reviewer.** The hold-lift floor | A real lift record: a `scope.pause_lifted` entry written by every pause-clearing writer, plus `agent.resumed`. The existing `*.updated` entries cannot identify a lift (section 6.1.2). Bounded by `lastRealProgress + 2 x timeout`. Fallback if R1 will not build the record: `agent.resumed` only, with the known gap |
 | **Q32** | A crash between the firing and the action | `action_state = pending`, retried by the next pass with an idempotency key, at most 5 attempts (section 6.3) |
 | **Q33** | Who builds the shared module, and in which order? | #105 R1, first, as a single, at `server/src/services/flow-stall.ts`. #113 S1 reuses it (sections 6.1 and 9.1) |
-| **Q34** | The lock-preserving variant of `withIssueExecutionLock` | One variant, owned by #103 D1. The first slice that needs it implements it to #103's spec; the others reuse it unchanged (section 6.1.3) |
+| **Q34** | The lock-preserving variant of `withIssueExecutionLock` | One variant, owned by #103 D1. It must be **keyed by the issue with the run optional** (an idle copy has no run) and settle one lock order (section 6.1.3). The first slice that needs it implements it to #103's spec; the others reuse it unchanged |
 
 ## Appendix A. Code anchors on `main` at `d9804ac4f`
 
