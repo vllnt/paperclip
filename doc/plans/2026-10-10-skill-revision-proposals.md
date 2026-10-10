@@ -20,8 +20,7 @@ holds the bytes the proposal was written against. It reads the result back, keep
 before-image, and writes an activity entry for every step. The board can revert an applied proposal while nothing has
 changed since. A company can also **protect** skills: on a protected skill the server refuses every direct text, head or
 source change by an agent on the routes that carry the skill's id, so a proposal is the only way in. It also refuses an agent's overwrite of a protected skill through the by-key import paths and through a plugin's managed-skill
-reset, and it takes that check under a lock that every such write holds while it commits and that a change of the protection
-must also take (section 4.9).
+reset, and it makes that check part of the write: inside the write's own transaction it reads the settings row under a share lock, which a change of the protection waits for, and where a write is not one transaction the plan states the window (section 4.9).
 
 ```
  author (agent)            server                         approver (board, later an agent)
@@ -145,7 +144,7 @@ policed at all today. The protected-skills guard of section 4.9 lives at these s
 | Write site | Where | Reached from | Principal the caller passes |
 | --- | --- | --- | --- |
 | `withSkillFileMutation` with `updateFile`, `deleteFile` | svc `:4639`, `:4679`, `:4763` | file PATCH and DELETE; proposal apply and revert | the request actor |
-| `updateSkill`, `updateSkillMetadata` | svc `:4427`, `:3459` | `PATCH /skills/:skillId` | the request actor |
+| `updateSkill` | svc `:4427-4478` | `PATCH /skills/:skillId` | the request actor |
 | `createVersion` | svc `:3626` | `POST /versions`; a test-run start through `ensureRunSkillVersion` (svc `:6589`, `:6710`) | the request actor |
 | `renameSkill`, `forkSkill` | svc `:4078`, `:3981` | rename, fork | the request actor |
 | `installUpdate`, `resetSkill`, `deleteSkill` | svc `:4828`, `:4948`, `:7150` | install-update, reset, remove | the request actor |
@@ -153,11 +152,11 @@ policed at all today. The protected-skills guard of section 4.9 lives at these s
 | `installFromCatalog` | svc `:5714` | install-catalog; the shipped-team install | the request actor (the team install gets none today) |
 | `publish` for managed sources | `server/src/services/skill-sources.ts:72-115` | skill-source create, refresh, patch | the request actor |
 | `managedSkills.reset` and `reconcile` | `server/src/services/plugin-managed-skills.ts:274-352` | a plugin's bridge action; a plugin's own timers and events | the plugin-call principal of section 4.9 |
-| `importBundledSkill` | `server/src/services/built-in-agents.ts:1181` | the built-in agents' reconcile, provision and reset routes, which need only `agents:create` (`server/src/routes/built-in-agents.ts:88-97`, `:261-328`). Reconcile (`:266`) and provision (`:287`) both reach `ensure`, which reaches the bundle import through `reconcileBundleResources` (svc `built-in-agents.ts:1779`, `:1827`) when the stock is missing or has an update (`:1226-1230`); reset reaches it at `:1988` | the request actor. The bytes are shipped, but the caller chose the moment, and `replace` overwrites the row that matches the bundle's key or slug (svc `:6162-6179`). Reset already passes `req.actor` (`routes/built-in-agents.ts:319`); reconcile and provision pass none today |
-| `importPackageFiles` for a company import | `server/src/services/company-portability.ts:5518-5519` | company import; `board_full` can replace, any other mode skips or renames (`:259-262`); the agent-safe route is open to the company's CEO agent (`server/src/routes/companies.ts:1189-1199`) | the request actor. It writes to disk before it resolves a conflict (section 4.9) |
+| `importBundledSkill` | `server/src/services/built-in-agents.ts:1181` | the built-in agents' reconcile, provision and reset routes, which need only `agents:create` (`server/src/routes/built-in-agents.ts:88-97`, `:261-328`). Reconcile (`:266`) and provision (`:287`) both reach `ensure`, which reaches the bundle import through `reconcileBundleResources` (svc `built-in-agents.ts:1779`, `:1827`) when the stock is missing or has an update (`:1226-1230`); reset reaches it at `:1988` | the request actor. The bytes are shipped, but the caller chose the moment, and `replace` overwrites the row that matches the bundle's key or slug (svc `:6162-6179`). Reset already passes `req.actor` (`routes/built-in-agents.ts:319`); reconcile and provision pass none today. Provision reaches `ensure` only when `requireBoardApprovalForNewAgents` is false (`built-in-agents.ts:1839-1841`); otherwise the bundle import happens when a board approves the hire (`server/src/services/approvals.ts:28`, `:159`; the approving board user is a `person`). Company creation auto-provisions (`server/src/services/companies.ts:382`; board only, a `person`) |
+| `importPackageFiles` for a company import | `server/src/services/company-portability.ts:5518-5519` | company import; `board_full` can replace, any other mode skips or renames (`:259-262`); the agent-safe route is open to the company's CEO agent (`server/src/routes/companies.ts:1189-1199`) | the request actor. It writes to disk before it resolves a conflict (section 4.9; its own fix PR lands first) |
 | `reconcileLocalPathSkillSources` | svc `:3138-3210`, called by `ensureSkillInventoryCurrent` (`:3231`), which runs inside many requests | state-driven; no caller principal | none. It deletes an unused `local_path` skill row, and its proposals with it, when the skill's directory is missing (`:3205-3208`). It is part of the filesystem limit of section 4.9 and is not guarded in S1 |
 
-Only boot-time bundled-skill seeding (svc `:3018`, `:3020`) is `system`, and the built-in agents' startup reconcile (`built-in-agents.ts:2105`; S1 confirms that it reaches the bundle import and passes `system` there). Metadata-only writers change no text, head or source and need no guard: `persistAuditMetadata` (svc `:3468-3492`), the source-metadata branches of `skill-sources.ts` (`:109`, `:120`, `:132`, `:210`), the star counter (svc `:3690`) and folder moves (`server/src/services/folders.ts:393`). Runtime and version materialization write derived copies, not the source. Comments, test inputs, templates and audit change no skill text.
+Only boot-time bundled-skill seeding (svc `:3018`, `:3020`) is `system`, and the built-in agents' startup reconcile (`built-in-agents.ts:2105`, which calls `autoProvisionBundledAgents` at `:2118`, `:2051-2073`, and so `ensure` or `provision`). Metadata-only writers change no text, head or source and need no guard: `persistAuditMetadata` (svc `:3468-3492`), the source-metadata branches of `skill-sources.ts` (`:109`, `:120`, `:132`, `:210`), the star counter (svc `:3690`) and folder moves (`server/src/services/folders.ts:393`). Runtime and version materialization write derived copies, not the source. Comments, test inputs, templates and audit change no skill text. Section 4.9 says, for each site that checks, whether it is one transaction (the check is then exact) or not (a stated window).
 
 ## 3. What else exists, and why it does not host this
 
@@ -250,7 +249,7 @@ created_at)` for the caps; a partial unique index on `(skill_id, author_agent_id
 author has at most one open proposal per skill; a partial unique index on `(skill_id, proposed_sha256)` where status is
 `pending`, so the same bytes are never open twice.
 
-`company_skill_proposal_settings`: one row per company: `company_id` pk, `revision` int, `settings` jsonb,
+`company_skill_proposal_settings`: one row per company, created by the first `PUT` (a company that never enabled the feature has none, and section 4.9 relies on that): `company_id` pk, `revision` int, `settings` jsonb,
 `created_at`, `updated_at`. A separate table, not columns on `company_skill_policies`, because
 `DELETE /skill-policy` removes that whole row (`company-skill-policy.ts:266-290`) and would silently switch the
 approval rules off at the moment direct writes reopen.
@@ -365,7 +364,7 @@ There are two bars, not four: the **decide bar** (decide, withdraw, revert) is `
   burst cannot step over the cap. `null` turns a cap off. `openPerCompany` stops many authors from flooding the approver. `appliedPerSkillPer24h`
   is checked at decision time under the skill lock; when it is exceeded the proposal stays pending and the caller gets
   409 `skill_proposal_cap_reached`. A revert does not count.
-- Changing settings uses `expectedRevision` compare-and-set and writes `company.skill_proposal_settings_updated`.
+- Changing settings uses `expectedRevision` compare-and-set and writes `company.skill_proposal_settings_updated`. The `UPDATE` runs with a 5-second `lock_timeout` and answers 409 `skill_settings_busy` when writes in flight hold the row (section 4.9).
   Only a person may change them (4.4), because the policy route also lets an agent holding
   `users:manage_permissions` rewrite the gate (`server/src/routes/company-skill-policy.ts:48-52`). That route is a
   named dependency (section 8.1).
@@ -431,7 +430,7 @@ from `proposed_sha256`, the decision is refused.
 For `approve`, in one outer transaction (the same shape the idempotent file-update route already uses with a
 transaction-scoped service, `company-skills.ts:1242-1258`):
 
-1. For an agent approver (S2) enter `withProtectionGuard` (section 4.9) at the route, before this transaction opens, so that the protection key is the first lock taken (a person's apply takes none). Then take the skill's **name advisory lock** (the key `withSkillFileMutation` uses, svc `:4639-4664`; advisory
+1. For an agent approver (S2) the first statements of this transaction are the settings reads of section 4.9 (a person's apply needs none), before any lock below. Then take the skill's **name advisory lock** (the key `withSkillFileMutation` uses, svc `:4639-4664`; advisory
    locks are re-entrant in a session), then lock the proposal row, then the skill row. `deleteSkill` takes the advisory
    lock and then deletes the skill row, which cascades to proposal rows (svc `:7150-7206`); locking the proposal row
    before the advisory lock could deadlock against it. Re-read the slug after the lock. If a rename moved it, the transaction ends and the whole decision starts
@@ -514,7 +513,7 @@ The policy engine cannot give the guarantee "only a reviewed proposal changes th
 does not cover the by-key paths (section 2.1), the policy is not asked by every writer (section 2.3), and a company must
 hand-write the right deny rules. So the server enforces it.
 
-**One guard, three outcomes.** Every write site of section 2.3 takes a **required** `guard` from its caller. There is no default: the parameter is required on `upsertImportedSkills`, `installFromCatalog`, `importPackageFiles`, `installUpdate`, `resetSkill`, `deleteSkill`, `renameSkill`, `forkSkill`, `createVersion`, `updateFile`, `deleteFile`, `updateSkill` and `publish`, so a caller that forgets it does not compile. An optional argument would default to unguarded, and a forgotten caller is exactly how the first design missed the built-in agents. A guard is a value, not a mode: `PERSON` and `SYSTEM` are two shared constants that check nothing, and the guard for an `other` principal can be made **only** by `withProtectionGuard` below (its type carries a brand that is not exported), so a call site cannot build one by hand. A nested site receives the guard it was called with and passes it on; it never opens a wrapper of its own.
+**One principal, three outcomes.** Every write site of section 2.3 takes a **required** principal from its caller. There is no default: the parameter is required on `upsertImportedSkills`, `installFromCatalog`, `importPackageFiles`, `importFromSource`, `scanProjectWorkspaces`, `createLocalSkill`, `installUpdate`, `resetSkill`, `deleteSkill`, `renameSkill`, `forkSkill`, `createVersion`, `ensureRunSkillVersion`, `createTestRun`, `updateFile`, `deleteFile`, `updateSkill` and `publish`, so a caller that forgets it does not compile. An optional argument would default to unguarded, and a forgotten caller is exactly how the first design missed the built-in agents. A nested site receives the principal it was called with and passes it on. The principal reaches the composite flows through their options (company import carries it in `ImportBehaviorOptions`).
 
 - `person`: a board actor (the implicit board of `local_trusted` included, section 4.15), or a plugin host call that the
   host recorded as started by a person (below). Not checked.
@@ -532,7 +531,7 @@ evaluation is authoritative:
 
 1. at the route gate (`assertCanMutateCompanySkills`, `company-skills.ts:209-251`) as a fast refusal before a transaction
    opens;
-2. inside `withProtectionGuard`, the wrapper described next, which holds the lock for the commit phase of the write.
+2. inside the write, as described under "Checked in the write's own transaction": in the transaction that does the write where the site is one transaction, and at the guard read before the first write otherwise.
 
 The route-gate check is keyed on neither the action string nor the raw URL id:
 
@@ -548,91 +547,69 @@ The route-gate check is keyed on neither the action string nor the raw URL id:
 
 A person is not affected: the board edits directly, as today. A proposal is the only path for an `other` principal.
 
-**Checked under the write lock (the settings-to-write race).** A check at the route followed by a transactional write has
-a gap. `PATCH …/files` checks at `company-skills.ts:1233` and writes at `:1255` (the idempotent branch) or `:1287`;
-managed-source refresh authorizes at `skill-sources.ts:171-185` and `publish` rewrites the existing row in a later
-transaction (`:186-190`, `:103`). A board that protects the skill in between would not stop the write. The first revision
-of this plan put a check after each site's row lock; the fifth review pass showed that this cannot work, so the design is:
+**Checked in the write's own transaction (the settings-to-write race).** A check at the route followed by a write has a gap.
+`PATCH …/files` checks at `company-skills.ts:1233` and writes at `:1255` (the idempotent branch) or `:1287`; managed-source
+refresh authorizes at `skill-sources.ts:171-185` and `publish` rewrites the existing row in a later transaction (`:186-190`,
+`:103`). A board that protects the skill in between would not stop the write. The manager ruled out any cost that every company
+pays (Q17), so there is no advisory lock, no extra connection and no semaphore. The settings row is the lock:
 
-- Every write by an `other` principal runs inside `withProtectionGuard(db, principal, companyId, fn)`. It is entered **once**,
-  at the outermost entry of the write, under three rules:
-  1. *Before every other lock, after every network call.* A route enters it before its own transaction, before the receipt
-     advisory lock and before `projectToolContext`. The idempotent PATCH and POST take the receipt lock and then call
-     `projectToolContext(tx)` (`company-skills.ts:1171-1173`, `:1242-1244`), which runs `captureRunIdentity` on that
-     transaction and keeps the run-task lock and the run row lock until the outer commit (`run-identity.ts:431-448`; it assumes
-     that drizzle runs a nested transaction as a savepoint, which I read and did not run). A
-     wrapper entered inside them would queue for the key while holding a run lock that a key holder may need. The sites that
-     fetch over the network (`importFromSource`, install-update's re-import from the skill's source, managed-source create and
-     refresh) split into a *fetch phase*, with no guard and no lock, and a *commit phase* inside the wrapper. The key is never
-     held across a fetch: a held key stalls the board's settings write, every later agent skill write queues behind that
-     write, and a refresh lease lasts up to 10 minutes (`skill-sources.ts:174-181`). The route-gate fast refusal comes before
-     all of it; it reads and holds nothing.
-  2. *The lock holder never borrows the shared pool.* The wrapper's transaction runs on a dedicated connection
-     (`withDedicatedDbConnection`, `packages/db/src/client.ts:257-268`, which
-     `server/src/services/native-runtime/native-workspace-finalization-ownership.ts:67` already uses for a long advisory-lock
-     transaction), and an in-process counting semaphore bounds how many exist. S1 proposes 4 per server process and a 30-second
-     wait that ends in 503 `skill_write_busy`; a waiter holds nothing while it queues. The reason: the pool is the driver
-     default of 10 (`DATABASE_POOL_MAX` is optional, `client.ts:139`, `:215`, `:247`; `docs/deploy/database.md:73`), so a lock
-     holder that took one pooled connection while its body needed a second would stop every request in the server at ten
-     concurrent writes, and Postgres would see no deadlock to break. It is a transaction and not a session-level lock because
-     the driver closes idle pooled connections after 60 seconds by default (`docs/deploy/database.md:74`). The helper works only
-     on the root `db` that `createDb` returned and throws on a transaction-scoped one (`client.ts:260-263`), which is one more
-     reason to enter once, at the outermost point. That every runtime builds its `db` with `createDb`, the embedded development
-     database included, is not verified here; S1 checks it.
-  3. *Once.* A nested site never opens a wrapper; it calls `guard.assertWritable(row)` with the guard it was given. A second
-     shared request arrives on another session, and a shared lock is not re-entrant across sessions: with the outer body
-     holding the key and the settings write queued for the exclusive key, a nested wrapper would queue behind the settings
-     write, which waits for the outer body, which waits for the nested call. Nesting is the normal case on `main`:
-     `installUpdate`, `importFromSource`, scan-projects and `importPackageFiles` call `upsertImportedSkills`; `forkSkill` calls
-     `upsertImportedSkills` and `createVersion`; `createTestRun` calls `ensureRunSkillVersion` and then `createVersion`; a
-     plugin's reset goes `importPackageFiles` then `upsertImportedSkills`; the S2 apply calls `updateFile`. The
-     transaction-scoped service that the idempotent routes build (`companySkillService(tx)`, `company-skills.ts:1178`, `:1255`)
-     takes the guard as an argument like every other caller.
-- Entered for an `other` principal, the wrapper takes a semaphore slot; opens the transaction on the dedicated connection; takes
-  `pg_advisory_xact_lock_shared(hashtext('skill-protection'), hashtext(companyId))`, the **outermost** lock; reads the settings
-  row and the protected set (a plain select after the lock, so it sees every committed change); runs `fn(guard)`; and ends the
-  transaction, which releases the key and the slot. `fn` runs the commit phase of the site on the normal pool with its own
-  transactions, so the lock holder's connection does nothing but hold the key. For `person` and `system` it runs `fn` with the
-  shared `PERSON` or `SYSTEM` guard and takes nothing.
-- Inside `fn` the site calls `guard.assertWritable(skillRow)` as soon as it has the target row (by canonical id, or by key for
-  the by-key paths) and before its first write to disk or to the database. The guard also refuses a row of another company and a
-  call made after its wrapper has returned; both are a server error, never a pass.
-- Because the key is held for the whole commit phase, the sites need no transaction or row lock of their own for the check to be
-  sound. That matters, because several have none: `upsertImportedSkills` runs on the pool from `importFromSource`,
-  scan-projects, install-update and `importPackageFiles` (svc `:6377`, `:5398`, `:5455`, `:4944`, `:6232`);
-  `installFromCatalog` writes the `__catalog__` files first (svc `:5776-5785`) and its row on the pool afterwards
-  (`:5836-5847`); install-update's catalog branch copies at `:4889` before its update at `:4916`; `resetSkill` copies at `:5006`
-  before its update at `:5010`; `deleteSkill` takes the name lock and no row lock (`:7183-7206`). A guard "after the row lock"
-  could not be placed at these sites, and a guard on the pool handle would release its advisory lock when the statement ended.
-  The disk copies must be inside the wrapper, and the check must run before them.
-- `PUT /skill-proposal-settings` takes the same key **exclusively**, on a dedicated connection and a semaphore slot like any
-  wrapped write, before it compares `expectedRevision` and writes. It waits for the `other` writes in flight.
-- The result is linear: a write commits before the protection takes effect (it was allowed when it was checked), or it is
-  refused. No `other` write commits after a settings change without having been checked against it.
-- **Why the key must be outermost, and entered once.** A waiting exclusive request makes later shared requests queue behind it
-  (this is how the Postgres lock manager works; it was not run here). With the key anywhere else, a cycle exists: writer A holds
-  the shared key and wants the row that writer B holds; B holds that row and queues for the shared key behind the waiting
-  settings write; the settings write waits for A. Entered once, before every other lock and after every network call, a writer
-  waits for the key holding nothing. A key holder may then take name, source, proposal, skill and run locks, and no writer holds
-  any of those while it waits for the key, so no cycle through the key can form. Rules 1 and 3 are what make that true. The
-  settings write takes only the key and its own row. One assumption is not verified: that no code outside the skills routes holds
-  a run or task lock while it calls a skill write. S1 searches for one; test (h) covers the routes that do.
-- *Key space.* The two-integer form is a different key space from the name locks, which use the single 64-bit
-  `hashtextextended(companyId:slug)` form (svc `:4652`, `:4515`), so no skill slug can collide with the protection key.
-- *Savepoints.* The wrapper takes the key in the outermost transaction, never inside a savepoint, because a rollback to a
-  savepoint releases the locks taken after it.
-- The proposal apply by an agent approver (S2) runs inside the same wrapper with an `other` principal, entered at the route
-  before the apply transaction. It takes the key first, then the name lock, the proposal row and the skill row (section 4.8), and
-  then refuses a protected skill, which is the rule "a protected skill is never decided by an agent". A person's apply takes no
-  protection key.
-- *Cost and failure mode.* An `other` write opens one extra connection (outside the shared pool) and a transaction for its commit
-  phase, file copies included; at most 4 per process at once. That is a latency cost on every agent-authored skill write in every
-  company, **including while `enabled` is false**, because the wrapper has to take the key before it can know whether protection
-  applies. It adds one failure mode: 503 `skill_write_busy` when no slot or connection is free within the wait. A refusal can
-  appear only after a board enables the feature. Not chosen: reading the settings unlocked and taking the key only when `enabled`
-  is true. It removes the cost for companies that never use the feature, but a write that read `enabled = false` just before
-  the board enabled and protected a skill could still commit after that change, so the linear result above would fail at exactly
-  that moment (Q17).
+- **The mechanism.** The settings are one row per company (`company_skill_proposal_settings`, section 4.2). An `other` write reads
+  it, and where the site is one transaction (the first group of the table below) it re-reads it `SELECT … FOR SHARE` (drizzle
+  `.for("share")`; `captureRunIdentity` uses `.for("no key update")` the same way, `run-identity.ts:448`) in that transaction and
+  checks the skill against the protected set it read. The settings `PUT` is an `UPDATE` of the same row, which takes
+  `FOR NO KEY UPDATE`. That conflicts with `FOR SHARE` and would not conflict with `FOR KEY SHARE`, so the mode must be
+  `FOR SHARE` (the lock-mode table in Postgres's `src/backend/access/heap/README.tuplock`; read, not run). The `UPDATE` waits for
+  every write in flight that holds the share lock, and a write that reads after the `UPDATE` commits sees the new settings. While
+  the feature is on, for the first group of sites: a write commits before the protection takes effect, or it is refused. The
+  change from off to on has the window described below, because a write that read `off` took no lock.
+- **When the feature is off, a write takes no lock.** The write first does a plain `SELECT` of the row. No row (a company that
+  never enabled the feature) or `enabled = false`: it proceeds holding nothing, at the cost of one select. Only `enabled = true`
+  leads to the `FOR SHARE` re-read and the share lock, held until the write commits. No extra connection, no new failure mode.
+- **Order: the reads are the first statements of the transaction**, before the receipt lock, the name lock, the source row, the
+  proposal row, the skill row and the run lock. A transaction that waits for the settings row then holds no database lock, so it
+  cannot be part of a cycle through one. (`deleteSkill` also holds the runtime-cache file lock, which no settings writer needs.)
+  This holds whether or not Postgres queues a new share locker behind a waiting `UPDATE`: the README says that
+  incoming share lockers take the tuple lock "if there is any conflict" and that a steady stream of share lockers can block an
+  exclusive locker forever, and it does not say which applies when only an updater is waiting. I did not run it; no Postgres runs
+  on the machine that wrote this plan. The `PUT` takes the settings row and nothing else.
+- **One share read per write, on one connection.** Every call inside a transaction of the first group uses that transaction (the
+  transaction-scoped service of the idempotent routes already does, `company-skills.ts:1178`, `:1255`), so a nested site repeats
+  the select on the same session and does not queue. A site that runs on the pool (the second group) only ever reads the row
+  plainly, and a plain read is never blocked by a row lock. So no transaction that holds the share lock waits for another session
+  that will read the settings row.
+- **The `PUT` cannot hang.** It runs with a `lock_timeout` of 5 seconds and answers 409 `skill_settings_busy` (retry) if the share
+  holders do not finish. It is a person's action; agent writes are unaffected. Every `enabled = true` agent write marks the
+  settings row with a share lock (a multixact), a small extra cost on one hot row for the companies that use the feature.
+- **Where a write is not one transaction, the check happens at its guard read and a window remains.** The read comes after any
+  fetch and before the first disk or database write. It is a plain read, because a lock released at once would protect nothing.
+  The window runs from that read to the site's last write. **A write that started before the enabling or protecting change
+  committed counts as pre-change**: its read saw the old settings and it may commit after the change. The same holds for the very
+  first enable (an `INSERT`, which waits for nobody) and for a re-enable after a disable, because a write that read `off` took no
+  lock.
+- *Not chosen:* a per-company advisory lock held on a dedicated connection, behind an in-process semaphore (the previous revision
+  of this plan). It closes every path, but every agent skill write in every company pays a connection and a new 503 failure mode,
+  which the manager ruled out during a capacity incident (Q17).
+
+**Write paths and their windows.** The sites of section 2.3 that check, and where the read goes. Composite flows (company import,
+the shipped-team install, the built-in agents' `ensure` and `reset`, a plugin's reset) hold no transaction or lock of their own,
+and each leaf write inside them does its own check, so the sites in this table are the only places that check.
+
+| Group | Site | Where | Structure | Where the read goes; result |
+| --- | --- | --- | --- | --- |
+| One transaction | `updateFile`, `deleteFile`, `renameSkill` | svc `:4639-4664` (`withSkillFileMutation`, `db.transaction` at `:4648`), `:4679`, `:4763`, `:4078-4091` | one transaction | before the name advisory lock; exact |
+| One transaction | file PATCH and skill POST with an idempotency key | `company-skills.ts:1171`, `:1242` | one outer transaction; the transaction-scoped service runs inside it | before the receipt lock and `projectToolContext`; exact |
+| One transaction | `createLocalSkill` | svc `:4513` | one transaction. With a GitHub or skills.sh fork source it reads the source files over the network inside it (`:4529`, `readLoadedSkillFile` `:4381-4406`) | first statement; S1 reads the source files before it opens the transaction, so no share lock is held across a fetch; exact |
+| One transaction | `createVersion` | svc `:3626-3678` (`db.transaction(persist)` at `:3678`) | its own transaction when no `database` is passed; a caller that passes one already holds the read | first statement of `persist`; exact. A test-run start reaches it through `ensureRunSkillVersion` (`:6589`) |
+| One transaction | `updateSkill` | svc `:4427-4478` | one `UPDATE` statement today; S1 runs the select and the update in one transaction | first statement; exact |
+| One transaction | `deleteSkill` | svc `:7150-7206`, transaction at `:7180`, inside `removeRuntimeSkillCache` | one transaction; the cache file lock is taken outside it and holds no database lock | first statement of the transaction; exact |
+| One transaction | managed-source create and refresh (`publish`) | `skill-sources.ts:150-164`, `:174-190`; `importFromUrl` `:216-253` fetches first | the scan runs before the transaction; the transaction takes the source row `FOR UPDATE` at `:187` | before the source row lock; exact |
+| One transaction | S2 apply by an agent approver | section 4.8 | one outer transaction | first statements; exact |
+| Not one transaction | `installFromCatalog`, `installUpdate`, `resetSkill` | svc `:5714`, `:4828`, `:4948` | files are copied, then rows are written on the pool (`:5776-5785` then `:5836-5847`; `:4889` then `:4916`; `:5006` then `:5010`). `installUpdate` fetches first (`updateStatus` `:4833`, `:4333`; re-import `:4939`) | after the fetch, before the first copy; window to the row write |
+| Not one transaction | `upsertImportedSkills` and its pool callers: `importFromSource`, `scanProjectWorkspaces`, `importPackageFiles` (so a plugin's reset, the built-in agents' reconcile and reset, company import and the shipped-team install) | svc `:6250`, `:6338`, `:5107`, `:6111` | one group of statements per skill, no transaction. `importFromSource` fetches first (`:6351`) | per row, after the fetch, before that row's write; window per row |
+| Not one transaction | `forkSkill` | svc `:3981` | the new row, its first version and the reassignments are separate writes; it reads the source files first (`:4001`, network for a GitHub source) | after the fetch, before the first write; window |
+
+"Exact" means exact while the feature is on. A change from off to on is a window at every site, because a write that read `off`
+took no lock; so is the very first enable.
 
 **Plugin-managed skills (the reachable writer the first draft missed).** A plugin's `reset` replaces a skill's files by key,
 and it is reachable by any authenticated actor through the plugin bridge (section 2.1). It never asks the skill policy, so
@@ -683,8 +660,8 @@ import, scan-projects, install-update, catalog install and the shipped-team inst
   by key (svc `:5728`) and overwrites it when the same catalog entry has a changed hash, or when `force` is set
   (svc `:5734` onward). An agent could therefore move a protected catalog skill to newer shipped bytes.
 
-The routes build the principal from `req.actor` and enter `withProtectionGuard` once (rules 1 to 3 above), with the commit phase of the site inside it. `upsertImportedSkills` and `installFromCatalog` call `guard.assertWritable(existingRow)` as soon as they have resolved the row by key, and before the first disk or database write. For `installFromCatalog` that is before the `__catalog__`
-files are written (svc `:5776-5785`), not before its row write; the same holds for install-update's catalog branch and for reset. `importPackageFiles` needs a reorder first (below). The sites that pass a principal are: import, scan-projects, install-update, catalog install, the shipped-team install
+The routes build the principal from `req.actor` and pass it down. `upsertImportedSkills` and `installFromCatalog` read the protection settings and call `assertWritable(existingRow)` as soon as they have resolved the row by key, after any fetch and before the first disk or database write. For `installFromCatalog` that is before the `__catalog__`
+files are written (svc `:5776-5785`), not before its row write; the same holds for install-update's catalog branch and for reset. `importPackageFiles` has a defect that its own PR fixes first (below). The sites that pass a principal are: import, scan-projects, install-update, catalog install, the shipped-team install
 (`server/src/services/teams-catalog.ts:880`, `:892` call `installFromCatalog` and `importFromSource` with no actor; its route
 requires `agents:create`, `server/src/routes/teams-catalog.ts:36-60`, so an agent can reach it), company import, the
 built-in agents' reconcile and reset, and the plugin path above. Bundled boot seeding passes `system`. Fork and create make
@@ -694,26 +671,41 @@ existing row outside the board's full mode (it skips or renames, `server/src/ser
 The guards do not replace the import follow-up of section 8.1, which everyone else still needs. The bridge does not admit
 import for sandbox runs today (#13 kept it human-only).
 
-**`importPackageFiles` writes to disk before it decides (a defect on `main`, and the guard cannot sit behind it).** For an
-inline package with no provenance in its frontmatter, `sourceType` is `catalog` (svc `:1059-1067`), and the only key refusal is
-for `paperclipai/paperclip/` keys (`assertImportedSkillKeyAllowed`). `importPackageFiles` then calls
-`materializeCatalogSkillFiles` for each such skill (svc `:6131-6137`), which runs `fs.rm` on
-`__catalog__/<buildSkillRuntimeName(key, slug)>` and rewrites it from the package (svc `:5497-5518`). That happens before
-conflict resolution (`:6139-6228`) and before `upsertImportedSkills` (`:6232`), **and in `skip` mode**. The live directory of an
-installed catalog skill is that same path (svc `:4884-4888`, `:5568`), and a package can name its key through its frontmatter
-metadata (`deriveCanonicalSkillKey`, svc `:650-657`). So a package whose key and slug equal an installed catalog skill's
-rewrites that skill's live files while the import reports it as skipped, and the runtime reads the live directory. The
-agent-safe company import (`server/src/routes/companies.ts:1189-1199`, open to the company's CEO agent, and it forbids only
-`replace`) reaches it; so do the built-in agents' and the plugin's resets, which call the same function. I read this from the
-code and did not run it.
+**`importPackageFiles` writes to disk before it decides (a defect on `main` that its own PR fixes first).** For an inline
+package with no provenance in its frontmatter, `sourceType` is `catalog` (svc `:1059-1067`), and the only key refusal is for
+`paperclipai/paperclip/` keys (`assertImportedSkillKeyAllowed`). `importPackageFiles` then calls `materializeCatalogSkillFiles`
+for each such skill (svc `:6131-6137`), which runs `fs.rm` on `__catalog__/<buildSkillRuntimeName(key, slug)>` and rewrites it
+from the package (svc `:5497-5518`). That happens before conflict resolution (`:6139-6228`) and before `upsertImportedSkills`
+(`:6232`), **and in `skip` mode**. The live directory of an installed catalog skill is that same path (svc `:4884-4888`, `:5568`),
+and a package can name its key through its frontmatter metadata (`deriveCanonicalSkillKey`, svc `:650-657`). So a package whose
+key and slug equal an installed catalog skill's rewrites that skill's live files while the import reports it as skipped, and the
+runtime reads the live directory. The agent-safe company import (`server/src/routes/companies.ts:1189-1199`, open to the
+company's CEO agent, and it forbids only `replace`) reaches it; so do the built-in agents' and the plugin's resets, which call
+the same function. I read this from the code and did not run it.
 
-- S1 resolves each incoming skill's conflict row, by key and by slug, before anything is written; calls
-  `guard.assertWritable(row)` on every row the chosen strategy will overwrite; and moves the materialization after conflict
-  resolution, for the persisted entries only, under their final key and slug.
-- That changes behavior on `main` for `skip` and `rename`: they stop rewriting the existing skill's catalog directory (a renamed
-  entry today gets a `sourceLocator` that points at the directory of the skill it was renamed to avoid, when that skill is a
-  catalog skill with the same key and slug). It is a defect fix that the guard needs, not a change of intent. S1 adds a test that
-  fails today (section 7), and the review should name who owns `importPackageFiles`.
+- **This plan does not carry the fix.** It is a small PR of its own, owned by the author of this plan, and it lands **before S1**
+  (the manager's ruling of 2026-10-10 at 20:25 UTC). It starts with a test that fails today: an import in `skip` mode and one in
+  `rename` mode, with a package whose key and slug equal an installed catalog skill's, must leave that skill's directory and row
+  byte-identical. The change resolves each incoming skill's conflict row first and writes the `__catalog__` directory only for the
+  entries that are persisted, under their final key and slug. It changes behavior on `main` for `skip`, for `rename`, and for a
+  `replace` onto a row with a different key (that row then points at the existing skill's directory, not at the incoming key's).
+- **What S1 adds on top** is one check: between conflict resolution and the directory write, `assertWritable` on every row a
+  `replace` will overwrite. S1 depends on the fix PR, and the review should name who owns `importPackageFiles`.
+
+**A second row over the same directory (the alias).** Protection is by skill id, but the live bytes are a directory.
+`POST /skills/import` of a local path is allowed under the company's managed-skills root (`assertLocalImportSourceAllowed`, svc
+`:2960-2988`), and a directory import is keyed `local/<hash(path)>/<slug>` (svc `:683-690`) while a managed skill's key is
+`company/<companyId>/<slug>` (svc `:684-685`). The by-key guard therefore finds no row. `upsertImportedSkills` inserts a second row
+whose `sourceLocator` is the protected skill's directory; the only unique index is `(companyId, key)`
+(`packages/db/src/schema/company_skills.ts:55`); and every `local_path` row is editable (`deriveSkillSourceInfo`, svc
+`:2745-2766`), so `updateFile` writes through the new row into the protected skill's directory (svc `:4695-4712`). The new row has
+a different id, so under `skillIds` it is not protected; `all: true` covers only rows created after it is set. I read this and did
+not run it. Rule for S1: while the settings are enabled, the protected set is resolved to directories (`normalizeSkillDirectory`,
+real path) when the check runs, and `assertWritable` refuses a write by an `other` principal to any row whose directory equals,
+contains or lies inside the directory of a protected row. `upsertImportedSkills`, `scanProjectWorkspaces`, `createLocalSkill` and
+`forkSkill` also refuse to create or re-point a row onto such a directory (a "same directory, different key" check beside the
+by-key one). A symlink in a project workspace that points into the managed root is not covered and belongs to the filesystem limit
+below.
 
 **Test runs.** A test-run start cuts a head version labelled "Auto version for test run" whenever the files on disk differ
 from the head snapshot (`ensureRunSkillVersion`, svc `:6589-6604`, called by `createTestRun`, svc `:6710`). On a protected
@@ -984,18 +976,20 @@ options (`server/src/app.ts:666-667`), so the implementation passes `deploymentM
 | T19 | The diff hides an invisible character or a homoglyph | Invisible and control characters are refused in the text (4.7). Homoglyphs are not refused; the rendered diff escapes non-ASCII characters (4.14) |
 | T20 | An agent with file access edits a protected skill's files directly, or edits them and starts a test run so the edit becomes the head | **Partly accepted in S1.** The test-run start is refused on drift (4.9); an edit to `SKILL.md` makes pending proposals stale; settings report where each protected skill lives. The edit itself is not preventable at the API; S3 can serve protected skills from the head snapshot (Q15). State-driven too: `reconcileLocalPathSkillSources` deletes an unused `local_path` row whose directory is missing (svc `:3205-3208`), so an agent that removes the directory removes the row; S3 can make it mark a protected skill missing instead (2.3) |
 | T21 | An agent replaces a protected plugin-managed skill through a plugin action, which never asks the skill policy | The plugin-call principal and the guard in `upsertImportedSkills`; positive person attribution on the invocation; unattributed calls are refused (4.9, "Plugin-managed skills"). Limit: the worker supplies the invocation id, so a hostile worker could echo a person's; the guard stops an agent reaching an action, not a compromised worker |
-| T22 | A board protects a skill between a writer's check and its write, or a settings change races a write | `withProtectionGuard`, entered once at the outermost entry of the write (before every other lock, after every network call), holds a shared per-company key on a dedicated connection for the commit phase of every `other` write; the settings write takes it exclusively (4.9) |
+| T22 | A board protects a skill between a writer's check and its write, or a settings change races a write | In the sites that are one transaction, the `other` write reads the settings row `FOR SHARE` as the first statement of its own transaction and the settings `UPDATE` waits for those readers. Where a write is not one transaction there is a stated window: a write that started before the change committed counts as pre-change (4.9, table). While the feature is off, writes take no lock |
 | T23 | The model family is read from a config that the agent can edit | The inputs are self-protected on the agent row (4.10), but a task issue's adapter override can set them for a run, so the snapshot merges that override as the run does; the values are snapshotted at submit and at decision; the rule is advisory; the override gap is a named dependency (8.1) |
 | T24 | An agent with `agents:create` resets, reconciles or provisions a built-in agent, and the replace overwrites a protected skill that shares the bundle's key or slug | The built-in agents carry the request principal, not `system` (4.9) |
-| T25 | A package import rewrites an installed catalog skill's live files before any conflict check, in `skip` mode too, so an agent reaches a protected skill's bytes without a refused write | S1 resolves conflicts first, guards the rows it will overwrite and materializes only the persisted entries (4.9, "`importPackageFiles` writes to disk before it decides") |
-| T26 | The protection lock stalls or exhausts the server: a lock holder borrows the shared pool, a nested wrapper queues behind the settings write, the receipt lock or a run lock is held while waiting for the key, or a network call runs inside the key | Dedicated connection and an in-process semaphore; one wrapper per write, entered before every other lock; nested sites take the guard; fetch phase outside, commit phase inside (4.9). Tested at the default pool of 10 (section 7) |
+| T25 | A package import rewrites an installed catalog skill's live files before any conflict check, in `skip` mode too, so an agent reaches a protected skill's bytes without a refused write | The separate `importPackageFiles` fix PR, which lands before S1, resolves conflicts first and writes persisted entries only; S1 adds the check on the rows a `replace` overwrites (4.9) |
+| T26 | The settings read stalls or deadlocks writers, or the settings change hangs or is starved | The reads are the first statements of the transaction, so a waiter holds nothing; sites on the pool only read plainly; the `PUT` has a 5-second `lock_timeout` and answers 409; a company that never enabled the feature has no row and takes no lock. Tested with the `UPDATE` queued (section 7) |
+| T27 | A second row over a protected skill's directory (an import of the managed directory under a different key) is edited instead | `assertWritable` compares directories, and the sites that create or re-point a row refuse a protected directory (4.9, "A second row over the same directory") |
 
 ## 6. Slices
 
-Each slice ships web, API, CLI and tests, and lands single after review (security gate). The feature is off for every company until `enabled` is set, so no refusal and no proposal exists until a board turns it on. S1 is not behavior-neutral in two named ways: agent-authored skill writes pay the wrapper's cost even while the feature is off (4.9, "Cost and failure mode", Q17), and `importPackageFiles` stops rewriting an existing skill's directory in `skip` and `rename` mode (4.9). S2 and S3 add no behavior change while the feature is off.
+Each slice ships web, API, CLI and tests, and lands single after review (security gate). The feature is off for every company until `enabled` is set, so each slice ships without a change in behavior for a company that never enables it: an agent's skill write does one plain select of a settings row that does not exist, and takes no lock (4.9). The one behavior change on `main` is the `importPackageFiles` fix, and it is its own PR (below).
 
+- **Before S1: the `importPackageFiles` fix (not one of this plan's slices).** A separate small PR, owned by the author of this plan, that lands before S1: the failing test first (`skip` and `rename` must not rewrite an existing skill's directory), then the reorder of section 4.9. S1 does not start before it has landed.
 - **S1: propose, humans decide and apply, revert, protected skills.** Tables and migration; `skills.propose`; settings
-  (without agent approval), including `humanApprovers` and `protectedSkills`; a **required** `guard` parameter on every write site of section 2.3; `withProtectionGuard`, entered once at the outermost entry of each `other` write on a dedicated connection with an in-process semaphore, with the shared protection key taken first, and the exclusive side in the settings write; the fetch phase and commit phase split of the sites that use the network; the `importPackageFiles` reorder; the route-gate check in `assertCanMutateCompanySkills`; the
+  (without agent approval), including `humanApprovers` and `protectedSkills`; a **required** `principal` parameter on every write site of section 2.3; the settings reads (a share lock in the write's own transaction for the sites that are one, a plain read after any fetch for the others, section 4.9) and the `PUT` with its `lock_timeout`; the directory check for alias rows; the check on the rows that a `replace` import overwrites; the fork-source read of `createLocalSkill` moved before its transaction; the route-gate check in `assertCanMutateCompanySkills`; the
   guards in `upsertImportedSkills` and `installFromCatalog` and the principal passed from every route that calls them
   (import, scan-projects, install-update, catalog install, the shipped-team install, company import, the built-in agents'
   reconcile and reset); the guard in `publish` for managed sources; the plugin person attribution
@@ -1057,20 +1051,16 @@ are additive. Applied changes stay as ordinary versions.
 - Write sites: one table-driven test over the sites of section 2.3 asserts that a protected skill is refused for `other` and
   allowed for `person` and for `system` (boot seeding only), and that on refusal **nothing is written to disk or to the
   database**, including for catalog install, install-update's catalog branch, reset and delete, which copy or remove files
-  before their row write. A type-level test fails to compile a call to any write site without a guard, or with a hand-built guard object; a guard made for one company is refused for another company's row, and a guard used after its wrapper returned is refused.
+  before their row write. A type-level test fails to compile a call to any write site without a principal.
 - Built-in agents: an agent with `agents:create` resets, reconciles or provisions a built-in agent whose bundle key or slug matches a protected skill, and the call is refused with the skill unchanged; a board user's call succeeds.
-- Import ordering: the agent-safe company import, in `skip` mode and in `rename` mode, with a package whose key and slug equal an installed catalog skill's (protected or not) leaves that skill's files and row byte-identical (this fails today); in `replace` mode a board user's import still replaces it; a package with a new key still imports; the built-in agents' and the plugin's resets refuse a protected skill before the first write.
+- Import (S1 only; the `skip` and `rename` tests belong to the `importPackageFiles` fix PR): an `other` principal's `replace` import over a protected skill (the built-in agents' reset, a plugin's reset) is refused before the first write, with the directory and the row untouched; a package with a new key still imports.
+- Alias rows: as an `other` principal, importing a protected managed skill's own directory is refused and creates no row; so are `createLocalSkill` and a fork onto it; `PATCH …/files` through an existing alias row of a protected directory is refused; the same import by a person succeeds; a protected skill and an unrelated sibling directory with a common name prefix are told apart (a path prefix is not containment).
 - Plugin-managed skills: an agent invokes a plugin's reset action through `POST /api/plugins/:pluginId/bridge/action`
   against a protected plugin-managed skill, and the host mutation refuses with 403 `skill_protected_use_proposal` and the skill
   is unchanged; a board user's call succeeds; a plugin's own timer call (no invocation id) is refused; a worker that omits the
   invocation id during a live invocation is refused; an unprotected skill still resets for an agent as it does today;
   `reconcile` with the row present relinks without writing; the activity entry carries `callerKind`.
-- Settings-to-write race, deterministic with barriers: (a) a writer passes the check and holds the shared key, the settings
-  write starts and waits, the writer commits, the settings write commits: the write landed; (b) the settings write commits
-  first, the writer is refused and the file on disk is unchanged; (c) the same pair for the file PATCH, a managed-source
-  refresh (authorize, then protect, then publish: refused), an import, a catalog install, install-update and reset; (d) a
-  three-way barrier with a multi-row writer (a managed-source refresh that updates two skills), a single-row writer on the
-  second skill, and the settings write: no deadlock and no 40P01; (e) no deadlock between a writer and `deleteSkill`; (f) at the default pool of 10, twenty concurrent `other` writes (each with a body that needs a second connection, among them a rename and a delete that wait on the runtime-cache file lock, `runtime-skill-cache.ts:216-230`) all finish, and a plain request still gets a connection during the burst; (g) a nested site (install-update, fork, a test-run start, a plugin reset, an S2 apply) completes while a settings write is queued for the exclusive key: no cycle; (h) the idempotent file PATCH and skill POST with a run context, with the settings write queued: the writer takes the key before the receipt lock and before the run lock, and a second request that needs the same run lock does not deadlock; (i) a fetch that stalls (a source refresh whose scan hangs) does not delay a settings write or another agent's skill write, because the key is not held during the fetch.
+- Settings-to-write race, deterministic with barriers, on the sites of the first group of section 4.9: (a) a writer has read the settings `FOR SHARE` and has not committed, the settings `UPDATE` starts and waits, the writer commits, the `UPDATE` commits: the write landed; (b) the `UPDATE` commits first, the writer then reads the new settings and is refused, and the file on disk is unchanged; (c) the same pair for each site of that group (file PATCH with and without an idempotency key, rename, delete, versions, skill patch, managed-source create and refresh, create, S2 apply); (d) with the `UPDATE` queued, a multi-row writer (a managed-source refresh that updates two skills), a single-row writer on the second skill, and a nested call inside a transaction of the group all finish, in every arrival order: no deadlock and no 40P01; (e) a share holder that does not finish makes the `PUT` answer 409 `skill_settings_busy` after 5 seconds, and nothing changes; (f) a company with no settings row, or with `enabled = false`: an `other` write takes no row lock (assert with `pg_locks`) and behaves as before; (g) the documented windows, written as such and not as bugs: a window site (catalog install, install-update, reset, import, fork) whose read ran before the `UPDATE` committed completes, and one whose read runs after is refused; the first enable and a re-enable behave the same way; (h) no transaction of the group holds a network call before its share read: a stalled fetch (a source refresh whose scan hangs, a fork from a GitHub source) does not delay the `PUT`; (i) the idempotent file PATCH and skill POST with a run context, with the `UPDATE` queued: the share read comes before the receipt lock and the run lock, and a second request that needs the same run lock does not deadlock.
 - Logs: the predicate matches the listed routes for POST, PUT and PATCH and no others; a sentinel string placed in the
   markdown never appears in any log line or crash-report payload on a route-level 422 (too large), 409 (stale), 403
   (protected) and a forced 500 from a database error, nor on a 413; malformed JSON gives the constant response.
@@ -1084,7 +1074,7 @@ are additive. Applied changes stay as ordinary versions.
 ## 8. Questions and decisions
 
 The manager answered Q1 to Q12 on 2026-10-10 at 17:09 UTC. Every recommendation of the first draft stood. The notes
-below say what each answer means for the build. Q13 to Q15 are new, raised by the independent review; Q16 and Q17 came later.
+below say what each answer means for the build. Q13 to Q17 are new, raised by the independent reviews. All are decided: Q14 and Q15 at 18:11 UTC, Q13, Q16 and Q17 at 20:25 UTC.
 
 - **Q1. Meaning of "protected skills".** **Decided:** a skill on the list is decided by the board only. Agent approval
   never applies to it. *Design note:* the first draft made this a rule about approvers only. The review showed that it
@@ -1114,7 +1104,7 @@ below say what each answer means for the build. Q13 to Q15 are new, raised by th
   clear message, and the check runs before any database write (section 4.7).
 - **Q12. Human approver bar.** **Decided:** any active non-viewer member in S1. Turning the feature on and every approver
   setting are person-only. A board tightens the bar to owner or admin by editing `humanApprovers.roles` (section 4.6).
-- **Q13. Who may author a proposal in S1.** *New; the manager has not decided it.* Recommendation: agents only. A person can already edit directly, and a
+- **Q13. Who may author a proposal in S1.** **Decided on 2026-10-10 at 20:25 UTC: yes, only agents author proposals in S1.** A person can already edit directly, and a
   person's proposal in a one-person company cannot be approved by anyone else (the approver is never the author). Revisit
   if a company wants a person's change reviewed by a second person.
 - **Q14. `local_trusted` deployments.** *New; confirmed on 2026-10-10 at 18:11 UTC: the review is advisory, say so at enable, record `actorSource`.* Recommendation: report `gateEffective: false`, require an explicit
@@ -1129,13 +1119,11 @@ below say what each answer means for the build. Q13 to Q15 are new, raised by th
   `readLoadedSkillFile` branch (svc `:4361-4367`), which is keyed on `metadata.skillSourceId` and a snapshot hash that
   `local_path` skills do not have. It is not in S1.
 
-- **Q16. Who may reset a protected plugin-managed skill.** *New, from the captain's review; needs a decision.*
-  Recommendation: only a reset that a person started (section 4.9). The alternative is to exempt plugin-managed skills from
-  protection, which is simpler and leaves the plugin path as the one way for an agent to change a protected skill. The
-  recommendation also changes the plugin runtime (a positive person attribution beside the agent one), so the plugin
+- **Q16. Who may reset a protected plugin-managed skill.** **Decided on 2026-10-10 at 20:25 UTC: yes.** Only a reset that a person started may replace a protected plugin-managed skill (section 4.9). It is listed as a dependency (section 8.1, item 7), so the plugin-runtime owner agrees to it in review. The alternative is to exempt plugin-managed skills from
+  protection, which is simpler and leaves the plugin path as the one way for an agent to change a protected skill. The decision also changes the plugin runtime (a positive person attribution beside the agent one), so the plugin
   runtime's owner should agree.
 
-- **Q17. The protection lock while the feature is off.** *New, from the sixth review pass; needs a decision.* Recommendation: always take the key for an `other` write, as section 4.9 says. It costs every agent-authored skill write one dedicated connection and a settings read, and adds the 503 `skill_write_busy` failure mode, in every company, and it keeps the invariant exact at the moment a board enables and protects. The alternative reads `enabled` unlocked and takes the key only when it is true. It makes S1 behavior-neutral for companies that never enable the feature, but a write that read `enabled = false` just before the enabling change can still commit after it.
+- **Q17. The protection lock while the feature is off.** **Decided on 2026-10-10 at 20:25 UTC: no always-on lock.** A semaphore plus a dedicated connection on every agent skill write adds a new 503 failure mode and pool pressure for every company, including those that never enable the feature, and the server is in a capacity incident. When the feature is off, a write takes no lock. The race is closed with the settings row, read `FOR SHARE` in the write's own transaction, and the enabling `UPDATE` waits for those readers (section 4.9). Where a write is not one transaction the plan states the window: a write that started before the enable committed counts as pre-enable.
 
 ### 8.1 Dependencies named, not fixed
 
@@ -1162,8 +1150,9 @@ These exist on `main`. This plan does not change them, and its guarantees are we
 6. **Issue adapter overrides are not checked for protected keys.** `assigneeAdapterOverrides.adapterConfig` accepts any key and
    wins over the agent's configuration for that task's runs (`heartbeat.ts:22320-22325`, `:23197-23199`;
    `validators/issue.ts:297-302`); the only check is for workspace command paths (`workspace-command-authz.ts:121-152`). S2
-   reads the merged value (section 4.10), but an agent can still choose its own model for a task. Follow-up: run the
-   self-protected-key check on issue overrides.
+   reads the merged value (section 4.10), but an agent can still choose its own model for a task. Follow-up: run the self-protected-key check on issue overrides.
+7. **The plugin runtime must agree to a person attribution (Q16).** S1's positive person attribution on the plugin invocation record changes the plugin runtime (`plugin-worker-manager.ts`, `plugin-host-call-actor.ts`). Its owner must agree to it in review before S1 lands. Without it, a protected plugin-managed skill could not be reset by anyone, because an unattributed call is refused.
+8. **The `importPackageFiles` fix** is its own PR and lands before S1 (section 4.9). S1 depends on it and does not carry it.
 
 ## Appendix A. Code anchors checked on `main` at `38819d350`
 
@@ -1227,7 +1216,7 @@ These exist on `main`. This plan does not change them, and its guarantees are we
   `:23197-23199`; issue override schema `packages/shared/src/validators/issue.ts:297-302`;
   `server/src/routes/workspace-command-authz.ts:121-152`; plugin invocation trust comment
   `server/src/services/plugin-worker-manager.ts:1250-1262`; error handler constant 500 `server/src/middleware/error-handler.ts:182-188`
-- Sixth-pass additions: pool and dedicated connection `packages/db/src/client.ts:139`, `:215`, `:247`, `:257-268`; `docs/deploy/database.md:73-74`; `doc/DATABASE.md:126`; precedent `server/src/services/native-runtime/native-workspace-finalization-ownership.ts:67`; idempotent routes `server/src/routes/company-skills.ts:1171-1178`, `:1242-1255`; run locks `server/src/services/run-identity.ts:431-448`; `server/src/services/project-tool-context.ts:8-28`; cache lock `server/src/services/runtime-skill-cache.ts:180-231`; `importPackageFiles` ordering svc `:1059-1067`, `:5497-5518`, `:6111-6232`, live catalog directory `:4884-4888`, `:5568`, key derivation `:650-657`; agent-safe import `server/src/routes/companies.ts:1189-1199`; source refresh network call `server/src/services/skill-sources.ts:174-181`; reconcile svc `:3138-3231`; built-in agents `built-in-agents.ts:1204-1230`, `:1605-1622`, `:1723-1830`, `:1831-1955`, `:1978-1988`, `:2105`, routes `:266`, `:287`, `:319`; native config merge `server/src/services/heartbeat.ts:25714-25726`
+- Sixth- and seventh-pass additions: transaction boundaries svc `:3626-3678`, `:4078-4091`, `:4427-4478`, `:4513`, `:4639-4664`, `:4679`, `:4763`, `:7150-7206` (`:7180`); `server/src/services/skill-sources.ts:150-164`, `:174-190`, `:216-253`; idempotent routes `server/src/routes/company-skills.ts:1171-1178`, `:1242-1255`; run locks `server/src/services/run-identity.ts:431-448` (`.for("no key update")` at `:448`); `server/src/services/project-tool-context.ts:8-28`; `importPackageFiles` ordering svc `:1059-1067`, `:5497-5518`, `:6111-6232`, live catalog directory `:4884-4888`, `:5568`, key derivation `:650-657`; alias rows svc `:683-690`, `:2745-2766`, `:2960-2988`, `:4695-4712`, `packages/db/src/schema/company_skills.ts:55`; agent-safe import `server/src/routes/companies.ts:1189-1199`; network sites svc `:4001`, `:4333`, `:4381-4406`, `:4529`, `:4833`, `:4939`, `:6351`, `skill-sources.ts:150`, `:181`; reconcile svc `:3138-3231`; built-in agents `built-in-agents.ts:1204-1230`, `:1605-1622`, `:1723-1830`, `:1831-1955`, `:1839-1841`, `:1978-1988`, `:2051-2073`, `:2105`, `:2118`, routes `:266`, `:287`, `:319`; `server/src/services/approvals.ts:28`, `:159`; `server/src/services/companies.ts:382`; native config merge `server/src/services/heartbeat.ts:25714-25726`
 - Model of record: `packages/db/src/schema/heartbeat_runs.ts:42-43`, `:96`; `server/src/services/agent-self-config-authz.ts:12-48`,
   `:227-228`; `packages/shared/src/ai-connections.ts` (providers)
 - Logging: `server/src/middleware/redact-sensitive.ts:14-93`, `:137-157`; `server/src/middleware/logger.ts:170-179`,
