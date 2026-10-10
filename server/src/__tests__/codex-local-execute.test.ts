@@ -980,6 +980,62 @@ process.exit(1);
     }
   });
 
+  it("does not classify capacity wording from tool output or stderr as provider quota", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-tool-capacity-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    await fs.mkdir(workspace, { recursive: true });
+    // A task's command prints provider wording; Codex itself reports no error event.
+    const script = `#!/usr/bin/env node
+console.log(JSON.stringify({ type: "thread.started", thread_id: "thread-tool-capacity" }));
+console.log(JSON.stringify({
+  type: "item.completed",
+  item: { id: "item-1", type: "command_execution", command: "make", aggregated_output: "Selected model is at capacity", exit_code: 1, status: "failed" },
+}));
+console.error("You've hit your usage limit. usage limit reached");
+process.exit(1);
+`;
+    await fs.writeFile(commandPath, script, "utf8");
+    await fs.chmod(commandPath, 0o755);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    await seedSharedCodexAuth(root);
+
+    try {
+      const result = await execute({
+        runId: "run-tool-capacity",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          model: "gpt-5.3-codex",
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).not.toBe("provider_quota");
+      expect(result.errorFamily).not.toBe("provider_quota");
+      expect(result.resultJson?.errorFamily).not.toBe("provider_quota");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies Codex refresh-token auth failures without credential telemetry", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-refresh-token-"));
     const workspace = path.join(root, "workspace");

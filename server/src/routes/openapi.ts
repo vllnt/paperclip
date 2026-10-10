@@ -308,6 +308,7 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  observabilityHealthSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -4146,7 +4147,11 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List scored duplicate candidates recorded for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    404: { ...r.notFound, description: "Issue not found, or it belongs to another company" },
+  },
 });
 
 registry.registerPath({
@@ -5359,6 +5364,19 @@ registry.registerPath({
     body: jsonBody(createCostEventSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/health",
+  tags: ["observability"],
+  summary: "Usage collector health for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(observabilityHealthSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registry.registerPath({
@@ -6915,6 +6933,15 @@ registry.registerPath({
     "the next wake is allowed.",
   request: { params: z.object({ companyId: z.string() }), query: heartbeatRunStatsQuerySchema },
   responses: { 200: r.ok(heartbeatRunStatsSchema), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/deferred-wakes",
+  tags: ["runs"],
+  summary: "Get deferred-wake queue health for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({

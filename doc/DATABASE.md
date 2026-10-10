@@ -39,6 +39,8 @@ pnpm issue-references:backfill -- --company <company-id>
 
 Future issue, comment, and document writes sync references automatically without running the backfill command.
 
+Run usage records (`run_usage_records`) are written by a background worker for runs that finish after the migration. To write them for older runs, run `pnpm observability:backfill`. See `doc/run-usage-records.md`.
+
 This mode is ideal for local development and one-command installs.
 
 Docker note: the Docker quickstart image also uses embedded PostgreSQL by default. Persist `/paperclip` to keep DB state across container restarts (see `doc/DOCKER.md`).

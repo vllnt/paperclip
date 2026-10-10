@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   createCostEventSchema,
@@ -21,6 +21,7 @@ import {
   logActivity,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertCompanyScopeReadAllowed } from "./company-scope-read.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -72,15 +73,8 @@ export function costRoutes(
     return issues.getById(rawId);
   }
 
-  async function assertCompanyCostReadAllowed(req: Parameters<typeof assertCompanyAccess>[0], res: any, companyId: string) {
-    const decision = await access.decide({
-      actor: req.actor,
-      action: "company_scope:read",
-      resource: { type: "company", companyId },
-    });
-    if (decision.allowed) return true;
-    res.status(403).json({ error: "Costs are outside this actor's authorization boundary" });
-    return false;
+  async function assertCompanyCostReadAllowed(req: Parameters<typeof assertCompanyAccess>[0], res: Response, companyId: string) {
+    return assertCompanyScopeReadAllowed(access, req, res, companyId, "Costs are outside this actor's authorization boundary");
   }
 
   async function assertIssueCostReadAllowed(req: Parameters<typeof assertCompanyAccess>[0], res: any, issue: {
