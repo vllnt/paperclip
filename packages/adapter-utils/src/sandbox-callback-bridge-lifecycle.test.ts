@@ -20,6 +20,16 @@ const BRIDGE_TOKEN = "lifecycle-test-token";
 // The stop proves a process is the bridge through /proc, or through ps where
 // there is no /proc (macOS). A few tests read /proc themselves.
 const HAS_PROC = existsSync("/proc/self/stat");
+// The launch makes the bridge lead its own process group only with `setsid`
+// (not on macOS).
+const HAS_SETSID = (() => {
+  try {
+    execFileSync("/bin/sh", ["-c", "command -v setsid"]);
+    return true;
+  } catch {
+    return false;
+  }
+})();
 const HAS_PS = (() => {
   try {
     execFileSync("/bin/sh", ["-c", "command -v ps"]);
@@ -219,7 +229,7 @@ describe("sandbox callback bridge process lifetime", () => {
     await pending;
   }, 60_000);
 
-  it("starts the bridge as the leader of its own process group, tagged with its run and start", async () => {
+  it("starts the bridge tagged with its run and start, leading its own process group where setsid exists", async () => {
     const { bridge } = await startBridge();
 
     let processGroup: number;
@@ -232,7 +242,7 @@ describe("sandbox callback bridge process lifetime", () => {
       processGroup = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim());
       command = execFileSync("ps", ["-ww", "-o", "command=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim().split(" ");
     }
-    expect(processGroup).toBe(bridge.pid);
+    if (HAS_SETSID) expect(processGroup).toBe(bridge.pid);
     expect(command).toContain(`--paperclip-run-id=${RUN_ID}`);
     expect(command.some((arg) => /^--paperclip-bridge-instance=[0-9a-f-]{36}$/.test(arg))).toBe(true);
     if (HAS_PROC) {

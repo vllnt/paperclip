@@ -66,12 +66,20 @@ async function createRoot(options: { ignoreTerm?: boolean } = {}): Promise<strin
   return root;
 }
 
-// Launches `node entry.cjs <tag>` the way a launch script does and returns its record.
+// Launches `node entry.cjs <tag>` the way a launch script does and returns
+// its record. Like the bridge launch, it makes a process group only where
+// `setsid` exists (not on macOS).
 async function launch(mode: Mode, root: string, tag: string): Promise<{ identity: RemoteProcessIdentity; argv: string[] }> {
   const argv = ["node", path.join(root, "entry.cjs"), tag];
+  const command = `${argv.map((arg) => `'${arg}'`).join(" ")} >/dev/null 2>&1 < /dev/null &`;
   const { stdout } = await runScript(forMode(mode, root, [
-    "group=1",
-    `nohup setsid ${argv.map((arg) => `'${arg}'`).join(" ")} >/dev/null 2>&1 < /dev/null &`,
+    "group=0",
+    "if command -v setsid >/dev/null 2>&1; then",
+    `  nohup setsid ${command}`,
+    "  group=1",
+    "else",
+    `  nohup ${command}`,
+    "fi",
     "pid=$!",
     ...buildRemoteProcessRecordLines(),
   ].join("\n")), root);
