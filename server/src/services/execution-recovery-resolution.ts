@@ -1,6 +1,7 @@
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import { claimedAdapterType, conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import { uuidColumnEqualsText } from "./uuid-text.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
@@ -360,7 +361,7 @@ export async function settleUnrecoverableExecutions(
       heartbeatRuns,
       and(
         eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
-        sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'`,
+        uuidColumnEqualsText(heartbeatRuns.id, sql`${issueRecoveryActions.evidence}->>'runId'`),
         sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text`,
       ),
     )
