@@ -62,6 +62,29 @@ export const routineVariableSchema = z.object({
   }
 });
 
+/** Values of the routine list `trigger` filter: a trigger kind, or `manual` for a routine with no trigger. */
+export const ROUTINE_LIST_TRIGGER_FILTERS = [...ROUTINE_TRIGGER_KINDS, "manual"] as const;
+export type RoutineListTriggerFilter = (typeof ROUTINE_LIST_TRIGGER_FILTERS)[number];
+
+const emptyToUndefined = (value: unknown) => (value === "" ? undefined : value);
+
+/**
+ * Query of `GET /companies/:companyId/routines`. Every filter is optional and they combine with AND;
+ * with none set the list is unchanged. Unknown parameters are ignored, as before.
+ */
+export const listRoutinesQuerySchema = z.object({
+  /** Case-insensitive text matched against the title and the description. */
+  q: z.preprocess(emptyToUndefined, z.string().trim().min(1).max(200).optional()),
+  assigneeAgentId: z.preprocess(emptyToUndefined, z.string().uuid().optional()),
+  /** A folder id, or `none` for routines in no folder. */
+  folderId: z.preprocess(emptyToUndefined, z.union([z.literal("none"), z.string().uuid()]).optional()),
+  projectId: z.preprocess(emptyToUndefined, z.string().uuid().optional()),
+  status: z.preprocess(emptyToUndefined, z.enum(ROUTINE_STATUSES).optional()),
+  /** A routine matches a trigger kind when it has a non-archived trigger of that kind; `manual` means it has none. */
+  trigger: z.preprocess(emptyToUndefined, z.enum(ROUTINE_LIST_TRIGGER_FILTERS).optional()),
+});
+export type ListRoutinesQuery = z.infer<typeof listRoutinesQuerySchema>;
+
 export const createRoutineSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   folderId: z.string().guid().optional().nullable(),
