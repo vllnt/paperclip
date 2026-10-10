@@ -96,6 +96,34 @@ its queue directory is gone in two checks in a row (for example after the SSH ru
 directory reaper removed the run's directory), or when a newer bridge took over
 its queue directory.
 
+### SSH connections of the control bridge
+
+On an SSH environment every bridge step (a queue listing, a request read, a
+response write) is one short `ssh` command. These commands share one OpenSSH
+master connection instead of one login each (`packages/adapter-utils/src/ssh-multiplex.ts`):
+
+- A scope is one environment, one target and one set of credentials. Its socket
+  is `<os.tmpdir() or /tmp>/paperclip-ssh-mux-XXXXXX/%C`, in a 0700 directory
+  that only that scope uses. The longest path on Linux is about 70 bytes, under
+  the 104-byte socket limit of macOS.
+- At most 10 commands share a master at a time, well under the usual
+  `MaxSessions 20`. A command over that cap connects directly. When sshd
+  refuses a channel anyway, or the master died, OpenSSH connects directly to
+  the same target.
+- The agent's own session, workspace sync and every other SSH command stay on
+  direct connections.
+- Each run's bridge holds the scope until the bridge stops: at run end, after
+  a failed start, and when a shutdown drain ends the run. The last hold ends
+  the master (`ssh -O exit`) and removes the directory. A process that exits
+  without stopping its runs still removes the directories it holds, so no
+  later process can reach those masters; each master exits after 60 seconds
+  idle.
+
+When the worker gives up on a queue listing or on a request whose handler did
+not start, it aborts that read, and the SSH runner stops its `ssh` process.
+Writes are never stopped this way: a stopped write could publish a cut-off
+response.
+
 ## The server-owned staging lease outer context
 
 The staging lease is a per-session lease. Only one run of a session may stage into
