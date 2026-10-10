@@ -216,6 +216,36 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
       expect(errors).toEqual([]);
     });
 
+    // A popper wrapper Radix left mounted after its content hid: once with the
+    // menu itself hidden, once with the wrapper aria-hidden.
+    for (const variant of ["hidden menu", "aria-hidden wrapper"] as const) {
+      test(`opens over popper content that is mounted but hidden (${variant})`, async ({ page, request }) => {
+        const seed = await seedCompany(request);
+        const errors = trackPageErrors(page);
+        await page.goto(`/${seed.prefix}/dashboard`);
+        await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+        await page.evaluate((hiddenOn) => {
+          const wrapper = document.createElement("div");
+          wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+          const menu = document.createElement("div");
+          menu.setAttribute("role", "menu");
+          menu.setAttribute("data-state", "open");
+          if (hiddenOn === "hidden menu") menu.hidden = true;
+          else wrapper.setAttribute("aria-hidden", "true");
+          wrapper.append(menu);
+          document.body.append(wrapper);
+        }, variant);
+
+        await page.locator("#main-content").focus();
+        await page.keyboard.press("ControlOrMeta+k");
+        await expect(page.getByRole("combobox", { name: "Command launcher" })).toBeVisible();
+        await page.keyboard.press("Escape");
+        await expect(page.getByRole("combobox", { name: "Command launcher" })).toHaveCount(0);
+
+        expect(errors).toEqual([]);
+      });
+    }
+
     test("lists the issue page's own actions under This view", async ({ page, request }) => {
       const seed = await seedCompany(request);
       const errors = trackPageErrors(page);

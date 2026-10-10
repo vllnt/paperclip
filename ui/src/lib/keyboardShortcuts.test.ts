@@ -413,6 +413,25 @@ describe("hasBlockingShortcutDialog", () => {
     expect(hasBlockingShortcutDialog(popup({ role: "dialog", "data-state": "closed" }))).toBe(false);
   });
 
+  it("ignores popper content that is hidden or aria-hidden, on itself or on an ancestor", () => {
+    function popup(contentAttributes: Record<string, string>, wrapperAttributes: Record<string, string> = {}) {
+      const root = document.createElement("div");
+      const wrapper = document.createElement("div");
+      wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+      for (const [name, value] of Object.entries(wrapperAttributes)) wrapper.setAttribute(name, value);
+      const content = document.createElement("div");
+      for (const [name, value] of Object.entries(contentAttributes)) content.setAttribute(name, value);
+      wrapper.appendChild(content);
+      root.appendChild(wrapper);
+      return root;
+    }
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", hidden: "" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "listbox", "aria-hidden": "true" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { "aria-hidden": "true" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "dialog", "data-state": "open" }, { hidden: "" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { "aria-hidden": "false" }))).toBe(true);
+  });
+
   it("finds the modal around a popover that is open inside it", () => {
     const modal = document.createElement("div");
     modal.setAttribute("role", "dialog");

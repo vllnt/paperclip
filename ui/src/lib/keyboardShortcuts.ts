@@ -69,12 +69,18 @@ const OPEN_POPUP_SELECTOR = [
   "[data-radix-popper-content-wrapper] [role='listbox']:not([data-state='closed'])",
 ].join(", ");
 
+// Radix can leave popper content mounted after it hides; hidden or
+// aria-hidden content (or a hidden wrapper) is not open.
+function isShownPopup(popup: Element): boolean {
+  return popup.closest("[hidden], [aria-hidden='true']") === null;
+}
+
 /**
  * True while a modal dialog or a popover, menu or select is open. Those own
  * the keyboard until they close, so page shortcuts stay quiet meanwhile.
  */
 export function hasBlockingShortcutDialog(root: ParentNode = document): boolean {
-  if (root.querySelector(OPEN_POPUP_SELECTOR)) return true;
+  if (Array.from(root.querySelectorAll(OPEN_POPUP_SELECTOR)).some(isShownPopup)) return true;
   return Array.from(root.querySelectorAll(OPEN_DIALOG_SELECTOR)).some(isModalDialog);
 }
 
