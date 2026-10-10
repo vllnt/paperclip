@@ -289,33 +289,44 @@ path that finalizes the run honours it:
    adapter's own grace period, and a new option `terminalStatus: "interrupted"`.
 3. **Finalize, in whichever path writes the ending** (`cancelRunInternal`'s own
    write, or the executor's ending write after an abort). When it sees the intent,
-   it:
-   - writes `status: "interrupted"`, `errorCode: "planned_restart"`, and the stop
-     metadata with outcome `interrupted` (not `cancelled`), including the
-     `runUsedConversationAdapter` result that the shutdown loop passes today, so
-     the class test of section 4.5 reads the same facts;
+   it writes `status: "interrupted"`, `errorCode: "planned_restart"`, and the stop
+   metadata with outcome `interrupted` (not `cancelled`), including the
+   `runUsedConversationAdapter` result that the shutdown loop passes today, so the
+   class test of section 4.5 reads the same facts. It then **skips every release**:
+   `cancelRunInternal`'s release, the executor's release after the ending, and the
+   executor's late release in its `finally` block. No path schedules a successor.
+   The issue lock stays on the stopped run for now. Nothing can take it during the
+   drain: the stale-lock sweep, the deferred-wake sweep and queue starts are all
+   suppressed.
+4. **Decide, in one place: the deadline caller, after `cancelRunInternal`
+   returns.** That function waits for the adapter to settle, and the executor
+   settles after its lease release, which is where a remote ACP run's stop proof
+   is written (`releaseEnvironmentLeasesForRun` calls `acknowledgeRemoteStop`).
+   Local in-process adapters (acpx, `grok-local`) carry the proof in their result
+   earlier. So when the caller decides, every kind of run has its proof or has
+   failed to get it. The caller:
    - **keeps the stop-proof contract.** Today a stop that cannot be verified is a
      conflict ("provider termination could not be verified"), and for a remote ACP
      run the proof (`executionCancellation.state: "acknowledged"`, and with it the
      conversation-continuation policy) is written only by `acknowledgeRemoteStop`,
-     which accepts only `status: "cancelled"`. The intent path extends that check
-     and `acknowledgeRemoteStop` to accept `interrupted` with `plannedRestartStop`.
-     A resume is scheduled **only after** the stop is acknowledged. A run whose stop
-     is not proven goes to the `reconciliation` class: no resume, because the
-     provider may still be working and the same work could run twice. The deadline
-     caller records this outcome and does not surface the conflict as an error;
-   - classifies the run (section 4.5) and, when it is `resumed`, schedules the
-     resume **before** any release;
-   - when the resume was scheduled, does **not** call
-     `releaseIssueExecutionAndPromote`. `scheduleBoundedRetryForRun` already moves
+     which accepts only `status: "cancelled"`. The plan extends that check and
+     `acknowledgeRemoteStop` to accept `interrupted` with `plannedRestartStop`. A run
+     whose stop is not proven goes to the `reconciliation` class: no resume,
+     because the provider may still be working and the same work could run twice.
+     The caller records this outcome and does not surface the conflict as an error;
+   - classifies the run (section 4.5);
+   - when it is `resumed`, schedules the resume. `scheduleBoundedRetryForRun` moves
      the issue lock to the resume row in the same transaction that creates it
      (`executionRunId` set to the resume, only where it still points at the
-     stopped run), so no deferred wake can take the lock in between, the resume's
-     claim keeps it, and the stale-lock sweep leaves it (the resume is not
-     terminal). This matches the shutdown loop's rule today (release only when no
-     retry was made). When no resume was scheduled (other classes), it releases
-     with `suppressImmediateRecovery: true`.
-4. **Clear** the intent from the map when the run is terminal.
+     stopped run), so the resume's claim keeps it and the stale-lock sweep leaves it
+     (the resume is not terminal). This matches the shutdown loop's rule today
+     (release only when no retry was made);
+   - otherwise releases the issue with `suppressImmediateRecovery: true`.
+
+   If the process dies between steps 3 and 4, the lock points at a terminal run.
+   After the restart, the startup stale-lock sweep clears it and the stranded-issue
+   sweep is the net (section 5.3), as for any hard stop.
+5. **Clear** the intent from the map after step 4.
 
 So the resume is always the first successor, it holds the issue lock from the
 moment it exists, it exists only when the stop is proven, and the ending is the
@@ -667,10 +678,13 @@ D1, embedded Postgres unless noted:
   each: the row ends `interrupted` / `planned_restart` (not `failed` or
   `cancelled`), the stop metadata outcome is `interrupted`, exactly one successor
   exists and it is `planned_restart_resume` (not a recovery run or
-  `transient_failure`), and the issue lock stays with the stopped run. (c) A run
-  that is claimed but still preparing is fenced the same way. (d) An acpx run whose
-  remote stop is not proven gets no resume, lands in `reconciliation`, and the
-  deadline caller sees no `409`.
+  `transient_failure`), and the issue lock has moved to the resume row. (c) A run
+  that is claimed but still preparing is fenced the same way. (d) A remote ACP run whose
+  stop is proven (the acknowledgment arrives at its lease release) gets the resume.
+  (e) A remote ACP run whose stop is not proven gets no resume, lands in
+  `reconciliation`, and the deadline caller sees no `409`. (f) The executor's late
+  release in its `finally` block does not clear the lock or promote a deferred wake
+  while the intent is set.
 - **No promotion into the lock.** An issue with a parked deferred wake: after the
   deadline stop, the wake is still parked and the lock is not held by a new run;
   after the restart, the resume runs first.
@@ -800,7 +814,8 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
 | Executor's own release (no suppression for a stop) | `heartbeat.ts:27445-27452` |
 | Shutdown keeps the lock when a retry is scheduled | `heartbeat.ts:15629-15634` |
 | The retry row takes the issue lock in its own transaction | `heartbeat.ts:16879-16902` |
-| Stop proof: conflict when not acknowledged; remote acknowledgment only for `cancelled` | `heartbeat.ts:31626-31643`; `acknowledgeRemoteStop` `:10634-10657` |
+| Stop proof: conflict when not acknowledged; remote acknowledgment only for `cancelled` | `heartbeat.ts:31626-31643`; `acknowledgeRemoteStop` `:10634-10657`, called from the lease release `:10631` in the executor's `lease_release` phase `:28284` |
+| Executor's late release in `finally` | `heartbeat.ts:28383-28395` |
 | A late release cannot promote past a live successor | wake-queue `adapters/postgres.ts:1229-1236`, `:1283-1290` |
 | Release promotes the next deferred wake | wake-queue `application/use-cases.ts` (`runReleaseDrain`), lock write in `adapters/postgres.ts` |
 | Retry dedup by `retryOfRunId` | `heartbeat.ts:16446-16461` (returns any existing successor, whatever its reason) |
