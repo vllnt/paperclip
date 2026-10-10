@@ -2078,6 +2078,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("does not reopen a run that finished while the reaper inspected its live pid", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      processPid: child.pid ?? null,
+      includeIssue: false,
+    });
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    const original = controllerLeases.hasLiveLegacyController;
+    // The run finishes after the reaper listed it as running and before the
+    // reaper writes the detached marker.
+    const finishDuringInspection = vi
+      .spyOn(controllerLeases, "hasLiveLegacyController")
+      .mockImplementation(async (database, run) => {
+        if (run.id === runId) {
+          await db
+            .update(heartbeatRuns)
+            .set({ status: "succeeded", finishedAt, updatedAt: finishedAt })
+            .where(eq(heartbeatRuns.id, runId));
+          return false;
+        }
+        return original(database, run);
+      });
+    try {
+      const heartbeat = heartbeatService(db);
+      await heartbeat.reapOrphanedRuns();
+
+      const run = await heartbeat.getRun(runId);
+      expect(run?.status).toBe("succeeded");
+      expect(run?.finishedAt?.toISOString()).toBe(finishedAt.toISOString());
+      expect(run?.errorCode).not.toBe("process_detached");
+      const detachedEvents = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(detachedEvents.filter((event) => event.message?.startsWith("Lost in-memory process handle"))).toEqual([]);
+    } finally {
+      finishDuringInspection.mockRestore();
+    }
+  });
+
   it("keeps a native run active without granting legacy retry or signal authority", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
