@@ -101,10 +101,11 @@ agent / CLI / web "try it"
  | 2. verify run id and issue (same company, agent)    |
  | 3. input <= 32 KiB       else 422, rejected row     |
  | 4. input matches schema  else 422, rejected row     |
- | 5. JudgeClient.ask({ companyId,                     |
+ | 5. redact secrets in string values (D15)            |
+ | 6. JudgeClient.ask({ companyId,                     |
  |      rubricVersion: version.id,                     |
  |      state: input, questions: version.questions })  |
- | 6. insert company_eval_runs row (answered | failed) |
+ | 7. insert company_eval_runs row (answered | failed) |
  +-----------------------------------------------------+
         |  200 { runId, outcome, answers | failureReason, cached, latencyMs, ... }
         v
@@ -231,6 +232,20 @@ migration, so the just-in-time renumbering happens once. Agent tools move into t
 slice, S1b, because the runner capability gate changes about ten generated files
 (section 9.2). This keeps the S1 review on data, authorization and running.
 
+**D15. Redact secrets in the input (default on; the user can still change it, Q5).** After
+the schema check, the service runs `redactSensitiveText` from `server/src/redaction.ts`
+over every string value and every string array item of the input. This is the run-log
+secret redaction; open PR #80 extends the same function with URL user-info and PEM masks.
+The redacted input is what goes to the gateway, what is hashed, and what is stored. The
+run records `input_redacted` and `input_redaction_count` (the number of string values that
+changed), never the matched text. Inputs are at most 32 KiB, so the cost per call is small.
+A false positive changes one value; it never fails the call. The redacted input is not
+checked against the schema again (a mask can exceed a short `maxLength`). A rejected input
+may not have the schema's flat shape, so for rejected rows the redaction walks every string
+in any JSON shape before the hash is taken.
+Rejected: no redaction (agent input can carry tokens from logs or diffs, and it would go
+to a third party and stay stored for 30 days).
+
 ## 5. Data model and migration
 
 All `id` columns are `uuid` with `defaultRandom()`. All timestamps are `timestamptz`.
@@ -287,8 +302,10 @@ The service has no update path for this table. A test asserts that.
 | `heartbeat_run_id` | uuid null | FK `heartbeat_runs.id` ON DELETE SET NULL |
 | `issue_id` | uuid null | FK `issues.id` ON DELETE SET NULL |
 | `project_id` | uuid null | FK `projects.id` ON DELETE SET NULL |
-| `input_hash` | text not null | SHA-256 of the canonical input alone, so equal inputs match across versions |
-| `input_bytes` | integer not null | |
+| `input_hash` | text not null | SHA-256 of the canonical redacted input alone (D15), so equal inputs match across versions; rejected rows also hash the redacted input, so no row holds a hash of raw secret text |
+| `input_redacted` | boolean not null default false | true when the redaction changed at least one value (D15) |
+| `input_redaction_count` | integer not null default 0 | number of string values the redaction changed; never the matched text |
+| `input_bytes` | integer not null | the raw size the caller sent, in UTF-8 bytes (the 32 KiB cap measures this value) |
 | `input` | jsonb null | kept until `input_expires_at` (D6) |
 | `input_expires_at` | timestamptz null | null when the input is not stored |
 | `mode` | text not null default `live` | `live` / `try_it` (D12); agents always `live` |
@@ -371,12 +388,44 @@ version delete is cheap.
 - Every agent, run, issue and project reference is nullable with ON DELETE SET NULL.
 - Child tables cascade from their NOT NULL parents.
 
-This meets the rules of the company-delete foreign-key check in open PR #83
+This meets the delete-order rules of the company-delete foreign-key check in open PR #83
 (`company-removal-coverage.test.ts`): SET NULL references are ignored, and NOT NULL
 cascades count as deleted with their parent. No `tx.delete` is needed in
-`companyService.remove()`. If #83 merges first, its check covers the new tables
-automatically. If not, S1 adds a test that removes a company with eval rows and asserts
-that none remain.
+`companyService.remove()`.
+
+**The #83 cross-company precheck.** #83 also adds a precheck
+(`server/src/services/company-removal-cross-company.ts`). It refuses a company delete with
+409 when a cascade or SET NULL key into a table that the delete removes holds another
+company's row. Its list `CROSS_COMPANY_REFERENCES` must name every cascade or SET NULL key
+whose parent is a table that `remove()` deletes **with its own statement**, except a
+`company_id` key to `companies` and composite `(company_id, x)` keys. The coverage test
+(`expectedCrossCompanyKeys`) builds the expected set from the recorded `tx.delete` calls,
+and it fails both on a missing key and on a listed key it does not expect. `remove()`
+deletes `agents`, `heartbeat_runs`, `issues` and `projects` with their own statements, but
+no eval table: the eval tables go by cascade from `companies`. So the keys between eval
+tables are not expected, and listing them would fail the test. The eval tables add these
+five keys:
+
+| Child | Column | Parent |
+|---|---|---|
+| `company_eval_runs` | `caller_agent_id` | `agents` |
+| `company_eval_runs` | `heartbeat_run_id` | `heartbeat_runs` |
+| `company_eval_runs` | `issue_id` | `issues` |
+| `company_eval_runs` | `project_id` | `projects` |
+| `company_eval_feedback` | `author_agent_id` | `agents` |
+
+Every eval row has `company_id`, so no entry needs an `owner`. The service only writes
+same-company references (5.3 verifies the run, issue and agent), so the precheck finds no
+cross-company row and the delete goes ahead. Whichever of S1 and #83 lands second adds the
+entries: S1 if #83 is on `main` first, else #83's next rebase (its coverage test fails
+until it does). S1 follows #83's final list format. Not chosen: composite
+`(company_id, x)` keys, which the precheck leaves out by shape. They would need a unique
+`(company_id, id)` on each parent, and a composite SET NULL key would also null
+`company_id`.
+
+S1 test: remove a company that has evals, versions, runs (linked to its agent, run, issue
+and project) and feedback. The precheck passes, the delete succeeds, and no eval row
+remains. Without #83 on `main`, the same test still asserts that no eval row remains.
 
 ### 5.6 Migration
 
@@ -402,17 +451,20 @@ that none remain.
    run of a draft version never counts in the default stats and never blocks deletion.
 3. Verify the caller's run id and issue (5.3).
 4. Size check on `JSON.stringify(input)` in UTF-8 bytes: over 32,768 gives 422 and a
-   `rejected` run row without the input.
+   `rejected` run row without the input. A rejected row's `input_hash` is still taken of
+   the redacted input (D15), and its `input_bytes` is the raw size.
 5. Schema check with the version's compiled Ajv validator: a mismatch gives 422 and a
    `rejected` run row without the input. Validators are cached by version id, because
    versions never change.
-6. `judge.ask({ companyId, rubricVersion: version.id, state: input, questions: version.questions })`.
+6. Redact secrets in every string value (D15). From here on, "input" means the redacted
+   input: it is what is sent, hashed and stored.
+7. `judge.ask({ companyId, rubricVersion: version.id, state: input, questions: version.questions })`.
    The evals service has its own `JudgeClient` with the key resolver consumer id `evals`,
    so secret reads are audited as evals. `createCompanySecretKeyResolver` moves from
    `duplicate-detection-factory.ts` to a module next to `judge-client.ts`, so the evals
    service does not import the duplicate-detection factory. It shares the
    `judge_usage_daily` cap (D9).
-7. Insert the run row (5.3), then return.
+8. Insert the run row (5.3), then return.
 
 ### 6.2 Input schema subset
 
@@ -817,7 +869,7 @@ that adds a telemetry event for evals.
 
 ### 14.2 What leaves the instance
 
-- The eval input and the questions go to the Vercel AI Gateway and the `typesafe-ai/jev`
+- The redacted eval input (D15) and the questions go to the Vercel AI Gateway and the `typesafe-ai/jev`
   model, with the company's own key. This is the same data flow as #40 duplicate detection.
   Zero data retention stays off (see 2.1).
 - Nothing goes out for a company without the `AI_GATEWAY_API_KEY` secret.
@@ -828,7 +880,7 @@ that adds a telemetry event for evals.
 |---|---|
 | Cross-company read | `company_id` in every query; 404 for another company's rows; isolation tests in every slice. |
 | An agent changes an eval's behaviour | Agents cannot author (D4); versions are immutable; changes are in the activity log. |
-| Secrets in agent-supplied input are sent and stored | The schema limits what can be sent (`additionalProperties: false`, `maxLength`); the template sends paths and counts, not diffs; input is purged after 30 days; `doc/company-evals.md` warns. Automatic redaction is open question Q5. |
+| Secrets in agent-supplied input are sent and stored | The run-log secret redaction runs over every string value before send and store (D15), and the run records only that it happened and a count; the schema limits what can be sent (`additionalProperties: false`, `maxLength`); the template sends paths and counts, not diffs; input is purged after 30 days; `doc/company-evals.md` warns that redaction is pattern-based and not complete. |
 | Rejected input lands in the server logs | The run and feedback routes are body-redacted in the HTTP logger (D5), with a test. |
 | A spoofed run id links a run to another company's issue | The run id is verified by company and agent before use; no match stores null (5.3). |
 | Prompt injection in the input | The questions come from the board. The model returns probabilities and choices only, never text that runs. Outsider text in the input can still steer the answer, so a result is advice and never the only gate for a governed action (6.4). Feedback and stats show wrong answers. |
@@ -842,7 +894,7 @@ template, including the web, API and CLI parity statement.
 
 | Slice | Contents | Migration |
 |---|---|---|
-| **S1** data and running | 4 tables; shared types and validators; evals service; all routes in section 7 except stats and templates; OpenAPI; CLI except `stats` and templates; activity log; run-id verification and the strict `readRunIssueId` helper (5.3); body redaction for the run and feedback routes; the input retention job; `JudgeOutcome.usage` (D10); the key resolver moved next to the judge client; `doc/company-evals.md`; CLI docs | yes, number taken just in time |
+| **S1** data and running | 4 tables; shared types and validators; evals service; all routes in section 7 except stats and templates; OpenAPI; CLI except `stats` and templates; activity log; run-id verification and the strict `readRunIssueId` helper (5.3); input secret redaction (D15); the #83 precheck entries if #83 is on `main` (5.5); body redaction for the run and feedback routes; the input retention job; `JudgeOutcome.usage` (D10); the key resolver moved next to the judge client; `doc/company-evals.md`; CLI docs | yes, number taken just in time |
 | **S1b** agent tools | 3 MCP tools; the runner capability gate (9.2); `skills/paperclip/references/evals.md` and the `SKILL.md` pointer | no |
 | **S2** web | list, eval page (definition, versions, try it, runs with feedback) | no |
 | **S3** stats | `GET /stats`, list summary stats, `paperclipai evals stats`, web stats panels | no |
@@ -873,8 +925,13 @@ daily rollup table (only if a stats query is measured slow).
   another company's or another agent's run, stores null run, issue and project and the
   call still succeeds; an agent cannot send `versionNumber` or `mode`; predicate answers
   carry `value` by the D7a rule; the retention sweep clears expired input in batches and
-  keeps the hash; company removal leaves no eval rows; `openapi-routes` covers every route;
-  CLI request shapes.
+  keeps the hash; a token-shaped value in a string field and in a string array item is
+  masked in the state sent to the judge and in the stored input, the run has
+  `input_redacted: true` and the right count, the hash is of the redacted input, and no
+  matched text appears in the run, the response or the logs; an input with nothing to
+  redact has `input_redacted: false`; removing a company with eval rows passes the #83
+  precheck (when #83 is on `main`) and leaves no eval rows (5.5); `openapi-routes` covers
+  every route; CLI request shapes.
 - **S1b:** MCP tool request shapes (`packages/mcp-server/src/tools.test.ts`); the full
   runner `build` and `test:scenarios` pass (9.2, step 7); the skill-doc tests
   (`paperclip-skill-utils`) pass.
@@ -909,7 +966,9 @@ S1b says so in its risks and does not change the CI layout.
    Agree, or log every run too?
 4. **Q4 Budget (D9).** Evals share the company's daily Jev cap with duplicate detection.
    Agree, or a separate cap?
-5. **Q5 Redaction.** Should the server run the existing secret redaction over string inputs
-   before it sends and stores them? It costs CPU per call and can damage legitimate input
-   (for example a file path that looks like a token).
+5. **Q5 Redaction (D15).** The plan's default, recommended by the manager: run the existing
+   run-log secret redaction over string inputs before they are sent and before they are
+   stored. The cost per call is small (inputs are at most 32 KiB). A false positive changes
+   one value (for example a file path that looks like a token) and never fails the call.
+   Keep this default, or turn redaction off?
 6. **Q6 Slices (D14).** Agent tools move from S1 into their own slice S1b. Agree?
