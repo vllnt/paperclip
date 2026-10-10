@@ -29,6 +29,7 @@ const ACTIVITY_ROW_VERBS: Record<string, string> = {
   "issue.read_unmarked": "marked unread",
   "issue.checked_out": "checked out",
   "issue.released": "released",
+  "heartbeat.deferred_wake_held": "is holding a deferred wake on",
   "issue.comment_added": "commented on",
   "issue.comment_cancelled": "cancelled a queued comment on",
   "issue.queued_comment_edited": "edited a queued comment on",
