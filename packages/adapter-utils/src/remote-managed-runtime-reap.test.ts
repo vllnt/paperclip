@@ -42,7 +42,7 @@ async function finishedRun(options: { git?: boolean } = {}) {
   if (options.git !== false) {
     await git(workspace, ["init", "-q", "-b", "main"]);
     await git(workspace, ["config", "user.name", "Paperclip Test"]);
-    await git(workspace, ["config", "user.email", "test@paperclip.dev"]);
+    await git(workspace, ["config", "user.email", "reap-test"]);
     await writeFile(path.join(workspace, "tracked.txt"), "base\n");
     await git(workspace, ["add", "tracked.txt"]);
     await git(workspace, ["commit", "-q", "-m", "base"]);
@@ -140,7 +140,7 @@ describe("reapSshRunDirectory and extra worktrees", () => {
     const foreign = path.join(run.runDir, "foreign");
     await mkdir(foreign);
     await git(foreign, ["init", "-q", "-b", "main"]);
-    await git(foreign, ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--allow-empty", "-m", "foreign"]);
+    await git(foreign, ["-c", "user.name=t", "-c", "user.email=reap-test", "commit", "-q", "--allow-empty", "-m", "foreign"]);
     await writeFile(path.join(foreign, "new.txt"), "not ours\n");
     // The agent re-points the worktree entry at the other repository, with no HEAD commit.
     const admin = path.join(run.workspace, ".git", "worktrees", "wt-agent");
@@ -223,6 +223,65 @@ describe("reapSshRunDirectory and a worktree outside the run directory", () => {
 
     expect(existsSync(run.runDir)).toBe(false);
   });
+
+  it("removes the run directory once the outside folder has no .git any more", async () => {
+    const run = await finishedRun();
+    const tree = await outsideWorktree(run);
+    await rm(path.join(tree, ".git"));
+
+    await expect(run.reap()).resolves.toMatchObject({ outcome: "removed" });
+
+    expect(existsSync(run.runDir)).toBe(false);
+  });
+
+  // What the reaper cannot read or understand may hide an outside worktree, so
+  // it keeps the run directory instead of guessing.
+  const asRoot = process.getuid?.() === 0;
+  const registration = (run: { workspace: string }) => path.join(run.workspace, ".git", "worktrees", "wt-agent", "gitdir");
+
+  it.each([
+    ["a registration that is not a worktree path", async (run: { workspace: string }) => {
+      await writeFile(registration(run), "not a worktree path\n");
+    }, "gitdir"],
+    ["an empty registration", async (run: { workspace: string }) => {
+      await writeFile(registration(run), "");
+    }, "gitdir"],
+    ["a registration folder without its gitdir file", async (run: { workspace: string }) => {
+      await rm(registration(run));
+    }, "gitdir"],
+  ])("keeps the run directory for %s", async (_label, damage, unreadableEnd) => {
+    const run = await finishedRun();
+    const tree = await outsideWorktree(run);
+    await damage(run);
+
+    const result = await run.reap();
+    expect(result).toMatchObject({ outcome: "kept", reason: "unreadable" });
+    expect(result.outcome === "kept" && result.unreadablePath?.endsWith(unreadableEnd)).toBe(true);
+    expect(existsSync(run.runDir)).toBe(true);
+    expect(existsSync(tree)).toBe(true);
+  });
+
+  it.skipIf(asRoot).each([
+    ["a registration it cannot read", (run: { workspace: string }) => registration(run)],
+    ["registrations it cannot list", (run: { workspace: string }) => path.join(run.workspace, ".git", "worktrees")],
+    ["a repository folder it cannot enter", (run: { workspace: string }) => path.join(run.workspace, ".git")],
+    ["an outside folder it cannot enter", (run: { root: string }) => path.join(run.root, ".paperclip-runtime", "wt-agent")],
+  ])("keeps the run directory for %s", async (_label, target) => {
+    const run = await finishedRun();
+    const tree = await outsideWorktree(run);
+    const locked = target(run as { root: string; workspace: string });
+    await chmod(locked, 0o000);
+    try {
+      const result = await run.reap();
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "unreadable" });
+      expect(existsSync(run.runDir)).toBe(true);
+    } finally {
+      await chmod(locked, 0o700).catch(() => undefined);
+    }
+    expect(existsSync(path.join(tree, ".git"))).toBe(true);
+    expect(existsSync(path.join(run.workspace, ".git", "worktrees", "wt-agent"))).toBe(true);
+  });
 });
 
 describe("reapSshRunDirectory and a run that is not a git repository", () => {
@@ -247,9 +306,26 @@ describe("reapSshRunDirectory and a run that is not a git repository", () => {
     const nested = path.join(run.workspace, "nested");
     await mkdir(nested);
     await git(nested, ["init", "-q", "-b", "main"]);
-    await git(nested, ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--allow-empty", "-m", "only here"]);
+    await git(nested, ["-c", "user.name=t", "-c", "user.email=reap-test", "commit", "-q", "--allow-empty", "-m", "only here"]);
 
     await expect(run.reap({ removeNotGitBacked: true })).resolves.toMatchObject({ outcome: "kept", reason: "not_git_backed" });
+
+    expect(existsSync(path.join(nested, ".git"))).toBe(true);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("keeps a run directory with a folder it cannot read, even after its keep window", async () => {
+    const run = await finishedRun({ git: false });
+    const locked = path.join(run.workspace, "locked");
+    const nested = path.join(locked, "nested");
+    await mkdir(nested, { recursive: true });
+    await git(nested, ["init", "-q", "-b", "main"]);
+    await git(nested, ["-c", "user.name=t", "-c", "user.email=reap-test", "commit", "-q", "--allow-empty", "-m", "only here"]);
+    await chmod(locked, 0o000);
+    try {
+      await expect(run.reap({ removeNotGitBacked: true })).resolves.toMatchObject({ outcome: "kept", reason: "unreadable" });
+    } finally {
+      await chmod(locked, 0o700).catch(() => undefined);
+    }
 
     expect(existsSync(path.join(nested, ".git"))).toBe(true);
   });

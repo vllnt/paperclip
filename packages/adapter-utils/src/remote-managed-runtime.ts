@@ -131,13 +131,16 @@ export type SshRunDirectoryKeepReason =
   | "worktree_dirty"
   | "preserve_failed"
   | "rm_failed"
-  | "external_worktree";
+  | "external_worktree"
+  // The reaper could not read something that may hold the run's work: a worktree
+  // registration, a worktree folder, or a directory that may hold a repository.
+  | "unreadable";
 
 export type SshRunDirectoryReapResult =
   | { outcome: "removed"; bytesFreed: number; preserved: string[] }
   | { outcome: "absent" }
   | { outcome: "symlink" }
-  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number; externalWorktree?: string };
+  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number; externalWorktree?: string; unreadablePath?: string };
 
 /** Where a reaped run's preserved git state is kept, outside every `runs/<runId>`. */
 export function sshPreservedBundlePath(remoteRoot: string, runId: string): string {
@@ -234,15 +237,36 @@ export async function reapSshRunDirectory(input: {
     // (an agent's `git worktree add ../x`) would keep its files but lose its
     // repository when the directory goes. Keep the directory while such a
     // worktree exists, restored or not. Read git's registration files, so no
-    // git runs in the agent's folder; a gone worktree (prunable) does not count.
+    // git runs in the agent's folder. Only a worktree that is provably gone
+    // (its folder or its `.git` missing, seen from a directory this user can
+    // enter) does not count. A registration that cannot be listed, read or
+    // parsed, or a folder that cannot be entered, keeps the directory too.
     'here=$(pwd -P)',
-    'for gd in "$ws"/.git/worktrees/*/gitdir; do',
-    '  if [ ! -f "$gd" ] || [ -L "$gd" ]; then continue; fi',
-    '  p=""; IFS= read -r p < "$gd" || [ -n "$p" ] || continue',
-    '  case "$p" in /*) ;; *) p="${gd%/gitdir}/$p" ;; esac',
-    '  [ -e "$p" ] || continue',
-    '  d=$(cd "${p%/.git}" 2>/dev/null && pwd -P) || continue',
-    '  case "$d/" in "$here/"*) ;; *) printf "external %s\\n" "$d"; keep external_worktree ;; esac',
+    'unreadable() { printf "unreadable %s\\n" "$1"; keep unreadable; }',
+    // Succeeds when the absolute path $1 does not exist, checked from its
+    // nearest ancestor this user can enter.
+    'gone() { t=$1; while :; do up=${t%/*}; [ -n "$up" ] || up=/; if (cd "$up" 2>/dev/null); then [ ! -e "$t" ] && [ ! -L "$t" ]; return; fi; [ "$up" = / ] && return 1; t=$up; done; }',
+    // Registrations below a folder this user cannot enter would look absent.
+    'if [ -d "$ws" ] && [ ! -L "$ws" ] && ! (cd "$ws" 2>/dev/null); then unreadable "$ws"; fi',
+    'if [ -d "$ws/.git" ] && [ ! -L "$ws/.git" ] && ! (cd "$ws/.git" 2>/dev/null); then unreadable "$ws/.git"; fi',
+    'adm_root="$ws/.git/worktrees"',
+    'if [ -e "$adm_root" ] || [ -L "$adm_root" ]; then',
+    '  if [ -L "$adm_root" ] || [ ! -d "$adm_root" ] || [ ! -r "$adm_root" ] || [ ! -x "$adm_root" ]; then unreadable "$adm_root"; fi',
+    "fi",
+    'for adm in "$adm_root"/*; do',
+    '  [ -e "$adm" ] || [ -L "$adm" ] || continue',
+    '  gd="$adm/gitdir"',
+    '  if [ -L "$adm" ] || [ ! -d "$adm" ] || [ -L "$gd" ] || [ ! -f "$gd" ] || [ ! -r "$gd" ]; then unreadable "$gd"; fi',
+    '  p=""; IFS= read -r p < "$gd" || [ -n "$p" ] || unreadable "$gd"',
+    // Git writes `<worktree folder>/.git`, absolute or relative to the admin directory.
+    '  case "$p" in */.git) ;; *) unreadable "$gd" ;; esac',
+    '  case "$p" in /*) ;; *) p="$here/$adm/$p" ;; esac',
+    '  w=${p%/.git}; [ -n "$w" ] || unreadable "$gd"',
+    '  if d=$(cd "$w" 2>/dev/null && pwd -P); then',
+    '    if [ -e "$d/.git" ] || [ -L "$d/.git" ]; then',
+    '      case "$d/" in "$here/"*) ;; *) printf "external %s\\n" "$d"; keep external_worktree ;; esac',
+    "    fi",
+    '  elif ! gone "$w"; then unreadable "$gd"; fi',
     "done",
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
     'had_marker=0; git_backed=0',
@@ -257,7 +281,9 @@ export async function reapSshRunDirectory(input: {
     // unless a repository below the run directory, or a linked workspace, may
     // hold commits that only this worker has.
     '  if [ "$git_backed" = 0 ] && [ "$unsaved_ok" != 1 ]; then keep not_git_backed; fi',
-    '  if [ "$git_backed" = 0 ] && { [ -L "$ws" ] || [ -n "$(find . -name .git -print 2>/dev/null | head -n 1)" ]; }; then keep not_git_backed; fi',
+    '  if [ "$git_backed" = 0 ] && [ -L "$ws" ]; then keep not_git_backed; fi',
+    // A directory find cannot read may hold a repository.
+    '  if [ "$git_backed" = 0 ]; then nested=$(find . -name .git -print 2>/dev/null) || keep unreadable; [ -z "$nested" ] || keep not_git_backed; fi',
     "fi",
     'if [ "$git_backed" = 1 ]; then',
     '  G rev-parse --git-dir >/dev/null 2>&1 || keep preserve_failed',
@@ -369,14 +395,16 @@ export async function reapSshRunDirectory(input: {
   if (last === "absent" || last === "symlink") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed|external_worktree) (\d+)$/.exec(last);
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed|external_worktree|unreadable) (\d+)$/.exec(last);
   if (kept) {
     const external = lines.find((line) => line.startsWith("external "))?.slice("external ".length);
+    const unreadable = lines.find((line) => line.startsWith("unreadable "))?.slice("unreadable ".length);
     return {
       outcome: "kept",
       reason: kept[1] as SshRunDirectoryKeepReason,
       bytes: Number(kept[2]) * 1024,
       ...(kept[1] === "external_worktree" && external ? { externalWorktree: external } : {}),
+      ...(kept[1] === "unreadable" && unreadable ? { unreadablePath: unreadable } : {}),
     };
   }
   throw new Error("SSH run directory reap returned an unexpected result.");

@@ -294,15 +294,45 @@ describeReaper("SSH run directory reaper", () => {
     expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "removed" } });
   });
 
-  it("checks a directory kept for an outside worktree again even past the 14-day look-back", async () => {
+  it("keeps a run directory whose worktree registration it cannot understand, and removes it once the registration is gone", async () => {
+    const run = await startRun({ status: "interrupted" });
+    const outside = path.join(sshConfig.remoteWorkspacePath, ".paperclip-runtime", `wt-${run.runId.slice(0, 8)}`);
+    await git(run.workspace, ["worktree", "add", "-q", "-b", `agent/broken-${run.runId.slice(0, 8)}`, outside]);
+    const registration = path.join(run.workspace, ".git", "worktrees", path.basename(outside), "gitdir");
+    await writeFile(registration, "not a worktree path\n");
+
+    await runtime.releaseRunLeases(run.runId);
+
+    await vi.waitFor(async () => expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1), { timeout: 15_000, interval: 100 });
+    expect((await activityFor(run.runId, "environment.ssh_run_directory_kept"))[0]!.details)
+      .toMatchObject({ reason: "unreadable", unreadablePath: expect.stringMatching(/\/gitdir$/) });
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({
+      sshRunDirectory: { state: "kept", reason: "unreadable", unreadablePath: expect.stringMatching(/\/gitdir$/) },
+    });
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await exists(outside)).toBe(true);
+
+    // Once git's own prune removed the broken registration and the folder is
+    // gone, the next sweep past the window removes the run directory.
+    await rm(outside, { recursive: true, force: true });
+    await git(run.workspace, ["worktree", "prune"]);
+    await reaper().sweep({ now: new Date(Date.now() + 25 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    expect(await exists(run.runDir)).toBe(false);
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "removed" } });
+  });
+
+  it.each([
+    ["an outside worktree", { reason: "external_worktree", externalWorktree: "/gone" }],
+    ["something it could not read", { reason: "unreadable", unreadablePath: "workspace/.git/worktrees/x/gitdir" }],
+  ])("checks a directory kept for %s again even past the 14-day look-back", async (_label, kept) => {
     const run = await startRun({ status: "failed" });
-    // The outside worktree is gone by now; the lease is three weeks old.
+    // The cause is gone by now; the lease is three weeks old.
     await db.update(environmentLeases).set({
       status: "released",
       releasedAt: new Date(Date.now() - 21 * 24 * HOUR_MS),
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
         sshRunDirectory: {
-          state: "kept", reason: "external_worktree", externalWorktree: "/gone", at: new Date(Date.now() - 48 * HOUR_MS).toISOString(),
+          state: "kept", ...kept, at: new Date(Date.now() - 48 * HOUR_MS).toISOString(),
           trigger: "sweep", bytes: 0,
         },
       })}::jsonb`,

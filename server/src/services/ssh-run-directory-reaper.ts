@@ -75,8 +75,11 @@ export function sshRunReaperKeepWindowMs(): number {
 
 // Kept decisions that the sweep reconsiders once the keep window is over.
 // `symlink` and `root_mismatch` stay kept: they say the path is not safe to use.
-// `external_worktree` is checked again and stays kept while the worktree exists.
-const RECONSIDERED_KEEP_REASONS = ["not_git_backed", "worktree_dirty", "preserve_failed", "rm_failed", "external_worktree"] as const;
+// `external_worktree` is checked again and stays kept while the worktree exists;
+// `unreadable` stays kept while the reaper cannot read what it must check.
+const RECONSIDERED_KEEP_REASONS = [
+  "not_git_backed", "worktree_dirty", "preserve_failed", "rm_failed", "external_worktree", "unreadable",
+] as const;
 
 /** Disk use, in percent, above which the sweep shortens the age threshold. */
 export function sshRunReaperDiskPressurePercent(): number {
@@ -509,7 +512,10 @@ async function recordResult(
   }
   const reason = result.outcome === "symlink" ? "symlink" : result.reason;
   const bytes = result.outcome === "kept" ? result.bytes : 0;
-  const extra = result.outcome === "kept" && result.externalWorktree ? { externalWorktree: result.externalWorktree } : {};
+  const extra = result.outcome !== "kept" ? {}
+    : result.externalWorktree ? { externalWorktree: result.externalWorktree }
+    : result.unreadablePath ? { unreadablePath: result.unreadablePath }
+    : {};
   return await recordKept(db, lease, runId, agentId, reason, bytes, context, claim, extra);
 }
 
@@ -579,10 +585,11 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: SshRunDirec
             isNotNull(environmentLeases.heartbeatRunId),
             isNotNull(environmentLeases.environmentId),
             sql`${environmentLeases.metadata} ->> 'remoteCwd' is not null`,
-            // A directory kept for an outside worktree is checked again however
-            // old its lease is, so it goes once that worktree does.
+            // A directory kept for an outside worktree, or for something the
+            // reaper could not read, is checked again however old its lease is,
+            // so it goes once that worktree goes or the reaper can read it.
             sql`(${finishedAt} > ${new Date(now.getTime() - SWEEP_LOOKBACK_MS).toISOString()}::timestamptz
-              or (${decision} ->> 'state' = 'kept' and ${decision} ->> 'reason' = 'external_worktree'))`,
+              or (${decision} ->> 'state' = 'kept' and ${decision} ->> 'reason' in ('external_worktree', 'unreadable')))`,
             sql`(${decision} is null
               or (${decision} ->> 'reason' = 'rm_failed' and coalesce((${decision} ->> 'attempts')::int, 0) < ${MAX_REMOVAL_ATTEMPTS})
               or ${keptPastWindow(now)}

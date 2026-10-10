@@ -31,13 +31,16 @@ status.
 - **After the keep window.** A kept directory (see below) is tried again by the
   sweep once `PAPERCLIP_SSH_RUN_REAPER_KEEP_WINDOW_HOURS` (default 24) have
   passed since the decision: `not_git_backed`, `preserve_failed`, `rm_failed`,
-  `external_worktree`, and `worktree_dirty` decisions recorded before the reaper
-  saved extra worktrees. A directory that is not a git repository is then deleted, because
-  nothing in it can be saved, unless a git repository lies below it or its
-  `workspace` is a link: that one stays kept. The others go through the save
-  step again and are kept again, for another window, if it still fails. Retries
-  stop once the lease is older than the sweep's 14-day look-back. `symlink` and
-  `root_mismatch` stay kept.
+  `external_worktree`, `unreadable`, and `worktree_dirty` decisions recorded
+  before the reaper saved extra worktrees. A directory that is not a git
+  repository is then deleted, because nothing in it can be saved, unless a git
+  repository lies below it or its `workspace` is a link: that one stays kept.
+  If the reaper cannot read every folder below it, it cannot rule a repository
+  out, so the directory stays kept as `unreadable`. The others go through the
+  save step again and are kept again, for another window, if it still fails.
+  Retries stop once the lease is older than the sweep's 14-day look-back, except
+  for `external_worktree` and `unreadable`. `symlink` and `root_mismatch` stay
+  kept.
 - The age thresholds and the keep window are capped at one year; a larger value
   counts as one year.
 
@@ -98,8 +101,20 @@ leases:list`:
   `externalWorktree`. This applies to restored runs too. The reaper reads git's
   registration files (`workspace/.git/worktrees/*/gitdir`) and runs no git in
   the folder. After each keep window it looks again, also past the sweep's
-  14-day look-back, and removes the run directory once the folder is gone. It
+  14-day look-back, and removes the run directory once the folder is gone (its
+  folder or its `.git` is missing, seen from a folder the reaper can enter). It
   never removes the folder itself.
+- `unreadable`: the reaper could not read something that may hold the run's
+  work, so it does not guess. The path is in `unreadablePath` when it is known.
+  Causes:
+  - A worktree registration it cannot list, read or understand. Git writes
+    `<folder>/.git` into `gitdir`, so anything else counts, as does a missing
+    `gitdir` file or a link.
+  - A worktree folder it cannot enter.
+  - A `workspace` or `workspace/.git` it cannot enter.
+  - For a directory that is not a git repository, a folder below it that `find`
+    cannot read.
+  It is checked again after each keep window, also past the 14-day look-back.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
 - `root_mismatch`: the root recorded on the lease is not the root the environment
   is configured with now (or the lease did not record that root), or it is too
