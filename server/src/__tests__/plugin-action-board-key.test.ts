@@ -1,4 +1,7 @@
+import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { eq } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -15,10 +18,13 @@ import {
   plugins,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { pluginRoutes } from "../routes/plugins.js";
 import { boardAuthService, hashBearerToken } from "../services/board-auth.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
+import { createPluginWorkerHandle } from "../services/plugin-worker-manager.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -32,6 +38,16 @@ if (!embeddedPostgresSupport.supported) {
 type Db = ReturnType<typeof createDb>;
 
 const PLUGIN_KEY = "vllnt.paperclip-github";
+
+const FIXTURE_WORKER = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "fixtures",
+  "plugin-worker-invocation-scope.cjs",
+);
+
+const eventBusStub = {
+  forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }),
+} as never;
 
 async function seed(db: Db) {
   const nonce = randomUUID().slice(0, 8);
@@ -187,6 +203,8 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
         runId: null,
         companyId: company.id,
         isInstanceAdmin: true,
+        keyId: adminKey.id,
+        source: "board_key",
       },
       renderEnvironment: null,
     });
@@ -205,6 +223,8 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
       agentId: null,
       runId: null,
       companyId: company.id,
+      keyId: memberKey.id,
+      source: "board_key",
     });
   });
 
@@ -227,6 +247,127 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(call.mock.calls[0]?.[2]?.actorContext).toMatchObject({ type: "agent", agentId: agent.id, userId: null });
   });
+
+  it("names the credential that called, with its kind and no key material, in every actor context", async () => {
+    const { company, adminKey, memberKey, agentToken } = await seed(db);
+    const call = vi.fn().mockResolvedValue({ ok: true });
+
+    await postAction(db, call, adminKey.token, "write-identity.get", { companyId: company.id, params: {} });
+    await postAction(db, call, memberKey.token, "write-identity.get", { companyId: company.id, params: {} });
+    await postAction(db, call, agentToken, "write-identity.get", { companyId: company.id, params: {} });
+
+    const contexts = call.mock.calls.map((args) => args[2]?.actorContext);
+    expect(contexts.map((context) => context?.source)).toEqual(["board_key", "board_key", "agent_key"]);
+    expect(contexts[0]?.keyId).toBe(adminKey.id);
+    expect(contexts[1]?.keyId).toBe(memberKey.id);
+    expect(contexts[2]?.keyId).toEqual(expect.any(String));
+    expect(new Set(contexts.map((context) => context?.keyId)).size).toBe(3);
+    const serialized = JSON.stringify(contexts);
+    for (const secret of [adminKey.token, memberKey.token, agentToken]) {
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(hashBearerToken(secret));
+    }
+  });
+
+  /**
+   * Starts a real plugin worker handle on the fixture worker, with the real host
+   * services behind it, and returns a `call` that the plugin routes use. The fixture
+   * serves each action by making one `activity.log` call to the host, as a plugin
+   * does when it records what it changed.
+   */
+  async function startAuditedWorker(pluginRow: { id: string }) {
+    const services = buildHostServices(db, pluginRow.id, PLUGIN_KEY, eventBusStub);
+    const handle = createPluginWorkerHandle(pluginRow.id, {
+      entrypointPath: FIXTURE_WORKER,
+      manifest: {
+        id: PLUGIN_KEY,
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Audit fixture",
+        description: "Audit fixture",
+        author: "Paperclip",
+        categories: ["automation"],
+        capabilities: ["activity.log.write"],
+        entrypoints: { worker: "dist/worker.js" },
+      },
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: createHostClientHandlers({
+        pluginId: PLUGIN_KEY,
+        capabilities: ["activity.log.write"],
+        services,
+      }),
+    });
+    await handle.start();
+    const call = vi.fn((_pluginId: string, method: string, params: unknown) => handle.call(method, params as never));
+    return { call, stop: () => handle.stop().catch(() => undefined), dispose: () => services.dispose() };
+  }
+
+  it("records which key ran a plugin action in the plugin's activity row, without key material", async () => {
+    const { company, plugin, agent, adminKey, memberKey, agentToken } = await seed(db);
+    const worker = await startAuditedWorker(plugin);
+    const message = "GitHub write identity updated";
+    const body = (extra: Record<string, unknown> = {}) => ({
+      companyId: company.id,
+      params: {
+        mode: "echo",
+        hostMethod: "activity.log",
+        requestedCompanyId: company.id,
+        message,
+        metadata: { enabled: true, ...extra },
+      },
+    });
+
+    try {
+      for (const [token, extra] of [
+        [adminKey.token, { initiatingKeyId: "forged-key", initiatingSource: "forged-source" }],
+        [memberKey.token, {}],
+        [agentToken, {}],
+      ] as const) {
+        const res = await postAction(db, worker.call, token, "write-identity.set", body(extra));
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+      }
+    } finally {
+      await worker.stop();
+      worker.dispose();
+    }
+
+    const rows = await db.select().from(activityLog).where(eq(activityLog.action, message));
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      expect(row.actorType).toBe("plugin");
+      expect(row.actorId).toBe(plugin.id);
+    }
+    const detailsOf = (userId: string | null, agentId: string | null) =>
+      rows
+        .map((row) => row.details as Record<string, unknown>)
+        .find((details) => details.initiatingUserId === userId && details.initiatingAgentId === agentId);
+
+    expect(detailsOf("admin-user", null)).toMatchObject({
+      initiatingActorType: "user",
+      initiatingActorId: "admin-user",
+      initiatingKeyId: adminKey.id,
+      initiatingSource: "board_key",
+      enabled: true,
+    });
+    expect(detailsOf("member-user", null)).toMatchObject({
+      initiatingKeyId: memberKey.id,
+      initiatingSource: "board_key",
+    });
+    expect(detailsOf(null, agent.id)).toMatchObject({
+      initiatingActorType: "agent",
+      initiatingSource: "agent_key",
+    });
+    const keyIds = rows.map((row) => (row.details as Record<string, unknown>).initiatingKeyId);
+    expect(new Set(keyIds).size).toBe(3);
+    expect(keyIds).not.toContain("forged-key");
+    const serialized = JSON.stringify(rows);
+    for (const secret of [adminKey.token, memberKey.token, agentToken]) {
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(hashBearerToken(secret));
+    }
+  }, 60_000);
 
   it("rejects a revoked board key", async () => {
     const { company, adminKey } = await seed(db);
