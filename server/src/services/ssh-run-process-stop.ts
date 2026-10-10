@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
@@ -43,6 +44,53 @@ function launchTarget(config: SshConnectionConfig, lease: EnvironmentLease): Ssh
   };
 }
 
+/** Twice the 20-second stop budget: a claim older than this belongs to a stop that died. */
+const STOP_CLAIM_TTL_MS = 40_000;
+const STOP_CLAIM_POLL_MS = 250;
+
+// Claims the lease's stop before any remote work, by compare-and-set: the key
+// is absent, or it holds a claim older than the TTL. The claim is
+// `{ state: "stopping", claim, claimedAt }`; a final outcome has no state.
+async function claimStop(db: Db, leaseId: string, token: string): Promise<boolean> {
+  const now = Date.now();
+  const stop = sql`${environmentLeases.metadata}->${REMOTE_PROCESS_STOP_METADATA_KEY}`;
+  const claimedAt = sql`${stop}->>'claimedAt'`;
+  const rows = await db
+    .update(environmentLeases)
+    .set({
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || jsonb_build_object(${REMOTE_PROCESS_STOP_METADATA_KEY}::text, jsonb_build_object('state', 'stopping', 'claim', ${token}::text, 'claimedAt', ${now}::bigint))`,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(environmentLeases.id, leaseId),
+        sql`(not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${REMOTE_PROCESS_STOP_METADATA_KEY})
+          or (${stop}->>'state' = 'stopping'
+            and (case when ${claimedAt} ~ '^[0-9]+$' then (${claimedAt})::bigint else 0 end) < ${now - STOP_CLAIM_TTL_MS}::bigint))`,
+      ),
+    )
+    .returning({ id: environmentLeases.id });
+  return rows.length > 0;
+}
+
+// Waits while another path holds the claim. `done`: that stop recorded its
+// outcome (or the lease is gone); `expired`: its claim outlived the TTL.
+async function waitForClaimedStop(db: Db, leaseId: string): Promise<"done" | "expired"> {
+  const deadline = Date.now() + STOP_CLAIM_TTL_MS + 5_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, STOP_CLAIM_POLL_MS));
+    const row = await db
+      .select({ metadata: environmentLeases.metadata })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leaseId))
+      .then((rows) => rows[0] ?? null);
+    const stop = row?.metadata?.[REMOTE_PROCESS_STOP_METADATA_KEY] as { state?: unknown; claimedAt?: unknown } | undefined;
+    if (!stop || stop.state !== "stopping") return "done";
+    if (typeof stop.claimedAt !== "number" || stop.claimedAt < Date.now() - STOP_CLAIM_TTL_MS) return "expired";
+  }
+  return "expired";
+}
+
 function classify(summary: RemoteProcessTreeStopSummary): RemoteRunProcessStopOutcome["outcome"] {
   if (summary.survived > 0) return "survived";
   return summary.partial ? "partial" : "stopped";
@@ -52,9 +100,11 @@ function classify(summary: RemoteProcessTreeStopSummary): RemoteRunProcessStopOu
  * Stops the processes that a legacy heartbeat run started on the SSH worker of
  * `lease`, over a connection of its own and within 20 seconds. It connects to
  * the worker and root recorded when the lease was acquired. It runs once
- * per lease: the outcome is kept in the lease metadata, and a second call, or
- * one that loses the race to record it, returns `null`. Native runs keep their
- * own runner lifecycle and are skipped. Never throws.
+ * per lease: it claims the lease's stop before any remote work, so a second
+ * caller does no remote work and waits for the first one's outcome (taking the
+ * claim over only once it is older than 40 seconds), then returns `null`. Only
+ * the claim holder records the outcome. Native runs keep their own runner
+ * lifecycle and are skipped. Never throws.
  *
  * @returns The outcome, or `null` when nothing was stopped by this call.
  */
@@ -64,7 +114,8 @@ export async function stopSshLeaseRunProcesses(
 ): Promise<RemoteRunProcessStopOutcome | null> {
   const { environment, lease } = input;
   if (lease.provider !== "ssh" || !lease.heartbeatRunId) return null;
-  if (lease.metadata?.[REMOTE_PROCESS_STOP_METADATA_KEY]) return null;
+  const recordedStop = lease.metadata?.[REMOTE_PROCESS_STOP_METADATA_KEY] as { state?: unknown } | undefined;
+  if (recordedStop && recordedStop.state !== "stopping") return null;
   try {
     const run = await db
       .select({ runtimeMode: heartbeatRuns.runtimeMode })
@@ -72,6 +123,14 @@ export async function stopSshLeaseRunProcesses(
       .where(eq(heartbeatRuns.id, lease.heartbeatRunId))
       .then((rows) => rows[0] ?? null);
     if (run?.runtimeMode === "native") return null;
+
+    const token = randomUUID();
+    let claimed = false;
+    for (let attempt = 0; attempt < 3 && !claimed; attempt += 1) {
+      claimed = await claimStop(db, lease.id, token);
+      if (!claimed && (await waitForClaimedStop(db, lease.id)) === "done") return null;
+    }
+    if (!claimed) return null;
 
     let summary: RemoteProcessTreeStopSummary;
     if (!environment) {
@@ -106,7 +165,7 @@ export async function stopSshLeaseRunProcesses(
       .where(
         and(
           eq(environmentLeases.id, lease.id),
-          sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${REMOTE_PROCESS_STOP_METADATA_KEY})`,
+          sql`${environmentLeases.metadata}->${REMOTE_PROCESS_STOP_METADATA_KEY}->>'claim' = ${token}`,
         ),
       )
       .returning({ id: environmentLeases.id });
