@@ -20,6 +20,16 @@ describe("activity formatting", () => {
     expect(formatActivityVerb("issue.read_unmarked")).toBe("marked unread");
   });
 
+  it("names the provider quota cap exemption alarm", () => {
+    expect(formatActivityVerb("heartbeat.provider_quota_cap_exemption_exhausted"))
+      .toBe("spent the daily provider quota cap exemption for");
+  });
+
+  it("names the provider quota retry ceiling stop", () => {
+    expect(formatActivityVerb("heartbeat.provider_quota_exhausted"))
+      .toBe("stopped provider capacity retries on");
+  });
+
   it("formats blocker activity using linked issue identifiers", () => {
     const details = {
       addedBlockedByIssues: [

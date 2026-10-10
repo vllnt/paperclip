@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { createPaperclipTempDir, removePaperclipTempDir } from "@paperclipai/adapter-utils/paperclip-temp";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
 
@@ -361,11 +362,6 @@ export async function writeApiKeyAuthJson(home: string, apiKey: string): Promise
   await fs.writeFile(target, JSON.stringify({ OPENAI_API_KEY: apiKey }), { mode: 0o600 });
 }
 
-export interface StageCodexHomeForSyncOptions {
-  /** Run id, used only to make the staged temp-dir name traceable in logs. */
-  runId?: string;
-}
-
 /**
  * True when `candidate` is `root` itself or a descendant of it. Both arguments
  * must be absolute, already-resolved (symlink-free) paths — callers pass
@@ -574,14 +570,9 @@ async function stageCodexHomeEntry(
  *
  * The caller owns removing the returned dir on run teardown.
  */
-export async function stageCodexHomeForSync(
-  effectiveCodexHome: string,
-  options: StageCodexHomeForSyncOptions = {},
-): Promise<string> {
-  const runIdPart = nonEmpty(options.runId ?? undefined);
-  const stagedHome = await fs.mkdtemp(
-    path.join(os.tmpdir(), `paperclip-codex-home-sync-${runIdPart ? `${runIdPart}-` : ""}`),
-  );
+export async function stageCodexHomeForSync(effectiveCodexHome: string): Promise<string> {
+  // Inside a run the name carries the run id (`runWithPaperclipTempRun`).
+  const stagedHome = await createPaperclipTempDir("paperclip-codex-home-sync-");
   try {
     for (const entry of CODEX_SYNC_ALLOWLIST) {
       await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry);
@@ -590,7 +581,7 @@ export async function stageCodexHomeForSync(
   } catch (error) {
     // Fail-closed: never hand back a partial home. Remove the temp dir we
     // created before propagating the failure.
-    await fs.rm(stagedHome, { recursive: true, force: true }).catch(() => {});
+    await removePaperclipTempDir(stagedHome).catch(() => {});
     throw error;
   }
 }

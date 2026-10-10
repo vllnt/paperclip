@@ -1,7 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import http2 from "node:http2";
-import os from "node:os";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import {
@@ -26,6 +25,7 @@ import {
   parseRemoteProcessIdentity,
   type RemoteProcessIdentity,
 } from "./remote-process-identity.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
 
@@ -562,16 +562,18 @@ export function buildSandboxCallbackBridgeEnv(input: {
 }
 
 export async function createSandboxCallbackBridgeAsset(): Promise<SandboxCallbackBridgeAsset> {
-  const localDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-asset-"));
-  const entrypoint = path.join(localDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
-  await fs.writeFile(entrypoint, getSandboxCallbackBridgeServerSource(), "utf8");
-  return {
-    localDir,
-    entrypoint,
-    cleanup: async () => {
-      await fs.rm(localDir, { recursive: true, force: true }).catch(() => undefined);
-    },
+  const localDir = await createPaperclipTempDir("paperclip-bridge-asset-");
+  const cleanup = async () => {
+    await removePaperclipTempDir(localDir).catch(() => undefined);
   };
+  const entrypoint = path.join(localDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
+  try {
+    await fs.writeFile(entrypoint, getSandboxCallbackBridgeServerSource(), "utf8");
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { localDir, entrypoint, cleanup };
 }
 
 export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallbackBridgeQueueClient {
