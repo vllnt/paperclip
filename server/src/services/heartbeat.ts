@@ -613,7 +613,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
-import { createPemStreamRedactor, type PemStreamRedactor } from "@paperclipai/adapter-utils/log-value-redaction";
+import { createRunLogChunkCompactor } from "./run-log-chunk-compactor.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -679,7 +679,6 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
-const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 
@@ -1450,8 +1449,6 @@ export function getTaskDrainStatus(): {
   };
 }
 
-const INLINE_BASE64_IMAGE_DATA_RE =
-  /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
   | "resolveAdapterConfigForRuntime"
@@ -3763,50 +3760,6 @@ export function boundHeartbeatRunEventPayloadForStorage(
 ): Record<string, unknown> {
   const bounded = boundRunEventValue(payload, 0, new WeakSet());
   return parseObject(bounded) ?? { _truncated: true };
-}
-
-function redactInlineBase64ImageData(chunk: string) {
-  return chunk.replace(
-    INLINE_BASE64_IMAGE_DATA_RE,
-    (_match, prefix: string, data: string, suffix: string) =>
-      `${prefix}[omitted base64 image data: ${data.length} chars]${suffix}`,
-  );
-}
-
-export function compactRunLogChunk(
-  chunk: string,
-  maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
-  pemStream?: PemStreamRedactor,
-) {
-  const withoutImages = redactInlineBase64ImageData(chunk);
-  const normalized = redactSensitiveText(
-    pemStream ? pemStream.redact(withoutImages) : withoutImages,
-  );
-  if (normalized.length <= maxChars) return normalized;
-
-  const headChars = Math.max(0, Math.floor(maxChars * 0.6));
-  const tailChars = Math.max(0, Math.floor(maxChars * 0.25));
-  const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
-  const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
-  return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
-}
-
-/**
- * Creates the chunk compactor of one run. It keeps one PEM redactor for each stream, so a PEM block
- * that arrives in several chunks of one stream is redacted from its BEGIN marker to its END marker.
- *
- * @returns A function that compacts and redacts the next chunk of a stream of this run.
- */
-export function createRunLogChunkCompactor(): (
-  stream: "stdout" | "stderr",
-  chunk: string,
-) => string {
-  const pemStreams = {
-    stdout: createPemStreamRedactor(),
-    stderr: createPemStreamRedactor(),
-  };
-  return (stream, chunk) =>
-    compactRunLogChunk(chunk, MAX_PERSISTED_LOG_CHUNK_CHARS, pemStreams[stream]);
 }
 
 function normalizeMaxConcurrentRuns(value: unknown) {
@@ -23754,6 +23707,9 @@ export function heartbeatService(
       } = { current: null };
       let stdoutExcerpt = "";
       let stderrExcerpt = "";
+      // Set once the run log is open. Both the success and the error path call it before they
+      // finalize the log, so the text that a stream held back is written, redacted.
+      let flushLogTails: () => Promise<void> = async () => {};
       let outputSeq = Number(run.lastOutputSeq ?? 0);
       let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
       let lastLogRuntimeStatusTouchMs = 0;
@@ -23883,11 +23839,11 @@ export function heartbeatService(
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
         const compactLogChunk = createRunLogChunkCompactor();
-        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          const sanitizedChunk = compactLogChunk(
-            stream,
-            redactCurrentUserText(chunk, currentUserRedactionOptions),
-          );
+        const emitLogChunk = async (
+          stream: "stdout" | "stderr",
+          sanitizedChunk: string,
+        ) => {
+          if (sanitizedChunk === "") return;
           if (stream === "stdout")
             stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
           if (stream === "stderr")
@@ -23958,6 +23914,30 @@ export function heartbeatService(
               truncated: payloadChunk.length !== sanitizedChunk.length,
             },
           });
+        };
+        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          await emitLogChunk(
+            stream,
+            compactLogChunk.compact(
+              stream,
+              redactCurrentUserText(chunk, currentUserRedactionOptions),
+            ),
+          );
+        };
+        // Each stream holds back the end of its last chunk until the token is whole. Call this
+        // before the run log is finalized, so that text is redacted and written, never lost.
+        flushLogTails = async () => {
+          const streams: Array<"stdout" | "stderr"> = ["stdout", "stderr"];
+          for (const stream of streams) {
+            try {
+              await emitLogChunk(stream, compactLogChunk.flush(stream));
+            } catch (err) {
+              logger.warn(
+                { err, runId, stream },
+                "failed to write the held tail of the run log",
+              );
+            }
+          }
         };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
@@ -26005,6 +25985,7 @@ export function heartbeatService(
           sha256?: string | null;
           compressed: boolean;
         } | null = null;
+        await flushLogTails();
         if (handle) {
           logSummary = await runLogStore.finalize(handle);
         }
@@ -26730,6 +26711,7 @@ export function heartbeatService(
           sha256?: string | null;
           compressed: boolean;
         } | null = null;
+        await flushLogTails();
         if (handle) {
           try {
             logSummary = await runLogStore.finalize(handle);

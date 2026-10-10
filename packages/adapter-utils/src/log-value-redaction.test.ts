@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   createPemStreamRedactor,
+  createStreamTailCarry,
   hasCredentialKeyName,
   isSensitiveEnvKey,
   maskPemBlocks,
@@ -33,6 +34,16 @@ describe("isSensitiveEnvKey", () => {
     expect(isSensitiveEnvKey("GH_PAT")).toBe(true);
     expect(isSensitiveEnvKey("PATH")).toBe(false);
   });
+
+  it.each(["AUTH", "AUTH_HEADER", "BASIC_AUTH", "X-AUTH", "AUTHORIZATION", "HTTP_AUTHORIZATION", "AUTHENTICATION_HEADER"])(
+    "hides %s",
+    (key) => expect(isSensitiveEnvKey(key)).toBe(true),
+  );
+
+  it.each(["AUTHORITY", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "AUTHOR", "OAUTH_CLIENT_ID"])(
+    "keeps %s, because auth is not a whole segment of it",
+    (key) => expect(isSensitiveEnvKey(key)).toBe(false),
+  );
 });
 
 describe("maskUrlUserInfo", () => {
@@ -97,12 +108,12 @@ describe("redactSecretShapedText", () => {
 });
 
 describe("createPemStreamRedactor", () => {
-  it("redacts a block that arrives in several chunks and keeps the text around it", () => {
+  it("gives one marker for a block that arrives in several chunks and keeps the text around it", () => {
     const redactor = createPemStreamRedactor();
     expect(redactor.redact(`log\n${BEGIN}\n`)).toBe(`log\n${REDACTED_LOG_VALUE}`);
-    expect(redactor.redact(`${BODY}\n`)).toBe(REDACTED_LOG_VALUE);
-    expect(redactor.redact(`${BODY}\n`)).toBe(REDACTED_LOG_VALUE);
-    expect(redactor.redact(`${END}\nnext\n`)).toBe(`${REDACTED_LOG_VALUE}\nnext\n`);
+    expect(redactor.redact(`${BODY}\n`)).toBe("");
+    expect(redactor.redact(`${BODY}\n`)).toBe("");
+    expect(redactor.redact(`${END}\nnext\n`)).toBe("\nnext\n");
     expect(redactor.redact("after\n")).toBe("after\n");
   });
 
@@ -114,14 +125,14 @@ describe("createPemStreamRedactor", () => {
     const redactor = createPemStreamRedactor();
     expect(redactor.redact(`x ${BEGIN.slice(0, 20)}`)).toBe(`x ${BEGIN.slice(0, 20)}`);
     expect(redactor.redact(`${BEGIN.slice(20)}\n${BODY}\n`)).toBe(REDACTED_LOG_VALUE);
-    expect(redactor.redact(`${END}\n`)).toBe(`${REDACTED_LOG_VALUE}\n`);
+    expect(redactor.redact(`${END}\n`)).toBe("\n");
   });
 
   it("finds an END marker split between two chunks", () => {
     const redactor = createPemStreamRedactor();
-    redactor.redact(`${BEGIN}\n${BODY}\n`);
-    expect(redactor.redact(END.slice(0, 12))).toBe(REDACTED_LOG_VALUE);
-    expect(redactor.redact(`${END.slice(12)}\nok\n`)).toBe(`${REDACTED_LOG_VALUE}\nok\n`);
+    expect(redactor.redact(`${BEGIN}\n${BODY}\n`)).toBe(REDACTED_LOG_VALUE);
+    expect(redactor.redact(END.slice(0, 12))).toBe("");
+    expect(redactor.redact(`${END.slice(12)}\nok\n`)).toBe("\nok\n");
     expect(redactor.redact("more\n")).toBe("more\n");
   });
 
@@ -137,15 +148,24 @@ describe("createPemStreamRedactor", () => {
     expect(redactor.redact(`${BEGIN}\n${BODY}\n${END}\nmid\n${BEGIN}\n${BODY}\n`)).toBe(
       `${REDACTED_LOG_VALUE}\nmid\n${REDACTED_LOG_VALUE}`,
     );
-    expect(redactor.redact(`${END}\n`)).toBe(`${REDACTED_LOG_VALUE}\n`);
+    expect(redactor.redact(`${END}\n`)).toBe("\n");
   });
 
-  it("stops redacting when a block stays open for more than 64 KiB", () => {
+  it("never gives the body back, however long the block is, and gives exactly one marker", () => {
     const redactor = createPemStreamRedactor();
-    redactor.redact(`${BEGIN}\n`);
-    const filler = `${"A".repeat(1023)}\n`;
-    for (let i = 0; i < 64; i += 1) expect(redactor.redact(filler)).toBe(REDACTED_LOG_VALUE);
-    expect(redactor.redact("normal output\n")).toBe("normal output\n");
+    const out = [redactor.redact(`${BEGIN}\n`)];
+    for (let i = 0; i < 3000; i += 1) out.push(redactor.redact(`KEYLINE${i}${"A".repeat(40)}\n`));
+    out.push(redactor.redact(`${END}\nnormal output\n`));
+    const joined = out.join("");
+    expect(joined).not.toContain("KEYLINE");
+    expect(joined.split(REDACTED_LOG_VALUE)).toHaveLength(2);
+    expect(joined.endsWith("\nnormal output\n")).toBe(true);
+  });
+
+  it("gives no body when the stream ends inside a block", () => {
+    const redactor = createPemStreamRedactor();
+    const out = [redactor.redact(`head\n${BEGIN}\n`), redactor.redact(`${BODY}\n`), redactor.redact(BODY)];
+    expect(out.join("")).toBe(`head\n${REDACTED_LOG_VALUE}`);
   });
 
   it("keeps separate state in separate instances", () => {
@@ -160,6 +180,64 @@ describe("createPemStreamRedactor", () => {
     const started = Date.now();
     redactor.redact(`-----BEGIN ${"A".repeat(200_000)}`);
     redactor.redact("-----BEGIN ".repeat(20_000));
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+});
+
+describe("createStreamTailCarry", () => {
+  it("releases text up to the last whitespace and holds the rest", () => {
+    const carry = createStreamTailCarry();
+    expect(carry.push("go https://u:pw@h")).toBe("go ");
+    expect(carry.push("/x now\n")).toBe("https://u:pw@h/x now\n");
+    expect(carry.flush()).toBe("");
+  });
+
+  it("holds nothing when a chunk ends with whitespace", () => {
+    const carry = createStreamTailCarry();
+    expect(carry.push("a line\n")).toBe("a line\n");
+    expect(carry.flush()).toBe("");
+  });
+
+  it("holds a whole chunk that has no whitespace, and joins the next chunk to it", () => {
+    const carry = createStreamTailCarry();
+    expect(carry.push("https://u:")).toBe("");
+    expect(carry.push("pw@h/x\n")).toBe("https://u:pw@h/x\n");
+  });
+
+  it("returns the held tail at flush, once", () => {
+    const carry = createStreamTailCarry();
+    carry.push("partial token");
+    expect(carry.flush()).toBe("token");
+    expect(carry.flush()).toBe("");
+  });
+
+  it("releases everything, whole, when the held part would pass the bound", () => {
+    const carry = createStreamTailCarry(16);
+    const long = `https://u:${"p".repeat(40)}@h/x`;
+    expect(carry.push(`a ${long}`)).toBe(`a ${long}`);
+    expect(carry.flush()).toBe("");
+  });
+
+  it("holds a tail of exactly the bound", () => {
+    const carry = createStreamTailCarry(5);
+    expect(carry.push("ab 12345")).toBe("ab ");
+    expect(carry.flush()).toBe("12345");
+  });
+
+  it("gives back every character in order across any split of a text", () => {
+    const text = "one two  three\tfour\nfive-six seven";
+    for (let i = 0; i <= text.length; i += 1) {
+      const carry = createStreamTailCarry(8);
+      const out = carry.push(text.slice(0, i)) + carry.push(text.slice(i)) + carry.flush();
+      expect(out).toBe(text);
+    }
+  });
+
+  it("takes linear time on a long chunk", () => {
+    const carry = createStreamTailCarry();
+    const started = Date.now();
+    carry.push("a".repeat(500_000));
+    carry.push(" ".repeat(500_000));
     expect(Date.now() - started).toBeLessThan(1_000);
   });
 });

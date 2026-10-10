@@ -71,6 +71,39 @@ describe("redactEnvForLogs", () => {
     expect(redacted.BLOB_USER).toBe(`${run}://u:***REDACTED***@h`);
   });
 
+  it("keeps AUTHORITY, GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL, and hides AUTH_HEADER", () => {
+    expect(
+      redactEnvForLogs({ AUTHORITY: "example.org", GIT_AUTHOR_NAME: "Dev", GIT_AUTHOR_EMAIL: "dev@example.org", AUTH_HEADER: "x" }),
+    ).toEqual({
+      AUTHORITY: "example.org",
+      GIT_AUTHOR_NAME: "Dev",
+      GIT_AUTHOR_EMAIL: "dev@example.org",
+      AUTH_HEADER: "***REDACTED***",
+    });
+  });
+
+  it("does not throw on a value that is not a string", () => {
+    const env: Record<string, unknown> = {
+      PORT: 5432,
+      DEBUG: false,
+      EMPTY: undefined,
+      NOTHING: null,
+      NESTED: { url: "postgres://u:FAKE_SECRET_123@h/db" },
+      LIST: ["postgres://u:FAKE_SECRET_123@h/db"],
+      SERVICE_TOKEN: { a: 1 },
+    };
+    const redacted = redactEnvForLogs(env);
+    expect(redacted).toEqual({
+      PORT: "5432",
+      DEBUG: "false",
+      EMPTY: "",
+      NOTHING: "",
+      NESTED: "***REDACTED***",
+      LIST: "***REDACTED***",
+      SERVICE_TOKEN: "***REDACTED***",
+    });
+  });
+
   it("gives the same result when it runs again on its own output", () => {
     const once = redactEnvForLogs({
       DATABASE_URL: "postgres://u:p@h/db",
