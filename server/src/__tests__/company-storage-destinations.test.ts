@@ -56,6 +56,12 @@ interface FakeBucketOptions {
   onPut?: () => Promise<void>;
   /** Runs before every GET. */
   onGet?: (key: string) => Promise<void>;
+  /** Runs after a PUT stored its object. */
+  afterPut?: (key: string) => Promise<void>;
+  /** The provider silently ignores If-None-Match and overwrites. */
+  ignoreIfNoneMatch?: boolean;
+  /** The provider refuses any conditional write with this error. */
+  refuseConditionalWrite?: string;
   /** GET streams this body (in 64 KiB chunks) instead of the stored object. */
   getBody?: Buffer;
   /** GET ignores the requested range, like a non-compliant server. */
@@ -82,9 +88,13 @@ function fakeBucket(options: FakeBucketOptions = {}) {
         await options.onPut?.();
         if (options.failPut) throw fail(options.failPut);
         if (options.scopedTo !== undefined && location.prefix !== options.scopedTo && !marker) throw fail("AccessDenied");
-        if (input.ifNoneMatch === "*" && objects.has(key)) throw fail("PreconditionFailed");
+        if (input.ifNoneMatch && options.refuseConditionalWrite) throw fail(options.refuseConditionalWrite);
+        if (input.ifNoneMatch === "*" && objects.has(key) && !options.ignoreIfNoneMatch) {
+          throw Object.assign(fail("PreconditionFailed"), { $metadata: { httpStatusCode: 412 } });
+        }
         const body = Buffer.isBuffer(input.body) ? input.body : Buffer.alloc(0);
         objects.set(key, body);
+        await options.afterPut?.(key);
         if (options.failPutAfterStore) throw fail(options.failPutAfterStore);
       },
       async headObject(input) {
@@ -347,6 +357,75 @@ describeEmbeddedPostgres("company storage destinations", () => {
     const { destination } = await service.create(company.companyId, createInput(company), BOARD);
     await expect(service.probe(company.companyId, destination.id, BOARD))
       .rejects.toMatchObject({ status: 409, details: { code: "location_unavailable" } });
+  });
+
+  it("refuses to claim a bucket on a provider that ignores conditional writes, so two aliases cannot both win", async () => {
+    const first = await seedCompany("ignore-a");
+    const second = await seedCompany("ignore-b");
+    const options: FakeBucketOptions = { serverSideEncryption: "AES256", ignoreIfNoneMatch: true };
+    const bucket = fakeBucket(options);
+    const service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => 403 });
+    const a = await service.create(first.companyId, createInput(first, { location: location({ endpoint: "https://minio-a.example.com/", bucket: "raced", prefix: "a" }) }), BOARD);
+    const b = await service.create(second.companyId, createInput(second, { location: location({ endpoint: "https://minio-b.example.com/", bucket: "raced", prefix: "b" }) }), BOARD);
+    let secondProbe: Promise<unknown> | null = null;
+    options.afterPut = async (key) => {
+      // A has read "no marker" and written its probe object; B now probes end to end.
+      if (secondProbe || !key.startsWith("a/paperclip-probe/")) return;
+      secondProbe = service.probe(second.companyId, b.destination.id, BOARD).then((result) => result, (error: unknown) => error);
+      await secondProbe;
+    };
+    const firstOutcome = await service.probe(first.companyId, a.destination.id, BOARD).then((result) => result, (error: unknown) => error);
+    const secondOutcome = await secondProbe;
+    const usable = await Promise.all([
+      service.providerFor(first.companyId, a.destination.id).then(() => true, () => false),
+      service.providerFor(second.companyId, b.destination.id).then(() => true, () => false),
+    ]);
+    expect(usable.filter(Boolean).length).toBeLessThanOrEqual(1);
+    for (const outcome of [firstOutcome, secondOutcome]) {
+      expect(outcome).toMatchObject({ status: 422, details: { code: "atomic_claim_unsupported" } });
+    }
+    expect(bucket.objects.has(MARKER_KEY)).toBe(false);
+    expect([...bucket.objects.keys()].filter((key) => key.includes("paperclip-probe"))).toEqual([]);
+  });
+
+  it("refuses to claim a bucket when the provider rejects conditional writes", async () => {
+    const company = await seedCompany("conditional-refused");
+    const bucket = fakeBucket({ serverSideEncryption: "AES256", refuseConditionalWrite: "NotImplemented" });
+    const service = storageDestinationService(db, { providerFactory: bucket.factory, anonymousGet: async () => 403 });
+    const { destination } = await service.create(company.companyId, createInput(company), BOARD);
+    await expect(service.probe(company.companyId, destination.id, BOARD))
+      .rejects.toMatchObject({ status: 422, details: { code: "atomic_claim_unsupported" } });
+    const [row] = await db.select().from(storageDestinations).where(eq(storageDestinations.id, destination.id));
+    expect(row?.lastProbeJson).toMatchObject({ status: "failed", errorCode: "atomic_claim_unsupported" });
+    expect(row?.claimedAt).toBeNull();
+    expect([...bucket.objects.keys()]).toEqual([]);
+    await expect(service.providerFor(company.companyId, destination.id)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("claims normally on a provider that honours conditional writes and removes its check object", async () => {
+    const company = await seedCompany("conditional-ok");
+    const bucket = fakeBucket({ serverSideEncryption: "AES256" });
+    const conditionalKeys: string[] = [];
+    const service = storageDestinationService(db, {
+      providerFactory: async (input) => {
+        const provider = await bucket.factory(input);
+        return {
+          ...provider,
+          async putObject(put) {
+            if (put.ifNoneMatch) conditionalKeys.push([input.location.prefix, put.objectKey].filter(Boolean).join("/"));
+            return provider.putObject(put);
+          },
+        };
+      },
+      anonymousGet: async () => 403,
+    });
+    const { destination } = await service.create(company.companyId, createInput(company), BOARD);
+    await expect(service.probe(company.companyId, destination.id, BOARD)).resolves.toMatchObject({ status: "passed" });
+    // The check writes one fresh key twice, then the marker once.
+    expect(conditionalKeys).toHaveLength(3);
+    expect(conditionalKeys[0]).toBe(conditionalKeys[1]);
+    expect(conditionalKeys[2]).toBe(MARKER_KEY);
+    expect([...bucket.objects.keys()]).toEqual([MARKER_KEY]);
   });
 
   it("requires the exact encryption the destination asked for", async () => {

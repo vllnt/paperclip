@@ -6757,9 +6757,9 @@ registry.registerPath({
   path: "/api/companies/{companyId}/storage/destinations/{destinationId}/probe",
   tags: ["companies"],
   summary: "Probe a storage destination: ownership marker, write, read, checksum, encryption, public read, prefix isolation, delete",
-  description: "Returns the probe result (status passed or failed with a fixed errorCode, including ownership_unverified when the key cannot read and write .paperclip/owner.json at the bucket root). A bucket another company claimed, shown by its ownership marker under any host name or by the instance's claim, records a failed probe and answers 409 with code location_unavailable. A passing probe writes the marker when there is none and claims the bucket for the company. See doc/company-storage.md.",
+  description: "Returns the probe result (status passed or failed with a fixed errorCode, including ownership_unverified when the key cannot read and write .paperclip/owner.json at the bucket root). A bucket another company claimed, shown by its ownership marker under any host name or by the instance's claim, records a failed probe and answers 409 with code location_unavailable. A passing probe writes the marker when there is none and claims the bucket for the company; claiming needs a provider that enforces If-None-Match conditional writes, otherwise the probe fails and answers 422 with code atomic_claim_unsupported. See doc/company-storage.md.",
   request: { params: storageDestinationParams },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
 });
 
 registry.registerPath({

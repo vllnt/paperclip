@@ -86,20 +86,20 @@ describe("storage destinations commands", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it("reports a bucket another organization claimed as a conflict with its code", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
-      error: "This storage location is not available. Use a bucket of your own.",
-      details: { code: "location_unavailable" },
-    }, 409)));
+  it.each([
+    [409, "location_unavailable", "This storage location is not available. Use a bucket of your own."],
+    [422, "atomic_claim_unsupported", "The provider does not enforce conditional writes (If-None-Match), so the bucket cannot be claimed safely."],
+  ])("reports a refused claim (%s %s) with its message and code", async (status, code, message) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ error: message, details: { code } }, status)));
     const printed: string[] = [];
-    vi.spyOn(console, "error").mockImplementation((message: unknown) => {
-      printed.push(String(message));
+    vi.spyOn(console, "error").mockImplementation((line: unknown) => {
+      printed.push(String(line));
     });
-    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw new Error(`exit ${code}`);
+    vi.spyOn(process, "exit").mockImplementation(((exitCode?: number) => {
+      throw new Error(`exit ${exitCode}`);
     }) as typeof process.exit);
     await expect(run(["storage", "destinations", "probe", DESTINATION_ID, "-C", COMPANY_ID])).rejects.toThrow("exit 1");
-    expect(printed.join("\n")).toContain("API error 409: This storage location is not available. Use a bucket of your own.");
-    expect(printed.join("\n")).toContain("location_unavailable");
+    expect(printed.join("\n")).toContain(`API error ${status}: ${message}`);
+    expect(printed.join("\n")).toContain(code);
   });
 });

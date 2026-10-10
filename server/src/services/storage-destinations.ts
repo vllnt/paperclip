@@ -69,6 +69,7 @@ const PROBE_ERRORS = {
   public_read_unverified: "The probe could not confirm that the bucket refuses unauthenticated reads.",
   location_unavailable: "This storage location is not available. Use a bucket of your own.",
   ownership_unverified: "The access key cannot read and write the ownership marker .paperclip/owner.json at the bucket root. Allow it for that one object.",
+  atomic_claim_unsupported: "The provider does not enforce conditional writes (If-None-Match), so the bucket cannot be claimed safely. Use a provider that supports them, such as AWS S3, Cloudflare R2 or MinIO.",
   cleanup_failed: "A probe object could not be deleted. Check the delete permission.",
   timeout: "The probe did not finish within its time limit.",
   probe_failed: "The probe failed.",
@@ -95,6 +96,24 @@ function probeErrorCode(error: unknown): ProbeErrorCode {
   if (["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH"].includes(code)) return "endpoint_unavailable";
   if (error instanceof Error && /network policy|endpoint/i.test(error.message)) return "endpoint_unavailable";
   return "probe_failed";
+}
+
+/** The provider refused a write because its If-None-Match condition failed (HTTP 412). */
+function isPreconditionFailed(error: unknown): boolean {
+  const candidate = error as { name?: string; $metadata?: { httpStatusCode?: number } } | null;
+  return candidate?.name === "PreconditionFailed" || candidate?.$metadata?.httpStatusCode === 412;
+}
+
+/** A refused conditional write: a missing permission, or a provider that cannot do it. */
+function conditionalWriteFailure(error: unknown): unknown {
+  const candidate = error as { name?: string; $metadata?: { httpStatusCode?: number } } | null;
+  const name = candidate?.name ?? "";
+  const status = candidate?.$metadata?.httpStatusCode;
+  if (name === "AccessDenied" || name === "Forbidden" || status === 403) return new ProbeFailure("access_denied");
+  if (name === "NotImplemented" || name === "InvalidArgument" || (status !== undefined && status >= 400 && status < 500)) {
+    return new ProbeFailure("atomic_claim_unsupported");
+  }
+  return error;
 }
 
 /**
@@ -324,10 +343,45 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
   }
 
   /**
+   * A claim that can overwrite is no claim: two host names of one bucket could
+   * each write and read back their own marker. So before claiming, write one
+   * fresh key twice with If-None-Match: *; the second write must be refused
+   * with 412. A provider that ignores or rejects the header cannot claim a
+   * bucket. The check object is removed either way.
+   */
+  async function assertConditionalWrites(client: StorageProvider, objectKey: string, signal: AbortSignal) {
+    const put = () => client.putObject({
+      objectKey,
+      body: Buffer.from("x"),
+      contentType: "application/octet-stream",
+      contentLength: 1,
+      ifNoneMatch: "*",
+      signal,
+    });
+    try {
+      try {
+        await put();
+      } catch (error) {
+        throw conditionalWriteFailure(error);
+      }
+      try {
+        await put();
+      } catch (error) {
+        if (isPreconditionFailed(error)) return;
+        throw conditionalWriteFailure(error);
+      }
+      throw new ProbeFailure("atomic_claim_unsupported");
+    } finally {
+      await client.deleteObject({ objectKey, signal: AbortSignal.timeout(CLEANUP_TIMEOUT_MS) }).catch((error: unknown) => {
+        logger.warn({ err: error }, "storage probe could not remove its conditional-write check object");
+      });
+    }
+  }
+
+  /**
    * Writes the marker only if none exists, then reads it back: of two
    * destinations racing for one bucket under different host names, only one
-   * sees its own marker. Providers without conditional writes get a plain
-   * write; the read-back still catches a lost race.
+   * sees its own marker. Never falls back to a plain write.
    */
   async function claimOwnerMarker(root: StorageProvider, companyId: string, row: DestinationRow, nonce: string, signal: AbortSignal) {
     const body = Buffer.from(`${JSON.stringify({
@@ -337,21 +391,20 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
       nonce,
       claimedAt: new Date().toISOString(),
     }, null, 2)}\n`);
-    const put = (ifNoneMatch?: "*") => root.putObject({
-      objectKey: STORAGE_OWNER_MARKER_KEY,
-      body,
-      contentType: "application/json",
-      contentLength: body.length,
-      ifNoneMatch,
-      signal,
-    });
     try {
-      await put("*");
+      await root.putObject({
+        objectKey: STORAGE_OWNER_MARKER_KEY,
+        body,
+        contentType: "application/json",
+        contentLength: body.length,
+        ifNoneMatch: "*",
+        signal,
+      });
     } catch (error) {
       const name = (error as { name?: string } | null)?.name;
       if (name === "AccessDenied" || name === "Forbidden") throw new ProbeFailure("ownership_unverified");
-      if (name === "NotImplemented" || name === "InvalidArgument") await put();
-      else if (name !== "PreconditionFailed" && name !== "ConditionalRequestConflict") throw error;
+      // Another claim won the race: the read-back below sees its marker.
+      if (!isPreconditionFailed(error) && name !== "ConditionalRequestConflict") throw conditionalWriteFailure(error);
     }
     const marker = await readOwnerMarker(root, signal);
     if (!marker || !(await markerIsOwn(companyId, marker))) throw new ProbeFailure("location_unavailable");
@@ -706,7 +759,10 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
         if (result.publicRead === "unknown") throw new ProbeFailure("public_read_unverified");
 
         if (location.prefix) result.isolation = await checkIsolation(row, credentials, probeId, signal);
-        if (!marker) await claimOwnerMarker(root, companyId, row, ownerNonce, signal);
+        if (!marker) {
+          await assertConditionalWrites(client, `${PROBE_PREFIX}/${probeId}.conditional`, signal);
+          await claimOwnerMarker(root, companyId, row, ownerNonce, signal);
+        }
         result.status = "passed";
       } catch (error) {
         const code = signal.aborted && !(error instanceof ProbeFailure) ? "timeout" : probeErrorCode(error);
@@ -764,6 +820,10 @@ export function storageDestinationService(db: Db, deps: StorageDestinationDeps =
       // Somebody else's bucket is a conflict on every surface, as on create.
       if (result.errorCode === "location_unavailable") {
         throw conflict(PROBE_ERRORS.location_unavailable, { code: "location_unavailable" });
+      }
+      // The bucket cannot be claimed at all on this provider: a request the API refuses, not a passing check.
+      if (result.errorCode === "atomic_claim_unsupported") {
+        throw unprocessable(PROBE_ERRORS.atomic_claim_unsupported, { code: "atomic_claim_unsupported" });
       }
       return result;
     },

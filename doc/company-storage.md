@@ -40,6 +40,12 @@ object: the ownership marker `.paperclip/owner.json` at the bucket root.
   - **In the bucket:** the probe writes the ownership marker
     `.paperclip/owner.json` at the bucket root (destination id and a random
     value kept in the database), with a conditional write, and reads it back.
+    A claim that could overwrite another one is no claim, so the provider must
+    enforce `If-None-Match: *`. Before the first claim the probe writes one
+    fresh key under its prefix twice with that header; the second write must
+    be refused with 412. A provider that ignores or rejects the header cannot
+    claim a bucket: the probe fails and answers 422
+    `atomic_claim_unsupported`. AWS S3, Cloudflare R2 and MinIO enforce it.
     Every probe reads the marker first. A marker of another organization, of
     a destination this instance does not know, or one that is not a Paperclip
     marker makes the probe answer 409 `location_unavailable`, whatever host
@@ -105,9 +111,12 @@ object: the ownership marker `.paperclip/owner.json` at the bucket root.
    `bucket_wide` (the key is not limited to the prefix) and the object is
    deleted (the probe fails if it cannot be deleted); a refusal is
    `prefix_scoped`. This check does not otherwise fail the probe;
-7. when the bucket has no marker yet, the conditional write of this
-   organization's marker and a read-back (`location_unavailable` if another
-   claim won);
+7. when the bucket has no marker yet: the conditional-write check (a fresh
+   key written twice with `If-None-Match: *`, then deleted;
+   `atomic_claim_unsupported` unless the second write gets 412), then the
+   conditional write of this organization's marker and a read-back
+   (`location_unavailable` if another claim won). There is no fallback to a
+   plain write;
 8. DELETE of the probe object, with its own 10-second limit. It also runs
    after a PUT that failed without saying whether the object was stored.
 
@@ -118,7 +127,8 @@ endpoints, so the probe cannot map internal names), `invalid_credentials`,
 `access_denied`, `bucket_not_found`, `encryption_unsupported`,
 `encryption_mismatch`, `encryption_unverified`, `read_mismatch`,
 `public_read`, `public_read_unverified`, `location_unavailable`,
-`ownership_unverified`, `cleanup_failed`, `timeout`, `probe_failed`.
+`ownership_unverified`, `atomic_claim_unsupported`, `cleanup_failed`,
+`timeout`, `probe_failed`. `atomic_claim_unsupported` is a 422.
 `location_unavailable` is also the probe's HTTP status: 409, as on create,
 on the web page, in the API and in the CLI (which exits 1).
 
