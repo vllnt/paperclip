@@ -118,6 +118,35 @@ server-authored event among these three types; provider
 source events cannot supply stop authority. These records stay in the local run
 log and do not add Telemetry or OpenTelemetry data.
 
+## SSH Remote Process Stop Events
+
+The local child of a legacy run on an SSH environment is the `ssh` client.
+Signalling it ends the connection but not the remote command, which keeps
+running without a pty. So before the run's GitHub launchers are removed and
+before its environment lease is released, the server stops what the run left
+on the worker over a separate SSH connection, within 20 seconds, once per
+lease. Each launch records its leader in
+`<remoteWorkspacePath>/.paperclip-runtime/processes/<runId>/` and gives every
+child a random marker in the `PAPERCLIP_RUN_MARKER` environment variable; the
+stop signals only the worker user's processes that are in the verified leader's
+process group or carry an exact recorded marker, and checks each start time
+again before `SIGKILL`.
+
+The server writes one of these events per SSH lease:
+
+| Event | Level | When |
+|---|---|---|
+| `remote_processes_stopped` | info | Nothing of the run is left on the worker. |
+| `remote_processes_survived` | warn | Some processes were still running after `SIGKILL`. |
+| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_summary` or `config_unavailable`. |
+
+The payload holds the environment id and the counts `records`, `matched`,
+`killed`, `skipped` and `survived`, plus `reason` when there is one. The marker
+value never appears in a run event, a log, argv or the launch record, which
+stores only its SHA-256. The lease metadata keeps the same outcome under
+`remoteProcessStop`. These records stay in the local run log and add no
+Telemetry or OpenTelemetry data.
+
 ## Verified Local Codex Replacement Evidence
 
 The server writes `native.stopped_text_turn_verified` in the same transaction
