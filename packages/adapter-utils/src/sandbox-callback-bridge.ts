@@ -1,7 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import http2 from "node:http2";
-import os from "node:os";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import {
@@ -26,6 +25,7 @@ import {
   parseRemoteProcessIdentity,
   type RemoteProcessIdentity,
 } from "./remote-process-identity.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
 
@@ -174,12 +174,14 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/]+\/approvals$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/routines$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills$/ },
-  // Company skills: read back and file updates. The server's skills.edit policy decides which agents may write;
-  // set a deny-by-default skill policy before relying on this. Id slots exclude ?, #, %, . and \ so a
+  // Company skills: read back, file updates and create. The server's skill policy (skills.edit, skills.create)
+  // decides which agents may write, and it also enforces the company boundary and logs the change; set a
+  // deny-by-default skill policy before relying on this. Id slots exclude ?, #, %, . and \ so a
   // queue_v1 path can't smuggle a query, an encoded segment or a dot segment past the rule.
   { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+$/ },
   { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
   { method: "PATCH", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/skills$/ },
   // Decisions: agents ask the board and withdraw their own open asks (the server allows the origin agent only).
   // Listing stays board-only; deciding and dismissing stay human-only.
   { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/decisions$/ },
@@ -562,16 +564,18 @@ export function buildSandboxCallbackBridgeEnv(input: {
 }
 
 export async function createSandboxCallbackBridgeAsset(): Promise<SandboxCallbackBridgeAsset> {
-  const localDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-asset-"));
-  const entrypoint = path.join(localDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
-  await fs.writeFile(entrypoint, getSandboxCallbackBridgeServerSource(), "utf8");
-  return {
-    localDir,
-    entrypoint,
-    cleanup: async () => {
-      await fs.rm(localDir, { recursive: true, force: true }).catch(() => undefined);
-    },
+  const localDir = await createPaperclipTempDir("paperclip-bridge-asset-");
+  const cleanup = async () => {
+    await removePaperclipTempDir(localDir).catch(() => undefined);
   };
+  const entrypoint = path.join(localDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
+  try {
+    await fs.writeFile(entrypoint, getSandboxCallbackBridgeServerSource(), "utf8");
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { localDir, entrypoint, cleanup };
 }
 
 export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallbackBridgeQueueClient {

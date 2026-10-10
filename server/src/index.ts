@@ -99,6 +99,8 @@ import {
   createProductionLoginSessionReaperRuntime,
 } from "./services/device-login-reaper.js";
 import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
+import { createPaperclipTempSweep, startPaperclipTempSweeper } from "./services/paperclip-temp-sweeper.js";
+import { isHeartbeatRunExecuting } from "./services/heartbeat.js";
 import { localAiLoginService } from "./services/local-ai-login.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -1197,6 +1199,17 @@ async function startServerWithDatabaseTeardown(
   };
   const runUsageRecordInterval = setInterval(deriveRunUsageRecords, config.runUsageRecordIntervalMs);
   runUsageRecordInterval.unref?.();
+  // Remove per-run temp entries of dead runs: on startup, then on the
+  // interval. It runs whether or not the heartbeat scheduler does.
+  const tempSweeper = startPaperclipTempSweeper({
+    sweep: createPaperclipTempSweep(db, {
+      runGraceMs: config.tempSweepRunGraceMinutes * 60 * 1000,
+      isRunExecuting: isHeartbeatRunExecuting,
+    }),
+    intervalMs: config.tempSweepIntervalMinutes * 60 * 1000,
+    log: (record) => logger.info(record, "paperclip temp sweep finished"),
+    onError: (err) => logger.error({ err, event: "paperclip_tmp_sweep" }, "paperclip temp sweep failed"),
+  });
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
@@ -1978,6 +1991,7 @@ async function startServerWithDatabaseTeardown(
     unsubscribeChatCompletions();
     clearInterval(executionControlInterval);
     clearInterval(runUsageRecordInterval);
+    tempSweeper.stop();
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;

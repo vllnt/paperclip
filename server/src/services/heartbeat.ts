@@ -16,7 +16,7 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -27,6 +27,7 @@ import { isBrowserUseConnection } from "./browser-use-client.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
+import { runWithPaperclipTempRun } from "@paperclipai/adapter-utils/paperclip-temp";
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -883,6 +884,20 @@ export {
 };
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
+const DEFERRED_WAKE_HELD_ACTION = "heartbeat.deferred_wake_held";
+/** A wake the sweep keeps parked this long after it was requested gets one held activity entry. */
+const DEFERRED_WAKE_HELD_NOTICE_MS = 10 * 60 * 1000;
+type DeferredWakeHeldReason =
+  /** The agent has no free run slot. */
+  | "no_free_run_slot"
+  /** The pass budget ran out, or an older wake of the same issue went first. */
+  | "waiting_for_turn"
+  | "agent_not_invokable"
+  | "budget_stop"
+  | "pause_hold"
+  | "execution_blocker"
+  | "operator_stop"
+  | "admission_deferred";
 // A workspace restore or agent directory lock that no queue progress released
 // in time. Contention clears on its own, so the run is retried under the
 // bounded transient budget instead of ending as a plain `adapter_failed`.
@@ -1343,6 +1358,11 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+
+/** Whether this server process is executing the run now. */
+export function isHeartbeatRunExecuting(runId: string): boolean {
+  return activeRunExecutions.has(runId);
+}
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an
@@ -20746,7 +20766,8 @@ export function heartbeatService(
    */
   async function readDeferredWakeHolds(candidates: readonly OrphanedDeferredWakeRow[]) {
     const holds = new Map<string, "pause_hold" | "execution_blocker" | "operator_stop">();
-    if (candidates.length === 0) return holds;
+    const blockers = new Map<string, ExecutionBlocker>();
+    if (candidates.length === 0) return { holds, blockers };
 
     const companyIds = [...new Set(candidates.map((candidate) => candidate.companyId))];
     const companiesWithPauseHold = new Set(
@@ -20784,8 +20805,10 @@ export function heartbeatService(
         holds.set(candidate.wakeId, "pause_hold");
         continue;
       }
-      if (await getExecutionBlocker(db, candidate.companyId, candidate.issueId)) {
+      const executionBlocker = await getExecutionBlocker(db, candidate.companyId, candidate.issueId);
+      if (executionBlocker) {
         holds.set(candidate.wakeId, "execution_blocker");
+        blockers.set(candidate.wakeId, executionBlocker);
         continue;
       }
       const latest = latestRunByIssueId.get(candidate.issueId);
@@ -20799,7 +20822,63 @@ export function heartbeatService(
         holds.set(candidate.wakeId, "operator_stop");
       }
     }
-    return holds;
+    return { holds, blockers };
+  }
+
+  /**
+   * Records, once per wake, that the sweep keeps a wake parked longer than
+   * `DEFERRED_WAKE_HELD_NOTICE_MS`, whatever holds it: no free run slot, an agent
+   * that cannot run, a budget stop, a pause hold, an operator Stop, an execution
+   * blocker (with its cause, run and recovery action) or admission deferring it
+   * again. The advisory lock makes the check and the insert atomic.
+   */
+  async function recordDeferredWakeHeld(
+    candidate: OrphanedDeferredWakeRow,
+    reason: DeferredWakeHeldReason,
+    blocker: ExecutionBlocker | null,
+  ) {
+    const publications: ActivityPublication[] = [];
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`deferred-wake-held:${candidate.wakeId}`}, 0))`,
+      );
+      const [existing] = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.action, DEFERRED_WAKE_HELD_ACTION),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.issueId),
+          sql`${activityLog.details} ->> 'wakeId' = ${candidate.wakeId}`,
+        ))
+        .limit(1);
+      if (existing) return;
+      await logActivity(txDb, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: candidate.agentId,
+        action: DEFERRED_WAKE_HELD_ACTION,
+        entityType: "issue",
+        entityId: candidate.issueId,
+        details: {
+          wakeId: candidate.wakeId,
+          reason,
+          parkedSince: candidate.requestedAt.toISOString(),
+          ...(blocker
+            ? {
+                cause: blocker.cause,
+                runId: blocker.runId,
+                recoveryActionId: blocker.recoveryActionId,
+                nextAction: blocker.nextAction,
+              }
+            : {}),
+        },
+      }, publications);
+    });
+    for (const publication of publications) publishActivity(publication);
   }
 
   /**
@@ -20875,6 +20954,16 @@ export function heartbeatService(
     };
     if ((await getSchedulingSuppression()).suppressed) return result;
     const now = opts.now ?? new Date();
+    if (!opts.agentId) {
+      // A wake parked on a closed task will never run; finalize it instead of
+      // keeping it parked.
+      const retiredClosed = await wakeQueue.retireClosedIssueDeferredWakes({
+        now,
+        minAgeMs: DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+      });
+      result.retired += retiredClosed.length;
+      for (const wake of retiredClosed) countersForCompany(wake.companyId).retired += 1;
+    }
 
     const orphans = await wakeQueue.listOrphanedDeferredWakes({
       now,
@@ -20934,6 +21023,20 @@ export function heartbeatService(
       for (const orphan of notInvokableWakes) countersForCompany(orphan.companyId).skippedNotInvokable += 1;
       result.skippedNotInvokable = notInvokableWakes.length;
     }
+    // Why each examined wake stays parked this pass; promoted wakes are removed.
+    const heldReasons = new Map<string, { reason: DeferredWakeHeldReason; blocker: ExecutionBlocker | null }>(
+      orphans.map((orphan) => [
+        orphan.wakeId,
+        {
+          reason: notInvokableAgentIds.has(orphan.agentId)
+            ? "agent_not_invokable"
+            : (freeSlotsByAgent.get(orphan.agentId) ?? 0) === 0
+              ? "no_free_run_slot"
+              : "waiting_for_turn",
+          blocker: null,
+        },
+      ]),
+    );
 
     const selected = selectDeferredWakesToPromote(orphans, freeSlotsByAgent, {
       maxTotal: sweepPromotionBudget(opts.maxPromotions),
@@ -20943,7 +21046,7 @@ export function heartbeatService(
       new Set(orphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId)).map((orphan) => orphan.issueId)).size -
         selected.length,
     );
-    const holds = await readDeferredWakeHolds(selected);
+    const { holds, blockers } = await readDeferredWakeHolds(selected);
     // Company, agent and project decide a budget block, so one read serves every
     // wake that shares them.
     const budgetBlockByScope = new Map<string, boolean>();
@@ -20957,10 +21060,16 @@ export function heartbeatService(
           observedUpdatedAt: candidate.observedUpdatedAt,
           now: new Date(),
         });
-        if (!claimed) continue;
-        if (holds.has(candidate.wakeId)) {
+        if (!claimed) {
+          // Another pass owns this wake now.
+          heldReasons.delete(candidate.wakeId);
+          continue;
+        }
+        const hold = holds.get(candidate.wakeId);
+        if (hold) {
           result.skippedHeld += 1;
           counters.skippedHeld += 1;
+          heldReasons.set(candidate.wakeId, { reason: hold, blocker: blockers.get(candidate.wakeId) ?? null });
           continue;
         }
         const budgetScope = `${candidate.companyId}:${candidate.agentId}:${candidate.projectId ?? ""}`;
@@ -20978,16 +21087,31 @@ export function heartbeatService(
           // created and none is cancelled later. It resumes when the budget does.
           result.skippedBudget += 1;
           counters.skippedBudget += 1;
+          heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
           continue;
         }
         const outcome = await redeliverDeferredWake(candidate);
         result[outcome] += 1;
         counters[outcome] += 1;
+        if (outcome === "stillDeferred") {
+          heldReasons.set(candidate.wakeId, { reason: "admission_deferred", blocker: null });
+        } else {
+          heldReasons.delete(candidate.wakeId);
+        }
       } catch (err) {
         result.failed += 1;
         counters.failed += 1;
+        heldReasons.delete(candidate.wakeId);
         logger.warn({ err, queueId: candidate.wakeId }, "failed to re-deliver an orphaned deferred wake");
       }
+    }
+
+    for (const orphan of orphans) {
+      const held = heldReasons.get(orphan.wakeId);
+      if (!held || now.getTime() - orphan.requestedAt.getTime() < DEFERRED_WAKE_HELD_NOTICE_MS) continue;
+      await recordDeferredWakeHeld(orphan, held.reason, held.blocker).catch((err) => {
+        logger.warn({ err, wakeId: orphan.wakeId }, "failed to record a held deferred wake");
+      });
     }
 
     if (result.promoted > 0 || result.failed > 0) {
@@ -21794,12 +21918,24 @@ export function heartbeatService(
     return promise;
   }
 
-  async function executeRun(
+  function executeRun(
     runId: string,
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
     } = {},
+  ) {
+    // Temp entries the run creates carry its id, so the temp sweep can prove
+    // the run ended before it removes them.
+    return runWithPaperclipTempRun(runId, () => executeRunAttempt(runId, runOptions));
+  }
+
+  async function executeRunAttempt(
+    runId: string,
+    runOptions: {
+      nativeLeaseOwner?: string;
+      nativeRestartRecovery?: NativeRestartRecoveryClaim;
+    },
   ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
