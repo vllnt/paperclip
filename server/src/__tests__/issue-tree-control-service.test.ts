@@ -569,7 +569,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
 
     const issueSvc = issueService(db);
     await expect(
-      issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], randomUUID()),
+      issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], randomUUID(), { kind: "agent", agentId }),
     ).rejects.toMatchObject({
       status: 409,
       details: expect.objectContaining({
@@ -578,7 +578,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       }),
     });
     await expect(
-      issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], forgedRunId),
+      issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], forgedRunId, { kind: "agent", agentId }),
     ).rejects.toMatchObject({
       status: 409,
       details: expect.objectContaining({
@@ -587,11 +587,11 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       }),
     });
 
-    const checkedOutChild = await issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], deepDescendantRunId);
+    const checkedOutChild = await issueSvc.checkout(deepDescendantIssueId, agentId, ["todo"], deepDescendantRunId, { kind: "agent", agentId });
     expect(checkedOutChild.status).toBe("in_progress");
     expect(checkedOutChild.checkoutRunId).toBe(deepDescendantRunId);
 
-    const checkedOutRoot = await issueSvc.checkout(rootIssueId, agentId, ["todo"], rootRunId);
+    const checkedOutRoot = await issueSvc.checkout(rootIssueId, agentId, ["todo"], rootRunId, { kind: "agent", agentId });
     expect(checkedOutRoot.status).toBe("in_progress");
     expect(checkedOutRoot.checkoutRunId).toBe(rootRunId);
 
@@ -618,7 +618,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
     });
 
-    const checkedOutLegacyFullPauseRoot = await issueSvc.checkout(rootIssueId, agentId, ["todo"], rootRunId);
+    const checkedOutLegacyFullPauseRoot = await issueSvc.checkout(rootIssueId, agentId, ["todo"], rootRunId, { kind: "agent", agentId });
     expect(checkedOutLegacyFullPauseRoot.status).toBe("in_progress");
     expect(checkedOutLegacyFullPauseRoot.checkoutRunId).toBe(rootRunId);
   });

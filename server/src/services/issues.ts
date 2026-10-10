@@ -89,6 +89,7 @@ import type {
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
+  IssueChanges,
   IssueRelationIssueSummary,
   IssueWatchdogSummary,
   LowTrustBoundary,
@@ -104,8 +105,18 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
+import {
+  assertAgentMayChangeBlock,
+  checkoutKeepsHumanOwnedBlock,
+  handsBlockToHuman,
+  HUMAN_OWNED_BLOCK_MESSAGE,
+  isHumanOwnedBlock,
+  notHumanOwnedBlockCondition,
+  type IssueCheckoutActor,
+  type NativeStatusProjectionActor,
+} from "./routable-blocked.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -10660,6 +10671,13 @@ export function issueService(db: Db) {
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        /**
+         * Names a platform caller that writes on its own account. The write is then held to the
+         * human-owned block rule in its `WHERE`: it does not match a block that the board or a
+         * person owns, and the call resolves with that row unchanged, with nothing else written. A
+         * caller that must know whether its values landed compares them with the row.
+         */
+        systemActor?: NativeStatusProjectionActor;
         companyGuard?: string;
       },
       dbOrTx: any = db,
@@ -10707,6 +10725,7 @@ export function issueService(db: Db) {
         actorRunId,
         actorRunStopId,
         actorUserId,
+        systemActor,
         companyGuard,
         ...issueData
       } = data;
@@ -10787,6 +10806,9 @@ export function issueService(db: Db) {
       ) {
         patch.unblockDescriptor = null;
         patch.blockedTransitionAt = null;
+        patch.blockedOwnerNotifiedAt = null;
+      } else if (handsBlockToHuman(existing, issueData)) {
+        patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
       }
       if (issueData.requestDepth !== undefined) {
@@ -10981,6 +11003,9 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Only a human lifts a human-owned block. An agent, and any write that names no actor at
+        // all, is refused. A named system actor is held by the `WHERE` of the write instead.
+        if (actorAgentId || (!actorUserId && !systemActor)) assertAgentMayChangeBlock(receiptExisting, issueData);
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -11049,10 +11074,15 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(idPredicate)
+          .where(systemActor ? and(idPredicate, notHumanOwnedBlockCondition(issues)) : idPredicate)
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          if (!systemActor || !isHumanOwnedBlock(receiptExisting)) return null;
+          const [held] = await withIssueLabels(tx, [receiptExisting]);
+          const noChanges: IssueChanges = {};
+          return { ...held, changes: noChanges };
+        }
         await recordChatCompletion(tx, receiptExisting, updated);
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.
@@ -11443,12 +11473,30 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
+    /**
+     * Assigns the issue to the agent and moves it to `in_progress`.
+     *
+     * An agent that acts through the API may not take an issue out of a block that the board or a
+     * person owns, the same rule as `update`. The rule is part of the `WHERE` of the write, so a
+     * descriptor that changes after the caller read the issue still stops it. The call fails with
+     * a 403 and the issue stays blocked.
+     *
+     * The caller must say who it is, so no caller skips the rule by forgetting to. A board user
+     * may check the issue out. The one exemption is the named system actor
+     * `HEARTBEAT_CHECKOUT_ACTOR` (`routable-blocked.ts`), which the heartbeat passes for its own
+     * checkout of the issue that it wakes an agent for, so that checkout keeps its behavior. The
+     * test group "the system checkout" in `issue-human-owned-block.test.ts` pins this.
+     *
+     * @param actor - Who asks for the checkout. An `agent` is held to the rule.
+     */
     checkout: async (
       id: string,
       agentId: string,
       expectedStatuses: string[],
       checkoutRunId: string | null,
+      actor: IssueCheckoutActor,
     ) => {
+      const keepHumanOwnedBlock = checkoutKeepsHumanOwnedBlock(actor);
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -11544,6 +11592,7 @@ export function issueService(db: Db) {
             inArray(issues.status, expectedStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            keepHumanOwnedBlock ? notHumanOwnedBlockCondition(issues) : undefined,
           ),
         )
         .returning()
@@ -11558,6 +11607,7 @@ export function issueService(db: Db) {
         .select({
           id: issues.id,
           status: issues.status,
+          unblockDescriptor: issues.unblockDescriptor,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
@@ -11567,6 +11617,10 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      if (keepHumanOwnedBlock && expectedStatuses.includes("blocked") && isHumanOwnedBlock(current)) {
+        throw forbidden(HUMAN_OWNED_BLOCK_MESSAGE);
+      }
 
       if (
         current.assigneeAgentId === agentId &&
@@ -11663,6 +11717,7 @@ export function issueService(db: Db) {
                   isNull(issues.assigneeAgentId),
                   eq(issues.assigneeAgentId, agentId),
                 ),
+                keepHumanOwnedBlock ? notHumanOwnedBlockCondition(issues) : undefined,
               ),
             )
             .returning()

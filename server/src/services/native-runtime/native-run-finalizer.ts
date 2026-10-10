@@ -39,6 +39,7 @@ import {
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
+import { NATIVE_STATUS_PROJECTION_ACTOR } from "../routable-blocked.js";
 import { publishChatPublicationCommitSignal } from "../chat-publication-reconciliation.js";
 import { nativeSha256 } from "./canonical.js";
 import {
@@ -500,6 +501,7 @@ async function recordRetryableFailure(input: {
             input.failureScope === "workspace"
               ? "blocked"
               : "in_review",
+          systemActor: NATIVE_STATUS_PROJECTION_ACTOR,
         },
         tx,
       );

@@ -13271,12 +13271,11 @@ export function issueRoutes(
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
-        if (
-          req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
-        ) {
+        // Agents may hand a block to the board (it lands in the board inbox),
+        // but may not page a specific person or wake another agent.
+        if (req.actor.type === "agent" && owner !== "board" && "userId" in owner) {
           throw forbidden(
-            "Agents may only name themselves as an unblock owner",
+            "Agents may name themselves or the board as an unblock owner",
           );
         }
         if (owner !== "board" && "agentId" in owner) {
@@ -13300,7 +13299,7 @@ export function issueRoutes(
             req.actor.agentId !== owner.agentId
           ) {
             throw forbidden(
-              "Agents may only name themselves as an unblock owner",
+              "Agents may name themselves or the board as an unblock owner",
             );
           }
         } else if (owner !== "board" && "userId" in owner) {
@@ -15184,6 +15183,10 @@ export function issueRoutes(
           req.body.agentId,
           req.body.expectedStatuses,
           checkoutRunId,
+          // An agent can only check out as itself (the gate above), so its id is the body's.
+          req.actor.type === "agent"
+            ? { kind: "agent", agentId: req.body.agentId }
+            : { kind: "board", userId: req.actor.userId ?? null },
         );
       } catch (error) {
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
@@ -17623,7 +17626,11 @@ export function issueRoutes(
               actor,
             })
           : null;
-        const reopenedIssue = await svc.update(id, { status: "todo" });
+        const reopenedIssue = await svc.update(id, {
+          status: "todo",
+          ...(actor.agentId ? { actorAgentId: actor.agentId } : {}),
+          ...(actor.actorType === "user" ? { actorUserId: actor.actorId } : {}),
+        });
         if (!reopenedIssue) {
           res.status(404).json({ error: "Issue not found" });
           return;

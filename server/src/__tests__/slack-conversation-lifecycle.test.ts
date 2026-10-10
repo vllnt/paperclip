@@ -136,7 +136,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await state(f))?.externalConversationState).toBe("active");
     expect(await settle(f)).toBe(false);
     expect((await state(f))?.status).toBe("todo");
-    await issueService(db).checkout(f.issueId, f.agentId, ["todo", "backlog", "blocked"], null);
+    await issueService(db).checkout(f.issueId, f.agentId, ["todo", "backlog", "blocked"], null, { kind: "agent", agentId: f.agentId });
     expect((await state(f))?.status).toBe("in_progress");
     const nextRun = randomUUID();
     await db.insert(chatMessageLinks).values({ companyId: f.companyId, endpointId: f.endpointId, conversationId: f.conversationId, commentId: followup.id, providerMessageId: followup.id, direction: "inbound" });
