@@ -889,20 +889,30 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       const agentA = await seedAgent(companyA, { name: "ReviewerA", maxConcurrentRuns: 3 });
       const agentB = await seedAgent(companyB, { name: "ReviewerB", maxConcurrentRuns: 3 });
       const issueA = await seedIssue(companyA, { assigneeAgentId: agentA });
-      // Company B has a wake that the sweep will never read (a hidden task).
-      const issueB = await seedIssue(companyB, { assigneeAgentId: agentB });
-      await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, issueB));
+      // Company B has a wake on a closed task, which the finalizer retires, and
+      // one on a hidden task, which the sweep never reads.
+      const issueB = await seedIssue(companyB, { assigneeAgentId: agentB, status: "done" });
+      const hiddenIssueB = await seedIssue(companyB, { assigneeAgentId: agentB });
+      await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, hiddenIssueB));
       await seedDeferredWake(companyA, agentA, issueA, { ageMs: 30 * MINUTE_MS });
-      await seedDeferredWake(companyB, agentB, issueB, { ageMs: 30 * MINUTE_MS });
+      const closedWakeB = await seedDeferredWake(companyB, agentB, issueB, { ageMs: 30 * MINUTE_MS });
+      await seedDeferredWake(companyB, agentB, hiddenIssueB, { ageMs: 30 * MINUTE_MS });
+      // A company A wake that names company B's closed task: neither the scan nor
+      // the finalizer may act on another company's task.
+      const crossTenantWake = await seedDeferredWake(companyA, agentA, issueB, { ageMs: 30 * MINUTE_MS });
 
       await heartbeat.resumeQueuedRuns();
       await heartbeat.drainActiveRunExecutions();
 
       const statsA = await heartbeat.getDeferredWakeStats(companyA);
       const statsB = await heartbeat.getDeferredWakeStats(companyB);
-      expect(statsA.sweep).toMatchObject({ examined: 1, promoted: 1, failed: 0 });
+      expect(statsA.sweep).toMatchObject({ examined: 1, promoted: 1, retired: 0, failed: 0 });
       expect(statsA.sweep.lastExaminedAt).toBeInstanceOf(Date);
-      expect(statsB.sweep).toMatchObject({ examined: 0, promoted: 0, skippedHeld: 0, skippedBudget: 0, failed: 0, lastExaminedAt: null });
+      expect(statsB.sweep).toMatchObject({
+        examined: 0, promoted: 0, retired: 1, skippedHeld: 0, skippedBudget: 0, failed: 0, lastExaminedAt: null,
+      });
+      expect((await wakeRow(closedWakeB)).status).toBe("cancelled");
+      expect((await wakeRow(crossTenantWake)).status).toBe("deferred_issue_execution");
       for (const stats of [statsA, statsB]) {
         // Process-wide fields would leak activity across companies.
         expect(stats.sweep).not.toHaveProperty("passes");

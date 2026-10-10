@@ -66,6 +66,8 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  /** Separate pools, so a test can hold a transaction open while the sweep runs. */
+  let otherDbs: Array<ReturnType<typeof createDb>> = [];
   const children: ChildProcess[] = [];
   const executed: Array<{ runId: string; context: Record<string, unknown> }> = [];
 
@@ -78,6 +80,7 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-recycled-process-group-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
+    otherDbs = [createDb(tempDb.connectionString), createDb(tempDb.connectionString)];
     registerServerAdapter({
       type: "codex_local",
       supportsLocalAgentJwt: false,
@@ -109,6 +112,7 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
   afterAll(async () => {
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     unregisterServerAdapter("codex_local");
+    for (const other of otherDbs) await other.$client.end({ timeout: 0 });
     await tempDb?.cleanup();
   });
 
@@ -231,8 +235,11 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
   async function parkWake(input: {
     kind: "comment" | "assignment";
     companyId: string; agentId: string; issueId: string; parkedMinutesAgo: number;
+    /** Defaults to the parking time; the sweep ages a wake by `requested_at`. */
+    requestedMinutesAgo?: number;
   }) {
     const parkedAt = new Date(Date.now() - input.parkedMinutesAgo * MINUTE_MS);
+    const requestedAt = new Date(Date.now() - (input.requestedMinutesAgo ?? input.parkedMinutesAgo) * MINUTE_MS);
     const executionWait = {
       recoveryActionId: null, reason: "execution_recovery",
       message: "Waiting for execution recovery. Your message is saved.",
@@ -251,7 +258,7 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
           requestedByActorType: "user", requestedByActorId: "board-user" }
         : { source: "assignment", triggerDetail: "system", reason: "issue_assigned", requestedByActorType: "system" }),
       status: "deferred_issue_execution",
-      requestedAt: parkedAt, createdAt: parkedAt, updatedAt: new Date(Date.now() - MINUTE_MS),
+      requestedAt, createdAt: parkedAt, updatedAt: new Date(Date.now() - MINUTE_MS),
       payload: {
         issueId: input.issueId,
         ...(commentId ? { commentId } : {}),
@@ -264,6 +271,41 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
       },
     }).returning();
     return { wakeId: wake!.id, commentId };
+  }
+
+  /** Waits until `count` backends wait on a lock. */
+  async function waitForLockWaiters(count: number) {
+    await vi.waitFor(async () => {
+      const rows = await db.execute(sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock'`);
+      expect(Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0)).toBeGreaterThanOrEqual(count);
+    }, { timeout: 10_000, interval: 50 });
+  }
+
+  /**
+   * Recovery's insert protocol on another connection: lock the issue row FOR
+   * SHARE, insert a scheduled retry for the issue, then hold the transaction
+   * open until `release` is called.
+   */
+  function insertRetryLikeRecovery(other: ReturnType<typeof createDb>, input: {
+    companyId: string; agentId: string; issueId: string;
+  }) {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    let inserted!: (runId: string) => void;
+    const insertedRun = new Promise<string>((resolve) => (inserted = resolve));
+    const done = other.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, input.issueId)).for("share");
+      const [run] = await tx.insert(heartbeatRuns).values({
+        companyId: input.companyId, agentId: input.agentId, invocationSource: "automation", triggerDetail: "system",
+        status: "scheduled_retry", scheduledRetryAt: new Date(Date.now() + 60 * MINUTE_MS),
+        scheduledRetryAttempt: 1, scheduledRetryReason: "issue_disposition_repair",
+        contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+      }).returning();
+      inserted(run!.id);
+      await released;
+      return run!.id;
+    });
+    return { insertedRun, release, done };
   }
 
   async function heldNotes(companyId: string) {
@@ -367,8 +409,11 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
     expect(executed).toEqual([]);
     expect(await issueRuns(companyId, [lostRunId])).toEqual([]);
     expect((await parkedWakes(companyId)).map((wake) => wake.id)).toEqual([wakeId]);
-    // The recovery action is the visible state; no extra note is written.
-    expect(await heldNotes(companyId)).toEqual([]);
+    // Held for 30 minutes: one entry, naming the recovery action that holds it.
+    expect(await heldNotes(companyId)).toEqual([{
+      entityId: issueId,
+      details: expect.objectContaining({ wakeId, reason: "execution_blocker", recoveryActionId: expect.any(String) }),
+    }]);
   });
 
   it.each(["comment", "assignment"] as const)("releases a %s wake that was parked before the fix once the sweep re-checks it", async (kind) => {
@@ -416,7 +461,8 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
 
   it("holds a wake behind a provider process that is really still running, and records why once", async () => {
     const { companyId, agentId, issueId, lostRunId } = await seed({ issueStatus: "todo", process: "live" });
-    await parkWake({ kind: "assignment", companyId, agentId, issueId, parkedMinutesAgo: 30 });
+    const { wakeId } = await parkWake({ kind: "assignment", companyId, agentId, issueId, parkedMinutesAgo: 30 });
+    const [before] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
 
     await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
     await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
@@ -425,7 +471,111 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
     expect(await parkedWakes(companyId)).toHaveLength(1);
     expect(await heldNotes(companyId)).toEqual([{
       entityId: issueId,
-      details: expect.objectContaining({ cause: "execution_owner_active", runId: lostRunId }),
+      details: expect.objectContaining({
+        wakeId, reason: "execution_blocker", cause: "execution_owner_active", runId: lostRunId, recoveryActionId: null,
+      }),
     }]);
+    // The sweep's claim moves updated_at on every pass; requested_at, which ages
+    // the wake, is never rewritten.
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(after!.requestedAt.getTime()).toBe(before!.requestedAt.getTime());
+    expect(after!.createdAt.getTime()).toBe(before!.createdAt.getTime());
+    expect(after!.updatedAt.getTime()).toBeGreaterThan(before!.updatedAt.getTime());
+  });
+
+  it("records one held entry for a wake that waits on a full agent", async () => {
+    const { companyId, agentId, issueId } = await seed({ issueStatus: "todo", process: "none" });
+    // The agent's one run slot is taken by a run on another task.
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
+      status: "running", startedAt: new Date(), contextSnapshot: { issueId: randomUUID() },
+    });
+    const { wakeId } = await parkWake({ kind: "assignment", companyId, agentId, issueId, parkedMinutesAgo: 15 });
+
+    await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
+    await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
+
+    expect((await parkedWakes(companyId)).map((wake) => wake.id)).toEqual([wakeId]);
+    expect(await heldNotes(companyId)).toEqual([{
+      entityId: issueId, details: expect.objectContaining({ wakeId, reason: "no_free_run_slot" }),
+    }]);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "running")));
+  });
+
+  // The sweep ages a wake by requested_at. For the wakes it reads (not durable
+  // chat input), requested_at is the insert time and is never rewritten; these
+  // cases pin which column decides when the two differ.
+  it.each([
+    ["an old parking time but a fresh request", { parkedMinutesAgo: 240, requestedMinutesAgo: 0.5 }, false],
+    ["a fresh parking time but an old request", { parkedMinutesAgo: 0.5, requestedMinutesAgo: 240 }, true],
+  ] as const)("ages a parked wake by requested_at: %s", async (_label, ages, aged) => {
+    const open = await seed({ issueStatus: "todo", process: "none" });
+    const openWake = await parkWake({ kind: "assignment", ...open, ...ages });
+    const closed = await seed({ issueStatus: "cancelled", process: "none" });
+    const closedWake = await parkWake({ kind: "assignment", ...closed, ...ages });
+
+    await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const [openAfter] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, openWake.wakeId));
+    const [closedAfter] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, closedWake.wakeId));
+    expect(openAfter!.status === "deferred_issue_execution").toBe(!aged);
+    expect(closedAfter!.status).toBe(aged ? "cancelled" : "deferred_issue_execution");
+  });
+
+  it("does not finalize a closed issue's wake while a retry inserted under the issue lock is still committing", async () => {
+    const { companyId, agentId, issueId } = await seed({ issueStatus: "cancelled", process: "none" });
+    const { wakeId } = await parkWake({ kind: "comment", companyId, agentId, issueId, parkedMinutesAgo: 30 });
+
+    // Recovery inserts a retry first and has not committed yet.
+    const recovery = insertRetryLikeRecovery(otherDbs[0]!, { companyId, agentId, issueId });
+    const retryRunId = await recovery.insertedRun;
+    const sweep = heartbeat.sweepDeferredWakes({ recheckMs: 0 });
+    // The finalizer waits on the issue row lock (a finalizer that does not lock
+    // would already have cancelled the wake).
+    await waitForLockWaiters(1).catch(() => undefined);
+    recovery.release();
+    await recovery.done;
+    await sweep;
+
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake!.status).toBe("deferred_issue_execution");
+    expect(await heartbeat.getRun(retryRunId)).toMatchObject({ status: "scheduled_retry" });
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, retryRunId));
+  });
+
+  it("lets a retry inserted while the finalizer holds the issue lock go through after it", async () => {
+    const { companyId, agentId, issueId } = await seed({ issueStatus: "cancelled", process: "none" });
+    const { wakeId } = await parkWake({ kind: "comment", companyId, agentId, issueId, parkedMinutesAgo: 30 });
+
+    // Hold the issue row so the finalizer queues on it first, then queue
+    // recovery's share lock behind the finalizer.
+    let releaseHolder!: () => void;
+    const holderReleased = new Promise<void>((resolve) => (releaseHolder = resolve));
+    let holderLocked!: () => void;
+    const lockTaken = new Promise<void>((resolve) => (holderLocked = resolve));
+    const holder = otherDbs[0]!.transaction(async (tx) => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+      holderLocked();
+      await holderReleased;
+    });
+    await lockTaken;
+    const sweep = heartbeat.sweepDeferredWakes({ recheckMs: 0 });
+    await waitForLockWaiters(1);
+    const recovery = insertRetryLikeRecovery(otherDbs[1]!, { companyId, agentId, issueId });
+    await waitForLockWaiters(2);
+    releaseHolder();
+    await holder;
+    await sweep;
+    const retryRunId = await recovery.insertedRun;
+    recovery.release();
+    await recovery.done;
+
+    // The finalizer saw no run and finalized the wake; the retry then committed.
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake!.status).toBe("cancelled");
+    expect(await heartbeat.getRun(retryRunId)).toMatchObject({ status: "scheduled_retry" });
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, retryRunId));
   });
 });
