@@ -244,8 +244,7 @@ export function DecisionCard({
   const [confirmText, setConfirmText] = useState("");
 
   const open = decision.status === "open";
-  const dismissed =
-    decision.chosenOptionId === "dismissed" || (decision.metadata as { dismissed?: boolean } | null)?.dismissed === true;
+  const dismissed = decision.metadata?.dismissed === true;
   const snapshots = (decision.targetSnapshots ?? {}) as Record<string, DecisionTargetSnapshot>;
 
   const staleTargetIds = useMemo(

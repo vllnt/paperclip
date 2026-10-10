@@ -717,6 +717,32 @@ describePg("decisionService", () => {
       .toEqual([expect.objectContaining({ entityId: rejected.id, responsibleUserId: decidedByUserId })]);
   });
 
+  it("counts and wakes a normally chosen option named dismissed as decided, and only a real dismissal as rejected", async () => {
+    const options = [{ id: "dismissed", label: "Close the alert", effects: [] }, { id: "keep", label: "Keep", effects: [] }];
+    const chosen = await service().create({
+      companyId, actor: agentActor(), agentId, runId, ruleKey: "alerts.close", title: "Close the alert?", body: "Body",
+      continuationPolicy: "wake_origin_agent", options,
+    });
+    const real = await service().create({
+      companyId, actor: agentActor(), agentId, runId, ruleKey: "alerts.close", title: "Close another alert?", body: "Body",
+      continuationPolicy: "wake_origin_agent", options,
+    });
+
+    await service().decide({ id: chosen.id, optionId: "dismissed", decidedByUserId, userActor: boardActor() });
+    await service().dismiss(real.id, decidedByUserId, boardActor(), "Not this time");
+
+    const stats = await service().stats(companyId, { originAgentId: agentId });
+    expect(stats.totals).toEqual({ proposed: 2, accepted: 1, rejected: 1, expired: 0 });
+    expect(stats.groups).toEqual([
+      { ruleKey: "alerts.close", proposed: 2, accepted: 1, rejected: 1, expired: 0, chosenOptions: [{ optionId: "dismissed", count: 1 }] },
+    ]);
+    expect(wakes).toEqual([
+      { companyId, agentId, issueId: originIssueId, decisionId: chosen.id, outcome: "decided" },
+      { companyId, agentId, issueId: originIssueId, decisionId: real.id, outcome: "dismissed", dismissReason: "Not this time" },
+    ]);
+    expect((await service().get(chosen.id))?.metadata).not.toHaveProperty("dismissed");
+  });
+
   it("rejects a direct dismissal when the signed decision spec was tampered with", async () => {
     const created = await createCommentDecision();
     await db.update(decisions).set({ options: [{ id: "tampered", label: "Tampered", effects: [{

@@ -24,8 +24,9 @@ export type DecisionServiceOptions = { wakeOriginAgent: Wake };
 const DAY = 86_400_000;
 
 /**
- * True for a decision that a board user dismissed. Legacy rows, written before dismissals stopped
- * naming an option, carry a real option id in `chosen_option_id`; `metadata.dismissed` marks them all.
+ * True for a decision that a board user dismissed. `metadata.dismissed` is the only dismissal record:
+ * `chosen_option_id` never classifies one, because an option may itself be named `dismissed`, and
+ * legacy rows (written before dismissals stopped naming an option) carry a real option id there.
  */
 function isDismissed(metadata: unknown): boolean {
   return typeof metadata === "object" && metadata !== null && "dismissed" in metadata && metadata.dismissed === true;
@@ -373,7 +374,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         continue;
       }
       if (row.status !== "decided") continue;
-      const rejected = row.chosenOptionId === "dismissed" || row.dismissed;
+      const rejected = row.dismissed;
       if (rejected) {
         totals.rejected += value;
         group.counts.rejected += value;
