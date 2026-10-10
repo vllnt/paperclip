@@ -16,8 +16,9 @@ An agent that wants to change an existing company skill does not write it. It fi
 When the approver approves, the server applies exactly the stored bytes, in one transaction, only if the skill still
 holds the bytes the proposal was written against. It reads the result back, keeps the previous version as the
 before-image, and writes an activity entry for every step. The board can revert an applied proposal while nothing has
-changed since. A company can also **protect** skills: on a protected skill the server refuses every direct write by an
-agent, so a proposal is the only way in.
+changed since. A company can also **protect** skills: on a protected skill the server refuses every direct text, head or
+source change by an agent on the routes that carry the skill's id, so a proposal is the only way in. While any skill is
+protected it also refuses agents on the three by-key import routes (section 4.9).
 
 ```
  author (agent)            server                         approver (board, later an agent)
@@ -90,6 +91,12 @@ Three consequences for the design:
   rewrites the `name:` line of the on-disk `SKILL.md` without one (svc `:4175`), and so do install-update, reset and an
   import overwrite. For a `local_path` skill the live bytes are the file on disk (`readLoadedSkillFile`, svc
   `:4353-4378`). A base check on the version id alone can pass while the bytes underneath have changed (section 4.8).
+- **Skill ids are compared as raw strings.** `skillPolicyResource` copies `req.params.skillId` into the policy resource
+  (`company-skills.ts:189`), nothing in the file normalizes it, and `resourceMatches` tests `skillIds.includes(...)`
+  (`company-skill-policy.ts:57`). Postgres's `uuid` type also accepts upper-case and hyphenless input (not run here), so
+  `getById` (svc `:3384-3391`) can find the row for an id written differently from the one a rule lists. That weakens
+  `skillIds` rules today, and it would defeat the invariant of section 4.9 if the invariant compared the raw string, so the
+  invariant compares the stored id. The existing weakness is listed in section 8.1.
 - Only a skill whose source type is `local_path` is editable (svc `:4695-4698`). Catalog and git skills are not, so a
   proposal against one is refused at submit.
 
@@ -142,10 +149,10 @@ This plan reuses what exists and defines nothing that another plan or pull reque
 | Work | What it is | Overlap | Rule |
 | --- | --- | --- | --- |
 | #13, #59 (merged) | Agents edit skill files and create skills from a sandbox run | They are the reason direct writes are open (section 2) | This plan sits on top of them and removes neither |
-| #114 (open plan) | Software factory plan, `doc/plans/2026-10-10-software-factory.md` | Its "Retrospective and improvement loop" row (`:15`) names this plan (#107) and reuses "proposal, eval, revision, and activity endpoints" | #114 points at #107 and defines no second flow. A skill-change approval step in a workflow calls the proposal routes of section 4.14. This plan defines no workflow or project concept |
+| #114 (open plan) | Software factory plan, `doc/plans/2026-10-10-software-factory.md` | Its "Retrospective and improvement loop" row (`:15` of the file on the #114 branch at `d80fe041d`) names this plan (#107) and reuses "proposal, eval, revision, and activity endpoints" | #114 points at #107 and defines no second flow. A skill-change approval step in a workflow calls the proposal routes of section 4.14. This plan defines no workflow or project concept |
 | #109 (open fix) and #92 (open plan) | Decisions: how a dismissed decision is recorded; reusable decisions that agents call as tools | A skill proposal is **not** a decision row. A decision needs an origin agent, issue and run (`NOT NULL`, `packages/db/src/schema/decisions.ts:43-45`), only a user decides (`:55`, `server/src/routes/decisions.ts:181`), and it carries a signed spec (`:59`). A board-authored proposal or an agent approver does not fit | #109 changes only `services/decisions.ts`, `services/decision-wakeup.ts` and the decision card, so these anchors hold. #92 touches skills only through Skill Studio test runs, which Q2 may reuse later. Neither defines a skill-change flow |
 | #89 (open) | Board skill, `paperclip-create-agent` links, and a skill-writing checklist | #89 adds nested bullets under the existing `## Notes` heading of `skills/paperclip/references/company-skills.md`. This plan edits no file that #89 edits | S1 adds no line to `skills/paperclip/SKILL.md` and nothing above a heading in `skills/paperclip/references/**`. Both are anchored by line in the runner capability contract, and a shifted heading fails the image build. If S1 must touch one, it extends an existing line and runs `node scripts/generate-capability-contract.mjs --check` and `node scripts/check-capability-inventory.mjs` in `packages/paperclip-runner`. When S1 lands, the checklist from #89 gets one bullet that says an agent changes an existing skill by proposing |
-| Launcher (#86 merged, #95 open) | The keyboard-first action catalog | The catalog is `packages/shared/src/command-actions.ts:66-92` | New entry points are actions in `COMMAND_ACTIONS`, not new sidebar buttons (section 4.14) |
+| Launcher (#86 merged, #95 open) | The keyboard-first action catalog | The catalog is `packages/shared/src/command-actions.ts:66-92` on `main` at `d9804ac4f` (added in `d47df97f0`, after this plan's base) | New entry points are actions in `COMMAND_ACTIONS`, not new sidebar buttons (section 4.14) |
 
 ## 4. Design
 
@@ -237,7 +244,7 @@ stored result (section 4.8). Terminal states are final; a new attempt is a new p
 | --- | --- | --- | --- |
 | Submit | no (Q13) | yes, if `skills.propose` allows and the run is task-bound | same as author |
 | Read a proposal and its diff | any member with company access, viewers included | yes, own proposals | only an approver-eligible agent (S2) |
-| Decide (S1) | a member whose role is in `humanApprovers.roles`, not the author | no | no |
+| Decide (S1) | a member whose human role is in `humanApprovers.roles`, not the author | no | no |
 | Decide (S2) | as S1 | no | an agent with an explicit `skills.approve` allow rule, not the author, subject to 4.5 and 4.6 |
 | Withdraw | as decide | yes, own | no |
 | Revert | as decide | no | no |
@@ -281,7 +288,7 @@ There are two bars, not four: the **decide bar** (decide, withdraw, revert) is `
 ```json
 {
   "enabled": false,
-  "humanApprovers": { "roles": ["owner", "admin", "operator", "member"] },
+  "humanApprovers": { "roles": ["owner", "admin", "operator"] },
   "protectedSkills": { "all": false, "skillIds": [] },
   "agentApproval": { "enabled": false, "requireDifferentModelFamily": true },
   "caps": { "submittedPerAuthorPer24h": 20, "appliedPerSkillPer24h": 5, "openPerAuthor": 5, "openPerCompany": 50 },
@@ -291,20 +298,22 @@ There are two bars, not four: the **decide bar** (decide, withdraw, revert) is `
 
 - `enabled: false` is the default and changes nothing. While it is false, submit returns 409
   `skill_proposals_disabled`, the protected-skills invariant is off, and existing rows stay readable.
-- **Human approvers** are the active members whose role is in `humanApprovers.roles`. The roles are the ones in
-  `packages/shared/src/constants.ts:964-970` (`owner`, `admin`, `operator`, `viewer`, `member`). `viewer` is never
-  accepted in the list. The default is every other role. To require owner or admin, a person sets
-  `["owner", "admin"]`. The check runs at decision time, so it applies to pending proposals. An instance admin always
-  counts.
-- **Protected skills** are stored **by id**. A request that names a key is resolved to an id when the settings are
-  written, because keys are derived from the slug and change on rename (svc `:4105`, `:4184`). `all: true` protects
+- **Human approvers** are the active members whose role is in `humanApprovers.roles`. The values are the human roles of
+  `packages/shared/src/constants.ts:973-978` (`owner`, `admin`, `operator`, `viewer`); `member` is a company role
+  (`:964-970`) and not a human one. `viewer` is never accepted in the list. The default is the other three, which is the
+  S1 bar of section 4.4. To require owner or admin, a person sets `["owner", "admin"]`. The check runs at decision time,
+  so it applies to pending proposals. An instance admin always counts. An actor whose membership data is missing is
+  refused (fail closed), because `assertCompanyAccess` checks memberships only when the array is present
+  (`server/src/routes/authz.ts:111`).
+- **Protected skills** are stored **by id**, in canonical lower-case form. A request that names a key or writes the id in another form is resolved
+  to the stored id when the settings are written, because keys are derived from the slug and change on rename (svc `:4105`, `:4184`). `all: true` protects
   every existing and future skill. Renaming a protected skill keeps it protected (same id). A fork is a new,
   unprotected skill unless `all` is on. The invariant is in section 4.9.
 - **Agent approval needs both** `agentApproval.enabled` **and** an explicit `skills.approve` allow rule. One without
   the other is a refusal. A protected skill is never decided by an agent. `requireDifferentModelFamily` applies only to
   agent approvals (S2).
-- **Caps** are rolling 24 hours, counted from rows, under a per-author advisory lock so a burst cannot step over the
-  cap. `null` turns a cap off. `openPerCompany` stops many authors from flooding the approver. `appliedPerSkillPer24h`
+- **Caps** are rolling 24 hours, counted from rows, under a per-author advisory lock (and, for `openPerCompany`, a company-level one) so a
+  burst cannot step over the cap. `null` turns a cap off. `openPerCompany` stops many authors from flooding the approver. `appliedPerSkillPer24h`
   is checked at decision time under the skill lock; when it is exceeded the proposal stays pending and the caller gets
   409 `skill_proposal_cap_reached`. A revert does not count.
 - Changing settings uses `expectedRevision` compare-and-set and writes `company.skill_proposal_settings_updated`.
@@ -323,12 +332,16 @@ gets **403**, and an unknown skill gets **404**. Every refusal carries a stable 
 Refused when:
 
 1. the markdown exceeds **256 KiB** (422 `skill_proposal_too_large`, with the limit and the received size in the
-   message), is not valid UTF-8, contains a lone surrogate, a NUL byte, a carriage return, a BOM, or any other control
-   character except tab and line feed, or any bidirectional-control or zero-width character (422);
+   message), is not valid UTF-8, or contains a character from any of these Unicode general categories: `Cc` other than tab
+   and line feed (this covers NUL, carriage return and U+0085), `Cf` (BOM, bidirectional controls, zero-width and joiner
+   characters, soft hyphen, word joiner, the Tags block U+E0000-E007F), `Cs` (lone surrogates), `Co`, `Cn`, `Zl`, `Zp`, and
+   `Zs` other than the plain space; or a variation selector (U+FE00-FE0F, U+E0100-E01EF) (422). Emoji sequences that need
+   a zero-width joiner are refused; that cost is accepted;
 2. the file has no frontmatter, or the bytes between the frontmatter fences differ from the base in any line other than
    the `name:` and `description:` lines, or those two lines are not each a single line of the form `key: value` whose
-   value does not start with a block or flow indicator (`|`, `>`, `[`, `{`, `&`, `*`, `!`) (422
-   `skill_proposal_frontmatter_changed`). This is a **byte rule, not a parse**: the repository's frontmatter reader is
+   value starts with a letter or digit, does not start or end with a quote character, and contains no `: ` and no ` #` (422
+   `skill_proposal_frontmatter_changed`). A quoted scalar can span lines in a real YAML reader, and a `: ` or ` #` inside a
+   plain scalar changes how it parses, so those are refused rather than interpreted. This is a **byte rule, not a parse**: the repository's frontmatter reader is
    hand-written and lenient (`packages/shared/src/frontmatter.ts`; it splits on `\n` only and cannot see quoted keys,
    anchors or tags), and a parser mismatch is exactly where a smuggled key would hide. A skill whose `description` is a
    folded or multi-line block keeps it unchanged in v1 and can still change the body. Frontmatter keys such as
@@ -336,7 +349,9 @@ Refused when:
    write (`readSkillStoreMetadata`, svc `:1874-1888`, called at svc `:4733`), and other keys may carry behavior for a
    runtime that reads the file; whether any runtime honors them is outside the server and not verified here. The board
    can still edit those keys directly;
-3. the text is byte-identical to the **current file on disk** (the live bytes, section 2.1) (422);
+3. the text is byte-identical to the **current file on disk** (the live bytes, section 2.1) (422), or the base
+   `SKILL.md` itself contains a carriage return or a BOM, so that no proposal could match it line by line (422
+   `skill_proposal_base_not_canonical`; the board normalizes the file first);
 4. the skill is not editable (`sourceType` is not `local_path`) (422);
 5. settings are disabled (409), the actor lacks `skills.propose` (403), or the run context fails (403, from
    `projectToolContext`);
@@ -362,19 +377,22 @@ transaction-scoped service, `company-skills.ts:1242-1258`):
 1. Take the skill's **name advisory lock first** (the key `withSkillFileMutation` uses, svc `:4639-4664`; advisory
    locks are re-entrant in a session), then lock the proposal row, then the skill row. `deleteSkill` takes the advisory
    lock and then deletes the skill row, which cascades to proposal rows (svc `:7150-7206`); locking the proposal row
-   before the advisory lock could deadlock against it. Re-read the slug after the lock and retry once if a rename moved
-   it.
+   before the advisory lock could deadlock against it. Re-read the slug after the lock. If a rename moved it, the transaction ends and the whole decision starts
+   again once, because transaction-scoped advisory locks cannot be released early. A deadlock against a rename (it locks
+   its slugs in sorted order, svc `:4639-4664`) is covered by the same one retry (`40P01`).
 2. Refuse unless `status = pending` and not expired. Re-read settings and evaluate the approver now (4.4 to 4.6). The
    approver is not the author. If `reviewedSha256` is present, it must match.
 3. Check `appliedPerSkillPer24h`.
 4. Call the existing `updateFile(companyId, skillId, "SKILL.md", proposed_markdown, author, { expectedVersionId:
-   base_version_id, expectedPreviousSha256: base_sha256, afterUpdate })`. `expectedPreviousSha256` is **one new optional
-   parameter**: `updateFile` already reads the file on disk under the lock before it writes (svc `:4709`), and with the
-   parameter it throws a conflict if the SHA-256 of those bytes differs. That makes the check atomic with the write, and
+   base_version_id, expectedPreviousSha256: base_sha256, versionLabel, afterUpdate })`. `expectedPreviousSha256` is the first of
+   **two new optional parameters**: `updateFile` already reads the file on disk under the lock before it writes (svc `:4709`),
+   and with the parameter it throws a conflict if the SHA-256 of the raw bytes it read differs. The check goes right after
+   that read, before the `onRollback` hand-off (svc `:4718`) and the `try` (svc `:4720`). That makes the check atomic with the write, and
    it fails closed when a rename, an import overwrite, an install-update, a reset or an out-of-band edit changed the file
    without a new version. A moved head throws the existing 409 (svc `:4691-4693`). The version's author is the
-   **proposal author**, so history blames the right party; the approver is on the proposal row, in the version label
-   ("Proposal <id> approved by <approver>") and in the log.
+   **proposal author**, so history blames the right party; the approver is on the proposal row, in the version label and
+   in the log. The label (`versionLabel`, "Proposal <id> approved by <approver>") is the second new parameter: `updateFile`
+   passes `{}` to `createVersion` today (svc `:4746`), so it needs a way to carry a label.
 5. Do the rest **inside `afterUpdate`** (it runs before commit and inside `updateFile`'s own `try`, svc `:4754`), so any
    failure there goes through `updateFile`'s catch, which restores the file on disk (svc `:4711-4718`, `:4756-4759`):
    1. read the result back from two independent places, the file on disk (`readLoadedSkillFile`, svc `:4353-4378`) and
@@ -435,15 +453,30 @@ The policy engine cannot give the guarantee "only a reviewed proposal changes th
 does not cover the by-key paths (section 2.1), and a company must hand-write the right deny rules. So the server
 enforces it.
 
-**The invariant.** While `enabled` is true, if a skill is protected, `assertCanMutateCompanySkills` refuses every
-mutation by an **agent** actor with 403 `skill_protected_use_proposal`, before it asks the policy. The check sits at
-that one choke point (`company-skills.ts:209-251`), where the resource already carries the skill id for edit, update,
-reset, remove, rename, versions and fork, and for managed-source updates (`skill-sources.ts:56-58`, `:65`). A person is
-not affected: the board edits directly, as today. A proposal is the only agent path.
+**The invariant.** While `enabled` is true and a skill is protected, the server refuses an **agent** actor's change to
+that skill's text, head or source with 403 `skill_protected_use_proposal`, before it asks the policy. The check lives in
+`assertCanMutateCompanySkills` (`company-skills.ts:209-251`), the one choke point, but it is keyed on neither the action
+string nor the raw URL id:
 
-**What the invariant does not cover.** The by-key paths (import, scan-projects, install-catalog, and the create-managed
-source branch) carry no skill id, so the invariant cannot see them. That is the import dependency of section 8.1. Until
-it is fixed, a company that uses protected skills denies `skills.import` and `skills.install` to agents (Q8).
+- *Scope.* The routes that change text, head or source pass an explicit flag to that function: file update and delete,
+  skill patch, rename, versions, fork, install-update, reset, remove and managed-source updates (the routes of section 2.1
+  that carry a skill id; `skill-sources.ts:56-58`, `:65`). Test inputs, test runs, templates and audit use `skills.edit` or
+  `skills.test` too (`company-skills.ts:510`, `:536`, `:563`, `:698`, `:802`, `:845`, `:1511`) but change no skill text, so
+  they are not flagged. The proposal routes (`skills.propose`, `skills.approve`) are never flagged.
+- *Canonical id.* The check resolves the row with `getById` and compares the stored `id` to the protected set. It does not
+  compare `req.params.skillId`: upper-case or hyphenless forms of the same uuid reach the same row (section 2.1), so a
+  raw-string comparison would let an agent step around it. Section 7 has a test for both forms.
+
+A person is not affected: the board edits directly, as today. A proposal is the only agent path on these routes.
+
+**By-key paths: an interim refusal.** Import, scan-projects and catalog install carry no skill id, so the invariant cannot
+name the skill they would overwrite. While `enabled` is true and any skill is protected (including `all`), the server
+refuses an **agent** actor on those three routes with the same 403 code. The bridge does not admit import for sandbox runs
+today (#13 kept it human-only), so the cost is small. This is the server doing what Q8 told the board to do by hand. It
+does not replace the import follow-up of section 8.1, which everyone else still needs.
+
+With `all: true`, a skill an agent creates (#59) is protected from that moment, so the create-then-edit loop becomes
+create, then propose.
 
 **Agent skill assignment is out of scope.** Which skills an agent runs is governed by agent-config permissions
 (`POST /agents/:id/skills/sync` is admitted by the bridge, `sandbox-callback-bridge.ts:160`). A protected skill's text
@@ -451,7 +484,7 @@ cannot be changed by an agent, but an agent with agent-config rights can still p
 The plan names this as a non-goal (T18).
 
 **The gate status** stays as a diagnostic for companies that do not protect everything. `GET /skill-proposal-settings`
-returns `directWriteGate`: for each active agent it evaluates `skills.edit`, `skills.update`, `skills.reset`,
+returns `directWriteGate`: for each active agent it evaluates (with no resource, and once more for each protected skill id with that skill as the resource, so rules with selectors match) `skills.edit`, `skills.update`, `skills.reset`,
 `skills.remove`, `skills.install`, `skills.import` and `skills.create` (the last on a skill id, for `POST /versions`)
 against the policy read once, and reports the agents that still have each action open, with the matching rule ids. It
 reports `open`, `partly_open` or `closed`. It is a diagnostic. It is not what protects a skill. The web panel and the CLI
@@ -517,8 +550,8 @@ Every mutation writes one entry in the same transaction. Details never contain s
 | Action | When | Details |
 | --- | --- | --- |
 | `company.skill_proposal_submitted` | submit | proposalId, skillId, baseVersionId, sha256, bytes, sourceIssueId |
-| `company.skill_proposal_approved` | approve | proposalId, decidedBy, sha256, note length |
-| `company.skill_proposal_applied` | apply | proposalId, beforeVersionId, appliedVersionId, sha256, beforeSha256, appliedSha256 |
+| `company.skill_proposal_approved` | approve | proposalId, decidedBy, actorSource, sha256, note length |
+| `company.skill_proposal_applied` | apply | proposalId, beforeVersionId, appliedVersionId, sha256, beforeSha256, appliedSha256, actorSource |
 | `company.skill_proposal_rejected` | reject | proposalId, decidedBy, note length |
 | `company.skill_proposal_withdrawn` | withdraw | proposalId |
 | `company.skill_proposal_stale` / `_expired` | persisted at a write | proposalId, currentVersionId or expiresAt |
@@ -545,9 +578,15 @@ undocumented mounted route):
 | `POST /skill-proposals/:proposalId/revert` | decide bar; not reachable from a sandbox |
 | `GET`/`PUT /skill-proposal-settings` | `PUT` takes `expectedRevision`; `GET` includes `directWriteGate` and `gateEffective` (section 4.15) |
 
-**Logs.** The proposal and decision routes join the routes whose request body the failure log replaces with
-`"[REDACTED]"`, as the runtime GitHub routes already do (`server/src/middleware/logger.ts:166-169`). Error `details`
-and list responses carry ids, hashes and sizes only. A test asserts that no failure log line contains proposal text.
+**Logs.** Two controls, because the request body is only one way text reaches a log. The proposal and decision routes join
+the routes whose request body the failure log replaces with `"[REDACTED]"`, as the runtime GitHub routes already do
+(`server/src/middleware/logger.ts:166-169`). They are also added to `SECRET_SENSITIVE_HTTP_PATHS`
+(`server/src/middleware/http-log-policy.ts:40-43`, applied to POST, PUT and PATCH at `:80-89`), which makes the error
+handler and the logger keep only a type marker for an error instead of its message, stack and details
+(`server/src/middleware/error-handler.ts:69`, `:81`, `:170`, `:184`, `:281`; `logger.ts:180-194`). A database error can
+quote what it was given. A unique-index violation (SQLSTATE 23505) from two identical racing submits is mapped to 409
+instead of reaching the handler as a 500. Error `details` and list responses carry ids, hashes and sizes only. The test
+exercises a database-error path and asserts that no failure log line contains proposal text.
 
 **Bridge** (`sandbox-callback-bridge.ts`): add `POST …/skills/:skillId/proposals`, `GET …/skill-proposals`,
 `GET …/skill-proposals/:id`, `POST …/skill-proposals/:id/withdraw`, and in S2 `POST …/skill-proposals/:id/decision`,
@@ -570,6 +609,11 @@ helper (`:31-46`). The path is company-relative and points at the Proposals tab.
 requires unique shortcuts, and the `g` letters d, i, t, p, o, a, r, v, e, m, k, s, c and f are already taken. The
 keywords include "review", "approve" and "skill change". The UI uses the token layer only (`DESIGN.md`).
 
+**Runner tools.** The runner's `create_skill` and `update_skill` actions (`packages/paperclip-runner/src/protocol-actions/create-skill.ts`,
+`update-skill.ts`) call the same routes, so on a protected skill `update_skill` returns the 403 above, and its message
+names the proposal route. The runner capability contract is anchored, so the implementation PR decides whether a
+`propose` action is added there; this plan changes no skill file.
+
 **Agent guidance:** in the OpenAPI operation descriptions and, if needed, one small separate skill. A new bundled skill
 adds a key to `PAPERCLIP_CORE_SKILL_KEYS` (svc `:642`), the list the library imports from the repo-root `skills/` bundle, so that is a choice for the implementation PR. **Not** new lines in
 `skills/paperclip/SKILL.md` or new headings in `skills/paperclip/references/**` (section 3.1).
@@ -587,22 +631,28 @@ The review is meaningful only where an agent cannot act as the board.
 What the server does:
 
 1. `GET /skill-proposal-settings` reports `gateEffective: false` with a `reasons` list (`local_trusted`) when the
-   deployment is `local_trusted`.
+   deployment is `local_trusted`. The web panel and the CLI show it as a banner.
 2. `PUT … enabled: true` in a `local_trusted` deployment returns 409 `skill_proposals_unsafe_deployment` unless the body
-   carries `acknowledgeLocalTrusted: true`. The acknowledgement is stored, shown in the web panel and the CLI, and logged
-   (Q14).
-3. The decision route refuses the `local_implicit` actor unless that acknowledgement is stored.
-4. For protected skills the plan does not add a separate session requirement, because the CLI decides with a board key
-   (parity). The deployment guidance says to keep board keys out of agent workspaces.
+   carries `acknowledgeLocalTrusted: true`. The acknowledgement is stored, shown, and logged. It is **consent, not a
+   control**: in this mode the implicit board and an agent that talks to the server directly are the same actor to the
+   server, so an agent can send the acknowledgement or call the decision route, and nothing in this plan stops it. The plan
+   does not claim otherwise, and it adds no check that the same actor can satisfy (Q14).
+3. The approved and applied activity entries carry `actorSource`. For the implicit board a person and an impersonating
+   agent are both `local-board` with source `local_implicit`, so the entry cannot tell them apart; the run id appears only
+   when the caller sends the run header. After the fact, the log helps in `authenticated` deployments and does not in this
+   one.
 
-The activity log names who decided, so a misuse is visible after the fact.
+`local_trusted` is the normal development mode. The CLI and the web UI keep working there, because both are the implicit
+board. The deployment guidance says to keep board keys out of agent workspaces. `companySkillRoutes(db)` is mounted without
+options (`server/src/app.ts:666-667`), so the implementation passes `deploymentMode` the way `boardChatRoutes(db,
+{ deploymentMode })` receives it (`server/src/routes/board-chat.ts:65-68`).
 
 ## 5. Threat model
 
 | # | Threat | Control |
 | --- | --- | --- |
-| T0 | An agent acts as the board (implicit local board, a board key in a workspace) and approves its own change | Section 4.15: `gateEffective`, refusal to enable without acknowledgement, the decision route refuses `local_implicit` without it; the author is never the approver; the log names the decider |
-| T1 | Agent writes a protected skill directly and skips the gate | The server invariant at the choke point (4.9), not the policy. Unprotected skills: the gate diagnostic |
+| T0 | An agent acts as the board (implicit local board, a board key in a workspace) and approves its own change | **Accepted and advisory in `local_trusted`; reported.** Section 4.15: `gateEffective: false`, a banner, consent at enable, `actorSource` in the log. In `authenticated` deployments the author is never the approver and the log names the decider |
+| T1 | Agent writes a protected skill directly and skips the gate | The server invariant at the choke point, keyed on the stored id and on a per-route flag (4.9), not the policy; by-key routes are refused while any skill is protected. Unprotected skills: the gate diagnostic |
 | T2 | Author approves itself | Approver is never the author; agent approval needs an explicit allow rule that selects the skill |
 | T3 | Two agents agree to pass each other's changes | Protected skills are decided by people only; `requireDifferentModelFamily` for the rest; caps; both families are logged |
 | T4 | Content swapped between review and apply | Immutable row; the id fixes the bytes; the optional `reviewedSha256`; read-back from disk and the version row |
@@ -611,7 +661,7 @@ The activity log names who decided, so a misuse is visible after the fact.
 | T7 | Prompt injection into an approving agent through the proposal text | Server-built diff in a fenced, labelled block; summary marked untrusted; the decision is structured, not free text; the approver cannot edit content; protected skills never go to an agent |
 | T8 | Frontmatter smuggles a key or metadata | Byte rule: only the `name:` and `description:` lines may differ, and control and invisible characters are refused (4.7) |
 | T9 | Script or executable bit smuggled in | v1 changes `SKILL.md` only |
-| T10 | Skill text leaks through logs | Activity: hashes and sizes only. HTTP failure log: request body redacted on the proposal routes (4.14) |
+| T10 | Skill text leaks through logs | Activity: hashes and sizes only. HTTP failure log: request body redacted and error text reduced to a type marker on the proposal routes (4.14) |
 | T11 | Pending text read by every agent | Reads limited to people, the author and approver-eligible agents |
 | T12 | Spam or storage growth | 256 KiB limit; per-author, per-skill and per-company caps; one open proposal per author per skill; no duplicate bytes; expiry; retention (Q9) |
 | T13 | Replay or double submit | Unique idempotency key; `status = pending` compare-and-set; decision retry returns the stored result |
@@ -620,7 +670,7 @@ The activity log names who decided, so a misuse is visible after the fact.
 | T16 | A partial apply leaves disk and database apart | Outer transaction; work inside `afterUpdate`; route-style compensation after a failed commit; fault-injection tests. Crash window named in 4.8 |
 | T17 | The gate is rewritten by an agent holding `users:manage_permissions` | Settings are person-only; the policy route is a named dependency (section 8.1) |
 | T18 | An agent changes what agents follow without editing an existing skill: creates a new skill (#59), re-points agents with skill sync, or forks a protected skill and reassigns | The invariant also covers fork (it carries the skill id). New-skill creation and agent skill assignment are **non-goals** of this plan and are governed by their own permissions |
-| T19 | The diff hides a homoglyph, a bidirectional control or a zero-width character | Such characters are refused in the text (4.7) and escaped in the rendered diff (4.14) |
+| T19 | The diff hides an invisible character or a homoglyph | Invisible and control characters are refused in the text (4.7). Homoglyphs are not refused; the rendered diff escapes non-ASCII characters (4.14) |
 
 ## 6. Slices
 
@@ -629,7 +679,7 @@ company until `enabled` is set, so each slice can ship without behavior change.
 
 - **S1: propose, humans decide and apply, revert, protected skills.** Tables and migration; `skills.propose`; settings
   (without agent approval), including `humanApprovers` and `protectedSkills`; the invariant at
-  `assertCanMutateCompanySkills`; the `expectedPreviousSha256` parameter of `updateFile`; submit, list, show, decision
+  `assertCanMutateCompanySkills`; the `expectedPreviousSha256` and `versionLabel` parameters of `updateFile`; submit, list, show, decision
   (human), withdraw, revert; caps; effective status computed on read; author wake; attention item; bridge rules;
   OpenAPI; CLI; Studio tab; launcher action; log redaction; deployment reporting (4.15).
 - **S2: agent approvers.** `skills.approve` (closed by default, `agents` subjects only); `agentApproval` settings; the
@@ -659,13 +709,17 @@ are additive. Applied changes stay as ordinary versions.
   policy and settings changes apply to pending rows.
 - Protected skills: an agent's edit, rename, versions, fork, reset, remove and managed-source update on a protected skill
   are refused with 403 `skill_protected_use_proposal`; a person's edit still works; `all: true` covers a skill created
-  later; renaming a protected skill keeps it protected.
+  later; renaming a protected skill keeps it protected; **the same refused edit written with an upper-case and with a
+  hyphenless skill id is refused too**; an agent's proposal on a protected skill succeeds; test inputs and test runs on a
+  protected skill still work for an agent; import, scan-projects and catalog install by an agent are refused while any
+  skill is protected.
 - Revert: succeeds only on an unmoved head and unchanged bytes; 409 otherwise; never edits history.
-- Deployment: `gateEffective` is false in `local_trusted`; enabling without the acknowledgement returns 409; the
-  `local_implicit` actor is refused at decision without it.
+- Deployment: `gateEffective` is false in `local_trusted`; enabling without the acknowledgement returns 409; the approved
+  and applied entries carry `actorSource`.
 - Parity: every route in OpenAPI (the existing coverage test); CLI commands call the same routes; the bridge allows the
   new paths and denies settings, revert and look-alike paths (`?`, `#`, `%2e`, `..`, backslash).
-- Logs and storage: no failure log line contains proposal text; activity details contain none; company delete removes
+- Logs and storage: no failure log line contains proposal text, including on a database-error path (two identical
+  racing submits give 409, not 500); activity details contain none; company delete removes
   both tables and `company-removal-coverage.test.ts` passes; the company boundary holds on every route, including
   by-id lookups with another company's id.
 - `ensureSkillInventoryCurrent` inside the outer transaction (4.8) does not delete or change a skill other than the
@@ -692,7 +746,8 @@ below say what each answer means for the build. Q13 and Q14 are new, raised by t
   a fix. The follow-up "make skill-policy replacement person-only" is recorded in the manager's follow-ups list.
 - **Q8. Import and install can overwrite a skill by key.** **Decided:** agreed. Until the import follow-up lands, a
   company that uses protected skills denies `skills.import` and `skills.install` to agents. This plan does not
-  change import. The import follow-up is recorded in the follow-ups list.
+  change import. *Design note:* S1 also refuses agents on those routes while any skill is protected (4.9), so the manual
+  deny is belt and braces for a protected company. The import follow-up is recorded in the follow-ups list.
 - **Q9. Retention of proposal text.** **Decided:** keep the hash and metadata, and null `proposed_markdown` on terminal
   rows after 90 days (S3).
 - **Q10. Push wake for approver agents.** **Decided:** defer.
@@ -703,10 +758,11 @@ below say what each answer means for the build. Q13 and Q14 are new, raised by t
 - **Q13. Who may author a proposal in S1.** *New.* Recommendation: agents only. A person can already edit directly, and a
   person's proposal in a one-person company cannot be approved by anyone else (the approver is never the author). Revisit
   if a company wants a person's change reviewed by a second person.
-- **Q14. `local_trusted` deployments.** *New.* Recommendation: refuse `enabled: true` without an explicit
-  `acknowledgeLocalTrusted`, report `gateEffective: false`, and say in the docs that the review is advisory there
-  (4.15). The alternative is to refuse outright; it is simpler but removes the feature from single-operator setups where
-  agents run in sandboxes behind the bridge and the review does hold.
+- **Q14. `local_trusted` deployments.** *New.* Recommendation: report `gateEffective: false`, require an explicit
+  acknowledgement when enabling (as consent, not as a control), record `actorSource`, and say in the docs that the review is
+  advisory there (4.15). Do not add controls that the same actor can satisfy. The alternative is to refuse `enabled: true`
+  in `local_trusted` outright; it is simpler but removes the feature from single-operator setups where agents run in
+  sandboxes behind the bridge and the review does hold.
 
 ### 8.1 Dependencies named, not fixed
 
@@ -718,9 +774,11 @@ These exist on `main`. This plan does not change them, and its guarantees are we
    Follow-up: make policy replacement person-only.
 2. **Import, scan-projects and catalog install overwrite by key.** A rule that selects a skill cannot stop them, and the
    protected-skills invariant cannot see them (section 2.1). Follow-up: key-conflict authorization on import, plus a
-   destination policy, a redirect policy, a timeout and a size cap on the fetch path. Until then, deny the actions to
-   agents.
-3. **Agent skill assignment and new-skill creation** are governed by their own permissions (T18). A company that needs
+   destination policy, a redirect policy, a timeout and a size cap on the fetch path. S1 refuses agents on these routes while
+   any skill is protected; companies without protected skills still need the follow-up.
+3. **Skill ids in `skillIds` policy rules are compared as raw strings** (section 2.1). A differently written uuid for the
+   same skill matches no rule. The invariant avoids it by comparing the stored id; the existing rules keep the weakness.
+4. **Agent skill assignment and new-skill creation** are governed by their own permissions (T18). A company that needs
    them gated has to gate them there.
 
 ## Appendix A. Code anchors checked on `main` at `38819d350`
@@ -741,12 +799,14 @@ These exist on `main`. This plan does not change them, and its guarantees are we
   changes), `:1033-1054` (low-trust agents), `:1644` (missing consent), `:1791-1796` (`skill_config:update`)
 - Request actor and access: `server/src/middleware/auth.ts:227-240` (implicit board); `server/src/routes/authz.ts:93-102`,
   `:104-119`; `server/src/services/project-tool-context.ts:8-24`
-- Logging: `server/src/middleware/logger.ts:163-198` (precedent `:166-169`)
+- Logging: `server/src/middleware/logger.ts:163-198` (precedent `:166-169`, error marker `:180-194`);
+  `server/src/middleware/http-log-policy.ts:40-43`, `:80-89`; `server/src/middleware/error-handler.ts:69`, `:81`, `:170`,
+  `:184`, `:281`
 - Approvals and decisions: `server/src/routes/approvals.ts:287`, `:325-342`, `:403`, `:441`;
   `server/src/services/approvals.ts:154`; `packages/db/src/schema/approvals.ts:16`;
   `packages/db/src/schema/decisions.ts:43-45`, `:55`, `:59`; `server/src/routes/decisions.ts:181`
 - Precedents: `server/src/routes/access.ts:4330-4345`; `packages/db/src/schema/issue_execution_decisions.ts:15-16`
-- Permissions, roles and adapters: `packages/shared/src/constants.ts:27-43`, `:964-970`, `:1003-1025`; agent role
+- Permissions, roles and adapters: `packages/shared/src/constants.ts:27-43`, `:964-970`, `:973-978` (human roles), `:1003-1025`; agent role
   column `packages/db/src/schema/agents.ts:22`; role validators `validators/company-portability.ts:78`,
   `validators/onboarding-seed.ts:25`, `validators/plugin.ts:242`
 - Activity: `server/src/services/activity-log.ts:75-91`, `:151`, `:160`, `:217`
@@ -756,15 +816,20 @@ These exist on `main`. This plan does not change them, and its guarantees are we
 - Frontmatter reader: `packages/shared/src/frontmatter.ts`
 - CLI and UI: `cli/src/commands/client/skills.ts:97-545` (`file` is read-only, `:231-258`; `update` `:374`);
   `ui/src/pages/SkillStudio.tsx:3446-3459`; `ui/src/api/companySkills.ts:195`
-- Launcher catalog: `packages/shared/src/command-actions.ts:31-46`, `:66-92`; the #114 plan row
-  `doc/plans/2026-10-10-software-factory.md:15`
+- Launcher catalog, on `main` at `d9804ac4f` and absent on the base: `packages/shared/src/command-actions.ts:31-46`,
+  `:66-92`; the #114 plan row `doc/plans/2026-10-10-software-factory.md:15` on the #114 branch at `d80fe041d`
+- Runner skill actions: `packages/paperclip-runner/src/protocol-actions/create-skill.ts`, `update-skill.ts`
+- Skill id handling: `server/src/routes/company-skills.ts:189`, `server/src/services/company-skill-policy.ts:57`,
+  `server/src/services/company-skills.ts:3384-3391`; test-input and test-run policy calls `company-skills.ts:510`, `:536`,
+  `:563`, `:698`, `:802`, `:845`, `:1511`
 - OpenAPI coverage test: `server/src/__tests__/openapi-routes.test.ts:716`
 - Mounting: `server/src/app.ts:666-667`; model read `server/src/services/heartbeat.ts:7164-7166`; wake reasons
   `server/src/services/heartbeat.ts:1327`, `:1345`
 
 ### Re-check on a newer `main`
 
-`main` moved from `38819d350` to `d9804ac4f` while this plan was in review. I compared every file the plan cites. Only
+`main` moved from `38819d350` to `d9804ac4f` while this plan was in review. I compared every cited file that exists on the base (`command-actions.ts` was added later, in `d47df97f0`, and the #114
+plan lives on its own branch). Only
 `server/src/services/heartbeat.ts` and `server/src/routes/openapi.ts` changed. In `heartbeat.ts` the wake-reason sets
 moved down by one line (`approval_approved` is now at `:1328` and `:1346`) and `readConfiguredModelFromAdapterConfig`
 moved to `:7204-7207`. Nothing the plan relies on changed in behavior. The latest migration is still `0298`. The line
