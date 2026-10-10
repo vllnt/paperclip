@@ -1315,7 +1315,8 @@ export async function runSshCommand(
 ): Promise<SshCommandResult> {
   options.signal?.throwIfAborted();
   let cleanup: () => Promise<void> = () => Promise.resolve();
-  const channel = await options.multiplex?.channel();
+  const channel = await options.multiplex?.channel(config);
+  let killed = false;
   try {
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
@@ -1369,8 +1370,11 @@ export async function runSshCommand(
           maxBuffer: options.maxBuffer ?? 1024 * 128,
           signal: options.signal,
         });
+  } catch (error) {
+    killed = options.signal?.aborted === true || (error as { killed?: unknown }).killed === true;
+    throw error;
   } finally {
-    channel?.done();
+    channel?.done({ killed });
     await cleanup();
   }
 }

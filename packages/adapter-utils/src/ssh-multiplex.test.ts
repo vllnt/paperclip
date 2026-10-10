@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,17 +25,14 @@ import { openSshMultiplex, sshControlDirFits, SSH_MULTIPLEX_MAX_CHANNELS, type S
 // `Accepted publickey` lines: one per SSH connection.
 
 const cleanups: Array<() => Promise<void>> = [];
+// The image has no sshd: these blocks show as skipped there, not as passed.
+const sshSupport = await getSshEnvLabSupport();
 
 afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()!().catch(() => undefined);
 });
 
 async function startFixture(sshdConfigExtra: string[] = []) {
-  const support = await getSshEnvLabSupport();
-  if (!support.supported) {
-    console.warn(`Skipping SSH multiplex test: ${support.reason}`);
-    return null;
-  }
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-mux-test-"));
   const statePath = path.join(rootDir, "state.json");
   cleanups.push(async () => {
@@ -71,8 +68,8 @@ function runnerFor(state: SshEnvLabFixtureState, config: SshConnectionConfig, mu
     runner.execute({ command: "sh", args: ["-c", script], timeoutMs: 30_000, signal });
 }
 
-async function controlPathOf(multiplex: SshMultiplex): Promise<string> {
-  const channel = await multiplex.channel();
+async function controlPathOf(multiplex: SshMultiplex, config: SshConnectionConfig): Promise<string> {
+  const channel = await multiplex.channel(config);
   channel.done();
   const option = channel.args.find((arg) => arg.startsWith("ControlPath="));
   if (!option || option === "ControlPath=none") throw new Error("no shared connection");
@@ -100,7 +97,32 @@ function isAlive(pid: number): boolean {
   }
 }
 
-describe("SSH multiplexing for short bridge commands", () => {
+// Waits up to 5 s for a process to exit (a zombie that is never reaped counts as alive).
+async function exited(pid: number): Promise<boolean> {
+  for (let tries = 0; tries < 250 && isAlive(pid); tries += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+  return !isAlive(pid);
+}
+
+// Every process below the fixture's listener: the per-connection sshd
+// processes and their children.
+function sessionProcesses(listenerPid: number): number[] {
+  const children = (pid: number) => {
+    try {
+      return execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8" }).split("\n").filter(Boolean).map(Number);
+    } catch {
+      return [];
+    }
+  };
+  const found: number[] = [];
+  for (let queue = children(listenerPid); queue.length > 0;) {
+    const pid = queue.shift()!;
+    found.push(pid);
+    queue.push(...children(pid));
+  }
+  return found;
+}
+
+describe.skipIf(!sshSupport.supported)("SSH multiplexing for short bridge commands", () => {
   it("runs twenty commands over one SSH connection", async () => {
     const fixture = await startFixture();
     if (!fixture) return;
@@ -160,7 +182,7 @@ describe("SSH multiplexing for short bridge commands", () => {
     const second = hold(fixture.config, "env-a");
     const run = runnerFor(fixture.state, fixture.config, first);
     expect((await run("true")).exitCode).toBe(0);
-    const controlPath = await controlPathOf(first);
+    const controlPath = await controlPathOf(first, fixture.config);
     const master = await masterCheck(fixture.config, controlPath);
     expect(master.running).toBe(true);
 
@@ -170,7 +192,7 @@ describe("SSH multiplexing for short bridge commands", () => {
 
     expect((await masterCheck(fixture.config, controlPath)).running).toBe(false);
     expect(existsSync(path.dirname(controlPath))).toBe(false);
-    expect(isAlive(master.pid!)).toBe(false);
+    expect(await exited(master.pid!)).toBe(true);
     // A released hold runs later commands on a direct connection.
     const before = await fixture.logins();
     expect((await run("true")).exitCode).toBe(0);
@@ -183,10 +205,10 @@ describe("SSH multiplexing for short bridge commands", () => {
     const multiplex = hold(fixture.config, "env-a");
     const run = runnerFor(fixture.state, fixture.config, multiplex);
     expect((await run("true")).exitCode).toBe(0);
-    const controlPath = await controlPathOf(multiplex);
+    const controlPath = await controlPathOf(multiplex, fixture.config);
     const master = await masterCheck(fixture.config, controlPath);
     process.kill(master.pid!, "SIGKILL");
-    while (isAlive(master.pid!)) await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await exited(master.pid!)).toBe(true);
     const before = await fixture.logins();
 
     const result = await run('echo "$SSH_CONNECTION"');
@@ -203,24 +225,113 @@ describe("SSH multiplexing for short bridge commands", () => {
   it("never shares a master across environments or credentials", async () => {
     const fixture = await startFixture();
     if (!fixture) return;
-    const envA = hold(fixture.config, "env-a");
-    const envB = hold(fixture.config, "env-b");
-    const otherKnownHosts = hold({ ...fixture.config, knownHosts: `${fixture.config.knownHosts}\n` }, "env-a");
-    const sameAsA = hold(fixture.config, "env-a");
+    const config = fixture.config;
+    const envA = hold(config, "env-a");
+    const variants = [
+      hold(config, "env-b"),
+      hold({ ...config, knownHosts: `${config.knownHosts}\n` }, "env-a"),
+      hold({ ...config, privateKey: `${config.privateKey}\n` }, "env-a"),
+      hold({ ...config, strictHostKeyChecking: false }, "env-a"),
+      hold({ ...config, host: "localhost" }, "env-a"),
+      hold({ ...config, port: config.port + 1 }, "env-a"),
+      hold({ ...config, username: `${config.username}-other` }, "env-a"),
+    ];
+    const variantConfigs = [
+      config,
+      { ...config, knownHosts: `${config.knownHosts}\n` },
+      { ...config, privateKey: `${config.privateKey}\n` },
+      { ...config, strictHostKeyChecking: false },
+      { ...config, host: "localhost" },
+      { ...config, port: config.port + 1 },
+      { ...config, username: `${config.username}-other` },
+    ];
+    const sameAsA = hold(config, "env-a");
 
-    const paths = await Promise.all([envA, envB, otherKnownHosts, sameAsA].map(controlPathOf));
+    const pathA = await controlPathOf(envA, config);
+    const variantPaths = await Promise.all(variants.map((multiplex, index) => controlPathOf(multiplex, variantConfigs[index]!)));
 
-    expect(new Set(paths.slice(0, 3)).size).toBe(3);
-    expect(paths[3]).toBe(paths[0]);
-    for (const controlPath of paths) {
+    expect(new Set([pathA, ...variantPaths]).size).toBe(1 + variants.length);
+    expect(await controlPathOf(sameAsA, config)).toBe(pathA);
+    for (const controlPath of [pathA, ...variantPaths]) {
       expect(path.basename(controlPath)).toBe("%C");
       expect(path.basename(path.dirname(controlPath))).toMatch(/^paperclip-ssh-mux-/);
     }
     const before = await fixture.logins();
-    for (const multiplex of [envA, envB, otherKnownHosts, sameAsA]) {
-      expect((await runnerFor(fixture.state, fixture.config, multiplex)("true")).exitCode).toBe(0);
+    for (const multiplex of [envA, variants[0]!, variants[1]!, sameAsA]) {
+      const runConfig = multiplex === variants[1] ? variantConfigs[1]! : config;
+      expect((await runnerFor(fixture.state, runConfig, multiplex)("true")).exitCode).toBe(0);
     }
     expect((await fixture.logins()) - before).toBe(3);
+  }, 120_000);
+
+  it("connects directly for a config the hold was not opened for", async () => {
+    const fixture = await startFixture();
+    if (!fixture) return;
+    const multiplex = hold(fixture.config, "env-a");
+    const run = runnerFor(fixture.state, fixture.config, multiplex);
+    expect((await run("true")).exitCode).toBe(0);
+    const before = await fixture.logins();
+
+    // Same target, other credentials: never through the hold's master.
+    const other = runnerFor(fixture.state, { ...fixture.config, privateKey: "not a key" }, multiplex);
+    const result = await other("echo through-master");
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain("through-master");
+    expect((await fixture.logins()) - before).toBe(0);
+  }, 120_000);
+
+  it("retires a master that stopped answering, so the next command connects again", async () => {
+    const fixture = await startFixture();
+    if (!fixture) return;
+    const multiplex = hold(fixture.config, "env-a");
+    const runner = createSshCommandManagedRuntimeRunner({
+      spec: { ...fixture.config, remoteCwd: fixture.state.workspaceDir },
+      multiplex,
+    });
+    const run = (script: string, timeoutMs: number) => runner.execute({ command: "sh", args: ["-c", script], timeoutMs });
+    expect((await run("true", 30_000)).exitCode).toBe(0);
+    // The master's connection stays open but its sshd stops answering, as
+    // after a dropped network path.
+    const frozen = sessionProcesses(fixture.state.pid);
+    expect(frozen.length).toBeGreaterThan(0);
+    for (const pid of frozen) process.kill(pid, "SIGSTOP");
+    cleanups.push(async () => {
+      for (const pid of frozen) {
+        try {
+          process.kill(pid, "SIGCONT");
+        } catch {
+          // gone
+        }
+      }
+    });
+    const before = await fixture.logins();
+
+    const hung = await run("echo hung", 2_000);
+    expect(hung.timedOut).toBe(true);
+    const startedAt = Date.now();
+    const next = await run("echo fresh", 30_000);
+
+    expect(next.exitCode).toBe(0);
+    expect(next.stdout.trim()).toBe("fresh");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect((await fixture.logins()) - before).toBe(1);
+  }, 120_000);
+
+  it("lets a command still on the master finish when the last hold is released", async () => {
+    const fixture = await startFixture();
+    if (!fixture) return;
+    const multiplex = openSshMultiplex(fixture.config, "env-a");
+    const run = runnerFor(fixture.state, fixture.config, multiplex);
+    expect((await run("true")).exitCode).toBe(0);
+
+    const pending = run("sleep 2; echo finished");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await multiplex.release();
+    const result = await pending;
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("finished");
   }, 120_000);
 
   it.each([
@@ -244,7 +355,7 @@ describe("SSH multiplexing for short bridge commands", () => {
   }, 120_000);
 });
 
-describe("callback bridge worker over a shared SSH connection", () => {
+describe.skipIf(!sshSupport.supported)("callback bridge worker over a shared SSH connection", () => {
   it("serves ten requests and ten idle seconds over one SSH connection", async () => {
     const fixture = await startFixture();
     if (!fixture) return;
@@ -289,6 +400,38 @@ describe("callback bridge worker over a shared SSH connection", () => {
 });
 
 describe("SSH control socket directory", () => {
+  const offline = {
+    host: "127.0.0.1", port: 22, username: "user", remoteWorkspacePath: "/w",
+    privateKey: "key", knownHosts: "hosts", strictHostKeyChecking: true,
+  };
+
+  it("connects directly when the target has no environment id", async () => {
+    const multiplex = openSshMultiplex(offline, null);
+    await expect(multiplex.channel(offline)).resolves.toMatchObject({ args: ["-o", "ControlPath=none"] });
+    await multiplex.release();
+  });
+
+  it("does not put the socket below a temp root that other users may write", async () => {
+    // Short, so the socket path would fit there and only the owner check decides.
+    const unsafe = await mkdtemp("/tmp/pu-");
+    cleanups.push(() => rm(unsafe, { recursive: true, force: true }));
+    await chmod(unsafe, 0o777);
+    const previous = process.env.TMPDIR;
+    process.env.TMPDIR = unsafe;
+    try {
+      const multiplex = openSshMultiplex(offline, "env-unsafe-root");
+      cleanups.push(() => multiplex.release());
+      const channel = await multiplex.channel(offline);
+      const option = channel.args.find((arg) => arg.startsWith("ControlPath="))!;
+      channel.done();
+
+      expect(option.startsWith(`ControlPath=${unsafe}`)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+    }
+  });
+
   it("is private while held and gone when the process exits", () => {
     // A server that exits without stopping its runs (a restart) still removes
     // its sockets; each master then exits after its idle time.
@@ -299,7 +442,8 @@ describe("SSH control socket directory", () => {
       `import { openSshMultiplex } from ${JSON.stringify(modulePath)};`,
       `const hold = openSshMultiplex({ host: "127.0.0.1", port: 22, username: "user", remoteWorkspacePath: "/w",`,
       `  privateKey: "key", knownHosts: "hosts", strictHostKeyChecking: true }, "env-a");`,
-      `const option = (await hold.channel()).args.find((arg) => arg.startsWith("ControlPath="));`,
+      `const option = (await hold.channel({ host: "127.0.0.1", port: 22, username: "user", remoteWorkspacePath: "/w",`,
+      `  privateKey: "key", knownHosts: "hosts", strictHostKeyChecking: true })).args.find((arg) => arg.startsWith("ControlPath="));`,
       `const dir = path.dirname(option.slice("ControlPath=".length));`,
       `console.log(JSON.stringify({ dir, mode: statSync(dir).mode & 0o777 }));`,
     ].join("\n")], { encoding: "utf8" });
@@ -319,5 +463,7 @@ describe("SSH control socket path", () => {
     expect(sshControlDirFits("/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/paperclip-ssh-mux-AbCdEf")).toBe(false);
     expect(sshControlDirFits("/tmp/with space/paperclip-ssh-mux-AbCdEf")).toBe(false);
     expect(sshControlDirFits("/tmp/100%/paperclip-ssh-mux-AbCdEf")).toBe(false);
+    expect(sshControlDirFits("/tmp/${HOME}/paperclip-ssh-mux-AbCdEf")).toBe(false);
+    expect(sshControlDirFits("~/paperclip-ssh-mux-AbCdEf")).toBe(false);
   });
 });
