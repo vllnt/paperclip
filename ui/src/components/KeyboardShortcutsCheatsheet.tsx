@@ -1,3 +1,4 @@
+import { COMMAND_ACTIONS, type CommandActionDefinition } from "@paperclipai/shared/command-actions";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 interface ShortcutEntry {
@@ -13,7 +14,33 @@ interface ShortcutSection {
   shortcuts: ShortcutEntry[];
 }
 
+function catalogShortcuts(include: (action: CommandActionDefinition) => boolean): ShortcutEntry[] {
+  return COMMAND_ACTIONS.filter((action) => action.shortcut && include(action)).map((action) => ({
+    keys: [...(action.shortcut ?? [])],
+    label: action.title,
+  }));
+}
+
+// Launcher shortcuts come from the shared action catalog, so the palette, the
+// chords and this sheet cannot drift. List-navigation keys are page-local and
+// stay listed here.
 const sections: ShortcutSection[] = [
+  {
+    title: "Go to",
+    shortcuts: catalogShortcuts((action) => action.group === "navigate"),
+  },
+  {
+    title: "Global",
+    shortcuts: [
+      { keys: ["⌘/Ctrl", "K"], label: "Open the command launcher", combo: true },
+      { keys: ["/"], label: "Search current page or quick search" },
+      ...catalogShortcuts((action) => action.group !== "navigate" && action.group !== "contextual"),
+    ],
+  },
+  {
+    title: "Task detail",
+    shortcuts: catalogShortcuts((action) => action.group === "contextual"),
+  },
   {
     title: "Inbox",
     shortcuts: [
@@ -31,14 +58,6 @@ const sections: ShortcutSection[] = [
     ],
   },
   {
-    title: "Task detail",
-    shortcuts: [
-      { keys: ["y"], label: "Quick-archive back to inbox" },
-      { keys: ["g", "i"], label: "Go to inbox" },
-      { keys: ["g", "c"], label: "Focus comment composer" },
-    ],
-  },
-  {
     title: "Decisions",
     shortcuts: [
       { keys: ["j"], label: "Move down" },
@@ -47,16 +66,6 @@ const sections: ShortcutSection[] = [
       { keys: ["↑"], label: "Move up" },
       { keys: ["Enter"], label: "Open or close selected decision" },
       { keys: ["x"], label: "Dismiss selected decision" },
-    ],
-  },
-  {
-    title: "Global",
-    shortcuts: [
-      { keys: ["/"], label: "Search current page or quick search" },
-      { keys: ["c"], label: "New task" },
-      { keys: ["["], label: "Toggle sidebar" },
-      { keys: ["]"], label: "Toggle panel" },
-      { keys: ["?"], label: "Show keyboard shortcuts" },
     ],
   },
 ];
@@ -72,7 +81,7 @@ function KeyCap({ children }: { children: string }) {
 export function KeyboardShortcutsCheatsheetContent() {
   return (
     <>
-      <div className="divide-y divide-border border-t border-border">
+      <div className="min-h-0 divide-y divide-border overflow-y-auto border-t border-border" data-shortcut-list>
         {sections.map((section) => (
           <div key={section.title} className="px-5 py-3">
             <h3 className="mb-2 text-(length:--text-micro) font-semibold uppercase tracking-wider text-muted-foreground">
@@ -82,12 +91,13 @@ export function KeyboardShortcutsCheatsheetContent() {
               {section.shortcuts.map((shortcut) => (
                 <div
                   key={shortcut.label + shortcut.keys.join()}
+                  data-shortcut-row
                   className="flex items-center justify-between gap-4"
                 >
                   <span className="text-sm text-foreground/90">{shortcut.label}</span>
                   <div className="flex items-center gap-1">
                     {shortcut.keys.map((key, i) => (
-                      <span key={key} className="flex items-center gap-1">
+                      <span key={`${key}-${i}`} className="flex items-center gap-1">
                         {i > 0 && (
                           <span className="text-xs text-muted-foreground">
                             {shortcut.combo ? "+" : "then"}
@@ -121,7 +131,7 @@ export function KeyboardShortcutsCheatsheet({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md gap-0 p-0 overflow-hidden" showCloseButton={false}>
+      <DialogContent className="flex max-h-(--sz-85vh) flex-col sm:max-w-md gap-0 p-0 overflow-hidden" showCloseButton={false}>
         <DialogHeader className="px-5 pt-5 pb-3">
           <DialogTitle className="text-base">Keyboard shortcuts</DialogTitle>
         </DialogHeader>

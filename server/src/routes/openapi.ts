@@ -89,6 +89,9 @@ import {
   updateDecisionQueueSchema,
   updateDecisionTriageSchema,
   updateDecisionRetentionSchema,
+  // Heartbeat runs
+  heartbeatRunStatsQuerySchema,
+  heartbeatRunStatsSchema,
   // Routine
   createRoutineSchema,
   updateRoutineSchema,
@@ -2103,8 +2106,10 @@ registry.registerPath({
   path: "/api/companies/{companyId}",
   tags: ["companies"],
   summary: "Delete a company",
+  description:
+    "Deletes the company and every row it owns, in one transaction. Before it checks anything it locks the company row and the rows of the company that other rows could point at, so a concurrent write cannot add a reference after the check. A write that waits for these locks fails with a foreign-key error when the delete commits. Returns 409 and deletes nothing when a row of another company would be deleted or changed (`details.code` is `company_delete_cross_company_references`, with `details.references` as a list of `{ table, count }`), when a row still blocks the delete (`details.table` and `details.blockingRows`), or when a lock could not be had within 5 seconds or the database ended the delete to break a deadlock (`details.code` is `company_delete_busy`; trying again can work). The response names no ids, companies or content. A successful delete writes one `company_deleted` server log entry with the actor and the row count per table.",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -6902,8 +6907,37 @@ registry.registerPath({
   path: "/api/companies/{companyId}/heartbeat-runs",
   tags: ["runs"],
   summary: "List heartbeat runs for a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "Newest first. `status` and `errorCode` take comma-separated values. `since` and `until` (ISO 8601) bound the " +
+    "run's creation time; `until` is exclusive, and an empty or inverted window returns 400. `limit` is 1-1000. " +
+    "`summary=true` returns lighter rows.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      status: z.string().optional(),
+      errorCode: z.string().optional(),
+      since: z.string().datetime({ offset: true }).optional(),
+      until: z.string().datetime({ offset: true }).optional(),
+      limit: z.string().optional(),
+      summary: z.enum(["true", "1"]).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/heartbeat-runs/stats",
+  tags: ["runs"],
+  summary: "Get heartbeat run stats and daily cap usage for a company",
+  description:
+    "Counts runs created in the window (default: the last 24 hours, at most 90 days) by status, the top error " +
+    "codes, and for each agent its runs today against `runtimeConfig.heartbeat.maxDailyRuns`. `runsToday` is the " +
+    "value the daily cap itself compares against the limit (one shared function), so `capReached` matches whether " +
+    "the next wake is allowed.",
+  request: { params: z.object({ companyId: z.string() }), query: heartbeatRunStatsQuerySchema },
+  responses: { 200: r.ok(heartbeatRunStatsSchema), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -7833,7 +7867,8 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     body: jsonBody(companySkillCreateSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  // 201 for a new skill, 200 when an idempotency key replays a prior create, 409 when the slug already has a skill.
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 409: r.conflict },
 });
 
 registry.registerPath({
