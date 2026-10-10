@@ -843,14 +843,19 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const HOUR_MS = 60 * 60 * 1000;
     const nowMs = Date.UTC(2026, 5, 1);
 
-    function reaper() {
+    function reaper(options: {
+      cooldownDays?: number;
+      retentionHours?: number;
+      beforeArchive?: (workspace: { id: string }) => Promise<void>;
+    } = {}) {
       return executionWorkspaceService(db, {
         resolvePullRequestDetails: async (companyId, reference) =>
           pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
           ?? { state: "unknown", headRef: null, headSha: null },
         now: () => new Date(nowMs),
-        workspaceReaperCooldownDays: 7,
-        workspaceReaperNoLocalWorkRetentionHours: 24,
+        workspaceReaperCooldownDays: options.cooldownDays ?? 7,
+        workspaceReaperNoLocalWorkRetentionHours: options.retentionHours ?? 24,
+        beforeTerminalWorkspaceArchive: options.beforeArchive,
       });
     }
 
@@ -998,6 +1003,105 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
         .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
       expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedReopened: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("archives on the same sweep when the retention is 0", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 0 });
+
+      expect(await reaper({ retentionHours: 0 }).sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      await expect(fs.stat(seeded.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    }, 20_000);
+
+    it("never waits longer than the cooldown", async () => {
+      // A 48 hour retention under a 1 day cooldown waits 24 hours.
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 30 });
+
+      expect(await reaper({ cooldownDays: 1, retentionHours: 48 }).sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+    }, 20_000);
+
+    it("keeps local commits when the base ref is the workspace's own HEAD", async () => {
+      // Branch detection falls back to the literal HEAD in a repository with no
+      // default branch. Compared with itself, HEAD always looks delivered.
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 240 });
+      await fs.writeFile(path.join(seeded.worktreePath, "work.txt"), "committed, never pushed\n", "utf8");
+      await runGit(seeded.worktreePath, ["add", "work.txt"]);
+      await runGit(seeded.worktreePath, ["commit", "-m", "Local work"]);
+      await db
+        .update(executionWorkspaces)
+        .set({ baseRef: "HEAD", updatedAt: new Date(nowMs - 400 * HOUR_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      expect(await reaper().sweepTerminalWorkspaces())
+        .toMatchObject({ archived: 0, skippedUndelivered: 1, skippedUnknownDelivery: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("keeps the 7 day cooldown for a workspace that is not a git worktree", async () => {
+      // Only a git worktree's cleanup re-verifies HEAD and status before it deletes.
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      await db
+        .update(executionWorkspaces)
+        .set({ providerType: "local_fs", updatedAt: new Date(nowMs - 400 * HOUR_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedCooldown: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("does not hold a shared workspace session for an open linked issue, as a board close only detaches it", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      await db
+        .update(executionWorkspaces)
+        .set({ mode: "shared_workspace", updatedAt: new Date(nowMs - 400 * HOUR_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        projectId: seeded.projectId,
+        identifier: `F-${randomUUID().slice(0, 8)}`,
+        title: "Open issue on the shared session",
+        status: "todo",
+        priority: "medium",
+        executionWorkspaceId: seeded.executionWorkspaceId,
+      });
+
+      expect(await reaper().sweepTerminalWorkspaces()).toMatchObject({ eligible: 1, skippedOpenLinkedIssue: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).not.toBe("active");
+    }, 20_000);
+
+    it("re-checks an open linked issue under the lifecycle lock", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      const sweep = await reaper({
+        beforeArchive: async () => {
+          await db.insert(issues).values({
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            projectId: seeded.projectId,
+            identifier: `F-${randomUUID().slice(0, 8)}`,
+            title: "Follow-up linked during the sweep",
+            status: "todo",
+            priority: "medium",
+            executionWorkspaceId: seeded.executionWorkspaceId,
+          });
+        },
+      }).sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ eligible: 1, archived: 0, skippedRace: 1 });
+      await expectKept(seeded);
+    }, 20_000);
+
+    it("re-checks the retention under the lifecycle lock", async () => {
+      const seeded = await seedNoLocalWork({ status: "cancelled", hoursAgo: 25 });
+      const sweep = await reaper({
+        beforeArchive: async () => {
+          // The issue is cancelled again just now, so it is inside the retention.
+          await db.update(issues).set({ cancelledAt: new Date(nowMs) }).where(eq(issues.id, seeded.sourceIssueId));
+        },
+      }).sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ eligible: 1, archived: 0, skippedRace: 1 });
       await expectKept(seeded);
     }, 20_000);
 

@@ -1484,15 +1484,17 @@ Environment overrides:
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
 - `PAPERCLIP_WORKSPACE_REAPER_NO_LOCAL_WORK_RETENTION_HOURS=<hours>` sets the
-  shorter wait for a terminal workspace with no local-only work: no modified or
-  untracked files and no commits ahead of its base ref, whether or not the work
-  was delivered (a cancelled issue, or a task that committed nothing). Deleting
-  it loses nothing, and a reopen provisions a fresh workspace. It never waits
-  longer than the cooldown above. The default is `24`; `0` archives it on the
-  same sweep; a negative or non-numeric value falls back to the default. A
-  workspace with commits ahead of its base stays until a merge proves delivery.
-  The reaper also keeps a workspace that an open issue outside its issue tree
-  still uses. Its "skipped all candidates" log line counts each reason:
+  shorter wait for a terminal git worktree with no local-only work: no modified
+  or untracked files and no commits ahead of its base ref (delivered by
+  ancestry, for example a cancelled issue or a task that committed nothing).
+  Deleting it loses nothing, and a reopen provisions a fresh workspace. It never
+  waits longer than the cooldown above. The default is `24`; `0` archives it on
+  the same sweep; a negative or non-numeric value falls back to the default.
+  Work merged through a pull request keeps the cooldown. A workspace with
+  commits ahead of its base stays until a merge proves delivery, and so does a
+  workspace whose base ref is its own HEAD or branch, which proves nothing. The
+  reaper also keeps an isolated workspace that an open issue outside its issue
+  tree still uses. Its "skipped all candidates" log line counts each reason:
   `skippedUnverifiedStatus`, `skippedDirty`, `skippedUntracked`,
   `skippedAheadOfBase` and `skippedUnknownDelivery` (together
   `skippedUndelivered`), `skippedOpenLinkedIssue`, `skippedActiveRun`,

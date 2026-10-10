@@ -228,6 +228,9 @@ export type ExecutionWorkspaceServiceOptions = {
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
   beforeTerminalWorkspaceCleanup?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
+  // Test seam: runs after the sweep's checks pass and before the archive
+  // statement re-checks them under the lifecycle lock.
+  beforeTerminalWorkspaceArchive?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
   // The terminal-workspace reaper waits this many days after an issue tree
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
@@ -825,6 +828,16 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
+// A base ref that names the workspace's own HEAD or branch compares HEAD with
+// itself: it always shows nothing ahead and "merged", so it proves nothing
+// about delivery. Branch detection falls back to the literal "HEAD" when a
+// repository has no default branch.
+function baseRefTracksWorkspaceHead(baseRef: string, branchName: string | null): boolean {
+  const ref = baseRef.trim();
+  if (ref === "HEAD" || ref === "@") return true;
+  return Boolean(branchName) && (ref === branchName || ref === `heads/${branchName}` || ref === `refs/heads/${branchName}`);
+}
+
 async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
@@ -924,7 +937,11 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   let isMergedIntoBase: boolean | null = null;
   const baseRef = workspace.baseRef;
 
-  if (repoRoot && baseRef) {
+  if (repoRoot && baseRef && baseRefTracksWorkspaceHead(baseRef, branchName)) {
+    warnings.push(
+      `The base ref "${baseRef}" is this workspace's own HEAD, so Paperclip cannot tell whether its commits were delivered.`,
+    );
+  } else if (repoRoot && baseRef) {
     try {
       const counts = (await runGit(["rev-list", "--left-right", "--count", `${baseRef}...HEAD`], workspacePath)).stdout.trim();
       const [behindRaw, aheadRaw] = counts.split(/\s+/);
@@ -2677,14 +2694,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           else result.skippedUntracked += 1;
           continue;
         }
-        // No local-only work: the clean worktree (checked above) has no commit
-        // that its base ref lacks, so deleting it loses nothing whether or not
-        // the work was delivered. Commits ahead of the base stay until a
-        // delivery is proven.
-        const noLocalWork = Boolean(git?.repoRoot) && git?.aheadCount === 0;
         if (
-          !noLocalWork
-          && assessment.deliveryState !== "merged_via_pr"
+          assessment.deliveryState !== "merged_via_pr"
           && assessment.deliveryState !== "merged_by_ancestry"
         ) {
           result.skippedUndelivered += 1;
@@ -2692,6 +2703,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           else result.skippedUnknownDelivery += 1;
           continue;
         }
+        // No local-only work: the clean git worktree (checked above) has no
+        // commit that its base ref lacks (delivered by ancestry), so deleting
+        // it loses nothing and it waits only the shorter retention. Only a git
+        // worktree qualifies, because its cleanup re-verifies HEAD and status
+        // under the cleanup lock before it removes anything.
+        const noLocalWork =
+          workspace.providerType === "git_worktree"
+          && Boolean(git?.repoRoot)
+          && git?.aheadCount === 0;
         // Hold the archive during the cooldown window, or the shorter retention
         // when there is no local-only work. The anchor is the most recent
         // terminal timestamp across the issue tree. A person can reopen the work
@@ -2766,9 +2786,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
           continue;
         }
-        // An open issue outside the source tree that still uses this workspace
-        // (a follow-up that inherited it) keeps it, as it blocks a board close.
-        if (await workspaceHasOpenLinkedIssue(workspace)) {
+        // An open issue outside the source tree that still uses this isolated
+        // workspace (a follow-up that inherited it) keeps it, as it blocks a
+        // board close. A shared workspace session only detaches such issues.
+        const guardOpenLinkedIssues = workspace.mode !== "shared_workspace";
+        if (guardOpenLinkedIssues && await workspaceHasOpenLinkedIssue(workspace)) {
           result.skippedOpenLinkedIssue += 1;
           continue;
         }
@@ -2777,6 +2799,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         result.eligible += 1;
+        await opts.beforeTerminalWorkspaceArchive?.(workspace);
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures
         // this generation and re-checks it before it deletes the worktree, so a
@@ -2828,13 +2851,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   AND live_run.company_id = ${workspace.companyId}
                   AND live_run.status IN ('queued', 'running')
               )`,
-              sql<boolean>`NOT EXISTS (
+              guardOpenLinkedIssues
+                ? sql<boolean>`NOT EXISTS (
                 SELECT 1
                 FROM ${issues} linked_issue
                 WHERE linked_issue.company_id = ${workspace.companyId}
                   AND linked_issue.execution_workspace_id = ${workspace.id}
                   AND linked_issue.status NOT IN ('done', 'cancelled')
-              )`,
+              )`
+                : undefined,
               sql<boolean>`NOT EXISTS (
                 WITH RECURSIVE issue_tree(id, status) AS (
                   SELECT root.id, root.status

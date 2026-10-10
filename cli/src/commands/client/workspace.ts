@@ -236,22 +236,37 @@ function addIdGet(parent: Command, name: string, description: string, resource: 
   );
 }
 
+interface WorkspaceArchiveOptions extends BaseClientOptions {
+  yes?: boolean;
+}
+
 // Archives an execution workspace as the board's close dialog does: it reads
-// close readiness first and refuses while that is blocked. The server checks
-// the same readiness again before it archives and deletes the workspace.
+// close readiness first, refuses while that is blocked, and shows the warnings
+// (uncommitted files, commits not merged) that archiving would discard, which
+// the caller must accept with --yes. The server checks readiness again before
+// it archives and removes the workspace.
 function addWorkspaceArchive(parent: Command): void {
   addCommonClientOptions(
     parent
       .command("archive")
       .description("Archive an execution workspace and remove its worktree, unless close readiness is blocked")
       .argument("<id>", "Execution workspace ID")
-      .action(async (id: string, opts: BaseClientOptions) => {
+      .option("--yes", "Archive even when close readiness lists warnings")
+      .action(async (id: string, opts: WorkspaceArchiveOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const workspacePath = `/api/execution-workspaces/${encodeURIComponent(id)}`;
-          const readiness = await ctx.api.get<{ state?: string; blockingReasons?: string[] }>(`${workspacePath}/close-readiness`);
-          if (readiness?.state === "blocked") {
+          const readiness = await ctx.api.get<{ state?: string; blockingReasons?: string[]; warnings?: string[] }>(
+            `${workspacePath}/close-readiness`,
+          );
+          if (!readiness?.state) throw new Error(`Could not read the close readiness of workspace ${id}.`);
+          if (readiness.state === "blocked") {
             throw new Error(`Workspace ${id} cannot be archived: ${(readiness.blockingReasons ?? []).join(" ")}`);
+          }
+          if (readiness.state !== "ready" && !opts.yes) {
+            throw new Error(
+              `Archiving workspace ${id} would discard: ${(readiness.warnings ?? []).join(" ")} Run again with --yes to archive it anyway.`,
+            );
           }
           const result = await ctx.api.patch(workspacePath, { status: "archived" });
           printOutput(result, { json: ctx.json });
