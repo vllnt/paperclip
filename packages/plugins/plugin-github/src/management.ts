@@ -11,7 +11,7 @@ import type { PluginWriteRequest } from "./write-identity.js";
 
 type Auth = { id: string; pem: string };
 type WriteToken = (companyId: string, repository: string | null, request: PluginWriteRequest) => Promise<string | null>;
-export function registerManagement(ctx: PluginContext, github: GitHubClient, credentials: (companyId: string) => Promise<Auth>, synced: (companyId: string) => Promise<unknown>, cache = new GitHubReadCache(), ensureTasks?: ReturnType<typeof registerSync>["ensureTasks"], writeToken: WriteToken = async () => null, appUser: (companyId: string) => Promise<boolean> = async () => false) {
+export function registerManagement(ctx: PluginContext, github: GitHubClient, credentials: (companyId: string) => Promise<Auth>, requestSync: (companyId: string) => void, cache = new GitHubReadCache(), ensureTasks?: ReturnType<typeof registerSync>["ensureTasks"], writeToken: WriteToken = async () => null, appUser: (companyId: string) => Promise<boolean> = async () => false) {
   const queues = new Map<string, Promise<unknown>>();
   /**
    * The App user's token for a board write when the company writes as its App user; null keeps the App.
@@ -68,7 +68,7 @@ export function registerManagement(ctx: PluginContext, github: GitHubClient, cre
       const saved = result ?? { ok: true };
       try { await ctx.state.set(key, { fingerprint, status: "done", result: saved, at: new Date().toISOString() }); }
       catch { throw new Error("GitHub applied this change, but Paperclip could not save its confirmation. Refresh the item before starting a new action."); }
-      void synced(companyId).catch(() => {});
+      requestSync(companyId);
       return saved;
     });
     queues.set(companyId, current);

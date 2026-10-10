@@ -15,7 +15,7 @@ beforeEach(() => {
   mocks.actions.clear(); mocks.navigate.mockReset();
   HTMLDialogElement.prototype.showModal = function() { this.open = true; };
   action("sync-status").mockResolvedValue({ configured: true, settings: { enabled: true }, busy: false, report: { at: new Date().toISOString(), warnings: [] }, pendingCount: 0 });
-  action("sync-now").mockResolvedValue({ started: true });
+  action("sync-now").mockResolvedValue({ queued: true, queuedAt: "2026-10-10T12:00:00.000Z", busy: false, lastRunAt: null });
   action("linked-repositories").mockResolvedValue({ repositories: [repository], warnings: [] });
   action("manage-repository").mockImplementation(async (params: any) => params.op === "pulls" ? { rows: [{ id: 20, number: 2, title: "Fix bug", state: params.state, user: { login: "alex" } }], nextPage: params.page === 1 ? 2 : null } : { rows: [], nextPage: null });
   action("open-record-task").mockResolvedValue({ id: "native-pr", panel: { recordId: "22:pull:2" } });

@@ -154,6 +154,9 @@ RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
+# The GitHub plugin syncs only in its scheduled job: these specs fail if an event handler or a button starts a sync again, if a
+# sync keeps calling the host after the host denied it, or if a button says "started" for a request that only waits.
+RUN pnpm exec vitest run packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts packages/plugins/plugin-github/tests/sync-job-context.spec.ts packages/plugins/plugin-github/tests/sync-queued-ui.spec.tsx
 # Build the remaining bundled local plugins here. The production root filesystem
 # is read-only and cannot run the server's install-time auto-build, so a bundled
 # plugin without its dist entrypoints cannot be installed from the UI.

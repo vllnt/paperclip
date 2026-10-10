@@ -195,9 +195,10 @@ describe("scheduled sync after a worker restart", () => {
   it("checks the connection for sync.trigger without loading the private key", async () => {
     const f = fixture();
     await f.connect("vllnt", V_APP, "v-key");
-    await f.h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "sync", stateKey: "report" }, { at: new Date().toISOString(), imported: 0, updated: 0, warnings: [] });
+    const at = new Date().toISOString();
+    await f.h.ctx.state.set({ scopeKind: "company", scopeId: "vllnt", namespace: "sync", stateKey: "report" }, { at, imported: 0, updated: 0, warnings: [] });
     f.resolve.mockClear();
-    expect(await f.h.performAction("sync.trigger", { companyId: "vllnt" }, member("vllnt"))).toEqual({ started: false, companyId: "vllnt" });
+    expect(await f.h.performAction("sync.trigger", { companyId: "vllnt" }, member("vllnt"))).toEqual({ queued: false, queuedAt: null, busy: false, lastRunAt: at, companyId: "vllnt" });
     expect(f.keyResolutions()).toEqual([]);
   });
 
@@ -307,10 +308,10 @@ describe("webhook authentication before any GitHub call", () => {
 // Every action that loads the company's App key while connected. Each other
 // action is credential-free: connection management and setup, status reads,
 // owner/skill/agent/native-channel settings, user-supplied verification, and
-// sync.trigger/save-sync-settings, which only queue the sync covered by sync-now.
+// sync-now, sync.trigger and save-sync-settings, which only queue a sync: the scheduled job loads the key and runs it.
 const CREDENTIALED_ACTIONS = ["allowed-owners.set", "automation-options", "catalog", "github-people-options", "issues", "link-task",
   "linked-repositories", "manage-agent-reviewers", "manage-project", "manage-repository", "management-options", "open-record-task",
-  "pr-task-options", "project-repositories", "publish-task", "repositories.list", "resolve-task-sync", "review-pr-task", "sync-now",
+  "pr-task-options", "project-repositories", "publish-task", "repositories.list", "resolve-task-sync", "review-pr-task",
   "task-destinations", "task-issues", "task-links", "task-repositories", "task-sync-detail"];
 
 describe("disconnect kill switch", () => {
