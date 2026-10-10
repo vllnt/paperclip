@@ -332,18 +332,91 @@ path that finalizes the run honours it:
      The caller records this outcome and does not surface the conflict as an error;
    - then makes the decision in **one atomic step** (below).
 
-   **The atomic decision step.** It reuses the atomic close pattern of the flow
-   watchdog plan (#113, section 6.1.3): one transaction, under the issue row lock,
-   with a compare-and-set, and the action inside the same transaction. It does not
-   define a second locking scheme. In order:
+   **The atomic decision step.** One transaction holds the issue row lock from the
+   re-check to the commit, and the action happens inside it. The guarantee rests on
+   three things that `main` has today, and on nothing else: **the issue row
+   `FOR UPDATE`**, **the re-check of the fields that matter inside that
+   transaction**, and **`executionRunId = stoppedRun` on the lock move**. It does not
+   depend on another plan's text. `issues.status_version` is not needed (see the
+   note below).
 
-   1. **Lock.** Open one transaction and take the issue row `FOR UPDATE` through the
-      wake-queue's `withIssueExecutionLock` (the lock that `releaseIssueExecution`
-      takes for every release today, `use-cases.ts:1024-1029` at `d47df97f0`), then
-      the stopped run's row.
-   2. **Re-validate under the lock.** Read `issues.status_version`,
-      `issues.executionRunId`, the run's status and `resultJson.plannedRestartStop`,
-      and any existing successor of the run (`retryOfRunId`). Then decide:
+   **The lock primitive (new in D1a, shared).** The existing helper cannot be used
+   as it is. `withIssueExecutionLock`
+   (`server/src/modules/wake-queue/adapters/postgres.ts:1171-1232` on `main` at
+   `d9804ac4`) reads the run without `FOR UPDATE` and **clears `executionRunId` and
+   `checkoutRunId` before it calls its callback** (`:1223-1232`). A re-check inside
+   that callback would see the lock already gone. So D1a adds **one** variant next
+   to it, and this plan owns it:
+
+   - **Name and place:** `withIssueExecutionLockHeld(input, fn)` on the wake-queue
+     `IssueLockWriter` port, implemented in
+     `server/src/modules/wake-queue/adapters/postgres.ts` beside
+     `withIssueExecutionLock`.
+   - **Input:** `{ companyId, runId, now }`. It opens the transaction itself; it is
+     the outermost transaction of the step.
+   - **What it does before the callback:** it takes the run row `FOR UPDATE`, then
+     the issue rows in the same id order and with the same predicate as
+     `withIssueExecutionLock` (`:1188-1207`), so it cannot deadlock with it. It
+     **clears nothing**.
+   - **What the callback gets:** the transaction, the run and issue rows as read
+     under the locks, and one helper, `clearAndDrain(options)`. That helper runs the
+     two clearing updates of `:1223-1232` and then `runReleaseDrain` in the same
+     transaction, which is exactly what a release does today.
+   - **The callback decides:** keep the lock, move it, or call `clearAndDrain`.
+   - **Shared:** the flow watchdog plan (#113, its S1 slice) and the routine
+     stale-tick plan (#105, its R1 slice) use this same variant for their
+     "issue lock first" steps. They do not add their own. Whichever of the three
+     lands first adds it; the others reuse it.
+
+   **`scheduleBoundedRetryForRun` takes the outer transaction.** Today it opens its
+   own transaction and locks the issue (`heartbeat.ts:16463-16477`), so called inside
+   the step it would wait on the row lock the step already holds. It also ignores
+   the affected-row count of its lock move and returns `scheduled` either way
+   (`:16912-16941`). D1a changes it as follows:
+
+   - an optional `tx` argument. When it is given, the function uses that
+     transaction, takes no lock of its own (the caller holds it), and returns
+     `lockMoved: boolean` from the affected-row count;
+   - with `tx` and `lockMoved: false`, it throws `retry_lock_lost`, which rolls back
+     the caller's transaction: **no successor exists**;
+   - without `tx` (every caller today), it behaves as it does now, and only adds
+     `lockMoved` to its result for information. A retry of a run that no longer
+     holds the lock is legitimate on several paths (the busy-wait deferrals, for
+     example), so the zero-row case is not an error there.
+
+   The twelve callers on `main`, and what each does with the result
+   (`heartbeat.ts` lines at `d9804ac4`). None passes `tx`, so none changes:
+
+   | Caller | Line | Uses the result |
+   |---|---|---|
+   | `scheduleRecoveryRetry` (the stranded-issue sweep's port) | `:9946` | returns the run when `scheduled`, else `null` |
+   | `applyWakeQueuePostCommitEffects`, review-participant recovery | `:10167` | ignores it |
+   | `dispatchClaimedIssueMonitor`, quota recovery | `:12102` | reads `outcome` |
+   | `enqueueProcessLossRetry` (shutdown loop, reaper) | `:14842` | returns the run when `scheduled`, else `null` |
+   | `finalizeAiConnectionBusyDeferral` | `:17147` | `scheduled = outcome === "scheduled"`; releases when not scheduled |
+   | `finalizeWorkspaceBusyDeferral` | `:17224` | keeps `outcome`; releases when not `scheduled` |
+   | `scheduleInteractionContinuationInfrastructureRetryIfEligible` | `:17309` | returns it to its caller |
+   | `executeRunAttempt`, max-turn continuation | `:27453` | ignores it |
+   | `executeRunAttempt`, transient recovery contract | `:27476` | ignores it |
+   | `executeRunAttempt`, workspace restore lock timeout | `:27912` | ignores it; **catches** an error, logs it, and the executor then releases |
+   | `executeRunAttempt`, setup failure (git scan) | `:28189` | ignores it; **catches** an error, logs it, then releases (`releaseIssueExecutionAndPromote`, `:28197`) |
+   | the service's `scheduleBoundedRetry` (exported port) | `:32436` | returns it |
+
+   **The rule for the two catching callers** (`:27912`, `:28189`): while a run has
+   an undecided `plannedRestartStop`, choke point B **returns** `not_scheduled` with
+   reason `planned_restart_pending`; it does not throw. So their catch never runs for
+   that reason, and the release that follows meets choke point A, which does nothing
+   until step 4. A real error keeps today's handling: it is logged, and the release
+   still passes through A. A catch can therefore never release a run that step 4 has
+   not decided.
+
+   In order:
+
+   1. **Lock.** `withIssueExecutionLockHeld` for the stopped run: the run row and
+      the issue rows `FOR UPDATE`, nothing cleared.
+   2. **Re-validate under the lock.** Read `issues.executionRunId`, the run's status
+      and `resultJson.plannedRestartStop`, and any existing successor of the run
+      (`retryOfRunId`). Then decide:
       - the marker already has `decidedAt`: another decider won; roll back and do
         nothing;
       - the run ended `cancelled` by another writer (an agent pause, a budget stop):
@@ -352,40 +425,62 @@ path that finalizes the run honours it:
         exists: `superseded`;
       - otherwise the class of section 4.5, using the stop proof above.
    3. **Act, in the same transaction:**
-      - `resumed`: insert the `planned_restart_resume` row (through
-        `scheduleBoundedRetryForRun`, which must accept the caller's transaction),
-        and move the lock to it with
+      - `resumed`: `scheduleBoundedRetryForRun(..., { tx })` inserts the
+        `planned_restart_resume` row and moves the lock with
         `UPDATE issues SET executionRunId = resume WHERE id = issue AND
-        executionRunId = stoppedRun AND status_version = <read value>`. **If that
-        update matches zero rows, the transaction rolls back: no successor exists**,
-        and the decider retries the step once; the second read then classifies
-        `superseded`. Today `scheduleBoundedRetryForRun` inserts the successor and
-        returns `scheduled` even when its final lock update matches zero rows
-        (`heartbeat.ts:16912-16941` at `d47df97f0`); D1 changes it to roll back in
-        that case, for every caller, because a successor without the lock is the
-        same defect wherever it comes from;
-      - `native`: apply, under the same lock, the one effect that the gated native
-        writer recorded instead of applying (section 4.2.1);
-      - every other class: run the release drain (`runReleaseDrain`) inside the same
-        lock callback, with `suppressImmediateRecovery: true`, exactly as
-        `releaseIssueExecution` does today;
+        executionRunId = stoppedRun`. Under the held row lock this matches one row,
+        because step 2 just saw that value and nobody can change it before the
+        commit. A zero-row result therefore cannot happen through a concurrent
+        writer; it is kept only as defense in depth (`retry_lock_lost`, roll back);
+      - `native`: apply or discard the effect that the gated native writer recorded,
+        by the terminal policy of section 4.2.1;
+      - every other class: `clearAndDrain({ suppressImmediateRecovery: true })`,
+        exactly as `releaseIssueExecution` does today;
       - set `plannedRestartStop.decidedAt` and `decision` on the run.
    4. **Commit.** The decision, the successor or the release, and the marker commit
       together. Post-commit effects (live events, wake dispatch) run after the
       commit, as they do for `releaseIssueExecution` today.
 
+   **How an operator's write interacts with the step.** Postgres row locks order
+   the two:
+
+   - **An operator write that commits before step 1 takes the lock:** step 2 sees
+     its result. If it moved or cleared the lock, or closed or reassigned the issue
+     (which clears the lock), the class is `superseded`.
+   - **An operator write that starts after step 1:** its `UPDATE` waits on the row
+     lock until step 4 commits, and then applies to the new state. That is the same
+     as an operator acting on any queued retry today: if it clears the lock, the
+     resume's claim re-checks it.
+   - **The hazard that remains is a stale read:** a writer that read the issue
+     **before** step 1 and writes **after** step 4 by issue id alone. The writers on
+     `main` that do that are listed in section 4.2.1 ("stale-read writers"). D1a makes
+     each one conditional on the holder it read, or takes the row lock before its
+     read.
+
+   **About `status_version`.** It is **not** part of the guarantee. Migration
+   `0227_modern_pandemic.sql:146-158` installs a trigger that increments
+   `issues.status_version` on every update that changes `status`, whatever code
+   issues it, and the issue service also increments it on assignment changes
+   (`issues.ts:11025-11047`). So it is a "status or assignment changed" counter.
+   `main` has no compare-and-set writer on it (`issues.update` takes no expected
+   version, `issues.ts:10654-10689`). The step may add
+   `AND status_version = <read value>` to the lock move as optional defense in depth;
+   it adds no safety the row lock does not already give, so D1a does not need it.
+
    **Crash safety.** A crash before the commit leaves nothing written: the marker is
    still undecided and the lock still points at the stopped (terminal) run. After the
    restart, the fallbacks of section 5.3 run **the same atomic step**, with the same
-   proof rule. A crash after the commit leaves a complete decision. No state exists
+   proof rule, and the startup stale-lock sweep leaves the lock to them (section
+   4.2.1). A crash after the commit leaves a complete decision. No state exists
    in which the marker says "decided" and the release or the successor is missing.
 
    **Undecided.** If the wait for the adapter times out (`waitForAdapterStop`
    gives up after 60 seconds and throws), the caller does not decide: no resume and
    no release. The run counts as undecided in the status. The same holds when the
    process dies between steps 3 and 4. Either way the lock points at a terminal
-   run; after the restart, the startup stale-lock sweep clears it and the
-   stranded-issue sweep is the net (section 5.3), **with the same proof rule**.
+   run whose marker is undecided. After the restart, the stale-lock sweep does
+   **not** clear that lock; the fallback of section 5.3 runs the atomic step,
+   **with the same proof rule**, and that step releases or resumes.
 5. **Clear** the intent from the map after step 4. The durable marker in
    `resultJson` stays.
 
@@ -437,9 +532,59 @@ cannot write the first successor.
 | Native runtime, status decision `release_checkout` (`native-runtime/status-decision-committer.ts:1468-1485`) | clears both run ids and the lock fields | **gated** the same way |
 | Native restart recovery (`native-runtime/native-restart-recovery.ts:843-862`) | clears `executionRunId` where it still points at the run | **gated** the same way; after a restart, an undecided marker sends the run to the fallback of section 5.3, which runs the atomic step |
 | Native safe replacement (`native-runtime/native-safe-replacement.ts:390-419`) | inserts its own queued successor wake (`native-safe-replacement:<runId>`) | **gated**: while the marker is undecided it inserts nothing and records the replacement as the `deferredEffect`; step 4 inserts it under the lock when the class is `native`, so it is the only successor |
+| Native workspace-export recovery (`native-runtime/native-workspace-export-recovery.ts:95`) | sets the run back to `running` and **re-admits** it: `executionRunId = run.id` | **gated**: a run with an undecided marker is not re-admitted; the recovery is recorded as the `deferredEffect` |
+| Native workspace-export retry (`native-runtime/native-workspace-export-retry.ts:140`) | the same re-admission, and re-activates the lease | **gated** the same way |
+| Native review participant (`native-runtime/native-review-participant.ts:243-251`) | claims the lock for a review run when `executionRunId` is null or itself | **gated**: it does not claim an issue whose last holder carries an undecided marker. While the marker is undecided the lock still points at the stopped run, so the claim already fails; the gate covers the case where a stale-lock clear happened first |
+| Stale-lock sweep (`recovery/service.ts:6203-6323`, `sweepStaleIssueLocks`) | clears a lock that points at a terminal or missing run | **gated**: it skips a lock whose run has an undecided `plannedRestartStop`. The atomic step (or its fallback) owns that lock. It is suppressed during a drain anyway; this matters after a restart |
+| Deferred-wake sweep (`wake-queue/adapters/deferred-wake-sweep-postgres.ts:81-99`, the `isNull(issues.executionRunId)` candidate rule) | promotes a parked wake once the lock is null | needs no gate of its own: it only acts when the lock is null, and nothing clears a lock owned by an undecided marker (the rows above). D1's test asserts it promotes nothing before step 4 |
 | Writers that clear `issues.executionRunId` without promotion: issue status and assignee changes (`issues.ts`), tree holds (`issue-tree-control.ts`), membership removal (`access.ts`), watchdog, run dispatch, recovery resolution, execution-control reconciliation | clear the lock as part of an operator or domain action | not gated: the operator action wins. Step 4 re-reads the issue; if the lock no longer points at the stopped run, it classifies the run `superseded` and schedules nothing. The retry row's lock transfer is already conditional on the old holder (`:16916`) |
 | New wakes from `enqueueWakeup` (comments, assignments, timers) | a new request, not a successor of this run (no `retryOfRunId`) | not gated: during a drain they stay queued behind the lock |
 | Operator-chosen successors: resolving a recovery action (`execution-recovery-resolution.ts:263`), an authorized chat retry (`chat-channels.ts`) | an operator decision | not gated: an operator action wins, as today; step 4 then finds the successor and classifies `superseded` |
+
+**What happens to a recorded `deferredEffect`.** A gated native writer records one
+effect on the run's marker (`plannedRestartStop.deferredEffect`: its kind and its
+input) and reports `deferred_for_planned_restart` to its caller, never success. Then:
+
+| Decision | The effect is | Recorded where |
+|---|---|---|
+| `native` (the normal case) | **applied** by the atomic step, under the lock, once | the marker (`decision`, `effectApplied: true`) and the writer's own run event |
+| `resumed` (a proven never-started native run) | **discarded**: the resume replaces it | the marker (`effectDiscarded: "superseded_by_resume"`) and a run event |
+| `superseded` (the lock or the issue moved first) | **discarded**: the operator's action stands | the marker (`effectDiscarded: "superseded"`) and a run event |
+| `operator_stop` (a pause or budget stop won) | **discarded**: the run is cancelled | the marker (`effectDiscarded: "operator_stop"`) and a run event |
+| Undecided at the deadline (adapter wait timed out) | **kept, not applied**; the run counts as undecided in the drain status | the marker (unchanged) |
+| A crash before the fallback | **kept, not applied**; the startup fallback runs the atomic step, which then applies or discards it by this table | the marker (unchanged until the fallback) |
+
+An effect is never dropped without a recorded reason, and the writer never reports
+it as done.
+
+**Stale-read writers.** Every writer that changes the issue row as one statement
+waits on the step's row lock. The risk is a writer that **read** the issue before
+step 1 and **writes** after step 4 by issue id alone. On `main` at `d47df97f0`,
+these writers are already conditional on the holder they read (`WHERE
+executionRunId = <run>`), so they are safe:
+
+- `active-run-watchdog/adapters/postgres.ts:348`;
+- `run-dispatch/adapters/postgres.ts:712`, `:918`;
+- `wake-queue/adapters/postgres.ts:1227`;
+- `queued-comment-postgres.ts:113`;
+- `heartbeat.ts:18306`, `:18701`, `:18808`, `:19049`, `:19096`, `:29882`;
+- `issues.ts:7701`, `:7772`;
+- `recovery/service.ts:6319`;
+- `native-restart-recovery.ts:845`.
+
+These are not keyed on the holder they read, and D1a makes each one conditional on
+it, or takes the issue row `FOR UPDATE` before its read in the same transaction:
+
+- `access.ts:702` (membership removal);
+- `execution-control-reconciliation.ts:229`;
+- `execution-recovery-resolution.ts:490`;
+- `legacy-execution-recovery.ts:111`;
+- `heartbeat.ts:30022`, `:30219`;
+- `issue-tree-control.ts:987`;
+- `issues.ts:11910`, `:11944`;
+- the native writers above, which are also gated by the marker:
+  `native-session-executor.ts:8982`, `status-decision-committer.ts:1473`/`:1490`,
+  `native-safe-replacement.ts:482`.
 
 A test exercises each gated row (section 9).
 
@@ -591,7 +736,7 @@ the `general` JSON: that is settings, not events, and it has no history.
 
 | Class | Test | What happens |
 |---|---|---|
-| `resumed` | legacy run, has an `issueId`, has a **proven stop**, and `legacyExecutionNeedsReconciliationWithEvidence` is false. That gate is false for a conversation-continuation adapter, and for **any** adapter whose provider never started | one `planned_restart_resume` retry (below) |
+| `resumed` | legacy run, has an `issueId`, has a **proven stop**, and either its proof is **never started** (any adapter), or `legacyExecutionNeedsReconciliationWithEvidence` is false (a conversation-continuation adapter) | one `planned_restart_resume` retry (below) |
 | `reconciliation` | legacy run for which that gate is true, or any run whose stop is not proven | the recovery that applies to a restart-orphaned run (below). A planned restart does **not** bypass it: the run's tool actions may already have happened, and nothing proves otherwise |
 | `operator_stop`, `superseded` | another writer ended the run or took the issue first (section 4.2.1) | nothing from this plan; the operator's action stands |
 | `native` | `runtimeMode: "native"` (not the native runner) | its own recovery, unchanged in kind: the effect its native writer recorded (a lock release or a safe replacement) is applied by the atomic step, so it cannot race the decision |
@@ -600,13 +745,14 @@ the `general` JSON: that is settings, not events, and it has no history.
 **The restart rule, stated once.** It is the manager's decision on #99 and #104
 (landing order **#74 → #99 → #104**), plus one case this plan adds first:
 
-1. **Proven stop, and the reconciliation gate is false** (a conversation adapter,
-   or any adapter whose provider never started): the `planned_restart_resume`,
-   which does not spend the failure budget.
+1. **Proven stop, and either the provider never started, or the reconciliation
+   gate is false** (a conversation adapter): the `planned_restart_resume`, which
+   does not spend the failure budget.
 2. **Otherwise, a conversation adapter** (no proof, or the gate is true): #104's
    continuation recovery. At #104's head `3777001734f` this is the bounded
    continuation retry, capped by `CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS`
-   (**3** at that head, `recovery/service.ts:546`, used at `:742-748`), then
+   (**3** at that head, `recovery/service.ts:546`, used at `:742-748`; still **3** at
+   #104's later head `be2d35bb652`, `:543`, used at `:739-745`), then
    `blocked`. D1 classifies `planned_restart` the way #104 classifies
    `server_shutdown_interrupted`; it does not add a second cap. #104 is still in
    review: D1 re-reads the constant and the classification at #104's merged head,
@@ -617,6 +763,17 @@ the `general` JSON: that is settings, not events, and it has no history.
 Rule 1 is checked first, so a proven never-started run of any adapter is resumed:
 it did no work, so running it again cannot repeat an action. The
 `reconciliation` row of the table means rules 2 and 3.
+
+**The never-started check comes before the retry count, in the classifier.** The
+shared gate `legacyExecutionNeedsReconciliation` checks
+`executionFailureRetryCount(run) >= 2` (`legacy-execution-recovery.ts:51`)
+**before** its never-started exemption (`:52-54`). So for a never-started run with
+two earlier failure retries, the gate says "reconcile". The planned-restart
+classifier therefore tests the never-started proof itself, first, and calls the
+gate only for the other runs. D1a does not reorder the shared gate: that would change
+today's retry rules for every caller. A never-started run with spent failure
+retries is still resumed once by rule 1, because the resume does not spend
+failures, and the cap of section 4.5 still bounds repeated restarts.
 
 Chat-completion deliveries keep their own bounded retry. The status and the drain
 row count the classes, so the operator sees how much work needed a hold. The
@@ -740,7 +897,7 @@ a thing (an agent, an issue tree) with a lift condition, as in the holds plan
 (#102). It does not use `hold_lift_conditions`.
 
 A drain left on (the deploy job died after "start") is noticed in four ways, all in
-D1:
+D1b:
 
 1. **It ends by itself.** A `planned_restart` drain must have an expiry
    (`deadlineAt + 30 minutes` by default). At expiry the timer (section 4.1) lifts
@@ -811,22 +968,26 @@ normal retry event, in the run's own company.
 
 | Slice | Content | Depends on |
 |---|---|---|
-| **D1** | `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the deadline stop through `cancelRunInternal` with the planned-restart stop intent honoured by both finalize paths (section 4.2), and the shutdown ending inside a drain; the two choke points of section 4.2.1; `planned_restart` code, its consumers and the cause-rules bump; the run classes with the restart rule; the atomic decision step and the rollback of `scheduleBoundedRetryForRun` on a moved lock; the gates on the four native writers; the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries | #74, #99 and #104 merged |
-| **D2** | Startup classification of runs killed during a drain (section 5.2); `orphaned_running_run` cause mapping; `stop_grace_period` in `deploy/compose.yaml` (question Q9) | D1 |
+| **D1a** | The decision core, no migration: `withIssueExecutionLockHeld` and `scheduleBoundedRetryForRun({ tx })`; the stop intent and the deadline stop through `cancelRunInternal` (section 4.2); the two choke points; the gates on the seven native writers and the stale-lock sweep; the `deferredEffect` terminal policy; the stale-read writers made conditional; `planned_restart` code, its consumers and the cause-rules bump; the run classes with the restart rule (never-started first); the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note. Driven by the existing in-memory task drain, with a deadline passed in memory. **Rollback:** revert the PR; no schema change, and a run left with an undecided marker by a reverted build is a terminal run that today's stale-lock sweep and stranded sweep handle | #74, #99 and #104 merged |
+| **D1b** | The surfaces: `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries. **Rollback:** revert the PR; the migration only adds a table, which the reverted code ignores | D1a |
+| **D2** | Startup classification of runs killed during a drain (section 5.2); `orphaned_running_run` cause mapping; `stop_grace_period` in `deploy/compose.yaml` (question Q9). **Rollback:** revert the PR | D1b |
 
-**Order: #74 → #99 → #104 → D1 → D2.** D1 depends on all three:
+**Order: #74 → #99 → #104 → D1a → D1b → D2.** D1a depends on all three:
 
 - #74's deferred-wake sweep and its holds are what choke point A must not bypass;
 - the `reconciliation` class hands runs to #99's stable hold and to #104's bounded
   retry, so both behaviours must be on `main` for D1's tests to assert them;
 - the stranded-sweep wiring of section 5.3 edits the sweep that #104 changes.
 
-**D1 and D2 are heartbeat core.** Each needs concurrency tests for operator races,
+**D1a and D2 are heartbeat core; D1b is surfaces and a migration.** D1a and D2
+each need concurrency tests for operator races,
 native finalization, restart classification and the no-proof path (section 9), and
 lands in a risky window, single.
 
-D2 depends on D1. D1 is useful alone: the deploy job can drain, and the runs end
-clean and resume.
+D2 depends on D1b. D1a is useful alone: with today's task drain and a deadline, the
+runs end clean and resume; D1b adds the durable drain and its surfaces.
+
+Elsewhere in this plan, **D1** means D1a and D1b together.
 
 ## 9. Verification per slice
 
@@ -868,29 +1029,49 @@ D1, embedded Postgres unless noted:
   (2) a conversation-adapter run with no proof gets #104's continuation recovery up
   to its constant's cap, then `blocked`; (3) a process-adapter run whose provider
   started gets #99's stable hold, with or without a proof.
-- **Atomic step** (section 4.2): (a) an operator clears the issue lock between the
-  decider's proof check and its transaction: the lock update matches zero rows, the
-  transaction rolls back, no successor exists, and the retry classifies
-  `superseded`; (b) two deciders race: exactly one commits, the other sees
-  `decidedAt` and does nothing; (c) a crash injected after the successor insert and
-  before the commit: no successor, marker undecided, and the startup fallback
-  decides it; (d) `scheduleBoundedRetryForRun` called by any other caller with a
-  lock that moved rolls back instead of returning `scheduled`.
-- **Native writers**, one test each (section 4.2.1): a native run stopped at the
-  deadline that then fails terminally, gets a `release_checkout` decision, is seen
-  by restart recovery, or qualifies for safe replacement: nothing clears the lock
-  and no successor appears before step 4; step 4 applies the recorded effect once.
+- **Atomic step** (section 4.2), both orders of an operator write:
+  - (a) **the operator commits first**: an operator clears or reassigns the issue
+    lock, and commits, before the step takes `withIssueExecutionLockHeld`. Step 2
+    sees it and classifies `superseded`; no successor exists;
+  - (b) **the step locks first**: the operator's update starts after step 1, waits
+    on the row lock, and applies only after step 4 commits; the resume exists and
+    the operator's write then applies to the new state;
+  - (c) two deciders race: exactly one commits, the other sees `decidedAt` and does
+    nothing;
+  - (d) a crash injected after the successor insert and before the commit: no
+    successor, the marker is undecided, the stale-lock sweep leaves the lock, and
+    the startup fallback decides it;
+  - (e) `withIssueExecutionLockHeld` clears nothing before its callback, and
+    `clearAndDrain` releases exactly as `withIssueExecutionLock` does (the existing
+    release suite passes through it);
+  - (f) `scheduleBoundedRetryForRun` with `tx` and a forced zero-row lock move
+    throws `retry_lock_lost` and the transaction rolls back (defense in depth);
+    without `tx`, each of the twelve callers keeps today's result.
+- **Native writers and sweeps**, one test each (section 4.2.1): a native run stopped
+  at the deadline that then fails terminally, gets a `release_checkout` decision, is
+  seen by restart recovery, qualifies for safe replacement, is re-admitted by
+  workspace-export recovery or retry, or meets a review-participant claim: nothing
+  clears or claims the lock and no successor appears before step 4. The stale-lock
+  sweep skips the lock; the deferred-wake sweep promotes nothing.
+- **The `deferredEffect` terminal policy**, one test per row of its table: applied
+  once for `native`, discarded with its reason for `resumed`, `superseded` and
+  `operator_stop`, kept for an undecided run and applied or discarded by the
+  fallback after a simulated crash. The writer never reports success for a
+  deferred effect.
 - **No promotion into the lock.** An issue with a parked deferred wake: after the
   deadline stop, the wake is still parked and the lock is not held by a new run;
   after the restart, the resume runs first.
 - At the deadline, a native-runner run is not stopped; `phase` becomes
   `ended_at_deadline` only after the in-process counts reach 0.
-- **Classes.** A conversation-continuation run gets the resume. A legacy run that
-  needs reconciliation gets the existing hold and no resume. A run with no
-  `issueId` gets nothing. The status counts each class.
-- A `SIGTERM` during a `planned_restart` drain writes `planned_restart` with the
-  acknowledged proof for a child-process run, which is resumed, and sends an
-  in-process or remote run to `reconciliation`; without a drain it writes
+- **Classes**, by rule 1 first: a conversation-adapter run with a **proven stop**
+  gets the resume; a never-started run with a proven stop gets the resume **even
+  with two earlier failure retries** (the classifier checks never-started before
+  the count); a run without a proof, or a started non-conversation run, gets rules
+  2 or 3; a run with no `issueId` gets nothing. The status counts each class.
+- A `SIGTERM` during a `planned_restart` drain writes `planned_restart`. A run whose
+  stop the shutdown loop can prove (a child process with a real pid or process
+  group: the acknowledgment) is classified by rule 1; an in-process or remote run
+  whose stop it cannot prove there goes to rules 2 or 3. Without a drain it writes
   `server_shutdown_interrupted` (unchanged).
 - After a simulated restart (new service instance, open row of another boot): the
   row closes with `process_stopped` before the reap; a suppressed process (worktree
