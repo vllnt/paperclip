@@ -132,6 +132,11 @@ export type SshRunDirectoryKeepReason =
   | "preserve_failed"
   | "mount_point"
   | "seed_unknown"
+  | "dirty"
+  | "unpushed"
+  | "stash"
+  | "linked_worktree"
+  | "git_unreadable"
   | "rm_failed";
 
 export type SshRunDirectoryReapResult =
@@ -193,8 +198,17 @@ export async function reapSshRunDirectory(input: {
    * (`seed_unknown`), because the worker cannot say which commits are the run's own.
    */
   seed?: string | null;
+  /**
+   * With no seed, remove the folder anyway when it holds no work that exists
+   * nowhere else: no uncommitted or untracked file (ignored files do not count),
+   * a HEAD and every local branch tip contained in a remote ref, no stash, and no
+   * linked worktree. The caller must already have checked that the run is dead and
+   * old enough. A remote ref is a hint that work was pushed, not proof. A read
+   * that fails keeps the folder (`git_unreadable`). Nothing is bundled.
+   */
+  legacy?: boolean;
   /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
-  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string; afterRead?: string };
+  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string; afterRead?: string; beforeRemove?: string };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -211,7 +225,7 @@ export async function reapSshRunDirectory(input: {
   const seed = typeof input.seed === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(input.seed) ? input.seed : "";
   const hook = (line: string | undefined) => (line ? [line] : []);
   const body = [
-    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}; seed=${q(seed)}`,
+    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}; seed=${q(seed)}; legacy=${input.legacy && !seed ? 1 : 0}`,
     // The root is resolved once. Everything below is compared with this physical path.
     'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
     'runtime="$root/.paperclip-runtime"; runs="$runtime/runs"; preserved="$runtime/preserved"',
@@ -231,14 +245,19 @@ export async function reapSshRunDirectory(input: {
     'cd "$id" 2>/dev/null || { echo absent; exit 0; }',
     'if [ "$(pwd -P)" != "$canon/.paperclip-runtime/runs/$id" ]; then echo symlink; exit 0; fi',
     ...hook(input.testHooks?.afterConfine),
+    // Device and inode of a path, as "dev:inode". The directory entered here is
+    // recorded, and checked again from the parent right before it is removed.
+    'statid() { stat -c %d:%i "$1" 2>/dev/null || stat -f %d:%i "$1" 2>/dev/null; }',
+    'ino_here=$(statid .)',
     'dev_here=$(stat -c %d . 2>/dev/null || stat -f %d . 2>/dev/null); dev_runs=$(stat -c %d .. 2>/dev/null || stat -f %d .. 2>/dev/null)',
+    'if [ -z "$ino_here" ]; then echo "kept mount_point 0"; exit 0; fi',
     'if [ -z "$dev_here" ] || [ "$dev_here" != "$dev_runs" ]; then echo "kept mount_point 0"; exit 0; fi',
     'if command -v mountpoint >/dev/null 2>&1 && mountpoint -q . 2>/dev/null; then echo "kept mount_point 0"; exit 0; fi',
     'ws=workspace; list=.paperclip-reap-refs; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"',
     'kb=$(du -sk . 2>/dev/null | cut -f1); kb=${kb:-0}',
     'keep() { echo "kept $1 $kb"; exit 0; }',
     // Keeps the directory and names the git command that failed.
-    'fail() { echo "detail $1"; keep preserve_failed; }',
+    'fail() { echo "detail $1"; keep "${fail_reason:-preserve_failed}"; }',
     'isoid() { case "$1" in ""|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -ge 40 ]; }',
     // Threat model: the worker's git is trusted. A git that exits 0 and prints
     // false output is out of scope. Output that is cut short is in scope, and so is
@@ -284,10 +303,46 @@ export async function reapSshRunDirectory(input: {
     // it. It is never taken from the worker's reflog, which an agent can expire.
     // Without it the directory stays. Every commit that is not reachable from
     // the seed is the run's own, whatever the reflog says.
-    '  if [ -z "$seed" ]; then keep seed_unknown; fi',
     // Exit 0 is "an ancestor", exit 1 is "not", and any other status is a failed
     // read, which keeps the directory.
     '  anc() { G merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1; as=$?; if [ "$as" = 0 ]; then return 0; fi; if [ "$as" = 1 ]; then return 1; fi; fail "git merge-base"; }',
+    '  if [ -z "$seed" ]; then',
+    '    if [ "$legacy" != 1 ]; then keep seed_unknown; fi',
+    // A folder with no seed record, and a caller that has already checked that
+    // its run is dead and old enough. It is removed only when it holds no work that
+    // exists nowhere else, as far as a remote ref can tell: a remote ref is a hint
+    // that the work was pushed, never proof. Any doubt keeps it. Nothing is
+    // bundled: a folder that passes holds nothing to save.
+    '    fail_reason=git_unreadable',
+    '    rd status "git status" G status --porcelain',
+    '    if [ -s "$list.status.body" ]; then keep dirty; fi',
+    '    G rev-parse -q --verify HEAD >/dev/null 2>&1; head_status=$?',
+    '    if [ "$head_status" = 0 ]; then',
+    '      rd head "git rev-parse HEAD" G rev-parse -q --verify HEAD',
+    '      head=$(cat "$list.head.body"); isoid "$head" || fail "git rev-parse HEAD"',
+    '      rd remote_head "git for-each-ref" G for-each-ref "--format=%(refname)" --contains "$head" refs/remotes',
+    '      if [ ! -s "$list.remote_head.body" ]; then keep unpushed; fi',
+    '    elif [ "$head_status" = 1 ] && G symbolic-ref -q HEAD >/dev/null 2>&1; then',
+    '      head=""',
+    "    else",
+    '      fail "git rev-parse HEAD"',
+    "    fi",
+    '    rd heads "git for-each-ref" G for-each-ref "--format=%(objectname) %(refname)" refs/heads',
+    '    tipn=0',
+    '    while IFS=" " read -r obj ref; do',
+    '      [ -n "$obj$ref" ] || continue',
+    '      isoid "$obj" || fail "git for-each-ref"',
+    '      if [ -n "$head" ] && anc "$obj" "$head"; then continue; fi',
+    '      tipn=$((tipn + 1))',
+    '      rd "tip$tipn" "git for-each-ref" G for-each-ref "--format=%(refname)" --contains "$obj" refs/remotes',
+    '      if [ ! -s "$list.tip$tipn.body" ]; then keep unpushed; fi',
+    '    done < "$list.heads.body"',
+    '    rd stash "git stash list" G stash list --format=%H',
+    '    if [ -s "$list.stash.body" ]; then keep stash; fi',
+    '    rd trees "git worktree list" G worktree list --porcelain',
+    '    wt=$(grep -c "^worktree " "$list.trees.body" || true)',
+    '    if [ "${wt:-0}" -gt 1 ]; then keep linked_worktree; fi',
+    "  else",
     // Every read below fails closed: a command that exits non-zero, whose output
     // lost its end (see rd), or that prints something that is not an object id
     // where one is due, keeps the directory. HEAD may be unborn (rev-parse exits
@@ -391,18 +446,20 @@ export async function reapSshRunDirectory(input: {
     '    matches "$bundle" || fail "bundle check"',
     '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
     "  fi",
+    "  fi",
     "fi",
     `( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && find . -maxdepth 1 -type f \\( -name '*.bundle' -o -name '.*.bundle.*' \\) -mtime +${PRESERVED_BUNDLE_RETENTION_DAYS} -exec rm -f -- {} + ) 2>/dev/null || true`,
     // Directories without owner rwx (a Go module cache, say) would stop the
     // delete. A per-directory chmod runs before find descends into that
     // directory. -xdev keeps both passes on the run directory's own filesystem,
     // so a mount below it keeps its contents (the delete fails on the mount point).
+    ...hook(input.testHooks?.beforeRemove),
     'find . -xdev -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null || true',
     // Empty the directory we are inside, then remove the marker, then the
     // directory itself from its parent, which must still be the real `runs`.
     'if find . -mindepth 1 -depth -xdev ! -path ./.paperclip-restored -delete 2>/dev/null \\',
     '  && rm -f -- .paperclip-restored \\',
-    '  && ( cd .. 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/runs" ] && rmdir -- "$id" 2>/dev/null ); then',
+    '  && ( cd .. 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/runs" ] && [ "$(statid "$id")" = "$ino_here" ] && rmdir -- "$id" 2>/dev/null ); then',
     '  echo "removed $kb"',
     "else",
     // A failed removal keeps a restored directory removable. A directory that
@@ -425,7 +482,7 @@ export async function reapSshRunDirectory(input: {
   if (last === "absent" || last === "symlink" || last === "unbounded") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|seed_unknown|rm_failed) (\d+)$/.exec(last);
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|seed_unknown|dirty|unpushed|stash|linked_worktree|git_unreadable|rm_failed) (\d+)$/.exec(last);
   if (kept) {
     const detail = lines.filter((line) => line.startsWith("detail ")).map((line) => line.slice("detail ".length)).pop();
     return {

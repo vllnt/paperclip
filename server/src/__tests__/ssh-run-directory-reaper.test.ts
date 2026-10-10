@@ -23,7 +23,7 @@ import {
   stopSshEnvLabFixture,
   type SshEnvLabFixtureState,
 } from "@paperclipai/adapter-utils/ssh";
-import { sshRunDirectory } from "@paperclipai/adapter-utils/remote-managed-runtime";
+import { reapSshRunDirectory, sshRunDirectory } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { recordSshWorkspaceSeed, sshRunDirectoryReaperService } from "../services/ssh-run-directory-reaper.ts";
 import { secretService } from "../services/secrets.ts";
@@ -105,7 +105,7 @@ describeReaper("SSH run directory reaper", () => {
   });
 
   // A run the way a worker leaves it: a lease on the host and runs/<id>/workspace on its disk.
-  async function startRun(options: { status?: string; git?: boolean; restored?: boolean; recordSeed?: boolean } = {}) {
+  async function startRun(options: { status?: string; git?: boolean; restored?: boolean; recordSeed?: boolean; pushed?: boolean } = {}) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "manual", status: "running" });
     const acquired = await runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: runId, persistedExecutionWorkspace: null });
@@ -121,6 +121,12 @@ describeReaper("SSH run directory reaper", () => {
       await git(workspace, ["add", "tracked.txt"]);
       await git(workspace, ["commit", "-q", "-m", "base"]);
       // What realizeWorkspace records on the lease before the upload.
+      if (options.pushed) {
+        const origin = path.join(fixtureRoot, `origin-${randomUUID()}.git`);
+        await git(fixtureRoot, ["init", "-q", "--bare", origin]);
+        await git(workspace, ["remote", "add", "origin", origin]);
+        await git(workspace, ["push", "-q", "origin", "main"]);
+      }
       if (options.recordSeed !== false) await recordSshWorkspaceSeed(db, acquired.lease.id, await git(workspace, ["rev-parse", "HEAD"]));
     } else {
       await writeFile(path.join(workspace, "work.txt"), "only copy\n");
@@ -173,6 +179,9 @@ describeReaper("SSH run directory reaper", () => {
 
   it("keeps a directory it cannot preserve, and records why once", async () => {
     const run = await startRun({ status: "failed", git: false });
+    // A workspace that is not a git repository has no seed record, so its run must
+    // have been finished for the long threshold before the worker is asked.
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 25 * HOUR_MS) }).where(eq(heartbeatRuns.id, run.runId));
 
     await runtime.releaseRunLeases(run.runId);
 
@@ -619,21 +628,166 @@ describeReaper("SSH run directory reaper", () => {
     expect(await exists(run.runDir)).toBe(false);
   }, 60_000);
 
-  it("keeps a failed run's directory as seed_unknown when the server never recorded where the upload started", async () => {
-    const run = await startRun({ status: "failed", recordSeed: false });
-    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 10 * HOUR_MS) }).where(eq(environmentLeases.id, run.leaseId));
-    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, run.leaseId));
-    await writeFile(path.join(run.workspace, "agent.txt"), "agent commit\n");
-    await git(run.workspace, ["add", "agent.txt"]);
-    await git(run.workspace, ["commit", "-q", "-m", "agent work"]);
+  describe("a run folder with no seed record", () => {
+    const OLD_ENOUGH = 25 * HOUR_MS;
 
-    await sshRunDirectoryReaperService(db).reapReleasedLease(environment, row as never);
+    // A dead run whose lease was released long ago, with a pushed, clean workspace.
+    async function legacyRun(options: { status?: string; finishedAgoMs?: number | null; releasedAgoMs?: number } = {}) {
+      const run = await startRun({ status: options.status ?? "failed", recordSeed: false, pushed: true });
+      const finishedAgoMs = options.finishedAgoMs === undefined ? OLD_ENOUGH : options.finishedAgoMs;
+      await db.update(heartbeatRuns)
+        .set({ finishedAt: finishedAgoMs === null ? null : new Date(Date.now() - finishedAgoMs) })
+        .where(eq(heartbeatRuns.id, run.runId));
+      await db.update(environmentLeases)
+        .set({ status: "released", releasedAt: new Date(Date.now() - (options.releasedAgoMs ?? 100 * HOUR_MS)) })
+        .where(eq(environmentLeases.id, run.leaseId));
+      const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, run.leaseId));
+      return { ...run, lease: row as never };
+    }
+    const decisionOf = async (leaseId: string) => (await leaseMetadata(leaseId)).sshRunDirectory;
 
-    expect(await exists(run.runDir)).toBe(true);
-    expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "kept", reason: "seed_unknown" } });
-    const [entry] = await activityFor(run.runId, "environment.ssh_run_directory_kept");
-    expect(entry?.details).toMatchObject({ reason: "seed_unknown" });
-  }, 60_000);
+    it("removes a clean, pushed folder of a run that finished more than a day ago, on the sweep", async () => {
+      const run = await legacyRun();
+
+      const summary = await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(false);
+      expect(summary.legacyRemoved).toBeGreaterThanOrEqual(1);
+      expect(await decisionOf(run.leaseId)).toMatchObject({ state: "removed", unseeded: true });
+      const [entry] = await activityFor(run.runId, "environment.ssh_run_directory_reaped");
+      expect(entry?.details).toMatchObject({ outcome: "removed", unseeded: true, preserved: [] });
+    }, 60_000);
+
+    it("still removes at once a folder the restore marked, whatever its run's age or finish time", async () => {
+      const marked = await startRun({ status: "succeeded", git: false, restored: true });
+      await runtime.releaseRunLeases(marked.runId);
+
+      await vi.waitFor(async () => expect(await exists(marked.runDir)).toBe(false), { timeout: 15_000, interval: 100 });
+      await vi.waitFor(async () => expect(await decisionOf(marked.leaseId)).toMatchObject({ state: "removed" }), { timeout: 15_000, interval: 100 });
+    }, 60_000);
+
+    it("leaves the folder of a run that finished less than a day ago, and records nothing", async () => {
+      const run = await legacyRun({ finishedAgoMs: 23 * HOUR_MS });
+
+      await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await decisionOf(run.leaseId)).toBeUndefined();
+    }, 60_000);
+
+    it("leaves the folder of a run that is not terminal", async () => {
+      const run = await legacyRun({ status: "running" });
+
+      await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await decisionOf(run.leaseId)).toBeUndefined();
+    }, 60_000);
+
+    it("leaves the folder while the run holds another active lease", async () => {
+      const run = await legacyRun();
+      await db.insert(environmentLeases).values({
+        companyId, environmentId: environment.id, heartbeatRunId: run.runId, status: "active", leasePolicy: "ephemeral",
+        provider: "ssh", providerLeaseId: `ssh://other/${randomUUID()}`, metadata: { remoteCwd: sshConfig.remoteWorkspacePath },
+      });
+
+      await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await decisionOf(run.leaseId)).toBeUndefined();
+    }, 60_000);
+
+    it("keeps the folder as finish_unknown on the sweep when the run has no finish time, and waits on the release", async () => {
+      const run = await legacyRun({ finishedAgoMs: null });
+
+      await reaper().reapReleasedLease(environment, run.lease);
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await decisionOf(run.leaseId)).toBeUndefined();
+
+      const summary = await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await decisionOf(run.leaseId)).toMatchObject({ state: "kept", reason: "finish_unknown" });
+      expect(summary.keptByReason.finish_unknown).toBeGreaterThanOrEqual(1);
+    }, 60_000);
+
+    it.each([
+      {
+        reason: "dirty",
+        prepare: async (run: { workspace: string }) => { await writeFile(path.join(run.workspace, "only-copy.txt"), "work\n"); },
+      },
+      {
+        reason: "unpushed",
+        prepare: async (run: { workspace: string }) => {
+          await writeFile(path.join(run.workspace, "local.txt"), "local\n");
+          await git(run.workspace, ["add", "local.txt"]);
+          await git(run.workspace, ["commit", "-q", "-m", "local only"]);
+        },
+      },
+      {
+        reason: "stash",
+        prepare: async (run: { workspace: string }) => {
+          await writeFile(path.join(run.workspace, "tracked.txt"), "stashed\n");
+          await git(run.workspace, ["stash", "push", "-q", "-m", "parked"]);
+        },
+      },
+      {
+        reason: "linked_worktree",
+        prepare: async (run: { workspace: string }) => {
+          await git(run.workspace, ["worktree", "add", "-q", "--detach", path.join(fixtureRoot, `agent-tree-${randomUUID()}`)]);
+        },
+      },
+    ])("keeps the folder as $reason, counts it, and records the reason", async ({ reason, prepare }) => {
+      const run = await legacyRun();
+      await prepare(run);
+
+      const summary = await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(path.join(run.workspace, ".git"))).toBe(true);
+      expect(await decisionOf(run.leaseId)).toMatchObject({ state: "kept", reason });
+      expect(summary.keptByReason[reason]).toBeGreaterThanOrEqual(1);
+      const [entry] = await activityFor(run.runId, "environment.ssh_run_directory_kept");
+      expect(entry?.details).toMatchObject({ reason });
+    }, 60_000);
+
+    it("keeps the folder as git_unreadable when a git read fails", async () => {
+      const run = await legacyRun();
+      const failingGit = `git() { case " $* " in *"-C workspace status --porcelain"*) return 42;; esac; command git "$@"; }`;
+      const service = sshRunDirectoryReaperService(db, {
+        hooks: { reapRemote: (input) => reapSshRunDirectory({ ...input, testHooks: { afterConfine: failingGit } }) },
+      });
+
+      const summary = await service.sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await decisionOf(run.leaseId)).toMatchObject({ state: "kept", reason: "git_unreadable", detail: "git status" });
+      expect(summary.keptByReason.git_unreadable).toBeGreaterThanOrEqual(1);
+    }, 60_000);
+
+    it("sends no more folders than the cap in one sweep, and does the rest on the next", async () => {
+      // The oldest first, so these three come before any other folder the suite left behind.
+      const runs = [];
+      for (let i = 0; i < 3; i += 1) runs.push(await legacyRun({ releasedAgoMs: (300 + i) * HOUR_MS }));
+      const capped = sshRunDirectoryReaperService(db, { legacyPassCap: 2 });
+
+      await capped.sweep({ readDiskUsagePercent: async () => 10 });
+      const afterFirst = await Promise.all(runs.map((run) => exists(run.runDir)));
+      await capped.sweep({ readDiskUsagePercent: async () => 10 });
+      const afterSecond = await Promise.all(runs.map((run) => exists(run.runDir)));
+
+      expect(afterFirst.filter(Boolean)).toHaveLength(1);
+      expect(afterSecond.filter(Boolean)).toHaveLength(0);
+    }, 120_000);
+
+    it("sends none when its time budget is already spent", async () => {
+      const run = await legacyRun({ releasedAgoMs: 310 * HOUR_MS });
+
+      await sshRunDirectoryReaperService(db, { legacyPassBudgetMs: 0 }).sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await decisionOf(run.leaseId)).toBeUndefined();
+    }, 60_000);
+  });
 
   it("records the commit a git workspace is uploaded from when the SSH driver realizes it, and nothing for a plain directory", async () => {
     const gitRun = await startRun({ status: "running", recordSeed: false });

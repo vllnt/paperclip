@@ -26,6 +26,35 @@ status.
   state holds the worker's identity and the provider's session id, and every run
   uploads its own directory.
 
+- **A run with no seed record.** A lease from before the seed record existed, or
+  of a workspace that was not a git repository with a commit, has no commit to
+  measure the run's own work from. The sweep removes its directory only under a
+  stricter rule, and only when all of these hold; otherwise it keeps it:
+  1. The run is dead, by the checks above: terminal, no other `active`,
+     `retained` or `pending_cleanup` lease, and, on a release, not the last run of
+     a task session.
+  2. The run finished more than `PAPERCLIP_SSH_RUN_REAPER_LEGACY_MIN_AGE_MINUTES`
+     ago (default 1440, a server setting). A run with no finish time is kept as
+     `finish_unknown` on the sweep; a release waits for the sweep.
+  3. The worker's git shows no local-only state, by the same sentinel-checked
+     reads as above: no uncommitted or untracked file (ignored files do not
+     count), HEAD contained in a remote ref (`unpushed` otherwise), every local
+     branch tip contained in HEAD or a remote ref, no stash, and no linked
+     worktree, which includes an agent worktree that points into it. A read that
+     fails keeps it as `git_unreadable`. Nothing is bundled, because a folder that
+     passes has nothing to save. A remote ref is a hint that work was pushed, not
+     proof of it.
+  4. One sweep sends at most 200 such folders to workers and spends at most 30
+     seconds on them, oldest first. The rest wait for the next sweep. The removal
+     is the one every directory gets: a direct child of the real root, no links, no
+     device crossing, the claim that serializes reapers, and a device and inode
+     recheck right before the final `rmdir`.
+
+  A folder the restore marked is not subject to this: it holds no unsynced work and
+  goes at once, whatever its run's age or finish time. For that reason the server
+  still asks the worker about a folder with no seed record that is not old enough
+  yet; an unmarked one answers "not yet", which the server does not record.
+
 A directory with the `.paperclip-restored` marker holds no unsynced work and is
 removed at once. Without the marker the worker may hold the only copy of the
 run's work, so the reaper first saves what is local-only.
@@ -68,8 +97,13 @@ The directory stays, with a reason in the activity entry and in the lease's
   bundle already at the published path is a link or not a regular file, or the
   bundle could not be replaced or still does not match this pass's refs exactly.
 - `seed_unknown`: the server has no record of the commit the run's workspace was
-  uploaded from, so the worker cannot say which commits are the run's own. Only
-  directories without the restored marker are kept for this.
+  uploaded from and the caller did not ask for the rule for folders with no
+  record. The server always asks once the run is dead and old enough, so this is
+  what a direct caller of the worker script sees.
+- For a folder with no seed record: `dirty`, `unpushed`, `stash` and
+  `linked_worktree` (the git state that rule 3 names), `git_unreadable` (a git
+  read failed or lost its end; the `detail` field names it), and `finish_unknown`
+  (the run has no finish time).
 - `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
   point (a bind mount on the same device included). Nothing in it is touched.
 - `rm_failed`: the removal failed. It is retried up to 5 times. A mount below the
@@ -158,9 +192,10 @@ instead of the run.
   expire` or `core.logAllRefUpdates=false` can shorten. A commit is the run's own
   when it is reachable from a ref, HEAD or a stash and not from that commit. The
   reflog's length changes nothing. A run with no record (a workspace that was not a
-  git repository with a commit, or a lease from before this record existed) keeps
-  its directory as `seed_unknown` when it has no restored marker. A directory that
-  the restore marked needs no seed.
+  git repository with a commit, or a lease from before this record existed) is
+  not bundled at all: its directory is removed only under the bounded rule in
+  "When a directory is removed", and kept otherwise. A directory that the restore
+  marked needs no seed.
 - **Git reads fail closed.** Every read of the repository before a delete (HEAD,
   the preserved refs, the branches, the stash, the worktree list, and `git status`
   of the workspace and of each extra worktree) must exit 0. Each one is written to
@@ -216,6 +251,10 @@ against `workspace/` inside the run directory, which the agent controls.
   the bundle path.
 - Activity `environment.ssh_run_directory_kept`, once, with the reason.
 - A log line per removal with `bytesFreed`, and one per sweep with the totals.
+  The totals include `keptByReason`, the number of folders kept in that sweep for
+  each reason, and `legacyRemoved`, the number removed under the rule for folders
+  with no seed record. A removal under that rule has `unseeded: true` in its
+  activity entry and lease record.
 
 The server has no metrics backend. Sum `details.bytesFreed` over the activity
 entries to chart freed bytes.

@@ -52,6 +52,16 @@ export function sshRunReaperMinAgeMs(): number {
   return minutesFromEnv("PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES", 6 * 60);
 }
 
+/**
+ * How long a run must have been finished before the folder of a run with no
+ * seed record may be removed. It is longer than the threshold above because
+ * such a folder is judged by what the worker's git can say about it. A server
+ * setting; there is no user setting for it.
+ */
+export function sshRunReaperLegacyMinAgeMs(): number {
+  return minutesFromEnv("PAPERCLIP_SSH_RUN_REAPER_LEGACY_MIN_AGE_MINUTES", 24 * 60);
+}
+
 /** The same threshold while the worker's disk is above the pressure level. */
 export function sshRunReaperPressureMinAgeMs(): number {
   return minutesFromEnv("PAPERCLIP_SSH_RUN_REAPER_PRESSURE_MAX_AGE_MINUTES", 15);
@@ -70,7 +80,16 @@ export interface SshRunDirectorySweepSummary {
   absent: number;
   bytesFreed: number;
   diskPressure: boolean;
+  /** Folders kept, by reason. The sweep logs this with the rest of the summary. */
+  keptByReason: Record<string, number>;
+  /** Folders of runs with no seed record that were removed under the bounded rule. */
+  legacyRemoved: number;
 }
+
+/** Most folders with no seed record that one sweep sends to a worker. */
+const LEGACY_PASS_CAP = 200;
+/** Most time one sweep spends on folders with no seed record. */
+const LEGACY_PASS_BUDGET_MS = 30 * 1000;
 
 type ReapTrigger = "lease_release" | "sweep";
 type ReapOutcome = "removed" | "kept" | "absent" | "skipped";
@@ -80,11 +99,17 @@ interface ReapContext {
   now: Date;
   // The sweep only: how long the directory must have been finished.
   minAgeMs?: (config: SshConnectionConfig, remoteRoot: string) => Promise<number>;
+  // The sweep only: whether one more folder with no seed record may be sent to a worker in this pass.
+  legacy?: { admit: () => boolean };
 }
 
 interface ReapReport {
   outcome: ReapOutcome;
   bytesFreed: number;
+  /** Why a kept folder was kept. */
+  reason?: string;
+  /** True when the folder had no seed record. */
+  unseeded?: boolean;
 }
 
 const SKIPPED: ReapReport = { outcome: "skipped", bytesFreed: 0 };
@@ -104,6 +129,9 @@ export interface SshRunDirectoryReaperOptions {
   clock?: () => Date;
   /** Test seam: how often a claim owner renews. 0 turns renewal off. */
   claimRenewMs?: number;
+  /** Test seams: the most folders with no seed record, and the most time, one sweep spends on them. */
+  legacyPassCap?: number;
+  legacyPassBudgetMs?: number;
 }
 
 function previousDecision(lease: EnvironmentLease): Record<string, unknown> | null {
@@ -366,7 +394,7 @@ async function reapLease(
   if (!(REAPABLE_LEASE_STATUSES as readonly string[]).includes(lease.status)) return SKIPPED;
   try {
     const [run] = await db
-      .select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId })
+      .select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId, finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId));
     if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return SKIPPED;
@@ -404,6 +432,28 @@ async function reapLease(
       const finishedAt = (lease.releasedAt ?? lease.updatedAt).getTime();
       if (context.now.getTime() - finishedAt < await context.minAgeMs(parsed.config, remoteRoot)) return SKIPPED;
     }
+    // A lease with no seed record can only be judged by what the worker's git
+    // says about its folder. The rule for that applies once the run is dead (the
+    // checks above) and has been finished for a long time, and only a bounded
+    // number of such folders go to a worker in one sweep. Until then the worker
+    // is still asked, because a folder the restore marked needs no seed and goes
+    // at once; the answer for an unmarked one is "not yet".
+    const seed = recordedSeed(lease);
+    const unseeded = seed === null;
+    let legacyAllowed = false;
+    let notYet: "wait" | "finish_unknown" = "wait";
+    if (unseeded) {
+      if (!run.finishedAt) {
+        // A release can come before the run row says it finished; only the sweep decides.
+        notYet = context.trigger === "sweep" ? "finish_unknown" : "wait";
+      } else if (context.now.getTime() - run.finishedAt.getTime() < sshRunReaperLegacyMinAgeMs()) {
+        notYet = "wait";
+      } else if (context.legacy && !context.legacy.admit()) {
+        notYet = "wait";
+      } else {
+        legacyAllowed = true;
+      }
+    }
 
     // Claim the directory, then look for a lease once more: a lease that began
     // after the checks above sees the claim and refuses, or is seen here.
@@ -428,9 +478,15 @@ async function reapLease(
       }
       remoteStarted = true;
       const result = await (hooks?.reapRemote ?? reapSshRunDirectory)({
-        spec: parsed.config, remoteRoot, runId, timeoutMs: REAP_TIMEOUT_MS, seed: recordedSeed(lease),
+        spec: parsed.config, remoteRoot, runId, timeoutMs: REAP_TIMEOUT_MS, seed, legacy: legacyAllowed,
       });
-      return await recordResult(db, lease, runId, run.agentId, remoteRoot, result, context, claim);
+      if (unseeded && !legacyAllowed && result.outcome === "kept" && result.reason === "seed_unknown") {
+        // An unmarked folder with no seed record, and the rule does not apply yet.
+        await releaseClaim(db, lease, owner);
+        if (notYet === "finish_unknown") return await recordKept(db, lease, runId, run.agentId, "finish_unknown", 0, context);
+        return SKIPPED;
+      }
+      return await recordResult(db, lease, runId, run.agentId, remoteRoot, result, context, claim, unseeded);
     } catch (error) {
       // After the command was sent, a failure here says nothing about the
       // worker: an SSH timeout does not stop a delete that already runs there.
@@ -460,6 +516,7 @@ async function recordResult(
   result: SshRunDirectoryReapResult,
   context: ReapContext,
   claim: HeldClaim,
+  unseeded = false,
 ): Promise<ReapReport> {
   const at = context.now.toISOString();
   const base = { leaseId: lease.id, environmentId: lease.environmentId, trigger: context.trigger };
@@ -491,15 +548,19 @@ async function recordResult(
     const preservedBundle = result.preserved.length > 0 ? sshPreservedBundlePath(remoteRoot, runId) : undefined;
     if (!await record({
       state: "removed", at, trigger: context.trigger, bytesFreed: result.bytesFreed, preserved: result.preserved,
+      ...(unseeded ? { unseeded: true } : {}),
     })) return SKIPPED;
     await logActivity(db, {
       companyId: lease.companyId, actorType: "system", actorId: REAPER_ACTOR_ID, action: REAPED_ACTION,
       entityType: "heartbeat_run", entityId: runId, runId, agentId,
-      details: { ...base, outcome: "removed", bytesFreed: result.bytesFreed, preserved: result.preserved, ...(preservedBundle ? { preservedBundle } : {}) },
+      details: {
+        ...base, outcome: "removed", bytesFreed: result.bytesFreed, preserved: result.preserved,
+        ...(preservedBundle ? { preservedBundle } : {}), ...(unseeded ? { unseeded: true } : {}),
+      },
     });
     logger.info({ runId, leaseId: lease.id, trigger: context.trigger, bytesFreed: result.bytesFreed, preserved: result.preserved.length },
       "removed a finished SSH run directory");
-    return { outcome: "removed", bytesFreed: result.bytesFreed };
+    return { outcome: "removed", bytesFreed: result.bytesFreed, unseeded };
   }
   const reason = result.outcome === "symlink" ? "symlink" : result.reason;
   const bytes = result.outcome === "kept" ? result.bytes : 0;
@@ -532,7 +593,7 @@ async function recordKept(
     });
   }
   logger.warn({ runId, leaseId: lease.id, trigger: context.trigger, reason, bytes, detail }, "kept a finished SSH run directory");
-  return { outcome: "kept", bytesFreed: 0 };
+  return { outcome: "kept", bytesFreed: 0, reason };
 }
 
 /**
@@ -554,7 +615,9 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: SshRunDirec
       now?: Date;
       readDiskUsagePercent?: (config: SshConnectionConfig, remoteRoot: string) => Promise<number>;
     } = {}): Promise<SshRunDirectorySweepSummary> {
-      const summary: SshRunDirectorySweepSummary = { examined: 0, removed: 0, kept: 0, absent: 0, bytesFreed: 0, diskPressure: false };
+      const summary: SshRunDirectorySweepSummary = {
+        examined: 0, removed: 0, kept: 0, absent: 0, bytesFreed: 0, diskPressure: false, keptByReason: {}, legacyRemoved: 0,
+      };
       if (sweeping) return summary;
       sweeping = true;
       try {
@@ -584,6 +647,18 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: SshRunDirec
         const environments = environmentService(db);
         const pressureByHost = new Map<string, boolean>();
         const startedAt = Date.now();
+        // Folders with no seed record: at most a fixed number, and a fixed time, per sweep.
+        const legacyCap = serviceOptions.legacyPassCap ?? LEGACY_PASS_CAP;
+        const legacyBudgetMs = serviceOptions.legacyPassBudgetMs ?? LEGACY_PASS_BUDGET_MS;
+        const legacyPass = { admitted: 0, spentMs: 0, active: false };
+        const legacy = {
+          admit: () => {
+            if (legacyPass.admitted >= legacyCap || legacyPass.spentMs >= legacyBudgetMs) return false;
+            legacyPass.admitted += 1;
+            legacyPass.active = true;
+            return true;
+          },
+        };
         for (const row of candidates) {
           if (Date.now() - startedAt > SWEEP_TIME_BUDGET_MS) break;
           const lease = row as unknown as EnvironmentLease;
@@ -597,13 +672,21 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: SshRunDirec
             }
             return pressureByHost.get(key) ? sshRunReaperPressureMinAgeMs() : sshRunReaperMinAgeMs();
           };
-          const report = await reapLease(db, environment, lease, { trigger: "sweep", now, minAgeMs }, serviceOptions);
+          legacyPass.active = false;
+          const reapStartedAt = Date.now();
+          const report = await reapLease(db, environment, lease, { trigger: "sweep", now, minAgeMs, legacy }, serviceOptions);
+          if (legacyPass.active) legacyPass.spentMs += Date.now() - reapStartedAt;
           if (report.outcome === "skipped") continue;
           summary.examined += 1;
           summary.bytesFreed += report.bytesFreed;
-          if (report.outcome === "removed") summary.removed += 1;
-          else if (report.outcome === "kept") summary.kept += 1;
-          else summary.absent += 1;
+          if (report.outcome === "removed") {
+            summary.removed += 1;
+            if (report.unseeded) summary.legacyRemoved += 1;
+          } else if (report.outcome === "kept") {
+            summary.kept += 1;
+            const reason = report.reason ?? "unknown";
+            summary.keptByReason[reason] = (summary.keptByReason[reason] ?? 0) + 1;
+          } else summary.absent += 1;
         }
         summary.diskPressure = [...pressureByHost.values()].some(Boolean);
         return summary;
