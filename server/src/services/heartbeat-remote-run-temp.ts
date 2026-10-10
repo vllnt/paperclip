@@ -60,10 +60,16 @@ export async function prepareHeartbeatRemoteRunTemp(
   };
 }
 
-/** Removes a remote run's temp directory; call at a terminal status, before the lease is released. */
+/**
+ * Removes a remote run's temp directory; call at a terminal status, once the
+ * run's remote process is proven stopped, before the lease is released.
+ *
+ * @returns `symlink` when it kept the directory because a link or a file
+ *   replaced a directory in its path.
+ */
 export async function cleanupHeartbeatRemoteRunTemp(
   location: RemoteRunTempLocation,
   cleanup = cleanupRemoteRunTempDirectory,
-): Promise<void> {
-  await cleanup(location);
+): ReturnType<typeof cleanupRemoteRunTempDirectory> {
+  return await cleanup(location);
 }

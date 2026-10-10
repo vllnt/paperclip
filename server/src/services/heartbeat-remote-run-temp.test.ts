@@ -58,9 +58,9 @@ describe("prepareHeartbeatRemoteRunTemp", () => {
 });
 
 describe("cleanupHeartbeatRemoteRunTemp", () => {
-  it("removes the run's directory", async () => {
-    const cleanup = vi.fn(async () => undefined);
-    await cleanupHeartbeatRemoteRunTemp({ runId: RUN_ID, target: sandbox }, cleanup);
+  it("removes the run's directory and reports what it did", async () => {
+    const cleanup = vi.fn(async () => "symlink" as const);
+    await expect(cleanupHeartbeatRemoteRunTemp({ runId: RUN_ID, target: sandbox }, cleanup)).resolves.toBe("symlink");
     expect(cleanup).toHaveBeenCalledWith({ runId: RUN_ID, target: sandbox });
   });
 });

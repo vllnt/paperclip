@@ -21010,6 +21010,9 @@ export function heartbeatService(
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let remoteRunTempLocation: HeartbeatRemoteRunTemp["cleanupLocation"] | null = null;
+    // Set when the adapter proves its last remote process exited, which a
+    // timeout or a dropped SSH channel does not.
+    let remoteProviderStopped = false;
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
@@ -25522,6 +25525,7 @@ export function heartbeatService(
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
+                  remoteProviderStopped = false;
                   return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
                     getFreshSessionHandoff,
                     runId: run.id,
@@ -25555,7 +25559,10 @@ export function heartbeatService(
                         issueId,
                       );
                     },
-                    onProviderStopped: collectStoppedInstructions,
+                    onProviderStopped: async () => {
+                      remoteProviderStopped = true;
+                      await collectStoppedInstructions();
+                    },
                     onDispatch: markDispatchStarted,
                     signal: executionControl.controller.signal,
                     ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
@@ -27261,14 +27268,32 @@ export function heartbeatService(
             latestRun &&
             isHeartbeatRunTerminalStatus(latestRun.status)
           ) {
-            await cleanupHeartbeatRemoteRunTemp(remoteRunTempLocation).catch(
-              (err) => {
-                logger.warn(
-                  { err, runId: run.id },
-                  "failed to remove the remote run temp directory",
-                );
-              },
-            );
+            // A remote process that outlived its channel may still use the
+            // directory, so it is removed only once the stop is proven. Without
+            // proof it stays: over SSH the run directory reaper, which checks
+            // liveness, removes it with the run directory.
+            const remoteStopProven =
+              remoteProviderStopped ||
+              (await remoteExecutionHasStopped(db, run.companyId, run.id).catch(() => false));
+            const remoteTempCleanup = remoteStopProven
+              ? await cleanupHeartbeatRemoteRunTemp(remoteRunTempLocation).catch(
+                (err) => {
+                  logger.warn(
+                    { err, runId: run.id },
+                    "failed to remove the remote run temp directory",
+                  );
+                  return null;
+                },
+              )
+              : "stop_unproven";
+            if (remoteTempCleanup === "stop_unproven" || remoteTempCleanup === "symlink") {
+              logger.warn(
+                { runId: run.id, reason: remoteTempCleanup },
+                remoteTempCleanup === "symlink"
+                  ? "kept the remote run temp directory: a link or a file replaced a directory in its path"
+                  : "kept the remote run temp directory: nothing proves the remote process stopped",
+              );
+            }
           }
           // A retained or unverified process stays above this release boundary.
           // If no stopped-copy capture occurred, preserve an explicit loss report.

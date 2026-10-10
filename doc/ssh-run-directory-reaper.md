@@ -11,9 +11,16 @@ worker and every terminal run status.
 
 - **At the end of the run, `tmp/` only.** Before it releases the lease, the
   heartbeat removes `tmp/`, and the run directory too when nothing else is left
-  in it (a run that never synced a workspace). A `tmp/` that outlives the run
-  (the removal failed, or the server stopped first) is removed with the rest of
-  the directory as below, except the `tmp/`-only case under `not_git_backed`.
+  in it (a run that never synced a workspace). It does so only when the adapter
+  proved that the run's remote process exited. A timeout or a dropped SSH
+  channel proves nothing, since the process may still use `tmp/`, so `tmp/`
+  stays. Like the reaper, the removal resolves the root once, enters each
+  directory below it, refuses a link, and checks the physical path, so a link
+  an agent planted cannot redirect it; with a link in the path it keeps
+  `tmp/`. A root that is not absolute and normalized, or is `/`, gets no
+  `tmp/`. A `tmp/` that outlives the run (no stop proof, a link, a failed
+  removal, or a server that stopped first) is removed with the rest of the
+  directory as below, except the `tmp/`-only case under `not_git_backed`.
 - **On lease release.** When an ephemeral SSH lease releases, expires, or
   fails, and its run is `succeeded`, `failed`, `cancelled`, `interrupted`, or
   `timed_out`, the server removes `runs/<runId>`. The release does not wait for

@@ -2058,10 +2058,36 @@ describe("SSH run temp directory", () => {
     if (!host) return;
     const run = await restoredRun(host);
 
-    await cleanupRemoteRunTempDirectory({ runId: run.runId, target: host.target });
+    await expect(cleanupRemoteRunTempDirectory({ runId: run.runId, target: host.target })).resolves.toBe("removed");
 
     await expect(stat(run.tmp)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(path.join(path.dirname(run.tmp), "workspace", "tracked.txt"), "utf8")).resolves.toBe("base\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  // An agent can replace any directory in runs/<id>/tmp's path with a link.
+  // Neither call may follow it: the files it points at stay, nothing is created there.
+  it.each([
+    [".paperclip-runtime", ["runs", "<id>", "tmp"]],
+    [".paperclip-runtime/runs", ["<id>", "tmp"]],
+    [".paperclip-runtime/runs/<id>", ["tmp"]],
+  ])("changes nothing through a link that replaced %s", async (linked, below) => {
+    const host = await startHost(`SSH run temp link test (${linked})`);
+    if (!host) return;
+    const runId = randomUUID();
+    const named = (entry: string) => entry.replace("<id>", runId);
+    const outside = path.join(host.rootDir, "outside");
+    const canary = path.join(outside, ...below.map(named), "canary");
+    await mkdir(path.dirname(canary), { recursive: true });
+    await writeFile(canary, "keep\n");
+    const link = path.join(host.spec.remoteCwd, named(linked));
+    await mkdir(path.dirname(link), { recursive: true });
+    await symlink(outside, link);
+
+    await expect(cleanupRemoteRunTempDirectory({ runId, target: host.target })).resolves.toBe("symlink");
+    await expect(prepareRemoteRunTempDirectory({ runId, target: host.target })).rejects.toThrow("link");
+
+    await expect(readFile(canary, "utf8")).resolves.toBe("keep\n");
+    expect(await readdir(path.dirname(canary))).toEqual(["canary"]);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   // Root removes it whatever the parent's mode.

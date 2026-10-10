@@ -15,6 +15,7 @@ import {
 } from "./command-managed-runtime.js";
 import {
   buildRemoteExecutionSessionIdentity,
+  isNormalizedRemoteRoot,
   prepareRemoteManagedRuntime,
   remoteExecutionSessionMatches,
   sshRunDirectory,
@@ -1580,8 +1581,26 @@ type RemoteRunTempLocation = {
   runId: string; target: AdapterExecutionTarget | null | undefined;
 };
 
+/** The run's directory under `root`: the real directories `parents`, then `entry`, which the run owns. */
+type RemoteRunTempLayout = { root: string; parents: string[]; entry: string };
+
+function remoteRunTempLayout(input: RemoteRunTempLocation): RemoteRunTempLayout | null {
+  // Only controller-generated run IDs may name a removable directory.
+  if (!/^[a-zA-Z0-9_-]+$/.test(input.runId)) throw new Error("Invalid run temp directory run ID");
+  if (input.target?.kind !== "remote") return null;
+  if (input.target.transport === "ssh") {
+    // The lease root, which the SSH run directory reaper also uses.
+    const root = input.target.spec.remoteCwd;
+    if (!isNormalizedRemoteRoot(root)) return null;
+    return { root, parents: path.posix.relative(root, sshRunDirectory(root, input.runId)).split("/"), entry: "tmp" };
+  }
+  const root = input.target.remoteCwd;
+  if (!isNormalizedRemoteRoot(root)) return null;
+  return { root, parents: [".paperclip-runtime", "tmp"], entry: input.runId };
+}
+
 /**
- * The per-run temp directory of a remote run, or `null` for a local target.
+ * The per-run temp directory of a remote run, or `null` when there is none.
  * Over SSH it is `tmp` beside the run's `workspace` in
  * `<root>/.paperclip-runtime/runs/<runId>`, so the SSH run directory reaper
  * also removes it after a crash. In a sandbox it is
@@ -1589,64 +1608,125 @@ type RemoteRunTempLocation = {
  *
  * @param input.runId - A controller-generated run id: one segment of letters, digits, `_` or `-`.
  * @param input.target - The run's execution target.
- * @returns The directory on the target, or `null` when the target is local.
+ * @returns The directory on the target, or `null` when the target is local or
+ *   its root is not one the SSH run directory reaper accepts (absolute,
+ *   normalized, not `/`).
  * @throws When the run id is not such a segment.
  */
 export function remoteRunTempDirectory(input: RemoteRunTempLocation): string | null {
-  // Only controller-generated run IDs may name a removable directory.
-  if (!/^[a-zA-Z0-9_-]+$/.test(input.runId)) throw new Error("Invalid run temp directory run ID");
-  if (input.target?.kind !== "remote") return null;
-  return input.target.transport === "ssh"
-    ? path.posix.join(sshRunDirectory(input.target.spec.remoteCwd, input.runId), "tmp")
-    : path.posix.join(input.target.remoteCwd, ".paperclip-runtime", "tmp", input.runId);
+  const layout = remoteRunTempLayout(input);
+  return layout && path.posix.join(layout.root, ...layout.parents, layout.entry);
+}
+
+// Shell lines that resolve the root once, then enter each of `dirs` below it
+// as a real directory and prove the physical path, as the SSH run directory
+// reaper does. A link an agent planted anywhere in the path is never followed:
+// the working directory is an inode, so later commands use names relative to
+// it. `onUnsafe` and `onMissing` run when a link or a non-directory, or a
+// missing directory, is found; with `create`, missing directories are made.
+function enterRemoteRunTempDirs(
+  root: string,
+  dirs: string[],
+  options: { create: boolean; onUnsafe: string; onMissing: string },
+): string[] {
+  const q = shellQuote;
+  return [
+    `canon=$(cd -P ${q(root)} 2>/dev/null && pwd -P) || { ${options.onMissing}; }`,
+    `cd -P "$canon" || { ${options.onMissing}; }`,
+    `for dir in ${dirs.map(q).join(" ")}; do`,
+    `  if [ -L "./$dir" ]; then ${options.onUnsafe}; fi`,
+    ...(options.create ? ['  if [ ! -e "./$dir" ]; then mkdir "./$dir" || exit 1; fi'] : []),
+    `  if [ ! -e "./$dir" ]; then ${options.onMissing}; fi`,
+    `  if [ -L "./$dir" ] || [ ! -d "./$dir" ]; then ${options.onUnsafe}; fi`,
+    `  cd -P "./$dir" || { ${options.onMissing}; }`,
+    "done",
+    `if [ "$(pwd -P)" != "$canon"/${q(dirs.join("/"))} ]; then ${options.onUnsafe}; fi`,
+  ];
 }
 
 /**
  * Creates the per-run temp directory of a remote run with mode `0700`.
  *
  * @returns The directory, or `null` when the target is local.
- * @throws When the target cannot create it.
+ * @throws When the target's root is not one the SSH run directory reaper
+ *   accepts, when a link or a file replaced a directory in its path, or when
+ *   the target cannot create it.
  */
 export async function prepareRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<string | null> {
-  const directory = remoteRunTempDirectory(input);
-  if (!directory || input.target?.kind !== "remote") return null;
+  const layout = remoteRunTempLayout(input);
+  if (input.target?.kind !== "remote") return null;
+  if (!layout) {
+    throw new Error("Refusing to create a run temp directory under a root that is not a normalized absolute path");
+  }
+  const script = [
+    "umask 077",
+    ...enterRemoteRunTempDirs(layout.root, [...layout.parents, layout.entry], {
+      create: true, onUnsafe: "echo unsafe; exit 1", onMissing: "exit 1",
+    }),
+    // BSD chmod reads a `--` after the mode as a file name; `.` needs no `--`.
+    "chmod 700 .",
+  ].join("\n");
   const result = await adapterExecutionTargetCommandRunner(input.target).execute({
     command: "sh",
-    args: ["-c", `umask 077 && mkdir -p -- ${shellQuote(directory)} && chmod 700 -- ${shellQuote(directory)}`],
+    args: ["-c", script],
     cwd: input.target.remoteCwd,
     timeoutMs: 15_000,
   });
+  if (result.stdout.trim().split("\n").pop() === "unsafe") {
+    throw new Error("Could not create the run temp directory: a link or a file replaced a directory in its path");
+  }
   if (result.timedOut || result.exitCode !== 0) throw new Error("Could not create the run temp directory");
-  return directory;
+  return path.posix.join(layout.root, ...layout.parents, layout.entry);
 }
+
+/**
+ * What {@link cleanupRemoteRunTempDirectory} did: `removed` the directory, found
+ * it `absent`, or kept it because a link or a file replaced a directory in its
+ * path (`symlink`), so removing it could have deleted something else.
+ */
+export type RemoteRunTempCleanup = "removed" | "absent" | "symlink";
 
 /**
  * Removes the per-run temp directory of a remote run. Over SSH it then
  * removes the run directory too when nothing else is left in it (a run that
- * never synced a workspace). Call only after execution settles, before
- * releasing the run's remote environment lease.
+ * never synced a workspace). Call only once the run's remote process is known
+ * to have stopped, before releasing the run's remote environment lease.
+ *
+ * @throws When the removal fails or times out.
  */
-export async function cleanupRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<void> {
-  const directory = remoteRunTempDirectory(input);
-  if (!directory || input.target?.kind !== "remote") return;
-  // The exit status is `rm`'s. `rm -rf` cannot empty a directory that lacks
-  // owner rwx (a Go module cache, say), so grant it first, as the SSH run
-  // directory reaper does. `find` follows no link, not even the directory
-  // itself if the agent replaced it with one; `chmod -R` would follow that.
-  const removeEmptyRunDirectory = input.target.transport === "ssh"
-    ? ` && { rmdir -- ${shellQuote(path.posix.dirname(directory))} 2>/dev/null || true; }`
-    : "";
+export async function cleanupRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<RemoteRunTempCleanup> {
+  const layout = remoteRunTempLayout(input);
+  if (!layout || input.target?.kind !== "remote") return "absent";
+  const entry = `./${layout.entry}`;
+  const script = [
+    ...enterRemoteRunTempDirs(layout.root, layout.parents, {
+      create: false, onUnsafe: "echo symlink; exit 0", onMissing: "echo absent; exit 0",
+    }),
+    `if [ ! -e ${shellQuote(entry)} ] && [ ! -L ${shellQuote(entry)} ]; then outcome=absent; else`,
+    // `rm -rf` cannot empty a directory that lacks owner rwx (a Go module
+    // cache, say), so grant it first, as the SSH run directory reaper does.
+    // `find` follows no link, not even the entry itself if the agent replaced
+    // it with one; `rm -rf` then removes only that link.
+    `  find ${shellQuote(entry)} -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null`,
+    // The exit status is the removal's.
+    `  rm -rf ${shellQuote(entry)} || exit 1`,
+    "  outcome=removed",
+    "fi",
+    ...(input.target.transport === "ssh"
+      ? [`cd -P .. && rmdir ${shellQuote(`./${input.runId}`)} 2>/dev/null`]
+      : []),
+    'echo "$outcome"',
+  ].join("\n");
   const result = await adapterExecutionTargetCommandRunner(input.target).execute({
     command: "sh",
-    args: [
-      "-c",
-      `find ${shellQuote(directory)} -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null; `
-        + `rm -rf -- ${shellQuote(directory)}${removeEmptyRunDirectory}`,
-    ],
+    args: ["-c", script],
     cwd: input.target.remoteCwd,
     timeoutMs: 60_000,
   });
   if (result.timedOut || result.exitCode !== 0) throw new Error("Could not remove the run temp directory");
+  const outcome = result.stdout.trim().split("\n").pop();
+  if (outcome === "removed" || outcome === "absent" || outcome === "symlink") return outcome;
+  throw new Error("Removing the run temp directory returned an unexpected result");
 }
 
 async function githubOperationLauncherBasePath(
