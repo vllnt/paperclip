@@ -21,12 +21,16 @@ commands, so installs the agent runs in its own worktrees use the same store.
 - A store the caller already chose (`npm_config_store_dir` in the run's
   environment, in any letter case) is kept. The default is skipped when the root is
   not a normalized absolute path.
-- Scope: one environment has one root and one SSH user, so its runs share a store
-  and no other environment does. Two environments that point at the same root on
-  the same worker already share the `runs` directory, and so share the store.
-  Package files in the store are content-addressed, but a store also holds
-  whatever a run installed from a private registry, so a worker that serves two
-  companies needs a separate root, and so a separate store, for each.
+- Scope: the store belongs to the environment's root, not to a company. Runs of
+  environments that use the same root on the same worker share one store.
+  **A worker that serves more than one company needs one root per company.** Give
+  each company's environment its own workspace path, for example
+  `/srv/paperclip/<company>`. Then each company has its own `runs` directory and its
+  own store, and no package file is shared between companies. Package files are
+  content-addressed and public packages are the same for everyone, but a store also
+  holds whatever a run installed from a private registry, and the files are
+  writable (see below). Paperclip does not check that two companies use different
+  roots.
 - The store only grows. Pruning it (`pnpm store prune`) is not automatic.
 
 Hard-linked files are shared between runs, and the store's files are writable by
