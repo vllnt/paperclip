@@ -150,7 +150,12 @@ Returns selectable models for an adapter type.
 
 ```
 GET /api/agents/{agentId}/config-revisions
+GET /api/agents/{agentId}/config-revisions/{revisionId}
 POST /api/agents/{agentId}/config-revisions/{revisionId}/rollback
 ```
 
-View and roll back agent configuration changes.
+View and roll back agent configuration changes. Each revision carries
+`changedKeys` (top-level fields, computed before redaction) and redacted
+`beforeConfig`/`afterConfig` snapshots. Secret values stay redacted, so a
+changed secret shows the same marker on both sides; the CLI command
+`agent config-revision:diff` reports such keys as changed with redacted values.

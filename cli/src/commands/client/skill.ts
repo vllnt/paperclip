@@ -7,6 +7,12 @@ import {
   resolveCommandContext,
   type BaseClientOptions,
 } from "./common.js";
+import { diffFileSets, type DiffableFile } from "./text-diff.js";
+
+interface SkillVersionRecord {
+  revisionNumber?: number;
+  fileInventory?: DiffableFile[];
+}
 
 interface SkillOptions extends BaseClientOptions {
   companyId?: string;
@@ -48,6 +54,73 @@ export function registerSkillCommands(program: Command): void {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
           const query = new URLSearchParams({ path: opts.path ?? "SKILL.md" });
           printOutput(await ctx.api.get(`${apiPath`/api/companies/${ctx.companyId}/skills/${skillId}/files`}?${query.toString()}`), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addSkillAction(skill, "versions", "List company skill versions, newest first", "versions", "GET");
+
+  addCommonClientOptions(
+    skill
+      .command("version:get")
+      .description("Get one company skill version, including file contents")
+      .argument("<skillId>", "Skill ID")
+      .argument("<versionId>", "Version ID")
+      .option("-C, --company-id <id>", "Company ID")
+      .action(async (skillId: string, versionId: string, opts: SkillOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          printOutput(
+            await ctx.api.get(apiPath`/api/companies/${ctx.companyId}/skills/${skillId}/versions/${versionId}`),
+            { json: ctx.json },
+          );
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    skill
+      .command("version:diff")
+      .description("Show a unified line diff of the files between two company skill versions")
+      .argument("<skillId>", "Skill ID")
+      .argument("<fromVersionId>", "Older version ID")
+      .argument("<toVersionId>", "Newer version ID")
+      .option("-C, --company-id <id>", "Company ID")
+      .action(async (skillId: string, fromVersionId: string, toVersionId: string, opts: SkillOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const [from, to] = await Promise.all([
+            ctx.api.get<SkillVersionRecord>(apiPath`/api/companies/${ctx.companyId}/skills/${skillId}/versions/${fromVersionId}`),
+            ctx.api.get<SkillVersionRecord>(apiPath`/api/companies/${ctx.companyId}/skills/${skillId}/versions/${toVersionId}`),
+          ]);
+          const files = diffFileSets(from?.fileInventory ?? [], to?.fileInventory ?? []);
+          if (ctx.json) {
+            printOutput(
+              {
+                fromVersionId,
+                toVersionId,
+                fromRevisionNumber: from?.revisionNumber ?? null,
+                toRevisionNumber: to?.revisionNumber ?? null,
+                files,
+              },
+              { json: true },
+            );
+            return;
+          }
+          console.log(`revision ${from?.revisionNumber ?? "?"} (${fromVersionId}) -> revision ${to?.revisionNumber ?? "?"} (${toVersionId})`);
+          if (files.length === 0) {
+            console.log("(no changes)");
+            return;
+          }
+          for (const file of files) {
+            for (const line of file.diff) console.log(line);
+          }
         } catch (err) {
           handleCommandError(err);
         }

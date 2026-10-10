@@ -74,7 +74,20 @@ command.
 ```sh
 npx paperclipai agent list
 npx paperclipai agent get <agent-id>
+
+# Config history
+npx paperclipai agent config-revisions <agent-id>
+npx paperclipai agent config-revision:get <agent-id> <revision-id>
+npx paperclipai agent config-revision:diff <agent-id> <revision-id> [--json]
+npx paperclipai agent config-revision:rollback <agent-id> <revision-id>
 ```
+
+`config-revision:diff` prints one line per changed leaf as
+`path: before -> after` (`(unset)` marks an added or removed key). Arrays are
+compared as whole values. Secret values are redacted by the server, so a key the
+server recorded as changed with no visible difference prints as
+`<key>: changed (values redacted)`. `--json` prints
+`{ changedKeys, changes: [{ path, kind, before, after }], redactedOnlyKeys }`.
 
 ## Skills Commands
 
@@ -98,6 +111,26 @@ npx paperclipai skills import owner/repo/path/to/skill --company-id <company-id>
 # Attach desired company skills to an agent after install/import
 npx paperclipai skills agent sync <agent-id> --skill github-pr-workflow --mode add --company-id <company-id>
 ```
+
+### Company Skill Versions
+
+```sh
+# List saved versions of a company skill, newest revision first
+npx paperclipai skill versions <skill-id> [-C <company-id>]
+
+# Get one version, including the content of every file
+npx paperclipai skill version:get <skill-id> <version-id> [-C <company-id>]
+
+# Unified line diff of the files between two versions
+npx paperclipai skill version:diff <skill-id> <from-version-id> <to-version-id> [-C <company-id>] [--json]
+```
+
+`version:diff` fetches both versions and diffs their files client-side: one
+`--- a/<path>` / `+++ b/<path>` block with `@@` hunks (3 lines of context) per
+added, removed, or modified file. Base64 (binary) files print
+`Binary file <path> differs`; an executable-bit change prints
+`executable: false -> true`. `--json` prints
+`{ fromVersionId, toVersionId, fromRevisionNumber, toRevisionNumber, files: [{ path, change, binary, diff }] }`.
 
 ## Approval Commands
 
