@@ -1471,7 +1471,7 @@ Terminal states: `done`, `cancelled`
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| GET    | `/api/companies/:companyId/routines` | List all routines in company |
+| GET    | `/api/companies/:companyId/routines` | List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `manual`) |
 | GET    | `/api/routines/:routineId` | Routine details including triggers |
 | POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only) |
 | PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign) |
