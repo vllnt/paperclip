@@ -2,6 +2,9 @@ services:
   paperclip:
     image: IMAGE_REFERENCE
     restart: unless-stopped
+    # Keep equal to PAPERCLIP_STOP_TIMEOUT_MS below: the server ends its shutdown
+    # 10 seconds before this, so it exits 0 instead of being killed.
+    stop_grace_period: 60s
     user: "1000:1000"
     read_only: true
     environment:
@@ -11,6 +14,7 @@ services:
       PAPERCLIP_BIND: custom
       PAPERCLIP_BIND_HOST: 0.0.0.0
       PAPERCLIP_HOME: /paperclip
+      PAPERCLIP_STOP_TIMEOUT_MS: "60000"
       DATABASE_URL: ${DATABASE_URL:?required}
       PAPERCLIP_DEPLOYMENT_MODE: authenticated
       PAPERCLIP_DEPLOYMENT_EXPOSURE: private

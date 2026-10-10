@@ -100,7 +100,7 @@ import {
 } from "./services/device-login-reaper.js";
 import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
 import { createPaperclipTempSweep, startPaperclipTempSweeper } from "./services/paperclip-temp-sweeper.js";
-import { isHeartbeatRunExecuting } from "./services/heartbeat.js";
+import { isHeartbeatRunExecuting, startTaskDrain } from "./services/heartbeat.js";
 import { localAiLoginService } from "./services/local-ai-login.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -125,6 +125,10 @@ import {
   drainRunExecutionFinalizersForShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
+  describeStopTimeout,
+  markServerStopping,
+  resolveShutdownBudgetMs,
+  runBoundedShutdown,
 } from "./shutdown.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
@@ -1136,9 +1140,11 @@ async function startServerWithDatabaseTeardown(
   let drainHeartbeatRunsForShutdown: ((
     signal: "SIGINT" | "SIGTERM",
     runIds?: readonly string[] | null,
+    deadlineAt?: number,
+    abortSignal?: AbortSignal,
   ) => Promise<unknown>) | null = null;
   let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
-  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
+  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM", opts?: { abortSignal?: AbortSignal }) => Promise<{
     skipDrain: boolean;
     drainRunIds?: string[];
   }>) | null = null;
@@ -1154,9 +1160,12 @@ async function startServerWithDatabaseTeardown(
       });
     heartbeatSchedulerInFlight.add(tracked);
   };
-  const waitForHeartbeatSchedulerIdle = async () => {
-    while (heartbeatSchedulerInFlight.size > 0) {
-      await Promise.allSettled([...heartbeatSchedulerInFlight]);
+  const waitForHeartbeatSchedulerIdle = async (abortSignal?: AbortSignal) => {
+    while (heartbeatSchedulerInFlight.size > 0 && !abortSignal?.aborted) {
+      const aborted = abortSignal
+        ? new Promise<void>((resolve) => abortSignal.addEventListener("abort", () => resolve(), { once: true }))
+        : null;
+      await Promise.race([Promise.allSettled([...heartbeatSchedulerInFlight]), ...(aborted ? [aborted] : [])]);
     }
   };
   const executionControlSweepsInFlight = new Set<string>();
@@ -1363,12 +1372,12 @@ async function startServerWithDatabaseTeardown(
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
     });
-    drainHeartbeatRunsForShutdown = (signal, runIds) => (
-      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+    drainHeartbeatRunsForShutdown = (signal, runIds, deadlineAt, abortSignal) => (
+      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds, { deadlineAt, abortSignal })
     );
     drainHeartbeatExecutionFinalizers = () =>
       heartbeat.drainActiveRunExecutions();
-    prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
+    prepareHotRestartShutdown = (signal, opts) => heartbeat.prepareHotRestartShutdown(signal, new Date(), opts);
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
@@ -1547,6 +1556,14 @@ async function startServerWithDatabaseTeardown(
             { err },
             "startup hot-restart adoption reconciliation failed - orphan reaper will serve as degraded backstop",
           );
+        }
+
+        // A run whose shutdown drain was cut after its status became
+        // `interrupted` gets its retry, issue release and agent status now.
+        try {
+          await heartbeat.repairIncompleteShutdownDrains();
+        } catch (err) {
+          logger.error({ err }, "startup repair of interrupted shutdown drains failed");
         }
 
         for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1997,95 +2014,109 @@ async function startServerWithDatabaseTeardown(
       heartbeatSchedulerInterval = null;
     }
 
-    const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
-      signal,
-      prepareHotRestartShutdown,
-      waitForHeartbeatSchedulerIdle,
-    });
-    const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
-    const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
-    if (skipHeartbeatDrain) {
-      logger.info(
-        { signal, hotRestart: heartbeatShutdown.hotRestart },
-        "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
-      );
-    } else if (heartbeatShutdown.preparationError) {
-      logger.error(
-        { err: heartbeatShutdown.preparationError, signal },
-        "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
-      );
-    }
-
-    const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
-      telemetryClient.stop();
-      await telemetryClient.flush();
-    }
-
-    if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-      try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-      } catch (err) {
-        logger.error({ err, signal }, "graceful heartbeat run drain failed");
-      }
-    }
-
-    if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
-        signal,
-        drain: drainHeartbeatExecutionFinalizers,
-        log: logger,
-      });
-    }
-
-    // Whatever the drain did not finalize (timed-out runs, the hot-restart
-    // skip path) still has a local-only tail when the in-flight run-log
-    // mirror is enabled; upload those tails now so an orderly restart
-    // never loses run output. No-op when the mirror is off.
-    try {
-      await flushInFlightRunLogMirrors();
-    } catch (err) {
-      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
-    }
-
     const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
       ?.paperclipShutdown;
     const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
       ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
       : null;
+    let skipHeartbeatDrain = false;
+    let selectiveDrainRunIds: readonly string[] | null = null;
 
-    // Await the ordered application teardown before the process exits. A live
-    // setup-token login session must stop and release its sandbox lease before
-    // the database and the provider stop, so an orderly shutdown never leaves a
-    // sandbox lease or confidential login state alive past the process exit.
-    // The HTTP listener closes first, while every service is still up, so a
-    // request in flight is drained against a working server and none reaches
-    // a route once the pool is gone; the programmatic close below then finds
-    // the listener already closed and skips.
-    await finalizeServerShutdown({
+    // One budget for the whole shutdown, under the stop timeout of whoever
+    // stops the process, so it exits 0 instead of being killed. The listener
+    // stops accepting connections first; the run drain ends runs in parallel
+    // by its deadline; every step logs its start, its end and its duration.
+    await runBoundedShutdown({
       signal,
-      shutdownAppServices: appShutdown,
-      closeHttpListener: () =>
-        closeHttpListenerForShutdown({ server, signal, log: logger }),
-      drainPendingRunFailureReports: waitForPendingRunFailureReports,
-      closeDatabase: closeDatabaseClients,
-      stopEmbeddedPostgres,
-      shutdownInstrumentation,
-      shutdownSentry,
+      budgetMs: resolveShutdownBudgetMs(),
       log: logger,
+      exit: exitProcess
+        ? (code) => {
+            // The final log line must reach the log before the process ends.
+            logger.flush?.();
+            process.exit(code);
+          }
+        : null,
+      steps: {
+        // The listener stays open while runs drain: their callbacks reach this
+        // process over loopback. Only new work is refused, and no run starts.
+        refuseNewWork: () => {
+          markServerStopping();
+          startTaskDrain();
+        },
+        closeHttpListener: () => closeHttpListenerForShutdown({ server, signal, log: logger }),
+        coordinateScheduler: async (abortSignal) => {
+          const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
+            signal,
+            prepareHotRestartShutdown,
+            waitForHeartbeatSchedulerIdle,
+            abortSignal,
+          });
+          skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+          selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
+          if (skipHeartbeatDrain) {
+            logger.info(
+              { signal, hotRestart: heartbeatShutdown.hotRestart },
+              "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
+            );
+          } else if (heartbeatShutdown.preparationError) {
+            logger.error(
+              { err: heartbeatShutdown.preparationError, signal },
+              "hot-restart shutdown preparation failed; falling back to graceful heartbeat run drain",
+            );
+          }
+        },
+        flushTelemetry: async () => {
+          const telemetryClient = getTelemetryClient();
+          if (telemetryClient) {
+            telemetryClient.stop();
+            await telemetryClient.flush();
+          }
+        },
+        drainRuns: async (deadlineAt, abortSignal) => {
+          if (skipHeartbeatDrain || !drainHeartbeatRunsForShutdown) return;
+          const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds, deadlineAt, abortSignal);
+          logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+        },
+        drainFinalizers: async (timeoutMs) => {
+          if (skipHeartbeatDrain) return;
+          await drainRunExecutionFinalizersForShutdown({
+            signal,
+            drain: drainHeartbeatExecutionFinalizers,
+            timeoutMs,
+            log: logger,
+          });
+        },
+        // Whatever the drain did not finalize (timed-out runs, the hot-restart
+        // skip path) still has a local-only tail when the in-flight run-log
+        // mirror is enabled; upload those tails now so an orderly restart
+        // never loses run output. No-op when the mirror is off.
+        flushRunLogMirrors: () => flushInFlightRunLogMirrors(),
+        // The listener is already closed (above), so the teardown starts with
+        // the application services: a live setup-token login session releases
+        // its sandbox lease before the database and the provider stop.
+        finalize: async () => {
+          await finalizeServerShutdown({
+            signal,
+            shutdownAppServices: appShutdown,
+            drainPendingRunFailureReports: waitForPendingRunFailureReports,
+            closeDatabase: closeDatabaseClients,
+            stopEmbeddedPostgres,
+            shutdownInstrumentation,
+            shutdownSentry,
+            log: logger,
+          });
+          if (!exitProcess && server.listening) {
+            await new Promise<void>((resolveClose, rejectClose) => {
+              server.close((err) => {
+                if (err) rejectClose(err);
+                else resolveClose();
+              });
+            });
+          }
+        },
+      },
     });
-
-    if (!exitProcess && server.listening) {
-      await new Promise<void>((resolveClose, rejectClose) => {
-        server.close((err) => {
-          if (err) rejectClose(err);
-          else resolveClose();
-        });
-      });
-    }
-
-    if (exitProcess) process.exit(0);
   };
 
   process.once("SIGINT", () => {
@@ -2094,6 +2125,15 @@ async function startServerWithDatabaseTeardown(
   process.once("SIGTERM", () => {
     void shutdown("SIGTERM", true);
   });
+  const stopTimeout = describeStopTimeout();
+  if (stopTimeout.source !== "env") {
+    logger.warn(
+      { ...stopTimeout, value: process.env.PAPERCLIP_STOP_TIMEOUT_MS ?? null },
+      "PAPERCLIP_STOP_TIMEOUT_MS is not set to a valid value; the shutdown assumes a 60-second stop timeout. " +
+        "Set it to the stop timeout of whatever stops this process (for example stop_grace_period), " +
+        "or a shorter stop (Docker's default is 10 seconds) kills the server before its shutdown ends.",
+    );
+  }
 
   return {
     server,

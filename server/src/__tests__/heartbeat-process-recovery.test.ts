@@ -3780,6 +3780,141 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).resolves.toEqual([{ executionRunId: runId }]);
   });
 
+  describe("bounded graceful shutdown drain", () => {
+    function spawnSigtermIgnoringProcess() {
+      return spawn(
+        process.execPath,
+        ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+        { stdio: "ignore" },
+      );
+    }
+
+    it("ends every running run in parallel within the drain deadline", async () => {
+      const heartbeat = heartbeatService(db);
+      const fixtures = [];
+      for (let index = 0; index < 3; index += 1) {
+        const fixture = await seedRunFixture({ adapterType: "process", agentStatus: "running" });
+        const child = spawnSigtermIgnoringProcess();
+        childProcesses.add(child);
+        runningProcesses.set(fixture.runId, { child, graceSec: 20, processGroupId: null });
+        fixtures.push({ ...fixture, child });
+      }
+      const started = Date.now();
+
+      const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), null, {
+        deadlineAt: started + 4_000,
+      });
+
+      // Three runs at a 20-second grace, one after another, take more than a
+      // minute. In parallel, with each grace capped by the deadline, they end
+      // in seconds.
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(result.interrupted).toBe(3);
+      for (const fixture of fixtures) {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+        expect(run).toMatchObject({ status: "interrupted", errorCode: "server_shutdown_interrupted" });
+        // The marker written with the status is complete once the follow-ups ran.
+        expect((run?.resultJson as Record<string, any> | null)?.shutdownDrain?.phase).toBe("complete");
+        expect(isPidAlive(fixture.child.pid)).toBe(false);
+      }
+    }, 60_000);
+
+    it("leaves a run running for the reaper when the drain deadline passed before its drain started", async () => {
+      const heartbeat = heartbeatService(db);
+      const fixture = await seedRunFixture({ adapterType: "process", agentStatus: "running" });
+      const child = spawnSigtermIgnoringProcess();
+      childProcesses.add(child);
+      runningProcesses.set(fixture.runId, { child, graceSec: 20, processGroupId: null });
+      const controller = new AbortController();
+      controller.abort();
+
+      const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), null, {
+        deadlineAt: Date.now(),
+        abortSignal: controller.signal,
+      });
+
+      expect(result.outcomes).toEqual([{ runId: fixture.runId, outcome: "deadline_skipped" }]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      expect(run?.status).toBe("running");
+    }, 60_000);
+
+    it("finishes, at the next start, a drain that was cut after the status became interrupted", async () => {
+      const heartbeat = heartbeatService(db);
+      // The state a kill leaves mid-drain: the status and its marker committed,
+      // and none of the follow-ups (no retry, the issue lock still on the run).
+      const fixture = await seedRunFixture({
+        adapterType: "process",
+        agentStatus: "running",
+        runStatus: "interrupted",
+        runErrorCode: "server_shutdown_interrupted",
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ resultJson: { shutdownDrain: { phase: "pending", signal: "SIGTERM", at: new Date().toISOString() } } })
+        .where(eq(heartbeatRuns.id, fixture.runId));
+
+      const repaired = await heartbeat.repairIncompleteShutdownDrains();
+
+      expect(repaired).toEqual({ found: 1, repairedRunIds: [fixture.runId] });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      expect((run?.resultJson as Record<string, any> | null)?.shutdownDrain?.phase).toBe("complete");
+      // The issue no longer points at the interrupted run: a retry holds it, or
+      // the release freed it.
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue?.executionRunId).not.toBe(fixture.runId);
+      // Run again, it finds nothing left to do.
+      await expect(heartbeat.repairIncompleteShutdownDrains()).resolves.toEqual({ found: 0, repairedRunIds: [] });
+    }, 60_000);
+
+    it("writes no hot-restart snapshot once the shutdown budget aborted the preparation", async () => {
+      const heartbeat = heartbeatService(db);
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(heartbeat.prepareHotRestartShutdown("SIGTERM", new Date(), { abortSignal: controller.signal }))
+        .resolves.toMatchObject({ mode: "aborted", skipDrain: false });
+    });
+
+    it("keeps ending the other runs when one run cannot be stopped, and reports each run's outcome", async () => {
+      const heartbeat = heartbeatService(db);
+      const stuck = await seedRunFixture({ adapterType: "process", agentStatus: "running" });
+      const healthy = await seedRunFixture({ adapterType: "process", agentStatus: "running" });
+      const stuckPid = 12_351;
+      runningProcesses.set(stuck.runId, { child: { pid: stuckPid } as ChildProcess, graceSec: 1, processGroupId: null });
+      const healthyChild = spawnAliveProcess();
+      childProcesses.add(healthyChild);
+      runningProcesses.set(healthy.runId, { child: healthyChild, graceSec: 1, processGroupId: null });
+      const actualSupervisor = await vi.importActual<
+        typeof import("../services/local-service-supervisor.js")
+      >("../services/local-service-supervisor.js");
+      mockTerminateLocalService.mockImplementation(async (target, opts) => {
+        if (target.pid === stuckPid) throw new Error("process remains alive after SIGKILL");
+        return actualSupervisor.terminateLocalService(target, opts);
+      });
+      try {
+        const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), null, {
+          deadlineAt: Date.now() + 5_000,
+        });
+
+        expect(result.interruptedRunIds).toEqual([healthy.runId]);
+        expect(result.outcomes).toEqual(
+          expect.arrayContaining([
+            { runId: healthy.runId, outcome: "interrupted" },
+            expect.objectContaining({ runId: stuck.runId, outcome: "terminate_failed" }),
+          ]),
+        );
+        // A run whose process may still be alive is not marked ended: the
+        // reaper decides after the restart, when the process is surely gone.
+        const [stuckRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stuck.runId));
+        expect(stuckRun?.status).toBe("running");
+        const [healthyRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, healthy.runId));
+        expect(healthyRun?.status).toBe("interrupted");
+      } finally {
+        mockTerminateLocalService.mockImplementation(actualSupervisor.terminateLocalService);
+      }
+    }, 60_000);
+  });
+
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
     const { runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "running",
