@@ -218,3 +218,82 @@ describe("run inspection commands", () => {
     expect(fetchMock.mock.calls[4]?.[0]).toBe("http://localhost:3100/api/issues/PC-1/active-run");
   });
 });
+
+describe("run list filters and run stats", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.PAPERCLIP_API_KEY;
+    delete process.env.PAPERCLIP_API_URL;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  async function run(args: string[]) {
+    await createProgram().parseAsync(
+      [...args, "--api-base", "http://localhost:3100", "--api-key", "board-token", "--company-id", COMPANY_ID],
+      { from: "user" },
+    );
+  }
+
+  it("sends status, error code and time filters on run list", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("[]", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run([
+      "run", "list", "--agent-id", AGENT_ID, "--status", "failed,timed_out", "--error-code", "adapter_failed",
+      "--since", "2026-10-08T00:00:00Z", "--limit", "50",
+    ]);
+
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.pathname).toBe(`/api/companies/${COMPANY_ID}/heartbeat-runs`);
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      agentId: AGENT_ID,
+      status: "failed,timed_out",
+      errorCode: "adapter_failed",
+      since: "2026-10-08T00:00:00.000Z",
+      limit: "50",
+    });
+  });
+
+  it("calls the stats endpoint and prints runs today against the cap", async () => {
+    const stats = {
+      companyId: COMPANY_ID,
+      window: { since: "2026-10-08T00:00:00.000Z", until: "2026-10-09T00:00:00.000Z" },
+      dailyCapWindow: { start: "2026-10-09T00:00:00.000Z", end: "2026-10-10T00:00:00.000Z" },
+      totals: { runs: 5, terminal: 4, succeeded: 2, unsuccessful: 2, byStatus: {} },
+      topErrorCodes: [{ errorCode: "adapter_failed", count: 2 }],
+      agents: [
+        { agentId: AGENT_ID, name: "Builder", status: "idle", runs: 5, terminal: 4, succeeded: 2, unsuccessful: 2,
+          byStatus: {}, runsToday: 3, maxDailyRuns: 3, remainingToday: 0, capReached: true },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(stats), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run(["run", "stats", "--since", "2d"]);
+
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.pathname).toBe(`/api/companies/${COMPANY_ID}/heartbeat-runs/stats`);
+    expect(Date.now() - new Date(url.searchParams.get("since") ?? "").getTime()).toBeGreaterThan(47 * 3_600_000);
+    const output = log.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("adapter_failed=2");
+    expect(output).toContain("3/3");
+  });
+
+  it("rejects an unparseable time before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+
+    await run(["run", "list", "--since", "yesterday"]);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+});
