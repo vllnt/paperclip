@@ -23,6 +23,8 @@ import { prepareConversationTurn } from "../services/agent-conversations.js";
 import { shouldAutoCheckoutIssueForWake } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
+  checkoutKeepsHumanOwnedBlock,
+  HEARTBEAT_CHECKOUT_ACTOR,
   HUMAN_OWNED_BLOCK_MESSAGE,
   isHumanOwnedBlock,
   notHumanOwnedBlockCondition,
@@ -390,7 +392,8 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
 
       const failure = await refusal(
         issueService(db).checkout(fixture.issue.id, fixture.agent.id, CHECKOUT_STATUSES, fixture.run.id, {
-          actorAgentId: fixture.agent.id,
+          kind: "agent",
+          agentId: fixture.agent.id,
         }),
       );
 
@@ -398,7 +401,26 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
       await expectUntouched(fixture, BOARD_BLOCK);
     });
 
-    // The one exemption: a checkout without an acting agent. `issueService.checkout` documents it.
+    it("decides the rule from the kind of actor: an agent is held to it, the board and the system are not", () => {
+      expect(checkoutKeepsHumanOwnedBlock({ kind: "agent", agentId: "agent-1" })).toBe(true);
+      expect(checkoutKeepsHumanOwnedBlock({ kind: "board", userId: "board-user" })).toBe(false);
+      expect(checkoutKeepsHumanOwnedBlock({ kind: "board", userId: null })).toBe(false);
+      expect(checkoutKeepsHumanOwnedBlock(HEARTBEAT_CHECKOUT_ACTOR)).toBe(false);
+    });
+
+    it("does not skip the rule when a JavaScript caller leaves the actor out: the call fails and writes nothing", async () => {
+      const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
+      const checkout = issueService(db).checkout;
+
+      const failure = await refusal(
+        Reflect.apply(checkout, undefined, [fixture.issue.id, fixture.agent.id, CHECKOUT_STATUSES, fixture.run.id]),
+      );
+
+      expect(failure).toBeInstanceOf(Error);
+      await expectUntouched(fixture, BOARD_BLOCK);
+    });
+
+    // The one exemption: the named system actor. `issueService.checkout` documents it.
     describe("the system checkout", () => {
       it("lets a board user check out a block that the board owns", async () => {
         const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
@@ -409,7 +431,7 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
         expect((await readIssue(fixture.issue.id)).status).toBe("in_progress");
       });
 
-      it("documents today's heartbeat path: it passes no actor, so it still moves a board-owned block to in_progress", async () => {
+      it("documents today's heartbeat path: it passes HEARTBEAT_CHECKOUT_ACTOR, so it still moves a board-owned block to in_progress", async () => {
         const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
 
         expect(
@@ -428,6 +450,7 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
           fixture.agent.id,
           ["todo", "backlog", "blocked"],
           fixture.run.id,
+          HEARTBEAT_CHECKOUT_ACTOR,
         );
 
         expect(checkedOut.status).toBe("in_progress");

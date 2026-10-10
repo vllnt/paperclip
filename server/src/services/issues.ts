@@ -108,10 +108,12 @@ import { conflict, forbidden, HttpError, notFound, unprocessable } from "../erro
 import { isForeignKeyViolation } from "../db-errors.js";
 import {
   assertAgentMayChangeBlock,
+  checkoutKeepsHumanOwnedBlock,
   handsBlockToHuman,
   HUMAN_OWNED_BLOCK_MESSAGE,
   isHumanOwnedBlock,
   notHumanOwnedBlockCondition,
+  type IssueCheckoutActor,
 } from "./routable-blocked.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
@@ -11462,23 +11464,22 @@ export function issueService(db: Db) {
      * descriptor that changes after the caller read the issue still stops it. The call fails with
      * a 403 and the issue stays blocked.
      *
-     * The system checkout is the one exemption. A caller that passes no `actorAgentId` is not an
-     * agent acting through the API, so the rule does not apply: the board's checkout from the
-     * route, and the heartbeat's own checkout of the issue that it wakes an agent for
-     * (`heartbeat.ts`, which passes no actor and so keeps its behavior). The test group
-     * "the system checkout" in `issue-human-owned-block.test.ts` pins this.
+     * The caller must say who it is, so no caller skips the rule by forgetting to. A board user
+     * may check the issue out. The one exemption is the named system actor
+     * `HEARTBEAT_CHECKOUT_ACTOR` (`routable-blocked.ts`), which the heartbeat passes for its own
+     * checkout of the issue that it wakes an agent for, so that checkout keeps its behavior. The
+     * test group "the system checkout" in `issue-human-owned-block.test.ts` pins this.
      *
-     * @param options.actorAgentId - The agent that the request authenticated as, for a caller that
-     *   acts through the API. Leave it unset only for the system checkout.
+     * @param actor - Who asks for the checkout. An `agent` is held to the rule.
      */
     checkout: async (
       id: string,
       agentId: string,
       expectedStatuses: string[],
       checkoutRunId: string | null,
-      options: { actorAgentId?: string | null } = {},
+      actor: IssueCheckoutActor,
     ) => {
-      const keepHumanOwnedBlock = Boolean(options.actorAgentId);
+      const keepHumanOwnedBlock = checkoutKeepsHumanOwnedBlock(actor);
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)

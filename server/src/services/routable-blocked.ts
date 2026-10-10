@@ -68,6 +68,46 @@ export function notHumanOwnedBlockCondition(columns: { status: SQLWrapper; unblo
 }
 
 /**
+ * Who asks for an issue checkout. `issueService.checkout` requires one, so a caller cannot skip
+ * the human-owned block rule by leaving the actor out: the code does not compile.
+ *
+ * - `agent`: an agent that acts through the API. It may not take an issue out of a block that the
+ *   board or a person owns.
+ * - `board`: a board user. It may, because it is the party that owns such a block.
+ * - `system`: platform code that checks out an issue on its own account. It is the exemption from
+ *   the rule, so every use is named by a `reason` and can be found by searching for `kind: "system"`.
+ *   The only one today is the heartbeat, `HEARTBEAT_CHECKOUT_ACTOR`.
+ */
+export type IssueCheckoutActor =
+  | { kind: "agent"; agentId: string }
+  | { kind: "board"; userId: string | null }
+  | { kind: "system"; reason: "heartbeat" };
+
+/**
+ * The system actor of the heartbeat's checkout of the issue that it wakes an agent for. It keeps
+ * the heartbeat's behavior from before the rule: that checkout can still move a board-owned block
+ * to `in_progress`. `issue-human-owned-block.test.ts` pins the result.
+ */
+export const HEARTBEAT_CHECKOUT_ACTOR: IssueCheckoutActor = { kind: "system", reason: "heartbeat" };
+
+/**
+ * Whether a checkout by this actor must leave a human-owned block blocked. The switch has no
+ * default, so a new kind of actor does not compile until its case is decided here.
+ *
+ * @param actor - Who asks for the checkout.
+ * @returns True for an agent, false for the board and for a named system caller.
+ */
+export function checkoutKeepsHumanOwnedBlock(actor: IssueCheckoutActor): boolean {
+  switch (actor.kind) {
+    case "agent":
+      return true;
+    case "board":
+    case "system":
+      return false;
+  }
+}
+
+/**
  * Refuses a change by an agent that would leave a human-owned block or rewrite
  * its descriptor: a new status other than `blocked`, or any descriptor that
  * differs from the stored one, including clearing it. Re-sending the same

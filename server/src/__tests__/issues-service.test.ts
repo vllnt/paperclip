@@ -745,7 +745,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       assigneeAgentId: null,
     });
 
-    await expect(svc.checkout(issue.id, terminatedAgentId, ["todo"], randomUUID()))
+    await expect(svc.checkout(issue.id, terminatedAgentId, ["todo"], randomUUID(), { kind: "agent", agentId: terminatedAgentId }))
       .rejects.toMatchObject({
         status: 409,
         details: {
@@ -4702,7 +4702,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       sampleBlockerIdentifier: "PAP-15043",
     });
     await expect(
-      svc.checkout(dependentId, assigneeAgentId, ["blocked"], null),
+      svc.checkout(dependentId, assigneeAgentId, ["blocked"], null, { kind: "agent", agentId: assigneeAgentId }),
     ).rejects.toMatchObject({
       status: 422,
       details: {
@@ -4921,7 +4921,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
 
     await expect(
-      svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null),
+      svc.checkout(blockedId, assigneeAgentId, ["todo", "blocked"], null, { kind: "agent", agentId: assigneeAgentId }),
     ).rejects.toMatchObject({
       status: 422,
       details: {
@@ -6122,7 +6122,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     const [releaseResult, checkoutResult] = await Promise.allSettled([
       svc.release(issueId, agentId, releasingRunId),
-      svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId),
+      svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId, { kind: "agent", agentId }),
     ]);
 
     expect(checkoutResult.status).toBe("fulfilled");
@@ -6208,7 +6208,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       completedAt: new Date("2026-06-10T10:01:00.000Z"),
     });
 
-    await expect(svc.checkout(issueId, agentId, ["todo"], successorRunId))
+    await expect(svc.checkout(issueId, agentId, ["todo"], successorRunId, { kind: "agent", agentId }))
       .rejects.toMatchObject({ status: 409 });
 
     const row = await db
@@ -6298,7 +6298,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       executionLockedAt: new Date("2026-06-10T10:00:00.000Z"),
     });
 
-    const result = await svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId);
+    const result = await svc.checkout(issueId, agentId, ["todo", "in_progress"], successorRunId, { kind: "agent", agentId });
     expect(result).toBeTruthy();
 
     const row = await db

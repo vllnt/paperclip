@@ -15183,7 +15183,10 @@ export function issueRoutes(
           req.body.agentId,
           req.body.expectedStatuses,
           checkoutRunId,
-          { actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null },
+          // An agent can only check out as itself (the gate above), so its id is the body's.
+          req.actor.type === "agent"
+            ? { kind: "agent", agentId: req.body.agentId }
+            : { kind: "board", userId: req.actor.userId ?? null },
         );
       } catch (error) {
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
