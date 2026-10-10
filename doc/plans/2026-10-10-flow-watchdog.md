@@ -354,6 +354,7 @@ a waiting state. The list is long on purpose: a false close costs more than a la
 | The assignee is over budget | the budget hard-stop check that wake dispatch already uses | both |
 | A deferred wake waits for the issue's own lock | `agent_wakeup_requests` in `deferred_issue_execution` | both |
 | An active task watchdog watches the issue | `issue_watchdogs` with status `active` | rule (a) only |
+| A conversation issue | `issues.conversation_agent_id` is set, or the origin kind is `chat_channel`. The issue service already refuses `done` and `cancelled` for these (section 6.1.3) | both |
 
 **This list must not drift from the attention feed.** Every source that the attention
 feed treats as "waiting on a person" (a pending interaction, a pending approval, a
@@ -393,12 +394,28 @@ application clock.
   action. A smaller jump can close early by at most 5 minutes, and the close is visible
   and recoverable (the next tick or evaluation recreates the work).
 
-#### 6.1.3 The atomic close step
+#### 6.1.3 The atomic close step (choice A: the row lock and a value compare)
 
-`closeStalledIssue({ companyId, issueId, binding, expectedStatusVersion, targetStatus,
-reason, source })` closes one issue so that no wake can be promoted onto it afterwards.
+`closeStalledIssue({ companyId, issueId, binding, observed, targetStatus, reason,
+source })` closes one issue so that no wake can be promoted onto it afterwards.
 #105 uses it with `targetStatus = cancelled`. This plan's `auto_close` (section 7.3)
-uses it with `done` or `cancelled`.
+uses it with `done` or `cancelled`. #103 may cite this section for its own locked step.
+
+**The choice.** `main` has no status compare-and-set, so this plan does not use one.
+`issues.status_version` is **not** a status version: the issue service bumps it only
+when the assignee changes and when `blocked` is asserted again
+(`issues.ts:11025-11047`), and the service write has no expected-version argument.
+A same-owner status change leaves it unchanged. So the step does **not** read or
+write `status_version`. It takes the issue row lock and compares **values**.
+(The alternative, a real compare-and-set with a bump at every status writer, is
+recorded in section 11 and is not needed.)
+
+**What `observed` is.** The values the evaluation or the preview saw when it decided:
+`{ status, assigneeAgentId, assigneeUserId, executionRunId, checkoutRunId,
+monitorNextCheckAt, updatedAt }`. The API returns it as an opaque `observedToken`
+(a digest of these values). A person's manual call sends the token that the preview
+showed. Values are compared, not counted, so a change that goes A, B, A is harmless:
+the decision depends on the values.
 
 **The race it closes.** The heartbeat cancel ends a run and then runs
 `releaseIssueExecutionAndPromote`, which takes the issue's row lock **under its own,
@@ -406,9 +423,9 @@ later transaction** and promotes the oldest deferred wake to a run. If the issue
 still open at that moment, the promoted run attaches to an issue that is about to be
 cancelled. A check made before the cancel does not prevent that.
 
-**The fix is an order, and a compare-and-set.** The issue is closed first, under the
-same row lock that promotion takes. A promotion that comes later sees a terminal issue
-and drops the wake. In order:
+**The fix is an order, and a value compare under the lock.** The issue is closed
+first, under the row lock that promotion also takes. A promotion that comes later sees
+a terminal issue and drops the wake. In order:
 
 1. **Lock.** In one database transaction, take the routine row lock if the caller is a
    dispatch (dispatch already holds it), and then the issue row `FOR UPDATE`, with any
@@ -419,14 +436,12 @@ and drops the wake. In order:
    and the caller does what it did before (a skipped or coalesced tick, or a 409):
    - the **binding** predicate that the caller passed (for #105: the issue is the
      routine's current blocker; section 3.6 of #105);
-   - **`issues.status_version` equals `expectedStatusVersion`** (the compare-and-set that
-     closes the status TOCTOU);
+   - the locked row's values **equal `observed`** (fail closed: any difference aborts);
    - no run of the issue is `running`;
-   - `stallExemption` returns `null`, evaluated now, under the lock;
+   - `stallExemption` returns `null`, evaluated now, **under the lock**;
    - the clock decision (6.1.2) holds, and the skew guard passes.
 3. **Close, in the same transaction:**
-   - set the issue to `targetStatus` through the issue service, passing the transaction
-     (this bumps `status_version`);
+   - set the issue to `targetStatus` through the issue service, passing the transaction;
    - cancel every `deferred_issue_execution` wake of the issue, with the reason code;
    - add the system comment;
    - end the originating record (for #105, the routine run, through the existing
@@ -441,6 +456,55 @@ and drops the wake. In order:
    `decideQueuedRunStaleness` cancels a queued run on a terminal issue. The cancel
    passes `suppressImmediateRecovery` so that no recovery run follows.
 
+**Why a writer that does not take the lock cannot fool the compare.** A row update takes
+a row-level write lock until its transaction ends. So an update that commits before the
+close takes its lock is visible in step 2 and fails the compare, and an update that
+starts after the close has taken the lock waits for the close to commit. Inserts into
+the tables that the exemptions read (`issue_approvals`, `issue_thread_interactions`,
+`issue_recovery_actions`, `issue_comments`) all have a foreign key to `issues`. Such an
+insert takes a `KEY SHARE` lock on the issue row, and `FOR UPDATE` conflicts with it.
+So an approval or interaction that is created while the close holds the lock waits,
+and one that was committed before is seen by the exemption check. S1 proves both with
+race tests.
+
+**The one real hazard: a writer that reads without the lock and writes after the close.**
+Such a writer decided on a row it read earlier, and its update lands after the commit.
+It could move a `cancelled` issue to another status. This hazard exists today for every
+cancel, an operator's included. It is not made worse here, and the list below is the
+audit that S1 starts with.
+
+**Writers of the compared fields.** Found by reading `main` at `d9804ac4f`. The list is
+a **lower bound**: the scan finds a status write only when `status:` appears in the
+`set` object, so a writer that passes a variable is missed. S1 begins with an exhaustive
+audit and a test (below).
+
+| Writer | Fields it changes | Row lock |
+|---|---|---|
+| `issueService.update` (`issues.ts:10654`, lock at `10981`) | status, assignee, and the rest | **Yes**: `SELECT … FOR UPDATE` at the start of the write transaction |
+| `issueService.release`, `checkout` (`issues.ts:11531`, `11905`) | assignee, status, execution and checkout locks | `release`: in the same function as the lock (verify in the S1 audit). `checkout`: the write has its own status predicate (verify) |
+| Execution claim and release (`heartbeat.ts` `lockIssueExecutionClaim`; `wake-queue` `withIssueExecutionLock`, `postgres.ts:1171`) | `execution_run_id`, `execution_locked_at` | **Yes**: `FOR UPDATE` on the issue rows |
+| Execution-recovery settle (`execution-recovery-resolution.ts:487`) | status `blocked`, locks | **Yes**: the task row is locked `FOR UPDATE` in the same transaction |
+| Slack conversation resume (`slack-conversation-state.ts:48`) | status `todo` | **Yes** by its own comment: it runs while the admission transaction owns the issue lock |
+| Pre-dispatch block (`heartbeat.ts:30215`) | status `blocked`, clears the locks | **No lock seen** in the code read. **S1 prerequisite** |
+| Conversation reactivation (`agent-conversations.ts:259`) | `conversation_state`, status `in_progress` | **No lock seen.** Conversation issues are excluded from the close (below) |
+| Slack conversation wait (`slack-conversation-lifecycle.ts:91`) | status `in_review` | **No lock seen.** Conversation issues are excluded from the close (below) |
+| Member archive (`access.ts:696`, `708`) | status | Locked in scope by a text scan; verify |
+| Monitor claim, trigger and clear (`heartbeat.ts:11927`, `12153`, `12189`) | the monitor columns and execution state, not `status` | No lock seen. The monitor column is an exemption that is re-read under the close lock |
+
+**S1 prerequisites from this audit (each with its own test):**
+
+1. **No unlocked writer may overwrite a terminal status.** Each writer in the table
+   without a lock gets `status not in ('done', 'cancelled')` in its `WHERE` predicate
+   (the minimal change), or takes the row lock. This removes the hazard above for the
+   writers found. It touches `heartbeat.ts` (heartbeat core), so it is a single, with
+   its own review.
+2. **The audit is a test.** A source test lists the known direct writers of `issues.status`
+   by file and function. A new unlisted writer fails the test and forces a decision.
+3. **Conversation issues are never closed by this module.** An issue with a
+   `conversation_agent_id`, or with the origin kind `chat_channel`, is an exemption
+   (added to the set in 6.1.1). The issue service already refuses `done` and `cancelled`
+   for a conversation issue.
+
 **Why the run cancel stays outside the transaction.** The heartbeat cancel is not a
 plain status update. It fences native sessions, records the cancellation, and stops
 processes. A queued run has no process, but the same code path handles it, and the plan
@@ -452,7 +516,7 @@ acting after the close, which is allowed. It is not a leak: it is a new, visible
 A queued run that carries a wake comment or a resume intent is not cancelled by the
 staleness check, for the same reason.
 
-**Tests (R1 of #105, S1 of this plan), on embedded Postgres:**
+**Tests (S1 of this plan, R1 of #105), on embedded Postgres:**
 
 - a wake deferred before the close is cancelled, not promoted, and no run is attached to
   the closed issue;
@@ -460,10 +524,19 @@ staleness check, for the same reason.
   terminal issue;
 - an interleaving test: the heartbeat cancel of a run races the close; the end state is
   one terminal issue and no live run on it;
-- `status_version` moved between the preview and the close: the step refuses;
+- **the value compare:** a status change made by a non-service writer after the
+  preview makes the close refuse, although `status_version` is unchanged (the case that
+  the old contract missed);
+- **an A, B, A change** of the status between the preview and the close does not make
+  the close refuse, and it re-checks the exemptions;
+- an approval, an interaction and a recovery action inserted while the close holds the
+  lock each wait for it (the foreign key lock), and a close never leaves a pending one
+  unseen;
 - a run that turns `running` after the check: the transaction rolls back;
 - a pending approval, a pending interaction, and an `in_review` participant each
   prevent the close;
+- each writer in the table that gets the terminal-status predicate cannot move a
+  closed issue back;
 - the skew guard, a backward jump and a forward jump.
 
 ### 6.2 Holds are exemptions
@@ -645,7 +718,7 @@ result (the routine run id and its status) goes to the firing.
   for the agent or a person to close, because closing hides the evidence. `auto_close`
   is opt-in per rule, and it only closes an issue that nobody has touched since the last
   watchdog comment. **It closes through the atomic close step (section 6.1.3)**, with the
-  binding "this is the firing's issue", the status version that the watchdog last saw,
+  binding "this is the firing's issue", the values that the watchdog last saw (`observed`),
   and the exemption set. The assigned agent may have woken on this issue, and a plain
   status write could leave a promoted wake on a closed issue. `none` writes nothing.
 - **If the issue is closed by someone while the condition still holds:** the firing
@@ -833,6 +906,7 @@ that produced an action. The estimate must be redone with that number.
 | Dedup by title or by #40 duplicate detection | A title match can merge issues of two rules. Semantic matching is the wrong tool for a key we control |
 | Rely on the firing row's index alone, with no index on `issues` | It works, but `issues` already has narrow partial unique indexes for other origin kinds (`task_watchdog`, `harness_liveness_escalation`). The same index here guards any path that creates such an issue outside the firing transaction (Q12) |
 | A global advisory lock for the pass | One process evaluates everything. Per-rule claims scale with the rules and survive a crashed process |
+| A real compare-and-set on `status_version` (choice B for the close step) | It needs a bump at every status writer and an expected-version argument on the issue service write. There are direct writers outside the service. The value compare under the row lock gives the same guarantee for the close with no change to the locked writers (section 6.1.3) |
 | Evaluate in the unclog agent | That is the cost this plan removes |
 | Create a new issue on every fire | A persistent clog would flood the board |
 
@@ -863,7 +937,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q19** | Lane-health checks from a separate planning effort | They are rule kinds that depend on this plan: two are filters on rule (a), five are new kinds after S1 (section 3.5). The filter set gets `labelIds` and "no assignee" |
 | **Q20** | The existing task watchdog | Keep it. Add "watched by an active task watchdog" as an exemption for rule (a) |
 | **Q21** | A paused or archived routine as a routine-action target | The watchdog checks the routine and its project itself, and skips (section 7.2) |
-| **Q23** | **For the reviewer.** The atomic close step: an issue-lock-aware order (close the issue first, then cancel the runs) with a `status_version` compare-and-set, in place of one transaction for everything | Yes (section 6.1.3). The heartbeat cancel fences native sessions and stops processes, so it stays a separate, existing path. The terminal issue is what makes the later promotion harmless |
+| **Q23** | **For the reviewer.** The atomic close contract on what `main` provides: **choice A**, the issue row lock plus a compare of values (`observed`), with no `status_version`. Choice B (a real compare-and-set with a bump at every status writer) is not used | A (section 6.1.3). `status_version` is bumped only for an assignee change or a blocked re-assertion, so it cannot guard a status change. The value compare is correct under the row lock, needs no change to the writers that already lock, and S1 adds a terminal-status guard to the few that do not. The heartbeat cancel stays a separate, existing path; the terminal issue is what makes the later promotion harmless |
 | **Q24** | The clock source and the hold-lift floor | The database clock, a 5-minute skew guard, and a floor taken from `agent.resumed` and the `*.updated` entries of the company, project and routine (section 6.1.2). #102's lift time replaces it later |
 | **Q22** | A terminated or pending assignee at fire time | Take no action. Record `suppressed: assignee_unavailable` and put the rule in an error state that the rules page shows |
 
@@ -913,7 +987,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | The heartbeat cancel (native fence, process stop) | `server/src/services/heartbeat.ts:31507` (`cancelRunInternal`) |
 | Pending linked approvals (the pair that attention reads) | `packages/db/src/schema/issue_approvals.ts:7-22`, `packages/db/src/schema/approvals.ts:5-19`, `server/src/services/attention.ts:1591-1617` |
 | Pause and resume are logged (`agent.paused`, `agent.resumed`) | `server/src/routes/agents.ts:5915`, `5950` |
-| Issue `status_version` is bumped on a status change | `server/src/services/issues.ts:11029`, `11047` |
+| `status_version` is bumped only for an assignee change and a blocked re-assertion (so it is not a status guard); the issue service takes `FOR UPDATE` at the start of its write | `server/src/services/issues.ts:11025-11047`, `10981` |
 | Scheduling suppression gate on the recovery pass | `server/src/index.ts:1827` |
 | Batch claim with `FOR UPDATE SKIP LOCKED` (precedent) | `server/src/services/chat-run-publications.ts:334`; `server/src/services/execution-recovery-resolution.ts:326` |
 | Labels on issues | `packages/db/src/schema/issue_labels.ts`, `labels.ts` |
