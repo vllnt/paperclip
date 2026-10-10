@@ -3158,12 +3158,20 @@ function renderPaperclipWakePromptBody(
  * is redacted whole. In a URL, a password is masked and its user name kept; user info without a
  * colon is masked whole, because it is a token (`https://<token>@host`).
  *
+ * An environment value is a string. A value that is not a string breaks that contract, and a log
+ * path must not throw on it: an object or an array is hidden (it can hold a secret that this
+ * function cannot read), `null` and `undefined` become an empty string, and a number, a boolean
+ * or a bigint becomes its text.
+ *
  * @param value - An environment value.
  * @returns The value with the secret part replaced by a fixed marker.
  */
-function redactEnvValueForLogs(value: string): string {
-  if (value.includes(PEM_BEGIN_MARKER)) return REDACTED_LOG_VALUE;
-  return maskUrlUserInfo(value);
+function redactEnvValueForLogs(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") return REDACTED_LOG_VALUE;
+  const text = String(value);
+  if (text.includes(PEM_BEGIN_MARKER)) return REDACTED_LOG_VALUE;
+  return maskUrlUserInfo(text);
 }
 
 /**
@@ -3171,13 +3179,13 @@ function redactEnvValueForLogs(value: string): string {
  * inside any other value (URL password, PEM block) is masked.
  *
  * @param env - The environment an adapter is about to log.
- * @returns A copy of the environment that is safe to log.
+ * @returns A copy of the environment that is safe to log. Every value is a string.
  * @example
  * redactEnvForLogs({ DATABASE_URL: "postgres://app:pw@db/app", GH_PAT: "x", PATH: "/bin" });
  * // { DATABASE_URL: "postgres://app:***REDACTED***@db/app", GH_PAT: "***REDACTED***", PATH: "/bin" }
  */
 export function redactEnvForLogs(
-  env: Record<string, string>,
+  env: Record<string, unknown>,
 ): Record<string, string> {
   const redacted: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
