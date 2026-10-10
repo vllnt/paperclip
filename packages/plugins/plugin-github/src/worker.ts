@@ -211,7 +211,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     { writeToken: identity.writeToken, maintain: identity.maintain });
   registerTaskLinks(ctx, github, credentials, cache, sync.linkForTask);
   registerRecordTasks(ctx, github, credentials, cache, sync.ensureTasks);
-  registerManagement(ctx, github, credentials, sync.sync, cache, sync.ensureTasks, identity.writeToken, identity.appUser);
+  registerManagement(ctx, github, credentials, sync.requestSync, cache, sync.ensureTasks, identity.writeToken, identity.appUser);
   // Native Paperclip owns Agent Channels and GitHub bot identity. The legacy
   // mapping actions remain registered for state migration, but are not used by
   // reviewer or agent-facing actions.
@@ -310,13 +310,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
   ctx.actions.register("sync.trigger", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
     if (!await connection(companyId)) throw new Error("Connect a GitHub App for this company first.");
-    if (params.refresh === true) cache.invalidate(companyId);
-    else {
-      const report = await ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: "report" }) as import("./contracts.js").SyncReport | null;
-      if (report && Date.now() - Date.parse(report.at) < 60_000) return { started: false, companyId };
-    }
-    void sync.sync(companyId).catch(error => ctx.logger.error("GitHub sync trigger failed", { companyId, error: error instanceof Error ? error.message : "unknown" }));
-    return { started: true, companyId };
+    return { ...await sync.queueSync(companyId, params.refresh === true), companyId };
   });
 
   ctx.actions.register("install-github-workflow-skill", async (params, actor) => {
