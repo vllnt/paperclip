@@ -169,7 +169,7 @@ describeReaper("SSH run directory reaper", () => {
     expect(entry!.details).toMatchObject({ preserved: [`refs/paperclip/preserved/${run.runId}/agent/feature`], preservedBundle: bundle });
   });
 
-  it("keeps a directory it cannot preserve, and records why once", async () => {
+  it("keeps a directory that is not a git repository for the keep window, records why once, then deletes it", async () => {
     const run = await startRun({ status: "failed", git: false });
 
     await runtime.releaseRunLeases(run.runId);
@@ -178,10 +178,55 @@ describeReaper("SSH run directory reaper", () => {
     expect(await readFile(path.join(run.workspace, "work.txt"), "utf8")).toBe("only copy\n");
     expect((await activityFor(run.runId, "environment.ssh_run_directory_kept"))[0]!.details).toMatchObject({ reason: "not_git_backed" });
     expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "kept", reason: "not_git_backed" } });
-    // A later sweep does not look at it again.
-    const summary = await reaper().sweep({ now: new Date(Date.now() + 48 * HOUR_MS) });
-    expect(summary.examined).toBe(0);
+    // Inside the 24 hour keep window a sweep does not look at it again.
+    const inside = await reaper().sweep({ now: new Date(Date.now() + 12 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    expect(inside.examined).toBe(0);
+    expect(await exists(run.runDir)).toBe(true);
+    // After the window nothing in it can be saved, so it goes.
+    const after = await reaper().sweep({ now: new Date(Date.now() + 25 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    expect(after).toMatchObject({ examined: 1, removed: 1 });
+    expect(await exists(run.runDir)).toBe(false);
     expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1);
+    expect((await activityFor(run.runId, "environment.ssh_run_directory_reaped"))[0]!.details).toMatchObject({ trigger: "sweep", outcome: "removed" });
+  });
+
+  it("tries a kept directory again only after the keep window", async () => {
+    const run = await startRun({ status: "failed" });
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 2 * HOUR_MS) }).where(eq(environmentLeases.id, run.leaseId));
+    const reapRemote = vi.fn()
+      .mockResolvedValueOnce({ outcome: "kept", reason: "preserve_failed", bytes: 1024 })
+      .mockResolvedValueOnce({ outcome: "removed", bytesFreed: 1024, preserved: [] });
+    const hooked = () => sshRunDirectoryReaperService(db, { hooks: { reapRemote } });
+
+    expect(await hooked().sweep({ readDiskUsagePercent: async () => 10 })).toMatchObject({ kept: 1 });
+    expect(await hooked().sweep({ now: new Date(Date.now() + 23 * HOUR_MS), readDiskUsagePercent: async () => 10 }))
+      .toMatchObject({ examined: 0 });
+    expect(reapRemote).toHaveBeenCalledTimes(1);
+
+    expect(await hooked().sweep({ now: new Date(Date.now() + 25 * HOUR_MS), readDiskUsagePercent: async () => 10 }))
+      .toMatchObject({ examined: 1, removed: 1 });
+    expect(reapRemote).toHaveBeenCalledTimes(2);
+    // A kept git repository is never removed without saving its state first.
+    expect(reapRemote.mock.calls[1]![0]).toMatchObject({ removeNotGitBacked: false });
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1);
+  });
+
+  it("saves the uncommitted work of an extra worktree into the bundle, then deletes the directory", async () => {
+    const run = await startRun({ status: "interrupted" });
+    const tree = path.join(run.runDir, "wt-agent");
+    await git(run.workspace, ["worktree", "add", "-q", "-b", "agent/scratch", tree]);
+    await writeFile(path.join(tree, "notes.txt"), "never committed\n");
+
+    await runtime.releaseRunLeases(run.runId);
+
+    const ref = `refs/paperclip/preserved/${run.runId}/worktree-dirty-0`;
+    await vi.waitFor(async () => expect(await activityFor(run.runId, "environment.ssh_run_directory_reaped")).toHaveLength(1), { timeout: 15_000, interval: 100 });
+    expect((await activityFor(run.runId, "environment.ssh_run_directory_reaped"))[0]!.details).toMatchObject({
+      outcome: "removed", preserved: expect.arrayContaining([ref]),
+    });
+    expect(await exists(run.runDir)).toBe(false);
+    const bundle = path.join(sshConfig.remoteWorkspacePath, ".paperclip-runtime", "preserved", `${run.runId}.bundle`);
+    expect(await git(sshConfig.remoteWorkspacePath, ["bundle", "list-heads", bundle])).toContain(ref);
   });
 
   // `releaseRunLeases` releases every active lease of a run, so a lease that is
@@ -220,11 +265,13 @@ describeReaper("SSH run directory reaper", () => {
     expect(await exists(run.runDir)).toBe(true);
     expect(await leaseMetadata(run.leaseId)).not.toHaveProperty("sshRunDirectory");
 
-    const young = await reaper().sweep({ now: new Date(Date.now() + 1 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    const young = await reaper().sweep({ now: new Date(Date.now() + 0.5 * HOUR_MS), readDiskUsagePercent: async () => 10 });
     expect(young.removed).toBe(0);
     expect(await exists(run.runDir)).toBe(true);
 
-    const old = await reaper().sweep({ now: new Date(Date.now() + 7 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    // No resume reads an earlier run's directory, so the sweep does not keep a
+    // session's last run once it is an hour old.
+    const old = await reaper().sweep({ now: new Date(Date.now() + 2 * HOUR_MS), readDiskUsagePercent: async () => 10 });
     expect(old.removed).toBe(1);
     expect(await exists(run.runDir)).toBe(false);
     expect((await activityFor(run.runId, "environment.ssh_run_directory_reaped"))[0]!.details).toMatchObject({ trigger: "sweep" });
@@ -259,9 +306,24 @@ describeReaper("SSH run directory reaper", () => {
     expect((await reaper().sweep({ readDiskUsagePercent: async () => 10 })).removed).toBe(0);
   });
 
+  it("removes a finished directory after 60 minutes by default", async () => {
+    const young = await startRun({ status: "failed" });
+    const old = await startRun({ status: "failed" });
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 45 * 60 * 1000) }).where(eq(environmentLeases.id, young.leaseId));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 75 * 60 * 1000) }).where(eq(environmentLeases.id, old.leaseId));
+
+    expect(await reaper().sweep({ readDiskUsagePercent: async () => 40 })).toMatchObject({ removed: 1, diskPressure: false });
+
+    expect(await exists(young.runDir)).toBe(true);
+    expect(await exists(old.runDir)).toBe(false);
+    // Leave no candidate behind for the tests that count removals.
+    await reaper().sweep({ now: new Date(Date.now() + HOUR_MS), readDiskUsagePercent: async () => 40 });
+    expect(await exists(young.runDir)).toBe(false);
+  });
+
   it("shortens the age threshold when the worker's disk is more than 80% full", async () => {
     const run = await startRun({ status: "failed" });
-    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 1 * HOUR_MS) }).where(eq(environmentLeases.id, run.leaseId));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 30 * 60 * 1000) }).where(eq(environmentLeases.id, run.leaseId));
 
     const calm = await reaper().sweep({ readDiskUsagePercent: async () => 40 });
     expect(calm).toMatchObject({ removed: 0, diskPressure: false });

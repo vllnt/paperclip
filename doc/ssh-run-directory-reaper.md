@@ -17,14 +17,24 @@ status.
   the last 14 days whose directory it has not decided about. It removes a
   directory when its run is terminal, no other lease of the run is `active`,
   `retained`, or `pending_cleanup`, and the lease finished at least
-  `PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES` ago (default 360). Above
+  `PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES` ago (default 60). Above
   `PAPERCLIP_SSH_RUN_REAPER_DISK_PRESSURE_PERCENT` disk use on the worker
   (default 80) the threshold is
   `PAPERCLIP_SSH_RUN_REAPER_PRESSURE_MAX_AGE_MINUTES` (default 15).
 - **Not on release:** the last run of an agent task session. The sweep removes
-  it once it is old enough. Resume itself does not read `runs/<runId>`: session
-  state holds the worker's identity and the provider's session id, and every run
-  uploads its own directory.
+  it once it is old enough, without a session check. Nothing reads an earlier
+  run's directory: session state holds the worker's identity and the provider's
+  session id, every run uploads its own directory (Codex saves the run's own
+  directory as the session's working directory, so it never resumes into an
+  earlier one), and a retry or continuation is a new run with a new directory.
+- **After the keep window.** A kept directory (see below) is tried again by the
+  sweep once `PAPERCLIP_SSH_RUN_REAPER_KEEP_WINDOW_HOURS` (default 24) have
+  passed since the decision: `not_git_backed`, `preserve_failed`, `rm_failed`,
+  and `worktree_dirty` decisions recorded before the reaper saved extra
+  worktrees. A directory that is not a git repository is then deleted, because
+  nothing in it can be saved. The others go through the save step again and are
+  kept again, for another window, if it still fails. `symlink` and
+  `root_mismatch` stay kept.
 
 A directory with the `.paperclip-restored` marker holds no unsynced work and is
 removed at once. Without the marker the worker may hold the only copy of the
@@ -44,6 +54,7 @@ small. Bundles older than 30 days are removed.
 | Each stash entry | `stash-<n>` |
 | The detached HEAD of an extra worktree | `worktree-head-<n>` |
 | Uncommitted work: tracked and untracked files git does not ignore, as a snapshot commit | `worktree` |
+| The same for each extra worktree (`git worktree list`), on top of its HEAD | `worktree-dirty-<n>` |
 
 To bring a run's work back, fetch from the bundle into a clone that has the
 start commit:
@@ -53,18 +64,28 @@ git fetch <remote root>/.paperclip-runtime/preserved/<runId>.bundle \
   'refs/paperclip/preserved/<runId>/*:refs/paperclip/preserved/<runId>/*'
 ```
 
-Git runs with the repository's `core.fsmonitor` and hooks switched off.
+Git runs with the repository's `core.fsmonitor` and hooks switched off. Files
+that git ignores (`node_modules`, build output) are not saved.
 
 ## When a directory is kept
 
-The directory stays, with a reason in the activity entry and in the lease's
-`metadata.sshRunDirectory`:
+The directory stays, with a reason in the activity entry (written once per
+reason) and in the lease's `metadata.sshRunDirectory`. The API returns it with
+the lease (`GET /api/environment-leases/:leaseId` and the lease lists), and the
+CLI with `environment lease`, `environment leases` and `environment
+leases:list`:
 
 - `not_git_backed`: no marker and not a git repository, so nothing can be saved.
-- `worktree_dirty`: an extra worktree has uncommitted work.
-- `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
-  verify; or `.git` is a link or a file; or the start commit is unknown.
-- `rm_failed`: the removal failed. It is retried up to 5 times.
+  It is kept for the keep window, then deleted.
+- `worktree_dirty`: an extra worktree had uncommitted work. Only decisions from
+  before the reaper saved extra worktrees have this reason; they are tried again
+  after the keep window.
+- `preserve_failed`: the state could not be saved (for example a file in an
+  extra worktree could not be read), the bundle could not be written, was over
+  1 GiB, or did not verify; or `.git` is a link or a file; or the start commit is
+  unknown. It is tried again after the keep window.
+- `rm_failed`: the removal failed. It is retried up to 5 times, then again after
+  each keep window.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
 - `root_mismatch`: the root recorded on the lease is not the root the environment
   is configured with now (or the lease did not record that root), or it is too

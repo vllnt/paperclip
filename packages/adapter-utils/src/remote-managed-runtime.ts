@@ -155,22 +155,39 @@ const PRESERVED_BUNDLE_RETENTION_DAYS = 30;
  * local-only git state is safe. That state is: commits on HEAD past the commit
  * the run started from, branch tips outside HEAD, stash entries, a detached
  * head of an extra worktree, and uncommitted work (a snapshot commit of the
- * tracked and untracked files that git does not ignore). It is written to
+ * tracked and untracked files that git does not ignore, in the main worktree
+ * and in each extra worktree). It is written to
  * `refs/paperclip/preserved/<runId>/*` and bundled into
  * `<root>/.paperclip-runtime/preserved/<runId>.bundle`, with the run's start
  * commit as the bundle's prerequisite, so only new objects are stored. The
- * directory is kept, with a reason, when the work is not a git repository,
- * when an extra worktree holds uncommitted work, or when the bundle cannot be
- * written and verified. Git runs with the repository's `core.fsmonitor` and
- * hooks switched off. Bundles older than 30 days are removed.
+ * directory is kept, with a reason, when the work is not a git repository
+ * (unless `removeNotGitBacked`, after its keep window), or when the state
+ * cannot be saved, or the bundle is over 1 GiB or cannot be written and
+ * verified. Git runs with the repository's `core.fsmonitor` and hooks switched
+ * off. Bundles older than 30 days are removed.
  */
 export async function reapSshRunDirectory(input: {
   spec: SshConnectionConfig;
   remoteRoot: string;
   runId: string;
   timeoutMs?: number;
-  /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
-  testHooks?: { afterChecks?: string; afterConfine?: string };
+  /**
+   * Delete a directory that is not a git repository instead of keeping it as
+   * `not_git_backed`. Nothing in it can be saved; the caller passes this once
+   * the directory's keep window is over.
+   */
+  removeNotGitBacked?: boolean;
+  /**
+   * Test seams only: shell lines the worker runs at fixed points, to swap a
+   * path under the script; a smaller bundle cap in KiB; and a runner that runs
+   * the script on this host instead of over SSH.
+   */
+  testHooks?: {
+    afterChecks?: string;
+    afterConfine?: string;
+    maxBundleKb?: number;
+    runScript?: (script: string) => Promise<{ stdout: string }>;
+  };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -186,7 +203,7 @@ export async function reapSshRunDirectory(input: {
   const q = shellQuote;
   const hook = (line: string | undefined) => (line ? [line] : []);
   const script = [
-    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
+    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}; unsaved_ok=${input.removeNotGitBacked ? 1 : 0}`,
     // The root is resolved once. Everything below is compared with this physical path.
     'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
     'runtime="$root/.paperclip-runtime"; runs="$runtime/runs"; preserved="$runtime/preserved"',
@@ -211,14 +228,20 @@ export async function reapSshRunDirectory(input: {
     'keep() { echo "kept $1 $kb"; exit 0; }',
     // A repository config the agent planted must not run commands here.
     'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
+    'GT() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$tree" "$@"; }',
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
-    'had_marker=0',
+    'had_marker=0; git_backed=0',
     'if [ -f "$marker" ] && [ ! -L "$marker" ]; then',
     "  had_marker=1",
     "else",
-    '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then keep not_git_backed; fi',
-    '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
-    '  if [ ! -d "$ws/.git" ]; then keep not_git_backed; fi',
+    "  git_backed=1",
+    '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then git_backed=0',
+    '  elif [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed',
+    '  elif [ ! -d "$ws/.git" ]; then git_backed=0; fi',
+    // Nothing here can be saved. After its keep window it goes like the rest.
+    '  if [ "$git_backed" = 0 ] && [ "$unsaved_ok" != 1 ]; then keep not_git_backed; fi',
+    "fi",
+    'if [ "$git_backed" = 1 ]; then',
     '  G rev-parse --git-dir >/dev/null 2>&1 || keep preserve_failed',
     // The run started from the oldest commit HEAD ever pointed at.
     '  head=$(G rev-parse -q --verify HEAD 2>/dev/null || true)',
@@ -248,8 +271,21 @@ export async function reapSshRunDirectory(input: {
     '      prunable*) prunable=1 ;;',
     '      "")',
     '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
-    '          changes=$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$tree" status --porcelain 2>/dev/null)',
-    '          if [ -n "$changes" ]; then keep worktree_dirty; fi',
+    '          case "$treehead" in *[!0]*) ;; *) treehead="" ;; esac',
+    '          changes=$(GT status --porcelain 2>/dev/null)',
+    // Uncommitted work in an extra worktree: the same snapshot as for the main
+    // worktree below, from a temporary index in this run directory. The
+    // worktree writes its objects to the repository's shared object store, so
+    // the bundle carries them.
+    '          if [ -n "$changes" ]; then',
+    '            tidx="$PWD/.paperclip-reap-index-$index"; rm -f "$tidx"',
+    '            if [ -n "$treehead" ]; then GIT_INDEX_FILE="$tidx" GT read-tree "$treehead" || keep preserve_failed; fi',
+    '            GIT_INDEX_FILE="$tidx" GT add -A || keep preserve_failed',
+    '            tid=$(GIT_INDEX_FILE="$tidx" GT write-tree) || keep preserve_failed',
+    '            if [ -n "$treehead" ]; then dsnap=$(GT commit-tree "$tid" -p "$treehead" -m "Paperclip preserved worktree") || keep preserve_failed; else dsnap=$(GT commit-tree "$tid" -m "Paperclip preserved worktree") || keep preserve_failed; fi',
+    '            rm -f "$tidx"',
+    '            add_ref "worktree-dirty-$index" "$dsnap"',
+    '          fi',
     '          if [ -n "$detached" ] && [ -n "$treehead" ] && { [ -z "$head" ] || ! G merge-base --is-ancestor "$treehead" "$head"; }; then add_ref "worktree-head-$index" "$treehead"; fi',
     '          index=$((index + 1))',
     '        fi',
@@ -274,7 +310,7 @@ export async function reapSshRunDirectory(input: {
     // preserved directory, which is confined the same way.
     '    G bundle create ../.paperclip-reap.bundle "$@" >/dev/null 2>&1 || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
     '    size=$(du -k .paperclip-reap.bundle 2>/dev/null | cut -f1); size=${size:-0}',
-    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
+    `    if [ "$size" -gt ${input.testHooks?.maxBundleKb ?? PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
     '    mkdir -p "$preserved" 2>/dev/null || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
     '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && mv -f -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle" ) || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
     '    G bundle verify "$bundle" >/dev/null 2>&1 || { keep preserve_failed; }',
@@ -298,10 +334,12 @@ export async function reapSshRunDirectory(input: {
     '  keep rm_failed',
     "fi",
   ].join("\n");
-  const result = await runSshCommand(input.spec, script, {
-    timeoutMs: input.timeoutMs ?? 10 * 60 * 1000,
-    maxBuffer: 256 * 1024,
-  });
+  const result = input.testHooks?.runScript
+    ? await input.testHooks.runScript(script)
+    : await runSshCommand(input.spec, script, {
+      timeoutMs: input.timeoutMs ?? 10 * 60 * 1000,
+      maxBuffer: 256 * 1024,
+    });
   const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   const preserved = lines.filter((line) => line.startsWith("preserved ")).map((line) => line.slice("preserved ".length));
   const last = lines[lines.length - 1] ?? "";
