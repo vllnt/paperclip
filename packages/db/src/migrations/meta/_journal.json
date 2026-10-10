@@ -2080,6 +2080,13 @@
       "when": 1791590969281,
       "tag": "0298_modern_junta",
       "breakpoints": true
+    },
+    {
+      "idx": 299,
+      "version": "7",
+      "when": 1791662756282,
+      "tag": "0299_faithful_rocket_racer",
+      "breakpoints": true
     }
   ]
 }

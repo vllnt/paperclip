@@ -7,6 +7,7 @@ import { recordingDb } from "./helpers/tool-gateway-listing-fixture.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { getConversationOwnershipBlocker } from "../services/conversation-continuation.js";
 import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
+import { heartbeatService } from "../services/heartbeat.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = support.supported ? describe : describe.skip;
@@ -87,18 +88,19 @@ describeEmbeddedPostgres("reads under the issue lock stay on the issue's rows", 
     await tempDb?.cleanup();
   });
 
-  /** The largest number of heartbeat_runs rows any one recorded statement read.
+  /** The largest number of `table` rows any one recorded select read.
    * Sequential scans are off, so the check does not depend on the planner's
-   * cost choice at this size: a predicate no index serves still reads every run.
+   * cost choice at this size: a predicate no index serves still reads every row.
    */
-  async function maxRunRowsRead(statements: string[], params: unknown[][]) {
+  async function maxRowsRead(table: string, statements: string[], params: unknown[][],
+    replay: (statement: string) => boolean = (statement) => statement.includes(table)) {
     let max = 0;
     await db.$client.begin(async (tx) => {
       await tx.unsafe("set local enable_seqscan = off");
       for (const [index, statement] of statements.entries()) {
-        if (!statement.includes("heartbeat_runs") || !/^\s*select/i.test(statement)) continue;
+        if (!replay(statement) || !/^\s*select/i.test(statement)) continue;
         const [result] = (await tx.unsafe(`explain (analyze, format json) ${statement}`, params[index] as never[])) as unknown as Array<{ "QUERY PLAN": Array<{ Plan: PlanNode }> }>;
-        const read = rowsReadByTable(result!["QUERY PLAN"][0]!.Plan).get("heartbeat_runs") ?? 0;
+        const read = rowsReadByTable(result!["QUERY PLAN"][0]!.Plan).get(table) ?? 0;
         max = Math.max(max, read);
       }
     });
@@ -112,7 +114,7 @@ describeEmbeddedPostgres("reads under the issue lock stay on the issue's rows", 
 
     expect(recorded.statements.some((statement) => statement.includes("heartbeat_runs"))).toBe(true);
     // The issue has RUNS_PER_ISSUE runs; the company has ISSUES times that.
-    expect(await maxRunRowsRead(recorded.statements, recorded.statementParams)).toBeLessThanOrEqual(RUNS_PER_ISSUE * 2);
+    expect(await maxRowsRead("heartbeat_runs", recorded.statements, recorded.statementParams)).toBeLessThanOrEqual(RUNS_PER_ISSUE * 2);
   });
 
   it("finds each settle candidate's run by its id", async () => {
@@ -124,7 +126,29 @@ describeEmbeddedPostgres("reads under the issue lock stay on the issue's rows", 
     await db.execute(sql`update issue_recovery_actions set status = 'active', outcome = null, resolved_at = null
       where company_id = ${companyId} and status = 'resolved' and outcome = 'blocked'`);
 
-    expect(await maxRunRowsRead(recorded.statements, recorded.statementParams)).toBeLessThanOrEqual(RUNS_PER_ISSUE * 2);
+    expect(await maxRowsRead("heartbeat_runs", recorded.statements, recorded.statementParams)).toBeLessThanOrEqual(RUNS_PER_ISSUE * 2);
+  });
+
+  it("finds the issues a finishing run still holds through an index", async () => {
+    const [issue] = (await db.execute(sql`select id from issues where company_id = ${companyId} order by issue_number offset 1 limit 1`)) as unknown as Array<{ id: string }>;
+    const runId = randomUUID();
+    await db.execute(sql`insert into heartbeat_runs (id, company_id, agent_id, invocation_source, trigger_detail, status, runtime_mode, context_snapshot, next_event_seq, started_at)
+      values (${runId}, ${companyId}, ${agentId}, 'assignment', 'system', 'running', 'legacy', jsonb_build_object('issueId', ${issue!.id}::text), 1, now())`);
+    await db.execute(sql`update issues set execution_run_id = ${runId}, checkout_run_id = ${runId} where id = ${issue!.id}`);
+    // Enough issues that reading them all is a choice the planner would not make with an index.
+    await db.execute(sql`insert into issues (company_id, title, status, priority, responsible_user_id, issue_number, identifier)
+      select ${companyId}, 'Filler ' || g, 'done', 'medium', 'plans-user', 1000 + g, 'PLN-' || (1000 + g) from generate_series(1, 2000) g`);
+    await db.execute(sql`analyze issues`);
+    const recorded = recordingDb(db);
+
+    await heartbeatService(recorded.db).cancelRun(runId, "Stop for the plan check");
+
+    // The issue execution lock's lookup: the run's context issue, or any issue whose run locks name it.
+    const isLockLookup = (statement: string) => /from issues\s+where company_id/i.test(statement) &&
+      statement.includes("execution_run_id") && /for update/i.test(statement);
+    expect(recorded.statements.some(isLockLookup)).toBe(true);
+    // It reads only the rows it locks, not every issue of the company.
+    expect(await maxRowsRead("issues", recorded.statements, recorded.statementParams, isLockLookup)).toBeLessThanOrEqual(3);
   });
 
   it("matches run evidence and issue ids exactly as the text comparisons did", async () => {
