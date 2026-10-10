@@ -57,6 +57,14 @@ export async function explicitOperatorRunIdentity(
 export type RunIdentityContext = typeof runIdentityContexts.$inferSelect;
 type Executor = Pick<Db, "select" | "insert" | "update">;
 
+/** The task a run is bound to (null when none). A bound id that is not a UUID fails closed, locked path or not. */
+function boundTaskId(issueId: unknown): string | null {
+  if (issueId !== undefined && issueId !== null && (typeof issueId !== "string" || !isUuidLike(issueId))) {
+    throw forbidden("Run task identity is invalid");
+  }
+  return typeof issueId === "string" ? issueId : null;
+}
+
 /**
  * Lock the task before the run, matching task mutation ordering. Identity
  * operations do not change parent keys: NO KEY UPDATE still serializes writers
@@ -78,15 +86,8 @@ async function lockIdentityTask(
     .where(
       and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)),
     );
-  const issueId = run?.context?.issueId ?? run?.context?.taskId ?? run?.issueId;
-  if (
-    issueId !== undefined &&
-    issueId !== null &&
-    (typeof issueId !== "string" || !isUuidLike(issueId))
-  ) {
-    throw forbidden("Run task identity is invalid");
-  }
-  if (typeof issueId === "string")
+  const issueId = boundTaskId(run?.context?.issueId ?? run?.context?.taskId ?? run?.issueId);
+  if (issueId !== null)
     await executor
       .select({ id: issues.id })
       .from(issues)
@@ -428,10 +429,45 @@ export async function acceptSteeredIdentity(
   if (accepted) await activate(executor, accepted);
 }
 
+/**
+ * The common case: the run is running, has an active identity, and none waits to be accepted. Nothing is written then,
+ * so nothing needs a lock: the run and its context are read as they are. The answer is the identity as of the read,
+ * which is what the locked path returns when it takes the lock before a steering reservation does; a reservation that
+ * commits later applies to the next capture.
+ *
+ * A request that waits on a row lock holds one of the few pooled connections of the whole API for as long as it waits,
+ * and this runs for every agent request that carries a run token, so the locked path is kept for the cases that need it.
+ * @returns Null when the locked path must decide: an identity waits to be accepted, the run is not running, or it has no context.
+ */
+async function captureSettledRunIdentity(
+  db: Db,
+  input: { companyId: string; runId: string; agentId: string },
+) {
+  const [run] = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId)));
+  if (!run || run.status !== "running" || !run.activeIdentityContextId) return null;
+  boundTaskId(run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId ?? run.nativeIssueId);
+  const [pending] = await db
+    .select({ id: runIdentityContexts.id })
+    .from(runIdentityContexts)
+    .where(and(eq(runIdentityContexts.runId, run.id), eq(runIdentityContexts.status, "pending")))
+    .limit(1);
+  if (pending) return null;
+  const [context] = await db
+    .select()
+    .from(runIdentityContexts)
+    .where(and(eq(runIdentityContexts.id, run.activeIdentityContextId), eq(runIdentityContexts.runId, run.id)));
+  return context ? { run, context } : null;
+}
+
 export async function captureRunIdentity(
   db: Db,
   input: { companyId: string; runId: string; agentId: string },
 ) {
+  const settled = await captureSettledRunIdentity(db, input);
+  if (settled) return settled;
   // Lock acquisition serializes with steering delivery and its durable acknowledgement.
   return db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);
