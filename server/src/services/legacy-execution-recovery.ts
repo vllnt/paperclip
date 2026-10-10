@@ -155,6 +155,10 @@ export async function terminalizeLegacyExecution(input: {
         fingerprint: `legacy-execution:${run.id}`,
         evidence: {
           runId: run.id,
+          // The conversation fold retires holds that older releases opened for
+          // chat turns. A hold on an ordinary task is a current board gate, so
+          // the fold must leave it, or this pass opens it again every tick.
+          ...(task.conversationAgentId ? {} : { boardHold: true }),
           ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
           originalFailureCode: updated.errorCode,
           ...(hasWorkspaceRestoreFailure(updated.resultJson) ? { workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure } : {}),

@@ -316,6 +316,8 @@ export async function settleUnrecoverableExecutions(
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = and(
     conversationRecoveryActionPredicate(),
+    // A hold that recovery opened on an ordinary task is a live board gate.
+    sql`${issueRecoveryActions.evidence}->>'boardHold' is distinct from 'true'`,
     or(
       inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
