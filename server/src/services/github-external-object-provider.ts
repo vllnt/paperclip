@@ -29,6 +29,12 @@ interface GitHubObjectIdentity {
 }
 
 const GITHUB_OBJECT_TTL_SECONDS = 300;
+/**
+ * How long an object waits to be tried again when the company has no GitHub token. GitHub allows 60 unauthenticated requests an
+ * hour per IP address, and a host's whole egress shares them, so without a token GitHub is not asked at all. Checking again costs
+ * a local lookup, so a token that is added later is used within this time.
+ */
+const GITHUB_NO_TOKEN_RETRY_SECONDS = 3600;
 
 function isGitHubHost(host: string) {
   const h = host.toLowerCase();
@@ -389,12 +395,21 @@ export function createGitHubExternalObjectProvider(
           };
         }
         token = token?.trim() || null;
+        if (!token) {
+          return {
+            ok: false,
+            liveness: "auth_required",
+            errorCode: "github_token_missing",
+            errorMessage: "No GitHub token is configured for this company, so this object is not refreshed.",
+            retryAfterSeconds: GITHUB_NO_TOKEN_RETRY_SECONDS,
+          };
+        }
         const headers: Record<string, string> = {
           accept: "application/vnd.github+json",
           "user-agent": "paperclip-external-object-resolver",
           "x-github-api-version": "2022-11-28",
+          authorization: `Bearer ${token}`,
         };
-        if (token) headers.authorization = `Bearer ${token}`;
 
         const apiKind = objectType === "pull_request" ? "pulls" : "issues";
         const url = `${gitHubApiBase(identity.host)}/repos/${encodeURIComponent(identity.owner)}/${encodeURIComponent(identity.repo)}/${apiKind}/${identity.number}`;
