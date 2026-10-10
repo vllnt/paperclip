@@ -98,9 +98,11 @@ function isCodexFamily(value: string | null): boolean {
 
 /**
  * Providers whose reported input count already includes the cached part. It holds for OpenAI-family
- * and xAI models. For every other provider the cached count is reported on top of the input. The
- * stream shape and the provider decide this, not the adapter type: a `codex_local` run that uses an
- * Anthropic model streams Anthropic counts.
+ * models. For every other provider the cached count is reported on top of the input. The stream
+ * shape and the recorded provider label decide this, not the adapter type and not the model id: a
+ * `codex_local` run that uses an Anthropic model streams Anthropic counts, and a Grok model that
+ * runs through `codex_local` is recorded as `openai`, so it follows the OpenAI rule. The `xai` rule
+ * stays for runs that record that label, which the `grok_local` adapter is expected to do.
  */
 const CACHED_INSIDE_INPUT_PROVIDERS: ReadonlySet<string> = new Set(["openai", "xai"]);
 

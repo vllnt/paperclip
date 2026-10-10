@@ -256,6 +256,31 @@ describe("deriveRunUsageRecord", () => {
       });
     });
 
+    it("classes a grok model that is recorded under the openai label the OpenAI way", () => {
+      const record = deriveRunUsageRecord(makeInput({
+        adapterType: "codex_local",
+        run: makeRun({ usageJson: { ...OPENAI_USAGE, provider: "openai", model: "grok-4.7" } }),
+      }));
+
+      expect(record).toMatchObject({
+        provider: "openai",
+        model: "grok-4.7",
+        inputTokens: 200,
+        cacheReadTokens: 800,
+        outputTokens: 50,
+        usageQuality: "measured",
+      });
+    });
+
+    it("takes the vendor from the recorded provider label and never from the model id", () => {
+      const record = deriveRunUsageRecord(makeInput({
+        adapterType: "codex_local",
+        run: makeRun({ usageJson: { ...OPENAI_USAGE, provider: "mystery", model: "grok-4.7" } }),
+      }));
+
+      expect(record).toMatchObject({ provider: "mystery", model: "grok-4.7", inputTokens: 1000, cacheReadTokens: 800 });
+    });
+
     it("keeps the counts of a provider that has no rule as reported", () => {
       const other = deriveRunUsageRecord(makeInput({ run: makeRun({ usageJson: { ...OPENAI_USAGE, provider: "mystery" } }) }));
       const none = deriveRunUsageRecord(makeInput({ run: makeRun({ usageJson: { ...OPENAI_USAGE, provider: undefined } }) }));
