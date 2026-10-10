@@ -2695,6 +2695,14 @@ export function recoveryService(
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
     return db.transaction(async (tx) => {
+      // A run has no foreign key to its issue. The share lock serializes this
+      // insert with the deferred-wake sweep, which locks the issue row before it
+      // finalizes the issue's parked wakes.
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+        .for("share");
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -3281,6 +3289,13 @@ export function recoveryService(
           created = Boolean(enqueuedRun);
         } else {
           scheduledRun = await db.transaction(async (tx) => {
+            // Serializes with the deferred-wake sweep's issue-row lock; see
+            // ensureProviderQuotaWaitRecoveryMonitor.
+            await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+              .for("share");
             const wakeup = await tx
               .insert(agentWakeupRequests)
               .values({

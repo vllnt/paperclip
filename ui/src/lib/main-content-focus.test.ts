@@ -63,4 +63,23 @@ describe("main-content-focus", () => {
 
     expect(shouldFocusMainContentAfterNavigation(main, staleButton)).toBe(true);
   });
+
+  it("does not steal focus from an open modal dialog, such as the command launcher", async () => {
+    const main = document.createElement("main");
+    main.tabIndex = -1;
+    // The shape Radix renders: no aria-modal, an open data-state.
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("data-slot", "dialog-content");
+    dialog.setAttribute("data-state", "open");
+    const launcherInput = document.createElement("input");
+    dialog.appendChild(launcherInput);
+    document.body.append(main, dialog);
+    launcherInput.focus();
+
+    scheduleMainContentFocus(main);
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    expect(document.activeElement).toBe(launcherInput);
+  });
 });

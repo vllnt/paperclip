@@ -64,6 +64,13 @@ agent's checkout. Attachment-backed artifact work products set `type` to
 `artifact` and `provider` to `paperclip`, with metadata canonicalized from the
 uploaded `attachmentId`.
 
+Uploads are limited to `PAPERCLIP_ATTACHMENT_MAX_BYTES` per file (10 MiB by
+default), from a sandbox or SSH run as from anywhere else. A larger evidence
+archive does not fit: split it into files under the limit, attach the files a
+reviewer needs most (the summary report, the failing trace), or keep the
+archive in the workspace and point to it with `workspace_file` metadata as
+described below. A link to an external host also works as a work product `url`.
+
 Use `workspace_file` metadata only for important files that intentionally remain
 in a project or execution workspace, such as source files, committed markdown
 plans, or generated files whose meaning depends on the checkout. Workspace-only

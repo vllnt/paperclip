@@ -4,6 +4,7 @@ import { pluginState, plugins, type Db } from "@paperclipai/db";
 import {
   GITHUB_WRITE_IDENTITY_STATE,
   classifyGitHubCommand,
+  gitHubAgentsNeverDenial,
   ghApiRoute,
   ghVerbIndex,
   gitNetworkArguments,
@@ -22,6 +23,7 @@ import {
   type PaperclipPluginManifestV1,
 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { protectedBranchRefusal } from "./github-protected-branches.js";
 
 /**
  * One managed `git`/`gh` invocation as reported by the token-free launcher.
@@ -235,6 +237,12 @@ export interface ClassifiedGitHubOperation {
   autoMerge?: true;
   /** The command changes an open pull request's base branch (gh pr edit --base, the REST base field). */
   retarget?: true;
+  /**
+   * Branches this write forces, deletes, renames or hard-resets, when only
+   * GitHub's answer on default and protected branches decides it: the write is
+   * refused until that answer is read (resolveGitHubOperationAccess reads it).
+   */
+  branchRewrites?: string[];
 }
 
 /** A reported command Paperclip could not read: it is treated as a write it cannot check. */
@@ -367,6 +375,17 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     const run = /^repos\/[^/]+\/[^/]+\/actions\/(?:runs|jobs)\/(\d{1,20})\//.exec(path);
     if (run && !deployment) target.actionsRunId = run[1];
   }
+  // A branch the write forces, deletes, renames or hard-resets may be GitHub's default or a protected branch.
+  const rewrites = !denied && access === "write" && command.branchRewrites?.length ? command.branchRewrites : undefined;
+  // Without the repository (an incomplete report, a placeholder path), or for a wiki (its branches are not the repository's),
+  // Paperclip cannot ask GitHub about these branches: the write is refused. A push target that looks like a local path is no exception:
+  // an unreported remote name (origin) reads the same way, and the real push would carry the credential.
+  const unverifiable = rewrites !== undefined && (repository === null || wiki);
+  const branchRefusal = !rewrites ? null
+    : unverifiable ? gitHubAgentsNeverDenial("defaultBranch", `Paperclip could not tell which repository ${rewrites.slice(0, 3).join(", ")} belongs to; name it in the command and report the push destination`)
+    : repository !== null ? protectedBranchRefusal(repository, rewrites) : null;
+  const branchRewrites = rewrites && !unverifiable && repository !== null ? rewrites : undefined;
+  if (branchRefusal) refuse(branchRefusal);
   if (pullRequest) target.pullRequest = pullRequest;
   // Only a full commit SHA binds a merge to one head; an abbreviation is dropped (and the merge refused).
   expectedHeadSha = expectedHeadSha?.toLowerCase() ?? null;
@@ -381,6 +400,7 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     ...(merging ? { merge: true as const } : {}),
     ...(autoMerge ? { autoMerge: true as const } : {}),
     ...(retarget ? { retarget: true as const } : {}),
+    ...(branchRewrites ? { branchRewrites } : {}),
     ...(operation.program === "git" && command.action === "commit" ? { signing: true } : {}),
   };
 }

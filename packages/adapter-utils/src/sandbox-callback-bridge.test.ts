@@ -22,6 +22,7 @@ import {
   syncSandboxCallbackBridgeEntrypoint,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
+  SandboxBridgeEnvelopeTooLargeError,
 } from "./sandbox-callback-bridge.js";
 import type { SandboxCallbackBridgeQueueClient } from "./sandbox-callback-bridge.js";
 import { createHttp2BridgeServer } from "./http2-bridge-server.js";
@@ -1566,6 +1567,58 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("admits company skill create, and no other skill write", () => {
+    const allowed: Array<{ method: string; path: string }> = [
+      { method: "POST", path: "/api/companies/co-1/skills" },
+    ];
+    for (const request of allowed) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST),
+      ).toBeNull();
+    }
+
+    const denied: Array<{ method: string; path: string }> = [
+      // Wrong method on the new paths.
+      { method: "PUT", path: "/api/companies/co-1/skills" },
+      { method: "PATCH", path: "/api/companies/co-1/skills" },
+      { method: "DELETE", path: "/api/companies/co-1/skills" },
+      { method: "PUT", path: "/api/companies/co-1/skills/import" },
+      { method: "DELETE", path: "/api/companies/co-1/skills/import" },
+      // Neighbouring skill writes stay human-only: only create is admitted here.
+      { method: "POST", path: "/api/companies/co-1/skills/import" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1" },
+      { method: "POST", path: "/api/companies/co-1/skills/install-catalog" },
+      { method: "POST", path: "/api/companies/co-1/skills/scan-projects" },
+      { method: "POST", path: "/api/companies/co-1/skills/browse-project" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1/audit" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1/reset" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1/install-update" },
+      { method: "POST", path: "/api/companies/co-1/skill-sources" },
+      // Extra or missing segments.
+      { method: "POST", path: "/api/companies/co-1/skills/import/extra" },
+      { method: "POST", path: "/api/companies/co-1/skills/import/" },
+      { method: "POST", path: "/api/companies/co-1/skills/" },
+      { method: "POST", path: "/api/companies//skills" },
+      // queue_v1 forwards the raw path: no query, fragment, encoded, dot or backslash segment may ride on the rules.
+      { method: "POST", path: "/api/companies/co-1/skills?source=https://example.test" },
+      { method: "POST", path: "/api/companies/co-1/skills/import?source=/etc" },
+      { method: "POST", path: "/api/companies/co-1/skills#x" },
+      { method: "POST", path: "/api/companies/co-1/skills/import#x" },
+      { method: "POST", path: "/api/companies/co-1/skills/import%2f..%2fapi" },
+      { method: "POST", path: "/api/companies/co%2f1/skills" },
+      { method: "POST", path: "/api/companies/co-1%2fskills/import" },
+      { method: "POST", path: "/api/companies/../skills" },
+      { method: "POST", path: "/api/companies/co.1/skills/import" },
+      { method: "POST", path: "/api/companies/co\\1/skills" },
+    ];
+    for (const request of denied) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
+        `Route not allowed: ${request.method} ${request.path}`,
+      );
+    }
+  });
+
   it("admits listing, uploads and downloads on the default queue route list", () => {
     const attachmentRequests: Array<{ method: string; path: string }> = [
       { method: "GET", path: "/api/issues/issue-1/attachments" },
@@ -1575,6 +1628,83 @@ describe("sandbox callback bridge", () => {
     for (const request of attachmentRequests) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
     }
+  });
+
+  /** Wraps a runner so each command returns at most `maxChars` of stdout, keeping the head or the tail. */
+  function createStdoutCappedRunner(maxChars: number, keep: "head" | "tail") {
+    const inner = createExecRunner();
+    return {
+      execute: async (input: Parameters<typeof inner.execute>[0]): Promise<RunProcessResult> => {
+        const result = await inner.execute(input);
+        const stdout = keep === "tail" ? result.stdout.slice(-maxChars) : result.stdout.slice(0, maxChars);
+        return { ...result, stdout };
+      },
+    };
+  }
+
+  async function writeEnvelopeFixture(bytes: number): Promise<{ filePath: string; content: string }> {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-read-"));
+    cleanupDirs.push(rootDir);
+    const filePath = path.join(rootDir, "request.json");
+    // A JSON envelope like the bridge writes: a base64 body inside a JSON string.
+    const body = Buffer.from(Buffer.alloc(bytes).map((_, index) => (index * 31 + 7) % 251)).toString("base64");
+    const content = JSON.stringify({ id: "req-1", bodyEncoding: "base64", body }).slice(0, bytes);
+    await writeFile(filePath, content, "utf8");
+    return { filePath, content };
+  }
+
+  it("reads a multi-megabyte envelope through a provider that keeps only the last 4 MiB of stdout", async () => {
+    // CreateOS keeps the last 4,194,304 characters of command stdout.
+    const runner = createStdoutCappedRunner(4_194_304, "tail");
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: os.tmpdir() });
+    const { filePath, content } = await writeEnvelopeFixture(3_500_000);
+
+    await expect(client.readTextFile(filePath, content.length)).resolves.toBe(content);
+    await expect(client.readTextFile(filePath)).resolves.toBe(content);
+  });
+
+  it("reads through a provider with a 1 MiB stdout buffer", async () => {
+    const runner = createStdoutCappedRunner(1_048_576, "head");
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: os.tmpdir() });
+    const { filePath, content } = await writeEnvelopeFixture(1_200_000);
+
+    await expect(client.readTextFile(filePath, content.length)).resolves.toBe(content);
+  });
+
+  it.each(["head", "tail"] as const)(
+    "fails loudly instead of returning a corrupt envelope when the provider cuts output (keeps %s)",
+    async (keep) => {
+      const runner = createStdoutCappedRunner(200_000, keep);
+      const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: os.tmpdir() });
+      const { filePath, content } = await writeEnvelopeFixture(600_000);
+
+      await expect(client.readTextFile(filePath, content.length)).rejects.toThrow(/provider truncated command output/);
+    },
+  );
+
+  it("bounds a read that passes no limit by the client's default ceiling", async () => {
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner: createExecRunner(),
+      remoteCwd: os.tmpdir(),
+      maxReadBytes: 1_000,
+    });
+    const { filePath: smallPath, content: small } = await writeEnvelopeFixture(900);
+    await expect(client.readTextFile(smallPath)).resolves.toBe(small);
+    const { filePath } = await writeEnvelopeFixture(600_000);
+    await expect(client.readTextFile(filePath)).rejects.toBeInstanceOf(SandboxBridgeEnvelopeTooLargeError);
+  });
+
+  it("reads an empty file and still enforces the size limit", async () => {
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner: createExecRunner(),
+      remoteCwd: os.tmpdir(),
+    });
+    const { filePath: emptyPath } = await writeEnvelopeFixture(0);
+    await expect(client.readTextFile(emptyPath, 10)).resolves.toBe("");
+    const { filePath, content } = await writeEnvelopeFixture(2_000);
+    await expect(client.readTextFile(filePath, content.length - 1)).rejects.toThrow(
+      "Bridge envelope exceeded the configured size limit.",
+    );
   });
 
   it.each([
@@ -1647,7 +1777,7 @@ describe("sandbox callback bridge", () => {
         execute: vi.fn(async (input: { args?: string[]; env?: Record<string, string> }) => {
           const script = input.args?.[1] ?? "";
           if ((stage === "start" && script.includes("nohup")) ||
-              (stage === "stop" && script.includes('kill "$pid"'))) {
+              (stage === "stop" && script.includes("kill -TERM"))) {
             return new Promise<RunProcessResult>(() => {});
           }
           return {
@@ -2689,6 +2819,82 @@ describe("sandbox callback bridge", () => {
     expect(writeAttempts).toBeGreaterThanOrEqual(2);
     // The recovery removed the request file only after the 503 write landed.
     expect(requestRemovals).toContain(requestPath);
+
+    await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("answers an oversized queued envelope on the recovery path with 413 without reading it whole", async () => {
+    // The first read hangs, so the loop's request catch runs the recovery pass.
+    // The queued envelope is far over the worker's envelope limit. The recovery
+    // read must pass that limit (an unbounded read would load the whole file),
+    // and the request gets a terminal 413 under its file-name ID.
+    const waitFor = async (predicate: () => boolean, timeoutMs: number) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("waitFor timed out");
+    };
+    const maxBodyBytes = 1_024;
+    const envelopeLimit = 6 * maxBodyBytes + 64 * 1024;
+    const queueDir = "/virtual-bridge/queue";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-oversized.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+    const responsePath = path.posix.join(directories.responsesDir, requestFile);
+    const oversized = `${JSON.stringify({ id: "spoofed-id", method: "POST", path: "/api/x", query: "", headers: {}, body: "x".repeat(envelopeLimit * 4) })}\n`;
+    const requestBodies = new Map([[requestPath, oversized]]);
+    const readLimits: Array<number | undefined> = [];
+    const responseWrites: Array<{ path: string; status: number; id: string }> = [];
+    let readCalls = 0;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {},
+      makeDirs: async () => {},
+      listJsonFiles: async (dir) =>
+        dir === directories.requestsDir ? [...requestBodies.keys()].map((entry) => path.posix.basename(entry)) : [],
+      readTextFile: async (remotePath, maxBytes) => {
+        readCalls += 1;
+        readLimits.push(maxBytes);
+        if (readCalls === 1) return await new Promise<string>(() => {});
+        const body = requestBodies.get(remotePath);
+        if (body === undefined) throw new Error(`missing request ${remotePath}`);
+        // Like the real readers: refuse before loading a file over the limit.
+        if (maxBytes !== undefined && Buffer.byteLength(body) > maxBytes) throw new SandboxBridgeEnvelopeTooLargeError();
+        return body;
+      },
+      writeTextFile: async () => {},
+      writeResponseFile: async (remotePath, body) => {
+        const parsed = JSON.parse(body.trim());
+        responseWrites.push({ path: remotePath, status: parsed.status, id: parsed.id });
+        return { wrote: true };
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      maxBodyBytes,
+      iterationTimeoutMs: 200,
+      watchdogTimeoutMs: 10_000,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: async () => ({ status: 200, body: "ok" }),
+    });
+
+    await waitFor(() => responseWrites.some((write) => write.path === responsePath), 3_000);
+
+    expect(readLimits.every((limit) => limit !== undefined && limit <= envelopeLimit)).toBe(true);
+    expect(responseWrites.filter((write) => write.path === responsePath)).toEqual([
+      { path: responsePath, status: 413, id: "req-oversized" },
+    ]);
+    expect(requestBodies.has(requestPath)).toBe(false);
 
     await worker.stop({ drainTimeoutMs: 10 });
   });

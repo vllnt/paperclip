@@ -265,6 +265,66 @@ remote push refspecs, `push.followTags`), a `gh` command that could pick
 between several remotes without `-R`, a `gh api` ref or tag hidden in an
 `--input` or `-F name=@file` file, and a command too long to report whole.
 
+**Operations agents never perform.** These are refused for every company,
+with or without a write identity policy, and no toggle turns them on. No token
+is handed out, and the refusal (`Denied: agents never …`, naming the route) is
+recorded as `github.write_identity_resolved` with the agent and run:
+
+| Operation | Refused routes |
+|---|---|
+| Archive, unarchive, delete, rename, transfer or change the settings of a repository | `gh repo archive\|unarchive\|delete\|rename\|edit\|transfer`; any `gh api` write to `repos/OWNER/REPO` (or `repositories/ID`) itself or to `…/transfer`; GraphQL `archiveRepository`, `unarchiveRepository`, `updateRepository`, `transferRepository` |
+| Delete or force-push a default or protected branch | `main`, `master`, `staging` and `production` always (any casing: `Production` too): `git push` with `--delete`/`-d`, `:main`, `+…:main`, `-f`/`--force`/`--force-with-lease` reaching `main`, `--mirror`, `--prune` or `--force` with branch patterns, `+:`, and a push without refspecs whose repository config may force or prune; `gh repo sync --force` without a branch; `DELETE …/git/refs/heads/main`, `PATCH` there with `force` not `false` or a body Paperclip cannot read; `POST …/branches/main/rename`. Any other branch the same forms name (and `gh repo sync --force --branch BRANCH`) when GitHub reports it as the default or a protected branch, or cannot be read (below). GraphQL `deleteRef`, `updateRef`, `updateRefs` (they name the ref by node ID, so every branch: use `git push`) |
+| Change branch protection or rulesets | writes to `…/branches/BRANCH/protection/**`, `…/tags/protection/**`, `…/rulesets/**`, `orgs/ORG/rulesets/**`; GraphQL `create`/`update`/`deleteBranchProtectionRule` and `…RepositoryRuleset` |
+| Change webhooks | writes to `…/hooks/**`, `orgs/ORG/hooks/**` |
+| Change secrets, variables or deploy keys | `gh secret`/`gh variable` writes, `gh repo deploy-key` writes; writes to `…/actions/secrets/**` and `…/actions/variables/**`, `…/dependabot/secrets/**`, `…/codespaces/secrets/**` (repository and organization), `…/keys/**` |
+| Delete deployments, change or delete environments, or mark a deployment inactive | writes to `…/environments/**`, `DELETE …/deployments/ID`, `POST …/deployments/ID/statuses` with `state=inactive` or a body Paperclip cannot read; GraphQL `deleteDeployment`, `createDeploymentStatus`, `create`/`update`/`deleteEnvironment` |
+
+Requests that could hide one of them are refused for every company as well: a
+GraphQL query or body from a file or stdin or in a `-F` value with a gh
+placeholder, an unreadable GraphQL document, mutation fragments or
+subscriptions, any GraphQL mutation outside the comment and Project fence (it
+names its target by node ID), a `gh api` write whose endpoint Paperclip cannot
+route (`..`, a bad encoding, half-filled placeholders) or holds a gh placeholder
+after `repos/{owner}/{repo}` (gh fills `{branch}` after the check, and a branch
+may be named `heads/main` or `hooks/1`), and a gh option before the verb. A
+`state` or `force` value from a query string, a file or a placeholder counts as
+unknown, and only a literal `force=false` is not forced. Routes are matched
+case-insensitively, after decoding, and a branch name may hold slashes.
+Deployment statuses other than `inactive` stay `deploymentApproval`.
+
+**The name floor does not ask GitHub.** `main`, `master`, `staging` and `production` (any casing) are refused for a delete, force-push, rename or hard-reset even when GitHub says the branch is neither the default nor protected. A fast-forward push to one of them is still an ordinary write.
+
+**Default and protected branches are GitHub's.** For any other branch a write
+forces, deletes, renames or hard-resets, Paperclip reads from GitHub, with the
+run's own read credential (used on the server, never handed out): the
+repository's default branch (`GET /repos/OWNER/REPO`), the branch's classic
+protection (`GET …/branches/BRANCH`, `protected`), and the active ruleset
+rules for its name (`GET …/rules/branches/BRANCH`, every page). The branch is
+protected when it has classic protection or any active rule other than those
+that only check commits, names or merges (`creation`, `required_signatures`,
+`required_linear_history`, commit and name patterns, file restrictions,
+`workflows`, `code_scanning`, `copilot_code_review`); a rule type Paperclip
+does not know protects it. The write is refused when the branch is the
+default (compared case-insensitively) or protected, and also when GitHub
+cannot be read or answers unclearly: the classifier refuses a branch it has no
+answer for from this very operation, so any caller that skips the read fails
+closed. The read happens for every such write and nothing is kept: no cache
+across runs, companies or requests, so a change at GitHub applies at once. A write that forces, deletes,
+renames or hard-resets a branch is also refused when Paperclip cannot tell
+which repository it targets: a push report without its remote or push URLs, a
+gh placeholder path, a wiki, or a target that only looks like a local path
+(an unreported remote name reads the same way). Name the repository, or push
+from the managed launcher, which reports the destination. Feature branches GitHub does
+not protect may still be force-pushed (with or without a lease) and deleted.
+
+**gh aliases, extensions and unknown commands.** gh runs an alias or an
+extension for a name it does not know, and either can run any command, so a
+gh command group that is not one of gh's own (gh 2.97) is refused for every
+company, whatever its arguments (`gh deployment delete`, for example, is not a
+gh command). `gh alias set|import`, `gh extension exec` and `gh copilot` are
+refused too. `gh alias list|delete`, `gh extension list|search|install|…`,
+gh's built-in `co` alias (`pr checkout`) and the help topics stay reads.
+
 An **admin merge** needs the pull request number and the full expected head
 commit SHA (`gh pr merge <n> --admin --match-head-commit <40-character sha>`,
 or the API `sha`); an abbreviation is refused. Every `gh pr merge` option must
@@ -274,8 +334,11 @@ check runs with the App's read-only token, and refuses unless the head equals
 that SHA exactly, the base branch's classic protection is on and binds
 administrators ("Do not allow bypassing the above settings", `enforce_admins`),
 the base branch requires at least one check, and every required check, from
-rulesets and classic branch protection, concluded `success` in its latest run
-(from the pinned integration when the rule names one). GitHub's branch read
+rulesets and classic branch protection, concluded `success` or `skipped` in its
+latest run (from the pinned integration when the rule names one). `skipped` is a
+job that its path filter or condition skipped, which GitHub passes too; a check
+that never reported, one still running, a commit status that is not `success`,
+and every other conclusion (`neutral` included) do not pass. GitHub's branch read
 (`GET /repos/{owner}/{repo}/branches/{branch}`) never includes `enforce_admins`;
 it reports administrators as bound with
 `protection.required_status_checks.enforcement_level: "everyone"`

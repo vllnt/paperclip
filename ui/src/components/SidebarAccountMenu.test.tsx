@@ -21,7 +21,7 @@ const mockInstanceSettingsApi = vi.hoisted(() => ({
 }));
 const mockHealthApi = vi.hoisted(() => ({ get: vi.fn() }));
 const mockGetCurrentBoardAccess = vi.hoisted(() => vi.fn());
-const mockToggleTheme = vi.hoisted(() => vi.fn());
+const mockSetPreference = vi.hoisted(() => vi.fn());
 const mockSetSidebarOpen = vi.hoisted(() => vi.fn());
 const mockNavigateTopLevel = vi.hoisted(() => vi.fn());
 
@@ -71,7 +71,8 @@ vi.mock("../context/SidebarContext", () => ({
 vi.mock("../context/ThemeContext", () => ({
   useTheme: () => ({
     theme: "dark",
-    toggleTheme: mockToggleTheme,
+    preference: "system",
+    setPreference: mockSetPreference,
   }),
 }));
 
@@ -272,7 +273,7 @@ describe("SidebarAccountMenu", () => {
     });
   });
 
-  it("shares the nav background without separator borders", async () => {
+  it("sits on the page surface and is separated from the nav by a hairline, not a tinted fill", async () => {
     const root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
@@ -288,11 +289,10 @@ describe("SidebarAccountMenu", () => {
     await flushReact();
 
     const accountSurface = container.firstElementChild;
-    expect(accountSurface?.className).toContain("bg-border/50");
-    expect(accountSurface?.className).toContain("dark:bg-muted");
-    expect(accountSurface?.className).not.toContain("border-t");
+    expect(accountSurface?.className).toContain("border-t");
+    expect(accountSurface?.className).toContain("border-border");
     expect(accountSurface?.className).not.toContain("border-r");
-    expect(accountSurface?.className).not.toContain("border-border");
+    expect(accountSurface?.className).not.toMatch(/\bbg-(border|muted|accent|secondary)\b/);
     const accountTrigger = container.querySelector('button[aria-label="Open account menu"]');
     expect(accountTrigger?.classList).toContain("rounded-lg");
     expect(accountTrigger?.classList).toContain("hover:bg-sidebar-accent");
@@ -436,7 +436,7 @@ describe("SidebarAccountMenu", () => {
     // Documentation still appears before the theme toggle.
     const menuText = popover?.textContent ?? "";
     const docsPos = menuText.indexOf("Documentation");
-    const themePos = menuText.indexOf("Switch to");
+    const themePos = menuText.indexOf("Appearance");
     expect(docsPos).toBeLessThan(themePos);
 
     // The popover header stays down to name + email: no "Account" badge, no version line.

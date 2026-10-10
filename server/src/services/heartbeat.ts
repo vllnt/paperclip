@@ -16,7 +16,8 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -26,9 +27,10 @@ import { isBrowserUseConnection } from "./browser-use-client.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
+import { runWithPaperclipTempRun } from "@paperclipai/adapter-utils/paperclip-temp";
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
+import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
@@ -108,6 +110,7 @@ import {
   notInArray,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -174,6 +177,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueTreeHolds,
   issues,
   issueWorkProducts,
   nativeRunFinalizations,
@@ -270,6 +274,7 @@ import {
   readNativeWorkspaceSyncReference,
   recordNativeFinalizationFailure,
   type NativeRestartRecoveryClaim,
+  type NativeRuntimeResolution,
   rebindNativeSessionCheckpoint,
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
@@ -394,6 +399,7 @@ import {
 } from "./chat-control-recovery-stop.js";
 import {
   classifyRunLiveness,
+  hasConcreteActionEvidence,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
@@ -406,7 +412,9 @@ import {
 } from "./issue-rewake-throttle.js";
 import {
   logActivity,
+  publishActivity,
   publishPluginDomainEvent,
+  type ActivityPublication,
   type LogActivityInput,
 } from "./activity-log.js";
 import {
@@ -433,7 +441,11 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import {
+  executeIssuePostCommitActions,
+  issueService,
+  type IssuePostCommitAction,
+} from "./issues.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -552,7 +564,10 @@ import {
   type StrandedRecoveryNoticeSeed,
 } from "./recovery/stranded-notice.js";
 import { withRecoveryContext } from "./recovery/status-only-context.js";
-import { recoveryService } from "./recovery/service.js";
+import {
+  PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+  recoveryService,
+} from "./recovery/service.js";
 import {
   createRunDispatch,
   type PostCommitEffect,
@@ -571,6 +586,8 @@ import {
 import {
   buildSelfReblockWakeParkedState,
   createWakeQueue,
+  DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+  DEFERRED_WAKE_SWEEP_RECHECK_MS,
   decideSelfReblockWakeLimit,
   deriveSelfReblockWakeMarker,
   isSelfReblockWakeOwner,
@@ -578,9 +595,12 @@ import {
   SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY,
   SELF_REBLOCK_WAKE_PAYLOAD_KEY,
   SELF_REBLOCK_WAKE_WINDOW_MS,
+  selectDeferredWakesToPromote,
   selfReblockWakeWindowStart,
+  sweepPromotionBudget,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
+  type OrphanedDeferredWakeRow,
   type PostCommitEffect as WakeQueuePostCommitEffect,
   type ReleaseRecoveryBlockedNoticeKind,
   type RunSnapshot as WakeQueueRunSnapshot,
@@ -878,6 +898,20 @@ export {
 };
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
+const DEFERRED_WAKE_HELD_ACTION = "heartbeat.deferred_wake_held";
+/** A wake the sweep keeps parked this long after it was requested gets one held activity entry. */
+const DEFERRED_WAKE_HELD_NOTICE_MS = 10 * 60 * 1000;
+type DeferredWakeHeldReason =
+  /** The agent has no free run slot. */
+  | "no_free_run_slot"
+  /** The pass budget ran out, or an older wake of the same issue went first. */
+  | "waiting_for_turn"
+  | "agent_not_invokable"
+  | "budget_stop"
+  | "pause_hold"
+  | "execution_blocker"
+  | "operator_stop"
+  | "admission_deferred";
 // A workspace restore or agent directory lock that no queue progress released
 // in time. Contention clears on its own, so the run is retried under the
 // bounded transient budget instead of ending as a plain `adapter_failed`.
@@ -1135,13 +1169,14 @@ function resolveCodexTransientFallbackMode(
   return "fresh_session_safer_invocation";
 }
 
+/**
+ * The persisted, adapter-set errorCode wins over a family carried in the run
+ * result. Only that errorCode can claim provider_quota, because the family
+ * unlocks the provider-quota retry lane and its cap exemption.
+ */
 function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
-  const resultJson = parseObject(run.resultJson);
-  const persistedFamily = readNonEmptyString(resultJson.errorFamily);
-  if (persistedFamily) return persistedFamily;
-
   if (run.errorCode === "provider_quota") {
     return "provider_quota";
   }
@@ -1152,7 +1187,10 @@ function readHeartbeatRunErrorFamily(
   ) {
     return "transient_upstream";
   }
-  return null;
+  const persistedFamily = readNonEmptyString(
+    parseObject(run.resultJson).errorFamily,
+  );
+  return persistedFamily === "provider_quota" ? null : persistedFamily;
 }
 
 function isMaxTurnExhaustionRun(
@@ -1335,6 +1373,11 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+
+/** Whether this server process is executing the run now. */
+export function isHeartbeatRunExecuting(runId: string): boolean {
+  return activeRunExecutions.has(runId);
+}
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an
@@ -2045,6 +2088,197 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   };
+}
+
+// A provider that rejects a turn for capacity (for example Codex "Selected
+// model is at capacity") stays unavailable for minutes to hours. Two 30-second
+// retries land inside the same burst, so a failure before any useful action
+// gets its own backoff and does not spend heartbeat.maxDailyRuns.
+const PROVIDER_QUOTA_RETRY_BASE_DELAY_MS = 60 * 1000;
+const PROVIDER_QUOTA_RETRY_MAX_BACKOFF_DELAY_MS = 30 * 60 * 1000;
+const PROVIDER_QUOTA_RETRY_JITTER_RATIO = 0.2;
+const PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION =
+  "heartbeat.provider_quota_cap_exemption_exhausted";
+const PROVIDER_QUOTA_EXHAUSTED_ACTION = "heartbeat.provider_quota_exhausted";
+
+export interface ProviderQuotaRetryPolicy {
+  /** False restores the default transient retry budget and charges every quota failure. */
+  enabled: boolean;
+  /** Backoff attempts before the chain drops to the hourly recovery cadence. */
+  maxAttempts: number;
+  /** Backoff window measured from the chain's first quota failure. */
+  windowMs: number;
+  /** Hard ceiling: retries in the chain, backoff and hourly phases together. */
+  maxTotalAttempts: number;
+  /** Hard ceiling: no retry is scheduled later than this after the chain's first failure. */
+  maxRetryMs: number;
+  /** Per agent and UTC day: quota failures exempt from maxDailyRuns. Later ones count. */
+  maxDailyUncountedRuns: number;
+}
+
+/**
+ * Groups provider-quota probes: the adapter and its configured model, so a
+ * model at capacity does not hold back agents on another model.
+ */
+function providerQuotaKeyForAgent(
+  agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
+) {
+  const model = readNonEmptyString(parseObject(agent.adapterConfig).model);
+  return model ? `${agent.adapterType}:${model}` : agent.adapterType;
+}
+
+/** One agent's runs in a UTC day, as `computeDailyRunUsage` reads them. */
+interface DailyRunUsage {
+  /** Started runs that are not queued or waiting to retry. */
+  total: number;
+  /** The failed ones among them that hit a provider quota before any useful action. */
+  providerQuotaBeforeUsefulAction: number;
+}
+
+const NO_DAILY_RUNS: DailyRunUsage = { total: 0, providerQuotaBeforeUsefulAction: 0 };
+
+/**
+ * The runs that count toward `maxDailyRuns`. Up to the daily allowance, a
+ * provider quota failure before any useful action is not a run the cap guards
+ * against. Failures beyond the allowance count again, so a permanent outage
+ * still meets the cap. The cap and the run stats both call this, so it is the
+ * one place that applies the allowance.
+ *
+ * @param usage - the agent's raw usage for the day.
+ * @param policy - the agent's heartbeat policy.
+ * @returns the number that the cap compares with `maxDailyRuns`.
+ */
+function countedDailyRuns(
+  usage: DailyRunUsage,
+  policy: { providerQuotaRetry: Pick<ProviderQuotaRetryPolicy, "enabled" | "maxDailyUncountedRuns"> },
+): number {
+  const forgiven = policy.providerQuotaRetry.enabled
+    ? Math.min(usage.providerQuotaBeforeUsefulAction, policy.providerQuotaRetry.maxDailyUncountedRuns)
+    : 0;
+  return usage.total - forgiven;
+}
+
+/** Reads `runtimeConfig.heartbeat.providerQuotaRetry`. */
+function parseProviderQuotaRetryPolicy(value: unknown): ProviderQuotaRetryPolicy {
+  const configured = parseObject(value);
+  const bounded = (raw: unknown, fallback: number, max: number) =>
+    Math.max(0, Math.min(max, Math.floor(asNumber(raw, fallback))));
+  return {
+    enabled: asBoolean(configured.enabled, true),
+    maxAttempts: bounded(configured.maxAttempts, 8, 50),
+    windowMs: bounded(configured.windowMinutes, 120, 24 * 60) * 60 * 1000,
+    maxTotalAttempts: bounded(configured.maxTotalAttempts, 24, 500),
+    maxRetryMs: bounded(configured.maxRetryHours, 24, 7 * 24) * 60 * 60 * 1000,
+    maxDailyUncountedRuns: bounded(configured.maxDailyUncountedRuns, 48, 1000),
+  };
+}
+
+/**
+ * Schedules the next retry after a provider-quota failure that happened
+ * before any useful action. Delays double from one minute up to thirty, with
+ * ±20% jitter, while both the attempt budget and the window that started with
+ * the chain's first failure hold. After that the chain probes at the hourly
+ * quota-recovery cadence until a hard ceiling: `maxTotalAttempts` retries or
+ * `maxRetryMs` after the first failure, whichever comes first.
+ *
+ * @returns The schedule, or null for an invalid attempt number or once the
+ *   next retry would pass either ceiling.
+ */
+export function computeProviderQuotaRetrySchedule(input: {
+  attempt: number;
+  now: Date;
+  chainStartedAt: Date;
+  policy: ProviderQuotaRetryPolicy;
+  random?: () => number;
+}) {
+  const { attempt, now, policy } = input;
+  if (!Number.isInteger(attempt) || attempt <= 0) return null;
+  const backoffDelayMs = Math.min(
+    PROVIDER_QUOTA_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+    PROVIDER_QUOTA_RETRY_MAX_BACKOFF_DELAY_MS,
+  );
+  const phase: "backoff" | "slow" =
+    attempt <= policy.maxAttempts &&
+    now.getTime() + backoffDelayMs <=
+      input.chainStartedAt.getTime() + policy.windowMs
+      ? "backoff"
+      : "slow";
+  const baseDelayMs =
+    phase === "backoff" ? backoffDelayMs : PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS;
+  const sample = Math.min(1, Math.max(0, (input.random ?? Math.random)()));
+  const delayMs = Math.round(
+    baseDelayMs * (1 + (sample * 2 - 1) * PROVIDER_QUOTA_RETRY_JITTER_RATIO),
+  );
+  const dueAt = new Date(now.getTime() + delayMs);
+  if (
+    attempt > policy.maxTotalAttempts ||
+    dueAt.getTime() > input.chainStartedAt.getTime() + policy.maxRetryMs
+  ) {
+    return null;
+  }
+  return {
+    attempt,
+    baseDelayMs,
+    delayMs,
+    dueAt,
+    maxAttempts: policy.maxTotalAttempts,
+    phase,
+  };
+}
+
+/**
+ * How long a provider lane in quota state waits after its latest quota failure
+ * before the next probe: the chain backoff (1, 2, 4 … minutes up to 30, then
+ * the hourly cadence past the backoff window) for probe number
+ * `failedProbes + 1`, without jitter. The per-chain ceilings do not apply: the
+ * lane keeps probing, one run at a time, until the provider answers.
+ *
+ * @returns The delay in milliseconds.
+ */
+export function computeProviderQuotaLaneProbeDelayMs(input: {
+  failedProbes: number;
+  lastFailureAt: Date;
+  stateStartedAt: Date;
+  policy: ProviderQuotaRetryPolicy;
+}) {
+  return (
+    computeProviderQuotaRetrySchedule({
+      attempt: Math.max(0, Math.floor(input.failedProbes)) + 1,
+      now: input.lastFailureAt,
+      chainStartedAt: input.stateStartedAt,
+      policy: {
+        ...input.policy,
+        maxTotalAttempts: Number.MAX_SAFE_INTEGER,
+        maxRetryMs: Number.MAX_SAFE_INTEGER,
+      },
+      random: () => 0.5,
+    })?.baseDelayMs ?? PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS
+  );
+}
+
+/**
+ * The checks that need no database: a failed legacy run in the
+ * provider_quota family whose model returned no output. Native runs are
+ * excluded because native recovery owns their retries.
+ *
+ * @returns True when the run still needs the durable-evidence check.
+ */
+export function isProviderQuotaUsefulActionCandidate(input: {
+  outcome: string;
+  runtimeKind: NativeRuntimeResolution["kind"];
+  outputTokens: number;
+  errorCode: string | null;
+  resultJson: Record<string, unknown> | null;
+}) {
+  return (
+    input.outcome === "failed" &&
+    input.runtimeKind !== "native" &&
+    input.outputTokens === 0 &&
+    readHeartbeatRunErrorFamily({
+      errorCode: input.errorCode,
+      resultJson: input.resultJson,
+    }) === "provider_quota"
+  );
 }
 
 async function resolveRunScopedMentionedSkillKeys(input: {
@@ -3839,6 +4073,14 @@ interface WakeupOptions {
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
+  /**
+   * Internal. With `executionWaitRequestId`, this call re-drives that parked
+   * `deferred_issue_execution` receipt because no run is left to promote it.
+   * Admission runs every gate again under the issue lock and consumes the
+   * receipt together with its successor run, or leaves it parked untouched.
+   * Only the deferred-wake sweep sets it; no route or payload can.
+   */
+  redeliverDeferredWake?: boolean;
 }
 
 type UsageTotals = {
@@ -9732,9 +9974,11 @@ export function heartbeatService(
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
     },
-    // Mirrors scheduleBoundedRetryForRun's transient budget check: a failed
-    // or interrupted run that has already consumed every bounded transient
-    // attempt cannot be retried again through this lane.
+    // Mirrors scheduleBoundedRetryForRun's default transient budget check: a
+    // failed or interrupted run that has already consumed every bounded
+    // transient attempt cannot be retried again through this lane. A
+    // provider-quota failure before useful action has its own ceiling there;
+    // recovery routes it to the quota branch before it can reach this check.
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -15609,6 +15853,422 @@ export function heartbeatService(
     };
   }
 
+  /**
+   * The provider-quota retry lane applies to a run that failed before any
+   * useful action. Past the backoff window it keeps one retry per hour until
+   * the chain's hard ceiling (`maxTotalAttempts` or `maxRetryMs`), then stops
+   * and blocks the issue. It does not depend on maxDailyRuns being set.
+   */
+  function resolveProviderQuotaRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
+    if (
+      !policy.enabled ||
+      run.status !== "failed" ||
+      readHeartbeatRunErrorFamily(run) !== "provider_quota" ||
+      parseObject(run.resultJson).providerQuotaBeforeUsefulAction !== true
+    ) {
+      return null;
+    }
+    const chainStartedAt =
+      dateValue(parseObject(run.contextSnapshot).providerQuotaRetryStartedAt) ??
+      run.startedAt ??
+      run.createdAt;
+    return { policy, chainStartedAt };
+  }
+
+  /**
+   * Quota state of the agent's provider lane (company, adapter and model). The
+   * lane is in quota state while its latest provider outcome (a succeeded,
+   * failed or timed-out legacy run of any agent on the lane) is a
+   * provider_quota failure. Any other outcome means the provider answered and
+   * ends the state. `nextProbeAt` follows the lane backoff over the failed
+   * probes since the state began; `probeInFlight` is a running lane run or a
+   * queued run already chosen as the probe; `laneRetryWaiting` is a scheduled
+   * retry of a lane chain, whose promotion the coalescing sweep paces.
+   */
+  async function readProviderQuotaLaneState(
+    agent: typeof agents.$inferSelect,
+    excludeRunId: string,
+    client: Db = db,
+  ) {
+    const laneKey = providerQuotaKeyForAgent(agent);
+    const laneAgentIds = (
+      await client
+        .select({ id: agents.id, adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
+        .from(agents)
+        .where(eq(agents.companyId, agent.companyId))
+    )
+      .filter((candidate) => providerQuotaKeyForAgent(candidate) === laneKey)
+      .map((candidate) => candidate.id);
+    const laneRuns = and(
+      eq(heartbeatRuns.companyId, agent.companyId),
+      inArray(heartbeatRuns.agentId, laneAgentIds),
+      eq(heartbeatRuns.runtimeMode, "legacy"),
+    );
+    const providerOutcome = and(
+      inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out"]),
+      isNotNull(heartbeatRuns.finishedAt),
+    );
+    const [latest] = await client
+      .select({ errorCode: heartbeatRuns.errorCode, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(and(laneRuns, providerOutcome))
+      .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
+      .limit(1);
+    if (!latest?.finishedAt || latest.errorCode !== "provider_quota") {
+      return { laneKey, inQuotaState: false as const };
+    }
+    const [boundary] = await client
+      .select({ finishedAt: sql<Date | null>`max(${heartbeatRuns.finishedAt})` })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        providerOutcome,
+        sql`${heartbeatRuns.errorCode} is distinct from 'provider_quota'`,
+      ));
+    const boundaryAt = boundary?.finishedAt ? new Date(boundary.finishedAt) : null;
+    const [stats] = await client
+      .select({
+        failedProbes: sql<number>`count(*) filter (where ${heartbeatRuns.contextSnapshot} ->> 'providerQuotaProbe' = 'true')::integer`,
+        stateStartedAt: sql<Date | null>`min(${heartbeatRuns.finishedAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        eq(heartbeatRuns.status, "failed"),
+        eq(heartbeatRuns.errorCode, "provider_quota"),
+        boundaryAt ? gt(heartbeatRuns.finishedAt, boundaryAt) : undefined,
+      ));
+    const lastFailureAt = new Date(latest.finishedAt);
+    const delayMs = computeProviderQuotaLaneProbeDelayMs({
+      failedProbes: Number(stats?.failedProbes ?? 0),
+      lastFailureAt,
+      stateStartedAt: stats?.stateStartedAt ? new Date(stats.stateStartedAt) : lastFailureAt,
+      policy: parseHeartbeatPolicy(agent).providerQuotaRetry,
+    });
+    const [inFlight] = await client
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        sql`${heartbeatRuns.id} <> ${excludeRunId}`,
+        or(
+          eq(heartbeatRuns.status, "running"),
+          and(
+            eq(heartbeatRuns.status, "queued"),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaProbe' = 'true'`,
+          ),
+        ),
+      ))
+      .limit(1);
+    const [laneRetry] = await client
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, agent.companyId),
+        eq(heartbeatRuns.status, "scheduled_retry"),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey' = ${laneKey}`,
+      ))
+      .limit(1);
+    return {
+      laneKey,
+      inQuotaState: true as const,
+      nextProbeAt: new Date(lastFailureAt.getTime() + delayMs),
+      probeInFlight: Boolean(inFlight),
+      laneRetryWaiting: Boolean(laneRetry),
+    };
+  }
+
+  /**
+   * Coalesces every run of a provider lane in quota state behind one probe per
+   * backoff interval: new assignments, comments and first retries alike. Only
+   * one run probes at a time. A lane chain's retry may probe when nothing else
+   * is in flight, because the coalescing sweep already promotes one retry per
+   * interval. Any other run may probe only when no lane retry is waiting and
+   * the lane backoff has passed. The probe is marked `providerQuotaProbe`
+   * under a lane advisory lock and proceeds; any other run stays queued without
+   * spending a retry and gets one "Waiting on provider capacity" run event.
+   * When a probe succeeds the lane leaves quota state and the queued runs start
+   * through the normal per-agent concurrency limit. An operator "retry now" is
+   * not held back.
+   *
+   * @returns True when the run must stay queued.
+   */
+  async function waitForProviderQuotaLane(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    if (agent.adapterType === "paperclip_runner") return false;
+    if (!parseHeartbeatPolicy(agent).providerQuotaRetry.enabled) return false;
+    if (operatorRequestedRetryNow(run)) return false;
+    if (!(await readProviderQuotaLaneState(agent, run.id)).inQuotaState) return false;
+    const now = new Date();
+    const waiting = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`provider-quota-lane:${agent.companyId}:${providerQuotaKeyForAgent(agent)}`}, 0))`,
+      );
+      const locked = await readProviderQuotaLaneState(agent, run.id, txDb);
+      if (!locked.inQuotaState) return null;
+      const laneRetry =
+        run.retryOfRunId !== null &&
+        parseObject(run.contextSnapshot).providerQuotaKey === locked.laneKey;
+      const mayProbe =
+        !locked.probeInFlight &&
+        (laneRetry ||
+          (!locked.laneRetryWaiting && now.getTime() >= locked.nextProbeAt.getTime()));
+      if (mayProbe) {
+        await txDb
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+              providerQuotaProbe: true,
+              providerQuotaKey: locked.laneKey,
+            })}::jsonb`,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")));
+        return null;
+      }
+      const [flagged] = await txDb
+        .update(heartbeatRuns)
+        .set({
+          // No provider key here: the coalescing sweep reads a keyed queued
+          // run as a probe in flight.
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+            providerQuotaWaitingSince: now.toISOString(),
+          })}::jsonb`,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.status, "queued"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaWaitingSince' is null`,
+        ))
+        .returning();
+      return { locked, newlyWaiting: flagged ?? null };
+    });
+    if (!waiting) return false;
+    if (waiting.newlyWaiting) {
+      await appendRunEvent(waiting.newlyWaiting, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          "Waiting on provider capacity: the provider is at capacity, so one run of it probes at a time; " +
+          "this run starts when a probe succeeds",
+        payload: {
+          providerQuotaKey: waiting.locked.laneKey,
+          nextProbeAt: waiting.locked.nextProbeAt.toISOString(),
+          probeInFlight: waiting.locked.probeInFlight,
+          laneRetryWaiting: waiting.locked.laneRetryWaiting,
+        },
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Records, once per agent and UTC day, that quota failures before useful
+   * action passed the uncounted allowance and now count toward maxDailyRuns.
+   * Best effort: finalization continues if the alarm cannot be written.
+   */
+  async function recordProviderQuotaCapExemptionExhausted(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
+    if (!policy.enabled) return;
+    try {
+      const usage = (await computeDailyRunUsage(agent.companyId, { agentId: agent.id })).get(agent.id) ?? NO_DAILY_RUNS;
+      if (usage.providerQuotaBeforeUsefulAction <= policy.maxDailyUncountedRuns) {
+        return;
+      }
+      const { start } = currentUtcDayWindow();
+      await logActivityOnce({
+        lockKey: `provider-quota-cap-alarm:${agent.id}:${start.toISOString()}`,
+        alreadyRecorded: and(
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, agent.id),
+          gte(activityLog.createdAt, start),
+        ),
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: agent.id,
+        action: PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION,
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          observed: usage.providerQuotaBeforeUsefulAction,
+          limit: policy.maxDailyUncountedRuns,
+          runId: run.id,
+          issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, agentId: agent.id },
+        "failed to record the provider quota cap exemption alarm",
+      );
+    }
+  }
+
+  /**
+   * Writes an activity entry unless one with the same action and
+   * `alreadyRecorded` condition exists. The advisory lock on `lockKey`
+   * serializes writers, so the check and the insert cannot race. `andThen`
+   * runs in the same transaction, after the insert; its issue updates publish
+   * only after the commit.
+   *
+   * @returns True when this call wrote the entry.
+   */
+  async function logActivityOnce(
+    input: LogActivityInput & {
+      lockKey: string;
+      alreadyRecorded: SQL | undefined;
+    },
+    andThen?: (
+      tx: Db,
+      postCommit: {
+        publications: ActivityPublication[];
+        actions: IssuePostCommitAction[];
+      },
+    ) => Promise<void>,
+  ) {
+    const { lockKey, alreadyRecorded, ...entry } = input;
+    const postCommit = {
+      publications: [] as ActivityPublication[],
+      actions: [] as IssuePostCommitAction[],
+    };
+    const recorded = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`,
+      );
+      const [existing] = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, entry.companyId),
+            eq(activityLog.action, entry.action),
+            alreadyRecorded,
+          ),
+        )
+        .limit(1);
+      if (existing) return false;
+      await logActivity(txDb, entry, postCommit.publications);
+      await andThen?.(txDb, postCommit);
+      return true;
+    });
+    for (const publication of postCommit.publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommit.actions);
+    return recorded;
+  }
+
+  /**
+   * Stops a provider-quota retry chain at its ceiling. In one transaction it
+   * writes one `heartbeat.provider_quota_exhausted` activity per chain and
+   * blocks an open issue with an unblock reason, so the stop is visible and a
+   * failed block is retried on the next call instead of being skipped. Best
+   * effort: the caller continues if this fails.
+   *
+   * @returns False when the stop could not be recorded.
+   */
+  async function recordProviderQuotaExhausted(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    chainStartedAt: Date;
+    attempts: number;
+  }) {
+    const { run, agent } = input;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return true;
+    const chainStartedAt = input.chainStartedAt.toISOString();
+    const hours = Math.round(
+      (Date.now() - input.chainStartedAt.getTime()) / (60 * 60 * 1000),
+    );
+    const reason =
+      `The provider (${agent.adapterType}) stayed at capacity for about ${hours} h ` +
+      `across ${input.attempts} automatic retries, so automatic retries stopped. ` +
+      "Unblock the issue once the provider is available.";
+    let blocked = false;
+    try {
+      await logActivityOnce(
+        {
+          lockKey: `provider-quota-exhausted:${run.companyId}:${issueId}:${chainStartedAt}`,
+          alreadyRecorded: and(
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issueId),
+            sql`${activityLog.details} ->> 'chainStartedAt' = ${chainStartedAt}`,
+          ),
+          companyId: run.companyId,
+          actorType: "system",
+          actorId: "heartbeat",
+          agentId: agent.id,
+          runId: run.id,
+          action: PROVIDER_QUOTA_EXHAUSTED_ACTION,
+          entityType: "issue",
+          entityId: issueId,
+          details: {
+            chainStartedAt,
+            attempts: input.attempts,
+            provider: agent.adapterType,
+            runId: run.id,
+          },
+        },
+        async (tx, postCommit) => {
+          const [issue] = await tx
+            .select({ status: issues.status })
+            .from(issues)
+            .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+            .for("update");
+          if (
+            issue?.status !== "todo" &&
+            issue?.status !== "in_progress" &&
+            issue?.status !== "in_review"
+          ) {
+            return;
+          }
+          await issuesSvc.update(
+            issueId,
+            {
+              status: "blocked",
+              unblockDescriptor: { owner: "board", action: reason },
+              companyGuard: run.companyId,
+            },
+            tx,
+            postCommit.publications,
+            postCommit.actions,
+          );
+          blocked = true;
+        },
+      );
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, issueId },
+        "failed to record provider quota retry exhaustion",
+      );
+      return false;
+    }
+    if (blocked) {
+      await issuesSvc
+        .addComment(
+          issueId,
+          `Provider capacity retries stopped. ${reason}`,
+          { runId: run.id },
+          { authorType: "system" },
+        )
+        .catch((err) => {
+          logger.warn({ err, runId: run.id, issueId }, "failed to comment on provider quota retry exhaustion");
+        });
+    }
+    return true;
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -15636,16 +16296,34 @@ export function heartbeatService(
       opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason =
       opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    const providerQuotaRetry =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      opts?.maxAttempts == null &&
+      opts?.delayMs == null
+        ? resolveProviderQuotaRetry(run, agent)
+        : null;
     const maxAttempts = Math.max(
       0,
       Math.floor(
-        opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+        opts?.maxAttempts ??
+          providerQuotaRetry?.policy.maxTotalAttempts ??
+          BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       ),
     );
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);
     const nextAttempt = consumedAttempts + 1;
-    const computedBaseSchedule =
-      opts?.delayMs != null
+    const providerQuotaSchedule = providerQuotaRetry
+      ? computeProviderQuotaRetrySchedule({
+          attempt: nextAttempt,
+          now,
+          chainStartedAt: providerQuotaRetry.chainStartedAt,
+          policy: providerQuotaRetry.policy,
+          random: opts?.random,
+        })
+      : null;
+    const computedBaseSchedule = providerQuotaRetry
+      ? providerQuotaSchedule
+      : (opts?.delayMs != null
         ? nextAttempt <= maxAttempts
           ? {
               attempt: nextAttempt,
@@ -15663,7 +16341,7 @@ export function heartbeatService(
               now,
               opts?.random,
             )
-          : null;
+          : null);
     const baseSchedule = computedBaseSchedule
       ? { ...computedBaseSchedule, maxAttempts }
       : null;
@@ -15694,6 +16372,14 @@ export function heartbeatService(
         payload: exhaustion,
         retryExhaustion: exhaustion,
       });
+      if (providerQuotaRetry) {
+        await recordProviderQuotaExhausted({
+          run,
+          agent,
+          chainStartedAt: providerQuotaRetry.chainStartedAt,
+          attempts: consumedAttempts,
+        });
+      }
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         await escalatePlanApprovalResumeFailureNeedsAttention({
           run,
@@ -15877,6 +16563,18 @@ export function heartbeatService(
             }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+        // Only a quota-lane retry carries the chain start; any other retry
+        // drops it so a later quota failure starts a fresh chain. Every retry
+        // of a provider_quota failure carries the provider key, so the
+        // coalescing sweep paces it with the other chains of the lane.
+        providerQuotaRetryStartedAt:
+          providerQuotaRetry?.chainStartedAt.toISOString(),
+        providerQuotaKey:
+          providerQuotaRetry ||
+          (transientRecovery?.errorFamily === "provider_quota" &&
+            parseHeartbeatPolicy(agent).providerQuotaRetry.enabled)
+            ? providerQuotaKeyForAgent(agent)
+            : undefined,
       },
       "normal_model",
     );
@@ -16448,10 +17146,16 @@ export function heartbeatService(
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
+      message:
+        providerQuotaSchedule?.phase === "slow"
+          ? `Scheduled provider quota retry ${schedule.attempt} at the hourly recovery cadence for ${schedule.dueAt.toISOString()}`
+          : `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
       payload: {
         retryRunId: retryRun.id,
         retryReason,
+        ...(providerQuotaSchedule
+          ? { providerQuotaRetryPhase: providerQuotaSchedule.phase }
+          : {}),
         ...(transientRecovery
           ? { errorFamily: transientRecovery.errorFamily }
           : {}),
@@ -16758,7 +17462,186 @@ export function heartbeatService(
     });
   }
 
+  /**
+   * Coalesces provider-quota retries per company and provider (the agent's
+   * adapter type and model). While the provider is in quota state, one retry probes at
+   * a time: the retry of the oldest chain. Other due retries wait one base
+   * delay past the probe's next attempt, or past a probe that is running, so
+   * at most one probe runs per backoff interval. Once a probe succeeds, every
+   * waiting retry is released. A waiting retry that would pass its chain's
+   * ceiling is cancelled and its issue blocked. An operator "retry now" is
+   * not held back; it exempts only the retry it was requested for.
+   */
+  async function coalesceProviderQuotaRetries(now: Date) {
+    const providerKey = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey'`;
+    const groups = await db
+      .selectDistinct({ companyId: heartbeatRuns.companyId, key: providerKey })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          sql`${providerKey} is not null`,
+        ),
+      );
+    for (const group of groups) {
+      try {
+        await coalesceProviderQuotaGroup(group.companyId, group.key, now);
+      } catch (err) {
+        logger.warn(
+          { err, companyId: group.companyId, provider: group.key },
+          "failed to coalesce provider quota retries",
+        );
+      }
+    }
+  }
+
+  /**
+   * True when an operator asked to retry this scheduled row now. Successor
+   * retries copy the context, so a request older than the row belongs to an
+   * earlier retry in the chain and does not exempt this one.
+   */
+  function operatorRequestedRetryNow(run: typeof heartbeatRuns.$inferSelect) {
+    const requestedAt = dateValue(parseObject(run.contextSnapshot).retryNowRequestedAt);
+    return requestedAt !== null && requestedAt.getTime() >= run.createdAt.getTime();
+  }
+
+  async function coalesceProviderQuotaGroup(
+    companyId: string,
+    key: string,
+    now: Date,
+  ) {
+    const inGroup = and(
+      eq(heartbeatRuns.companyId, companyId),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey' = ${key}`,
+    );
+    const chainStartOf = (run: typeof heartbeatRuns.$inferSelect) =>
+      dateValue(parseObject(run.contextSnapshot).providerQuotaRetryStartedAt) ??
+      run.createdAt;
+    const expired = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`provider-quota-probe:${companyId}:${key}`}, 0))`,
+      );
+      const waiting = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(inGroup, eq(heartbeatRuns.status, "scheduled_retry")))
+        .for("update");
+      if (waiting.length === 0) return [];
+
+      const newestWaitingAt = new Date(
+        Math.max(...waiting.map((run) => run.createdAt.getTime())),
+      );
+      const [recovered] = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            inGroup,
+            eq(heartbeatRuns.status, "succeeded"),
+            gt(heartbeatRuns.finishedAt, newestWaitingAt),
+          ),
+        )
+        .limit(1);
+      if (recovered) {
+        await tx
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: now, updatedAt: now })
+          .where(
+            and(
+              inGroup,
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              gt(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          );
+        return [];
+      }
+
+      const [inFlight] = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(inGroup, inArray(heartbeatRuns.status, ["queued", "running"])))
+        .limit(1);
+      const leader = inFlight
+        ? null
+        : [...waiting].sort(
+            (a, b) =>
+              chainStartOf(a).getTime() - chainStartOf(b).getTime() ||
+              (a.scheduledRetryAt?.getTime() ?? 0) -
+                (b.scheduledRetryAt?.getTime() ?? 0) ||
+              a.id.localeCompare(b.id),
+          )[0];
+      // Hold until just after the probe's next attempt, but re-check at
+      // least at the hourly cadence: a probe that waits for a provider reset
+      // days away must not push followers past their ceilings at once.
+      const holdUntil = new Date(
+        Math.min(
+          Math.max(now.getTime(), leader?.scheduledRetryAt?.getTime() ?? 0),
+          now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+        ) + PROVIDER_QUOTA_RETRY_BASE_DELAY_MS,
+      );
+      const held = waiting.filter(
+        (run) =>
+          run.id !== leader?.id &&
+          run.scheduledRetryAt !== null &&
+          run.scheduledRetryAt.getTime() <= now.getTime() &&
+          !operatorRequestedRetryNow(run),
+      );
+      if (held.length === 0) return [];
+      await tx
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAt: holdUntil, updatedAt: now })
+        .where(
+          and(
+            inArray(heartbeatRuns.id, held.map((run) => run.id)),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            lte(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        );
+      const heldAgents = await tx
+        .select()
+        .from(agents)
+        .where(inArray(agents.id, [...new Set(held.map((run) => run.agentId))]));
+      return held.flatMap((run) => {
+        const agent = heldAgents.find((row) => row.id === run.agentId);
+        if (!agent) return [];
+        const { maxRetryMs } = parseHeartbeatPolicy(agent).providerQuotaRetry;
+        return holdUntil.getTime() > chainStartOf(run).getTime() + maxRetryMs
+          ? [{ run, agent }]
+          : [];
+      });
+    });
+
+    for (const { run, agent } of expired) {
+      try {
+        // Stop and block first: if that fails, the row is still a scheduled
+        // retry and the next sweep tries again. Recording is idempotent.
+        const source = run.retryOfRunId ? await getRun(run.retryOfRunId) : null;
+        const stopped = await recordProviderQuotaExhausted({
+          run: source ?? run,
+          agent,
+          chainStartedAt: chainStartOf(run),
+          attempts: Math.max(0, (run.scheduledRetryAttempt ?? 1) - 1),
+        });
+        if (!stopped) continue;
+        // No immediate recovery: a continuation run would be another probe.
+        await cancelRunInternal(
+          run.id,
+          "Provider capacity retries stopped: the chain reached its retry ceiling while waiting for the provider.",
+          { errorCode: "provider_quota_exhausted", suppressImmediateRecovery: true },
+        );
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id },
+          "failed to stop a provider quota retry past its ceiling",
+        );
+      }
+    }
+  }
+
   async function promoteDueScheduledRetries(now = new Date()) {
+    await coalesceProviderQuotaRetries(now).catch((err) => {
+      logger.warn({ err }, "failed to coalesce provider quota retries");
+    });
     const cutoff = await getWorktreeExecutionCutoff();
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
@@ -17013,6 +17896,9 @@ export function heartbeatService(
           heartbeat.dailySpendCentsLimit ??
           heartbeat.dailyBudgetCents,
       ),
+      providerQuotaRetry: parseProviderQuotaRetryPolicy(
+        heartbeat.providerQuotaRetry,
+      ),
     };
   }
 
@@ -17048,6 +17934,63 @@ export function heartbeatService(
     return { start, end };
   }
 
+  /**
+   * The single definition of how many runs `maxDailyRuns` counts, per agent,
+   * in one UTC day. The cap check (`getHeartbeatDailyCapBlock`), the run
+   * stats (`runStats`) and the provider quota alarm all read it, so what
+   * automation reads from the stats is exactly what the cap enforces. A run
+   * that the cap should not charge is taken out of the count here and in
+   * `countedDailyRuns`, and nowhere else.
+   *
+   * Counted: runs started in the day that are not queued or waiting to retry.
+   * `providerQuotaBeforeUsefulAction` is the part of them that failed on a
+   * provider quota before any useful action; `countedDailyRuns` decides how
+   * many of those the cap forgives.
+   *
+   * @param companyId - the company whose runs are counted.
+   * @param options.agentId - count one agent; omit to count every agent that has runs.
+   * @param options.excludeRunId - a run to leave out (the run being admitted).
+   * @param options.window - the UTC day; defaults to the current one.
+   * @returns the usage per agent ID; an agent with none is absent.
+   */
+  async function computeDailyRunUsage(
+    companyId: string,
+    options: {
+      agentId?: string;
+      excludeRunId?: string | null;
+      window?: { start: Date; end: Date };
+    } = {},
+    client: Pick<Db, "select"> = db,
+  ): Promise<Map<string, DailyRunUsage>> {
+    const window = options.window ?? currentUtcDayWindow();
+    const conditions = [
+      eq(heartbeatRuns.companyId, companyId),
+      gte(heartbeatRuns.startedAt, window.start),
+      lt(heartbeatRuns.startedAt, window.end),
+      notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
+      ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
+    ];
+    const rows = await client
+      .select({
+        agentId: heartbeatRuns.agentId,
+        total: sql<number>`count(*)::integer`,
+        providerQuotaBeforeUsefulAction: sql<number>`count(*) filter (where ${heartbeatRuns.status} = 'failed' and ${heartbeatRuns.resultJson} ->> 'providerQuotaBeforeUsefulAction' = 'true')::integer`,
+      })
+      .from(heartbeatRuns)
+      .where(and(...conditions))
+      .groupBy(heartbeatRuns.agentId);
+    return new Map(
+      rows.map((row) => [
+        row.agentId,
+        {
+          total: Number(row.total),
+          providerQuotaBeforeUsefulAction: Number(row.providerQuotaBeforeUsefulAction),
+        },
+      ]),
+    );
+  }
+
   async function getHeartbeatDailyCapBlock(
     agent: typeof agents.$inferSelect,
     policy: ReturnType<typeof parseHeartbeatPolicy>,
@@ -17062,21 +18005,12 @@ export function heartbeatService(
     const checkCostCap = options.checkCostCap ?? true;
     const { start, end } = currentUtcDayWindow();
     if (checkRunCap && policy.maxDailyRuns !== null) {
-      const conditions = [
-        eq(heartbeatRuns.companyId, agent.companyId),
-        eq(heartbeatRuns.agentId, agent.id),
-        gte(heartbeatRuns.startedAt, start),
-        lt(heartbeatRuns.startedAt, end),
-        notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
-      ];
-      if (options.excludeRunId) {
-        conditions.push(sql`${heartbeatRuns.id} <> ${options.excludeRunId}`);
-      }
-      const [row] = await client
-        .select({ total: sql<number>`count(*)::integer` })
-        .from(heartbeatRuns)
-        .where(and(...conditions));
-      const observed = Number(row?.total ?? 0);
+      const usage = await computeDailyRunUsage(
+        agent.companyId,
+        { agentId: agent.id, excludeRunId: options.excludeRunId, window: { start, end } },
+        client,
+      );
+      const observed = countedDailyRuns(usage.get(agent.id) ?? NO_DAILY_RUNS, policy);
       if (observed >= policy.maxDailyRuns) {
         return {
           reason: "heartbeat.daily_run_limit",
@@ -17615,6 +18549,7 @@ export function heartbeatService(
       await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock);
       return null;
     }
+    if (await waitForProviderQuotaLane(run, agent)) return null;
 
     const issueId = readNonEmptyString(context.issueId);
     if (issueId && activeRunExecutions.size > 0) {
@@ -18642,6 +19577,51 @@ export function heartbeatService(
         ),
       },
     };
+  }
+
+  /**
+   * Marks a provider-quota failure that happened before any useful action:
+   * the model produced no output and the run left no comment, document,
+   * work product, activity or run event beyond lifecycle, invocation and
+   * error records. Any tool or action event counts as useful action, so a run
+   * that may have caused an external side effect is never replayed for free.
+   * The server owns the marker, so an adapter-supplied value is dropped.
+   */
+  async function withProviderQuotaUsefulActionMarker(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    // Typed from the resolution so the stale string run.runtimeMode cannot be passed.
+    runtimeKind: NativeRuntimeResolution["kind"];
+    outcome: string;
+    errorCode: string | null;
+    outputTokens: number;
+    resultJson: Record<string, unknown> | null;
+  }) {
+    const { resultJson } = input;
+    const marked =
+      isProviderQuotaUsefulActionCandidate(input) &&
+      !(await runLeftDurableActionEvidence(input.run));
+    if (!marked && !(resultJson && "providerQuotaBeforeUsefulAction" in resultJson)) {
+      return resultJson;
+    }
+    const result = { ...resultJson };
+    delete result.providerQuotaBeforeUsefulAction;
+    return marked ? { ...result, providerQuotaBeforeUsefulAction: true } : result;
+  }
+
+  /** An unreadable evidence check counts as useful work: the run is charged as before. */
+  async function runLeftDurableActionEvidence(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    try {
+      const { evidence } = await buildRunLivenessInput(run, run.resultJson);
+      return hasConcreteActionEvidence(evidence);
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id },
+        "could not read run action evidence; treating the provider quota failure as charged",
+      );
+      return true;
+    }
   }
 
   async function classifyAndPersistRunLiveness(
@@ -19757,6 +20737,7 @@ export function heartbeatService(
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       await startNextQueuedRunForAgent(run.agentId);
+      await redeliverDeferredWakesForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
@@ -19885,6 +20866,456 @@ export function heartbeatService(
         await repark(tx as unknown as Db, wake);
       }
     });
+  }
+
+  // Counters for deferred-wake redelivery, kept per company so a reader of one
+  // company never sees another company's activity. They reset on restart;
+  // `getDeferredWakeStats` pairs them with durable counts read from the queue.
+  type DeferredWakeCompanyCounters = {
+    examined: number;
+    promoted: number;
+    retired: number;
+    stillDeferred: number;
+    skippedHeld: number;
+    skippedBudget: number;
+    skippedNotInvokable: number;
+    failed: number;
+    lastExaminedAt: Date | null;
+  };
+  const deferredWakeSweepCounters = new Map<string, DeferredWakeCompanyCounters>();
+  const countersForCompany = (companyId: string) => {
+    let counters = deferredWakeSweepCounters.get(companyId);
+    if (!counters) {
+      counters = {
+        examined: 0,
+        promoted: 0,
+        retired: 0,
+        stillDeferred: 0,
+        skippedHeld: 0,
+        skippedBudget: 0,
+        skippedNotInvokable: 0,
+        failed: 0,
+        lastExaminedAt: null,
+      };
+      deferredWakeSweepCounters.set(companyId, counters);
+    }
+    return counters;
+  };
+  // The completion trigger runs after a run frees a slot. Promotion queues a run
+  // whose start calls `startNextQueuedRunForAgent` again, so one pass per agent.
+  const deferredWakeCompletionPassesInFlight = new Set<string>();
+
+  /**
+   * The holds that mean "do not wake this issue" and need more than a column to
+   * prove: an active subtree pause hold, an execution blocker that awaits an
+   * operator, and an operator Stop. An operator Stop never promotes old queued
+   * work by itself; the next explicit wake adopts it. Read once for a whole
+   * batch: one pause-hold probe per company, one latest-run read for all issues,
+   * and the per-issue blocker read only for the wakes about to be promoted.
+   */
+  async function readDeferredWakeHolds(candidates: readonly OrphanedDeferredWakeRow[]) {
+    const holds = new Map<string, "pause_hold" | "execution_blocker" | "operator_stop">();
+    const blockers = new Map<string, ExecutionBlocker>();
+    if (candidates.length === 0) return { holds, blockers };
+
+    const companyIds = [...new Set(candidates.map((candidate) => candidate.companyId))];
+    const companiesWithPauseHold = new Set(
+      (await db
+        .selectDistinct({ companyId: issueTreeHolds.companyId })
+        .from(issueTreeHolds)
+        .where(and(
+          inArray(issueTreeHolds.companyId, companyIds),
+          eq(issueTreeHolds.status, "active"),
+          eq(issueTreeHolds.mode, "pause"),
+        ))).map((row) => row.companyId),
+    );
+
+    const issueKey = sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+    const latestRuns = await db
+      .selectDistinctOn([issueKey])
+      .from(heartbeatRuns)
+      .where(and(
+        inArray(heartbeatRuns.companyId, companyIds),
+        sql`${issueKey} in (${sql.join(
+          [...new Set(candidates.map((candidate) => candidate.issueId))].map((issueId) => sql`${issueId}`),
+          sql`, `,
+        )})`,
+      ))
+      .orderBy(issueKey, desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+    const latestRunByIssueId = new Map(
+      latestRuns.map((run) => [String(parseObject(run.contextSnapshot).issueId), run]),
+    );
+
+    for (const candidate of candidates) {
+      if (
+        companiesWithPauseHold.has(candidate.companyId) &&
+        (await treeControlSvc.getActivePauseHoldGate(candidate.companyId, candidate.issueId))
+      ) {
+        holds.set(candidate.wakeId, "pause_hold");
+        continue;
+      }
+      const executionBlocker = await getExecutionBlocker(db, candidate.companyId, candidate.issueId);
+      if (executionBlocker) {
+        holds.set(candidate.wakeId, "execution_blocker");
+        blockers.set(candidate.wakeId, executionBlocker);
+        continue;
+      }
+      const latest = latestRunByIssueId.get(candidate.issueId);
+      if (
+        latest &&
+        (isAcknowledgedNativeReassignmentStop(latest) ||
+          (latest.status === "cancelled" &&
+            (parseObject(latest.resultJson?.executionCancellation).state === "acknowledged" ||
+              isAcknowledgedNativeStop(latest))))
+      ) {
+        holds.set(candidate.wakeId, "operator_stop");
+      }
+    }
+    return { holds, blockers };
+  }
+
+  /**
+   * Records, once per wake, that the sweep keeps a wake parked longer than
+   * `DEFERRED_WAKE_HELD_NOTICE_MS`, whatever holds it: no free run slot, an agent
+   * that cannot run, a budget stop, a pause hold, an operator Stop, an execution
+   * blocker (with its cause, run and recovery action) or admission deferring it
+   * again. The advisory lock makes the check and the insert atomic.
+   */
+  async function recordDeferredWakeHeld(
+    candidate: OrphanedDeferredWakeRow,
+    reason: DeferredWakeHeldReason,
+    blocker: ExecutionBlocker | null,
+  ) {
+    const publications: ActivityPublication[] = [];
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`deferred-wake-held:${candidate.wakeId}`}, 0))`,
+      );
+      const [existing] = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.action, DEFERRED_WAKE_HELD_ACTION),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.issueId),
+          sql`${activityLog.details} ->> 'wakeId' = ${candidate.wakeId}`,
+        ))
+        .limit(1);
+      if (existing) return;
+      await logActivity(txDb, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: candidate.agentId,
+        action: DEFERRED_WAKE_HELD_ACTION,
+        entityType: "issue",
+        entityId: candidate.issueId,
+        details: {
+          wakeId: candidate.wakeId,
+          reason,
+          parkedSince: candidate.requestedAt.toISOString(),
+          ...(blocker
+            ? {
+                cause: blocker.cause,
+                runId: blocker.runId,
+                recoveryActionId: blocker.recoveryActionId,
+                nextAction: blocker.nextAction,
+              }
+            : {}),
+        },
+      }, publications);
+    });
+    for (const publication of publications) publishActivity(publication);
+  }
+
+  /**
+   * Re-drives one orphaned wake through ordinary admission. Admission takes the
+   * issue-row lock, compare-and-swaps the parked receipt, applies every gate
+   * (budget, pause hold, execution blocker, dependencies, a closed task, a former
+   * assignee), creates the successor run and consumes the receipt in ONE
+   * transaction. A concurrent release drain, adoption or cancellation that got
+   * the lock first leaves nothing to deliver, so a wake starts at most one run
+   * and never leaves a second parked receipt behind.
+   */
+  async function redeliverDeferredWake(candidate: OrphanedDeferredWakeRow) {
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.id, candidate.wakeId),
+      eq(agentWakeupRequests.companyId, candidate.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ));
+    if (!wake) return "retired" as const;
+    // The context rides inside the receipt's payload; hand it back as the
+    // wake's context so the successor run is built as the original would be.
+    const { [DEFERRED_WAKE_CONTEXT_KEY]: deferredContext, ...payload } = parseObject(wake.payload);
+    const context = parseObject(deferredContext);
+    await enqueueWakeup(wake.agentId, {
+      source: (wake.source ?? "automation") as WakeupOptions["source"],
+      triggerDetail: (wake.triggerDetail ?? "system") as WakeupOptions["triggerDetail"],
+      // A parked receipt's own reason is the deferral; the wake's reason is in its context.
+      reason: readNonEmptyString(context.wakeReason) ?? wake.reason,
+      payload,
+      contextSnapshot: context,
+      requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+      requestedByActorId: wake.requestedByActorId,
+      redeliverDeferredWake: true,
+    }, wake.id);
+    const [after] = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, candidate.wakeId));
+    if (!after || after.status === "deferred_issue_execution") return "stillDeferred" as const;
+    return after.runId ? ("promoted" as const) : ("retired" as const);
+  }
+
+  /**
+   * Safety net for deferred wakes nothing will promote. A wake is parked behind
+   * its issue's execution lock and promoted when the holder releases; several
+   * paths clear that lock without the drain (the stale-lock sweeper, the
+   * claim-time stale-run cancel, a reaped holder), and the older recovery only
+   * saw comment-shaped wakes of an agent that had already run the issue. This
+   * finds every wake whose open issue has no lock and no live run, skips held
+   * work, and re-delivers in priority then FIFO order, at most one per issue
+   * and one per free agent slot, and at most `DEFERRED_WAKE_SWEEP_MAX_PER_PASS`
+   * per pass so a backlog drains over several passes instead of one burst.
+   * Idempotent: an optimistic claim on the wake and the issue-locked admission
+   * mean concurrent passes can start at most one run per wake.
+   */
+  async function sweepDeferredWakes(opts: {
+    agentId?: string;
+    /** `0` for the run-completion trigger; the periodic sweep waits `DEFERRED_WAKE_SWEEP_MIN_AGE_MS`. */
+    minAgeMs?: number;
+    recheckMs?: number;
+    maxPromotions?: number;
+    now?: Date;
+  } = {}) {
+    const result = {
+      scanned: 0,
+      promoted: 0,
+      retired: 0,
+      stillDeferred: 0,
+      skippedHeld: 0,
+      skippedBudget: 0,
+      skippedNotInvokable: 0,
+      skippedCapacity: 0,
+      failed: 0,
+    };
+    if ((await getSchedulingSuppression()).suppressed) return result;
+    const now = opts.now ?? new Date();
+    if (!opts.agentId) {
+      // A wake parked on a closed task will never run; finalize it instead of
+      // keeping it parked.
+      const retiredClosed = await wakeQueue.retireClosedIssueDeferredWakes({
+        now,
+        minAgeMs: DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+      });
+      result.retired += retiredClosed.length;
+      for (const wake of retiredClosed) countersForCompany(wake.companyId).retired += 1;
+    }
+
+    const orphans = await wakeQueue.listOrphanedDeferredWakes({
+      now,
+      minAgeMs: opts.minAgeMs ?? DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+      recheckMs: opts.recheckMs ?? DEFERRED_WAKE_SWEEP_RECHECK_MS,
+      ...(opts.agentId ? { agentId: opts.agentId } : {}),
+      requestedAtGte: await getWorktreeExecutionCutoff(),
+    });
+    result.scanned = orphans.length;
+    if (orphans.length === 0) return result;
+    for (const orphan of orphans) {
+      const counters = countersForCompany(orphan.companyId);
+      counters.examined += 1;
+      counters.lastExaminedAt = now;
+    }
+
+    // Agent facts for the whole batch: the agents, each company's org rows for
+    // the invokability chain, and each agent's running count, in three reads.
+    const agentIds = [...new Set(orphans.map((orphan) => orphan.agentId))];
+    const agentRows = await db.select().from(agents).where(inArray(agents.id, agentIds));
+    const agentById = new Map(agentRows.map((row) => [row.id, row]));
+    const orgRowsByCompany = new Map<string, AgentOrgRow[]>();
+    for (const companyId of new Set(agentRows.map((row) => row.companyId))) {
+      orgRowsByCompany.set(companyId, await listCompanyAgentOrgRows(companyId));
+    }
+    const runningRows = await db
+      .select({ agentId: heartbeatRuns.agentId, running: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(and(inArray(heartbeatRuns.agentId, agentIds), eq(heartbeatRuns.status, "running")))
+      .groupBy(heartbeatRuns.agentId);
+    const runningByAgent = new Map(runningRows.map((row) => [row.agentId, Number(row.running)]));
+
+    const freeSlotsByAgent = new Map<string, number>();
+    const notInvokableAgentIds = new Set<string>();
+    for (const agentId of agentIds) {
+      const agent = agentById.get(agentId);
+      if (!agent) continue;
+      const invokable = evaluateAgentInvokability(toAgentOrgRow(agent), orgRowsByCompany.get(agent.companyId) ?? [])
+        .invokable;
+      if (!invokable) {
+        notInvokableAgentIds.add(agentId);
+        continue;
+      }
+      freeSlotsByAgent.set(
+        agentId,
+        Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - (runningByAgent.get(agentId) ?? 0)),
+      );
+    }
+    // A wake of an agent that cannot run waits for it. Move those wakes to the
+    // back of the recheck window in one write, so they cannot crowd out others.
+    const notInvokableWakes = orphans.filter((orphan) => notInvokableAgentIds.has(orphan.agentId));
+    if (notInvokableWakes.length > 0) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        inArray(agentWakeupRequests.id, notInvokableWakes.map((orphan) => orphan.wakeId)),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      for (const orphan of notInvokableWakes) countersForCompany(orphan.companyId).skippedNotInvokable += 1;
+      result.skippedNotInvokable = notInvokableWakes.length;
+    }
+    // Why each examined wake stays parked this pass; promoted wakes are removed.
+    const heldReasons = new Map<string, { reason: DeferredWakeHeldReason; blocker: ExecutionBlocker | null }>(
+      orphans.map((orphan) => [
+        orphan.wakeId,
+        {
+          reason: notInvokableAgentIds.has(orphan.agentId)
+            ? "agent_not_invokable"
+            : (freeSlotsByAgent.get(orphan.agentId) ?? 0) === 0
+              ? "no_free_run_slot"
+              : "waiting_for_turn",
+          blocker: null,
+        },
+      ]),
+    );
+
+    const selected = selectDeferredWakesToPromote(orphans, freeSlotsByAgent, {
+      maxTotal: sweepPromotionBudget(opts.maxPromotions),
+    });
+    result.skippedCapacity = Math.max(
+      0,
+      new Set(orphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId)).map((orphan) => orphan.issueId)).size -
+        selected.length,
+    );
+    const { holds, blockers } = await readDeferredWakeHolds(selected);
+    // Company, agent and project decide a budget block, so one read serves every
+    // wake that shares them.
+    const budgetBlockByScope = new Map<string, boolean>();
+
+    for (const candidate of selected) {
+      const counters = countersForCompany(candidate.companyId);
+      try {
+        const claimed = await wakeQueue.claimDeferredWakeExamination({
+          companyId: candidate.companyId,
+          wakeId: candidate.wakeId,
+          observedUpdatedAt: candidate.observedUpdatedAt,
+          now: new Date(),
+        });
+        if (!claimed) {
+          // Another pass owns this wake now.
+          heldReasons.delete(candidate.wakeId);
+          continue;
+        }
+        const hold = holds.get(candidate.wakeId);
+        if (hold) {
+          result.skippedHeld += 1;
+          counters.skippedHeld += 1;
+          heldReasons.set(candidate.wakeId, { reason: hold, blocker: blockers.get(candidate.wakeId) ?? null });
+          continue;
+        }
+        const budgetScope = `${candidate.companyId}:${candidate.agentId}:${candidate.projectId ?? ""}`;
+        if (!budgetBlockByScope.has(budgetScope)) {
+          budgetBlockByScope.set(
+            budgetScope,
+            Boolean(await budgets.getInvocationBlock(candidate.companyId, candidate.agentId, {
+              issueId: candidate.issueId,
+              projectId: candidate.projectId,
+            })),
+          );
+        }
+        if (budgetBlockByScope.get(budgetScope)) {
+          // A hard stop leaves the receipt parked and untouched: no run row is
+          // created and none is cancelled later. It resumes when the budget does.
+          result.skippedBudget += 1;
+          counters.skippedBudget += 1;
+          heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
+          continue;
+        }
+        const outcome = await redeliverDeferredWake(candidate);
+        result[outcome] += 1;
+        counters[outcome] += 1;
+        if (outcome === "stillDeferred") {
+          heldReasons.set(candidate.wakeId, { reason: "admission_deferred", blocker: null });
+        } else {
+          heldReasons.delete(candidate.wakeId);
+        }
+      } catch (err) {
+        result.failed += 1;
+        counters.failed += 1;
+        heldReasons.delete(candidate.wakeId);
+        logger.warn({ err, queueId: candidate.wakeId }, "failed to re-deliver an orphaned deferred wake");
+      }
+    }
+
+    for (const orphan of orphans) {
+      const held = heldReasons.get(orphan.wakeId);
+      if (!held || now.getTime() - orphan.requestedAt.getTime() < DEFERRED_WAKE_HELD_NOTICE_MS) continue;
+      await recordDeferredWakeHeld(orphan, held.reason, held.blocker).catch((err) => {
+        logger.warn({ err, wakeId: orphan.wakeId }, "failed to record a held deferred wake");
+      });
+    }
+
+    if (result.promoted > 0 || result.failed > 0) {
+      logger.warn({ ...result }, "re-delivered orphaned deferred issue-execution wakes");
+    }
+    return result;
+  }
+
+  /**
+   * Run-completion trigger: a run just freed one of this agent's slots, so
+   * promote its oldest (priority-aware) orphaned deferred wake now instead of
+   * waiting for the periodic sweep. Best effort; the periodic sweep is the net.
+   */
+  async function redeliverDeferredWakesForAgent(agentId: string) {
+    if (deferredWakeCompletionPassesInFlight.has(agentId)) return;
+    deferredWakeCompletionPassesInFlight.add(agentId);
+    try {
+      await sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
+    } catch (err) {
+      logger.warn({ err, agentId }, "failed to re-deliver deferred wakes after a run completed");
+    } finally {
+      deferredWakeCompletionPassesInFlight.delete(agentId);
+    }
+  }
+
+  /**
+   * Per-agent deferred-queue health for the API: how many wakes are parked, how
+   * long the oldest has waited, and how many were promoted recently. The sweep
+   * counters are this company's own, since the last server restart.
+   */
+  async function getDeferredWakeStats(companyId: string, now = new Date()) {
+    const perAgent = await wakeQueue.getDeferredWakeAgentStats({ companyId, now });
+    const agentStats = perAgent.map((row) => ({
+      agentId: row.agentId,
+      agentName: row.agentName,
+      deferredCount: row.deferredCount,
+      oldestDeferredAt: row.oldestDeferredAt,
+      oldestDeferredAgeSeconds: row.oldestDeferredAt
+        ? Math.max(0, Math.round((now.getTime() - row.oldestDeferredAt.getTime()) / 1000))
+        : null,
+      promotedLast24h: row.promotedLast24h,
+    }));
+    const oldest = agentStats
+      .map((row) => row.oldestDeferredAt)
+      .filter((at): at is Date => at !== null)
+      .sort((left, right) => left.getTime() - right.getTime())[0] ?? null;
+    return {
+      generatedAt: now,
+      deferredTotal: agentStats.reduce((sum, row) => sum + row.deferredCount, 0),
+      promotedLast24h: agentStats.reduce((sum, row) => sum + row.promotedLast24h, 0),
+      oldestDeferredAt: oldest,
+      oldestDeferredAgeSeconds: oldest ? Math.max(0, Math.round((now.getTime() - oldest.getTime()) / 1000)) : null,
+      agents: agentStats,
+      sweep: { ...countersForCompany(companyId) },
+    };
   }
 
   async function resumeQueuedRuns() {
@@ -20019,6 +21450,13 @@ export function heartbeatService(
         logger.error({ err, runId: run.id }, "failed to retry interrupted comment queue");
       });
     }
+
+    // Every deferred wake above waits for a specific trigger. Any other wake
+    // whose issue lock is already free has no run left to promote it, so
+    // re-deliver it here instead of leaving it parked indefinitely.
+    await sweepDeferredWakes().catch((err) => {
+      logger.error({ err }, "failed to sweep orphaned deferred wakes");
+    });
 
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
@@ -20629,12 +22067,24 @@ export function heartbeatService(
     return promise;
   }
 
-  async function executeRun(
+  function executeRun(
     runId: string,
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
     } = {},
+  ) {
+    // Temp entries the run creates carry its id, so the temp sweep can prove
+    // the run ended before it removes them.
+    return runWithPaperclipTempRun(runId, () => executeRunAttempt(runId, runOptions));
+  }
+
+  async function executeRunAttempt(
+    runId: string,
+    runOptions: {
+      nativeLeaseOwner?: string;
+      nativeRestartRecovery?: NativeRestartRecoveryClaim;
+    },
   ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
@@ -25858,7 +27308,14 @@ export function heartbeatService(
               } as Record<string, unknown>)
             : null;
 
-        const persistedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
+        const persistedResultJson = await withProviderQuotaUsefulActionMarker({
+          run,
+          // The in-memory run predates native selection; use the resolution.
+          runtimeKind: nativeRuntimeResolution.kind,
+          outcome,
+          errorCode: runErrorCode,
+          outputTokens: normalizedUsage?.outputTokens ?? 0,
+          resultJson: cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
           mergeRunStopMetadataForAgent(agent, outcome, {
             resultJson: mergeAdapterRecoveryMetadata({
               resultJson: {
@@ -25886,7 +27343,8 @@ export function heartbeatService(
             errorMessage: runErrorMessage,
           }),
           adapterResult.summary ?? null,
-        ), runErrorCode, runErrorMessage);
+          ), runErrorCode, runErrorMessage),
+        });
 
         const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
           finishedAt: new Date(),
@@ -25963,6 +27421,9 @@ export function heartbeatService(
               persistedRun,
               persistedResultJson,
             )) ?? persistedRun;
+          if (persistedResultJson?.providerQuotaBeforeUsefulAction === true) {
+            await recordProviderQuotaCapExemptionExhausted(persistedRun, agent);
+          }
         }
 
         await setWakeupStatus(
@@ -27179,6 +28640,7 @@ export function heartbeatService(
             });
         }
         await startNextQueuedRunForAgent(run.agentId);
+        await redeliverDeferredWakesForAgent(run.agentId);
       }
     }
   }
@@ -27909,24 +29371,59 @@ export function heartbeatService(
           }
 
           if (executionWaitRequestId) {
+            const redelivery = opts.redeliverDeferredWake === true;
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
               eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
-              (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
+              // A redelivered receipt keeps its own actor; the lock below revalidates it.
+              redelivery || (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
                 ? undefined : eq(agentWakeupRequests.requestedByActorType, "user"),
-              opts.queuedCommentInterruptId === executionWaitRequestId
+              redelivery ? undefined
+                : opts.queuedCommentInterruptId === executionWaitRequestId
                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
                   : eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId ?? ""),
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
             ));
-            // The issue lock serializes cleanup callbacks and periodic workers.
-            // An adopted, discarded, or edited receipt is no longer authority.
-            if (!pending || (!(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+            if (redelivery) {
+              // Another writer under this lock may already have promoted, adopted
+              // or cancelled the receipt. Then there is nothing left to deliver.
+              if (!pending) return { kind: "deferred" as const };
+              const [lockedIssue] = await tx
+                .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+                .from(issues)
+                .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)));
+              // A closed task is not revived by an old parked wake. The receipt
+              // stays parked; the release of the task's next run retires it.
+              if (!lockedIssue || lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+                return { kind: "deferred" as const };
+              }
+              // Task messages parked for a former assignee now belong to the
+              // current one, as on a normal release. Retire the receipt.
+              if (
+                ["issue_commented", "issue_reopened_via_comment"].includes(reason ?? "") &&
+                queuedCommentIdsFromWakePayload(pending.payload).length > 0 &&
+                lockedIssue.assigneeAgentId !== agentId
+              ) {
+                const retiredAt = new Date();
+                await tx.update(agentWakeupRequests).set({
+                  status: "cancelled",
+                  error: "Deferred task messages now belong to the current assignee",
+                  finishedAt: retiredAt,
+                  updatedAt: retiredAt,
+                }).where(and(
+                  eq(agentWakeupRequests.id, pending.id),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                ));
+                return { kind: "skipped" as const };
+              }
+            } else if (!pending || (!(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
                 !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
                   agent.companyId, issueId, pending.payload)))) {
+              // The issue lock serializes cleanup callbacks and periodic workers.
+              // An adopted, discarded, or edited receipt is no longer authority.
               return { kind: "deferred" as const };
             }
             if (opts.queuedCommentRequestId) {
@@ -28969,6 +30466,10 @@ export function heartbeatService(
             // its fresh-session contract into unrelated work or create a second
             // deferred wake that could later replay the same reconciliation.
             if (reconciledSourceRunId) return { kind: "deferred" as const };
+            // A run took the issue after the sweep read it. The receipt being
+            // redelivered is already parked behind that run and its release
+            // promotes it. Parking or merging a second receipt would duplicate it.
+            if (opts.redeliverDeferredWake) return { kind: "deferred" as const };
 
             const admissionScope = wakeQueue.createAdmissionTransactionScope(
               agent.companyId,
@@ -29446,6 +30947,13 @@ export function heartbeatService(
                 payload: withQueuedCommentIdsInWakePayload(payload, adoptedCommentIds),
               })
               .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+            if (opts.redeliverDeferredWake && executionWaitRequestId) {
+              // The same marker a release promotion leaves, so the queue stats count it.
+              await tx
+                .update(agentWakeupRequests)
+                .set({ reason: "issue_execution_promoted" })
+                .where(eq(agentWakeupRequests.id, executionWaitRequestId));
+            }
           }
 
           // executionRunId is NOT stamped here (enqueueWakeup queues the run but
@@ -29479,6 +30987,22 @@ export function heartbeatService(
 
       if (outcome.kind === "durable") {
         return outcome.receipt.runId ? getRun(outcome.receipt.runId) : null;
+      }
+      if (outcome.kind === "skipped" && opts.redeliverDeferredWake && executionWaitRequestId) {
+        // Admission judged this redelivered wake final and recorded why in its
+        // own receipt. Retire the parked receipt, or the sweep would re-evaluate
+        // it on every recheck. A transient wait is "deferred", not "skipped".
+        const retiredAt = new Date();
+        await db.update(agentWakeupRequests).set({
+          status: "skipped",
+          error: "Redelivery of this deferred wake was skipped by admission",
+          finishedAt: retiredAt,
+          updatedAt: retiredAt,
+        }).where(and(
+          eq(agentWakeupRequests.id, executionWaitRequestId),
+          eq(agentWakeupRequests.companyId, agent.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
         return null;
@@ -30458,6 +31982,7 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
         await startNextQueuedRunForAgent(run.agentId);
+        await redeliverDeferredWakesForAgent(run.agentId);
       }
       return cancelled;
     } finally {
@@ -30657,12 +32182,128 @@ export function heartbeatService(
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
     },
+    /**
+     * Run counts for a company over a creation-time window, the most common
+     * error codes, and each agent's runs today against its daily run cap.
+     */
+    runStats: async (
+      companyId: string,
+      input: { since: Date; until: Date; agentId?: string },
+    ): Promise<HeartbeatRunStats> => {
+      const windowFilters = [
+        eq(heartbeatRuns.companyId, companyId),
+        gte(heartbeatRuns.createdAt, input.since),
+        lt(heartbeatRuns.createdAt, input.until),
+        ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
+      ];
+      const capWindow = currentUtcDayWindow();
+      const [statusRows, errorRows, runsToday, agentRows] = await Promise.all([
+        db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters))
+          .groupBy(heartbeatRuns.agentId, heartbeatRuns.status),
+        db
+          .select({ errorCode: heartbeatRuns.errorCode, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters, isNotNull(heartbeatRuns.errorCode)))
+          .groupBy(heartbeatRuns.errorCode)
+          .orderBy(desc(sql`count(*)`), asc(heartbeatRuns.errorCode))
+          .limit(20),
+        computeDailyRunUsage(companyId, { agentId: input.agentId, window: capWindow }),
+        db
+          .select()
+          .from(agents)
+          .where(and(eq(agents.companyId, companyId), ...(input.agentId ? [eq(agents.id, input.agentId)] : []))),
+      ]);
+
+      const isRunStatus = (status: string): status is HeartbeatRunStatus =>
+        HEARTBEAT_RUN_STATUSES.some((known) => known === status);
+      const emptyCounts = () => {
+        const byStatus: Record<HeartbeatRunStatus, number> = {
+          queued: 0,
+          scheduled_retry: 0,
+          running: 0,
+          succeeded: 0,
+          interrupted: 0,
+          failed: 0,
+          cancelled: 0,
+          timed_out: 0,
+        };
+        return { runs: 0, terminal: 0, succeeded: 0, unsuccessful: 0, byStatus };
+      };
+      const addCounts = (counts: ReturnType<typeof emptyCounts>, status: string, count: number) => {
+        counts.runs += count;
+        if (!isRunStatus(status)) return;
+        counts.byStatus[status] += count;
+        if (HEARTBEAT_RUN_TERMINAL_STATUSES.some((terminal) => terminal === status)) counts.terminal += count;
+        if (status === "succeeded") counts.succeeded += count;
+        if (UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.some((unsuccessful) => unsuccessful === status)) {
+          counts.unsuccessful += count;
+        }
+      };
+
+      const totals = emptyCounts();
+      const perAgent = new Map<string, ReturnType<typeof emptyCounts>>();
+      for (const row of statusRows) {
+        const count = Number(row.count);
+        addCounts(totals, row.status, count);
+        const agentCounts = perAgent.get(row.agentId) ?? emptyCounts();
+        addCounts(agentCounts, row.status, count);
+        perAgent.set(row.agentId, agentCounts);
+      }
+
+      const agentStats = agentRows
+        .filter((agent) => agent.status !== "terminated" || perAgent.has(agent.id))
+        .map((agent) => {
+          const policy = parseHeartbeatPolicy(agent);
+          const maxDailyRuns = policy.maxDailyRuns;
+          const today = countedDailyRuns(runsToday.get(agent.id) ?? NO_DAILY_RUNS, policy);
+          return {
+            agentId: agent.id,
+            name: agent.name,
+            status: agent.status,
+            ...(perAgent.get(agent.id) ?? emptyCounts()),
+            runsToday: today,
+            maxDailyRuns,
+            remainingToday: maxDailyRuns === null ? null : Math.max(0, maxDailyRuns - today),
+            capReached: maxDailyRuns !== null && today >= maxDailyRuns,
+          };
+        })
+        .sort((a, b) => b.runs - a.runs || b.runsToday - a.runsToday || a.name.localeCompare(b.name));
+
+      return {
+        companyId,
+        window: { since: input.since.toISOString(), until: input.until.toISOString() },
+        dailyCapWindow: { start: capWindow.start.toISOString(), end: capWindow.end.toISOString() },
+        totals,
+        topErrorCodes: errorRows
+          .filter((row): row is { errorCode: string; count: number } => row.errorCode !== null)
+          .map((row) => ({ errorCode: row.errorCode, count: Number(row.count) })),
+        agents: agentStats,
+      };
+    },
+
     list: async (
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: {
+        summary?: boolean;
+        statuses?: string[];
+        errorCodes?: string[];
+        since?: Date;
+        until?: Date;
+      } = {},
     ) => {
+      const filters = [
+        eq(heartbeatRuns.companyId, companyId),
+        ...(agentId ? [eq(heartbeatRuns.agentId, agentId)] : []),
+        ...(options.statuses?.length ? [inArray(heartbeatRuns.status, options.statuses)] : []),
+        ...(options.errorCodes?.length ? [inArray(heartbeatRuns.errorCode, options.errorCodes)] : []),
+        ...(options.since ? [gte(heartbeatRuns.createdAt, options.since)] : []),
+        ...(options.until ? [lt(heartbeatRuns.createdAt, options.until)] : []),
+      ];
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
       const query = db
@@ -30685,14 +32326,7 @@ export function heartbeatService(
                 },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(
-                eq(heartbeatRuns.companyId, companyId),
-                eq(heartbeatRuns.agentId, agentId),
-              )
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(and(...filters))
         .orderBy(desc(heartbeatRuns.createdAt));
 
       const rows = limit ? await query.limit(limit) : await query;
@@ -30965,6 +32599,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    sweepDeferredWakes,
+    getDeferredWakeStats,
 
     scheduleBoundedRetry: async (
       runId: string,

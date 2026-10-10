@@ -64,6 +64,8 @@ import {
   restoreIssueDocumentRevisionSchema,
   upsertIssueFeedbackVoteSchema,
   upsertIssueWatchdogSchema,
+  findSimilarIssuesSchema,
+  labelDuplicatePairSchema,
   runnerGoalActionRequestSchema,
   // Project
   createProjectSchema,
@@ -87,6 +89,9 @@ import {
   updateDecisionQueueSchema,
   updateDecisionTriageSchema,
   updateDecisionRetentionSchema,
+  // Heartbeat runs
+  heartbeatRunStatsQuerySchema,
+  heartbeatRunStatsSchema,
   // Routine
   createRoutineSchema,
   updateRoutineSchema,
@@ -138,6 +143,9 @@ import {
   workspaceRuntimeControlTargetSchema,
   // Environments
   createEnvironmentSchema,
+  listEnvironmentLeasesQuerySchema,
+  ENVIRONMENT_DRIVERS,
+  ENVIRONMENT_LEASE_STATUSES,
   cancelEnvironmentCustomImageSetupSessionSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageSetupSessionSchema,
@@ -304,6 +312,7 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  observabilityHealthSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1653,6 +1662,20 @@ const FORBIDDEN_RESPONSE = {
   },
 };
 
+// A path value that the database cannot parse (e.g. a malformed UUID) returns
+// 400 from the central error handler, so every operation with a path parameter
+// can answer 400.
+const BAD_REQUEST_RESPONSE = {
+  description: "Bad request",
+  content: {
+    "application/json": {
+      schema: { $ref: "#/components/schemas/Error" },
+    },
+  },
+};
+
+const PATH_PARAMETER_PATTERN = /\{[^}]+\}/;
+
 function operationKey(method: string, path: string) {
   return `${method.toUpperCase()} ${path}`;
 }
@@ -1770,6 +1793,13 @@ function applyDocumentFixups(document: any): any {
         if (!responses["403"]) {
           responses["403"] = FORBIDDEN_RESPONSE;
         }
+      }
+      if (PATH_PARAMETER_PATTERN.test(path)) {
+        const responses = (operation.responses ??= {}) as Record<
+          string,
+          unknown
+        >;
+        responses["400"] ??= BAD_REQUEST_RESPONSE;
       }
       if (CREATED_OPERATIONS.has(key)) {
         applyOperationStatusOverride(operation, "200", "201");
@@ -2077,8 +2107,10 @@ registry.registerPath({
   path: "/api/companies/{companyId}",
   tags: ["companies"],
   summary: "Delete a company",
+  description:
+    "Deletes the company and every row it owns, in one transaction. Before it checks anything it locks the company row and the rows of the company that other rows could point at, so a concurrent write cannot add a reference after the check. A write that waits for these locks fails with a foreign-key error when the delete commits. Returns 409 and deletes nothing when a row of another company would be deleted or changed (`details.code` is `company_delete_cross_company_references`, with `details.references` as a list of `{ table, count }`), when a row still blocks the delete (`details.table` and `details.blockingRows`), or when a lock could not be had within 5 seconds or the database ended the delete to break a deadlock (`details.code` is `company_delete_busy`; trying again can work). The response names no ids, companies or content. A successful delete writes one `company_deleted` server log entry with the actor and the row count per table.",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -4099,6 +4131,54 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issues/similar",
+  tags: ["issues"],
+  summary: "Check a draft issue for likely duplicates before creating it",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(findSimilarIssuesSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/duplicate-pairs",
+  tags: ["issues"],
+  summary: "List scored duplicate candidates recorded for an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    404: { ...r.notFound, description: "Issue not found, or it belongs to another company" },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issue-duplicate-pairs/{pairId}/label",
+  tags: ["issues"],
+  summary: "Label a scored duplicate pair as duplicate or keep both",
+  request: {
+    params: z.object({ companyId: z.string(), pairId: z.string() }),
+    body: jsonBody(labelDuplicatePairSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/issues/{id}/work-products",
   tags: ["issues"],
@@ -5290,6 +5370,19 @@ registry.registerPath({
     body: jsonBody(createCostEventSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/health",
+  tags: ["observability"],
+  summary: "Usage collector health for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(observabilityHealthSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registry.registerPath({
@@ -6815,8 +6908,46 @@ registry.registerPath({
   path: "/api/companies/{companyId}/heartbeat-runs",
   tags: ["runs"],
   summary: "List heartbeat runs for a company",
+  description:
+    "Newest first. `status` and `errorCode` take comma-separated values. `since` and `until` (ISO 8601) bound the " +
+    "run's creation time; `until` is exclusive, and an empty or inverted window returns 400. `limit` is 1-1000. " +
+    "`summary=true` returns lighter rows.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      status: z.string().optional(),
+      errorCode: z.string().optional(),
+      since: z.string().datetime({ offset: true }).optional(),
+      until: z.string().datetime({ offset: true }).optional(),
+      limit: z.string().optional(),
+      summary: z.enum(["true", "1"]).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/heartbeat-runs/stats",
+  tags: ["runs"],
+  summary: "Get heartbeat run stats and daily cap usage for a company",
+  description:
+    "Counts runs created in the window (default: the last 24 hours, at most 90 days) by status, the top error " +
+    "codes, and for each agent its runs today against `runtimeConfig.heartbeat.maxDailyRuns`. `runsToday` is the " +
+    "value the daily cap itself compares against the limit (one shared function), so `capReached` matches whether " +
+    "the next wake is allowed.",
+  request: { params: z.object({ companyId: z.string() }), query: heartbeatRunStatsQuerySchema },
+  responses: { 200: r.ok(heartbeatRunStatsSchema), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/deferred-wakes",
+  tags: ["runs"],
+  summary: "Get deferred-wake queue health for a company",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7737,7 +7868,8 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     body: jsonBody(companySkillCreateSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  // 201 for a new skill, 200 when an idempotency key replays a prior create, 409 when the slug already has a skill.
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -8318,9 +8450,43 @@ registry.registerPath({
   method: "get",
   path: "/api/environments/{id}/leases",
   tags: ["environments"],
-  summary: "List leases for an environment",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "List leases for an environment, optionally filtered by status",
+  description:
+    "Board only. Returns only the leases of the caller's companies (the local board and instance admins see all). " +
+    "Lease metadata is redacted.",
+  request: { params: z.object({ id: z.string() }), query: listEnvironmentLeasesQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/environment-leases",
+  tags: ["environments"],
+  summary:
+    "List a company's environment leases across environments, most recently used first (default status active,pending_cleanup). " +
+    "Board only; lease metadata is redacted",
+  request: { params: z.object({ companyId: z.string() }), query: listEnvironmentLeasesQuerySchema },
+  responses: {
+    200: r.ok(
+      z.array(
+        z
+          .object({
+            id: z.string(),
+            companyId: z.string(),
+            environmentId: z.string().nullable(),
+            status: z.enum(ENVIRONMENT_LEASE_STATUSES),
+            environment: z
+              .object({ id: z.string(), name: z.string(), driver: z.enum(ENVIRONMENT_DRIVERS) })
+              .nullable()
+              .describe("Null for an orphan lease whose environment was deleted"),
+          })
+          .passthrough(),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registry.registerPath({
@@ -8328,6 +8494,9 @@ registry.registerPath({
   path: "/api/environment-leases/{leaseId}",
   tags: ["environments"],
   summary: "Get an environment lease",
+  description:
+    "Board only. A lease of a company the caller is not in returns 404, the same as a missing lease (the local " +
+    "board and instance admins can read any). Lease metadata is redacted.",
   request: { params: z.object({ leaseId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });

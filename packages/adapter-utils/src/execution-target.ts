@@ -4894,6 +4894,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
       shellCommand,
+      runId: input.runId,
     });
   } catch (error) {
     await Promise.allSettled([

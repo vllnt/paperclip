@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { isUniqueViolation } from "../db-errors.js";
+import {
+  isForeignKeyViolation,
+  isInvalidTextRepresentation,
+  isLockContention,
+  isUniqueViolation,
+  readForeignKeyViolation,
+} from "../db-errors.js";
 
 const CONSTRAINT = "issues_open_routine_execution_uq";
 
@@ -47,5 +53,131 @@ describe("isUniqueViolation", () => {
     const looped: { cause?: unknown } = {};
     looped.cause = looped;
     expect(isUniqueViolation(looped, CONSTRAINT)).toBe(false);
+  });
+});
+
+describe("readForeignKeyViolation", () => {
+  const FK = "finance_events_heartbeat_run_id_heartbeat_runs_id_fk";
+
+  it("reads the constraint and table that postgres.js surfaces", () => {
+    expect(readForeignKeyViolation({ code: "23503", constraint_name: FK, table_name: "finance_events" })).toEqual({
+      constraint: FK,
+      table: "finance_events",
+    });
+  });
+
+  it("reads the node-postgres field names", () => {
+    expect(readForeignKeyViolation({ code: "23503", constraint: FK, table: "finance_events" })).toEqual({
+      constraint: FK,
+      table: "finance_events",
+    });
+  });
+
+  it("finds the driver error behind the error Drizzle wraps around it", () => {
+    const wrapped = new Error("Failed query: delete from \"heartbeat_runs\"");
+    Object.defineProperty(wrapped, "cause", {
+      value: { code: "23503", constraint_name: FK, table_name: "finance_events" },
+    });
+    expect(readForeignKeyViolation(wrapped)).toEqual({ constraint: FK, table: "finance_events" });
+  });
+
+  it("falls back to the driver message when the fields are not surfaced", () => {
+    expect(
+      readForeignKeyViolation({
+        cause: {
+          code: "23503",
+          message: `update or delete on table "heartbeat_runs" violates foreign key constraint "${FK}" on table "finance_events"`,
+        },
+      }),
+    ).toEqual({ constraint: FK, table: "finance_events" });
+  });
+
+  it("reads a RESTRICT violation (SQLSTATE 23001) the same way", () => {
+    const restrict = "managed_agent_profiles_api_key_secret_id_company_secrets_id_fk";
+    expect(
+      readForeignKeyViolation({ cause: { code: "23001", constraint_name: restrict, table_name: "managed_agent_profiles" } }),
+    ).toEqual({ constraint: restrict, table: "managed_agent_profiles" });
+  });
+
+  it("reads the RESTRICT wording of the driver message", () => {
+    const restrict = "managed_agent_profiles_api_key_secret_id_company_secrets_id_fk";
+    expect(
+      readForeignKeyViolation({
+        cause: {
+          code: "23001",
+          message: `update or delete on table "company_secrets" violates RESTRICT setting of foreign key constraint "${restrict}" on table "managed_agent_profiles"`,
+        },
+      }),
+    ).toEqual({ constraint: restrict, table: "managed_agent_profiles" });
+  });
+
+  it("reports a foreign key violation whose names are unknown", () => {
+    expect(readForeignKeyViolation({ cause: { code: "23503" } })).toEqual({ constraint: null, table: null });
+  });
+
+  it("ignores errors that are not foreign key violations", () => {
+    expect(readForeignKeyViolation({ cause: { code: "23505", constraint_name: FK } })).toBeNull();
+    expect(readForeignKeyViolation(new Error("boom"))).toBeNull();
+    expect(readForeignKeyViolation(null)).toBeNull();
+    expect(readForeignKeyViolation(undefined)).toBeNull();
+  });
+
+  it("stops walking a self-referential cause chain", () => {
+    const looped: { cause?: unknown } = {};
+    looped.cause = looped;
+    expect(readForeignKeyViolation(looped)).toBeNull();
+  });
+});
+
+describe.each([
+  ["isInvalidTextRepresentation", isInvalidTextRepresentation, "22P02"],
+  ["isForeignKeyViolation", isForeignKeyViolation, "23503"],
+] as const)("%s", (_name, matches, code) => {
+  it("matches the code on the error itself and through Drizzle's cause", () => {
+    expect(matches({ code })).toBe(true);
+    expect(matches(new Error("Failed query: select 1", { cause: { code } }))).toBe(true);
+  });
+
+  it("ignores other codes, non-objects, and self-referential chains", () => {
+    expect(matches({ code: "23505" })).toBe(false);
+    expect(matches(code)).toBe(false);
+    expect(matches(null)).toBe(false);
+    const looped: { cause?: unknown } = {};
+    looped.cause = looped;
+    expect(matches(looped)).toBe(false);
+  });
+});
+
+describe("isForeignKeyViolation with a RESTRICT reference", () => {
+  it("matches SQLSTATE 23001 on the error itself and through Drizzle's cause", () => {
+    expect(isForeignKeyViolation({ code: "23001" })).toBe(true);
+    expect(isForeignKeyViolation(new Error("Failed query: delete from \"company_secrets\"", { cause: { code: "23001" } }))).toBe(
+      true,
+    );
+  });
+
+  it("still ignores other integrity codes", () => {
+    expect(isForeignKeyViolation({ code: "23502" })).toBe(false);
+    expect(isForeignKeyViolation({ cause: { code: "23514" } })).toBe(false);
+  });
+});
+
+describe("isLockContention", () => {
+  it.each([
+    ["a lock timeout (55P03)", "55P03"],
+    ["a deadlock (40P01)", "40P01"],
+  ])("matches %s on the error itself and through Drizzle's cause", (_label, code) => {
+    expect(isLockContention({ code })).toBe(true);
+    expect(isLockContention(new Error("Failed query: select 1", { cause: { code } }))).toBe(true);
+  });
+
+  it("ignores other codes, non-objects and self-referential chains", () => {
+    expect(isLockContention({ code: "23503" })).toBe(false);
+    expect(isLockContention({ cause: { code: "40001" } })).toBe(false);
+    expect(isLockContention("55P03")).toBe(false);
+    expect(isLockContention(null)).toBe(false);
+    const looped: { cause?: unknown } = {};
+    looped.cause = looped;
+    expect(isLockContention(looped)).toBe(false);
   });
 });

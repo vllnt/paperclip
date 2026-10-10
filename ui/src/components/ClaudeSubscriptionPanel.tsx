@@ -45,7 +45,7 @@ function orderedWindows(windows: QuotaWindow[]): QuotaWindow[] {
 }
 
 function fillClass(usedPercent: number | null): string {
-  if (usedPercent == null) return "bg-zinc-700";
+  if (usedPercent == null) return "bg-status-neutral";
   if (usedPercent >= 90) return "bg-(--status-task-blocked)";
   if (usedPercent >= 70) return "bg-(--status-task-todo)";
   return "bg-primary/70";

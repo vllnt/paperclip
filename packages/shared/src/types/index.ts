@@ -78,6 +78,7 @@ export type {
   EnvironmentDeleteReusableLeaseHolder,
   EnvironmentDeleteBlockedReason,
   EnvironmentLease,
+  CompanyEnvironmentLeaseListItem,
   EnvironmentProbeResult,
   FakeSandboxEnvironmentConfig,
   LocalEnvironmentConfig,
@@ -903,6 +904,9 @@ export type {
   AgentRuntimeState,
   AgentTaskSession,
   AgentWakeupRequest,
+  DeferredWakeAgentStats,
+  DeferredWakeStats,
+  DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
 } from "./heartbeat.js";
 export type { LiveEvent } from "./live.js";

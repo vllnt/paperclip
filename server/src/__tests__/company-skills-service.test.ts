@@ -412,6 +412,72 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(await db.select().from(companySkills).where(eq(companySkills.companyId, companyId))).toHaveLength(0);
   });
 
+  async function insertAgentActor(companyId: string) {
+    const agentId = randomUUID();
+    await db.insert(agents).values({ id: agentId, companyId, name: "Skill author", role: "engineer", adapterType: "codex_local", adapterConfig: {} });
+    return { type: "agent" as const, agentId };
+  }
+
+  async function snapshotSkill(companyId: string, skillId: string) {
+    const [row] = await db.select().from(companySkills).where(eq(companySkills.id, skillId));
+    const versions = await db.select().from(companySkillVersions).where(eq(companySkillVersions.companySkillId, skillId));
+    const file = await fs.readFile(path.join(paperclipHome!, "instances", "default", "skills", companyId, row!.slug, "SKILL.md"), "utf8");
+    return { row, versionIds: versions.map((version) => version.id).sort(), file };
+  }
+
+  it("rejects an agent create whose slug already has a skill and leaves that skill untouched", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Existing slug", issuePrefix: `T${companyId.slice(0, 6)}` });
+    const governance = await svc.createLocalSkill(
+      companyId,
+      { name: "Governance", slug: "governance", markdown: "# original rules\n", tagline: "Original" },
+      { type: "user", userId: "board" },
+    );
+    const before = await snapshotSkill(companyId, governance.id);
+    const actor = await insertAgentActor(companyId);
+
+    // Different bytes: the on-disk directory check also refuses this one.
+    await expect(svc.createLocalSkill(
+      companyId,
+      { name: "Governance", slug: "governance", markdown: "# replaced rules\n" },
+      actor,
+    )).rejects.toMatchObject({ status: 409 });
+    // Identical bytes with new metadata: the directory check would adopt the files, so only the key check stops it.
+    await expect(svc.createLocalSkill(
+      companyId,
+      { name: "Governance", slug: "governance", markdown: "# original rules\n", tagline: "Replaced", categories: ["replaced"] },
+      actor,
+    )).rejects.toMatchObject({ status: 409 });
+
+    expect(await snapshotSkill(companyId, governance.id)).toEqual(before);
+    expect(before.file).toBe("# original rules\n");
+    expect(await db.select().from(companySkills).where(eq(companySkills.companyId, companyId))).toHaveLength(1);
+  });
+
+  it("derives the key from the slug, so a key in the markdown frontmatter cannot select another skill", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Frontmatter key", issuePrefix: `T${companyId.slice(0, 6)}` });
+    const governance = await svc.createLocalSkill(
+      companyId,
+      { name: "Governance", slug: "governance", markdown: "# original rules\n" },
+      { type: "user", userId: "board" },
+    );
+    const before = await snapshotSkill(companyId, governance.id);
+
+    const actor = await insertAgentActor(companyId);
+    for (const key of [`company/${companyId}/governance`, "paperclipai/paperclip/paperclip"]) {
+      const created = await svc.createLocalSkill(
+        companyId,
+        { name: "Other", slug: `other-${key.length}`, markdown: `---\nname: Other\nkey: ${key}\n---\n# replacement\n` },
+        actor,
+      );
+      expect(created.id).not.toBe(governance.id);
+      expect(created.key).toBe(`company/${companyId}/${created.slug}`);
+    }
+
+    expect(await snapshotSkill(companyId, governance.id)).toEqual(before);
+  });
+
   it("observes supporting-only local file saves across runtime preparations and service restarts", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Local supporting files", issuePrefix: `T${companyId.slice(0, 6)}` });

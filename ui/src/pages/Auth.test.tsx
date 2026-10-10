@@ -34,12 +34,15 @@ vi.mock("@/components/AsciiArtAnimation", () => ({
   AsciiArtAnimation: () => null,
 }));
 
-// The auth page renders a ThemeToggle, which reads ThemeContext. The provider
-// lives in main.tsx (above the router), so mock the hook here the same way
-// SidebarAccountMenu.test.tsx does.
+// The auth page renders the System / Light / Dark switch, which reads
+// ThemeContext. The provider lives in main.tsx (above the router), so mock the
+// hook here the same way SidebarAccountMenu.test.tsx does.
+const setPreferenceMock = vi.hoisted(() => vi.fn());
 vi.mock("../context/ThemeContext", () => ({
   useTheme: () => ({
+    preference: "system",
     theme: "dark",
+    setPreference: setPreferenceMock,
     setTheme: vi.fn(),
     toggleTheme: vi.fn(),
   }),
@@ -168,6 +171,25 @@ describe("AuthPage", () => {
     expect(container.querySelector("form")).toBeNull();
     expect(beginCloudSignInMock).not.toHaveBeenCalled();
     await act(() => root.unmount());
+  });
+
+  it("lets a signed-out user pick System, Light or Dark, not only flip between two", async () => {
+    const { root } = await mount();
+
+    const group = container.querySelector('[role="radiogroup"]');
+    expect(group?.getAttribute("aria-label")).toBe("Appearance");
+    const radios = Array.from(container.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
+    expect(radios.map((radio) => radio.getAttribute("aria-label"))).toEqual(["System", "Light", "Dark"]);
+    expect(radios.map((radio) => radio.checked)).toEqual([true, false, false]);
+
+    await act(async () => {
+      radios[1].click();
+    });
+    expect(setPreferenceMock).toHaveBeenCalledWith("light");
+
+    await act(async () => {
+      root.unmount();
+    });
   });
 
   it("exposes password-manager metadata and a11y attributes on the sign-in form", async () => {

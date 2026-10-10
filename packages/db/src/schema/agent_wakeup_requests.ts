@@ -56,6 +56,12 @@ export const agentWakeupRequests = pgTable(
       table.agentId,
       table.requestedAt,
     ),
+    // The deferred-wake recovery sweep reads every parked wake across companies,
+    // oldest first. Parked wakes are a few rows in a large table; this narrow
+    // partial index lets that read skip the rest.
+    deferredRequestedIdx: index("agent_wakeup_requests_deferred_requested_idx")
+      .on(table.requestedAt)
+      .where(sql`${table.status} = 'deferred_issue_execution'`),
     reviewPathRecoveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_review_path_recovery_idempotency_uq",
     )

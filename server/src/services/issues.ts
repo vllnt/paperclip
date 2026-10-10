@@ -6639,6 +6639,36 @@ function monitorClearedForAssigneeChange(
   };
 }
 
+export interface IssueCreatedEvent {
+  id: string;
+  companyId: string;
+}
+
+let issueCreatedListener: ((event: IssueCreatedEvent) => void) | null = null;
+
+/**
+ * Registers the one listener told about every newly inserted issue, whichever path created it
+ * (root create, child create, plan decomposition, routines, chat, runtime delegation).
+ * It is not called when a create resolves to an existing issue. When the caller owns an open
+ * transaction the event can fire before that transaction commits, so listeners must tolerate an
+ * issue that is not visible yet. Pass `null` to remove it.
+ */
+export function setIssueCreatedListener(listener: ((event: IssueCreatedEvent) => void) | null): void {
+  issueCreatedListener = listener;
+}
+
+function notifyIssueCreated(event: IssueCreatedEvent): void {
+  if (!issueCreatedListener) return;
+  try {
+    issueCreatedListener(event);
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error), issueId: event.id },
+      "issue created listener failed",
+    );
+  }
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -9850,6 +9880,7 @@ export function issueService(db: Db) {
       ) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      const created: { event: IssueCreatedEvent | null } = { event: null };
       const persist = async (tx: DbTransaction) => {
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
@@ -10241,6 +10272,7 @@ export function issueService(db: Db) {
         );
 
         const [issue] = await tx.insert(issues).values(values).returning();
+        created.event = { id: issue.id, companyId: issue.companyId };
         await recordChatHandoff(tx, issue, actorRunId);
         if (idempotencyKey) {
           await tx.insert(issueCreateIdempotencyKeys).values({
@@ -10291,8 +10323,10 @@ export function issueService(db: Db) {
         );
         return withRelations;
       };
-      if (dbOrTx === db) return db.transaction(persist);
-      return persist(dbOrTx as DbTransaction);
+      const result =
+        dbOrTx === db ? await db.transaction(persist) : await persist(dbOrTx as DbTransaction);
+      if (created.event) notifyIssueCreated(created.event);
+      return result;
     },
 
     /**
