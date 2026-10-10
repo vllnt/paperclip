@@ -11755,6 +11755,49 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
+  /** Reads the database clock, which is what wake receipt timestamps use. */
+  async function readDatabaseNow(agentId: string, fallback: Date) {
+    return db
+      .select({ now: sql<string>`clock_timestamp()` })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .limit(1)
+      .then((rows) => (rows[0] ? new Date(rows[0].now) : fallback));
+  }
+
+  /**
+   * enqueueWakeup returns null for a wake it admitted behind a live run, and
+   * also for one it dropped (wake on demand off, tree hold, pause). Only a
+   * skipped receipt written or touched since `startedAt` means the agent will
+   * not run for this issue.
+   */
+  async function findDroppedIssueWake(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    startedAt: Date;
+  }) {
+    return db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.status, "skipped"),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+          gte(agentWakeupRequests.updatedAt, input.startedAt),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Runs the recovery the monitor's policy asks for. With `detectBlockedWake`,
+   * an owner wake the queue drops or refuses is reported as a blocked reason
+   * instead of being treated as delivered, so the caller can keep the monitor.
+   */
   async function performIssueMonitorRecovery(input: {
     claimed: IssueMonitorDispatchRow;
     scheduledAtIso: string;
@@ -11767,7 +11810,8 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
-  }) {
+    detectBlockedWake?: boolean;
+  }): Promise<string | null> {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
       (await issuesSvc
@@ -11857,7 +11901,7 @@ export function heartbeatService(
           recoveryIdentifier: recoveryIssue.identifier,
         },
       });
-      return;
+      return null;
     }
 
     if (input.recoveryPolicy === "escalate_to_board") {
@@ -11883,45 +11927,66 @@ export function heartbeatService(
         entityId: input.claimed.id,
         details,
       });
-      return;
+      return null;
     }
 
-    await enqueueWakeup(input.claimed.assigneeAgentId!, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "issue_monitor_recovery",
-      idempotencyKey: `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
-      payload: withRecoveryContext(
-        {
-          issueId: input.claimed.id,
-          monitorAttemptCount: input.nextAttemptCount,
-          monitorNotes: input.claimed.monitorNotes ?? null,
-          clearReason: input.clearReason,
-          serviceName: input.monitor?.serviceName ?? null,
-          timeoutAt: input.monitor?.timeoutAt ?? null,
-          maxAttempts: input.monitor?.maxAttempts ?? null,
-          ...(reviewPathContext ?? {}),
-        },
-        "status_only",
-      ),
-      requestedByActorType: input.actorType,
-      requestedByActorId: input.actorId,
-      contextSnapshot: withRecoveryContext(
-        {
-          issueId: input.claimed.id,
-          source: "issue.monitor.recovery",
-          wakeReason: "issue_monitor_recovery",
-          monitorAttemptCount: input.nextAttemptCount,
-          monitorNotes: input.claimed.monitorNotes ?? null,
-          clearReason: input.clearReason,
-          serviceName: input.monitor?.serviceName ?? null,
-          timeoutAt: input.monitor?.timeoutAt ?? null,
-          maxAttempts: input.monitor?.maxAttempts ?? null,
-          ...(reviewPathContext ?? {}),
-        },
-        "status_only",
-      ),
-    });
+    const ownerAgentId = input.claimed.assigneeAgentId!;
+    const wakeStartedAt = input.detectBlockedWake
+      ? await readDatabaseNow(ownerAgentId, new Date())
+      : null;
+    let ownerWake: Awaited<ReturnType<typeof enqueueWakeup>>;
+    try {
+      ownerWake = await enqueueWakeup(ownerAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_monitor_recovery",
+        idempotencyKey: `issue-monitor-recovery:${input.claimed.id}:${input.clearReason}:${input.scheduledAtIso}`,
+        payload: withRecoveryContext(
+          {
+            issueId: input.claimed.id,
+            monitorAttemptCount: input.nextAttemptCount,
+            monitorNotes: input.claimed.monitorNotes ?? null,
+            clearReason: input.clearReason,
+            serviceName: input.monitor?.serviceName ?? null,
+            timeoutAt: input.monitor?.timeoutAt ?? null,
+            maxAttempts: input.monitor?.maxAttempts ?? null,
+            ...(reviewPathContext ?? {}),
+          },
+          "status_only",
+        ),
+        requestedByActorType: input.actorType,
+        requestedByActorId: input.actorId,
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: input.claimed.id,
+            source: "issue.monitor.recovery",
+            wakeReason: "issue_monitor_recovery",
+            monitorAttemptCount: input.nextAttemptCount,
+            monitorNotes: input.claimed.monitorNotes ?? null,
+            clearReason: input.clearReason,
+            serviceName: input.monitor?.serviceName ?? null,
+            timeoutAt: input.monitor?.timeoutAt ?? null,
+            maxAttempts: input.monitor?.maxAttempts ?? null,
+            ...(reviewPathContext ?? {}),
+          },
+          "status_only",
+        ),
+      });
+    } catch (err) {
+      if (input.detectBlockedWake && isRetryableMonitorWakeBlock(err)) {
+        return (err as HttpError).message;
+      }
+      throw err;
+    }
+    if (wakeStartedAt && ownerWake === null) {
+      const dropped = await findDroppedIssueWake({
+        companyId: input.claimed.companyId,
+        agentId: ownerAgentId,
+        issueId: input.claimed.id,
+        startedAt: wakeStartedAt,
+      });
+      if (dropped) return dropped.reason ?? "skipped";
+    }
 
     await logActivity(db, {
       companyId: input.claimed.companyId,
@@ -11934,6 +11999,7 @@ export function heartbeatService(
       entityId: input.claimed.id,
       details,
     });
+    return null;
   }
 
   async function clearIssueMonitorAndRecover(input: {
@@ -11950,7 +12016,51 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    /**
+     * Keeps the monitor armed and backs off when the owner recovery wake is
+     * dropped or refused. Omit it once the attempts are spent: the monitor
+     * then clears whatever happens to the wake.
+     */
+    holdForRetry?: (blockedReason: string) => Promise<{ outcome: "skipped"; reason: string }>;
   }) {
+    const recovery = {
+      claimed: input.claimed,
+      scheduledAtIso: input.scheduledAtIso,
+      nextAttemptCount: input.nextAttemptCount,
+      clearReason: input.clearReason,
+      recoveryPolicy: input.recoveryPolicy,
+      monitor: input.monitor,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: input.agentId,
+      runId: input.runId,
+      activitySource: input.activitySource,
+    };
+    const holdForRetry = input.recoveryPolicy === "wake_owner" ? input.holdForRetry : undefined;
+    const logExhausted = () =>
+      logActivity(db, {
+        companyId: input.claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_exhausted",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: monitorRecoveryDetails({
+          claimed: input.claimed,
+          scheduledAtIso: input.scheduledAtIso,
+          nextAttemptCount: input.nextAttemptCount,
+          clearReason: input.clearReason,
+          recoveryPolicy: input.recoveryPolicy,
+          monitor: input.monitor,
+          source: input.activitySource,
+        }),
+      });
+
+    // Clear before waking: the woken owner must see the cleared monitor its
+    // wake payload describes, and its own writes must not be overwritten by
+    // this stale snapshot.
     await db
       .update(issues)
       .set({
@@ -11964,40 +12074,24 @@ export function heartbeatService(
       })
       .where(eq(issues.id, input.claimed.id));
 
-    await logActivity(db, {
-      companyId: input.claimed.companyId,
-      actorType: input.actorType,
-      actorId: input.actorId,
-      agentId: input.agentId,
-      runId: input.runId,
-      action: "issue.monitor_exhausted",
-      entityType: "issue",
-      entityId: input.claimed.id,
-      details: monitorRecoveryDetails({
-        claimed: input.claimed,
-        scheduledAtIso: input.scheduledAtIso,
-        nextAttemptCount: input.nextAttemptCount,
-        clearReason: input.clearReason,
-        recoveryPolicy: input.recoveryPolicy,
-        monitor: input.monitor,
-        source: input.activitySource,
-      }),
-    });
+    if (!holdForRetry) {
+      await logExhausted();
+      await performIssueMonitorRecovery(recovery);
+      return { outcome: "skipped" as const, reason: input.clearReason };
+    }
 
-    await performIssueMonitorRecovery({
-      claimed: input.claimed,
-      scheduledAtIso: input.scheduledAtIso,
-      nextAttemptCount: input.nextAttemptCount,
-      clearReason: input.clearReason,
-      recoveryPolicy: input.recoveryPolicy,
-      monitor: input.monitor,
-      actorType: input.actorType,
-      actorId: input.actorId,
-      agentId: input.agentId,
-      runId: input.runId,
-      activitySource: input.activitySource,
-    });
-
+    // A wake the queue drops or refuses started no run, so re-arming the
+    // monitor from the claim snapshot cannot overwrite an owner's work. Any
+    // other error leaves the monitor cleared and propagates, as before.
+    let blockedReason: string | null;
+    try {
+      blockedReason = await performIssueMonitorRecovery({ ...recovery, detectBlockedWake: true });
+    } catch (err) {
+      await logExhausted();
+      throw err;
+    }
+    if (blockedReason) return holdForRetry(blockedReason);
+    await logExhausted();
     return { outcome: "skipped" as const, reason: input.clearReason };
   }
 
@@ -12070,24 +12164,6 @@ export function heartbeatService(
         }
       : {};
 
-    if (clearReason) {
-      return clearIssueMonitorAndRecover({
-        claimed,
-        policy,
-        scheduledAtIso,
-        nextAttemptCount,
-        clearReason,
-        recoveryPolicy,
-        monitor,
-        now: input.now,
-        actorType: input.actorType,
-        actorId: input.actorId,
-        agentId: input.agentId,
-        runId: input.runId,
-        activitySource: input.activitySource,
-      });
-    }
-
     const monitorWakeKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
     // The queue dropped or refused the wake. Keep the monitor armed: count the
     // attempt, back off, and hand the issue to owner recovery once the attempts
@@ -12146,6 +12222,28 @@ export function heartbeatService(
       });
       return { outcome: "skipped" as const, reason: message };
     };
+    if (clearReason) {
+      return clearIssueMonitorAndRecover({
+        claimed,
+        policy,
+        scheduledAtIso,
+        nextAttemptCount,
+        clearReason,
+        recoveryPolicy,
+        monitor,
+        now: input.now,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        activitySource: input.activitySource,
+        holdForRetry:
+          nextAttemptCount < ISSUE_WAIT_MONITOR_MAX_ATTEMPTS
+            ? (blockedReason) =>
+                holdMonitorForRetry(`Monitor recovery wake blocked (${blockedReason})`, blockedReason)
+            : undefined,
+      });
+    }
     let monitorWake: Awaited<ReturnType<typeof enqueueWakeup>> | undefined;
     let monitorWakeStartedAt = input.now;
     try {
@@ -12208,12 +12306,7 @@ export function heartbeatService(
       } else {
         // The receipt lookup below compares database timestamps, so the start
         // mark comes from the database clock too.
-        monitorWakeStartedAt = await db
-          .select({ now: sql<string>`clock_timestamp()` })
-          .from(agents)
-          .where(eq(agents.id, targetAgentId))
-          .limit(1)
-          .then((rows) => (rows[0] ? new Date(rows[0].now) : input.now));
+        monitorWakeStartedAt = await readDatabaseNow(targetAgentId, input.now);
         monitorWake = await enqueueWakeup(targetAgentId, {
           source: input.source,
           triggerDetail: input.triggerDetail,
@@ -12246,25 +12339,14 @@ export function heartbeatService(
         });
       }
 
-      // enqueueWakeup returns null for a wake it admitted behind a live run, and
-      // also for one it dropped (wake on demand off, tree hold, pause). Only a
-      // skipped receipt written or touched by this dispatch means the agent
-      // will not run, so the monitor stays armed.
+      // A dropped wake keeps the monitor armed (see findDroppedIssueWake).
       if (monitorWake === null) {
-        const skipped = await db
-          .select({ reason: agentWakeupRequests.reason })
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              eq(agentWakeupRequests.companyId, claimed.companyId),
-              eq(agentWakeupRequests.agentId, targetAgentId),
-              eq(agentWakeupRequests.status, "skipped"),
-              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${claimed.id}`,
-              gte(agentWakeupRequests.updatedAt, monitorWakeStartedAt),
-            ),
-          )
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
+        const skipped = await findDroppedIssueWake({
+          companyId: claimed.companyId,
+          agentId: targetAgentId,
+          issueId: claimed.id,
+          startedAt: monitorWakeStartedAt,
+        });
         if (skipped) {
           return holdMonitorForRetry(
             `Monitor wake skipped (${skipped.reason ?? "skipped"})`,

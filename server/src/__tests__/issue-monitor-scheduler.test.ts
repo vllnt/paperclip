@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
+import { ISSUE_WAIT_MONITOR_MAX_ATTEMPTS, PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
   activityLog,
   agentRuntimeState,
@@ -631,6 +631,90 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).toContain("issue.monitor_exhausted");
     expect(activity).toContain("issue.monitor_recovery_wake_queued");
     expect(activity).not.toContain("issue.monitor_triggered");
+  });
+
+  it("keeps a timed-out monitor armed when the owner recovery wake is dropped, then recovers once the queue admits it", async () => {
+    const { issueId, agentId } = await seedFixture({
+      wakeOnDemand: false,
+      monitor: { timeoutAt: "2026-04-11T12:00:00.000Z" },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    const held = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(held.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    expect(held.monitorAttemptCount).toBe(1);
+    expect(parseIssueExecutionState(held.executionState)?.monitor).toMatchObject({ status: "scheduled" });
+    const heldActions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
+    expect(heldActions).toContain("issue.monitor_wake_skipped");
+    expect(heldActions).not.toContain("issue.monitor_exhausted");
+
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+    }).where(eq(agents.id, agentId));
+    await heartbeat.tickTimers(new Date("2026-04-11T12:37:00.000Z"));
+
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((wake) => wake.status !== "skipped").map((wake) => wake.reason)).toEqual(["issue_monitor_recovery"]);
+    const recovered = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(recovered.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(recovered.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+    });
+    const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
+    expect(actions).toContain("issue.monitor_recovery_wake_queued");
+  });
+
+  it("keeps a timed-out monitor armed when the owner recovery wake is refused with a retryable 409", async () => {
+    const { issueId, agentId } = await seedFixture({ monitor: { timeoutAt: "2026-04-11T12:00:00.000Z" } });
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, agentId));
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    const held = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(held.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    expect(held.monitorAttemptCount).toBe(1);
+    expect(parseIssueExecutionState(held.executionState)?.monitor).toMatchObject({ status: "scheduled" });
+  });
+
+  it("clears a timed-out monitor when the owner can never be woken (terminated), instead of re-claiming it forever", async () => {
+    const { issueId } = await seedFixture({
+      agentStatus: "terminated",
+      monitor: { timeoutAt: "2026-04-11T12:00:00.000Z" },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+    });
+    const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
+    expect(actions).toContain("issue.monitor_exhausted");
+  });
+
+  it("stops holding a timed-out monitor for a dropped recovery wake after the attempt cap", async () => {
+    const { issueId } = await seedFixture({
+      wakeOnDemand: false,
+      monitorAttemptCount: ISSUE_WAIT_MONITOR_MAX_ATTEMPTS - 1,
+      monitor: { timeoutAt: "2026-04-11T12:00:00.000Z" },
+    });
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+    });
+    const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
+    expect(actions).toContain("issue.monitor_exhausted");
   });
 
   it("clears timed-out monitors and creates a visible recovery issue when requested", async () => {
