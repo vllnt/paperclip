@@ -583,8 +583,8 @@ One gap: the sweep calls `scheduleRecoveryRetry`, which schedules with the defau
 transient reason and so **spends the failure budget**. If a resume row is lost and
 the sweep schedules the successor of a `planned_restart` run, it must pass
 `planned_restart_resume` as the reason, **and only when the stop was proven**
-(`executionCancellation.state` is `"acknowledged"`, or the run's process is
-proven gone, as section 4.2 step 4 requires). A `planned_restart` run with no proof
+(the same proof that section 4.2 step 4 checks:
+`executionCancellation.state` is `"acknowledged"`). A `planned_restart` run with no proof
 goes to the `reconciliation` class and its existing hold, never to a resume:
 its provider may still be working. The same rule applies to every fallback that
 can see a `planned_restart` run (the D2 startup classification too). That is a one-line wiring change in
