@@ -31,6 +31,14 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
+// The longest wait between two empty request listings of the host queue
+// worker. Each listing is one remote command, and over SSH one new connection,
+// so an idle run that listed 100 ms after each empty listing cost the worker up
+// to ten logins a second. The wait starts at the poll interval after a request
+// and doubles while the queue stays empty, so a request that arrives while
+// idle waits at most this long (plus one listing) before the worker picks it
+// up.
+const DEFAULT_BRIDGE_IDLE_POLL_MAX_MS = 3_000;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
@@ -915,7 +923,12 @@ async function writeBridgeResponse(
 export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
+  // The wait after the first empty listing that follows a request. Each
+  // further empty listing doubles the wait, up to `idlePollMaxMs`.
   pollIntervalMs?: number | null;
+  // The longest wait between two empty listings. Defaults to
+  // DEFAULT_BRIDGE_IDLE_POLL_MAX_MS; never below `pollIntervalMs`.
+  idlePollMaxMs?: number | null;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
   // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
@@ -964,6 +977,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
   hostLeaseRefreshMs?: number | null;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
+  const idlePollMaxMs = Math.max(
+    pollIntervalMs,
+    normalizeTimeoutMs(input.idlePollMaxMs, DEFAULT_BRIDGE_IDLE_POLL_MAX_MS),
+  );
   const hostLeaseRefreshMs = normalizeTimeoutMs(input.hostLeaseRefreshMs, DEFAULT_BRIDGE_HOST_LEASE_REFRESH_MS);
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
@@ -994,6 +1011,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
   }
 
   let stopping = false;
+  // Ends the poll loop's current idle wait early, so `stop` does not wait out
+  // a long idle wait before the loop drains the queue and exits.
+  let wakeIdleWait: (() => void) | null = null;
   let inFlight = 0;
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
@@ -1657,6 +1677,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // successful iteration and fails the queued requests fast, while this loop
       // keeps probing for recovery.
       let consecutivePollFailures = 0;
+      // The wait after the next empty listing. It doubles while the queue stays
+      // empty, up to `idlePollMaxMs`, and goes back to `pollIntervalMs` after
+      // the loop handles a request.
+      let idleWaitMs = pollIntervalMs;
       while (true) {
         let fileNames: string[];
         try {
@@ -1689,9 +1713,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // A file whose attempt is still in flight (or waiting on its 504
         // backstop) is not actionable: `processRequestFile` would skip it via
         // the guard map. Treat an all-guarded listing like an empty one and
-        // sleep a poll interval. Re-listing immediately would spin the loop —
-        // an exec storm against a real sandbox channel, and with an in-memory
-        // client a pure-microtask loop that starves every timer in the process
+        // wait. Re-listing immediately would spin the loop — an exec storm
+        // against a real sandbox channel, and with an in-memory client a
+        // pure-microtask loop that starves every timer in the process
         // (including the guard's own backstop and abort timers).
         const actionableFileNames = fileNames.filter((fileName) => !inFlightRequestGuards.has(fileName));
         if (actionableFileNames.length === 0) {
@@ -1699,9 +1723,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
           if (stopping) {
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          await new Promise<void>((resolve) => {
+            const wake = () => {
+              clearTimeout(timer);
+              wakeIdleWait = null;
+              resolve();
+            };
+            const timer = setTimeout(wake, idleWaitMs);
+            wakeIdleWait = wake;
+          });
+          idleWaitMs = Math.min(idleWaitMs * 2, idlePollMaxMs);
           continue;
         }
+        idleWaitMs = pollIntervalMs;
         for (const fileName of actionableFileNames) {
           if (stopping && Date.now() >= stopDeadline) break;
           inFlight += 1;
@@ -1780,6 +1814,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
       stopping = true;
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
+      // The loop lists once more after the wake, so it still serves requests
+      // that are already queued.
+      wakeIdleWait?.();
       if (!settled) {
         await Promise.race([
           settledPromise,
