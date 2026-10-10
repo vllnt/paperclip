@@ -313,10 +313,34 @@ async function brokerPost(env, route, body) {
   if (!urls.length || !env.PAPERCLIP_GITHUB_BROKER_TOKEN) return null;
   // A slow or restarting control plane must not cost the operation its
   // managed identity, so a failed request is retried before giving up.
-  // Busy (409) responses and transport failures keep separate budgets, and
-  // the body is read inside the retry so a failed read is retried too.
-  // Only the last route spends the transport budget.
-  let transportFailures = 0, conflicts = 0, index = 0, response, result;
+  // A busy server (409: the run bridge says so when its own 10 s timeout
+  // fires) and a request that timed out (this launcher's own 10 s limit) are
+  // retried with a growing, jittered pause: 1, 2, 4 and 8 s at most, five
+  // tries in all (a timeout: three tries, 0.5 and 1 s), on the same route: the first request may still be running
+  // on the server, so asking every second would only add work to a server
+  // that is already busy. Other transport failures keep a small budget of
+  // their own, and the body is read inside the retry so a failed read is
+  // retried too. A failure that is not a timeout on a route that is not the
+  // last (it cannot be reached) moves on to the next route at once; only the
+  // last route spends that budget. When the tries run out, the error says why.
+  // A request that timed out may still be running on the server, so it gets no more tries and no more waiting than the
+  // old transport budget gave it: three requests, pauses of 0.5 and 1 s. A busy answer (409) is cheap and gets five.
+  const BACKOFF_MS = [1000, 2000, 4000, 8000], TRIES = BACKOFF_MS.length + 1;
+  const TIMEOUT_BACKOFF_MS = [500, 1000], TIMEOUT_TRIES = TIMEOUT_BACKOFF_MS.length + 1;
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const startedAt = Date.now();
+  let transportFailures = 0, slowTries = 0, timeouts = 0, index = 0, response, result;
+  // One busy or timed-out request: count it, give up when the tries are spent, else pause.
+  const slowTry = (reason, timedOut) => {
+    slowTries += 1;
+    if (timedOut) timeouts += 1;
+    if (slowTries >= TRIES || (timedOut && timeouts >= TIMEOUT_TRIES)) {
+      const error = new Error('credentials unavailable after ' + slowTries + ' tries over ' + Math.round((Date.now() - startedAt) / 1000) + ' s: ' + reason);
+      error.diagnostic = error.message;
+      throw error;
+    }
+    return pause(Math.round((timedOut ? TIMEOUT_BACKOFF_MS[timeouts - 1] : BACKOFF_MS[slowTries - 1]) * (0.5 + Math.random() / 2)));
+  };
   for (;;) {
     try {
       response = await fetch(urls[index], {
@@ -325,20 +349,26 @@ async function brokerPost(env, route, body) {
           'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
         body,
       });
-      if (response.status === 409 && conflicts < 29) {
-        conflicts += 1;
+      if (response.status === 409) {
         await response.arrayBuffer();
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await slowTry('the Paperclip server is busy (HTTP 409)', false);
         continue;
       }
       // A failed read of a successful answer is retried; an error answer is read best-effort.
       result = response.ok ? await response.json() : await response.json().catch(() => null);
       return { response, result };
     } catch (error) {
+      if (error && error.diagnostic) throw error;
+      // A route that is slow or busy is still the route that works (a sandbox's own bridge, whose answer the broker URL
+      // may not even reach), so it is asked again. Only a route that cannot be reached at all gives way to the next one.
+      if (error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+        await slowTry('the Paperclip server did not answer within 10 s', true);
+        continue;
+      }
       if (index < urls.length - 1) { index += 1; continue; }
       transportFailures += 1;
       if (transportFailures >= 3) throw error;
-      await new Promise(resolve => setTimeout(resolve, 500 * transportFailures));
+      await pause(500 * transportFailures);
     }
   }
 }
@@ -395,6 +425,8 @@ async function main() {
   }
   let env = { ...process.env };
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
+  // Why the broker could not be asked (set after the tries are spent): said again if the command then fails.
+  let brokerFailure = null;
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
   // fallback deliberately cannot load the host's gh authentication files.
@@ -434,7 +466,12 @@ async function main() {
       report = operation(env);
       answered = await brokerPost(env, '/runtime-tools/github/credentials', JSON.stringify({ operation: report }));
       if (!answered) diagnostic('capability_missing');
-    } catch { diagnostic('broker_transport_unavailable'); }
+    } catch (error) {
+      // After the tries are spent the error says why. It is said again below if the command then fails: git alone
+      // would only say that it could not read a username.
+      brokerFailure = error && error.diagnostic ? error.diagnostic : 'broker_transport_unavailable';
+      diagnostic(brokerFailure);
+    }
     if (answered && !answered.response.ok) {
       diagnostic(answered.response.status === 401 || answered.response.status === 403 ? 'capability_rejected' : 'broker_response_unavailable');
     } else if (answered && answered.result) {
@@ -524,6 +561,7 @@ async function main() {
       result = await run(fallback, false);
     }
   }
+  if (brokerFailure && result.code !== 0) process.stderr.write('Paperclip: this command ran without managed GitHub credentials (' + brokerFailure + ').\n');
   process.exitCode = result.code;
 }
 (program === SIGNER ? signer() : main()).catch(() => { process.stderr.write('Paperclip: GitHub launcher_setup_failed.\n'); process.exitCode = 1; });
