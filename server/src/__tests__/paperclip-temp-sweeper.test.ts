@@ -59,7 +59,7 @@ describe("startPaperclipTempSweeper", () => {
   });
 
   function record(trigger: PaperclipTempSweepTrigger): PaperclipTempSweepLogRecord {
-    return { event: "paperclip_tmp_sweep", trigger, runGraceMs: 15 * 60 * 1000, removed: 1, freedBytes: 10, kept: {}, deferred: 0 };
+    return { event: "paperclip_tmp_sweep", trigger, runGraceMs: 15 * 60 * 1000, removed: 1, freedBytes: 10, kept: {}, deferred: 0, stops: [] };
   }
 
   it("sweeps on startup and every interval, and logs each pass", async () => {
@@ -110,6 +110,24 @@ describe("startPaperclipTempSweeper", () => {
     vi.advanceTimersByTime(HOUR_MS);
     await vi.waitFor(() => expect(errors).toHaveLength(1));
     expect(records).toEqual([]);
+  });
+
+  it("aborts a running pass when stopped", async () => {
+    let signal: AbortSignal | null = null;
+    const sweeper = startPaperclipTempSweeper({
+      sweep: (_trigger, passSignal) => {
+        signal = passSignal;
+        return new Promise((resolve) => passSignal.addEventListener("abort", () => resolve(null)));
+      },
+      intervalMs: HOUR_MS,
+      log: () => undefined,
+      onError: () => undefined,
+    });
+
+    expect(signal?.aborted).toBe(false);
+    sweeper.stop();
+    await sweeper.startup;
+    expect(signal?.aborted).toBe(true);
   });
 
   it("sweeps only on startup when the interval is 0", async () => {

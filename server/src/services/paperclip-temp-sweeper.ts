@@ -11,10 +11,17 @@ import { BUSY_LEASE_STATUSES, TERMINAL_RUN_STATUSES } from "./ssh-run-directory-
 // Each creator removes its entry in `finally`, but a process that dies (a
 // restart, a lost run) never reaches it. Each entry carries its run id, and
 // the sweep removes it only when the database proves the run dead: terminal,
-// finished more than the grace period ago, with no busy lease, and not
-// executing in this process. That is the SSH run directory reaper's
+// with a known finish time more than the grace period ago, with no busy lease,
+// and not executing in this process. That is the SSH run directory reaper's
 // definition of a live run, plus the grace period. Anything it cannot prove
 // stays.
+//
+// Threat model: another local user is in scope. Nothing another user creates
+// or controls, and no race another user wins, may make the server delete
+// anything outside a run's own temp tree. The server's own user and root are
+// out of scope, since they can already delete everything the sweep reaches.
+// The sweep therefore enters only directories no other user can change; see
+// `sweepPaperclipTempEntries`.
 
 export type PaperclipTempSweepTrigger = "startup" | "interval";
 
@@ -51,7 +58,6 @@ export async function classifyPaperclipTempRuns(
       id: heartbeatRuns.id,
       status: heartbeatRuns.status,
       finishedAt: heartbeatRuns.finishedAt,
-      updatedAt: heartbeatRuns.updatedAt,
     })
     .from(heartbeatRuns)
     .where(inArray(heartbeatRuns.id, runIds));
@@ -67,7 +73,9 @@ export async function classifyPaperclipTempRuns(
   for (const run of runs) {
     if (options.isRunExecuting(run.id) || !TERMINAL_RUN_STATUSES.includes(run.status)) verdicts.set(run.id, "run_live");
     else if (busyRuns.has(run.id)) verdicts.set(run.id, "lease_busy");
-    else if (options.now - (run.finishedAt ?? run.updatedAt).getTime() < options.runGraceMs) verdicts.set(run.id, "run_recent");
+    // Without a finish time the grace period cannot be proven.
+    else if (!run.finishedAt) verdicts.set(run.id, "finish_unknown");
+    else if (options.now - run.finishedAt.getTime() < options.runGraceMs) verdicts.set(run.id, "run_recent");
     else verdicts.set(run.id, "dead");
   }
   return verdicts;
@@ -75,7 +83,8 @@ export async function classifyPaperclipTempRuns(
 
 /**
  * Builds one sweep pass. A pass takes a transaction-scoped advisory lock and
- * returns `null` when another process holds it.
+ * returns `null` when another process holds it. The pass's time budget covers
+ * the whole sweep, so the lock is held for about that long at most.
  *
  * @param options.runGraceMs - How long after a run finished its entries stay; also the minimum entry age.
  * @param options.isRunExecuting - Whether this process executes the run now.
@@ -87,9 +96,10 @@ export function createPaperclipTempSweep(db: Db, options: {
   tmpDir?: string;
   now?: () => number;
   maxEntries?: number;
+  scanBudget?: number;
   timeBudgetMs?: number;
-}): (trigger: PaperclipTempSweepTrigger) => Promise<PaperclipTempSweepLogRecord | null> {
-  return (trigger) => db.transaction(async (tx) => {
+}): (trigger: PaperclipTempSweepTrigger, signal?: AbortSignal) => Promise<PaperclipTempSweepLogRecord | null> {
+  return (trigger, signal) => db.transaction(async (tx) => {
     const [lock] = await tx.execute<{ acquired: boolean }>(
       sql`select pg_try_advisory_xact_lock(hashtext(${SWEEP_LOCK_KEY})) as acquired`,
     );
@@ -105,7 +115,9 @@ export function createPaperclipTempSweep(db: Db, options: {
       tmpDir: options.tmpDir,
       now,
       maxEntries: options.maxEntries,
+      scanBudget: options.scanBudget,
       timeBudgetMs: options.timeBudgetMs,
+      signal,
     });
     return { event: "paperclip_tmp_sweep", trigger, runGraceMs: options.runGraceMs, ...result };
   });
@@ -117,17 +129,20 @@ export function createPaperclipTempSweep(db: Db, options: {
  *
  * @param options.sweep - One pass; `null` means another process swept.
  * @param options.intervalMs - The period; `0` sweeps on startup only.
- * @returns `startup`, which settles when the startup sweep has logged, and `stop`.
+ * @returns `startup`, which settles when the startup sweep has logged, and
+ *   `stop`, which also aborts a running pass.
  */
 export function startPaperclipTempSweeper(options: {
-  sweep: (trigger: PaperclipTempSweepTrigger) => Promise<PaperclipTempSweepLogRecord | null>;
+  sweep: (trigger: PaperclipTempSweepTrigger, signal: AbortSignal) => Promise<PaperclipTempSweepLogRecord | null>;
   intervalMs: number;
   log: (record: PaperclipTempSweepLogRecord) => void;
   onError: (error: unknown) => void;
 }): { startup: Promise<void>; stop: () => void } {
   let running: Promise<void> | null = null;
+  const stopping = new AbortController();
   const sweep = (trigger: PaperclipTempSweepTrigger): Promise<void> => {
-    running ??= options.sweep(trigger)
+    if (stopping.signal.aborted) return Promise.resolve();
+    running ??= options.sweep(trigger, stopping.signal)
       .then((record) => {
         if (record) options.log(record);
       })
@@ -142,6 +157,7 @@ export function startPaperclipTempSweeper(options: {
     startup,
     stop: () => {
       if (timer) clearInterval(timer);
+      stopping.abort();
     },
   };
 }

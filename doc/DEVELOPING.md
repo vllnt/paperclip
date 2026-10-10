@@ -1489,13 +1489,19 @@ Environment overrides:
   `paperclip-workspace-baseline-<runId>-*`, and similar). The default is `15`.
   Values between `0` and `1` use `1`; zero, negative and non-numeric values use
   the default. The sweep removes an entry only when the database shows its run
-  terminal, finished at least this long ago, with no `active`, `retained` or
-  `pending_cleanup` lease, and not executing. It keeps an entry without a run id
-  (also every entry from before this change), a link, a mount point, and
-  anything it cannot classify. One pass handles at most 200 entries in 30
-  seconds, and only one server process sweeps at a time. It logs
-  `event: "paperclip_tmp_sweep"` with `removed`, `freedBytes`, `deferred`, the
-  kept reasons (`kept`), and the first removal failure (`firstFailure`).
+  terminal, with a `finished_at` at least this long ago, with no `active`,
+  `retained` or `pending_cleanup` lease, and not executing. It keeps an entry
+  without a run id (also every entry from before run ids were added; the
+  operator's temp cleanup removes those), a link, and anything it cannot
+  classify. It does nothing when another user may change the temp directory or
+  a directory above it (unless the directory is sticky, like `/tmp`), and it
+  enters only directories the server's user owns that no other user can write,
+  on the temp directory's device. One pass examines at most 5,000 entry names,
+  removes at most 200 entries and takes at most 30 seconds; the rest waits for
+  the next pass. Only one server process sweeps at a time, and shutdown stops a
+  running pass. Each pass logs `event: "paperclip_tmp_sweep"` with `removed`,
+  `freedBytes`, `deferred`, the kept reasons (`kept`), why it stopped early
+  (`stops`), and the first failure (`firstFailure`).
 - `PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES=<minutes>` sets how often the temp sweep
   runs after startup. The default is `60`. A value of `0` sweeps on startup only.
   Other values are kept between `1` and `1440`; negative and non-numeric values

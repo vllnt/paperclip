@@ -13,6 +13,7 @@ import {
   runWithPaperclipTempRun,
   sweepPaperclipTempEntries,
   SWEPT_PAPERCLIP_TEMP_PREFIXES,
+  type PaperclipTempFs,
   type PaperclipTempRunVerdict,
 } from "./paperclip-temp.js";
 import { disposeGitWorkspaceSnapshot, readGitWorkspaceSnapshot, withShallowGitWorkspaceClone } from "./git-workspace-sync.js";
@@ -26,6 +27,7 @@ const GRACE_MS = 15 * 60 * 1000;
 const RUN_ID = "2f1d3c4b-5a69-4788-9a0b-1c2d3e4f5a6b";
 const OTHER_RUN_ID = "7e6d5c4b-3a29-4180-8f7e-6d5c4b3a2918";
 const SWEPT = /^paperclip-(ssh-key|ssh-known-hosts|ssh-sync-back|ssh-bundle|workspace-baseline|codex-home-sync|bridge-asset|workspace-manifest|git-workspace|sandbox-sync|sandbox-restore|tar-list|syncin-fallback)-/;
+const IS_ROOT = process.getuid?.() === 0;
 
 const spec: SshRemoteExecutionSpec = {
   host: "127.0.0.1",
@@ -54,14 +56,38 @@ function sweep(options: Partial<Parameters<typeof sweepPaperclipTempEntries>[0]>
   return sweepPaperclipTempEntries({ tmpDir: tmp, minAgeMs: GRACE_MS, now: later(), classifyRuns: verdict("dead"), ...options });
 }
 
-async function sweptEntries(): Promise<string[]> {
-  return (await fsp.readdir(tmp)).filter((name) => SWEPT.test(name)).sort();
+// The sweep's file operations with some replaced, to simulate a race, a mount
+// or another owner.
+function fsWith(overrides: Partial<PaperclipTempFs>): PaperclipTempFs {
+  return {
+    lstat: (entry) => fsp.lstat(entry),
+    realpath: (entry) => fsp.realpath(entry),
+    opendir: (entry) => fsp.opendir(entry),
+    chmod: (entry, mode) => fsp.chmod(entry, mode),
+    unlink: (entry) => fsp.unlink(entry),
+    rmdir: (entry) => fsp.rmdir(entry),
+    ...overrides,
+  };
+}
+
+function statsWith(stats: Stats, changes: Partial<Pick<Stats, "dev" | "ino" | "uid">>): Stats {
+  return Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, changes);
+}
+
+async function sweptEntries(dir = tmp): Promise<string[]> {
+  return (await fsp.readdir(dir)).filter((name) => SWEPT.test(name)).sort();
+}
+
+// A private directory, whatever the umask.
+async function privateDir(dir: string): Promise<string> {
+  await fsp.mkdir(dir, { recursive: true });
+  await fsp.chmod(dir, 0o700);
+  return dir;
 }
 
 // A dead run's entry as a restarted server finds it.
 async function deadRunEntry(name: string, dir = tmp): Promise<string> {
-  const entry = path.join(dir, name);
-  await fsp.mkdir(entry);
+  const entry = await privateDir(path.join(dir, name));
   await fsp.writeFile(path.join(entry, "file"), "12345");
   return entry;
 }
@@ -74,10 +100,11 @@ async function installFakeSsh(): Promise<void> {
 }
 
 beforeEach(async () => {
-  root = await fsp.mkdtemp(path.join(os.tmpdir(), "paperclip-temp-sweep-test-"));
-  tmp = path.join(root, "tmp");
+  // A canonical path, so the paths the tests build match the ones the sweep
+  // uses after it resolves the root (macOS keeps temp dirs behind a link).
+  root = await fsp.realpath(await fsp.mkdtemp(path.join(os.tmpdir(), "paperclip-temp-sweep-test-")));
+  tmp = await privateDir(path.join(root, "tmp"));
   bin = path.join(root, "bin");
-  await fsp.mkdir(tmp);
   await fsp.mkdir(bin);
   await installFakeSsh();
   // os.tmpdir() reads TMPDIR on every call, so creators in this process use `tmp`.
@@ -169,7 +196,7 @@ describe("startup sweep after a killed run", () => {
     expect(await sweptEntries()).toHaveLength(3);
 
     const removed = await sweep();
-    expect(removed).toMatchObject({ removed: 3, kept: {}, deferred: 0 });
+    expect(removed).toMatchObject({ removed: 3, kept: {}, deferred: 0, stops: [] });
     expect(removed.freedBytes).toBeGreaterThanOrEqual(extractedBytes);
     expect(await sweptEntries()).toEqual([]);
   }, 150_000);
@@ -201,6 +228,7 @@ describe("proof that the run is dead", () => {
     expect(await sweep({ classifyRuns: async () => new Map([[RUN_ID, "run_recent"]]) }))
       .toMatchObject({ removed: 0, kept: { run_recent: 1, run_missing: 1 } });
     expect(await sweep({ classifyRuns: verdict("lease_busy") })).toMatchObject({ removed: 0, kept: { lease_busy: 2 } });
+    expect(await sweep({ classifyRuns: verdict("finish_unknown") })).toMatchObject({ removed: 0, kept: { finish_unknown: 2 } });
     expect(await sweep({ classifyRuns: async () => { throw Object.assign(new Error("database down"), { code: "ECONNREFUSED" }); } }))
       .toMatchObject({ removed: 0, kept: { db_error: 2 }, firstFailure: "classifyRuns: ECONNREFUSED" });
     expect(await sweptEntries()).toHaveLength(2);
@@ -256,71 +284,78 @@ describe("prefix allowlist", () => {
   });
 });
 
-describe("confinement", () => {
+describe("root safety", () => {
+  it("does nothing when other users may write the root and it is not sticky", async () => {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`);
+    await fsp.chmod(tmp, 0o775);
+
+    expect(await sweep()).toEqual({ removed: 0, freedBytes: 0, kept: {}, deferred: 0, stops: ["root_unsafe"] });
+    expect(fs.existsSync(entry)).toBe(true);
+
+    // A sticky root (like /tmp) is safe: no other user can rename this user's entries.
+    await fsp.chmod(tmp, 0o1777);
+    expect(await sweep()).toMatchObject({ removed: 1, stops: [] });
+  });
+
+  it("does nothing when another user owns the root or a directory above it (fixture)", async () => {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`);
+    for (const owned of [tmp, root]) {
+      const foreign = fsWith({
+        lstat: async (target) => {
+          const stats = await fsp.lstat(target);
+          return target === owned ? statsWith(stats, { uid: stats.uid + 1 }) : stats;
+        },
+      });
+      expect(await sweep({ fs: foreign })).toMatchObject({ removed: 0, stops: ["root_unsafe"] });
+    }
+    expect(fs.existsSync(entry)).toBe(true);
+  });
+
+  it("stops when the root is replaced during the sweep", async () => {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`);
+    const moved = path.join(root, "tmp-moved");
+
+    const result = await sweep({
+      classifyRuns: async (runIds) => {
+        // Between the scan and the removal, the root becomes another directory.
+        await fsp.rename(tmp, moved);
+        await privateDir(tmp);
+        await deadRunEntry(path.basename(entry));
+        return new Map(runIds.map((runId) => [runId, "dead"] as const));
+      },
+    });
+
+    expect(result).toMatchObject({ removed: 0, deferred: 1, stops: ["root_changed"] });
+    expect(fs.existsSync(path.join(moved, path.basename(entry), "file"))).toBe(true);
+    expect(fs.existsSync(path.join(entry, "file"))).toBe(true);
+  });
+
   it("removes only under the real temp dir when the TMPDIR link changes during the sweep", async () => {
-    const realRoot = path.join(root, "real");
-    const otherRoot = path.join(root, "other");
-    await fsp.mkdir(realRoot);
-    await fsp.mkdir(otherRoot);
+    const realRoot = await privateDir(path.join(root, "real"));
+    const otherRoot = await privateDir(path.join(root, "other"));
     const link = path.join(root, "tmp-link");
     await fsp.symlink(realRoot, link);
     const name = `paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`;
     await deadRunEntry(name, realRoot);
     await deadRunEntry(name, otherRoot);
 
-    // Point the link elsewhere right after the sweep lists the entries.
-    const realReaddir = fsp.readdir.bind(fsp);
+    // Point the link elsewhere right after the sweep opens the root.
     let swapped = false;
-    vi.spyOn(fsp, "readdir").mockImplementation(async (target, options) => {
-      const listing = await realReaddir(target, options);
-      if (!swapped && (String(target) === link || String(target) === realRoot)) {
-        swapped = true;
-        await fsp.unlink(link);
-        await fsp.symlink(otherRoot, link);
-      }
-      return listing;
+    const swapping = fsWith({
+      opendir: async (target) => {
+        const dir = await fsp.opendir(target);
+        if (!swapped) {
+          swapped = true;
+          await fsp.unlink(link);
+          await fsp.symlink(otherRoot, link);
+        }
+        return dir;
+      },
     });
 
-    expect(await sweep({ tmpDir: link })).toMatchObject({ removed: 1 });
+    expect(await sweep({ tmpDir: link, fs: swapping })).toMatchObject({ removed: 1 });
     expect(fs.existsSync(path.join(realRoot, name))).toBe(false);
     expect(fs.existsSync(path.join(otherRoot, name, "file"))).toBe(true);
-  });
-
-  it("keeps an entry that was replaced after it was checked", async () => {
-    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`);
-    const realLstat = fsp.lstat.bind(fsp);
-    let replaced = false;
-    vi.spyOn(fsp, "lstat").mockImplementation(async (target, options) => {
-      const stats = await realLstat(target, options);
-      if (!replaced && String(target) === entry) {
-        replaced = true;
-        fs.renameSync(entry, `${entry}-moved`);
-        fs.mkdirSync(entry);
-        fs.writeFileSync(path.join(entry, "replacement"), "keep");
-      }
-      return stats;
-    });
-
-    expect(await sweep()).toMatchObject({ removed: 0, kept: { changed: 1 } });
-    expect(fs.existsSync(path.join(entry, "replacement"))).toBe(true);
-  });
-
-  it("stops at a mount point inside an entry", async () => {
-    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`);
-    const mount = path.join(entry, "mnt");
-    await fsp.mkdir(mount);
-    await fsp.writeFile(path.join(mount, "data"), "keep");
-    // Report `mnt` on another device, as a mount there would be.
-    const realLstat = fsp.lstat.bind(fsp);
-    vi.spyOn(fsp, "lstat").mockImplementation(async (target, options) => {
-      const stats = await realLstat(target, options);
-      if (String(target) !== mount) return stats;
-      const mounted: Stats = Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, { dev: Number(stats.dev) + 1 });
-      return mounted;
-    });
-
-    expect(await sweep()).toMatchObject({ removed: 0, kept: { mount_point: 1 } });
-    expect(fs.existsSync(path.join(mount, "data"))).toBe(true);
   });
 
   it("keeps an entry this process holds when TMPDIR is a link", async () => {
@@ -334,35 +369,96 @@ describe("confinement", () => {
     expect(fs.existsSync(held)).toBe(true);
     await removePaperclipTempDir(held);
   });
+});
 
-  it("removes a file that reports another device, as files on overlayfs can", async () => {
-    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ovl001`);
-    const file = path.join(entry, "file");
-    const realLstat = fsp.lstat.bind(fsp);
-    vi.spyOn(fsp, "lstat").mockImplementation(async (target, options) => {
-      const stats = await realLstat(target, options);
-      if (String(target) !== file) return stats;
-      const lowerLayer: Stats = Object.assign(Object.create(Object.getPrototypeOf(stats)), stats, { dev: Number(stats.dev) + 1 });
-      return lowerLayer;
-    });
+describe("what a removal may enter", () => {
+  async function entryWithInner(): Promise<{ entry: string; inner: string }> {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`);
+    const inner = await privateDir(path.join(entry, "inner"));
+    await fsp.writeFile(path.join(inner, "data"), "keep");
+    return { entry, inner };
+  }
 
-    expect(await sweep()).toMatchObject({ removed: 1, kept: {} });
-    expect(fs.existsSync(entry)).toBe(false);
+  it("keeps an entry whose inner directory group or others may write", async () => {
+    const { inner } = await entryWithInner();
+    await fsp.chmod(inner, 0o775);
+
+    expect(await sweep()).toMatchObject({ removed: 0, kept: { unsafe_mode: 1 } });
+    expect(fs.existsSync(path.join(inner, "data"))).toBe(true);
   });
 
-  it("treats a node that disappears during removal as removed", async () => {
-    const dir = await runWithPaperclipTempRun(RUN_ID, () => createPaperclipTempDir("paperclip-ssh-sync-back-"));
-    await fsp.writeFile(path.join(dir, "file"), "12345");
-    // A concurrent dispose removes the file first.
-    const realUnlink = fsp.unlink.bind(fsp);
-    vi.spyOn(fsp, "unlink").mockImplementation(async (target) => {
-      await realUnlink(target);
-      return realUnlink(target);
+  it("keeps an entry whose inner directory another user owns (fixture)", async () => {
+    const { inner } = await entryWithInner();
+    const foreign = fsWith({
+      lstat: async (target) => {
+        const stats = await fsp.lstat(target);
+        return target === inner ? statsWith(stats, { uid: stats.uid + 1 }) : stats;
+      },
     });
 
-    await removePaperclipTempDir(dir);
-    expect(fs.existsSync(dir)).toBe(false);
-    expect(isPaperclipTempEntryHeld(dir)).toBe(false);
+    expect(await sweep({ fs: foreign })).toMatchObject({ removed: 0, kept: { foreign_owner: 1 } });
+    expect(fs.existsSync(path.join(inner, "data"))).toBe(true);
+  });
+
+  it.runIf(IS_ROOT)("keeps an entry whose inner directory another user owns", async () => {
+    const { inner } = await entryWithInner();
+    await fsp.chown(inner, 65534, 65534);
+
+    expect(await sweep()).toMatchObject({ removed: 0, kept: { foreign_owner: 1 } });
+    expect(fs.existsSync(path.join(inner, "data"))).toBe(true);
+  });
+
+  it("stops at a mount point inside an entry (fixture)", async () => {
+    const { entry, inner } = await entryWithInner();
+    // Report `inner` on another device, as a mount there would be.
+    const mounted = fsWith({
+      lstat: async (target) => {
+        const stats = await fsp.lstat(target);
+        return target === inner ? statsWith(stats, { dev: stats.dev + 1 }) : stats;
+      },
+    });
+
+    expect(await sweep({ fs: mounted })).toMatchObject({ removed: 0, kept: { mount_point: 1 } });
+    expect(fs.existsSync(path.join(inner, "data"))).toBe(true);
+    expect(fs.existsSync(entry)).toBe(true);
+  });
+
+  it("stops when a directory is replaced while the removal opens it", async () => {
+    const { entry, inner } = await entryWithInner();
+    const moved = path.join(entry, "inner-moved");
+    const swapping = fsWith({
+      opendir: async (target) => {
+        const dir = await fsp.opendir(target);
+        if (target === inner) {
+          await fsp.rename(inner, moved);
+          await privateDir(inner);
+        }
+        return dir;
+      },
+    });
+
+    expect(await sweep({ fs: swapping })).toMatchObject({ removed: 0, kept: { changed: 1 } });
+    expect(fs.existsSync(path.join(moved, "data"))).toBe(true);
+  });
+
+  it("keeps an entry that was replaced after it was checked", async () => {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ab12Cd`);
+    let replaced = false;
+    const replacing = fsWith({
+      lstat: async (target) => {
+        const stats = await fsp.lstat(target);
+        if (!replaced && target === entry) {
+          replaced = true;
+          await fsp.rename(entry, `${entry}-moved`);
+          await deadRunEntry(path.basename(entry));
+          await fsp.writeFile(path.join(entry, "replacement"), "keep");
+        }
+        return stats;
+      },
+    });
+
+    expect(await sweep({ fs: replacing })).toMatchObject({ removed: 0, kept: { changed: 1 } });
+    expect(fs.existsSync(path.join(entry, "replacement"))).toBe(true);
   });
 
   it("keeps held entries, symlinks, files and other names", async () => {
@@ -377,13 +473,27 @@ describe("confinement", () => {
 
     const result = await sweep();
 
-    expect(result).toEqual({ removed: 1, freedBytes: 5, kept: { held: 1, symlink: 1, not_directory: 1 }, deferred: 0 });
+    expect(result).toEqual({ removed: 1, freedBytes: 5, kept: { held: 1, symlink: 1, not_directory: 1 }, deferred: 0, stops: [] });
     expect(fs.existsSync(stale)).toBe(false);
     expect(fs.existsSync(held)).toBe(true);
     expect(fs.existsSync(path.join(tmp, "paperclip-run-abc123"))).toBe(true);
     expect(fs.existsSync(path.join(outside, "keep"))).toBe(true);
     await removePaperclipTempDir(held);
     expect(isPaperclipTempEntryHeld(held)).toBe(false);
+  });
+
+  it("removes a file that reports another device, as files on overlayfs can (fixture)", async () => {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Ovl001`);
+    const file = path.join(entry, "file");
+    const overlay = fsWith({
+      lstat: async (target) => {
+        const stats = await fsp.lstat(target);
+        return target === file ? statsWith(stats, { dev: stats.dev + 1 }) : stats;
+      },
+    });
+
+    expect(await sweep({ fs: overlay })).toMatchObject({ removed: 1, kept: {} });
+    expect(fs.existsSync(entry)).toBe(false);
   });
 
   it("removes entries that hold a read-only directory without changing a symlink target", async () => {
@@ -399,8 +509,7 @@ describe("confinement", () => {
     };
     const held = await runWithPaperclipTempRun(RUN_ID, () => createPaperclipTempDir("paperclip-ssh-sync-back-"));
     await readOnlyTree(held);
-    const stale = path.join(tmp, `paperclip-ssh-sync-back-${RUN_ID}-ReadOn`);
-    await fsp.mkdir(stale);
+    const stale = await privateDir(path.join(tmp, `paperclip-ssh-sync-back-${RUN_ID}-ReadOn`));
     await readOnlyTree(stale);
 
     await removePaperclipTempDir(held);
@@ -414,13 +523,14 @@ describe("confinement", () => {
 
   it("reports the first entry it cannot remove", async () => {
     const stale = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Busy01`);
-    const realRmdir = fsp.rmdir.bind(fsp);
-    vi.spyOn(fsp, "rmdir").mockImplementation(async (target, options) => {
-      if (String(target) === stale) throw Object.assign(new Error("busy"), { code: "EBUSY" });
-      return realRmdir(target, options);
+    const busy = fsWith({
+      rmdir: async (target) => {
+        if (target === stale) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+        return fsp.rmdir(target);
+      },
     });
 
-    expect(await sweep()).toMatchObject({
+    expect(await sweep({ fs: busy })).toMatchObject({
       removed: 0,
       kept: { rm_failed: 1 },
       firstFailure: `paperclip-ssh-sync-back-${RUN_ID}-Busy01: EBUSY`,
@@ -450,12 +560,84 @@ describe("bounded work", () => {
     expect(await sweptEntries()).toEqual([`paperclip-ssh-sync-back-${RUN_ID}-Old001`]);
   });
 
-  it("leaves everything for the next pass when the time budget is spent", async () => {
+  it("examines at most the scan budget of names in one pass", async () => {
+    for (let index = 0; index < 8; index += 1) await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Scan0${index}`);
+    await fsp.writeFile(path.join(tmp, "unrelated"), "skipped by name");
+
+    const first = await sweep({ scanBudget: 5 });
+
+    expect(first).toMatchObject({ removed: 5, stops: ["scan_budget_exhausted"] });
+    expect(await sweptEntries()).toHaveLength(3);
+    expect(await sweep({ scanBudget: 5 })).toMatchObject({ removed: 3, stops: [] });
+  });
+
+  it("stops classifying once the entry cap is reached", async () => {
+    for (let index = 0; index < 150; index += 1) {
+      const runId = `${index.toString(16).padStart(8, "0")}-0000-4000-8000-000000000000`;
+      await deadRunEntry(`paperclip-ssh-bundle-${runId}-Cap001`);
+    }
+    const classified: string[] = [];
+
+    const result = await sweep({
+      maxEntries: 2,
+      classifyRuns: async (ids) => {
+        classified.push(...ids);
+        return new Map(ids.map((runId) => [runId, "dead"] as const));
+      },
+    });
+
+    expect(result).toMatchObject({ removed: 2, deferred: 148 });
+    expect(classified).toHaveLength(100);
+  });
+
+  it("stops a deep removal at the time budget and finishes it in the next pass", async () => {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Deep01`);
+    for (let index = 0; index < 40; index += 1) await fsp.writeFile(path.join(entry, `f${index}`), "x");
+    // Each removed file costs 10 ms on a clock the test controls.
+    let time = 0;
+    const slow = fsWith({
+      unlink: async (target) => {
+        time += 10;
+        return fsp.unlink(target);
+      },
+    });
+
+    const first = await sweep({ fs: slow, clock: () => time, timeBudgetMs: 100 });
+
+    expect(first).toMatchObject({ removed: 0, deferred: 1, stops: ["time_budget_exhausted"] });
+    const left = (await fsp.readdir(entry)).length;
+    expect(left).toBeGreaterThan(0);
+    expect(left).toBeLessThan(41);
+    expect(await sweep()).toMatchObject({ removed: 1, stops: [] });
+    expect(fs.existsSync(entry)).toBe(false);
+  });
+
+  it("does nothing more once the time budget is spent", async () => {
     await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Old001`);
     await deadRunEntry(`paperclip-ssh-bundle-${RUN_ID}-Old002`);
 
-    expect(await sweep({ timeBudgetMs: -1 })).toMatchObject({ removed: 0, deferred: 2 });
+    expect(await sweep({ timeBudgetMs: -1 })).toMatchObject({ removed: 0, stops: ["time_budget_exhausted"] });
     expect(await sweptEntries()).toHaveLength(2);
+  });
+
+  it("stops when the abort signal fires", async () => {
+    const entry = await deadRunEntry(`paperclip-ssh-sync-back-${RUN_ID}-Abrt01`);
+    for (let index = 0; index < 40; index += 1) await fsp.writeFile(path.join(entry, `f${index}`), "x");
+
+    const before = new AbortController();
+    before.abort();
+    expect(await sweep({ signal: before.signal })).toMatchObject({ removed: 0, stops: ["aborted"] });
+
+    // Abort in the middle of a removal, as server shutdown does.
+    const during = new AbortController();
+    const aborting = fsWith({
+      unlink: async (target) => {
+        during.abort();
+        return fsp.unlink(target);
+      },
+    });
+    expect(await sweep({ fs: aborting, signal: during.signal })).toMatchObject({ removed: 0, deferred: 1, stops: ["aborted"] });
+    expect(fs.existsSync(entry)).toBe(true);
   });
 });
 
@@ -514,6 +696,33 @@ describe("registry", () => {
       expect(isPaperclipTempEntryHeld(clone)).toBe(false);
       await disposeGitWorkspaceSnapshot(snapshot);
     });
+  });
+
+  it("makes its own group-writable directories private before it removes them", async () => {
+    const dir = await runWithPaperclipTempRun(RUN_ID, () => createPaperclipTempDir("paperclip-ssh-sync-back-"));
+    await fsp.mkdir(path.join(dir, "shared"));
+    await fsp.writeFile(path.join(dir, "shared", "file"), "12345");
+    await fsp.chmod(path.join(dir, "shared"), 0o777);
+
+    await removePaperclipTempDir(dir);
+
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(isPaperclipTempEntryHeld(dir)).toBe(false);
+  });
+
+  it("treats a node that disappears during removal as removed", async () => {
+    const dir = await runWithPaperclipTempRun(RUN_ID, () => createPaperclipTempDir("paperclip-ssh-sync-back-"));
+    await fsp.writeFile(path.join(dir, "file"), "12345");
+    // A concurrent dispose removes the file first.
+    const realUnlink = fsp.unlink.bind(fsp);
+    vi.spyOn(fsp, "unlink").mockImplementation(async (target) => {
+      await realUnlink(target);
+      return realUnlink(target);
+    });
+
+    await removePaperclipTempDir(dir);
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(isPaperclipTempEntryHeld(dir)).toBe(false);
   });
 });
 

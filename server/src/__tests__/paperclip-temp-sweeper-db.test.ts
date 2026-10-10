@@ -62,13 +62,23 @@ describeDb("paperclip temp sweeper with the database", () => {
     tmpDir = "";
   });
 
-  async function seedRun(status: string, finishedAgoMs: number | null): Promise<string> {
+  async function seedRun(status: string, finishedAgoMs: number | null, updatedAgoMs = 0): Promise<string> {
     const id = randomUUID();
     await db.insert(heartbeatRuns).values({
       id, companyId, agentId, invocationSource: "manual", status,
       finishedAt: finishedAgoMs === null ? null : new Date(Date.now() - finishedAgoMs),
+      updatedAt: new Date(Date.now() - updatedAgoMs),
     });
     return id;
+  }
+
+  // A run's entry as `mkdtemp` makes it: private, whatever the umask.
+  async function runEntry(name: string): Promise<string> {
+    const dir = path.join(tmpDir, name);
+    await fs.mkdir(dir);
+    await fs.chmod(dir, 0o700);
+    await fs.writeFile(path.join(dir, "file"), "12345");
+    return dir;
   }
 
   async function seedLease(runId: string, status: string): Promise<void> {
@@ -87,9 +97,11 @@ describeDb("paperclip temp sweeper with the database", () => {
     const releasedLease = await seedRun("timed_out", HOUR_MS);
     await seedLease(releasedLease, "released");
     const executing = await seedRun("succeeded", HOUR_MS);
+    // Terminal, but with no finish time: an old update time proves nothing.
+    const finishUnknown = await seedRun("failed", null, 10 * HOUR_MS);
     const missing = randomUUID();
 
-    const verdicts = await classifyPaperclipTempRuns(db, [running, dead, recent, leased, releasedLease, executing, missing], {
+    const verdicts = await classifyPaperclipTempRuns(db, [running, dead, recent, leased, releasedLease, executing, finishUnknown, missing], {
       runGraceMs: GRACE_MS,
       now: Date.now(),
       isRunExecuting: (runId) => runId === executing,
@@ -102,6 +114,7 @@ describeDb("paperclip temp sweeper with the database", () => {
       [leased]: "lease_busy",
       [releasedLease]: "dead",
       [executing]: "run_live",
+      [finishUnknown]: "finish_unknown",
     });
   });
 
@@ -109,16 +122,12 @@ describeDb("paperclip temp sweeper with the database", () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-temp-sweeper-db-"));
     const live = await seedRun("running", null);
     const dead = await seedRun("failed", HOUR_MS);
-    const entry = async (name: string) => {
-      const dir = path.join(tmpDir, name);
-      await fs.mkdir(dir);
-      await fs.writeFile(path.join(dir, "file"), "12345");
-      return dir;
-    };
-    const liveEntry = await entry(`paperclip-ssh-sync-back-${live}-Live01`);
-    const deadEntry = await entry(`paperclip-ssh-sync-back-${dead}-Dead01`);
-    const missingEntry = await entry(`paperclip-ssh-key-${randomUUID()}-Miss01`);
-    const legacyEntry = await entry("paperclip-ssh-sync-back-Leg001");
+    const unknown = await seedRun("succeeded", null, 10 * HOUR_MS);
+    const liveEntry = await runEntry(`paperclip-ssh-sync-back-${live}-Live01`);
+    const deadEntry = await runEntry(`paperclip-ssh-sync-back-${dead}-Dead01`);
+    const missingEntry = await runEntry(`paperclip-ssh-key-${randomUUID()}-Miss01`);
+    const unknownEntry = await runEntry(`paperclip-ssh-bundle-${unknown}-Unkn01`);
+    const legacyEntry = await runEntry("paperclip-ssh-sync-back-Leg001");
     const holder = spawn(process.execPath, ["-e", `
       const fd = require("node:fs").openSync(${JSON.stringify(path.join(liveEntry, "file"))}, "r+");
       process.stdout.write("open\\n");
@@ -140,20 +149,21 @@ describeDb("paperclip temp sweeper with the database", () => {
       event: "paperclip_tmp_sweep",
       trigger: "startup",
       removed: 1,
-      kept: { run_live: 1, run_missing: 1, unattributed: 1 },
+      kept: { run_live: 1, run_missing: 1, finish_unknown: 1, unattributed: 1 },
+      stops: [],
     });
     expect(existsSync(path.join(liveEntry, "file"))).toBe(true);
     expect(holder.exitCode).toBeNull();
     expect(existsSync(deadEntry)).toBe(false);
     expect(existsSync(missingEntry)).toBe(true);
+    expect(existsSync(unknownEntry)).toBe(true);
     expect(existsSync(legacyEntry)).toBe(true);
   });
 
   it("skips the pass while another process holds the sweep lock", async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-temp-sweeper-db-"));
     const dead = await seedRun("succeeded", HOUR_MS);
-    const deadEntry = path.join(tmpDir, `paperclip-ssh-bundle-${dead}-Lock01`);
-    await fs.mkdir(deadEntry);
+    const deadEntry = await runEntry(`paperclip-ssh-bundle-${dead}-Lock01`);
     const sweep = createPaperclipTempSweep(db, {
       runGraceMs: GRACE_MS,
       isRunExecuting: () => false,
