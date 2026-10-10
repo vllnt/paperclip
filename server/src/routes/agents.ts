@@ -20,6 +20,7 @@ import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaper
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
+import { rateLimit } from "express-rate-limit";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -95,7 +96,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, tooManyRequests, unprocessable } from "../errors.js";
 import { ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX } from "../services/issue-assignment-wakeup.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
@@ -106,6 +107,17 @@ import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
+import {
+  agentProtectedConfigAfterPatch,
+  collectAgentConfigRollbackChanges,
+  collectAgentPermissionChanges,
+  collectAgentProtectedConfigChanges,
+  collectNewAgentProtectedFields,
+  type AgentProtectedConfigState,
+} from "../services/agent-self-config-authz.js";
+import { assertAgentProtectedChangeGranted, type AgentProtectedChangeSurface } from "./agent-protected-change-guard.js";
+import { configPatchFromSnapshot } from "../services/agents.js";
+import { normalizeAgentPermissions } from "../services/agent-permissions.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
@@ -2841,6 +2853,174 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  /**
+   * An agent may not raise its own run caps, budget, model, or permissions on
+   * the strength of allow_self. These changes need the same direct
+   * agents:configure grant (for itself) that editing a peer needs, and every
+   * refusal is logged so operators can see the attempt.
+   */
+  async function assertCanChangeOwnProtectedAgentFields(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    fields: string[],
+    surface: AgentProtectedChangeSurface,
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId !== targetAgent.id || fields.length === 0) return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target: targetAgent,
+      fields,
+      surface,
+    });
+  }
+
+  /**
+   * Route middleware for the agent create and hire routes. They authorize the
+   * caller and write several rows per request, so each actor gets a bounded
+   * number of requests per company per minute across both routes. Runs before
+   * validation and authorization. A spent limit answers 429 with `Retry-After`
+   * through the error handler.
+   */
+  const limitAgentCreation = rateLimit({
+    windowMs: 60_000,
+    limit: 30,
+    standardHeaders: false,
+    legacyHeaders: true,
+    keyGenerator: (req) => {
+      const actor = req.actor.type === "agent"
+        ? `agent:${req.actor.agentId ?? req.actor.keyId ?? "unknown"}`
+        : `user:${req.actor.userId ?? req.actor.source ?? "board"}`;
+      return `${req.params.companyId}:${actor}`;
+    },
+    handler: (_req, _res, next, options) => {
+      next(tooManyRequests("Too many agent creation requests", { limit: options.limit }));
+    },
+  });
+
+  /**
+   * An agent that creates or hires an agent may not give it settings it could
+   * not set on an existing agent. There is no target to compare with, so the
+   * request is compared with a bare new agent, and a protected setting needs
+   * `agents:configure` for the new agent (a company-wide grant). Board callers
+   * and hires that wait for board approval are not checked here.
+   */
+  async function assertAgentMayCreateWithProtectedFields(
+    req: Request,
+    companyId: string,
+    newAgentId: string,
+    input: Parameters<typeof collectNewAgentProtectedFields>[0],
+    surface: "agent_create" | "agent_hire",
+  ) {
+    if (req.actor.type !== "agent") return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target: { id: newAgentId, companyId },
+      entity: { type: "company", id: companyId },
+      fields: collectNewAgentProtectedFields(input),
+      surface,
+    });
+  }
+
+  /**
+   * The create default grants `canCreateAgents` to a new agent. An agent that
+   * creates or hires must not hand that on, so the server sets it to false
+   * unless the request asks for true, which the protected-field check has
+   * already refused for a caller without `agents:configure`.
+   */
+  function withoutInheritedCreateAuthority<T extends { permissions?: unknown }>(req: Request, input: T): T {
+    if (req.actor.type !== "agent") return input;
+    const supplied = input.permissions;
+    const permissions = typeof supplied === "object" && supplied !== null && !Array.isArray(supplied)
+      ? { ...supplied }
+      : {};
+    return { ...input, permissions: { canCreateAgents: false, ...permissions } };
+  }
+
+  function protectedStateOfAgentRow(row: {
+    adapterType: string;
+    adapterConfig: unknown;
+    runtimeConfig: unknown;
+    budgetMonthlyCents: number;
+    role: string;
+    status: string;
+    defaultEnvironmentId: string | null;
+  }): AgentProtectedConfigState {
+    return {
+      adapterType: row.adapterType,
+      adapterConfig: row.adapterConfig,
+      runtimeConfig: row.runtimeConfig,
+      budgetMonthlyCents: row.budgetMonthlyCents,
+      role: row.role,
+      status: row.status,
+      defaultEnvironmentId: row.defaultEnvironmentId,
+    };
+  }
+
+  /**
+   * Builds the check `svc.update` runs on the locked agent row. The route
+   * authorized an agent's change against an earlier read. If a protected value
+   * changed since that read (for example a board user lowered a cap), the write
+   * would put the stale value back, so an agent without `agents:configure` gets
+   * 409 and the committed value stays. No concurrent protected change means
+   * the earlier decision stands. Only an agent editing itself needs this.
+   */
+  function lockedRowVerifier(
+    req: Request,
+    existing: Parameters<typeof protectedStateOfAgentRow>[0] & { id: string; companyId: string },
+    patch: () => Record<string, unknown>,
+    surface: "patch_conflict" | "config_rollback_conflict",
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId !== existing.id) return undefined;
+    return async (locked: Parameters<typeof protectedStateOfAgentRow>[0]) => {
+      const lockedState = protectedStateOfAgentRow(locked);
+      if (collectAgentProtectedConfigChanges(protectedStateOfAgentRow(existing), lockedState).length === 0) return;
+      const written = patch();
+      const fields = collectAgentProtectedConfigChanges(lockedState, {
+        adapterType: typeof written.adapterType === "string" ? written.adapterType : locked.adapterType,
+        adapterConfig: written.adapterConfig ?? locked.adapterConfig,
+        runtimeConfig: written.runtimeConfig ?? locked.runtimeConfig,
+        budgetMonthlyCents: typeof written.budgetMonthlyCents === "number" ? written.budgetMonthlyCents : locked.budgetMonthlyCents,
+        role: typeof written.role === "string" ? written.role : locked.role,
+        status: typeof written.status === "string" ? written.status : locked.status,
+        defaultEnvironmentId: Object.prototype.hasOwnProperty.call(written, "defaultEnvironmentId")
+          ? (typeof written.defaultEnvironmentId === "string" ? written.defaultEnvironmentId : null)
+          : locked.defaultEnvironmentId,
+      });
+      if (fields.length === 0) return;
+      try {
+        await assertCanChangeOwnProtectedAgentFields(req, existing, fields, surface);
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 403) {
+          throw conflict("The agent configuration changed while this update was being applied. Re-read the agent and retry.", {
+            code: "agent_config_changed_concurrently",
+            fields,
+          });
+        }
+        throw error;
+      }
+    };
+  }
+
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
     await assertCanApplyProtectedAgentChange(
       req,
@@ -2866,11 +3046,14 @@ export function agentRoutes(
   ) {
     if (req.actor.type !== "agent") return;
 
+    const editsItself = req.actor.agentId === targetAgent.id;
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
-      scope: { requiresChangeGrant: true },
+      scope: editsItself
+        ? { requiresChangeGrant: true, targetAgentId: targetAgent.id, requireExplicitTargetGrant: true }
+        : { requiresChangeGrant: true },
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -4369,6 +4552,14 @@ export function agentRoutes(
     if (!rollbackConfig) {
       throw unprocessable("Invalid revision snapshot");
     }
+    if (req.actor.type === "agent" && req.actor.agentId === existing.id) {
+      await assertCanChangeOwnProtectedAgentFields(
+        req,
+        existing,
+        collectAgentConfigRollbackChanges(existing, configPatchFromSnapshot(rollbackConfig)),
+        "config_rollback",
+      );
+    }
     assertProviderTraceSettingTransition(
       req,
       rollbackConfig.runtimeConfig,
@@ -4403,6 +4594,8 @@ export function agentRoutes(
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
       agentId: actor.agentId,
       userId: actor.actorType === "user" ? actor.actorId : null,
+    }, {
+      verifyLockedRow: lockedRowVerifier(req, existing, () => configPatchFromSnapshot(rollbackConfig), "config_rollback_conflict"),
     });
     if (!updated) {
       res.status(404).json({ error: "Revision not found" });
@@ -4486,7 +4679,7 @@ export function agentRoutes(
   // adapter-config secret lands in the activity log.
   const hireFingerprint = (body: unknown): string => sha256Digest(body);
 
-  router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
+  router.post("/companies/:companyId/agent-hires", limitAgentCreation, validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
     const sourceIssueIds = parseSourceIssueIds(req.body);
@@ -4589,7 +4782,7 @@ export function agentRoutes(
     });
     const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig);
     const normalizedHireInput = {
-      ...hireInput,
+      ...withoutInheritedCreateAuthority(req, hireInput),
       adapterConfig: normalizedAdapterConfig,
       runtimeConfig: normalizedRuntimeConfig,
     };
@@ -4607,6 +4800,18 @@ export function agentRoutes(
     if (!company) {
       res.status(404).json({ error: "Company not found" });
       return;
+    }
+
+    if (!company.requireBoardApprovalForNewAgents) {
+      await assertAgentMayCreateWithProtectedFields(
+        req,
+        companyId,
+        hiredAgentId,
+        inheritRuntimeFrom === "caller"
+          ? { ...hireInput, adapterConfig: {}, defaultEnvironmentId: null }
+          : hireInput,
+        "agent_hire",
+      );
     }
 
     // Idempotency within a run: if this run already created a hire from this
@@ -4806,7 +5011,7 @@ export function agentRoutes(
     res.status(outcome.status).json(outcome.body);
   });
 
-  router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
+  router.post("/companies/:companyId/agents", limitAgentCreation, validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
 
@@ -4854,6 +5059,8 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     const agentId = randomUUID();
+    await assertAgentMayCreateWithProtectedFields(req, companyId, agentId, createInput, "agent_create");
+    Object.assign(createInput, withoutInheritedCreateAuthority(req, createInput));
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
       agentId,
@@ -4990,6 +5197,17 @@ export function agentRoutes(
       if (actorAgent.role !== "ceo") {
         res.status(403).json({ error: "Only CEO can manage permissions" });
         return;
+      }
+      if (actorAgent.id === existing.id) {
+        const changedPermissions = collectAgentPermissionChanges(
+          existing.permissions,
+          normalizeAgentPermissions({ ...existing.permissions, ...req.body }),
+        );
+        if (changedPermissions.length === 0) {
+          res.json(await buildAgentDetail(existing));
+          return;
+        }
+        await assertCanChangeOwnProtectedAgentFields(req, existing, changedPermissions, "permissions");
       }
     } else {
       await assertBoardCanManageAgentsForCompany(req, existing.companyId);
@@ -5449,6 +5667,41 @@ export function agentRoutes(
     // from the patch so it never reaches the update values.
     const applyStoredClaudeLogin = patchData.applyStoredClaudeLogin === true;
     delete patchData.applyStoredClaudeLogin;
+    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
+    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
+      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
+    );
+    if (!profileOnlyChange && req.actor.type === "agent" && req.actor.agentId === existing.id) {
+      const requestedAdapterConfigForGuard = asRecord(patchData.adapterConfig);
+      const protectedAfterPatch = agentProtectedConfigAfterPatch(
+        existing,
+        requestedAdapterConfigForGuard
+          ? {
+            ...patchData,
+            adapterConfig: restoreRedactedAgentEnv(requestedAdapterConfigForGuard, asRecord(existing.adapterConfig) ?? {}),
+          }
+          : patchData,
+        replaceAdapterConfig,
+      );
+      const patchTouchesAdapterConfiguration = hasOwn(patchData, "adapterType") || hasOwn(patchData, "adapterConfig");
+      await assertCanChangeOwnProtectedAgentFields(
+        req,
+        existing,
+        collectAgentProtectedConfigChanges(
+          existing,
+          patchTouchesAdapterConfiguration
+            ? {
+              ...protectedAfterPatch,
+              adapterConfig: applyCreateDefaultsByAdapterType(
+                protectedAfterPatch.adapterType,
+                asRecord(protectedAfterPatch.adapterConfig) ?? {},
+              ),
+            }
+            : protectedAfterPatch,
+        ),
+        "patch",
+      );
+    }
     if (hasOwn(patchData, "adapterConfig")) {
       const adapterConfig = asRecord(patchData.adapterConfig);
       if (!adapterConfig) {
@@ -5595,10 +5848,6 @@ export function agentRoutes(
         },
       );
     }
-    const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
-    const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
-      (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
-    );
     if (profileOnlyChange) {
       await assertCanApplyAgentProfileChange(req, existing);
     } else {
@@ -5607,6 +5856,7 @@ export function agentRoutes(
 
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
+      verifyLockedRow: lockedRowVerifier(req, existing, () => patchData, "patch_conflict"),
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,

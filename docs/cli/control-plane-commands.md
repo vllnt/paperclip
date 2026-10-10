@@ -16,6 +16,7 @@ npx paperclipai issue get <issue-id-or-identifier>
 
 # Create issue
 npx paperclipai issue create --title "..." [--description "..."] [--status todo] [--priority high]
+npx paperclipai issue similar --title "..." [--description "..."] [--parent-id <issue-id>]
 
 # Update issue
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]

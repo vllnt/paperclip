@@ -11,8 +11,13 @@ import {
   createIssueThreadInteractionSchema,
   createIssueTreeHoldSchema,
   createIssueWorkProductSchema,
+  DUPLICATE_PAIR_LABELS,
   type FeedbackTrace,
+  findSimilarIssuesSchema,
+  type FindSimilarIssuesResult,
   type HeartbeatRun,
+  type IssueDuplicatePair,
+  labelDuplicatePairSchema,
   linkIssueApprovalSchema,
   previewIssueTreeControlSchema,
   rejectIssueThreadInteractionSchema,
@@ -48,6 +53,12 @@ interface IssueBaseOptions extends BaseClientOptions {
   assigneeAgentId?: string;
   projectId?: string;
   match?: string;
+}
+
+interface IssueSimilarOptions extends BaseClientOptions {
+  title: string;
+  description?: string;
+  parentId?: string;
 }
 
 interface IssueCreateOptions extends BaseClientOptions {
@@ -306,6 +317,75 @@ export function registerIssueCommands(program: Command): void {
 
           const created = await ctx.api.post<Issue>(apiPath`/api/companies/${ctx.companyId}/issues`, payload);
           printOutput(created, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("similar")
+      .description("Check a draft issue for likely duplicates before creating it")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .requiredOption("--title <title>", "Draft issue title")
+      .option("--description <text>", "Draft issue description")
+      .option("--parent-id <id>", "Parent issue ID")
+      .action(async (opts: IssueSimilarOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const payload = findSimilarIssuesSchema.parse({
+            title: opts.title,
+            description: opts.description,
+            parentId: opts.parentId,
+          });
+          const result = await ctx.api.post<FindSimilarIssuesResult>(
+            apiPath`/api/companies/${ctx.companyId}/issues/similar`,
+            payload,
+          );
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("duplicate-pairs")
+      .description("List scored duplicate candidates recorded for an issue")
+      .argument("<idOrIdentifier>", "Issue ID or identifier (e.g. PC-12)")
+      .action(async (idOrIdentifier: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const pairs = await ctx.api.get<IssueDuplicatePair[]>(
+            apiPath`/api/issues/${idOrIdentifier}/duplicate-pairs`,
+          );
+          printOutput(pairs, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("duplicate-label")
+      .description("Record whether a scored pair is a duplicate or should be kept as two issues")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .argument("<pairId>", "Duplicate pair ID from `issue duplicate-pairs`")
+      .argument("<label>", `One of: ${DUPLICATE_PAIR_LABELS.join(", ")}`)
+      .action(async (pairId: string, label: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const payload = labelDuplicatePairSchema.parse({ label });
+          const pair = await ctx.api.post<IssueDuplicatePair>(
+            apiPath`/api/companies/${ctx.companyId}/issue-duplicate-pairs/${pairId}/label`,
+            payload,
+          );
+          printOutput(pair, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

@@ -53,6 +53,7 @@ const apiPrefixes: Record<string, string> = {
   "instance-database-backups.ts": "/api",
   "instance-settings.ts": "/api",
   "issues.ts": "/api",
+  "issue-duplicates.ts": "/api",
   "issue-tree-control.ts": "/api",
   "llms.ts": "/api",
   "managed-agent-profiles.ts": "/api",
@@ -339,7 +340,7 @@ describe("openapi routes", () => {
           "/api/issues/{id}/work-products/{workProductId}/review-document"
         ].post.responses,
       ).sort(),
-    ).toEqual(["200", "201", "401", "403", "404", "409", "413", "415", "422"]);
+    ).toEqual(["200", "201", "400", "401", "403", "404", "409", "413", "415", "422"]);
     expect(
       res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"]
         .post.summary,
@@ -923,7 +924,32 @@ describe("openapi routes", () => {
     // it. The idempotent cancel still returns 200 for an owner-scoped missing,
     // terminal, or foreign session id.
     const codes = Object.keys(cancel.responses).sort();
-    expect(codes).toEqual(["200", "401", "403", "404"]);
+    expect(codes).toEqual(["200", "400", "401", "403", "404"]);
+  });
+
+  it("documents 400 on every operation with a path parameter", () => {
+    // A malformed path value (e.g. not a UUID) returns 400 from the error
+    // handler, so any operation with a path parameter can answer 400.
+    const { spec } = loadSpecRoutes();
+    const missing: string[] = [];
+    let checked = 0;
+    for (const [routePath, pathItem] of Object.entries<
+      Record<string, { responses?: Record<string, unknown> }>
+    >(spec.paths ?? {})) {
+      if (!/\{[^}]+\}/.test(routePath)) continue;
+      for (const [method, operation] of Object.entries(pathItem)) {
+        if (!HTTP_METHODS.has(method)) continue;
+        checked++;
+        if (!operation.responses?.["400"]) missing.push(`${method.toUpperCase()} ${routePath}`);
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+    expect(missing).toEqual([]);
+    expect(
+      spec.paths["/api/routines/{id}"].patch.responses["400"].content[
+        "application/json"
+      ].schema,
+    ).toBeDefined();
   });
 });
 

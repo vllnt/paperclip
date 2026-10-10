@@ -19,6 +19,7 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
+  decide: vi.fn(),
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
@@ -343,6 +344,7 @@ describe.sequential("company portability routes", () => {
       role: id === ceoAgentId ? "ceo" : "engineer",
     }));
     mockAgentService.list.mockResolvedValue([]);
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow_explicit_grant", explanation: "Allowed." });
     mockCompanyPortabilityService.exportBundle.mockResolvedValue(createExportResult());
     mockCompanyPortabilityService.previewExport.mockResolvedValue({
       rootPath: "paperclip",
@@ -811,6 +813,56 @@ describe.sequential("company portability routes", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("Instance admin");
     expect(mockCompanyPortabilityService.previewImport).not.toHaveBeenCalled();
+  });
+
+  describe("CEO agent applying an import that creates agents", () => {
+    const ceoActor = { type: "agent", agentId: ceoAgentId, companyId, source: "agent_key", runId: "run-1" };
+
+    it.sequential("denies a CEO agent without agents:configure, writes nothing, and logs it", async () => {
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        reason: "deny_no_grant",
+        explanation: "Missing permission: agents:configure.",
+      });
+      const app = await createApp(ceoActor);
+
+      const res = await request(app).post(`/api/companies/${companyId}/imports/apply`).send(importRequest);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields: ["importedAgents"] });
+      expect(mockCompanyPortabilityService.importBundle).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        companyId,
+        actorType: "agent",
+        actorId: ceoAgentId,
+        entityType: "company",
+        action: "agent.self_config_update_denied",
+        details: expect.objectContaining({ surface: "company_import", fields: ["importedAgents"] }),
+      }));
+    });
+
+    it.sequential("still applies for a CEO agent holding agents:configure", async () => {
+      mockCompanyPortabilityService.importBundle.mockResolvedValue(createImportResult());
+      const app = await createApp(ceoActor);
+
+      const res = await request(app).post(`/api/companies/${companyId}/imports/apply`).send(importRequest);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalled();
+    });
+
+    it.sequential("does not ask for agents:configure when the import leaves agents out", async () => {
+      mockAccessService.decide.mockResolvedValue({ allowed: false, reason: "deny_no_grant", explanation: "Missing." });
+      mockCompanyPortabilityService.importBundle.mockResolvedValue(createImportResult());
+      const app = await createApp(ceoActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/imports/apply`)
+        .send({ ...importRequest, include: { company: true, agents: false, projects: true, issues: false } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAccessService.decide).not.toHaveBeenCalled();
+    });
   });
 
   it.sequential("rejects replace collision strategy on CEO-safe import apply routes", async () => {

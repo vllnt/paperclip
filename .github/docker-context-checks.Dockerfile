@@ -18,8 +18,9 @@
 #
 # node:24-slim — the runner requires Node >= 24.11 and the production
 # image builds on Node 24; the digest pin keeps the security gate's own
-# runtime immutable.
-FROM node:24-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
+# runtime immutable. It comes from Docker's ECR Public mirror at the same
+# digest, never from anonymous Docker Hub (see the root Dockerfile header).
+FROM public.ecr.aws/docker/library/node:24-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
 WORKDIR /context
 COPY . .
 # Committed artifacts the image build reads whose drift checks cannot run

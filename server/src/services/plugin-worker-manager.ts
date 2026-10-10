@@ -66,6 +66,7 @@ import {
 } from "./login-command.js";
 import { logger } from "../middleware/logger.js";
 import { traceparentFromContextToken } from "../instrumentation.js";
+import { runWithPluginHostCallAgent, type PluginHostCallAgent } from "./plugin-host-call-actor.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -539,6 +540,10 @@ interface PendingRequest {
 
 interface ActiveInvocation {
   scope: PluginInvocationScope;
+  // The agent that started this call, taken from the host-authenticated request
+  // or run context. Host handlers read it so a plugin cannot do for an agent
+  // what the agent may not do itself. Absent for user, system, and event calls.
+  agent?: PluginHostCallAgent;
   timer?: ReturnType<typeof setTimeout>;
   // The host-minted W3C `traceparent` for the active startup span, or undefined
   // when no startup span is active. The span host handler reads it to mint the
@@ -1139,7 +1144,26 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function agentBehindHostCall(method: string, params: unknown): PluginHostCallAgent | null {
+    if (!isRecord(params)) return null;
+    let source: Record<string, unknown> | null = null;
+    if (method === "performAction" && isRecord(params.actorContext) && params.actorContext.type === "agent") {
+      source = params.actorContext;
+    } else if (method === "executeTool" && isRecord(params.runContext)) {
+      source = params.runContext;
+    }
+    if (!source) return null;
+    const agentId = readNonEmptyString(source.agentId);
+    const companyId = readNonEmptyString(source.companyId);
+    if (!agentId || !companyId) return null;
+    return { agentId, runId: readNonEmptyString(source.runId), companyId };
+  }
+
+  function registerInvocation(
+    scope: PluginInvocationScope,
+    ttlMs?: number,
+    agent?: PluginHostCallAgent | null,
+  ): PluginInvocationContext {
     // Mint a W3C `traceparent` from the active startup span, so the worker's
     // provider span can parent to it. The host keeps the value on its own record
     // (below) and never trusts the worker to supply the parent. Outside a
@@ -1153,7 +1177,7 @@ export function createPluginWorkerHandle(
       scope,
       ...(traceparent ? { traceparent } : {}),
     };
-    const entry: ActiveInvocation = { scope, traceparent };
+    const entry: ActiveInvocation = { scope, traceparent, ...(agent ? { agent } : {}) };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -2717,7 +2741,14 @@ export function createPluginWorkerHandle(
     }
 
     try {
-      const result = await handler(request.params, contextForWorkerMessage(request));
+      const invocationId = readNonEmptyString(
+        (request as { paperclipInvocationId?: unknown }).paperclipInvocationId,
+      );
+      const callAgent = invocationId ? activeInvocations.get(invocationId)?.agent ?? null : null;
+      const result = await runWithPluginHostCallAgent(
+        callAgent,
+        () => handler(request.params, contextForWorkerMessage(request)),
+      );
       sendMessage({
         jsonrpc: JSONRPC_VERSION,
         id: request.id,
@@ -3305,7 +3336,9 @@ export function createPluginWorkerHandle(
       const id = nextRequestId++;
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      const invocation = invocationScope
+        ? registerInvocation(invocationScope, undefined, agentBehindHostCall(method, params))
+        : null;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived
       // invocation scope, never from the worker. This binds the sink to the

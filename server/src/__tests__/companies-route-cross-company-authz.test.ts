@@ -24,6 +24,7 @@ const mockAgentService = vi.hoisted(() => ({
 const mockAccessService = vi.hoisted(() => ({
   ensureMembership: vi.fn(),
   ensureRoleDefaultGrants: vi.fn(),
+  decide: vi.fn(),
 }));
 
 const mockBudgetService = vi.hoisted(() => ({
@@ -153,6 +154,7 @@ function importResult(companyId = companyBId) {
 }
 
 function resetMockDefaults() {
+  mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow_explicit_grant", explanation: "Allowed." });
   mockCompanyService.getById.mockImplementation(async (id: string) => {
     if (id === companyAId || id === companyBId) return createCompany(id);
     return null;

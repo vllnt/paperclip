@@ -26,8 +26,8 @@ each one).
 * Make **logical commits** of all uncommitted changes before anything else.
   Do not stash and forget; do not leave files behind. If commits are missing,
   make them.
-* Commit messages must end with exactly:
-  `Co-Authored-By: Paperclip <noreply@paperclip.ing>`
+* Commit with the repository's configured author identity. Add no co-author
+  or attribution trailers.
 
 ## 2. Get changes cleanly on top of master
 
