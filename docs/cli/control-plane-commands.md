@@ -150,6 +150,31 @@ npx paperclipai instance settings:experimental:update --payload-json '{...}'
 
 Experimental features are opt-in and are provided without compatibility guarantees. They may break, change, or be removed at any time. Use them at your own risk.
 
+## Plugin Actions
+
+Plugin actions that the board UI runs also work from the CLI with a board API key (from
+`paperclipai auth login`), with no browser session. The CLI sends the company from `-C`, `PAPERCLIP_COMPANY_ID`
+or the context profile; the server overrides any `companyId` inside `--params-json` with it.
+
+```sh
+# GitHub write identity and user authorization (set/check/start need a board key whose user is an instance admin)
+npx paperclipai plugin action vllnt.paperclip-github write-identity.get --params-json '{}'
+npx paperclipai plugin action vllnt.paperclip-github write-identity.set --params-file policy.json
+npx paperclipai plugin action vllnt.paperclip-github user-authorization.status --params-json '{}'
+npx paperclipai plugin action vllnt.paperclip-github user-authorization.check --params-json '{}'
+
+# Repositories and sync
+npx paperclipai plugin action vllnt.paperclip-github repositories.list --params-json '{"refresh":true}'
+npx paperclipai plugin action vllnt.paperclip-github sync.trigger --params-json '{}'
+
+# Update a PR branch from its base (board-only; the head SHA must match)
+npx paperclipai plugin action vllnt.paperclip-github manage-repository \
+  --params-json '{"op":"update-branch","repositoryId":123,"number":45,"sha":"<head-sha>","requestId":"update-45-1"}'
+```
+
+Board-only GitHub actions refuse an agent credential with "board-only, but it was called with an agent credential".
+Use `paperclipai auth whoami` to check which credential the CLI is using.
+
 ## Heartbeat
 
 ```sh

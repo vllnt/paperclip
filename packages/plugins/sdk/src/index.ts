@@ -159,6 +159,7 @@ export type {
   GetDataParams,
   PerformActionParams,
   PluginPerformActionActorType,
+  PluginPerformActionCredentialSource,
   PluginPerformActionActorContext,
   PluginPerformActionContext,
   ExecuteToolParams,

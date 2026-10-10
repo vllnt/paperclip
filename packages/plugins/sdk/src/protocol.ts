@@ -309,6 +309,12 @@ export interface WorkerHostCallContext {
   invocationScope?: PluginInvocationScope | null;
   invalidInvocationScope?: boolean;
   /**
+   * Who started the echoed invocation, when it is a `performAction` call. The host
+   * recovers it from its own invocation record, not from the worker, so the audit
+   * trail of a plugin write names the caller that the host authenticated.
+   */
+  initiator?: Readonly<PluginPerformActionActorContext> | null;
+  /**
    * The W3C `traceparent` the host minted for the echoed invocation. The host
    * recovers it from its own invocation record, not from the worker, so a worker
    * can never forge a span parent. The span host handler validates and uses it.
@@ -418,6 +424,20 @@ export interface GetDataParams {
  */
 export type PluginPerformActionActorType = "user" | "agent" | "system";
 
+/**
+ * How the host authenticated the caller of a plugin action. It names the kind of
+ * credential only; it never carries the credential.
+ */
+export type PluginPerformActionCredentialSource =
+  | "local_implicit"
+  | "session"
+  | "board_key"
+  | "agent_key"
+  | "agent_jwt"
+  | "cloud_tenant"
+  | "cloud_control"
+  | "none";
+
 export interface PluginPerformActionActorContext {
   /** Authenticated principal type resolved by the Paperclip host. */
   type: PluginPerformActionActorType;
@@ -431,6 +451,14 @@ export interface PluginPerformActionActorContext {
   companyId: string | null;
   /** Whether the authenticated board user is an instance administrator. */
   isInstanceAdmin?: boolean;
+  /**
+   * The id of the credential record the caller authenticated with, such as a
+   * board API key or an agent API key. It is an identifier, never the key or its
+   * hash. Absent when the host did not resolve one.
+   */
+  keyId?: string;
+  /** How the caller authenticated. Absent when the host did not resolve it. */
+  source?: PluginPerformActionCredentialSource;
 }
 
 export interface PluginPerformActionContext {

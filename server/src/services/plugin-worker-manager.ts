@@ -48,6 +48,8 @@ import type {
   JsonRpcId,
   PluginInvocationContext,
   PluginInvocationScope,
+  PluginPerformActionActorContext,
+  PluginPerformActionCredentialSource,
   JsonRpcResponse,
   JsonRpcRequest,
   JsonRpcNotification,
@@ -538,8 +540,24 @@ interface PendingRequest {
   invocationId?: string;
 }
 
+const CREDENTIAL_SOURCES: readonly PluginPerformActionCredentialSource[] = [
+  "local_implicit",
+  "session",
+  "board_key",
+  "agent_key",
+  "agent_jwt",
+  "cloud_tenant",
+  "cloud_control",
+  "none",
+];
+
 interface ActiveInvocation {
   scope: PluginInvocationScope;
+  /**
+   * Who started a `performAction` invocation, copied from the actor context that
+   * the host built from the authenticated request. A worker never supplies it.
+   */
+  initiator?: Readonly<PluginPerformActionActorContext>;
   // The agent that started this call, taken from the host-authenticated request
   // or run context. Host handlers read it so a plugin cannot do for an agent
   // what the agent may not do itself. Absent for user, system, and event calls.
@@ -1117,6 +1135,16 @@ export function createPluginWorkerHandle(
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
 
+  /**
+   * Reads how the host authenticated a caller. Anything outside the known kinds is dropped.
+   *
+   * @param value - The `source` field of an actor context.
+   * @returns The credential kind, or null when it is missing or unknown.
+   */
+  function readCredentialSource(value: unknown): PluginPerformActionCredentialSource | null {
+    return CREDENTIAL_SOURCES.find((source) => source === value) ?? null;
+  }
+
   function deriveInvocationScope(
     method: HostToWorkerMethodName | string,
     params: unknown,
@@ -1144,6 +1172,36 @@ export function createPluginWorkerHandle(
     return null;
   }
 
+  /**
+   * Reads the initiating caller from the actor context of a `performAction` call.
+   * The host built that context from the authenticated request. Any other method
+   * has no initiator.
+   *
+   * @param method - The host-to-worker method being called.
+   * @param params - The params of that call.
+   * @returns The caller the host authenticated, or undefined when the call has none.
+   */
+  function deriveInvocationInitiator(
+    method: HostToWorkerMethodName | string,
+    params: unknown,
+  ): Readonly<PluginPerformActionActorContext> | undefined {
+    if (method !== "performAction" || !isRecord(params) || !isRecord(params.actorContext)) return undefined;
+    const actor = params.actorContext;
+    const type = actor.type;
+    if (type !== "user" && type !== "agent" && type !== "system") return undefined;
+    const keyId = readNonEmptyString(actor.keyId);
+    const source = readCredentialSource(actor.source);
+    return Object.freeze({
+      type,
+      userId: readNonEmptyString(actor.userId) ?? null,
+      agentId: readNonEmptyString(actor.agentId) ?? null,
+      runId: readNonEmptyString(actor.runId) ?? null,
+      companyId: readNonEmptyString(actor.companyId) ?? null,
+      ...(keyId ? { keyId } : {}),
+      ...(source ? { source } : {}),
+    });
+  }
+
   function agentBehindHostCall(method: string, params: unknown): PluginHostCallAgent | null {
     if (!isRecord(params)) return null;
     let source: Record<string, unknown> | null = null;
@@ -1163,6 +1221,7 @@ export function createPluginWorkerHandle(
     scope: PluginInvocationScope,
     ttlMs?: number,
     agent?: PluginHostCallAgent | null,
+    initiator?: Readonly<PluginPerformActionActorContext>,
   ): PluginInvocationContext {
     // Mint a W3C `traceparent` from the active startup span, so the worker's
     // provider span can parent to it. The host keeps the value on its own record
@@ -1177,7 +1236,12 @@ export function createPluginWorkerHandle(
       scope,
       ...(traceparent ? { traceparent } : {}),
     };
-    const entry: ActiveInvocation = { scope, traceparent, ...(agent ? { agent } : {}) };
+    const entry: ActiveInvocation = {
+      scope,
+      traceparent,
+      ...(agent ? { agent } : {}),
+      ...(initiator ? { initiator } : {}),
+    };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -2712,7 +2776,11 @@ export function createPluginWorkerHandle(
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
-    return { invocationScope: entry.scope, traceparent: entry.traceparent };
+    return {
+      invocationScope: entry.scope,
+      traceparent: entry.traceparent,
+      ...(entry.initiator ? { initiator: entry.initiator } : {}),
+    };
   }
 
   /**
@@ -3337,7 +3405,12 @@ export function createPluginWorkerHandle(
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
       const invocationScope = deriveInvocationScope(method, params);
       const invocation = invocationScope
-        ? registerInvocation(invocationScope, undefined, agentBehindHostCall(method, params))
+        ? registerInvocation(
+            invocationScope,
+            undefined,
+            agentBehindHostCall(method, params),
+            deriveInvocationInitiator(method, params),
+          )
         : null;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived

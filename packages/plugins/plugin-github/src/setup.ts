@@ -3,15 +3,31 @@ import type { PluginContext, PluginPerformActionContext } from "@paperclipai/plu
 import { PAGE_PATH, PLUGIN_ID, type SetupStart } from "./contracts.js";
 import type { GitHubClient } from "./github.js";
 
+/**
+ * Board-only GitHub actions accept a board user (a browser session or a board API key) acting in one company.
+ * Each refusal names what is missing, because API and CLI callers can't see the UI that would otherwise guide them.
+ */
 export function boardScope(params: Record<string, unknown>, context: PluginPerformActionContext): { companyId: string; userId: string | null } {
-  if (context.actor.type !== "user" || !context.companyId || context.actor.companyId !== context.companyId || params.companyId !== context.companyId) {
+  if (context.actor.type !== "user") {
+    throw new Error(
+      `This GitHub action is board-only, but it was called with ${context.actor.type === "agent" ? "an agent" : "a system"} credential. ` +
+        "Use a board session or a board API key (paperclipai auth login).",
+    );
+  }
+  if (!context.companyId) {
+    throw new Error("This GitHub action needs the company: send companyId (CLI: paperclipai plugin action ... -C <company-id>).");
+  }
+  if (context.actor.companyId !== context.companyId || params.companyId !== context.companyId) {
     throw new Error("Open this plugin as a Paperclip board user in the selected company.");
   }
   return { companyId: context.companyId, userId: context.actor.userId };
 }
 export function requireInstanceAdmin(context: PluginPerformActionContext): void {
   if (context.actor.type !== "user" || context.actor.isInstanceAdmin !== true) {
-    throw new Error("Instance administrator access is required for GitHub connection changes.");
+    throw new Error(
+      "Instance administrator access is required for GitHub connection changes. " +
+        "With an API key, use a board key whose user is an instance admin.",
+    );
   }
 }
 export function callbackUrl(value: unknown): string {

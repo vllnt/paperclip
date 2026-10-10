@@ -715,7 +715,7 @@ Governance helpers:
 - `ctx.issues.requestWakeups(issueIds, companyId, options)` applies the same host-owned wakeup semantics to a batch and may use an idempotency key prefix for stable coordinator retries.
 - `ctx.issues.createComment(issueId, body, companyId, options)` posts a comment attributed to the plugin's own agent by default (`options.authorAgentId`). Passing `options.actorUserId` instead attributes the comment to that human company member — this requires `issue.comments.create_human_attributed` in addition to `issue.comments.create`, and the host independently verifies `actorUserId` is an active human member of the company before applying it, so a plugin can never forge attribution to an arbitrary or inactive user. A human-attributed comment on a non-terminal-status issue with an assignee also triggers the same assignee wakeup a board user's comment gets.
 
-Plugin-originated issue, relation, document, comment, and wakeup mutations must write activity entries with `actorType: "plugin"` and details fields for `sourcePluginId`, `sourcePluginKey`, `initiatingActorType`, `initiatingActorId`, and `initiatingRunId` when a user or agent run initiated the plugin work.
+Plugin-originated issue, relation, document, comment, and wakeup mutations must write activity entries with `actorType: "plugin"` and details fields for `sourcePluginId`, `sourcePluginKey`, `initiatingActorType`, `initiatingActorId`, and `initiatingRunId` when a user or agent run initiated the plugin work. An entry that a plugin writes with `ctx.activity.log` while it serves an action also carries `initiatingKeyId` and `initiatingSource`: the id of the credential record the caller used and how it authenticated (`board_key`, `session`, `agent_key` and so on). The host takes both from its own record of the action, never from the plugin. They are identifiers; the entry never holds the key or its hash.
 
 Scoped API routes:
 
@@ -1431,6 +1431,7 @@ Plugin-originated mutations should write:
 - `actor_id = <plugin-id>`
 - details include `sourcePluginId` and `sourcePluginKey`
 - details include `initiatingActorType`, `initiatingActorId`, and `initiatingRunId` when a user or agent run triggered the plugin work
+- details include `initiatingKeyId` and `initiatingSource` for an action that a caller started with a credential record, so two keys of the same user stay apart
 
 ## 21.5 Plugin Migrations
 

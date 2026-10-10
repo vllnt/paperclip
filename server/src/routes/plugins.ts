@@ -768,6 +768,18 @@ export function pluginRoutes(
     }
   }
 
+  /**
+   * The credential record id and kind that authenticated the request. The plugin
+   * host writes them into the audit row of what the plugin does next, so two
+   * callers who act as the same user stay apart. They are identifiers, not secrets.
+   */
+  function performActionCredential(req: Request): Pick<PluginPerformActionActorContext, "keyId" | "source"> {
+    return {
+      ...(req.actor.keyId ? { keyId: req.actor.keyId } : {}),
+      ...(req.actor.source ? { source: req.actor.source } : {}),
+    };
+  }
+
   function performActionActorContext(req: Request, companyId: string | undefined): PluginPerformActionActorContext {
     const scopedCompanyId = companyId ?? null;
     if (req.actor.type === "agent") {
@@ -777,6 +789,7 @@ export function pluginRoutes(
         agentId: req.actor.agentId ?? null,
         runId: req.actor.runId ?? null,
         companyId: scopedCompanyId,
+        ...performActionCredential(req),
       };
     }
     if (req.actor.type === "board") {
@@ -787,6 +800,7 @@ export function pluginRoutes(
         runId: req.actor.runId ?? null,
         companyId: scopedCompanyId,
         ...(req.actor.isInstanceAdmin ? { isInstanceAdmin: true } : {}),
+        ...performActionCredential(req),
       };
     }
     return {
@@ -795,6 +809,7 @@ export function pluginRoutes(
       agentId: null,
       runId: req.actor.runId ?? null,
       companyId: scopedCompanyId,
+      ...performActionCredential(req),
     };
   }
 
