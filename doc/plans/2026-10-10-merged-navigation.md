@@ -369,7 +369,7 @@ owners.
 
 ## 8. Exit criteria
 
-The user selects Q1, Q4, Q7, and confirms Q2, Q5, Q6, Q9, and Q10. The owner
+The user resolves Q1–Q11. The listed defaults apply unless the product owner changes them. The owner
 then converts only the selected options into implementation issues. Before code:
 
 - re-read every source anchor at the new base;
