@@ -208,8 +208,9 @@ export const REMOTE_RUN_STOPPED_MARK = "stopped";
  * Shell lines that write the launch record of the process in `pidExpression`
  * to `<recordDir>/<launchId>.json`: the identity line of
  * {@link buildRemoteProcessRecordLines}, then `{"uid":…,"marker":"<entrySha256>"}`.
- * They write a temporary file and rename it, and a failed write never fails
- * the launch. Then they exit with 143 when the run was already stopped.
+ * They write a temporary file and rename it, and exit with 125 when the
+ * record is not there afterwards. Then they exit with 143 when the run was
+ * already stopped.
  *
  * The order is the handshake with {@link buildRemoteProcessTreeStopLines},
  * which leaves its stop mark before it reads the records: either the stop
@@ -238,6 +239,8 @@ export function buildRemoteRunRecordLines(input: {
     ...buildRemoteProcessRecordLines(),
     `printf '{"uid":%s,"marker":"%s"}\\n' "$(id -u)" ${shellQuote(input.markerSha256)}`,
     `} > ${recordFile}.tmp 2>/dev/null && mv -f ${recordFile}.tmp ${recordFile} 2>/dev/null`,
+    // A launch that no stop could find must not start.
+    `[ -s ${recordFile} ] || { echo "[paperclip] The run's process record could not be written on the worker, so the run was not started." >&2; exit 125; }`,
     `[ ! -e ${input.recordDir}/${REMOTE_RUN_STOPPED_MARK} ] || exit 143`,
   ];
 }
@@ -274,8 +277,8 @@ const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
  *   SHA-256 is a recorded marker hash (one NUL-separated entry, matched
  *   whole). The `SIGKILL` pass and the final count use the first scan's
  *   processes and marker carriers only, never a group proven earlier;
- * - its start time, read by the scan, is unchanged right before `SIGTERM` and
- *   again right before `SIGKILL`.
+ * - its start time, read by the scan, and its real uid are unchanged right
+ *   before `SIGTERM` and again right before `SIGKILL`.
  *
  * Nothing is signalled without a valid record, or when `/proc`, `awk`, `grep`,
  * `tr` or `sha256sum` is missing; the summary names the reason. It never
@@ -285,13 +288,13 @@ const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
  *
  * @param input.recordDir - A shell word naming the directory of launch records.
  * @param input.termWaitSeconds - How long to wait after `SIGTERM`; 2 by default.
- * @param input.testOnlyBeforeKill - Test seam: a shell function body run with the pid before each `SIGKILL` recheck.
+ * @param input.testOnlyBeforeSignal - Test seam: a shell function body run with the pid and `TERM` or `KILL` before each recheck.
  * @returns Lines for a stop script.
  */
 export function buildRemoteProcessTreeStopLines(input: {
   recordDir: string;
   termWaitSeconds?: number;
-  testOnlyBeforeKill?: string;
+  testOnlyBeforeSignal?: string;
 }): string[] {
   const termWaitSteps = Math.max(1, Math.round((input.termWaitSeconds ?? 2) * 20));
   return [
@@ -309,7 +312,7 @@ export function buildRemoteProcessTreeStopLines(input: {
     "hashes=",
     ...VALID_PID_LINES,
     "note() { [ -n \"$partial\" ] || partial=$1; }",
-    `before_kill() { ${input.testOnlyBeforeKill ?? ":"}; }`,
+    `before_signal() { ${input.testOnlyBeforeSignal ?? ":"}; }`,
     // Sets st_state, st_pgrp and st_start without a fork: the scan calls it often.
     "read_stat() {",
     "  st_line=",
@@ -340,11 +343,22 @@ export function buildRemoteProcessTreeStopLines(input: {
     "      st[$1] = f[1]; pg[$1] = f[3]; start[$1] = f[20] }",
     "    END { for (p in st) if ((p in uid) && uid[p] == me && st[p] !~ /^[ZXx]$/) print p, pg[p], start[p] }'",
     "}",
-    // Prints the `pid start` pairs of $1 that still run with the same start time.
+    // Sets rid to the real uid of $1, without a fork.
+    "real_uid() {",
+    "  rid=",
+    "  { while IFS= read -r ru_line; do case \"$ru_line\" in Uid:*) set -f; set -- $ru_line; set +f; rid=$2; break ;; esac; done < \"/proc/$1/status\"; } 2>/dev/null",
+    "  [ -n \"$rid\" ]",
+    "}",
+    // The rule checked right before each signal: same start time, not a
+    // zombie, and still the worker's real uid.
+    "same_proc() {",
+    "  read_stat \"$1\" && [ \"$st_start\" = \"$2\" ] && [ \"$st_state\" != Z ] && real_uid \"$1\" && [ \"$rid\" = \"$me\" ]",
+    "}",
+    // Prints the `pid start` pairs of $1 that still pass that rule.
     "still_running() {",
     "  set -f; set -- $1; set +f",
     "  while [ \"$#\" -ge 2 ]; do",
-    "    if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ] && [ \"$st_state\" != Z ]; then echo \"$1 $2\"; fi",
+    "    if same_proc \"$1\" \"$2\"; then echo \"$1 $2\"; fi",
     "    shift 2",
     "  done",
     "}",
@@ -391,9 +405,10 @@ export function buildRemoteProcessTreeStopLines(input: {
     "    groups=",
     "    set -f; set -- $first; set +f",
     "    while [ \"$#\" -ge 2 ]; do",
+    "      t_pid=$1; t_start=$2; shift 2",
     "      matched=$((matched + 1))",
-    "      if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ]; then kill -TERM \"$1\" 2>/dev/null || :; else skipped=$((skipped + 1)); fi",
-    "      shift 2",
+    "      before_signal \"$t_pid\" TERM",
+    "      if same_proc \"$t_pid\" \"$t_start\"; then kill -TERM \"$t_pid\" 2>/dev/null || :; else skipped=$((skipped + 1)); fi",
     "    done",
     "    i=0",
     `    while [ "$i" -lt ${termWaitSteps} ] && [ -n "$(still_running "$first")" ]; do`,
@@ -406,8 +421,8 @@ export function buildRemoteProcessTreeStopLines(input: {
     "    set -f; set -- $targets; set +f",
     "    while [ \"$#\" -ge 2 ]; do",
     "      t_pid=$1; t_start=$2; shift 2",
-    "      before_kill \"$t_pid\"",
-    "      if read_stat \"$t_pid\" && [ \"$st_start\" = \"$t_start\" ]; then",
+    "      before_signal \"$t_pid\" KILL",
+    "      if same_proc \"$t_pid\" \"$t_start\"; then",
     "        kill -KILL \"$t_pid\" 2>/dev/null && killed=$((killed + 1))",
     "      else",
     "        skipped=$((skipped + 1))",

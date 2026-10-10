@@ -190,11 +190,26 @@ describe.skipIf(!isLinux)("remote process tree stop", () => {
 
     // The seam runs between the scan and the SIGKILL recheck. It moves the
     // start time the scan read, as a pid reused in that window would.
-    const summary = await stop(dir, { testOnlyBeforeKill: `[ "$1" = ${stubborn.leader} ] && t_start=0` });
+    const summary = await stop(dir, { testOnlyBeforeSignal: `[ "$1" = ${stubborn.leader} ] && [ "$2" = KILL ] && t_start=0` });
 
     expect(summary?.skipped).toBeGreaterThanOrEqual(1);
     expect(alive(stubborn.leader!)).toBe(true);
     expect((summary?.survived ?? 0)).toBeGreaterThanOrEqual(1);
+  }, 30_000);
+
+  it("does not signal a target whose uid no longer matches right before the signal", async () => {
+    const marker = createRemoteRunMarker();
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-tree-stop-"));
+    const target = await startSession("", { [REMOTE_RUN_MARKER_ENV]: marker.value }, ["sleep", "600"]);
+    await writeRecord(dir, { pid: target.leader!, group: true, markerSha256: marker.entrySha256 });
+
+    // The seam runs right before each signal. Moving the expected uid there
+    // is what a process that changed its real uid after the scan looks like.
+    const summary = await stop(dir, { testOnlyBeforeSignal: `[ "$1" = ${target.leader} ] && me=$((me + 1))` });
+
+    expect(summary).toMatchObject({ matched: 1, killed: 0 });
+    expect(summary?.skipped).toBeGreaterThanOrEqual(1);
+    expect(alive(target.leader!)).toBe(true);
   }, 30_000);
 
   it("does not use a group whose leader can no longer be proven after the first scan", async () => {
@@ -292,7 +307,14 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(record).toContain(`"marker":"${marker}"`);
   }, 30_000);
 
-  async function runLaunch(input: { env?: Record<string, string>; home?: string; command: string; root?: string; runId?: string }) {
+  async function runLaunch(input: {
+    env?: Record<string, string>;
+    home?: string;
+    command: string;
+    root?: string;
+    runId?: string;
+    stdinPrefix?: string;
+  }) {
     const root = input.root ?? (await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-")));
     await mkdir(path.join(root, "ws"), { recursive: true });
     const target = await buildSshSpawnTarget({
@@ -320,10 +342,14 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
-    child.stdin.end(`${target.stdinPrefix}hello\n`);
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.stdin.end(`${input.stdinPrefix ?? target.stdinPrefix}hello\n`);
     const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
     await target.cleanup();
-    return { stdout, code, marker: target.stdinPrefix!.trim() };
+    return { stdout, stderr, code, marker: target.stdinPrefix!.trim() };
   }
 
   it("does not start a launch whose run was already stopped, so a stop cannot miss a late record", async () => {
@@ -337,6 +363,27 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
 
     expect(late.stdout).not.toContain("started");
     expect(late.code).toBe(143);
+  }, 30_000);
+
+  it("does not start a launch whose record cannot be written", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    await mkdir(path.join(root, ".paperclip-runtime"), { recursive: true });
+    // A file where the record directory belongs makes every record write fail.
+    await writeFile(path.join(root, ".paperclip-runtime", "processes"), "");
+
+    const launch = await runLaunch({ root, command: "echo started" });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    expect(launch.stderr).toContain("not started");
+  }, 30_000);
+
+  it("does not start a launch whose marker line is missing or malformed", async () => {
+    for (const stdinPrefix of ["\n", "not-a-marker\n", `${"a".repeat(31)}\n`]) {
+      const launch = await runLaunch({ command: "echo started", stdinPrefix });
+      expect(launch.stdout).not.toContain("started");
+      expect(launch.code).toBe(125);
+    }
   }, 30_000);
 
   it("removes stop marks older than a week, and keeps newer ones", async () => {

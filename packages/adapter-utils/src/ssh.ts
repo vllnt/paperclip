@@ -1424,7 +1424,10 @@ export async function buildSshSpawnTarget(input: {
       `{ mkdir -p ${recordDir} 2>/dev/null || :; }`,
       `cd ${shellQuote(input.spec.remoteCwd)}`,
       "{ IFS= read -r paperclip_run_marker || :; }",
-      `{ [ -z "$paperclip_run_marker" ] || export ${REMOTE_RUN_MARKER_ENV}="$paperclip_run_marker"; }`,
+      // Without a valid marker the stop could not find the run's processes.
+      "case \"$paperclip_run_marker\" in *[!0-9a-f]*|'') paperclip_run_marker= ;; esac",
+      "{ [ \"${#paperclip_run_marker}\" -eq 32 ] || { echo \"[paperclip] The run marker did not reach the worker, so the run was not started.\" >&2; exit 125; }; }",
+      `export ${REMOTE_RUN_MARKER_ENV}="$paperclip_run_marker"`,
       "unset paperclip_run_marker",
       "{ if command -v setsid >/dev/null 2>&1; then "
         + `( exec setsid sh -c ${shellQuote(leaderScript(true))} paperclip-run ); `
