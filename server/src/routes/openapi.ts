@@ -4144,7 +4144,11 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List scored duplicate candidates recorded for an issue",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    404: { ...r.notFound, description: "Issue not found, or it belongs to another company" },
+  },
 });
 
 registry.registerPath({

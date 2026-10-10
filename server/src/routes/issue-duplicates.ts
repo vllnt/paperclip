@@ -11,7 +11,7 @@ import { forbidden, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { logActivity } from "../services/activity-log.js";
 import type { DuplicateDetectionService } from "../services/duplicate-detection.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
 
 function assertNotSkillTestScoped(req: Request): void {
   if (req.actor.type === "agent" && req.actor.keyScope?.kind === "skill_test") {
@@ -22,7 +22,8 @@ function assertNotSkillTestScoped(req: Request): void {
 /**
  * Duplicate-check endpoints, all company-scoped and open to board and agent keys:
  * - `POST /companies/:companyId/issues/similar` checks a draft before creating an issue.
- * - `GET /issues/:id/duplicate-pairs` lists the ledger rows for an issue.
+ * - `GET /issues/:id/duplicate-pairs` lists the ledger rows for an issue. Another company's issue gets
+ *   the same 404 as a missing one, so the route does not reveal which ids exist elsewhere.
  * - `POST /companies/:companyId/issue-duplicate-pairs/:pairId/label` records "duplicate" or "keep_both".
  */
 export function issueDuplicateRoutes(db: Db, detection: DuplicateDetectionService): Router {
@@ -51,7 +52,7 @@ export function issueDuplicateRoutes(db: Db, detection: DuplicateDetectionServic
       .select({ id: issues.id, companyId: issues.companyId })
       .from(issues)
       .where(isUuidLike(idOrIdentifier) ? eq(issues.id, idOrIdentifier) : eq(issues.identifier, idOrIdentifier));
-    if (!issue) throw notFound("Issue not found");
+    if (!issue || !hasCompanyAccess(req, issue.companyId)) throw notFound("Issue not found");
     assertCompanyAccess(req, issue.companyId);
     res.json(await detection.listPairs(issue.companyId, issue.id));
   });
