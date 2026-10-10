@@ -315,7 +315,6 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     root?: string;
     runId?: string;
     stdinPrefix?: string;
-    pathPrefix?: string;
   }) {
     const root = input.root ?? (await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-")));
     await mkdir(path.join(root, "ws"), { recursive: true });
@@ -338,10 +337,7 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     const child = spawn("sh", ["-c", target.args.at(-1)!], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: root,
-      env: {
-        PATH: `${input.pathPrefix ? `${input.pathPrefix}:` : ""}${process.env.PATH ?? "/usr/bin:/bin"}`,
-        HOME: input.home ?? root,
-      },
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: input.home ?? root },
     });
     let stdout = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -385,11 +381,17 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
 
   it("does not start a launch whose record is written but cannot be read back as valid", async () => {
     // A failing `id` leaves the uid empty; a failing `cut` leaves the start time empty.
+    // The failing tool goes on PATH from the login profile, which the launch
+    // sources after /etc/profile: Debian's /etc/profile (the production image)
+    // sets PATH outright, so a PATH handed in from outside never reaches it.
     for (const broken of ["id", "cut"]) {
-      const bin = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-bin-"));
+      const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
+      const bin = path.join(home, "bin");
+      await mkdir(bin);
       await writeFile(path.join(bin, broken), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      await writeFile(path.join(home, ".profile"), `PATH=${bin}:$PATH; export PATH\n`);
 
-      const launch = await runLaunch({ command: "echo started", pathPrefix: bin });
+      const launch = await runLaunch({ command: "echo started", home });
 
       expect(launch.stdout).not.toContain("started");
       expect(launch.code).toBe(125);
