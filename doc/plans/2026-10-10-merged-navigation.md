@@ -321,7 +321,7 @@ The default load test recommendation is 100 concurrent authenticated users,
 10,000 attention items per company, 1,000 agents, 1,000 status cards, and 10
 navigation events per user over 10 minutes. The service must prove bounded
 pagination, stable cursors, no duplicate requests, and no cross-company data.
-The user may choose a smaller pilot or a larger stress run in Q8 below; the
+The user may choose a smaller pilot or a larger stress run in Q9 below; the
 chosen scale becomes a release gate rather than an implementation guess.
 
 ## 6. User questions and defaults
