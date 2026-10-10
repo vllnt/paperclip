@@ -1,5 +1,5 @@
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { eq } from "drizzle-orm";
 import express from "express";
@@ -48,6 +48,73 @@ const FIXTURE_WORKER = path.join(
 const eventBusStub = {
   forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }),
 } as never;
+
+const MIN_SECRET_FRAGMENT = 8;
+const MIN_KEY_FRAGMENT = 16;
+const PUBLIC_KEY_PREFIX = /^pcp_(?:board|agent)_/;
+
+interface KeyMaterial {
+  tokens: string[];
+  hashes: string[];
+}
+
+/**
+ * The part of a key after its public prefix (`pcp_board_` or `pcp_agent_`). Only this part is secret.
+ *
+ * @param token - A board or agent key.
+ * @returns The key without its public prefix.
+ */
+function secretPartOf(token: string): string {
+  return token.replace(PUBLIC_KEY_PREFIX, "");
+}
+
+/**
+ * Every run of `length` characters of `value`, with the offset where it starts.
+ *
+ * @param value - The text to cut.
+ * @param length - The number of characters in each run.
+ * @returns The runs in order of offset. Empty when `value` is shorter than `length`.
+ */
+function runsOf(value: string, length: number): Array<{ offset: number; text: string }> {
+  const runs: Array<{ offset: number; text: string }> = [];
+  for (let offset = 0; offset + length <= value.length; offset += 1) {
+    runs.push({ offset, text: value.slice(offset, offset + length) });
+  }
+  return runs;
+}
+
+/**
+ * Looks for pieces of key material in serialized rows. It checks every run of 8 characters of
+ * the secret part of each key and of each stored hash, and every run of 16 characters of the
+ * whole key. The second check also finds a cut of the key that holds the public prefix and
+ * fewer than 8 secret characters. A longer piece, or the whole key or hash, holds a run of
+ * those lengths, so it is found too. Two random 8-character hex runs match by chance about
+ * once in 4 billion times.
+ *
+ * It returns labels that say which key matched and where. It never returns the matched text,
+ * so a failing test does not print key material.
+ *
+ * @param serialized - The rows or contexts as JSON text.
+ * @param material - The keys that were made for the test and the hashes the database holds for them.
+ * @returns One label for each matching run. Empty when nothing matches.
+ */
+function findKeyMaterial(serialized: string, material: KeyMaterial): string[] {
+  const found: string[] = [];
+  material.tokens.forEach((token, index) => {
+    for (const { offset, text } of runsOf(secretPartOf(token), MIN_SECRET_FRAGMENT)) {
+      if (serialized.includes(text)) found.push(`key ${index}: secret part, ${MIN_SECRET_FRAGMENT} characters at offset ${offset}`);
+    }
+    for (const { offset, text } of runsOf(token, MIN_KEY_FRAGMENT)) {
+      if (serialized.includes(text)) found.push(`key ${index}: whole key, ${MIN_KEY_FRAGMENT} characters at offset ${offset}`);
+    }
+  });
+  material.hashes.forEach((hash, index) => {
+    for (const { offset, text } of runsOf(hash, MIN_SECRET_FRAGMENT)) {
+      if (serialized.includes(text)) found.push(`stored hash ${index}: ${MIN_SECRET_FRAGMENT} characters at offset ${offset}`);
+    }
+  });
+  return found;
+}
 
 async function seed(db: Db) {
   const nonce = randomUUID().slice(0, 8);
@@ -273,13 +340,9 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     expect(contexts[1]?.keyId).toBe(memberKey.id);
     expect(contexts[2]?.keyId).toEqual(expect.any(String));
     expect(new Set(contexts.map((context) => context?.keyId)).size).toBe(3);
-    const serialized = JSON.stringify(contexts);
-    for (const secret of [adminKey.token, memberKey.token, agentToken]) {
-      expect(serialized).not.toContain(secret);
-    }
     const hashes = await storedKeyHashes();
     expect(hashes).toHaveLength(3);
-    for (const hash of hashes) expect(serialized).not.toContain(hash);
+    expect(findKeyMaterial(JSON.stringify(contexts), { tokens: [adminKey.token, memberKey.token, agentToken], hashes })).toEqual([]);
   });
 
   /**
@@ -375,13 +438,42 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     const keyIds = rows.map((row) => (row.details as Record<string, unknown>).initiatingKeyId);
     expect(new Set(keyIds).size).toBe(3);
     expect(keyIds).not.toContain("forged-key");
-    const serialized = JSON.stringify(rows);
-    for (const secret of [adminKey.token, memberKey.token, agentToken]) {
-      expect(serialized).not.toContain(secret);
-    }
     const hashes = await storedKeyHashes();
     expect(hashes).toHaveLength(3);
-    for (const hash of hashes) expect(serialized).not.toContain(hash);
+    expect(findKeyMaterial(JSON.stringify(rows), { tokens: [adminKey.token, memberKey.token, agentToken], hashes })).toEqual([]);
+  }, 60_000);
+
+  it("notices a 16-character piece of a key in a plugin activity row, which a full-key check misses", async () => {
+    const { company, plugin, adminKey, memberKey, agentToken } = await seed(db);
+    const worker = await startAuditedWorker(plugin);
+    const message = "GitHub write identity updated";
+
+    try {
+      const res = await postAction(db, worker.call, adminKey.token, "write-identity.set", {
+        companyId: company.id,
+        params: {
+          mode: "echo",
+          hostMethod: "activity.log",
+          requestedCompanyId: company.id,
+          message,
+          metadata: { note: secretPartOf(adminKey.token).slice(0, 16) },
+        },
+      });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    } finally {
+      await worker.stop();
+      worker.dispose();
+    }
+
+    const rows = await db.select().from(activityLog).where(eq(activityLog.action, message));
+    expect(rows).toHaveLength(1);
+    const serialized = JSON.stringify(rows);
+    const hashes = await storedKeyHashes();
+    const material = { tokens: [adminKey.token, memberKey.token, agentToken], hashes };
+
+    expect(serialized.includes(adminKey.token)).toBe(false);
+    expect(hashes.some((hash) => serialized.includes(hash))).toBe(false);
+    expect(findKeyMaterial(serialized, material)).not.toEqual([]);
   }, 60_000);
 
   it("rejects a revoked board key", async () => {
@@ -393,5 +485,61 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
 
     expect(res.status).toBe(401);
     expect(call).not.toHaveBeenCalled();
+  });
+});
+
+describe("the key material check", () => {
+  const token = `pcp_board_${randomBytes(24).toString("hex")}`;
+  const secret = secretPartOf(token);
+  const hash = randomBytes(32).toString("hex");
+  const material: KeyMaterial = { tokens: [token], hashes: [hash] };
+  const inRow = (piece: string): string => JSON.stringify({ details: { note: piece } });
+
+  it("splits a key at its public prefix", () => {
+    expect(secret).toHaveLength(48);
+    expect(token).toBe(`pcp_board_${secret}`);
+    expect(secretPartOf(`pcp_agent_${"a".repeat(32)}`)).toBe("a".repeat(32));
+  });
+
+  it("finds nothing in text that holds no key material", () => {
+    expect(findKeyMaterial(JSON.stringify({ keyId: randomUUID(), source: "board_key", enabled: true }), material)).toEqual([]);
+  });
+
+  it.each([
+    ["the first 16 characters of the secret part", secret.slice(0, 16)],
+    ["the last 16 characters of the secret part", secret.slice(-16)],
+    ["the first 8 characters of the secret part", secret.slice(0, 8)],
+    ["the last 8 characters of the secret part", secret.slice(-8)],
+    ["8 characters from the middle of the secret part", secret.slice(20, 28)],
+    ["the first 16 characters of the whole key", token.slice(0, 16)],
+    ["the whole key", token],
+    ["the first 8 characters of the stored hash", hash.slice(0, 8)],
+    ["the last 8 characters of the stored hash", hash.slice(-8)],
+    ["the whole stored hash", hash],
+  ])("finds %s in a row", (_label, piece) => {
+    expect(findKeyMaterial(inRow(piece), material)).not.toEqual([]);
+  });
+
+  it("finds a piece that the earlier full-key and full-hash check accepted", () => {
+    const row = inRow(secret.slice(0, 16));
+
+    expect(row.includes(token)).toBe(false);
+    expect(row.includes(hash)).toBe(false);
+    expect(findKeyMaterial(row, material)).not.toEqual([]);
+  });
+
+  it("does not flag a piece with fewer than 8 secret characters and fewer than 16 characters of the key", () => {
+    expect(findKeyMaterial(inRow(secret.slice(0, 7)), material)).toEqual([]);
+    expect(findKeyMaterial(inRow(token.slice(0, 15)), material)).toEqual([]);
+    expect(findKeyMaterial(inRow(hash.slice(0, 7)), material)).toEqual([]);
+  });
+
+  it("says where the match is and never repeats the matched text", () => {
+    const found = findKeyMaterial(inRow(secret.slice(0, 16)), material);
+
+    expect(found).toContain("key 0: secret part, 8 characters at offset 0");
+    const text = found.join("\n");
+    expect(text.includes(secret.slice(0, 8))).toBe(false);
+    expect(text.includes(token)).toBe(false);
   });
 });
