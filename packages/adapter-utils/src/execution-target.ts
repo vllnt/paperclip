@@ -17,6 +17,7 @@ import {
   buildRemoteExecutionSessionIdentity,
   prepareRemoteManagedRuntime,
   remoteExecutionSessionMatches,
+  sshRunDirectory,
 } from "./remote-managed-runtime.js";
 import type {
   AdditionalSourceStagingFailure,
@@ -1573,6 +1574,71 @@ export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocat
   } else {
     await fs.rm(directory, { recursive: true, force: true });
   }
+}
+
+type RemoteRunTempLocation = {
+  runId: string; target: AdapterExecutionTarget | null | undefined;
+};
+
+/**
+ * The per-run temp directory of a remote run, or `null` for a local target.
+ * Over SSH it is `tmp` beside the run's `workspace` in
+ * `<root>/.paperclip-runtime/runs/<runId>`, so the SSH run directory reaper
+ * also removes it after a crash. In a sandbox it is
+ * `<remoteCwd>/.paperclip-runtime/tmp/<runId>`, which workspace sync excludes.
+ *
+ * @param input.runId - A controller-generated run id: one segment of letters, digits, `_` or `-`.
+ * @param input.target - The run's execution target.
+ * @returns The directory on the target, or `null` when the target is local.
+ * @throws When the run id is not such a segment.
+ */
+export function remoteRunTempDirectory(input: RemoteRunTempLocation): string | null {
+  // Only controller-generated run IDs may name a removable directory.
+  if (!/^[a-zA-Z0-9_-]+$/.test(input.runId)) throw new Error("Invalid run temp directory run ID");
+  if (input.target?.kind !== "remote") return null;
+  return input.target.transport === "ssh"
+    ? path.posix.join(sshRunDirectory(input.target.spec.remoteCwd, input.runId), "tmp")
+    : path.posix.join(input.target.remoteCwd, ".paperclip-runtime", "tmp", input.runId);
+}
+
+/**
+ * Creates the per-run temp directory of a remote run with mode `0700`.
+ *
+ * @returns The directory, or `null` when the target is local.
+ * @throws When the target cannot create it.
+ */
+export async function prepareRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<string | null> {
+  const directory = remoteRunTempDirectory(input);
+  if (!directory || input.target?.kind !== "remote") return null;
+  const result = await adapterExecutionTargetCommandRunner(input.target).execute({
+    command: "sh",
+    args: ["-c", `umask 077 && mkdir -p -- ${shellQuote(directory)} && chmod 700 -- ${shellQuote(directory)}`],
+    cwd: input.target.remoteCwd,
+    timeoutMs: 15_000,
+  });
+  if (result.timedOut || result.exitCode !== 0) throw new Error("Could not create the run temp directory");
+  return directory;
+}
+
+/**
+ * Removes the per-run temp directory of a remote run. Over SSH it then
+ * removes the run directory too when nothing else is left in it (a run that
+ * never synced a workspace). Call only after execution settles, before
+ * releasing the run's remote environment lease.
+ */
+export async function cleanupRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<void> {
+  const directory = remoteRunTempDirectory(input);
+  if (!directory || input.target?.kind !== "remote") return;
+  const removeEmptyRunDirectory = input.target.transport === "ssh"
+    ? `; rmdir -- ${shellQuote(path.posix.dirname(directory))} 2>/dev/null || true`
+    : "";
+  const result = await adapterExecutionTargetCommandRunner(input.target).execute({
+    command: "sh",
+    args: ["-c", `rm -rf -- ${shellQuote(directory)}${removeEmptyRunDirectory}`],
+    cwd: input.target.remoteCwd,
+    timeoutMs: 60_000,
+  });
+  if (result.timedOut || result.exitCode !== 0) throw new Error("Could not remove the run temp directory");
 }
 
 async function githubOperationLauncherBasePath(

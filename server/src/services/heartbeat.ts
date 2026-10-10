@@ -75,6 +75,11 @@ import {
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
 import {
+  cleanupHeartbeatRemoteRunTemp,
+  prepareHeartbeatRemoteRunTemp,
+  type HeartbeatRemoteRunTemp,
+} from "./heartbeat-remote-run-temp.js";
+import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
   startAdapterExecutionTargetPaperclipBridge,
@@ -21004,6 +21009,7 @@ export function heartbeatService(
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
+    let remoteRunTempLocation: HeartbeatRemoteRunTemp["cleanupLocation"] | null = null;
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
@@ -23409,6 +23415,30 @@ export function heartbeatService(
         }
       } else {
         delete context.paperclipScratch;
+        // A remote run gets its own temp directory on the target, so agents
+        // do not fill the worker's shared /tmp.
+        try {
+          const existingRuntimeEnv = parseObject(runtimeConfig.env);
+          const remoteTemp = await prepareHeartbeatRemoteRunTemp({
+            native: agent.adapterType === "paperclip_runner",
+            runId: run.id,
+            target: executionTarget,
+            env: existingRuntimeEnv,
+          });
+          if (remoteTemp) {
+            remoteRunTempLocation = remoteTemp.cleanupLocation;
+            runtimeConfig = {
+              ...runtimeConfig,
+              env: { ...existingRuntimeEnv, ...remoteTemp.env },
+            };
+            context.paperclipScratch = remoteTemp.scratchContext;
+          }
+        } catch (remoteTempError) {
+          logger.warn(
+            { err: remoteTempError, runId: run.id, agentId: agent.id },
+            "failed to prepare the remote run temp directory; continuing without it",
+          );
+        }
       }
       const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
         target: executionTarget,
@@ -27222,6 +27252,20 @@ export function heartbeatService(
                 logger.warn(
                   { err, runId: run.id },
                   "failed to clean managed GitHub launchers",
+                );
+              },
+            );
+          }
+          if (
+            remoteRunTempLocation &&
+            latestRun &&
+            isHeartbeatRunTerminalStatus(latestRun.status)
+          ) {
+            await cleanupHeartbeatRemoteRunTemp(remoteRunTempLocation).catch(
+              (err) => {
+                logger.warn(
+                  { err, runId: run.id },
+                  "failed to remove the remote run temp directory",
                 );
               },
             );
