@@ -124,6 +124,28 @@ The server sets `Preference-Applied: return=minimal` and returns exactly:
 
 **The PATCH response is the authoritative post-write state. A confirming GET after a 2xx PATCH is unnecessary.**
 
+## Per-Issue Adapter Overrides
+
+`assigneeAdapterOverrides` on create and update changes how the issue's assignee runs for this issue only:
+
+```
+PATCH /api/issues/{issueId}
+{
+  "assigneeAdapterOverrides": {
+    "adapterConfig": { "model": "gpt-5", "effort": "high" },
+    "useProjectWorkspace": true
+  }
+}
+```
+
+- `adapterConfig` keys replace the same top-level keys of the agent's adapter config for runs on this issue.
+  Nested objects are replaced whole, not merged.
+- The overrides apply only while the running agent is the issue's assignee.
+- Send `null` to clear them. Unknown keys return `400`.
+- Authorization is the same as any issue update; host workspace commands inside the overrides are subject to
+  the same checks as on an agent's own config.
+- CLI: `paperclipai issue update <id> --adapter-overrides-json '<json>'` (see the CLI docs).
+
 ## Checkout (Claim Task)
 
 ```
