@@ -4,6 +4,7 @@ import * as controllerLeases from "../services/legacy-controller-lease.js";
 import * as instructionWorkingCopies from "../services/agent-instruction-working-copies.js";
 import * as runEvents from "../services/heartbeat-run-events.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { getRunLogStore } from "../services/run-log-store.js";
 import { randomUUID } from "node:crypto";
 import { logger } from "../middleware/logger.js";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
@@ -1489,6 +1490,57 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
+
+  describe("held run log tails", () => {
+    const HELD = "last line https://user:FAKE_SECRET_123@host/x";
+
+    async function readStoredLog(runId: string, heartbeat: ReturnType<typeof heartbeatService>) {
+      const run = await heartbeat.getRun(runId);
+      if (!run?.logStore || !run.logRef) throw new Error("the run has no stored log");
+      const stored = await getRunLogStore().read({ store: "local_file", logRef: run.logRef });
+      return { run, content: stored.content };
+    }
+
+    it("writes the redacted tail of a stream before the log is finalized when the run succeeds", async () => {
+      mockAdapterExecute.mockImplementationOnce((async (input: unknown) => {
+        const context = input as { onLog: (stream: "stdout" | "stderr", text: string) => Promise<void> };
+        await context.onLog("stdout", `first line\n${HELD}`);
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, provider: "test", model: "test-model" };
+      }) as typeof mockAdapterExecute);
+
+      const { runId } = await seedQueuedIssueRunFixture();
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+      await heartbeat.waitForRunExecutionDrain(runId);
+
+      const { run, content } = await readStoredLog(runId, heartbeat);
+      expect(content).not.toContain("FAKE_SECRET_123");
+      expect(content).toContain("https://user:***REDACTED***@host/x");
+      expect(run.stdoutExcerpt ?? "").toContain("https://user:***REDACTED***@host/x");
+      expect(run.stdoutExcerpt ?? "").not.toContain("FAKE_SECRET_123");
+    });
+
+    it("writes the redacted tail of a stream before the log is finalized when the adapter throws", async () => {
+      mockAdapterExecute.mockImplementationOnce((async (input: unknown) => {
+        const context = input as { onLog: (stream: "stdout" | "stderr", text: string) => Promise<void> };
+        await context.onLog("stderr", `first line\n${HELD}`);
+        throw new Error("adapter crashed after it printed a partial line");
+      }) as typeof mockAdapterExecute);
+
+      const { runId } = await seedQueuedIssueRunFixture();
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+      await heartbeat.waitForRunExecutionDrain(runId);
+
+      const { run, content } = await readStoredLog(runId, heartbeat);
+      expect(run.status).toBe("failed");
+      expect(content).not.toContain("FAKE_SECRET_123");
+      expect(content).toContain("https://user:***REDACTED***@host/x");
+      expect(run.stderrExcerpt ?? "").toContain("https://user:***REDACTED***@host/x");
+    });
+  });
 
   it("persists the normalized failure without permanently blocking the conversation", async () => {
     mockAdapterExecute.mockResolvedValueOnce({
