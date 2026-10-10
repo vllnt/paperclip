@@ -391,7 +391,7 @@ INP: the same in every option. Only S9 changes it.
 | Cold LCP, first visit | `wan` | 876-1,672 ms (4 routes measured) | < 1.5 s | B for the dashboard, list and issue page; the board is just above the line (about 1,530 ms [D]) and under it with S10 (about 1,360 ms [D]); S1 also traces its 1 s gap between first paint and LCP; C2 or A with margin |
 | Cold LCP, repeat visit | `wan` | as first visit | < 1.0 s | B with S7 (0.5-0.7 s on the same build, 0.7-0.9 s after a deploy [D]); C2 or A |
 | Cold LCP | `slow` | 2,268-3,236 ms | < 3.0 s | B with S6 and S10; C2 or A with margin |
-| Cold usable (TTI) | `wan` | 1,053-4,751 ms | < 2.5 s | any option, only with S6 for the issue page |
+| Cold TTI (quiet window) | `wan` | 1,053-4,751 ms | < 2.5 s | any option, only with S6 for the issue page |
 | Warm navigation, usable, after a hover or highlight lead of 200 ms or more, or a revisit | `laptop` (1x CPU, 40 ms) | not measured | < 200 ms, p75 | B (network wait 0; render only); A and C2 with intent prefetch too, at one server render per prefetch |
 | Warm navigation, usable, no intent (chords, fast click) | `laptop` | not measured | < 300 ms, p75 | B; A and C2 are similar |
 | Visible feedback after any navigation input | any | none until the chunk arrives | next frame (< 50 ms) | B (S5); A and C2 by design |
