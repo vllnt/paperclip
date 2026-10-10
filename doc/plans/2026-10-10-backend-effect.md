@@ -1,4 +1,4 @@
-# Backend on Effect 4: one runtime for time, failure and cleanup, measured before and after
+# Backend on Effect 4: one runtime for time, failure, cleanup and resources, sized for hundreds of agents, measured before and after
 
 Date: 2026-10-10
 Status: Plan only (docs). No Effect code, no install and no measurement run is part of this pull request.
@@ -9,15 +9,19 @@ Anchors: `origin/main` `d9804ac4f`. Effect facts come from the published `effect
 
 **Proposal.** Put an Effect runtime under the existing backend, one slice at a time. Keep a slice only if a measured before-and-after shows that it is not slower and not bigger in memory, and, for a slice that claims a reliability gain, that it is more reliable. The first Effect slice (E0b) is a cost-only step: it moves a plain-TypeScript change (E0a) onto Effect, so it can only show cost.
 
+**Expanded scope (2026-10-10 19:05 UTC).** The user widened the request: rework the full backend on Effect for better resource management and performance, so that one deployment scales and runs hundreds of agents. This is still one plan and still incremental: no big-bang rewrite (1,769 server files; `heartbeat.ts` alone is 1.28 MB), every slice measured and gated. Sections 13 to 19 add the scale target, a scale baseline (S0) on `main`, a resource model with one Effect Layer per resource, concurrency control with backpressure and fair scheduling across companies, the answer on replicas, proposed service levels (Q19) and the slice order. The capacity fixes that are in flight land first, in plain TypeScript, and the Effect slices absorb them later and keep their tests (section 13). Until S0 has valid numbers, the slice order in section 19 is provisional and rests on the production evidence in section 14.
+
 **What "Effect everywhere" means here (a scope call for the user).** Effect becomes the way the backend writes time, failure and cleanup: timeouts, retries, concurrency caps, cancellation, resource release, typed errors and dependency wiring. It does **not** replace Express, drizzle, pino, ws or zod. Reason: Effect's own `http`, `sql`, `socket` and `observability` modules are marked `@stability unstable` (section 3). Those are the modules that would replace Express, drizzle, ws and the OpenTelemetry path. Effect's core `Schema` module is not tagged unstable, but it would be a second validator next to zod, which is the shared contract of the UI, the CLI and OpenAPI (section 6). The stable core, without `Schema`, is what this plan uses (section 9, rule 1).
 
 **Order.**
 
 1. Measure B0 on `main`, before any Effect code (section 4). B0 includes A/A pairs, so that the noise of each metric is known, and the number of pairs that each gated row needs is written down, before a gate uses it.
+   S0, the scale baseline (section 14), follows B0 on the same harness and decides the order of the scale slices.
 2. Slice E0a: the new retry policy for `database-retry.ts` in plain TypeScript, with a shared retry budget so that an outage cannot multiply the load on the database. It needs no install and can merge on its own once its merge rule holds (section 8).
 3. Slice E0b: the Effect runtime, and the same helper on Effect, with the same policy (section 7.4). It needs the install and a pin of 4.0.2 or later.
 4. Slice E1 (one bounded runner), then the go/no-go checkpoints with stated numbers: Gate 1 after E0b, Gate 2 after E1, Gate 3 after E6 (section 8).
 5. More leaf services (E2 to E5). Slice E6 (shutdown) and the heartbeat and recovery slices are **not scheduled**: they wait for #119 (the bounded shutdown, Q16), for #103's D1 and D2, and for the freeze list to clear, and they run one per deploy window. Every slice that touches `server/src/index.ts` or `server/src/app.ts` comes after #119, then #95, then #110's M0, and builds on M0 (order decided 2026-10-10 18:17 UTC).
+6. The scale slices L1 to L8 (section 19): one Layer per resource, concurrency control with backpressure and fair scheduling, ordered by what S0 shows breaks first. L5 to L7 are risky singles and are not scheduled.
 
 **What is already known (verified at `d9804ac4f`).**
 
@@ -29,7 +33,7 @@ Anchors: `origin/main` `d9804ac4f`. Effect facts come from the published `effect
 
 ## 1. Goal and constraints
 
-The user asked (2026-10-10) to consolidate the codebase on Effect 4 (the latest 4.x), to use Effect across the backend logic, to compare backend performance, scalability, memory and CPU before and after, and to make the code leaner, more reliable and faster.
+On 2026-10-10 (19:05 UTC) the goal was widened from consolidating the backend on Effect to making one deployment run hundreds of agents (section 13). The first request was: the user asked (2026-10-10) to consolidate the codebase on Effect 4 (the latest 4.x), to use Effect across the backend logic, to compare backend performance, scalability, memory and CPU before and after, and to make the code leaner, more reliable and faster.
 
 Read as these outcomes: **one set of tools** for async work, **measured** performance, scalability, memory and CPU, **leaner** code, **more reliable** behavior, and **faster** behavior. "Learner" is read as "leaner".
 
@@ -39,7 +43,7 @@ Constraints, all binding:
 - **No second system.** One validator (zod), one log format (pino), one tracing path (the operator-gated OpenTelemetry path), one record of runs (`heartbeat_run_events`). Section 6.
 - **Incremental, never a big bang.** Old and new code run side by side. Each slice is one revertible change.
 - **Do not touch a file that an open pull request touches.** Section 7.3.
-- **Web, API and CLI parity: not applicable.** This is an internal change. It adds no user-facing capability. The measurement tooling is a developer script. If a slice changes a documented API behavior, that slice must say so and carry the parity work.
+- **Web, API and CLI parity.** Not applicable to the slices that are internal. It applies to the scale slices that add behavior an operator or a client sees: L2 (the 503 answer with Retry-After and its settings) and L5 (run caps and fairness settings). Each adds the setting or response to the API (OpenAPI), the CLI and the web UI in the same pull request, or in a named follow-up. The measurement tooling is a developer script.
 - **Public repository.** No instance, host, company or agent names in this plan, in code, in commits or in the pull request.
 - **Data path.** Effect tracing feeds the **observability** path (`server/src/instrumentation.ts`, `doc/observability.md`). It never feeds **Telemetry** (`packages/shared/src/telemetry/`). See `AGENTS.md` section 5.7.
 - **Disk.** An install or a measurement run needs at least 9,000 MiB of free disk before and after, and the maintainers' go.
@@ -82,7 +86,7 @@ Size for scale: `chat-channels.ts` 38,507 lines, `heartbeat.ts` 32,602, `tool-ac
 
 **One version for all packages.** Every Effect package shares one version number, and each companion has a peer dependency on the same `effect` version (`@effect/platform-node@4.0.3` and `@effect/opentelemetry@4.0.3` require `effect@^4.0.3`). Pin every Effect package to the **same exact version**. **Slice E0b should not be built or measured on 4.0.0 or 4.0.1 (Q2 asks the maintainers to confirm).** The release notes of 4.0.1 and 4.0.2 contain fixes that E0b and later slices depend on: 4.0.1 #8629 keeps a fiber's `AsyncLocalStorage` context (the server uses it in `chat-sdk-runtime.ts`, `plugin-host-call-actor.ts` and `native-run-trace.ts`); 4.0.2 #8799 stops `Effect.retry` from retrying failures that contain defects or interruptions; 4.0.2 #8783 fixes a `ManagedRuntime` disposal deadlock when called from one of its own fibers; 4.0.2 #8819 stops `Queue` from losing messages when `take` is interrupted. The earliest sensible pin is therefore 4.0.2, installable from the evening of 2026-10-14 (UTC).
 
-**Stability.** The 4.0.0 guide marks these subpaths `@stability unstable`: `ai`, `cli`, `cluster`, `devtools`, `eventlog`, `http`, `http-api`, `jsonschema`, `observability`, `persistence`, `process`, `reactivity`, `rpc`, `schema`, `socket`, `sql`, `workflow`, `workers`. An unstable API "may receive breaking changes in minor releases". Modules in packages other than `effect` (for example `@effect/platform-node`, `@effect/sql-pg`, `@effect/opentelemetry`, `@effect/vitest`) are currently unstable too. The unstable `effect/schema` subpath holds only the model and the schema compilers; the core `Schema` module has no unstable tag. **Version 4.0.2 tags every module explicitly** (#8770). Its `index.d.ts` marks 19 modules unstable (`Arbitrary`, `ByteSize`, `ChannelSchema`, `Crypto`, `ErrorReporter`, `ExecutionPlan`, `FileSystem`, `Graph`, `HashRing`, `LayerMap`, `LayerRef`, `Newtype`, `PartitionedSemaphore`, `Path`, `PlatformError`, `Stdio`, `Terminal`, `TxChunk`, `Version`) and the 18 modules of section 9, rule 1 stable. **Consequence:** this plan uses only a positive list of core modules that read stable (section 9, rule 1) and pins the exact version. Re-read the tags when the pin changes.
+**Stability.** The 4.0.0 guide marks these subpaths `@stability unstable`: `ai`, `cli`, `cluster`, `devtools`, `eventlog`, `http`, `http-api`, `jsonschema`, `observability`, `persistence`, `process`, `reactivity`, `rpc`, `schema`, `socket`, `sql`, `workflow`, `workers`. An unstable API "may receive breaking changes in minor releases". Modules in packages other than `effect` (for example `@effect/platform-node`, `@effect/sql-pg`, `@effect/opentelemetry`, `@effect/vitest`) are currently unstable too. The unstable `effect/schema` subpath holds only the model and the schema compilers; the core `Schema` module has no unstable tag. **Version 4.0.2 tags every module explicitly** (#8770). Its `index.d.ts` marks 19 modules unstable (`Arbitrary`, `ByteSize`, `ChannelSchema`, `Crypto`, `ErrorReporter`, `ExecutionPlan`, `FileSystem`, `Graph`, `HashRing`, `LayerMap`, `LayerRef`, `Newtype`, `PartitionedSemaphore`, `Path`, `PlatformError`, `Stdio`, `Terminal`, `TxChunk`, `Version`) and the 24 modules of section 9, rule 1 stable. **Consequence:** this plan uses only a positive list of core modules that read stable (section 9, rule 1) and pins the exact version. Re-read the tags when the pin changes.
 
 **Footprint.** `effect@4.0.0` has no runtime dependencies. The registry reports 49.5 MB unpacked in 2,561 files for 4.0.0, and 50.1 MB in 2,581 files for 4.0.2. The root entry `dist/index.js` is a barrel of about 138 `export * as X` lines, so in Node ESM a root import evaluates every module. A subpath import (`effect/Effect`) loads only that module's graph, so the guide requires subpath imports (section 9, rule 1). Requirements from the package README: TypeScript 5.9 or newer (TypeScript 7 recommended), Node 18 or newer, `strict` on. The repository meets all three.
 
@@ -437,7 +441,7 @@ The thresholds are proposals. The maintainers decided them on the first text of 
 
 Where it goes: this section moves to `doc/effect-guide.md` in slice E0b. Effect code lives under `server/src/effect/` (the runtime, the pino logger, the tracer, the error mapper) and inside the service that a slice converts.
 
-1. **A positive list of modules, imported by subpath.** Allowed: `effect/Effect`, `effect/Layer`, `effect/Context`, `effect/Scope`, `effect/Schedule`, `effect/Semaphore`, `effect/Duration`, `effect/Exit`, `effect/Cause`, `effect/Fiber`, `effect/FiberSet`, `effect/FiberMap`, `effect/Deferred`, `effect/Queue`, `effect/ManagedRuntime`, `effect/Data` (tagged errors), and, from slice E2, `effect/Logger` and `effect/Tracer`. In 4.0.2 all of these read stable. Any other module needs an amendment to this plan, because the package has about 138 top-level modules and some are tagged unstable or experimental (for example `Arbitrary`). **Never** `Schema` (either path), **never** `from "effect"` (the barrel loads every module), **never** a subdirectory (`effect/http`, `effect/sql`, `effect/socket`, `effect/process`, `effect/observability`, `effect/workflow`, `effect/rpc`, `effect/cluster`, `effect/ai`, `effect/cli`, `effect/persistence`, `effect/reactivity`, `effect/workers`, `effect/devtools`, `effect/eventlog`, `effect/jsonschema`), and **never** an `@effect/*` package.
+1. **A positive list of modules, imported by subpath.** Allowed: `effect/Effect`, `effect/Layer`, `effect/Context`, `effect/Scope`, `effect/Schedule`, `effect/Semaphore`, `effect/Duration`, `effect/Exit`, `effect/Cause`, `effect/Fiber`, `effect/FiberSet`, `effect/FiberMap`, `effect/Deferred`, `effect/Queue`, `effect/ManagedRuntime`, `effect/Data` (tagged errors), and, from slice E2, `effect/Logger` and `effect/Tracer`; and, from the first scale slice that needs them (section 19), `effect/Request`, `effect/RequestResolver`, `effect/Cache`, `effect/Pool`, `effect/RcMap` and `effect/PubSub`. In 4.0.2 all of these read stable (the six added modules were read through their published typings on 2026-10-10; the spike confirms each tag in the installed package). `RequestResolver.persisted` is tagged unstable and is not used. Any other module needs an amendment to this plan, because the package has about 138 top-level modules and some are tagged unstable or experimental (for example `Arbitrary`). **Never** `Schema` (either path), **never** `from "effect"` (the barrel loads every module), **never** a subdirectory (`effect/http`, `effect/sql`, `effect/socket`, `effect/process`, `effect/observability`, `effect/workflow`, `effect/rpc`, `effect/cluster`, `effect/ai`, `effect/cli`, `effect/persistence`, `effect/reactivity`, `effect/workers`, `effect/devtools`, `effect/eventlog`, `effect/jsonschema`), and **never** an `@effect/*` package.
 2. **Where Effect may be imported.** Only in `server/src/effect/` and in files that a slice converts. **Never** in `packages/shared`, `packages/db`, `cli`, `ui`, plugin code, or `server/src/modules/*/domain` (the domain layer is pure).
 3. **Services.** Use `Context.Service` (v4 replaces `Context.Tag`). One service per existing `xService(db)` factory that a slice converts. The factory stays exported and returns the same object, so callers do not change.
 4. **Layers.** A layer builds a service once. `ManagedRuntime.make(layer)` holds the layers for the life of the process. A test builds a small test layer. No global singletons.
@@ -452,6 +456,8 @@ Where it goes: this section moves to `doc/effect-guide.md` in slice E0b. Effect 
 13. **Names and spans.** Use `Effect.fnUntraced` by default, so an effect makes no span and the gate-off case costs nothing. Use `Effect.fn` only where a span is wanted and its name and attributes are in the allowlist (section 6). Confirm both names in the spike.
 14. **Tests.** Use plain `vitest`. Build a `ManagedRuntime` from a test layer and dispose it in `afterEach`. Pure Effect unit tests may join the `Dockerfile` `vitest run` list. Embedded-Postgres suites cannot. The spike decides whether `effect/testing`'s `TestClock` fits the fake-clock tests next to vitest's fake timers.
 15. **Enforcement.** Extend `scripts/check-module-boundaries.mjs` (it already extracts imports, and today scans only `server/src`) with new scan roots and rules 1 and 2, and add it to a CI step in slice E0b. Rules 5 to 8 are enforced by review. No new linter.
+16. **Resources.** Every resource that a slice puts under Effect is a Layer with four things written down: an explicit bound (a number from config, not an unbounded list), an owner (one service), a scope (it closes on scope close, on failure and on interruption), and metrics (in use, queue length and wait time, refusals), exported as pino fields and, when the operator gate is on, as spans. Section 15 is the list.
+17. **Tests.** New tests are real end-to-end tests: the real server, a throwaway embedded Postgres on loopback, real API or CLI calls. They do not mock internal modules (the DB, services, the heartbeat). Time, external network and providers may be faked, so the fake-clock, timer-spy and characterization tests of this plan (R2, R3, R5, R6, R7, R8) are allowed. Every slice adds e2e coverage for the flow it touches, shows it failing against a deliberate mutant first, and runs it in the git hooks (the maintainers' rule of 2026-10-10; the hooks themselves are being built, so until they land the pull request shows the run). The tests of the plain-TypeScript fixes that a slice absorbs stay, and run green before and after.
 
 ## 10. Risks
 
@@ -472,6 +478,10 @@ Where it goes: this section moves to `doc/effect-guide.md` in slice E0b. Effect 
 | Merge conflicts with open pull requests, and with upstream merges. `VLLNT.md` says the fork merges upstream regularly. | The freeze list (section 7.3). Prefer files that upstream rarely changes. Refresh before each slice. |
 | The measurement is noisy on a shared host. | The rules in 4.1 and section 8: interleave, at least 10 pairs, a confidence interval on the paired differences, and no row dropped for noise: more pairs or a quieter host instead. |
 | The in-scope share of the 82 definitions is smaller than the headline. | The B0 report counts again for `server/src`. The slices name what they replace. |
+| S0's synthetic agents understate the cost of real agents (they are small processes with a fixed request and log rate). | Section 14.5 lists what is not covered and states the assumptions. Q20 asks for the host and the per-run memory. The L slices are gated at the level where a resource broke, not on S0 alone, and the first real deployment of a slice is watched. |
+| Fair scheduling and company caps change who waits and can starve a large tenant. | Round-robin with equal weights changes only the order among companies with queued work; caps start at none (Q21); the flood test of section 16 runs in the e2e suite. |
+| Admission control sheds a legitimate request. | It sheds only above limits, P2 first, P0 last, with 503 and Retry-After; the limits are set from S0 and reported with every shed. |
+| Two scheduler leaders (H1). | A lease row with a fencing token, so that an old leader's late writes are refused; H1 is not scheduled (Q22). |
 
 ## 11. The pull request sequence
 
@@ -480,11 +490,12 @@ Where it goes: this section moves to `doc/effect-guide.md` in slice E0b. Effect 
 | 1 | **This plan** | Docs only. | Plan review. |
 | 2 | **B0 harness** | `tests/perf/backend/` and the B0 numbers in its body. No `server/src` change. | #50 is a dependency (the fixture script is read from its pinned head, with no copy). The harness has run on the shared host. |
 | 2b | **Fault harness** | `tests/perf/backend/faults.mjs` and `fault-proxy.mjs`: the helper-level F1, the route-level F4, and the `authenticated` server configuration. Test code only, no `server/src` change. | The B0 harness. |
+| 2c | **S0 harness and baseline** | `tests/perf/backend/scale.mjs` and `lib/{farm,http,summary,watch}.mjs`: synthetic agents at 25, 50, 100, 200 and 300, the production request mix, the board pages, DB, process and event-loop samplers, and what breaks first (section 14). Test code only. The S0 numbers go in the pull request body and in section 14. | The B0 harness. A load of 6 or less. |
 | 3 | **A bounded shutdown** (not this plan; it is #119, slice D0 of #103) | Plain TypeScript, ready for review. E6 and Gate 3 wait for it, for #103's D1 and D2, and for #110's M0 (order decided 2026-10-10 18:17 UTC). | #119 to land. |
 | 4 | **E0a** | The retry policy in plain TypeScript, with the shared retry budget and its tests. | No install. The fault harness (step 2b) for F4. |
 | 5 | **E0b** | The smallest edge: an empty-layer runtime, `edge.facade`, the boundary gate, the guide, and `database-retry.ts` on Effect. | A separate go for the **online install** of `effect`. The maintainers decide it on or after 2026-10-14, and only once this plan is approved, with the version past the cooldown (4.0.2 or later, one exact pin for every Effect package), at least 9,000 MiB free and a load of 10 or below (the install gate; the round start of the harness is 6). |
 | 6 | **Gate 1 report** | E0b against E0a, in the format of section 8. | Quiet-window measurement. |
-| 7 onward | E1 to E5, one pull request each, in the order of section 7.4. Gate 2 follows E1. E6, Gate 3 and the heartbeat and recovery slices are not scheduled. | Each with its before-and-after row. | The freeze list refreshed first. |
+| 7 onward | E1 to E5 and the scale slices L1 to L8 (section 19), one pull request each, in the order of section 19. Gate 2 follows E1. E6, Gate 3 and the heartbeat and recovery slices are not scheduled. | Each with its before-and-after row. | The freeze list refreshed first. |
 
 Every pull request after this one follows `.github/PULL_REQUEST_TEMPLATE.md` in full, including the model line. The E0a and E0b pull requests state the change in outage latency and the retry budget (section 7.2), because it reaches the cloud-tenant actor lookup and the wake path, and the E0a pull request names #113, which reserves the issue wake path.
 
@@ -512,6 +523,212 @@ On 2026-10-10 (17:48 UTC) the maintainers confirmed Q2, Q3 and Q14 as changed in
 | **Q16** | Who owns the bounded shutdown? | **Resolved by #119** (slice D0 of #103; open and ready for review at `a461efff9`, with changes to `shutdown.ts`, `index.ts` and `heartbeat.ts`): it ends the shutdown inside one budget under the stop timeout. E6 and Gate 3 wait for #119 to land, for #103's D1 and D2, and for #110's M0 (order decided 2026-10-10 18:17 UTC). Gate 3 still measures against the bounded shutdown alone. |
 | **Q17** | Should the default predicate of `retryIdempotentDatabaseOperation` also retry SQLSTATE 57P01 and closed sockets (the wide `isTransientDatabaseError`)? Today the dashboard and the auth lookup retry four client codes only, and the wake path retries the wider set. | **Decided (2026-10-10 17:48 UTC):** the default is to retry 57P01 and closed sockets **only for reads and for operations already marked idempotent, never for a non-idempotent write**, because after a lost connection it is unknown whether the commit happened. This matches the helper's own contract (`database-retry.ts`: the caller proves that the operation is idempotent). The change itself is a separate pull request with its own test, not part of E0a or E0b, and it runs after the F1 pre-check shows which codes a real blip produces. |
 | **Q18** | What are the numbers of the shared retry budget (the retries of the last 10 s fewer than the calls of the last 10 s plus 100), and should it be a window, a token bucket, a share of calls or a circuit breaker? | **Decided as a merge prerequisite of E0a (2026-10-10 18:40 UTC); the numbers were left to this plan and are proposals:** a 10 s sliding window with a ratio of 1 and a reserve of 100. Its allowance grows with traffic, so a short blip is served at any call rate. A fixed token bucket with 0.2 token per call and a bank of 100 was tried in an event model and refused almost every retry of a 1 s blip at the dashboard rate. A ratio of 1 keeps a sustained outage at 2 + 10 ÷ R statements per call at R calls a second, at most `main`'s three from 10 calls a second up. A circuit breaker needs a state machine and a probing policy, which a budget does not. Check the numbers with R8(f), the helper-level F1 at both rates and F4 (the gain at 0.3 s and 1 s must survive and the bound must hold), and move them within that bound if they ask. |
+| **Q19** | Confirm the proposed service levels (section 18): 300 agents running at once on a stated host; agent-route p95 under 500 ms; browser API p95 under 1 s; zero lost runs on a planned restart; bounded memory per run and bounded DB connections. | **Proposed, for the user to confirm.** Accept them as the first target, with the limits that S0 already uses as its break criteria (section 14.4). Revisit them when S0 has numbers. The host size and the per-run memory are the user's input (Q20). |
+| **Q20** | Where do the agent processes run: on the application host (local adapters) or on worker hosts over SSH? What is the host size for the 300-agent target (the planned resize is 8 vCPU), and how much memory does one real agent process use? S0 cannot answer this: its synthetic agents are small processes. | **Ask the operators.** The answer decides whether the bound that breaks first is the number of child processes on the application host or the number of SSH connections and bridge workers. Until then S0 reports both counts per run. |
+| **Q21** | Per-company run caps and fair scheduling change who waits. Should they be on by default? | **Recommend: configurable, default off for the caps, on for round-robin across companies with equal weights.** Round-robin only changes the order among companies that have queued work, and it has no effect until a cap binds. A cap changes behavior and starts from "no cap" until S0 sets one. |
+| **Q22** | Replicas: approve the design in section 17 (a leader by lease and fencing token, a `SKIP LOCKED` claim with a per-agent lock, run affinity), or only the single-node target? | **Approve H0 only (one node, bounded and instrumented) now.** H1 to H3 stay specified and unscheduled until S0, after the L slices, shows that one node cannot hold the target and that the database is not what breaks. H1 (a lease row) and H2 (`owner_node`) need a migration; all three are risky singles. |
+| **Q23** | S0 covers neither the GitHub credentials route (the most likely first breaker in production) nor the bridge listing over SSH (section 14.5). Accept that for the first S0 result, or hold the result until a loopback fake GitHub provider exists? | **Accept the gap for the first S0 result, and say so wherever the result is quoted.** The result is then "what breaks first among the covered paths". Build the fake provider in the harness before L4; the credentials owner's own measurement stands for the route until then. |
+
+## 13. The expanded goal: hundreds of agents on one deployment
+
+On 2026-10-10 (19:05 UTC) the user widened the request to: *use Effect to rework the full backend for better resource management and performance; make it enterprise ready, so that the system scales and manages hundreds of agents; use the existing session.* This section says what changes and what does not.
+
+**What changes.** The goal grows from "move helpers to Effect, measured" to "one deployment runs hundreds of agents reliably, and Effect is the way each resource gets a bound, an owner and a scope". The plan gains a scale baseline on `main` (section 14), a resource model with one Layer per resource (15), concurrency control, backpressure and fair scheduling (16), the answer on replicas (17), proposed service levels (18) and a slice order (19).
+
+**What does not change.**
+- The migration is incremental, service by service and route by route. There is no big-bang rewrite.
+- One plan: this one.
+- Q1 = A holds: Express, drizzle, pino, ws and zod stay at the edges, unless S0 shows that an edge is the bottleneck. Then that edge gets its own measured slice and its own question.
+- Every gate compares a slice with its parent commit on one machine, interleaved (section 8). The freeze list holds (section 7.3).
+- Spans go only on the operator-gated OpenTelemetry path, never on Telemetry (section 6).
+
+**Absorb, do not fight.** The capacity fixes in flight land first, in plain TypeScript: #119 (bounded shutdown), #120 (a queued run that loses the routine slot), #121 (bridge listing backoff), #122 (credentials retry backoff), #123 (one SSH connection for the bridge), #88 (merged: leftover bridge processes), #93, #98 and #112 (remote process kill, run directories), #104 and #27 (recovery), the credentials-route cache and the database lock fix (both not yet opened as pull requests). The perf track's route fixes land first too. A later Effect slice may replace the internals of one of these. It then keeps the tests of the fix as its regression guard, lists them in its pull request and shows them green before and after. No slice touches a file that an open pull request holds.
+
+**Test rule.** Rule 17 of section 9: real end-to-end tests, no mocks of internal modules, run in the git hooks.
+
+## 14. S0: the scale baseline on `main`
+
+### 14.1 The question
+
+How many synthetic agents does one server carry, which resource breaks first among the paths S0 covers, and at how many agents? Section 14.5 lists what S0 does not cover. S0 runs on `main` before any further Effect code and needs no Effect install. Its result decides the order of the scale slices: fix the resource that breaks first, first.
+
+### 14.2 Method
+
+S0 extends the B0 harness (same server start, same load gate, same probe, same report rules). Nothing is run against production. **State of the harness when this text was written:** the code is committed locally and syntax-checked; the child script, the summary and the report were exercised with synthetic inputs; and the seed (fixture, two extra companies, agents created through the API) ran end to end on a small fixture. **No step has been run against a server yet.** A `--smoke` step must pass before the harness pull request is opened.
+
+- **A synthetic agent is a real run.** The server starts a `process` agent whose command is a small shell and perl script. The child writes the run token the server gave it to a file, prints log lines at a fixed rate (2 a second by default), and exits 0 when the farm signals it through a FIFO. The farm is one Node process. It reads each token and sends the requests that a real agent sends, with that token and the run id header. So the server does its real per-run work: the wake, the claim, the spawn, the run-log writes, the identity capture, the checkout, the finish and the exit. A run costs a few megabytes on the host instead of a coding agent's few hundred, which is what should make 300 runs possible on a shared host (about 47 GB of RAM, about 20 GB of it free; to be confirmed by the first step).
+- **Levels, steps and repeats.** 25, 50, 100, 200 and 300 agents (400 if 300 holds). A step restores the same seeded database, starts the production command, runs a canary run, ramps the agents over 60 s, waits half a run, holds the level for a window of three run cycles (288 s with 90 s runs), and ends all runs. Each level is run at least 3 times, interleaved across levels (25, 50, 100, 200, 300, 25, ...), and reported as the median and the range. A criterion counts as broken at a level when it is broken in most of its valid steps. One agent is one open issue at a time; when a run ends the farm creates the next issue.
+- **Data.** The B0 fixture (a busy company with 32 agents, 1,000 issues and 10,000 runs; `--issues` and `--runs` raise it toward production size) plus two small companies. The synthetic agents are spread over the three companies, so that every level has a multi-tenant mix.
+- **The request mix of an agent (per run).** At the start: `GET /api/agents/me`, `GET /api/heartbeat-runs/:id`, the issue's heartbeat-context, `POST` checkout, `GET` issue, comments and documents. During the run, a weighted request every 10 s on average (`agents/me` 3, issue 4, heartbeat-context 3, comments 2, documents 2: the proportions of the agent routes in the production log). At the end: a comment and `PATCH` status done. All with the run's JWT, and so with the auth work of a real agent request (about 5 sequential queries and the identity capture, `server/src/middleware/auth.ts:325-431`). An option sends several requests of one run at once (`--agent-burst`), because the lead in 14.6 is about requests of one run queueing behind each other and one request at a time cannot show it.
+- **Board users.** Three, on the hot pages of the fixture company, with 4 to 10 s of think time: the attention page, the issue list (`view=compact`, 100 rows), and the issue page (about 15 calls), each page preceded by the floor calls a browser makes (`instance/settings/experimental`, `auth/get-session`, `cli-auth/me`, `adapters`, `plugins/ui-contributions`).
+- **Load rule.** A step starts only at a 1-minute load of 6 or less, samples the load every 15 s, and is void when the load goes above 10. Void steps are redone. The same rule as B0, with one caveat: the step's own processes (the server, the database, the farm and the children) count in that load, and at the top levels they may push it over 10 by themselves. If that happens the rule is judged on the load that does not come from the step, as already proposed for B0.
+- **The farm is watched too.** The farm records its own event-loop delay and CPU. A step is void when the farm's delay is high (p99 above 50 ms), because its latencies would then be the farm's.
+
+### 14.3 What is measured, per step
+
+| Id | Metric | How |
+| --- | --- | --- |
+| SM1 | Throughput: runs completed per hour, against the ideal for the level | Runs that ended in the window |
+| SM2 | p50, p95 and p99 per route, for agent and board requests, with failures (status 0 or 5xx) and rejections (4xx) counted separately | The farm times each request from the call to the end of the body |
+| SM3 | Wake-to-running latency (from the call that creates the issue to the first poll, every 150 ms, that sees the run's token file): p50, p95, max; runs that never start | The farm |
+| SM4 | Event-loop delay, CPU per second, RSS and heap of the server | The B0 probe preload |
+| SM5 | DB sessions, active sessions, sessions waiting on a lock, idle in a transaction, the oldest transaction, ungranted locks, deadlocks, transactions a second | One query on `pg_stat_activity` and `pg_locks` every 500 ms from a separate connection |
+| SM6 | Pool busy share: the share of samples in which the busy sessions (active plus idle in a transaction) reach the pool bound (`DATABASE_POOL_MAX`, default 10, `packages/db/src/client.ts:139,215`). This is a proxy for pool saturation, not a wait time: postgres.js exposes no pool statistics. The first level that breaks is run again at pool sizes 10 and 30, and the pool wait is attributed to the difference. L1 adds the real queue wait | Derived from SM5 and `--pool-max` |
+| SM7 | Child processes and SSH processes per run, threads (the database subtree is left out) | `/proc`, descendants of the server, every second |
+| SM8 | Cycle stretch: the median time of a whole synthetic run against its nominal length | The farm |
+| SM9 | Memory growth over the window | SM4 |
+
+### 14.4 What "breaks" means
+
+The first level at which any criterion below is broken is "what breaks first"; if two break at the same level, the one with the largest ratio of value to limit is named first and both are listed (`scale.mjs report` does this). The limits are the proposed service levels of section 18, and the report prints each value next to its limit, so a reader can apply other limits.
+
+| Criterion | Limit |
+| --- | --- |
+| Agent-route p95 (any route with at least 20 requests) | 500 ms |
+| Board-route p95 | 1,000 ms |
+| Agent request failures (status 0 or 5xx) | 1% |
+| Agent request rejections (4xx) | 1% |
+| Event-loop delay p99, median over the window | 100 ms |
+| CPU of the server process | 900 ms per second (one core) |
+| Share of DB samples with a session waiting on a lock | 20% |
+| Share of DB samples with the busy sessions at the pool bound | 50% |
+| Wake-to-running p95, or any run that never starts | 30 s |
+| Cycle stretch | 1.5 |
+| RSS growth over the window | 20% |
+
+### 14.5 What S0 does not cover
+
+- **The GitHub credentials route** (`POST /runtime-tools/github/credentials`, about half of the API requests on one production read). It needs a GitHub connection and a broker, which the harness does not set up, and the body of its cost (several DB reads, one write, a policy decision and a plugin call per command) is not reproduced. This is the most likely first breaker in production, so the gap matters: a loopback fake provider (external network may be faked, rule 17) is built for it before L4, and Q23 asks the maintainers to accept the gap for the first S0 result.
+- **The bridge and SSH.** The bridge queue listing is a file listing on a remote sandbox over SSH, not a REST route, and the harness host has no SSH target. S0 counts `ssh` processes (always 0 here) and reports the child processes per run. The SSH cost is read from the in-flight fixes (#121, #123) and their own tests.
+- **Statements per route.** S0 counts transactions a second, not statements per route. The per-route statement census (needed to say which routes are N+1 shaped, section 15) uses the fault proxy of step 2b, which counts the Query and Execute messages the server sends, and is added there.
+- **Real agent cost.** The synthetic child is small; a real coding agent uses far more memory and CPU on whichever host runs it (Q20). The log rate (2 lines a second) and the request rate (one in 10 s) are assumptions, not production measurements, and the report states them.
+- **Cache effects on the board pages.** The company issue list passes through an in-process TTL cache (`routes/issues.ts:8125`), so board users that request the same list measure cache hits.
+- **WebSocket fan-out** (live events), large run outputs, and a production-sized database. The fixture is smaller than production; raise `--issues` and `--runs` at seed time.
+- **Restart under load** (M8 with runs in flight) belongs to #119 and Gate 3.
+
+### 14.6 Evidence from production, until S0 has numbers
+
+Three infra reads of the production system on 2026-10-10 are the only scale evidence today. They are read-only, they report latencies and counts, and they differ in window and in what they measured.
+
+- **Read A, the request log, 16:56 to 18:56 UTC (2,604 API lines).** A floor of 3 to 4 s at the median in a browser on routes that read one settings row or return a constant (`instance/settings/experimental`, `auth/get-session`, `cli-auth/me`, `adapters`, `plugins/ui-contributions`), and on static images. Routes with a code cost on top of it: company attention 59 s at the median, skills 45 s, company issue list 27 s, issue by id 17 s, dashboard 15 s, live runs 12 s. Agent routes at 9.6 to 9.8 s at the median with a narrow band, even `GET /api/agents/me`: every agent request costs about 6 s more than the browser floor. Host at 18:58 UTC: 4 vCPU; the application container at about 195% CPU and 1.9 GiB of its 3 GiB limit; the database container at about 110% CPU; of 10 active DB sessions, 7 waiting on a lock, the oldest transaction 11 s.
+- **Read B, the bridge triage, from 15:36 UTC.** `POST /runtime-tools/github/credentials` was about half of all API requests (3,248 calls, about 31 a minute). Its median went from 0.1 s to 9 s as the host became CPU-starved, and 41% of its calls were aborted by the caller at 10 s and then retried. The bridge opened a new `ssh` process per operation.
+- **Read C, the database, 18:07 UTC.** The database container at about 185% CPU and the application at about 136% after the load was cut to 10 runs; 7 of 11 active sessions waiting on locks, behind a transaction open 11 to 17 s that already held row locks and was running a plain read. `issues` had 1.0M sequential scans over 4.4k rows.
+
+A lead from read A, not measured: an agent-JWT request for a running run takes `FOR NO KEY UPDATE` row locks on the run's issue and on the run in a transaction (`auth.ts:413-417`, `run-identity.ts:67-90,179-180`), so requests of one run queue behind each other and behind writers of the issue.
+
+These reads were taken while the host was starved, so they show that the system is saturated, not which resource saturates first. S0 is there to separate the layers.
+
+### 14.7 Results
+
+Not available yet. The shared host stayed above the load gate of 6 (it was above 10 most of the time in the first hours of 2026-10-10), so no step has been run as a measurement. This section is updated, in a later commit, with the table of steps (median and range per level), the name of what breaks first, and a note of the voided steps. The harness pull request carries the raw numbers and the load of every step.
+
+## 15. The resource model: one Layer per resource
+
+Each row is a resource that today has no bound, no single owner or no scope. A Layer gives it the four things of section 9, rule 16. The anchors are on `main` (`d9804ac4f`).
+
+| Resource | Today | The Layer (bound, scope, metrics) | Absorbs, and keeps the tests of | Slice |
+| --- | --- | --- | --- | --- |
+| Database pool and transactions | postgres.js pool of 10 by default; an agent request runs about 5 sequential queries in auth; long transactions hold row locks (`wake-queue/adapters/postgres.ts:1171-1232`); `issues` has no index on `execution_run_id` or `checkout_run_id`; no queue-wait metric | `Db`: pool size from config; a scoped `transaction` helper that sets `lock_timeout` and `statement_timeout` and logs a transaction that stays open too long. The queue wait and the queue length come from a semaphore the size of the pool, placed in front of the client in the server's own wiring (plain TypeScript, no Effect import in `packages/db`, rule 2) | The database lock fix (not yet opened) and its tests | L1 |
+| Admission at the HTTP edge | No limit per class of request; the same pool serves the agent control plane, board pages and sweeps. Some routes have their own limiters (agent creation, the issue-list coordinator) | `Admission`: classes (A agent control plane, B board, C background), a bound per class and per company, and a share of the DB connections per class (section 16), shedding with 503 and Retry-After above the limits | none | L2 |
+| Query batching | Routes that read as N+1 shaped: attention, skills, the company issue list, the issue page. S0 does not count statements per route yet (14.5), so which are N+1 shaped is confirmed by the census first | `RequestResolver` with `batchN` for the loads that repeat inside one request. `withCache` is a process-level cache and is not used for this; request-level deduplication is confirmed in the spike. `persisted` is unstable and not used | The perf track's plain-TypeScript route fixes (the ones that remain N+1 shaped after the census) | L3 |
+| Outbound calls (GitHub credentials, GitHub API, providers) | The credentials route does DB reads, one write and a plugin call per git or gh command; callers abort at 10 s and retry | `Outbound`: a `Cache` per run and company (`makeWith`, so that a failed lookup has a TTL of 0: `Cache` otherwise keeps a failure until it expires and one timeout would fail every command of the run; capacity, TTL, one lookup per key at a time, never across runs or companies, never on disk, dropped at run end), a permit per host, a timeout from the caller's abort | The credentials-route cache and lock-free identity capture (not yet opened), #122 | L4 |
+| Run capacity and fairness | One cap per agent (1 to 50, default 20: `heartbeat.ts:722-724,21697-21702`); none per company, per environment or per instance | `Capacity`: permits per company, per environment and per instance; a central dispatcher that claims queued runs by round-robin over companies and skips agents at their cap (section 16) | none | L5 |
+| Timers and periodic jobs | At least 12 boot-time loops (section 2.1); each tick loads all agents (`heartbeat.ts:32460-32475`) and scans all assigned issues (`recovery/service.ts:4409`); a failing step can stop the rest of a tick | `Jobs`: supervised fibers in a `FiberSet`, single flight, a timeout per step, isolation per step (a failed step logs and the next one runs), interruption on stop. The reaper and the recovery chain are protected jobs (section 16) | #120, #104, #27 (their fixes become structural) | L6 |
+| The run scope: child process, remote process, bridge worker, temp directory, locks, run-log writer | Cleanup is hand-ordered in 8 registries and sequences (section 5.1); a run that is interrupted can leave a process or a connection | `RunScope`: one `Scope` per run, opened at claim and closed at the end, on failure, on cancel and on shutdown, in reverse order of acquisition | #93, #98, #112, #119, #103 (the drain and the bounded shutdown become the scope closing within a budget) | L7 |
+| SSH connections and bridge workers | One `ssh` per bridge operation today; #123 shares one connection; #121 backs off idle listing | `RemoteHost`: an `RcMap` keyed by environment, one master connection per environment, reference-counted by runs, idle TTL, closed by scope; at its `capacity` an `RcMap` fails (it does not wait), so a permit is taken before `get`. The bridge worker is a fiber in the run scope | #121, #123 | L7 |
+| Live events and WebSockets | One global emitter that sends to every subscriber; no `bufferedAmount` check; `wss.close()` is never called (section 2.1) | `Live`: a `PubSub.sliding` or `dropping` per company (a bounded `PubSub` suspends the publisher when one subscriber is slow, so one stuck socket would stall the others), a close policy for a socket that falls behind, sockets closed by scope | none | L8 |
+| Memory per run | Not bounded or measured (run-log buffers, session state) | A bound per run once S0 has measured it, enforced where the buffer is | none | L7 |
+
+## 16. Concurrency control, backpressure and fair scheduling
+
+**Rule.** Every queue is bounded. When a bound is reached the work waits where it can be seen (a run stays `queued`) or is refused with a clear answer (HTTP 503 with Retry-After). Nothing grows without a bound in memory. A caller's abort leaves the queue (test R2). The queue length and the wait time of each are exported. A job that releases capacity is never shed (below).
+
+**Limits.**
+
+| Limit | Key | Today | Proposed |
+| --- | --- | --- | --- |
+| Concurrent runs | agent | 1 to 50, default 20 | unchanged |
+| Concurrent runs | company | none | configurable, default none; set from S0 (Q21) |
+| Concurrent runs | environment (a worker host) | none | configurable; read from the host metrics of #75 |
+| Concurrent runs | instance | none | configurable; set from host memory |
+| Concurrent API requests | class and company | none | `Admission` (below) |
+| DB connections | class | none (one pool of 10) | class C at most 20% and class B at most 50% of the pool, class A the rest and the right to borrow; proposals, set from S0 |
+| Outbound calls | host | none | a permit per host, with a timeout |
+| Database | pool | 10 | from config, with queue-wait metrics |
+
+**Classes at the edge.** Class A: the agent control plane (`agents/me`, heartbeat-context, checkout, comments, finish). Class B: board pages. Class C: background work (exports, search). Under overload (the pool queue wait or the event-loop delay above its limit) class C is shed first, then class B with 503 and Retry-After. Class A is shed last. **Shedding at the edge is not enough**: board routes hold DB connections for tens of seconds in production, so a class A request would still queue behind them. The DB connections therefore have a bulkhead per class (the table above), taken before the pool, so class B and class C cannot fill the pool.
+
+**Protected jobs.** The orphan reaper, the stranded-issue reconcile and the recovery chain release capacity (a permit held by a dead run). They are never shed and never skipped for load; they run in their own reserve of the pool. Shedding them under load would leak permits and block agents exactly when the load is high.
+
+**Fair scheduling across companies.** Today a queued run is started by its own agent's claim (`startNextQueuedRunForAgent`, `heartbeat.ts:21674`), and the only global ordering is the 30 s backstop; there is no company-level order, so the company that enqueues first is served first. Fair scheduling needs one central dispatcher: it takes queued runs by round-robin over the companies that have queued work (equal weights by default), skips agents that are at their cap (so a capped agent at the head of the line cannot block the others), and within a company keeps the order of request time and priority. With no instance or company cap there is nothing to order, so the round-robin matters only when a cap binds: it is on by default and has no effect until a cap is set (Q21). Read from the code; S0's flood test confirms it.
+
+**Effect mapping.** `Semaphore` for permits and for the bulkheads; `Queue.bounded` for work queues; `Effect.timeout` with a duration, and the caller's abort through the facade's interrupt (section 7.1); `Pool` for fixed resources; `FiberSet` for supervised loops; the route adapter of section 7.1 for admission. `PartitionedSemaphore` (round-robin across partitions) is a candidate for the dispatcher; it is tagged unstable, so it is not on the module list.
+
+**Tests (real e2e).**
+- Two companies and a binding instance cap; one company enqueues 200 wakes. The other company's first run starts within a stated bound, and every queued run of both eventually starts.
+- The DB pool never has more than its bound in use (read from `pg_stat_activity`), and a flood of class B requests does not delay a class A request beyond a stated bound.
+- Above the limits a class B request gets 503 with Retry-After, a class A request is served, and the client's retry succeeds when the load drops.
+- A queued run that is cancelled leaves its queue. A dead run's permit is released while the system is shedding.
+
+## 17. Horizontal scale: the answer on replicas
+
+**The question.** Is one application node enough for hundreds of agents? S0 answers it. Let N* be the highest level tested at which every criterion of section 14.4 holds on the S0 host.
+
+| S0 result (after the L slices that the data asks for) | Decision |
+| --- | --- |
+| The first break is the database (lock waits, pool busy, long transactions) | More application nodes do not help. Fix the database path first (L1, L3, the lock fixes) and measure again. |
+| N* is 300 or more, with a 30% margin on the limits | One node (H0). No replicas. |
+| N* is between 100 and 300 | Do the L slices first and measure again. Go to H1 if N* is still below 300. |
+| N* is below 100 after the L slices | A design bottleneck. Name it and treat it as a finding before any replica work. |
+
+N* is measured with synthetic request and log rates on a shared host. It is rescaled by the real per-agent request rate and the real per-run cost (Q20) before it decides anything. The grid has 25, 50, 100, 200 and 300 agents (400 if 300 holds), so a result of "300 or more" is only as fine as the top of the grid.
+
+**What blocks several replicas today.**
+- **Timers run in every process.** There is no leader. A second node would run the recovery sweeps, the stranded-issue reconcile and the backups twice.
+- **Locks and limiters live in process memory.** The agent-start lock is per process; the agent-creation limit (30 a minute per company and actor) is an in-memory counter (`routes/agents.ts:2897-2912`); there are 207 module-level `Map` or `Set` declarations, 18 weak ones and 43 module-level `let` in `services/` (section 2.1).
+- **Live events** go through one global emitter, so a browser connected to node B does not see an event raised on node A.
+- **Run processes, SSH connections and bridge workers are local** to the node that started the run.
+- **Local disk** holds run logs, storage and workspaces.
+- What is already safe: the execution lock is a DB `FOR UPDATE`, sessions are in the database, and migrations take a lock.
+
+**The design, if S0 asks for it (staged; each stage is a pull request, with a migration where it needs one).**
+- **H0. One node, bounded and instrumented.** The L slices. This is the commitment of this plan (Q22).
+- **H1. A scheduler leader.** A `Leader` Layer. The lock must not be a session advisory lock on a pooled connection: postgres.js recycles connections (`max_lifetime`, reconnects), which releases the lock silently while the old leader keeps running, and a transaction-mode pooler (which the repository supports) breaks it. Use a lease row with a fencing token (holder, a token that increases on each takeover, a lease time, renewed every few seconds; every leader-only write carries the token, and the leader steps down when a renewal fails), or an advisory lock on a dedicated raw connection that steps down when the connection closes. A leader whose event loop is blocked cannot renew, so its lease expires and another node takes over; the fencing token stops the old one from writing late. Only the leader forks the timers and the sweeps; followers serve HTTP. The lease row needs a migration; the dedicated connection does not.
+- **H2. A shared work claim.** Queued wakeups and runs are claimed with `FOR UPDATE SKIP LOCKED`, so any node can start a run. `SKIP LOCKED` alone does not keep the per-agent cap (an aggregate count over running rows) or the per-issue execution lock correct across nodes, so the claim also takes a per-agent lock (an advisory transaction lock on the agent id, or a row lock on the agent) and re-checks the cap inside the same transaction. The run records its node (`owner_node`, a migration), and the process lives there.
+- **H3. Affinity and fan-out.** A request that needs the run's process, bridge or SSH connection goes to the owner node (by header or redirect) or is answered from the database and storage. Live events cross nodes through `LISTEN` and `NOTIFY`. In-flight maps and limiters that must be global move to the database. Run logs and storage move to a shared store.
+
+H1 to H3 are specified here and not scheduled.
+
+## 18. Proposed service levels (Q19)
+
+| Service level | Measured by | Gate |
+| --- | --- | --- |
+| 300 agents running at once on a stated host (Q20) | S0 level 300 with every other criterion holding | The target of the L slices |
+| Agent-route p95 under 500 ms | SM2, agent routes | Section 14.4 |
+| Browser API p95 under 1 s | SM2, board routes | Section 14.4 |
+| Zero lost runs on a planned restart with the target number of runs in flight | M8 with runs in flight; #119 and #103 | Gate 3 |
+| Bounded memory per run and bounded DB connections | SM4 and SM5 per level; the pool bound from config | Set a number per run once S0 has measured it |
+
+## 19. The slice order, re-derived from S0
+
+**Rule.** Fix the resource that breaks first, first. Until S0 has valid numbers (section 14.7) the order below is provisional. It follows the production evidence of section 14.6: lock waits and long transactions first, then the pool and the floor, then the heaviest routes and calls.
+
+**Scheduled and not scheduled.** L1 to L4 and L8 touch files that no open pull request holds and are ordered and scheduled after E0b. L5, L6 and L7 touch the heartbeat and recovery code. They are ordered here and **not scheduled**: each is a risky single (section 7.3), one per deploy window, and waits for the plain-TypeScript fixes that it absorbs to land and for the freeze check. This agrees with section 7.4, which keeps the heartbeat and recovery slices out of the schedule.
+
+| Slice | Resource | Content | Needs | Lane, size | Number to beat |
+| --- | --- | --- | --- | --- | --- |
+| **L1** | Database pool and transactions | The `Db` Layer: a bound from config, queue-wait metrics from a semaphore in front of the client, the scoped transaction helper with `lock_timeout` and `statement_timeout`, a log of long transactions. Metrics first, no behavior change except the timeouts. | E0b; the database lock fix has landed | Normal, about 250 lines | The DB criteria (lock waiters, pool busy) at the level where they broke |
+| **L2** | Admission at the edge | The `Admission` Layer: classes, per-company bound, DB bulkheads, shedding above the limits. Adds the 503 response and the settings: **parity** work (OpenAPI, CLI, web) in the same pull request. | E0b; the route adapter (section 7.1, not yet planned); L1; the order #119, #95, #110 M0 if it touches `app.ts` | Normal, about 300 lines | Agent p95 and the floor routes at the level where they broke |
+| **L3** | Query batching | `RequestResolver` on the N+1 routes that remain after the perf track and the census | E0b; the route adapter; the perf track's fixes have landed; `routes/issues.ts` is held by 8 open pull requests, so only after they land | Normal, per route | Board p95 for attention, skills and the issue list |
+| **L4** | Outbound calls | `Outbound`: cache, permit and timeout for the credentials path; the loopback fake provider in S0 | E0b; the credentials-route cache and #122 have landed | Normal, about 200 lines | The credentials route's DB statements per call and its calls per run |
+| **L5** | Run capacity and fairness | `Capacity` permits and the central dispatcher; the flood test of section 16. Adds the settings: **parity** work. | E0b; L1; Q21; the claim code in `heartbeat.ts` is free of open pull requests | **Risky single**, not scheduled | Wake-to-running p95 and cycle stretch at 300 |
+| **L6** | Periodic jobs | `Jobs`: supervised fibers with per-step isolation; the recovery chain; the order #119, #95, #110 M0 for `index.ts` | E0b; #120, #104, #27 have landed | **Risky single**, not scheduled | Event-loop delay and CPU of the tick; no step stops another |
+| **L7** | The run scope | `RunScope`, `RemoteHost`, memory per run; #119 and #103 become structural; the order #119, #95, #110 M0 for `index.ts` | E0b; #93, #123, #121, #119 have landed; the E6 conditions (section 7.4) | **Risky single**, not scheduled | Runs lost on restart not worse than #119 alone (Gate 3); no leaked process or connection (R5) |
+| **L8** | Live events | `Live`: `PubSub` per company with a sliding or dropping buffer and a close policy | E0b; the order #119, #95, #110 M0 if it touches `index.ts` | Normal | R4 (a slow socket does not slow others); RSS |
+
+**With the E slices.** B0 and S0 first (test code only). E0a (plain). E0b (the runtime, needs the install). Then L1, L2, L3 and L4 in that order, with E1 to E5 where they fit between them. L8 where it fits. L5 to L7 when their conditions hold. The order changes when S0 names another resource first.
+
+**The gate of an L slice.** The S0 step at the level where the slice's resource broke, and at the level below, against the slice's parent commit, on one machine, interleaved, with the interval rule of section 8. The criterion that broke must improve: the upper end of the interval of its paired differences is below -25% of the parent (or the criterion no longer breaks at that level in most steps). Every other S0 criterion and every section 8 threshold stays within its limit. A step takes about 9 minutes with the ramp and the window, so 10 pairs of one level cost about 3 hours. Every slice has e2e coverage (rule 17); a slice that claims a reliability gain also has an e2e test that fails on the parent.
 
 ## Appendix A. How the counts were made
 
@@ -522,7 +739,7 @@ Counts come from `git grep -E` at `d9804ac4f`, non-test files, and a reviewer re
 - Transactions: `\.transaction\(` in `server/src` (608 calls in 140 files). Own alias: `type (DbTransaction|DbOrTransaction|Tx|DbTx) = ` finds 30 lines in 26 files; a looser form finds about 30 files.
 - Environment: `process\.env` outside `config.ts` and `config-file.ts` in `server/src` (348 occurrences in 113 files; 337 lines).
 - Wiring: `export function [a-zA-Z]+Service\(` in `server/src/services` (111); `\b[a-zA-Z]+Routes\(` in `app.ts` (69); `router\.(get|post|put|patch|delete)\(` in `server/src/routes` (903); `vi\.mock\(` in server tests (458 in 181 files).
-- Module state in `services/`: `^(export )?const X = new (Map|Set)(<|\()` (207), the weak forms (18), and `^(export )?let X` (43).
+- Module state in `services/`: `^(export )?const [A-Za-z_]+(: [^=]+)? = new (Map|Set)(<|\()` (207), the weak forms (18), and `^(export )?let X` (43).
 - Timeouts: `Promise\.race\(` (102), `AbortSignal\.timeout\(` (81), `setTimeout\(\s*\(\)\s*=>\s*\w*[cC]ontroller\.abort\(` (19). Of the 102 races, 80 have a `setTimeout` within -30/+12 lines (heuristic), and 28 of those have no `clearTimeout` in that window.
 - Inline sleeps: `new Promise(<[^>]*>)?\(\s*\(?\s*(resolve|res|r|done|resolveWait)\s*\)?\s*=>\s*\{?\s*setTimeout` finds 74 lines; 12 are inside the helper bodies, so 62 are inline.
 - Timed retries: a `for` loop over `attempt|retry|tries|index|i` with a bound named `max|retries|attempts|delays|backoff` finds 43 loops, 10 of them with a wait within 45 lines; `setTimeout\([^;]*\b(attempt|attempts|retry|retries|retryCount|backoff\w*|failures|consecutive\w*|delays?\[\w+\])\b` finds 24 lines in 20 files. The union is 29 sites. Both regexes miss some forms (six are known).
