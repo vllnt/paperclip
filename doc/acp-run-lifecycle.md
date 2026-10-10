@@ -99,10 +99,12 @@ its queue directory.
 The host's queue worker lists the request queue with one remote command (over
 SSH, one new connection). After it handles a request it lists again at once,
 then waits 100 ms after the first empty listing and doubles the wait after each
-further empty one, up to 3 seconds. So an idle run lists about 20 times a
-minute, and a request that arrives while the run is idle is picked up within
-3 seconds plus one listing. `stop_transport` ends the wait early; the worker
-lists once more and still serves the requests already queued.
+further empty one, up to 3 seconds (or a quarter of the worker's watchdog, if
+that is shorter). So an idle run lists about 20 times a minute. While listings
+succeed, a request that arrives while the run is idle is picked up within
+3 seconds plus a listing round trip. After a failed listing, the existing retry
+backoff applies instead. `stop_transport` ends the wait early; the worker lists
+once more and still serves the requests already queued.
 
 ## The server-owned staging lease outer context
 

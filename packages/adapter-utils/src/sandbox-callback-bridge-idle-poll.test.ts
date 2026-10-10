@@ -76,7 +76,7 @@ function createMemoryClient() {
     const body = files.get(path.posix.join(RESPONSES_DIR, `${id}.json`));
     return body === undefined ? undefined : JSON.parse(body) as { status: number };
   };
-    const onNextList = (fn: () => void) => {
+  const onNextList = (fn: () => void) => {
     afterList = () => {
       afterList = null;
       fn();
@@ -103,7 +103,10 @@ describe("sandbox callback bridge worker idle polling", () => {
     vi.useRealTimers();
   });
 
-  async function startIdleWorker(handleRequest = vi.fn(async () => ({ status: 200, body: "{}" }))) {
+  async function startIdleWorker(
+    handleRequest = vi.fn(async () => ({ status: 200, body: "{}" })),
+    options: { watchdogTimeoutMs?: number } = {},
+  ) {
     vi.useFakeTimers();
     const memory = createMemoryClient();
     worker = await startSandboxCallbackBridgeWorker({
@@ -111,9 +114,15 @@ describe("sandbox callback bridge worker idle polling", () => {
       queueDir: QUEUE_DIR,
       authorizeRequest: () => null,
       handleRequest,
+      ...options,
     });
     await vi.advanceTimersByTimeAsync(0);
-    return { ...memory, handleRequest };
+    // Waits until the worker lists again, so a test starts right after a listing.
+    const untilNextListing = async () => {
+      const listings = memory.listedAt.length;
+      while (memory.listedAt.length === listings) await vi.advanceTimersByTimeAsync(1);
+    };
+    return { ...memory, handleRequest, untilNextListing };
   }
 
   it("lists an idle queue at most six times in four seconds, doubling the wait each time", async () => {
@@ -139,12 +148,11 @@ describe("sandbox callback bridge worker idle polling", () => {
   });
 
   it("picks up a request queued just after an idle listing within the three-second bound", async () => {
-    const { enqueue, response, handleRequest, onNextList, listedAt } = await startIdleWorker();
+    const { enqueue, response, handleRequest, onNextList, listedAt, untilNextListing } = await startIdleWorker();
     await vi.advanceTimersByTimeAsync(30_000);
     // The worst case: the request lands right after a listing at the longest wait.
     onNextList(() => enqueue("late"));
-    const listings = listedAt.length;
-    while (listedAt.length === listings) await vi.advanceTimersByTimeAsync(1);
+    await untilNextListing();
     const queuedAt = listedAt.at(-1)!;
 
     await vi.advanceTimersByTimeAsync(queuedAt + 3_000 - Date.now());
@@ -171,9 +179,10 @@ describe("sandbox callback bridge worker idle polling", () => {
   });
 
   it("stops without waiting out a long idle wait and still serves a queued request", async () => {
-    const { enqueue, response, handleRequest, listedAt } = await startIdleWorker();
-    await vi.advanceTimersByTimeAsync(31_000);
-    // The next listing is still more than the 2 s stop drain away.
+    const { enqueue, response, handleRequest, listedAt, untilNextListing } = await startIdleWorker();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await untilNextListing();
+    // The next listing is 3 s away, more than the 2 s stop drain.
     expect(listedAt.at(-1)! + 3_000 - Date.now()).toBeGreaterThan(2_000);
 
     enqueue("at-stop");
@@ -189,6 +198,24 @@ describe("sandbox callback bridge worker idle polling", () => {
     expect(handleRequest).toHaveBeenCalledTimes(1);
     expect(response("at-stop")?.status).toBe(200);
     await stop;
+    // No idle-wait timer outlives the stop. Stop's own 2 s drain timer ends
+    // first; the idle wait would have run 3 s.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the idle wait under a quarter of a short watchdog, so an idle loop never trips it", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { listedAt } = await startIdleWorker(undefined, { watchdogTimeoutMs: 1_000 });
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(Math.max(...gaps(listedAt))).toBe(250);
+      expect(warn.mock.calls.filter(([message]) => String(message).includes("made no successful poll iteration")))
+        .toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -214,7 +241,14 @@ describe("sandbox callback bridge worker idle polling over SSH", () => {
       await stopSshEnvLabFixture(statePath).catch(() => false);
       await rm(rootDir, { recursive: true, force: true });
     };
-    const fixture = await startSshEnvLabFixture({ statePath });
+    let fixture: Awaited<ReturnType<typeof startSshEnvLabFixture>>;
+    try {
+      fixture = await startSshEnvLabFixture({ statePath });
+    } catch (error) {
+      // For example as root, where the fixture's sshd refuses the login.
+      console.warn(`Skipping the idle SSH poll test: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     const config = await buildSshEnvLabFixtureConfig(fixture);
     const runner = createSshCommandManagedRuntimeRunner({
       spec: { ...config, remoteCwd: fixture.workspaceDir },
@@ -236,8 +270,9 @@ describe("sandbox callback bridge worker idle polling over SSH", () => {
     await worker.stop();
     worker = null;
 
-    // Startup (queue dirs, host lease) plus about eight listings. On a fixed
-    // 100 ms poll this was one login per listing round trip, 30 to 60 here.
+    // Startup (queue dirs, host lease), about eight listings, and the two
+    // listings of the stop. On a fixed 100 ms poll this was one login per
+    // listing round trip, 30 to 60 here.
     const opened = (await logins()) - before;
     console.info(`idle SSH bridge worker: ${opened} SSH connections in 10 s`);
     expect(opened).toBeLessThanOrEqual(16);

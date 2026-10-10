@@ -35,10 +35,12 @@ const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
 // worker. Each listing is one remote command, and over SSH one new connection,
 // so an idle run that listed 100 ms after each empty listing cost the worker up
 // to ten logins a second. The wait starts at the poll interval after a request
-// and doubles while the queue stays empty, so a request that arrives while
-// idle waits at most this long (plus one listing) before the worker picks it
-// up.
-const DEFAULT_BRIDGE_IDLE_POLL_MAX_MS = 3_000;
+// and doubles while the queue stays empty. While listings succeed, a request
+// that arrives while idle waits at most this long, plus the listing in
+// progress and the next one, before the worker picks it up. A worker with a
+// short watchdog waits at most a quarter of the watchdog instead, so an idle
+// wait never looks like a stalled loop.
+const MAX_BRIDGE_IDLE_POLL_WAIT_MS = 3_000;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
@@ -72,8 +74,9 @@ const DEFAULT_BRIDGE_MAX_BODY_BYTES = 10 * 1024 * 1024 + BRIDGE_MULTIPART_FRAMIN
 const DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS = 10_000;
 // Watchdog backstop for a hang that the per-iteration timeout does not catch
 // (for example many slow-but-under-timeout calls, or a stall outside the awaited
-// calls). It is larger than one iteration timeout, so a single slow iteration
-// never trips it, and it stays under the in-sandbox 30s response deadline.
+// calls). It is larger than one iteration timeout plus the longest idle wait
+// (MAX_BRIDGE_IDLE_POLL_WAIT_MS), so a single slow iteration never trips it,
+// and it stays under the in-sandbox 30s response deadline.
 const DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS = 20_000;
 // The host's queue worker rewrites the host lease file this often while it runs.
 const DEFAULT_BRIDGE_HOST_LEASE_REFRESH_MS = 60_000;
@@ -924,11 +927,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   // The wait after the first empty listing that follows a request. Each
-  // further empty listing doubles the wait, up to `idlePollMaxMs`.
+  // further empty listing doubles the wait, up to MAX_BRIDGE_IDLE_POLL_WAIT_MS.
+  // It is also the first step of the backoff after a failed listing.
   pollIntervalMs?: number | null;
-  // The longest wait between two empty listings. Defaults to
-  // DEFAULT_BRIDGE_IDLE_POLL_MAX_MS; never below `pollIntervalMs`.
-  idlePollMaxMs?: number | null;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
   // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
@@ -977,13 +978,13 @@ export async function startSandboxCallbackBridgeWorker(input: {
   hostLeaseRefreshMs?: number | null;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
-  const idlePollMaxMs = Math.max(
-    pollIntervalMs,
-    normalizeTimeoutMs(input.idlePollMaxMs, DEFAULT_BRIDGE_IDLE_POLL_MAX_MS),
-  );
   const hostLeaseRefreshMs = normalizeTimeoutMs(input.hostLeaseRefreshMs, DEFAULT_BRIDGE_HOST_LEASE_REFRESH_MS);
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
+  const maxIdleWaitMs = Math.max(
+    pollIntervalMs,
+    Math.min(MAX_BRIDGE_IDLE_POLL_WAIT_MS, Math.floor(watchdogTimeoutMs / 4)),
+  );
   const abortedHandlerGraceMs = normalizeTimeoutMs(
     input.abortedHandlerGraceMs,
     DEFAULT_BRIDGE_ABORTED_HANDLER_GRACE_MS,
@@ -1678,7 +1679,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // keeps probing for recovery.
       let consecutivePollFailures = 0;
       // The wait after the next empty listing. It doubles while the queue stays
-      // empty, up to `idlePollMaxMs`, and goes back to `pollIntervalMs` after
+      // empty, up to `maxIdleWaitMs`, and goes back to `pollIntervalMs` after
       // the loop handles a request.
       let idleWaitMs = pollIntervalMs;
       while (true) {
@@ -1732,7 +1733,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
             const timer = setTimeout(wake, idleWaitMs);
             wakeIdleWait = wake;
           });
-          idleWaitMs = Math.min(idleWaitMs * 2, idlePollMaxMs);
+          idleWaitMs = Math.min(Math.max(1, idleWaitMs * 2), maxIdleWaitMs);
           continue;
         }
         idleWaitMs = pollIntervalMs;
