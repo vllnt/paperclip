@@ -1,5 +1,6 @@
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
+import { liveRunsRefetchInterval } from "@/lib/live-run-polling";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { readTaskRecordSelection } from "@/plugins/task-record-panels";
@@ -1462,6 +1463,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     enabled: !!issueId,
     placeholderData: keepPreviousDataForSameQueryTail<ActivityEvent[]>(issueQueryRef),
   });
+  const activeRunQueryEnabled =
+    !!executionRunId || issueStatus === "in_progress";
   const {
     data: liveRuns,
     isFetched: liveRunsFetched,
@@ -1471,14 +1474,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     queryKey: queryKeys.issues.liveRuns(issueQueryRef),
     queryFn: () => heartbeatsApi.liveRunsForIssue(issueQueryRef),
     enabled: !!issueId,
-    refetchInterval: 1000,
+    refetchInterval: liveRunsRefetchInterval(activeRunQueryEnabled),
     placeholderData:
       keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueQueryRef),
   });
   const resolvedLiveRuns = liveRuns ?? [];
   const liveRunCount = resolvedLiveRuns.length;
-  const activeRunQueryEnabled =
-    !!executionRunId || issueStatus === "in_progress";
   const {
     data: activeRun = null,
     isFetched: activeRunFetched,
@@ -3314,7 +3315,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       queryKey: queryKeys.issues.liveRuns(issueId!),
       queryFn: () => heartbeatsApi.liveRunsForIssue(issueId!),
       enabled: !!issueId,
-      refetchInterval: 3000,
+      refetchInterval: liveRunsRefetchInterval(
+        !!issue?.executionRunId || issue?.status === "in_progress",
+        3000,
+      ),
       select: (runs) => runs.length,
       placeholderData: keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(
         issueId ?? "pending",
@@ -3732,7 +3736,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     openTaskSidePanel();
     if (isMobile) setMobilePropsOpen(true);
   }, [issue?.id, openTaskSidePanel, isMobile]);
-  const browserQuery = useTaskBrowsers(issue?.id);
+  const browserQuery = useTaskBrowsers(issue?.id, hasLiveRuns);
   const { openBrowserId, openBrowser: setOpenBrowserId, acknowledgeBrowserOpened: handleBrowserOpened } =
     useBrowserArrivals(currentUserId ?? "anonymous", issue?.id, browserQuery.data);
   useEffect(() => {
