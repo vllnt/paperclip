@@ -419,8 +419,9 @@ methods:
 isHeld(companyId, scopeId)
   -> { exists: boolean, held: boolean,
        generation: { since: Date, reason: string | null } | null }
-lift(companyId, scopeId, expected: Generation, actor, tx)
+lift(companyId, scopeId, expected: Generation, actor, tx, options?: { wakeAgents })
   -> "lifted" | "stale"        // a compare-and-set (section 3.3)
+                               // wakeAgents: issue tree holds only; the checker passes false
 canLift(userId, companyId, scopeId) -> boolean
                                // the scope's own resume check for a user,
                                // without a request object (section 3.7 rule 5)
@@ -441,7 +442,7 @@ the local, authenticated and cloud-tenant modes, and the predicate fails closed.
 | Scope | `isHeld` reads | `lift` calls | `canLift` is |
 |---|---|---|---|
 | `agent` | `status = 'paused'`, `paused_at`, `pause_reason` | the shared agent resume function (it now holds the invalid-org-chain refusal) | the checks of `getAccessibleAgent` for a board user: company access, write access, and the `agents:create` manage check |
-| `issue_tree_hold` | `status = 'active'`, `mode = 'pause'` | the tree control `releaseHold`, **without** the wake step (section 3.5) | the tree-hold routes' access check and `assertBoard` |
+| `issue_tree_hold` | `status = 'active'`, `mode = 'pause'` | the shared release function in the new module `services/issue-tree-release.ts` (section 3.3), which wraps `releaseHold` and runs the wake step only when `wakeAgents` is true. The checker passes false (section 3.5) | the tree-hold routes' access check and `assertBoard` |
 | `company` (H2) | `status = 'paused'`, `paused_at` | the new company resume path (section 3.3). Lifting can also restore the agents that the archive paused with `company_archived`, and `hold.lifted` lists that cascade in its details | board with company access |
 | `routine` (H2) | `status = 'paused'`, `paused_at` | the routine update with `status: "active"` | `assertCanManageExistingRoutine` and `assertBoardCanAssignTasks` |
 | `project` | `paused_at`, `pause_reason` | not exposed in slice 1: no pause API exists, and only the budget service writes it | n/a |
@@ -459,7 +460,7 @@ It needs no new table, because the stored `met_at` is the only extra fact.
 | `sourceKind` | `hold_lift` (ranked after `budget_alert`) |
 | subject | the **condition**: `kind: "hold"`, `id` = the condition id, the title is the held thing's name, and `href`, `scopeType` and `scopeId` are in the metadata. (`AttentionSubjectKind` has no `routine` or `company` today, and retention and triage key on the subject, so a per-condition subject keeps each alert independent.) |
 | `whyNow` | "Lift condition met 3 hours ago. *Name* is still paused." |
-| `entryRule` | the condition row is `met` and the target is still held (same generation). Evaluated by one batch read for each scope type inside the feed build |
+| `entryRule` | the condition row is `met`, the target is still held (same generation), and the company is not archived. Evaluated by one batch read for each scope type inside the feed build |
 | `exitRule` | the hold is lifted, withdrawn or superseded, or the alert is dismissed |
 | `dedupKey` | the condition id. (The item id already starts with the kind, so a `hold_lift:` prefix would double it) |
 | `severity` | `medium` when the condition was just met, `high` once it has been met for one hour (a shared constant) |
@@ -486,9 +487,10 @@ the feed works today:
   `last_evaluated_at`, every dismissal would come back on the next pass.
 - **Retention must not archive a live alert.** The decision retention job
   auto-archives items idle for 90 days (`DEFAULT_DECISION_ARCHIVE_DAYS`). A `met`
-  alert on a hold that is still on would silently leave the inbox. While the
-  condition is `met` and the target is held, the item is kept (seeded as `keep` or
-  skipped by the job). Because each alert has its own subject id, a later alert on
+  alert, or a no-condition nudge, on a hold that is still on would silently leave
+  the inbox. While the condition is `met` (or the nudge applies) and the target is
+  held, the item is kept (seeded as `keep` or skipped by the job). The change is
+  part of H1 for the `met` state and part of H1b for the nudge. Because each alert has its own subject id, a later alert on
   the same target never inherits an archived state.
 - **More code than the UI map.** The new kind touches the shared
   `ATTENTION_SOURCE_KINDS`, `AttentionItemDetail` and `AttentionSubjectKind`
@@ -614,8 +616,8 @@ and every response is company-scoped.
 |---|---|
 | `GET /companies/:companyId/lift-conditions` | List, joined with the live state of the target. Filters: `status`, `scopeType`, `scopeId`. Keyset pagination |
 | `GET /companies/:companyId/lift-conditions/:id` | One condition |
-| `POST /companies/:companyId/lift-conditions` | Attach to a held target: `{ scopeType, scopeId, expectedHeldSince, expectedHeldReason, condition, autoLift?, note? }`. 409 if the generation differs or a condition is active already (use `PATCH`). 422 if an agent, company or routine hold has a reason other than `manual`, if the condition is already met, or if `autoLift` is set by a user who fails `canLift` |
-| `PATCH /companies/:companyId/lift-conditions/:id` | Replace the condition while it is `armed` or `met`. The body carries `expectedHeldSince`. A `met` row goes back to `armed` (**Keep holding**). The replacer becomes the setter, and `autoLift` survives only if the replacer passes `canLift` (else 422). A replace into `active_runs_finished` with `autoLift` is a 422 |
+| `POST /companies/:companyId/lift-conditions` | Attach to a held target: `{ scopeType, scopeId, expectedHeldSince, expectedHeldReason, condition, autoLift?, note? }`. 409 if the generation differs or a condition is active already (use `PATCH`). 422 if an agent, company or routine hold has a reason other than `manual`, if the condition is already met, or if `autoLift` is set by a user who fails `canLift`, or `autoLift` is combined with `review_date` or `active_runs_finished` |
+| `PATCH /companies/:companyId/lift-conditions/:id` | Replace the condition while it is `armed` or `met`. The body carries `expectedHeldSince`. A `met` row goes back to `armed` (**Keep holding**). The replacer becomes the setter, and `autoLift` survives only if the replacer passes `canLift` (else 422). A replace is a 422 if the **resulting** `auto_lift` would be true and the new condition type is `review_date` or `active_runs_finished`, even when the flag was kept from the old condition |
 | `POST /companies/:companyId/lift-conditions/:id/lift` | Deliberate lift. Calls the scope's own lift. Body: `{ reason?, wakeAgents? }`. `wakeAgents` is for issue tree holds and board users only, and the automatic lift always sends false |
 | `POST /companies/:companyId/lift-conditions/:id/withdraw` | Remove the condition. The hold stays |
 
@@ -664,11 +666,14 @@ payload and to `lift-condition set`, not a new flag.
 - **Pause dialog** (agent in slice 1; the routine toggle in slice 2): an optional
   section *Lift when*. Choices: Never (today's behaviour), At a time, When an
   issue closes, Review on a date. A checkbox *Lift automatically* (board only,
-  hidden for Review on a date and for the tree hold condition *Runs finished*). A short note field.
+  hidden for Review on a date). A short note field.
 - **Badge on the held thing** (agent header and list, tree hold panel on issue
   detail; routine page and company banner in slice 2): "Paused since *date*.
   Lifts when *condition*." When the condition is met: "Condition met 2 hours ago."
   with a **Lift now** action.
+- **Condition editor** (opened by **Keep holding**, **Edit condition** and **Set lift
+  condition**): the same choices as the dialog. In H2, the editor of a tree hold
+  also offers *Runs finished*, **without** the *Lift automatically* checkbox.
 - **Inbox card** for `hold_lift` with the verbs in section 3.9.
 - **Lift conditions list** (slice 2): one company page with the armed and met
   conditions, linked from the badge and from the inbox card.
@@ -688,7 +693,7 @@ own tests and docs. Each migration is numbered just in time.
 | Slice | Scope | Needs |
 |---|---|---|
 | **H1** | Table and migration; shared contract; service; checker; agent and tree hold adapters; condition types `time`, `review_date`, `issue_closed`; API, OpenAPI, CLI; activity entries; the `hold_lift` alert; web: pause dialog for agents, badge, inbox card | none |
-| **H1b** | The no-condition nudge (section 3.12): the `no_condition` state of the `hold_lift` alert, the instance setting `holdNoConditionNudgeHours` (default 24, 0 turns it off) in the API, the CLI and the web settings page. No migration. Kept out of H1's diff | H1 |
+| **H1b** | The no-condition nudge (section 3.12): the `no_condition` state of the `hold_lift` alert, the retention change that keeps a live nudge, the instance setting `holdNoConditionNudgeHours` (default 24, 0 turns it off) in the API, the CLI and the web settings page. No migration. Kept out of H1's diff | H1 |
 | **H2** | Company and routine adapters; the dedicated company pause and resume path (section 3.3); `routines.paused_at` and `pause_reason` (a second, small migration) and an explicit pause-reason parameter on the routine update, written only on a transition (built-in routines call the same update as the `PATCH`, so `system` cannot be guessed); the lift conditions list page; the same options on the company and routine routes, CLI and dialogs; `active_runs_finished`, the backfill, and the deprecation of `after_active_runs_finish` (section 3.6); the nudge for the company and routine scopes | H1 |
 | **H3** | `metric_below` on environment disk; the reserved `environment` scope; the link with disk-aware dispatch | H1 and the resource capacity samples on `main` |
 | **Later** | `any_of`; the condition "an agent is assigned" for system-paused draft routines; agent read access (with the plan for agents acting on other agents' work); a chat message for an alert | n/a |
@@ -791,6 +796,8 @@ without the code.
   the same target after a resume gives a new item.
 - **Removal.** Attaching a condition, lifting the hold, or resuming it by another
   path removes the item.
+- **Retention.** A nudge on a hold that is still on is not auto-archived after 90
+  days.
 - **No side effects.** Reading the feed creates or changes no hold, condition or
   target and writes no activity entry. (The decision retention job keeps its own
   bookkeeping rows, as it does for every other kind.)
@@ -814,7 +821,8 @@ tests the `routines` column migration on a table with rows. It also tests:
   the tree, met when the last one ends. Refused on any other scope, refused with
   `auto_lift`, and refused at attach when already true (the backfill is exempt, and
   its first checker pass raises one alert for each row). A replace into this type
-  with `autoLift` is refused, and the create-with-condition path refuses the type.
+  or into `review_date`, with `auto_lift` already true on the row, is refused (the
+  rule is on the resulting row), and the create-with-condition path refuses the type.
 
 **H3** adds the stale sample rule, the hysteresis test, and an end-to-end test
 with a fixture capacity sample.
