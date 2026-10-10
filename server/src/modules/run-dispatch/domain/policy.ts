@@ -117,7 +117,8 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "routine_execution_superseded";
 
 export type StalenessDecision =
   | { stale: false }
@@ -129,6 +130,14 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  /**
+   * Another open copy of the same routine execution (same origin and dispatch
+   * fingerprint) that already holds the execution slot. The index
+   * `issues_open_routine_execution_uq` allows one such holder, so a run that
+   * would also take the slot cannot start. Null when none, or when this issue is
+   * not a routine execution.
+   */
+  routineCopyHoldingExecution?: { issueId: string; runId: string; runLive: boolean } | null;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
   runId: string;
@@ -673,6 +682,32 @@ export function decideQueuedRunStaleness(
         issueId: facts.issueId,
         currentStageType: facts.reviewParticipant.currentStageType,
         currentParticipant: facts.reviewParticipant.currentParticipant,
+      },
+    };
+  }
+
+  // The claim takes the issue's execution slot for the assignee's run. Another
+  // open copy of this routine execution that already holds the slot through a
+  // live run makes that impossible, so the wake is coalesced into the live copy.
+  // A holder whose run already ended is a stale lock; the sweep clears it and the
+  // claim retries, so it is not a reason to cancel.
+  const copy = facts.routineCopyHoldingExecution ?? null;
+  if (
+    copy &&
+    copy.runLive &&
+    facts.issueExecutionRunId === null &&
+    facts.issueAssigneeAgentId === facts.runAgentId &&
+    facts.wakeReason !== "source_scoped_recovery_action"
+  ) {
+    return {
+      stale: true,
+      errorCode: "routine_execution_superseded",
+      reason:
+        "Cancelled because another open copy of this routine execution holds the execution slot; the live copy continues the work",
+      details: {
+        issueId: facts.issueId,
+        liveIssueId: copy.issueId,
+        liveRunId: copy.runId,
       },
     };
   }

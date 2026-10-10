@@ -520,6 +520,9 @@ export function createPostgresRunDispatchAdapter(
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
         executionState: issues.executionState,
+        originKind: issues.originKind,
+        originId: issues.originId,
+        originFingerprint: issues.originFingerprint,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
@@ -581,6 +584,40 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    // The same predicate as the partial unique index issues_open_routine_execution_uq:
+    // another visible, open copy with this origin and fingerprint that holds the slot.
+    const routineCopyHoldingExecution =
+      issue &&
+      issue.executionRunId === null &&
+      issue.originKind === "routine_execution" &&
+      issue.originId !== null
+        ? await dbOrTx
+            .select({ issueId: issues.id, runId: heartbeatRuns.id, runStatus: heartbeatRuns.status })
+            .from(issues)
+            .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+            .where(
+              and(
+                eq(issues.companyId, input.companyId),
+                eq(issues.originKind, issue.originKind),
+                eq(issues.originId, issue.originId),
+                eq(issues.originFingerprint, issue.originFingerprint),
+                sql`${issues.id} <> ${issue.id}`,
+                sql`${issues.hiddenAt} is null`,
+                inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+              ),
+            )
+            .limit(1)
+            .then((rows) =>
+              rows[0]
+                ? {
+                    issueId: rows[0].issueId,
+                    runId: rows[0].runId,
+                    runLive: ["queued", "running", "scheduled_retry"].includes(rows[0].runStatus),
+                  }
+                : null,
+            )
+        : null;
+
     const retryReasonKind = classifyRetryReasonKind(retryReason);
     // Dependency edges can change after scheduled promotion without changing
     // the displayed status. Read them again under the queued/final issue lock.
@@ -601,6 +638,7 @@ export function createPostgresRunDispatchAdapter(
       issueAssigneeAgentId: issue?.assigneeAgentId ?? null,
       issueExecutionRunId: issue?.executionRunId ?? null,
       issueCheckoutRunId: issue?.checkoutRunId ?? null,
+      routineCopyHoldingExecution,
       isResolvedInteractionContinuation,
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
