@@ -78,6 +78,7 @@ export function createSshCommandManagedRuntimeRunner(input: {
           stdin: commandInput.stdin,
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
+          storeHints: { cwd, env: commandInput.env },
         });
         if (result.stdout) await commandInput.onLog?.("stdout", result.stdout);
         if (result.stderr) await commandInput.onLog?.("stderr", result.stderr);
@@ -463,6 +464,86 @@ export async function untrackedSshSyncBackDependencyDirNames(localDir: string): 
     maxBuffer: 64 * 1024 * 1024,
   }).then((result) => new Set(result.stdout.split("\0").flatMap((entry) => entry.split("/"))), () => null);
   return tracked ? SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES.filter((name) => !tracked.has(name)) : [];
+}
+
+/**
+ * The pnpm store every process of an SSH environment shares. It sits under the
+ * environment's root, so it is on the same filesystem as the run directories
+ * and pnpm can hard-link packages from it instead of copying them into each
+ * run's `node_modules`. It is outside every `runs/<runId>`, so the run reaper
+ * never removes it. One environment has one root and one SSH user, so the store
+ * is shared by that environment's runs and by nothing else.
+ */
+export function sshSharedPnpmStoreDir(remoteWorkspacePath: string): string | null {
+  const root = remoteWorkspacePath;
+  if (!path.posix.isAbsolute(root) || root === "/" || root.endsWith("/") || path.posix.normalize(root) !== root) {
+    return null;
+  }
+  return path.posix.join(root, ".paperclip-runtime", "pnpm-store");
+}
+
+/**
+ * What the remote prelude may look at to see whether the caller already chose a
+ * pnpm store. Nothing here changes the command: `cwd` is only where a project
+ * `.npmrc` is looked for, and `env` is only read for a store or a user config.
+ */
+export interface SshStoreHints {
+  cwd?: string | null;
+  env?: Record<string, string>;
+}
+
+const STORE_KEY_PATTERN = /^npm_config_store_dir$/i;
+const USERCONFIG_KEY_PATTERN = /^npm_config_userconfig$/i;
+
+/**
+ * Shell for the prelude of every remote command: sets `npm_config_store_dir` to
+ * the environment's shared store, but only when nothing else chose a store. The
+ * order, highest first: an environment variable the caller passes, the project's
+ * `.npmrc` (`store-dir`) or `pnpm-workspace.yaml` (`storeDir`) in the working
+ * directory or any parent, the worker user's `.npmrc` or pnpm `rc`, then this
+ * default. It is one place for every way a process starts on a worker, so no
+ * caller adds its own.
+ */
+function sharedPnpmStorePrelude(remoteWorkspacePath: string, hints: SshStoreHints): string[] {
+  const store = sshSharedPnpmStoreDir(remoteWorkspacePath);
+  const env = hints.env ?? {};
+  if (!store || Object.keys(env).some((key) => STORE_KEY_PATTERN.test(key))) return [];
+  const userConfigKey = Object.keys(env).find((key) => USERCONFIG_KEY_PATTERN.test(key));
+  const userConfig = userConfigKey ? shellQuote(env[userConfigKey] ?? "") : '"${npm_config_userconfig:-$HOME/.npmrc}"';
+  const dir = hints.cwd ? shellQuote(hints.cwd) : '"$PWD"';
+  const npmrcSetsStore = "grep -Eq '^[[:space:]]*(store-dir|store_dir|storeDir)[[:space:]]*=' ";
+  const hasProjectOrUserStore = [
+    "paperclip_sets_store() {",
+    'd=$1; while :; do',
+    `if [ -f "$d/.npmrc" ] && ${npmrcSetsStore}"$d/.npmrc"; then return 0; fi;`,
+    `if [ -f "$d/pnpm-workspace.yaml" ] && grep -Eq '^[[:space:]]*storeDir[[:space:]]*:' "$d/pnpm-workspace.yaml"; then return 0; fi;`,
+    'case "$d" in /) break ;; /*) d=$(dirname "$d") ;; *) break ;; esac;',
+    "done;",
+    'for f in "$2" "${XDG_CONFIG_HOME:-$HOME/.config}/pnpm/rc"; do',
+    `if [ -f "$f" ] && ${npmrcSetsStore}"$f"; then return 0; fi;`,
+    "done;",
+    "return 1;",
+    "}",
+  ].join(" ");
+  return [
+    `{ paperclip_store=${shellQuote(store)}; ${hasProjectOrUserStore} if paperclip_sets_store ${dir} ${userConfig}; then :; else export npm_config_store_dir="$paperclip_store"; fi; }`,
+  ];
+}
+
+/**
+ * The shell every remote command starts with: the login profiles, so a worker
+ * that exposes `node` or an agent CLI only through them resolves it, then the
+ * shared pnpm store default. `buildSshSpawnTarget` and `runSshCommand` both use
+ * it, so a process started either way gets the same environment.
+ */
+function sshRemotePrelude(config: SshConnectionConfig, hints: SshStoreHints): string[] {
+  return [
+    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+    ...sharedPnpmStorePrelude(config.remoteWorkspacePath, hints),
+  ];
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
@@ -1266,6 +1347,8 @@ export async function runSshCommand(
     stdin?: string;
     timeoutMs?: number;
     maxBuffer?: number;
+    /** What the caller already chose for pnpm; see {@link SshStoreHints}. It does not change the command. */
+    storeHints?: SshStoreHints;
   } = {},
 ): Promise<SshCommandResult> {
   let cleanup: () => Promise<void> = () => Promise.resolve();
@@ -1294,10 +1377,10 @@ export async function runSshCommand(
     // .bashrc still resolves node without a double-run of the setup.
     const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
     const remoteScript = [
-      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+      ...sshRemotePrelude(config, {
+        cwd: options.storeHints?.cwd,
+        env: { ...(options.storeHints?.env ?? {}), ...(options.env ?? {}) },
+      }),
       envArgs.length > 0
         ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
         : `exec sh -c ${shellQuote(remoteCommand)}`,
@@ -1358,10 +1441,7 @@ export async function buildSshSpawnTarget(input: {
   // directly when no .bash_profile exists, so a host that adds nvm in
   // .bashrc still resolves node without a double-run of the setup.
   const remoteScript = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+    ...sshRemotePrelude(input.spec, { cwd: input.spec.remoteCwd, env: input.env }),
     `cd ${shellQuote(input.spec.remoteCwd)}`,
     envArgs.length > 0
       ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
@@ -1703,11 +1783,18 @@ export async function prepareWorkspaceForSshExecution(input: {
       snapshot: gitSnapshot,
       onProgress: input.onProgress,
     });
+    // The history is already there, so only the working tree goes over. The
+    // dependency and cache trees the repository does not track are left behind,
+    // as sync-back leaves them: the run installs its own on the worker.
     await syncDirectoryToSsh({
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [
+        ".git",
+        ".paperclip-runtime",
+        ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.localDir)),
+      ],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
