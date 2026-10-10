@@ -420,7 +420,6 @@ export function registerAgentCommands(program: Command): void {
     ["resume", "resume", "Resume an agent"],
     ["approve", "approve", "Approve a pending agent"],
     ["terminate", "terminate", "Terminate an agent"],
-    ["heartbeat:invoke", "heartbeat/invoke", "Invoke an agent heartbeat"],
     ["claude-login", "claude-login", "Trigger Claude login for an agent"],
   ] as const) {
     addCommonClientOptions(
@@ -439,6 +438,24 @@ export function registerAgentCommands(program: Command): void {
         }),
     );
   }
+
+  addCommonClientOptions(
+    agent
+      .command("heartbeat:invoke")
+      .description("Invoke an agent heartbeat, optionally for one assigned issue")
+      .argument("<agentId>", "Agent ID")
+      .option("--issue <issueId>", "Wake the agent for this issue (sends payload.issueId)")
+      .action(async (agentId: string, opts: BaseClientOptions & { issue?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body = opts.issue ? { payload: { issueId: opts.issue } } : {};
+          const result = await ctx.api.post(`${apiPath`/api/agents/${agentId}`}/heartbeat/invoke`, body);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
 
   addCommonClientOptions(
     agent
