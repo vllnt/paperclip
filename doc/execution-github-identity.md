@@ -60,6 +60,19 @@ discovery stops startup instead of silently falling back to a minimal path.
 
 Scripts that previously read a persistent `GH_TOKEN` must use managed `git`, `gh`, or GitHub gateway tools. Managed execution skips legacy GitHub token bindings in agent, environment, project, and routine configuration before secret preflight. Configure personal or dedicated access through the GitHub connection instead. Directly invoking an unmanaged executable or retaining a token obtained during an earlier invocation is outside the managed invocation contract.
 
+### Cost of the credentials route
+
+The launcher asks `POST /runtime-tools/github/credentials` once for each `git` or `gh` command. The server keeps the answer for an ordinary read (no write, refusal or signing) for a short time, so the commands of one run do not repeat the database reads, the secret-store read and the plugin call.
+
+- **What is kept, and for whom:** one answer for each company, agent, run and kind of operation (the repository and the pull request it names). Never another run, agent or company.
+- **Where and how long:** in the memory of the server process only, never on disk or in the database. 30 seconds by default. `PAPERCLIP_GITHUB_READ_CACHE_SECONDS` sets it from 0 to 300; 0 turns the cache off. At most 2,000 entries, oldest first. Never longer than the credential's own expiry, when the grant states one.
+- **What is checked on every hit:** the run is still running with the same active identity and none waits to be accepted; the write-identity policy is the one the answer was made under; the trust gate still allows a token; the grant, its connection and its secret are active and unchanged. If any of them changed, the entry is dropped and the answer is resolved in full.
+- **What is never kept:** a write, a refused command, a signing request, or an answer that is not `available`.
+- **Concurrent identical requests** share one resolution. Nothing is stored by sharing.
+- **A caller that gave up:** the route aborts the work when the launcher closes the connection (its own limit is 10 seconds). No plugin call, secret read or GitHub request starts for a caller that is gone.
+- **What the server cannot see:** a change that only the GitHub plugin knows (for example the App user's authorization) can show up up to one time limit later, for reads only.
+- **Audit:** the secret store records one read for each answer that is resolved, so a cached read records none.
+
 ## Write identity: who acts on GitHub
 
 The GitHub plugin's write identity policy (one per company, changed only by
