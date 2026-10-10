@@ -106,6 +106,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
+import { assertAgentMayChangeBlock, handsBlockToHuman } from "./routable-blocked.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -10788,6 +10789,9 @@ export function issueService(db: Db) {
         patch.unblockDescriptor = null;
         patch.blockedTransitionAt = null;
         patch.blockedOwnerNotifiedAt = null;
+      } else if (handsBlockToHuman(existing, issueData)) {
+        patch.blockedTransitionAt = patch.updatedAt;
+        patch.blockedOwnerNotifiedAt = null;
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
@@ -10981,6 +10985,7 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (actorAgentId) assertAgentMayChangeBlock(receiptExisting, issueData);
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

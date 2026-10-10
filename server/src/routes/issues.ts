@@ -21,7 +21,6 @@ import {
   rejectSteeredIdentity,
 } from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -13269,23 +13268,6 @@ export function issueRoutes(
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
         throw unprocessable("unblockDescriptor requires blocked status");
       }
-      // A block owned by the board or a user waits for a human. The agent that
-      // is waiting may not leave it or rewrite its owner; a board user clears it.
-      const existingDescriptor = existing.unblockDescriptor ?? null;
-      const humanOwnedBlock =
-        existing.status === "blocked" &&
-        existingDescriptor !== null &&
-        (existingDescriptor.owner === "board" || "userId" in existingDescriptor.owner);
-      if (req.actor.type === "agent" && humanOwnedBlock) {
-        const changingDescriptor =
-          hasOwn(req.body as Record<string, unknown>, "unblockDescriptor") &&
-          !isDeepStrictEqual(req.body.unblockDescriptor, existingDescriptor);
-        if (nextStatus !== "blocked" || changingDescriptor) {
-          throw forbidden(
-            "This block waits for the board; a board user must unblock it or change its owner",
-          );
-        }
-      }
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
@@ -17640,7 +17622,10 @@ export function issueRoutes(
               actor,
             })
           : null;
-        const reopenedIssue = await svc.update(id, { status: "todo" });
+        const reopenedIssue = await svc.update(id, {
+          status: "todo",
+          ...(actor.agentId ? { actorAgentId: actor.agentId } : {}),
+        });
         if (!reopenedIssue) {
           res.status(404).json({ error: "Issue not found" });
           return;

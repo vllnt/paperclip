@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { HttpError } from "../errors.js";
 import {
+  assertAgentMayChangeBlock,
   deliverAgentUnblockNotification,
+  handsBlockToHuman,
+  HUMAN_OWNED_BLOCK_MESSAGE,
+  isHumanOwnedBlock,
   ROUTABLE_BLOCKED_ROLLOUT_AT,
 } from "../services/routable-blocked.js";
 
@@ -72,5 +77,62 @@ describe("routable blocked notifications", () => {
     expect(wakeup.mock.calls[0]?.[1]).toMatchObject({
       idempotencyKey: expect.stringContaining(secondTransition.toISOString()),
     });
+  });
+});
+
+describe("human-owned blocks", () => {
+  const boardBlock = { status: "blocked", unblockDescriptor: { owner: "board", action: "Approve" } } as const;
+  const userBlock = { status: "blocked", unblockDescriptor: { owner: { userId: "user-1" }, action: "Sign" } } as const;
+  const agentBlock = { status: "blocked", unblockDescriptor: { owner: { agentId }, action: "Wait" } } as const;
+
+  it("treats a blocked issue owned by the board or a person as human-owned", () => {
+    expect(isHumanOwnedBlock(boardBlock)).toBe(true);
+    expect(isHumanOwnedBlock(userBlock)).toBe(true);
+    expect(isHumanOwnedBlock(agentBlock)).toBe(false);
+    expect(isHumanOwnedBlock({ status: "blocked", unblockDescriptor: null })).toBe(false);
+    expect(isHumanOwnedBlock({ status: "in_progress", unblockDescriptor: boardBlock.unblockDescriptor })).toBe(false);
+  });
+
+  it("refuses an agent that leaves a human-owned block or rewrites its descriptor", () => {
+    const refused = [
+      { status: "todo" },
+      { status: "in_progress" },
+      { unblockDescriptor: null },
+      { unblockDescriptor: { owner: { agentId }, action: "Never mind" } },
+      { unblockDescriptor: { owner: "board", action: "A different action" } },
+    ] as const;
+    for (const change of refused) {
+      for (const stored of [boardBlock, userBlock]) {
+        let thrown: unknown = null;
+        try {
+          assertAgentMayChangeBlock(stored, change);
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown, JSON.stringify(change)).toBeInstanceOf(HttpError);
+        expect(thrown).toMatchObject({ status: 403, message: HUMAN_OWNED_BLOCK_MESSAGE });
+      }
+    }
+  });
+
+  it("allows an agent to keep a human-owned block as it is, and to change anything on other blocks", () => {
+    expect(() => assertAgentMayChangeBlock(boardBlock, {})).not.toThrow();
+    expect(() => assertAgentMayChangeBlock(boardBlock, { status: "blocked" })).not.toThrow();
+    expect(() => assertAgentMayChangeBlock(boardBlock, { unblockDescriptor: boardBlock.unblockDescriptor })).not.toThrow();
+    expect(() => assertAgentMayChangeBlock(agentBlock, { status: "todo" })).not.toThrow();
+    expect(() => assertAgentMayChangeBlock(agentBlock, { unblockDescriptor: null })).not.toThrow();
+    expect(() => assertAgentMayChangeBlock({ status: "todo" }, { status: "in_progress" })).not.toThrow();
+  });
+
+  it("hands a block to a human only when an existing block that is not human-owned gets a human owner", () => {
+    const toBoard = { unblockDescriptor: { owner: "board", action: "Approve" } } as const;
+    expect(handsBlockToHuman(agentBlock, toBoard)).toBe(true);
+    expect(handsBlockToHuman({ status: "blocked", unblockDescriptor: null }, toBoard)).toBe(true);
+    expect(handsBlockToHuman(agentBlock, { unblockDescriptor: userBlock.unblockDescriptor })).toBe(true);
+    expect(handsBlockToHuman(boardBlock, toBoard)).toBe(false);
+    expect(handsBlockToHuman(agentBlock, { unblockDescriptor: agentBlock.unblockDescriptor })).toBe(false);
+    expect(handsBlockToHuman(agentBlock, {})).toBe(false);
+    expect(handsBlockToHuman({ status: "todo" }, toBoard)).toBe(false);
+    expect(handsBlockToHuman(agentBlock, { status: "todo", ...toBoard })).toBe(false);
   });
 });

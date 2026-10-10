@@ -3994,7 +3994,7 @@ registry.registerPath({
   description:
     "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
     "Agents may name themselves or `\"board\"` as `unblockDescriptor.owner`, never a specific user or another agent (403). " +
-    "While the board or a user owns a block, an agent may not move the issue out of `blocked` or change or clear its descriptor (403).",
+    "While the board or a user owns a block, an agent may not move the issue out of `blocked` or change or clear its descriptor (403). The same rule applies to a comment that asks to `resume` or `reopen` the issue (POST /api/issues/{id}/comments).",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateIssueSchema.partial()),
@@ -4003,6 +4003,7 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     422: r.unprocessable,
   },
@@ -4313,11 +4314,13 @@ registry.registerPath({
   path: "/api/issues/{id}/comments",
   tags: ["issues"],
   summary: "Add a comment to an issue",
+  description:
+    "An agent may not use `resume` or `reopen` to move an issue out of a block that the board or a user owns, or change that block's descriptor (403). Nothing is posted when this refuses. A board user may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(addIssueCommentSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({

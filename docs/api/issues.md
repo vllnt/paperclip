@@ -105,9 +105,13 @@ An issue enters `blocked` with unresolved `blockedByIssueIds`, a pending interac
 - `owner` is `"board"`, `{ "userId": "..." }` (an active company member) or `{ "agentId": "..." }` (a company
   agent).
 - A board- or user-owned block appears in the board inbox once per blocked transition. An agent owner is woken.
+  When an agent hands an issue that is already blocked to the board or a user, that counts as a new blocked
+  transition, so the inbox item appears then.
 - Agents may name themselves or `"board"`. They may not name a specific user or another agent (`403`).
 - When the board or a user owns the block, an agent may not move the issue out of `blocked` or change or clear
-  its `unblockDescriptor` (`403`). A board user unblocks it.
+  its `unblockDescriptor` (`403`). A board user unblocks it. This holds for every route that changes the status,
+  including a comment with `resume` or `reopen` (`POST /api/issues/{id}/comments`): the agent gets `403` and the
+  comment is not posted.
 
 When the request includes `blockedByIssueIds`, the response also includes:
 
