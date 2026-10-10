@@ -125,6 +125,7 @@ import {
   drainRunExecutionFinalizersForShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
+  describeStopTimeout,
   resolveShutdownBudgetMs,
   runBoundedShutdown,
 } from "./shutdown.js";
@@ -2098,6 +2099,15 @@ async function startServerWithDatabaseTeardown(
   process.once("SIGTERM", () => {
     void shutdown("SIGTERM", true);
   });
+  const stopTimeout = describeStopTimeout();
+  if (stopTimeout.source !== "env") {
+    logger.warn(
+      { ...stopTimeout, value: process.env.PAPERCLIP_STOP_TIMEOUT_MS ?? null },
+      "PAPERCLIP_STOP_TIMEOUT_MS is not set to a valid value; the shutdown assumes a 60-second stop timeout. " +
+        "Set it to the stop timeout of whatever stops this process (for example stop_grace_period), " +
+        "or a shorter stop (Docker's default is 10 seconds) kills the server before its shutdown ends.",
+    );
+  }
 
   return {
     server,

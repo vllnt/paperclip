@@ -205,11 +205,27 @@ const STOP_TIMEOUT_HEADROOM_MS = 10_000;
  * for that headroom.
  */
 export function resolveShutdownBudgetMs(env: Record<string, string | undefined> = process.env): number {
-  const parsed = Number(env.PAPERCLIP_STOP_TIMEOUT_MS);
-  const stopTimeoutMs = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STOP_TIMEOUT_MS;
-  return stopTimeoutMs >= 2 * STOP_TIMEOUT_HEADROOM_MS
+  return describeStopTimeout(env).budgetMs;
+}
+
+/**
+ * The stop timeout the shutdown budget is sized for, and where it came from.
+ * `default` and `invalid` mean the server assumes 60 seconds: a stop with a
+ * shorter timeout (Docker's own default is 10 seconds) kills it mid-shutdown.
+ */
+export function describeStopTimeout(env: Record<string, string | undefined> = process.env): {
+  stopTimeoutMs: number;
+  budgetMs: number;
+  source: "env" | "default" | "invalid";
+} {
+  const raw = env.PAPERCLIP_STOP_TIMEOUT_MS;
+  const parsed = Number(raw);
+  const valid = raw !== undefined && raw.trim() !== "" && Number.isFinite(parsed) && parsed > 0;
+  const stopTimeoutMs = valid ? parsed : DEFAULT_STOP_TIMEOUT_MS;
+  const budgetMs = stopTimeoutMs >= 2 * STOP_TIMEOUT_HEADROOM_MS
     ? stopTimeoutMs - STOP_TIMEOUT_HEADROOM_MS
     : Math.floor(stopTimeoutMs / 2);
+  return { stopTimeoutMs, budgetMs, source: valid ? "env" : raw === undefined || raw.trim() === "" ? "default" : "invalid" };
 }
 
 /** What a graceful shutdown did with one running run. */

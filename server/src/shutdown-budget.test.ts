@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
+  describeStopTimeout,
   drainRunsInParallel,
   resolveShutdownBudgetMs,
   runBoundedShutdown,
@@ -292,4 +294,44 @@ describe("drainRunsInParallel", () => {
       { runId: "broken", outcome: "finalize_failed", error: "database write failed" },
     ]));
   });
+});
+
+describe("describeStopTimeout", () => {
+  it("reads the stop timeout the deploy declares", () => {
+    expect(describeStopTimeout({ PAPERCLIP_STOP_TIMEOUT_MS: "60000" })).toEqual({
+      stopTimeoutMs: 60_000, budgetMs: 50_000, source: "env",
+    });
+  });
+
+  it("says when it assumes the default, so the server can warn at boot", () => {
+    expect(describeStopTimeout({})).toEqual({ stopTimeoutMs: 60_000, budgetMs: 50_000, source: "default" });
+    expect(describeStopTimeout({ PAPERCLIP_STOP_TIMEOUT_MS: "soon" })).toEqual({
+      stopTimeoutMs: 60_000, budgetMs: 50_000, source: "invalid",
+    });
+  });
+});
+
+describe("the deploy's stop timeout", () => {
+  // The container runtime kills the process when its stop timeout ends; the
+  // server sizes its shutdown budget from PAPERCLIP_STOP_TIMEOUT_MS. If the two
+  // disagree, the budget is wrong: a longer variable lets the kill win, a shorter
+  // one cuts the run grace for nothing.
+  function appService(file: string) {
+    const text = readFileSync(new URL(`../../deploy/${file}`, import.meta.url), "utf8");
+    const start = text.indexOf("\n  paperclip:\n");
+    const end = text.indexOf("\n  db:\n", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    return text.slice(start, end);
+  }
+
+  for (const file of ["compose.template.yaml", "compose.yaml"]) {
+    it(`matches stop_grace_period and PAPERCLIP_STOP_TIMEOUT_MS in ${file}`, () => {
+      const service = appService(file);
+      const grace = /\n    stop_grace_period: (\d+)s\n/.exec(service);
+      const variable = /\n      PAPERCLIP_STOP_TIMEOUT_MS: "(\d+)"\n/.exec(service);
+      expect(grace, "stop_grace_period on the app service").not.toBeNull();
+      expect(variable, "PAPERCLIP_STOP_TIMEOUT_MS on the app service").not.toBeNull();
+      expect(Number(grace![1]) * 1000).toBe(Number(variable![1]));
+    });
+  }
 });
