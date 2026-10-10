@@ -3,8 +3,9 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environments, projects, projectWorkspaces } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, environments, projects, projectWorkspaces } from "@paperclipai/db";
 import {
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
@@ -19,9 +20,12 @@ import { secretService } from "../services/secrets.ts";
 // What the agent process would see, recorded while the run executes. The SSH
 // fixture's host is this machine, so its paths are readable here.
 type Seen = { tmpdir: unknown; tmp: unknown; temp: unknown; dirExisted: boolean };
-const state = vi.hoisted(() => ({ runs: [] as Seen[], exitCode: 0, release: null as null | Promise<void> }));
+const state = vi.hoisted(() => ({
+  runs: [] as Seen[], exitCode: 0 as number | null, timedOut: false, proveStop: true, release: null as null | Promise<void>,
+}));
 
-const adapterExecute = vi.hoisted(() => vi.fn(async (ctx: { config: { env?: Record<string, unknown> } }) => {
+type AdapterContext = { config: { env?: Record<string, unknown> }; onProviderStopped?: () => Promise<void> };
+const adapterExecute = vi.hoisted(() => vi.fn(async (ctx: AdapterContext) => {
   const env = ctx.config.env ?? {};
   const tmpdir = env.TMPDIR;
   state.runs.push({
@@ -31,7 +35,9 @@ const adapterExecute = vi.hoisted(() => vi.fn(async (ctx: { config: { env?: Reco
     dirExisted: typeof tmpdir === "string" && (await import("node:fs")).existsSync(tmpdir),
   });
   if (state.release) await state.release;
-  return { exitCode: state.exitCode, signal: null, timedOut: false, provider: "test", model: "test-model" };
+  // A real adapter reports this only when its remote process exited with a status.
+  if (state.proveStop) await ctx.onProviderStopped?.();
+  return { exitCode: state.exitCode, signal: null, timedOut: state.timedOut, provider: "test", model: "test-model" };
 }));
 
 vi.mock("../adapters/index.js", () => ({
@@ -67,6 +73,8 @@ describeRemoteTemp("remote run temp directory through the heartbeat (SSH)", () =
     adapterExecute.mockClear();
     state.runs.length = 0;
     state.exitCode = 0;
+    state.timedOut = false;
+    state.proveStop = true;
     state.release = null;
     for (const root of workspaceRoots.splice(0)) await rm(root, { recursive: true, force: true });
   });
@@ -120,7 +128,15 @@ describeRemoteTemp("remote run temp directory through the heartbeat (SSH)", () =
         expect((await heartbeat.getRun(runId))?.status).toBe(status);
       }, { timeout: 60_000, interval: 200 });
     };
-    return { heartbeat, start, waitForStatus };
+    // The temp directory is removed or kept before the run's lease is released.
+    const waitForLeaseRelease = async (runId: string) => {
+      await vi.waitFor(async () => {
+        const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
+        expect(leases.length).toBeGreaterThan(0);
+        expect(leases.every((lease) => lease.releasedAt !== null)).toBe(true);
+      }, { timeout: 60_000, interval: 200 });
+    };
+    return { heartbeat, start, waitForStatus, waitForLeaseRelease };
   }
 
   function expectRunTemp(seen: Seen | undefined, runId: string): string {
@@ -142,9 +158,24 @@ describeRemoteTemp("remote run temp directory through the heartbeat (SSH)", () =
     await waitForStatus(runId, status);
 
     const dir = expectRunTemp(state.runs[0], runId);
-    await vi.waitFor(() => expect(existsSync(dir)).toBe(false), { timeout: 15_000 });
-    // Nothing else was written to the run directory, so it goes too.
-    expect(existsSync(path.dirname(dir))).toBe(false);
+    // Nothing else was written to the run directory, so it goes too. The
+    // cleanup removes `tmp` first, then the run directory.
+    await vi.waitFor(() => expect(existsSync(path.dirname(dir))).toBe(false), { timeout: 15_000 });
+  }, 120_000);
+
+  it("keeps the directory when the run timed out and nothing proves its remote process stopped", async () => {
+    const { start, waitForStatus, waitForLeaseRelease } = await setup();
+    // An SSH timeout or a dropped channel does not prove the remote process exited.
+    state.proveStop = false;
+    state.timedOut = true;
+    state.exitCode = null;
+
+    const runId = await start();
+    await waitForStatus(runId, "timed_out");
+    await waitForLeaseRelease(runId);
+
+    const dir = expectRunTemp(state.runs[0], runId);
+    expect(existsSync(dir)).toBe(true);
   }, 120_000);
 
   it("removes the directory when the run is cancelled", async () => {
