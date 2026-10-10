@@ -69,7 +69,7 @@ describeEmbeddedPostgres("GET /companies/:companyId/routines filters", () => {
     await seed("deploy", { companyId: companyA, title: "Deploy hook", description: "Runs on GitHub push", assigneeAgentId: engineer }, 2, [{ kind: "webhook" }]);
     await seed("paused", { companyId: companyA, title: "Paused digest", description: "100% coverage_report", assigneeAgentId: engineer, status: "paused" }, 3, [{ kind: "schedule", enabled: false }]);
     await seed("manual", { companyId: companyA, title: "Ad hoc audit", description: null, assigneeAgentId: ceo, folderId: folderOps }, 4, [{ kind: "webhook", archived: true }]);
-    await seed("api", { companyId: companyA, title: "API kickoff", description: "Started by the API", assigneeAgentId: null }, 5, [{ kind: "api" }]);
+    await seed("api", { companyId: companyA, title: "API kickoff", description: "Started by the API from C:\\ops", assigneeAgentId: null }, 5, [{ kind: "api" }]);
     await seed("archived", { companyId: companyA, title: "Old weekly report", description: "Retired", assigneeAgentId: ceo, status: "archived" }, 6, [{ kind: "schedule" }]);
     await seed("other", { companyId: companyB, title: "Weekly CEO Review", description: "Other company", assigneeAgentId: otherCompanyAgent }, 7, [{ kind: "schedule" }]);
   }, 30_000);
@@ -112,10 +112,12 @@ describeEmbeddedPostgres("GET /companies/:companyId/routines filters", () => {
     expect(await listIds("?q=nothing-matches")).toEqual([]);
   });
 
-  it("treats % and _ in q as literal characters", async () => {
+  it("treats %, _ and \\ in q as literal characters", async () => {
     expect(await listIds(`?q=${encodeURIComponent("100%")}`)).toEqual(named("paused"));
     expect(await listIds(`?q=${encodeURIComponent("coverage_report")}`)).toEqual(named("paused"));
     expect(await listIds(`?q=${encodeURIComponent("%")}`)).toEqual(named("paused"));
+    expect(await listIds(`?q=${encodeURIComponent("C:\\ops")}`)).toEqual(named("api"));
+    expect(await listIds(`?q=${encodeURIComponent("\\")}`)).toEqual(named("api"));
   });
 
   it("filters by assignee agent", async () => {
@@ -146,12 +148,17 @@ describeEmbeddedPostgres("GET /companies/:companyId/routines filters", () => {
     expect(await listIds(`?q=weekly&folderId=none`)).toEqual(named("archived"));
   });
 
-  it("treats empty parameters as absent and ignores unknown ones", async () => {
+  it("treats empty and whitespace-only parameters as absent and ignores unknown ones", async () => {
     expect(await listIds("?q=&status=&unknown=1")).toEqual(named("archived", "api", "manual", "paused", "deploy", "weekly"));
+    expect(await listIds("?q=%20%20&folderId=%20")).toEqual(named("archived", "api", "manual", "paused", "deploy", "weekly"));
+  });
+
+  it("accepts ids that are UUIDs but not version 4, like the other routine routes", async () => {
+    expect(await listIds("?assigneeAgentId=22222222-2222-2222-2222-222222222222")).toEqual([]);
   });
 
   it("rejects invalid filter values with 400", async () => {
-    for (const query of ["?status=sleeping", "?trigger=cron", "?assigneeAgentId=not-a-uuid", "?folderId=nope", `?q=${"x".repeat(201)}`]) {
+    for (const query of ["?status=sleeping", "?trigger=cron", "?assigneeAgentId=not-a-uuid", "?folderId=nope", `?q=${"x".repeat(201)}`, "?q=weekly%00", "?status=active&status=paused"]) {
       const res = await request(app()).get(`/api/companies/${companyA}/routines${query}`);
       expect(res.status, query).toBe(400);
     }

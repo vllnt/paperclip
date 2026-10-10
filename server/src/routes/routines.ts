@@ -5,7 +5,7 @@ import {
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createRoutineTriggerSchema,
-  listRoutinesQuerySchema,
+  parseListRoutinesQuery,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
   updateDocumentAnnotationThreadSchema,
@@ -150,7 +150,7 @@ export function routineRoutes(
   router.get("/companies/:companyId/routines", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const result = await svc.list(companyId, listRoutinesQuerySchema.parse(req.query));
+    const result = await svc.list(companyId, parseListRoutinesQuery(req.query));
     res.json(result);
   });
 
