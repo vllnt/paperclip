@@ -20,6 +20,14 @@ const BRIDGE_TOKEN = "lifecycle-test-token";
 // The stop proves a process is the bridge through /proc, or through ps where
 // there is no /proc (macOS). A few tests read /proc themselves.
 const HAS_PROC = existsSync("/proc/self/stat");
+const HAS_PS = (() => {
+  try {
+    execFileSync("/bin/sh", ["-c", "command -v ps"]);
+    return true;
+  } catch {
+    return false;
+  }
+})();
 const HAS_BUSYBOX = (() => {
   try {
     execFileSync("busybox", ["true"]);
@@ -214,9 +222,17 @@ describe("sandbox callback bridge process lifetime", () => {
   it("starts the bridge as the leader of its own process group, tagged with its run and start", async () => {
     const { bridge } = await startBridge();
 
-    const processGroup = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim());
+    let processGroup: number;
+    let command: string[];
+    if (HAS_PROC) {
+      const stat = await readFile(`/proc/${bridge.pid}/stat`, "utf8");
+      processGroup = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]);
+      command = (await readFile(`/proc/${bridge.pid}/cmdline`, "utf8")).split("\0");
+    } else {
+      processGroup = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim());
+      command = execFileSync("ps", ["-ww", "-o", "command=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim().split(" ");
+    }
     expect(processGroup).toBe(bridge.pid);
-    const command = execFileSync("ps", ["-ww", "-o", "command=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim().split(" ");
     expect(command).toContain(`--paperclip-run-id=${RUN_ID}`);
     expect(command.some((arg) => /^--paperclip-bridge-instance=[0-9a-f-]{36}$/.test(arg))).toBe(true);
     if (HAS_PROC) {
@@ -345,7 +361,7 @@ describe("sandbox callback bridge process lifetime", () => {
     await waitUntilDead(pid, 10_000);
   }, 60_000);
 
-  it("stops the bridge where only ps can inspect it, as on macOS", async () => {
+  it.runIf(HAS_PS)("stops the bridge where only ps can inspect it, as on macOS", async () => {
     const { root } = await createRunRoot();
     const hidden = path.join(root, "no-proc");
     // On Linux the control scripts see no /proc; on macOS there is none.

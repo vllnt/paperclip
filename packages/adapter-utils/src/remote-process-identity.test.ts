@@ -12,14 +12,22 @@ import {
 } from "./remote-process-identity.js";
 
 const HAS_PROC = existsSync("/proc/self/stat");
-const REAL_PS = execFileSync("/bin/sh", ["-c", "command -v ps"], { encoding: "utf8" }).trim();
+// The production image has no `ps`; its Linux workers use /proc.
+const REAL_PS = (() => {
+  try {
+    return execFileSync("/bin/sh", ["-c", "command -v ps"], { encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+})();
 const pids: number[] = [];
 const roots: string[] = [];
 
 // `proc` inspects through /proc (Linux). `ps` inspects as a host without
-// /proc does (macOS); on Linux the scripts see /proc hidden.
+// /proc does (macOS); on Linux the scripts see /proc hidden. Each mode runs
+// where the host has what it needs.
 type Mode = "proc" | "ps";
-const MODES: Mode[] = HAS_PROC ? ["proc", "ps"] : ["ps"];
+const MODES: Mode[] = [...(HAS_PROC ? ["proc" as const] : []), ...(REAL_PS ? ["ps" as const] : [])];
 
 function isAlive(pid: number): boolean {
   try {
