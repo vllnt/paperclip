@@ -376,7 +376,7 @@ describe("hasBlockingShortcutDialog", () => {
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-state": "open" }))).toBe(true);
   });
 
-  it("ignores closing dialogs and non-modal popovers", () => {
+  it("ignores closing dialogs, and does not treat popovers as modal", () => {
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "dialog-content", "data-state": "closed" }))).toBe(false);
     // A closing dialog stays mounted for its exit animation, even with aria-modal.
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "aria-modal": "true", "data-state": "closed" }))).toBe(false);
@@ -391,8 +391,26 @@ describe("hasBlockingShortcutDialog", () => {
     popover.setAttribute("data-state", "open");
     wrapper.appendChild(popover);
     root.appendChild(wrapper);
-    expect(hasBlockingShortcutDialog(root)).toBe(false);
+    // A popover is not modal, but it still owns the keyboard while open.
+    expect(hasBlockingShortcutDialog(root)).toBe(true);
     expect(isInsideOpenModalDialog(popover)).toBe(false);
+  });
+
+  it("blocks shortcuts while a menu or select is open, but not for a tooltip or a closing popover", () => {
+    function popup(attributes: Record<string, string>) {
+      const root = document.createElement("div");
+      const wrapper = document.createElement("div");
+      wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+      const content = document.createElement("div");
+      for (const [name, value] of Object.entries(attributes)) content.setAttribute(name, value);
+      wrapper.appendChild(content);
+      root.appendChild(wrapper);
+      return root;
+    }
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }))).toBe(true);
+    expect(hasBlockingShortcutDialog(popup({ role: "listbox", "data-state": "open" }))).toBe(true);
+    expect(hasBlockingShortcutDialog(popup({ role: "tooltip", "data-state": "delayed-open" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "dialog", "data-state": "closed" }))).toBe(false);
   });
 
   it("finds the modal around a popover that is open inside it", () => {
@@ -446,4 +464,3 @@ describe("shouldOpenCommandLauncher", () => {
     expect(shouldOpenCommandLauncher({ ...base, hasOpenDialog: true })).toBe(false);
   });
 });
-

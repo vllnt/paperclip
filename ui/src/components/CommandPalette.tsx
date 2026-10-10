@@ -1,5 +1,5 @@
 import { AgentIdentity } from "@/components/AgentIdentity";
-import { Fragment, useState, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { Fragment, useState, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 import { useNavigate } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import { rankCommandActions, scoreTextMatch } from "@paperclipai/shared/command-action-rank";
@@ -70,6 +70,17 @@ function ShortcutHint({ keys }: { keys: readonly string[] | undefined }) {
   );
 }
 
+/** Focuses `element` if it can still take focus, otherwise the page's main content. */
+function restoreFocus(element: HTMLElement | null) {
+  const canFocus = element !== null
+    && element.isConnected
+    && !element.closest("[inert], [hidden], [aria-hidden='true']")
+    && !("disabled" in element && element.disabled === true)
+    && element.getClientRects().length > 0;
+  const target = canFocus ? element : document.getElementById("main-content");
+  target?.focus({ preventScroll: true });
+}
+
 export function CommandPalette() {
   const {
     paletteOpen: open,
@@ -87,6 +98,14 @@ export function CommandPalette() {
   // restore focus to where it was before the palette opened.
   const pendingRunRef = useRef<(() => void) | null>(null);
   const ranFromPaletteRef = useRef(false);
+  // Where focus was before the launcher opened. Recorded in a layout effect,
+  // which runs before the dialog moves focus into itself.
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const active = document.activeElement;
+    returnFocusRef.current = active instanceof HTMLElement && active !== document.body ? active : null;
+  }, [open]);
   const navigate = useNavigate();
   const { selectedCompanyId } = useCompany();
   const { isMobile, setSidebarOpen } = useSidebar();
@@ -376,9 +395,14 @@ export function CommandPalette() {
       onOpenChange={setOpen}
       commandProps={{ shouldFilter: false, loop: true }}
       onCloseAutoFocus={(event) => {
-        if (!ranFromPaletteRef.current) return;
-        ranFromPaletteRef.current = false;
+        // Radix would focus the dialog's trigger, and the launcher has none,
+        // which left focus on <body>.
         event.preventDefault();
+        if (ranFromPaletteRef.current) {
+          ranFromPaletteRef.current = false;
+          return;
+        }
+        restoreFocus(returnFocusRef.current);
       }}
     >
       <CommandInput

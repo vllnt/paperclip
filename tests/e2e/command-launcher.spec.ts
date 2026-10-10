@@ -158,6 +158,64 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
       expect(errors).toEqual([]);
     });
 
+    test("returns focus to where it was when the launcher closes without running anything", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      const errors = trackPageErrors(page);
+      await page.goto(`/${seed.prefix}/dashboard`);
+      await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+
+      const main = page.locator("#main-content");
+      await main.focus();
+      await openLauncher(page);
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      await expect(main).toBeFocused();
+
+      // A focused control in the page gets focus back too. (Text fields keep
+      // Cmd/Ctrl+K for themselves, so the launcher never opens from one.)
+      const link = main.getByRole("link").first();
+      await link.focus();
+      await openLauncher(page);
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      await expect(link).toBeFocused();
+
+      expect(errors).toEqual([]);
+    });
+
+    test("does not open over an open popover", async ({ page, request }) => {
+      const seed = await seedCompany(request);
+      const errors = trackPageErrors(page);
+      await page.goto(`/${seed.prefix}/dashboard`);
+      await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
+      // Records whether the last Cmd/Ctrl+K was claimed by any handler.
+      await page.evaluate(() => {
+        window.addEventListener("keydown", (event) => {
+          if (event.key.toLowerCase() === "k" && (event.metaKey || event.ctrlKey)) {
+            document.documentElement.dataset.lastCommandKPrevented = String(event.defaultPrevented);
+          }
+        });
+      });
+
+      if (viewport.name === "mobile") {
+        await page.getByRole("button", { name: "Open sidebar" }).focus();
+        await page.keyboard.press("Enter");
+      }
+      const accountButton = page.getByRole("button", { name: "Open account menu" });
+      await accountButton.focus();
+      await page.keyboard.press("Enter");
+      const viewProfile = page.getByRole("link", { name: "View profile" });
+      await expect(viewProfile).toBeVisible();
+      await viewProfile.focus();
+
+      await page.keyboard.press("ControlOrMeta+k");
+      await expect(page.getByRole("combobox", { name: "Command launcher" })).toHaveCount(0);
+      await expect(viewProfile).toBeVisible();
+      await expect.poll(() => page.evaluate(() => document.documentElement.dataset.lastCommandKPrevented)).toBe("false");
+
+      expect(errors).toEqual([]);
+    });
+
     test("lists the issue page's own actions under This view", async ({ page, request }) => {
       const seed = await seedCompany(request);
       const errors = trackPageErrors(page);
