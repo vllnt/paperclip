@@ -9326,6 +9326,26 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
+/** What a graceful shutdown did with one running run. */
+type ShutdownRunOutcome =
+  | { runId: string; outcome: "interrupted" | "restart_suspended" | "not_running" | "foreign_owner" | "native_runner_owned" }
+  | { runId: string; outcome: "terminate_failed" | "finalize_failed"; error: string };
+
+/** `terminateLocalService` waits this long after SIGKILL to verify the exit. */
+const SHUTDOWN_TERMINATE_VERIFY_MS = 2_000;
+const SHUTDOWN_TERMINATE_MIN_GRACE_MS = 100;
+
+/**
+ * A run's grace before SIGKILL during shutdown: its adapter's `graceSec`, cut so
+ * that the SIGKILL and its verify still end by the drain deadline.
+ */
+function shutdownTerminationGraceMs(graceSec: number, deadlineAt: number | undefined): number {
+  const graceMs = Math.max(1, graceSec) * 1000;
+  if (deadlineAt === undefined) return graceMs;
+  const untilDeadlineMs = deadlineAt - Date.now() - SHUTDOWN_TERMINATE_VERIFY_MS;
+  return Math.max(SHUTDOWN_TERMINATE_MIN_GRACE_MS, Math.min(graceMs, untilDeadlineMs));
+}
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -15491,10 +15511,19 @@ export function heartbeatService(
     };
   }
 
+  /**
+   * Ends this boot's running runs for a graceful shutdown. The runs are ended
+   * in parallel, and with `deadlineAt` (epoch ms) each run's grace is capped so
+   * that its termination, SIGKILL and verify end by the deadline. A run that
+   * cannot be stopped does not stop the drain of the others: it is reported as
+   * `terminate_failed` and left `running` for the reaper, because its process
+   * may still be alive. Every run gets one reported outcome.
+   */
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    opts: { deadlineAt?: number } = {},
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
@@ -15503,6 +15532,7 @@ export function heartbeatService(
         interruptedRunIds: [],
         retryRunIds: [],
         restartSuspendedRunIds: [],
+        outcomes: [],
       };
     }
     const activeRuns = await db
@@ -15524,13 +15554,14 @@ export function heartbeatService(
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
     const restartSuspendedRunIds: string[] = [];
+    const outcomes: ShutdownRunOutcome[] = [];
 
-    for (const { run, agent } of activeRuns) {
+    const drainOne = async ({ run, agent }: (typeof activeRuns)[number]): Promise<ShutdownRunOutcome> => {
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
-          run.controllerBootId !== legacyControllerBootId) continue;
-      if (isNativeRunnerOwnershipHeld(run)) continue;
+          run.controllerBootId !== legacyControllerBootId) return { runId: run.id, outcome: "foreign_owner" };
+      if (isNativeRunnerOwnershipHeld(run)) return { runId: run.id, outcome: "native_runner_owned" };
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -15591,7 +15622,7 @@ export function heartbeatService(
           },
         });
         restartSuspendedRunIds.push(run.id);
-        continue;
+        return { runId: run.id, outcome: "restart_suspended" };
       }
       const message = `Interrupted by graceful server shutdown (${signal})`;
       const running = runningProcesses.get(run.id);
@@ -15608,9 +15639,18 @@ export function heartbeatService(
           await terminateHeartbeatRunProcess({
             pid: running.child.pid,
             processGroupId: running.processGroupId,
-            graceMs: Math.max(1, running.graceSec) * 1000,
+            graceMs: shutdownTerminationGraceMs(running.graceSec, opts.deadlineAt),
           });
         }
+      } catch (err) {
+        // The process may still be alive, so the run is not marked ended here.
+        // The reaper ends it after the restart, when the process is gone.
+        logger.error({ err, runId: run.id, signal }, "failed to stop a run for graceful shutdown");
+        return {
+          runId: run.id,
+          outcome: "terminate_failed",
+          error: err instanceof Error ? err.message : String(err),
+        };
       } finally {
         runningProcesses.delete(run.id);
       }
@@ -15638,7 +15678,7 @@ export function heartbeatService(
           }),
         },
       );
-      if (!interruptedStatus.updated || !interruptedStatus.run) continue;
+      if (!interruptedStatus.updated || !interruptedStatus.run) return { runId: run.id, outcome: "not_running" };
       let interrupted = interruptedStatus.run;
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: now,
@@ -15682,7 +15722,20 @@ export function heartbeatService(
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       interruptedRunIds.push(interrupted.id);
-    }
+      return { runId: run.id, outcome: "interrupted" };
+    };
+
+    await Promise.all(activeRuns.map(async (row) => {
+      let outcome: ShutdownRunOutcome;
+      try {
+        outcome = await drainOne(row);
+      } catch (err) {
+        logger.error({ err, runId: row.run.id, signal }, "failed to finalize a run for graceful shutdown");
+        outcome = { runId: row.run.id, outcome: "finalize_failed", error: err instanceof Error ? err.message : String(err) };
+      }
+      outcomes.push(outcome);
+      logger.info({ signal, ...outcome }, "shutdown run outcome");
+    }));
 
     if (interruptedRunIds.length > 0) {
       logger.warn(
@@ -15701,6 +15754,7 @@ export function heartbeatService(
       interruptedRunIds,
       retryRunIds,
       restartSuspendedRunIds,
+      outcomes,
     };
   }
 

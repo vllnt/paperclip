@@ -193,6 +193,137 @@ export async function finalizeServerShutdown(input: {
   await input.shutdownSentry();
 }
 
+/** The stop timeout the deploy path uses today (`docker stop --time 60`). */
+const DEFAULT_STOP_TIMEOUT_MS = 60_000;
+/** Time kept free under the stop timeout for the exit itself and the runtime. */
+const STOP_TIMEOUT_HEADROOM_MS = 10_000;
+
+/**
+ * The whole shutdown must end before the container runtime kills the process.
+ * The deploy sets `PAPERCLIP_STOP_TIMEOUT_MS` to the stop timeout it uses; the
+ * budget keeps 10 seconds of headroom under it, or half of a timeout too short
+ * for that headroom.
+ */
+export function resolveShutdownBudgetMs(env: Record<string, string | undefined> = process.env): number {
+  const parsed = Number(env.PAPERCLIP_STOP_TIMEOUT_MS);
+  const stopTimeoutMs = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STOP_TIMEOUT_MS;
+  return stopTimeoutMs >= 2 * STOP_TIMEOUT_HEADROOM_MS
+    ? stopTimeoutMs - STOP_TIMEOUT_HEADROOM_MS
+    : Math.floor(stopTimeoutMs / 2);
+}
+
+type ShutdownStepOutcome = "done" | "timed_out" | "failed";
+
+/**
+ * The ordered shutdown steps. Each is awaited for at most its share of the
+ * budget; a step that outlives its share keeps running in the background while
+ * the shutdown moves on, because a clean exit beats a SIGKILL.
+ */
+export type BoundedShutdownSteps = {
+  /** Stops accepting connections and drains the open ones. Starts first. */
+  closeHttpListener: () => Promise<unknown>;
+  coordinateScheduler: () => Promise<unknown>;
+  flushTelemetry: () => Promise<unknown>;
+  /** Ends the running runs; each run's grace must end by `deadlineAt` (epoch ms). */
+  drainRuns: (deadlineAt: number) => Promise<unknown>;
+  drainFinalizers: (timeoutMs: number) => Promise<unknown>;
+  flushRunLogMirrors: () => Promise<unknown>;
+  /** Application services, database, embedded PostgreSQL, telemetry and Sentry. */
+  finalize: () => Promise<unknown>;
+};
+
+const SCHEDULER_QUIESCE_MAX_MS = 10_000;
+const TELEMETRY_FLUSH_MAX_MS = 3_000;
+const FINALIZER_DRAIN_MAX_MS = 5_000;
+const RUN_LOG_FLUSH_MAX_MS = 5_000;
+
+/**
+ * Runs the shutdown inside one budget, so the process exits 0 before the stop
+ * timeout instead of being killed. The listener stops accepting connections
+ * first, so no new request is cut by the exit; the run drain gets a deadline
+ * that leaves time for the teardown; every step logs its start and its end with
+ * a duration and an outcome; and a hard deadline exits even if a step hangs.
+ * Pass `exit: null` to keep the process alive (the caller exits later).
+ */
+export async function runBoundedShutdown(input: {
+  signal: "SIGINT" | "SIGTERM";
+  budgetMs: number;
+  steps: BoundedShutdownSteps;
+  log: ShutdownLogger;
+  exit: ((code: number) => void) | null;
+}): Promise<void> {
+  const { signal, budgetMs, steps, log } = input;
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + budgetMs;
+  const remainingMs = () => Math.max(0, deadlineAt - Date.now());
+  let currentStep = "start";
+  let exited = false;
+  const exit = (reason: string) => {
+    if (exited || !input.exit) return;
+    exited = true;
+    log.info({ signal, reason, elapsedMs: Date.now() - startedAt }, "shutdown exiting");
+    input.exit(0);
+  };
+
+  log.info({ signal, budgetMs }, "shutdown started");
+  let hardDeadline: NodeJS.Timeout | null = null;
+  if (input.exit) {
+    hardDeadline = setTimeout(() => {
+      log.error({ signal, step: currentStep, budgetMs }, "shutdown hard deadline reached; exiting");
+      exit("hard_deadline");
+    }, budgetMs);
+    hardDeadline.unref?.();
+  }
+
+  const runStep = async (step: string, maxMs: number, work: () => Promise<unknown>) => {
+    currentStep = step;
+    const stepStartedAt = Date.now();
+    const limitMs = Math.max(0, Math.min(maxMs, remainingMs()));
+    log.info({ signal, step, limitMs }, "shutdown step started");
+    let timer: NodeJS.Timeout | null = null;
+    let outcome: ShutdownStepOutcome;
+    let err: unknown = null;
+    try {
+      outcome = await Promise.race([
+        work().then(() => "done" as const),
+        new Promise<"timed_out">((resolve) => {
+          timer = setTimeout(() => resolve("timed_out"), limitMs);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (error) {
+      outcome = "failed";
+      err = error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    const fields = { signal, step, outcome, durationMs: Date.now() - stepStartedAt, ...(err ? { err } : {}) };
+    if (outcome === "done") log.info(fields, "shutdown step finished");
+    else log.error(fields, "shutdown step finished");
+  };
+
+  // Start closing the listener at once: from here, no new connection is
+  // accepted, and the requests in flight finish while the runs drain.
+  const listenerClosed = steps.closeHttpListener().catch((error) => {
+    log.error({ err: error, signal }, "HTTP listener shutdown failed");
+  });
+
+  await runStep("scheduler_quiesce", SCHEDULER_QUIESCE_MAX_MS, steps.coordinateScheduler);
+  await runStep("telemetry_flush", TELEMETRY_FLUSH_MAX_MS, steps.flushTelemetry);
+  // The drain ends with 30 % of the budget (at most 15 seconds) left for the
+  // finalizers, the listener and the teardown.
+  const drainDeadlineAt = deadlineAt - Math.min(15_000, Math.floor(budgetMs * 0.3));
+  await runStep("run_drain", Math.max(0, drainDeadlineAt - Date.now()), () => steps.drainRuns(drainDeadlineAt));
+  await runStep("finalizer_drain", FINALIZER_DRAIN_MAX_MS, () =>
+    steps.drainFinalizers(Math.min(FINALIZER_DRAIN_MAX_MS, remainingMs())));
+  await runStep("run_log_flush", RUN_LOG_FLUSH_MAX_MS, steps.flushRunLogMirrors);
+  await runStep("http_listener_close", Number.POSITIVE_INFINITY, () => listenerClosed);
+  await runStep("teardown", Number.POSITIVE_INFINITY, steps.finalize);
+
+  if (hardDeadline) clearTimeout(hardDeadline);
+  exit("complete");
+}
+
 const COORDINATED_SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM"] as const;
 
 type ShutdownSignalTarget = {

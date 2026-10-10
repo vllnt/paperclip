@@ -321,6 +321,21 @@ When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eage
 snapshot and any required drain complete while the database is still available;
 the coordinated shutdown path stops embedded PostgreSQL afterward.
 
+**Shutdown budget.** On `SIGTERM` or `SIGINT` the server finishes inside one
+budget, so it exits 0 before the stop timeout instead of being killed. Set
+`PAPERCLIP_STOP_TIMEOUT_MS` to the stop timeout of whatever stops the process (for
+example the `--time` of `docker stop`); the default is 60000. The budget is that
+timeout minus 10 seconds (half of it when the timeout is under 20 seconds). In
+order: the HTTP listener stops accepting connections at once, and requests in
+flight get up to 5 seconds; the scheduler quiesces (at most 10 seconds); running
+runs are ended in parallel, each run's grace cut so that it ends with 30 % of the
+budget (at most 15 seconds) still left; then the finalizers, the run-log flush and
+the teardown share the rest. Each step logs `shutdown step started` and `shutdown
+step finished` with its duration and its outcome (`done`, `timed_out` or
+`failed`), and each run logs `shutdown run outcome`. A run whose process cannot be
+stopped is reported as `terminate_failed` and left `running` for the reaper. If a
+step hangs, a hard deadline at the end of the budget logs the step and exits 0.
+
 The request command records the preflight set of running heartbeat IDs and writes
 an instance-scoped marker plus a PID-targeted legacy home-root handoff marker.
 This lets a previous server version capture its snapshot at the old path while
