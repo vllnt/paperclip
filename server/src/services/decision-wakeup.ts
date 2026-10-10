@@ -28,6 +28,7 @@ export function createDecisionWakeOriginAgent(
       issueId: input.issueId,
       decisionId: input.decisionId,
       outcome: input.outcome,
+      ...(input.outcome === "dismissed" ? { dismissReason: input.dismissReason ?? null } : {}),
     },
   });
 }
