@@ -625,8 +625,10 @@ npx paperclipai run watchdog-decision <run-id> --decision continue [--reason "..
 
 `paperclipai routines disable-all` remains the local maintenance command. The singular `routine` group maps to the REST API.
 
+`routine list` filters combine with AND: `--q` searches the title and description (case-insensitive), `--folder-id none` lists routines in no folder, and `--trigger manual` lists routines that have no trigger and only run when started by hand. With no filter it lists every routine, as before.
+
 ```sh
-npx paperclipai routine list --company-id <company-id> [--project-id <project-id>]
+npx paperclipai routine list --company-id <company-id> [--project-id <project-id>] [--q <text>] [--agent-id <agent-id>] [--folder-id <folder-id>|none] [--status active|paused|archived] [--trigger schedule|webhook|api|manual]
 npx paperclipai routine create --company-id <company-id> --payload-json '{...}'
 npx paperclipai routine get <routine-id>
 npx paperclipai routine update <routine-id> --payload-json '{...}'

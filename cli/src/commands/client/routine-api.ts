@@ -13,9 +13,30 @@ interface CompanyOptions extends BaseClientOptions {
   projectId?: string;
 }
 
-interface JsonOptions extends CompanyOptions {
-  payloadJson?: string;
-  limit?: string;
+interface RoutineListOptions extends CompanyOptions {
+  q?: string;
+  agentId?: string;
+  folderId?: string;
+  status?: string;
+  trigger?: string;
+}
+
+/** Builds the list query from the CLI flags; the server validates the values. */
+function routineListQuery(opts: RoutineListOptions): string {
+  const params = new URLSearchParams();
+  const entries: Array<[string, string | undefined]> = [
+    ["projectId", opts.projectId],
+    ["q", opts.q],
+    ["assigneeAgentId", opts.agentId],
+    ["folderId", opts.folderId],
+    ["status", opts.status],
+    ["trigger", opts.trigger],
+  ];
+  for (const [key, value] of entries) {
+    if (value) params.set(key, value);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
 }
 
 export function registerRoutineApiCommands(program: Command): void {
@@ -23,13 +44,18 @@ export function registerRoutineApiCommands(program: Command): void {
   addCommonClientOptions(
     routine
       .command("list")
-      .description("List routines")
+      .description("List routines; filters combine with AND")
       .option("-C, --company-id <id>", "Company ID")
       .option("--project-id <id>", "Filter by project ID")
-      .action(async (opts: CompanyOptions) => {
+      .option("--q <text>", "Search the title and description (case-insensitive)")
+      .option("--agent-id <id>", "Only routines assigned to this agent")
+      .option("--folder-id <id>", "Only routines in this folder; none for routines in no folder")
+      .option("--status <status>", "active, paused or archived")
+      .option("--trigger <kind>", "schedule, webhook, api, or manual for routines with no trigger")
+      .action(async (opts: RoutineListOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
-          const query = opts.projectId ? `?${new URLSearchParams({ projectId: opts.projectId }).toString()}` : "";
+          const query = routineListQuery(opts);
           printOutput(await ctx.api.get(`${apiPath`/api/companies/${ctx.companyId}/routines`}${query}`), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
