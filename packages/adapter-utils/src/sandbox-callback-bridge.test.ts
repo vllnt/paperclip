@@ -1567,6 +1567,58 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("admits company skill create, and no other skill write", () => {
+    const allowed: Array<{ method: string; path: string }> = [
+      { method: "POST", path: "/api/companies/co-1/skills" },
+    ];
+    for (const request of allowed) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST),
+      ).toBeNull();
+    }
+
+    const denied: Array<{ method: string; path: string }> = [
+      // Wrong method on the new paths.
+      { method: "PUT", path: "/api/companies/co-1/skills" },
+      { method: "PATCH", path: "/api/companies/co-1/skills" },
+      { method: "DELETE", path: "/api/companies/co-1/skills" },
+      { method: "PUT", path: "/api/companies/co-1/skills/import" },
+      { method: "DELETE", path: "/api/companies/co-1/skills/import" },
+      // Neighbouring skill writes stay human-only: only create is admitted here.
+      { method: "POST", path: "/api/companies/co-1/skills/import" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1" },
+      { method: "POST", path: "/api/companies/co-1/skills/install-catalog" },
+      { method: "POST", path: "/api/companies/co-1/skills/scan-projects" },
+      { method: "POST", path: "/api/companies/co-1/skills/browse-project" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1/audit" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1/reset" },
+      { method: "POST", path: "/api/companies/co-1/skills/skill-1/install-update" },
+      { method: "POST", path: "/api/companies/co-1/skill-sources" },
+      // Extra or missing segments.
+      { method: "POST", path: "/api/companies/co-1/skills/import/extra" },
+      { method: "POST", path: "/api/companies/co-1/skills/import/" },
+      { method: "POST", path: "/api/companies/co-1/skills/" },
+      { method: "POST", path: "/api/companies//skills" },
+      // queue_v1 forwards the raw path: no query, fragment, encoded, dot or backslash segment may ride on the rules.
+      { method: "POST", path: "/api/companies/co-1/skills?source=https://example.test" },
+      { method: "POST", path: "/api/companies/co-1/skills/import?source=/etc" },
+      { method: "POST", path: "/api/companies/co-1/skills#x" },
+      { method: "POST", path: "/api/companies/co-1/skills/import#x" },
+      { method: "POST", path: "/api/companies/co-1/skills/import%2f..%2fapi" },
+      { method: "POST", path: "/api/companies/co%2f1/skills" },
+      { method: "POST", path: "/api/companies/co-1%2fskills/import" },
+      { method: "POST", path: "/api/companies/../skills" },
+      { method: "POST", path: "/api/companies/co.1/skills/import" },
+      { method: "POST", path: "/api/companies/co\\1/skills" },
+    ];
+    for (const request of denied) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
+        `Route not allowed: ${request.method} ${request.path}`,
+      );
+    }
+  });
+
   it("admits listing, uploads and downloads on the default queue route list", () => {
     const attachmentRequests: Array<{ method: string; path: string }> = [
       { method: "GET", path: "/api/issues/issue-1/attachments" },

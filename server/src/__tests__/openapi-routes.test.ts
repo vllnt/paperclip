@@ -827,6 +827,12 @@ describe("openapi routes", () => {
     expect(
       spec.paths["/api/routines/{id}/run"].post.responses["422"],
     ).toBeDefined();
+    // Skill create answers 201 (new), 200 (idempotent replay) and 409 (slug taken); import answers 201 only.
+    const skillCreate = spec.paths["/api/companies/{companyId}/skills"].post.responses;
+    expect(Object.keys(skillCreate)).toEqual(expect.arrayContaining(["200", "201", "409"]));
+    const skillImport = Object.keys(spec.paths["/api/companies/{companyId}/skills/import"].post.responses);
+    expect(skillImport).toContain("201");
+    expect(skillImport).not.toContain("200");
   });
 
   it("publishes the Claude browser-code grammar and strict setup-token response shapes", () => {
