@@ -3,6 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import {
+  resolveCodexHomeSeedSelection,
+  seedCodexHomeFiles,
+} from "@paperclipai/adapter-utils/codex-home-seed";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
 
 const TRUTHY_ENV_RE = /^(1|true|yes|on)$/i;
@@ -364,6 +368,11 @@ export async function writeApiKeyAuthJson(home: string, apiKey: string): Promise
 export interface StageCodexHomeForSyncOptions {
   /** Run id, used only to make the staged temp-dir name traceable in logs. */
   runId?: string;
+  /**
+   * Validated worker-seed file names (see `resolveCodexHomeSeedSelection`) staged
+   * in addition to {@link CODEX_SYNC_ALLOWLIST}, so a sandbox run gets them too.
+   */
+  extraEntries?: readonly string[];
 }
 
 /**
@@ -586,6 +595,10 @@ export async function stageCodexHomeForSync(
     for (const entry of CODEX_SYNC_ALLOWLIST) {
       await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry);
     }
+    // Re-validate: only plain, non-credential names ever extend the allowlist.
+    for (const entry of resolveCodexHomeSeedSelection([...(options.extraEntries ?? [])], {}).names) {
+      await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry);
+    }
     return stagedHome;
   } catch (error) {
     // Fail-closed: never hand back a partial home. Remove the temp dir we
@@ -611,7 +624,7 @@ export async function seedManagedCodexHome(
   targetHome: string,
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
-  options: { apiKey?: string | null } = {},
+  options: { apiKey?: string | null; codexHomeSeed?: unknown } = {},
 ): Promise<void> {
   const apiKey = nonEmpty(options.apiKey ?? undefined);
 
@@ -742,6 +755,15 @@ export async function seedManagedCodexHome(
       await ensureCopiedFile(path.join(targetHome, name), source);
     }
 
+    // Opt-in worker files (global AGENTS.md, files it includes, hooks.json).
+    // Nothing is copied unless `codexHomeSeed` or PAPERCLIP_CODEX_HOME_SEED says so.
+    await seedCodexHomeFiles({
+      sourceHome,
+      targetHome,
+      selection: resolveCodexHomeSeedSelection(options.codexHomeSeed, env),
+      onLog,
+    });
+
     await onLog(
       "stdout",
       `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
@@ -772,7 +794,7 @@ export async function prepareManagedCodexHome(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
   companyId?: string,
-  options: { apiKey?: string | null } = {},
+  options: { apiKey?: string | null; codexHomeSeed?: unknown } = {},
 ): Promise<string> {
   const targetHome = resolveManagedCodexHomeDir(env, companyId);
   await seedManagedCodexHome(targetHome, env, onLog, options);
