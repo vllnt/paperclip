@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import type { RemoteProcessTreeStopSummary } from "@paperclipai/adapter-utils/remote-process-identity";
-import { stopSshRunProcesses } from "@paperclipai/adapter-utils/ssh";
+import { stopSshRunProcesses, type SshConnectionConfig } from "@paperclipai/adapter-utils/ssh";
 import { logger } from "../middleware/logger.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 
@@ -24,6 +24,25 @@ export interface RemoteRunProcessStopOutcome extends RemoteProcessTreeStopSummar
 
 const NO_STOP: RemoteProcessTreeStopSummary = { records: 0, matched: 0, killed: 0, skipped: 0, survived: 0, partial: null };
 
+// The worker and root the lease was acquired on, as `acquireRunLease` recorded
+// them: an environment edited since then must not send the stop elsewhere.
+// Only the credentials come from the current config.
+function launchTarget(config: SshConnectionConfig, lease: EnvironmentLease): SshConnectionConfig {
+  const metadata = lease.metadata ?? {};
+  const text = (key: string) => {
+    const value = metadata[key];
+    return typeof value === "string" && value.length > 0 ? value : null;
+  };
+  const port = metadata.port;
+  return {
+    ...config,
+    host: text("host") ?? config.host,
+    port: typeof port === "number" && Number.isInteger(port) && port > 0 ? port : config.port,
+    username: text("username") ?? config.username,
+    remoteWorkspacePath: text("remoteWorkspacePath") ?? config.remoteWorkspacePath,
+  };
+}
+
 function classify(summary: RemoteProcessTreeStopSummary): RemoteRunProcessStopOutcome["outcome"] {
   if (summary.survived > 0) return "survived";
   return summary.partial ? "partial" : "stopped";
@@ -31,7 +50,8 @@ function classify(summary: RemoteProcessTreeStopSummary): RemoteRunProcessStopOu
 
 /**
  * Stops the processes that a legacy heartbeat run started on the SSH worker of
- * `lease`, over a connection of its own and within 20 seconds. It runs once
+ * `lease`, over a connection of its own and within 20 seconds. It connects to
+ * the worker and root recorded when the lease was acquired. It runs once
  * per lease: the outcome is kept in the lease metadata, and a second call, or
  * one that loses the race to record it, returns `null`. Native runs keep their
  * own runner lifecycle and are skipped. Never throws.
@@ -63,8 +83,9 @@ export async function stopSshLeaseRunProcesses(
         const parsed = await resolveEnvironmentDriverConfigForRuntime(db, lease.companyId, environment, {
           heartbeatRunId: lease.heartbeatRunId,
         });
-        if (parsed.driver !== "ssh") return null;
-        summary = await stopSshRunProcesses(parsed.config, lease.heartbeatRunId);
+        summary = parsed.driver === "ssh"
+          ? await stopSshRunProcesses(launchTarget(parsed.config, lease), lease.heartbeatRunId)
+          : { ...NO_STOP, partial: "environment_changed" };
       } catch {
         summary = { ...NO_STOP, partial: "config_unavailable" };
       }

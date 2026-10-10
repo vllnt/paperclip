@@ -238,10 +238,11 @@ describeStop("SSH remote process stop", () => {
     signalRunningProcess(runningProcesses.get(run.runId)!, "SIGKILL");
     await run.done;
     runningProcesses.delete(run.runId);
-    const unreachable = { ...sshConfig, port: await closedLoopbackPort() };
-    await db.update(environments).set({
-      config: { ...((reachable as unknown as { config: Record<string, unknown> }).config), port: unreachable.port },
-    }).where(eq(environments.id, reachable.id));
+    // The worker the run was launched on has gone away.
+    const launched = await lease(run.leaseId);
+    await db.update(environmentLeases)
+      .set({ metadata: { ...launched.metadata, port: await closedLoopbackPort() } })
+      .where(eq(environmentLeases.id, run.leaseId));
 
     const startedAt = Date.now();
     await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
@@ -254,6 +255,39 @@ describeStop("SSH remote process stop", () => {
     expect(partial).toHaveLength(1);
     expect(partial[0]!.payload).toMatchObject({ reason: "worker_unreachable" });
   }, 90_000);
+
+  it("stops on the worker the lease was acquired on after the environment is edited", async () => {
+    const environment = await seedEnvironment(sshConfig);
+    const run = await startRun({ environment });
+    signalRunningProcess(runningProcesses.get(run.runId)!, "SIGKILL");
+    await run.done;
+    runningProcesses.delete(run.runId);
+    const config = (environment as unknown as { config: Record<string, unknown> }).config;
+    await db.update(environments)
+      .set({ config: { ...config, port: await closedLoopbackPort(), remoteWorkspacePath: "/nonexistent-paperclip-root" } })
+      .where(eq(environments.id, environment.id));
+
+    await runtime.releaseRunLeases(run.runId);
+
+    expect(alive(run.leader)).toBe(false);
+    expect(alive(run.child)).toBe(false);
+    expect((await lease(run.leaseId)).metadata?.remoteProcessStop).toMatchObject({ outcome: "stopped" });
+  }, 60_000);
+
+  it("records a partial stop when the lease's environment is no longer SSH", async () => {
+    const environment = await seedEnvironment(sshConfig);
+    const run = await startRun({ environment });
+    signalRunningProcess(runningProcesses.get(run.runId)!, "SIGKILL");
+    await run.done;
+    runningProcesses.delete(run.runId);
+    // Only one local environment may exist; drop the one the migration seeds.
+    await db.delete(environments).where(eq(environments.driver, "local"));
+    await db.update(environments).set({ driver: "local", config: {} }).where(eq(environments.id, environment.id));
+
+    const outcomes = await runtime.stopRunProcesses(run.runId);
+
+    expect(outcomes).toMatchObject([{ outcome: "partial", partial: "environment_changed" }]);
+  }, 60_000);
 
   it("records a partial stop, not silence, when the lease's environment was deleted", async () => {
     const environment = await seedEnvironment(sshConfig);

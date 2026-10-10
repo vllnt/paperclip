@@ -80,9 +80,11 @@ async function startSession(script: string, env: Record<string, string> = {}, co
 
 async function writeRecord(dir: string, input: { pid: number | string; group: boolean; markerSha256: string; uid?: string }) {
   await mkdir(dir, { recursive: true });
-  const file = path.join(dir, `${randomBytes(8).toString("hex")}.json`);
+  const launchId = randomBytes(8).toString("hex");
+  const file = path.join(dir, `${launchId}.json`);
   const lines = buildRemoteRunRecordLines({
-    recordFile: file,
+    recordDir: dir,
+    launchId,
     markerSha256: input.markerSha256,
     group: input.group,
     pidExpression: String(input.pid),
@@ -126,7 +128,7 @@ describe.skipIf(!isLinux)("remote process tree stop", () => {
     expect(summary).toMatchObject({ records: 1, matched: 4, survived: 0, partial: null });
     for (const pid of [group.leader!, group.member!, group.envless!, otherSession.leader!]) expect(alive(pid)).toBe(false);
     for (const bystander of bystanders) expect(alive(bystander.leader!)).toBe(true);
-    await expect(readdir(dir)).rejects.toThrow();
+    expect(await readdir(dir)).toEqual(["stopped"]);
   }, 30_000);
 
   it("signals no process of another user, even one carrying the same marker", async () => {
@@ -290,8 +292,8 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(record).toContain(`"marker":"${marker}"`);
   }, 30_000);
 
-  async function runLaunch(input: { env?: Record<string, string>; home?: string; command: string }) {
-    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+  async function runLaunch(input: { env?: Record<string, string>; home?: string; command: string; root?: string; runId?: string }) {
+    const root = input.root ?? (await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-")));
     await mkdir(path.join(root, "ws"), { recursive: true });
     const target = await buildSshSpawnTarget({
       spec: {
@@ -307,7 +309,7 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
       command: "sh",
       args: ["-c", input.command],
       env: input.env ?? {},
-      processRecord: { runId: randomUUID() },
+      processRecord: { runId: input.runId ?? randomUUID() },
     });
     const child = spawn("sh", ["-c", target.args.at(-1)!], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -319,10 +321,39 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
       stdout += chunk.toString();
     });
     child.stdin.end(`${target.stdinPrefix}hello\n`);
-    await new Promise((resolve) => child.on("close", resolve));
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
     await target.cleanup();
-    return { stdout, marker: target.stdinPrefix!.trim() };
+    return { stdout, code, marker: target.stdinPrefix!.trim() };
   }
+
+  it("does not start a launch whose run was already stopped, so a stop cannot miss a late record", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    // The stop runs first, while the launch is still sourcing profiles.
+    const early = await stop(sshRunProcessRecordDir(root, runId));
+    expect(early).toMatchObject({ records: 0, partial: "no_process_record" });
+
+    const late = await runLaunch({ root, runId, command: "echo started" });
+
+    expect(late.stdout).not.toContain("started");
+    expect(late.code).toBe(143);
+  }, 30_000);
+
+  it("removes stop marks older than a week, and keeps newer ones", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const [oldRun, newRun, current] = [randomUUID(), randomUUID(), randomUUID()];
+    for (const runId of [oldRun, newRun]) {
+      await mkdir(sshRunProcessRecordDir(root, runId), { recursive: true });
+      await writeFile(path.join(sshRunProcessRecordDir(root, runId), "stopped"), "");
+    }
+    await execFileAsync("touch", ["-d", "10 days ago", path.join(sshRunProcessRecordDir(root, oldRun), "stopped")]);
+
+    await stop(sshRunProcessRecordDir(root, current));
+
+    await expect(readdir(sshRunProcessRecordDir(root, oldRun))).rejects.toThrow();
+    expect(await readdir(sshRunProcessRecordDir(root, newRun))).toEqual(["stopped"]);
+    expect(await readdir(sshRunProcessRecordDir(root, current))).toEqual(["stopped"]);
+  }, 30_000);
 
   it("keeps its own marker when the caller's environment names the same variable", async () => {
     const { stdout, marker } = await runLaunch({

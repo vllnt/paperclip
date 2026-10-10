@@ -1407,10 +1407,11 @@ export async function buildSshSpawnTarget(input: {
     remoteScript = [...profileLines(">/dev/null 2>&1"), `cd ${shellQuote(input.spec.remoteCwd)}`, execLine].join(" && ");
   } else {
     const recordDir = sshRunProcessRecordDirWord(input.spec.remoteWorkspacePath, runId);
-    const recordFile = `${recordDir}/${randomBytes(8).toString("hex")}.json`;
-    // The leader records itself, then execs the command with the same pid.
+    const launchId = randomBytes(8).toString("hex");
+    // The leader records itself, stops if the run was already stopped, then
+    // execs the command with the same pid.
     const leaderScript = (group: boolean) => [
-      ...buildRemoteRunRecordLines({ recordFile, markerSha256: marker.entrySha256, group }),
+      ...buildRemoteRunRecordLines({ recordDir, launchId, markerSha256: marker.entrySha256, group }),
       execLine,
     ].join("\n");
     // The profiles read no stdin, so they can neither take the marker line

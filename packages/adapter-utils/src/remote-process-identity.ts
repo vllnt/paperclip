@@ -201,31 +201,44 @@ export function createRemoteRunMarker(): RemoteRunMarker {
   return { value, entrySha256 };
 }
 
+/** The file a stop leaves in a run's record directory; a launch that finds it does not start. */
+export const REMOTE_RUN_STOPPED_MARK = "stopped";
+
 /**
  * Shell lines that write the launch record of the process in `pidExpression`
- * to `recordFile`: the identity line of {@link buildRemoteProcessRecordLines},
- * then `{"uid":…,"marker":"<entrySha256>"}`. They write a temporary file and
- * rename it, and a failed write never fails the launch.
+ * to `<recordDir>/<launchId>.json`: the identity line of
+ * {@link buildRemoteProcessRecordLines}, then `{"uid":…,"marker":"<entrySha256>"}`.
+ * They write a temporary file and rename it, and a failed write never fails
+ * the launch. Then they exit with 143 when the run was already stopped.
  *
- * @param input.recordFile - A shell word naming the record file.
+ * The order is the handshake with {@link buildRemoteProcessTreeStopLines},
+ * which leaves its stop mark before it reads the records: either the stop
+ * reads this record and finds the process, or this check finds the mark.
+ *
+ * @param input.recordDir - A shell word naming the run's record directory.
+ * @param input.launchId - Names this launch's record; letters and digits only.
  * @param input.markerSha256 - {@link RemoteRunMarker.entrySha256}.
  * @param input.group - Whether the launch made the process lead its own session (`setsid`).
  * @param input.pidExpression - The process; `$$` (the running shell) by default.
  * @returns Lines for a launch script.
  */
 export function buildRemoteRunRecordLines(input: {
-  recordFile: string;
+  recordDir: string;
+  launchId: string;
   markerSha256: string;
   group: boolean;
   pidExpression?: string;
 }): string[] {
+  if (!/^[0-9a-zA-Z]+$/.test(input.launchId)) throw new Error("invalid launch id");
+  const recordFile = `${input.recordDir}/${input.launchId}.json`;
   return [
     `pid=${input.pidExpression ?? "$$"}`,
     `group=${input.group ? 1 : 0}`,
     "{",
     ...buildRemoteProcessRecordLines(),
     `printf '{"uid":%s,"marker":"%s"}\\n' "$(id -u)" ${shellQuote(input.markerSha256)}`,
-    `} > ${input.recordFile}.tmp 2>/dev/null && mv -f ${input.recordFile}.tmp ${input.recordFile} 2>/dev/null`,
+    `} > ${recordFile}.tmp 2>/dev/null && mv -f ${recordFile}.tmp ${recordFile} 2>/dev/null`,
+    `[ ! -e ${input.recordDir}/${REMOTE_RUN_STOPPED_MARK} ] || exit 143`,
   ];
 }
 
@@ -266,7 +279,9 @@ const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
  *
  * Nothing is signalled without a valid record, or when `/proc`, `awk`, `grep`,
  * `tr` or `sha256sum` is missing; the summary names the reason. It never
- * matches command lines. After a stop that found records, it deletes them.
+ * matches command lines. It leaves a stop mark first (see
+ * {@link buildRemoteRunRecordLines}), deletes the records it read, and drops
+ * stop marks older than a week.
  *
  * @param input.recordDir - A shell word naming the directory of launch records.
  * @param input.termWaitSeconds - How long to wait after `SIGTERM`; 2 by default.
@@ -282,6 +297,9 @@ export function buildRemoteProcessTreeStopLines(input: {
   return [
     `dir=${input.recordDir}`,
     `name=${REMOTE_RUN_MARKER_ENV}`,
+    // Leave the stop mark before reading any record: a launch that has not
+    // written its record yet will find the mark and not start.
+    `stop_mark_failed=; mkdir -p "$dir" 2>/dev/null; : > "$dir/${REMOTE_RUN_STOPPED_MARK}" 2>/dev/null || stop_mark_failed=1`,
     "self=$$",
     "parent=$PPID",
     "me=\"$(id -u 2>/dev/null)\"",
@@ -340,6 +358,7 @@ export function buildRemoteProcessTreeStopLines(input: {
     "    echo \"$sc_pid $sc_start\"",
     "  done",
     "}",
+    "[ -z \"$stop_mark_failed\" ] || note no_stop_mark",
     "if [ ! -r /proc/self/stat ]; then note no_proc",
     "elif [ -z \"$me\" ] || ! command -v awk >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1; then note no_tools",
     "elif ! command -v sha256sum >/dev/null 2>&1; then note no_sha256sum",
@@ -397,9 +416,13 @@ export function buildRemoteProcessTreeStopLines(input: {
     "    sleep 0.1",
     "    survived=\"$( { still_running \"$first\"; scan; } | cut -d' ' -f1 | sort -u | grep -c .)\"",
     "  fi",
-    // The records only serve this stop; the lease that started the launches is being released.
-    "  [ \"$records\" -eq 0 ] || { rm -f -- \"$dir\"/*.json \"$dir\"/*.json.tmp 2>/dev/null; rmdir -- \"$dir\" 2>/dev/null; }",
+    // The records only serve this stop; the lease that started the launches
+    // is being released. The stop mark stays.
+    "  [ \"$records\" -eq 0 ] || rm -f -- \"$dir\"/*.json \"$dir\"/*.json.tmp 2>/dev/null",
     "fi",
+    // No launch of a run starts a week after its stop: drop older marks and
+    // their directories.
+    `find "\${dir%/*}" -mindepth 2 -maxdepth 2 -type f -name ${REMOTE_RUN_STOPPED_MARK} -mtime +7 -exec sh -c 'for f; do rm -f -- "$f"; rmdir -- "\${f%/*}" 2>/dev/null; done' sh {} + 2>/dev/null`,
     `printf '${STOP_SUMMARY_PREFIX} records=%s matched=%s killed=%s skipped=%s survived=%s partial=%s\\n' "$records" "$matched" "$killed" "$skipped" "$survived" "\${partial:--}"`,
     "exit 0",
   ];

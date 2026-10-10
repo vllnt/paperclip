@@ -130,7 +130,10 @@ lease. Each launch records its leader in
 child a random marker in the `PAPERCLIP_RUN_MARKER` environment variable; the
 stop signals only the worker user's processes that are in the verified leader's
 process group or carry an exact recorded marker, and checks each start time
-again before `SIGKILL`.
+again before `SIGKILL`. The stop first leaves a `stopped` mark in that
+directory, so a launch that has not written its record yet does not start;
+marks older than a week are removed. It connects to the worker and root
+recorded when the lease was acquired, even if the environment was edited since.
 
 The server writes one of these events per SSH lease:
 
@@ -138,7 +141,7 @@ The server writes one of these events per SSH lease:
 |---|---|---|
 | `remote_processes_stopped` | info | Nothing of the run is left on the worker. |
 | `remote_processes_survived` | warn | Some processes were still running after `SIGKILL`. |
-| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_summary`, `config_unavailable` or `environment_deleted`. |
+| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_stop_mark`, `no_summary`, `config_unavailable`, `environment_changed` or `environment_deleted`. |
 
 The payload holds the environment id and the counts `records`, `matched`,
 `killed`, `skipped` and `survived`, plus `reason` when there is one. The marker
