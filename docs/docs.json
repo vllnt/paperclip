@@ -125,6 +125,7 @@
               "api/approvals",
               "api/goals-and-projects",
               "api/costs",
+              "api/heartbeat-runs",
               "api/secrets",
               "api/activity",
               "api/dashboard"

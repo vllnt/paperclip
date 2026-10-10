@@ -2884,8 +2884,8 @@ export function Inbox() {
                     if (showTodayDivider) {
                       elements.push(
                         <div key={`today-divider-${group.key}-${index}`} className="my-2 flex items-center gap-3 px-4">
-                          <div className="flex-1 border-t border-zinc-600" />
-                          <span className="shrink-0 text-(length:--text-micro) font-medium uppercase tracking-wider text-zinc-500">
+                          <div className="flex-1 border-t border-border" />
+                          <span className="shrink-0 text-(length:--text-micro) font-medium uppercase tracking-wider text-muted-foreground">
                             Earlier
                           </span>
                         </div>,

@@ -224,6 +224,83 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     }
   });
 
+  describe("board column scoping", () => {
+    const columnKey = (status: string) => [
+      ...queryKeys.issues.boardColumns("company-1"),
+      status, "", "__all-projects__", {}, "compact", 200, "without-routine-executions",
+    ];
+    const seedBoard = () => {
+      const client = new QueryClient();
+      client.setQueryData(columnKey("todo"), [{ id: "issue-1" }]);
+      client.setQueryData(columnKey("in_progress"), [{ id: "issue-2" }]);
+      client.setQueryData(columnKey("done"), [{ id: "issue-3" }]);
+      client.setQueryData(queryKeys.issues.labels("company-1"), []);
+      return client;
+    };
+    const emit = (client: QueryClient, entityId: string, action = "issue.comment_added", details: unknown = null) =>
+      __liveUpdatesTestUtils.invalidateActivityQueries(
+        client,
+        "company-1",
+        { entityType: "issue", entityId, action, details },
+        { userId: null, agentId: null },
+      );
+    const listRefreshes = (invalidate: { mock: { calls: unknown[][] } }) =>
+      invalidate.mock.calls
+        .map(([filters]) => filters)
+        .filter((filters): filters is { queryKey: unknown[]; predicate?: (query: unknown) => boolean } =>
+          typeof filters === "object" && filters !== null && "queryKey" in filters
+          && JSON.stringify((filters as { queryKey: unknown }).queryKey) === JSON.stringify(queryKeys.issues.list("company-1")));
+    const refreshed = (client: QueryClient, filters: { predicate?: (query: never) => boolean }) =>
+      client.getQueryCache().getAll()
+        .filter((query) => (filters.predicate ? filters.predicate(query as never) : true))
+        .map((query) => String(query.queryKey[2] === "board-column" ? query.queryKey[3] : query.queryKey[2]))
+        .sort();
+
+    it("refreshes only the column holding the commented issue, and not the label catalog", () => {
+      vi.useFakeTimers();
+      try {
+        const client = seedBoard();
+        const invalidate = vi.spyOn(client, "invalidateQueries");
+        emit(client, "issue-1");
+        const [first] = listRefreshes(invalidate);
+        expect(first.predicate).toBeTypeOf("function");
+        expect(refreshed(client, first)).toEqual(["todo"]);
+        client.clear();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("covers every collapsed event in the trailing refresh, and widens to all for a status change", () => {
+      vi.useFakeTimers();
+      try {
+        const client = seedBoard();
+        const invalidate = vi.spyOn(client, "invalidateQueries");
+        emit(client, "issue-1");
+        vi.advanceTimersByTime(500);
+        emit(client, "issue-2");
+        emit(client, "issue-1", "issue.updated", { changes: { priority: { from: "low", to: "high" } } });
+        expect(listRefreshes(invalidate)).toHaveLength(1);
+
+        vi.advanceTimersByTime(2_500);
+        const [, trailing] = listRefreshes(invalidate);
+        expect(refreshed(client, trailing)).toEqual(["in_progress", "todo"]);
+
+        // The trailing refresh opened a new window: these two collapse into its
+        // trailing refresh, and the status change widens that one to every list.
+        emit(client, "issue-1");
+        emit(client, "issue-3", "issue.updated", { changes: { status: { from: "in_progress", to: "done" } }, status: "done" });
+        vi.advanceTimersByTime(3_000);
+        const refreshesNow = listRefreshes(invalidate);
+        expect(refreshesNow).toHaveLength(3);
+        expect(refreshesNow[2]).toEqual({ queryKey: queryKeys.issues.list("company-1") });
+        client.clear();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("still refreshes comments when a comment activity event arrives", () => {
     const invalidations: unknown[] = [];
     const queryClient = {
@@ -231,6 +308,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         invalidations.push(input);
       },
       getQueryData: () => undefined,
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -658,6 +736,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         invalidations.push(input);
       },
       getQueryData: () => undefined,
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -877,6 +956,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
       invalidateQueries: (input: unknown) => {
         invalidations.push(input);
       },
+      getQueriesData: () => [],
       getQueryData: (key: unknown) => {
         if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
           return {

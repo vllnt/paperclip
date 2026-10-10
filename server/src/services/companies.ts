@@ -1,4 +1,5 @@
-import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
+import { and, count, eq, getTableName, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
+import type { AnyPgColumn, PgTable } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   companies,
@@ -16,6 +17,7 @@ import {
   heartbeatRuns,
   runIdentityContexts,
   heartbeatRunEvents,
+  runUsageRecords,
   costEvents,
   financeEvents,
   issueReadStates,
@@ -33,8 +35,46 @@ import {
   routineTriggers,
   routineRevisions,
   routines,
+  browserUseBrowsers,
+  browserUseRuns,
+  browserUseSessions,
+  browserUseSettings,
+  budgetIncidents,
+  budgetPolicies,
+  chatEndpoints,
+  completionContracts,
+  decisionArchiveNotificationOutbox,
+  decisionBundles,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisionTriage,
+  decisionTriageEvents,
+  decisions,
+  inboxDismissals,
+  nativeRunFinalizations,
+  nativeRunResults,
+  secretAccessEvents,
+  statusDecisionEffects,
+  statusDecisions,
+  workAssessments,
+  workspaceRuntimeServices,
+  chatActions,
+  chatConversations,
+  chatDeliveries,
+  chatGitHubReviews,
+  chatMessageLinks,
+  chatPublications,
+  chatTeamsFileTransfers,
+  companySkillTestRuns,
+  managedAgentProfiles,
+  toolMcpGateways,
+  issueDuplicatePairs,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
+import { explainBlockedCompanyRemoval } from "./company-removal-conflict.js";
+import { assertNoCrossCompanyReferences, lockCompanyForRemoval } from "./company-removal-cross-company.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { notifyCloudOfPrimaryCompanyLifecycleChange } from "./cloud-lifecycle-sync.js";
 import {
@@ -65,6 +105,26 @@ const SYSTEM_COMPANY_ACTOR: CompanyActivityActor = {
   agentId: null,
   runId: null,
 };
+
+/** Who asked for a company delete, and how long it waits for locks. */
+export interface CompanyRemovalOptions {
+  /** The user that the request authenticated as. An identifier, never a credential. */
+  actorUserId?: string | null;
+  /** The id of the board key record that the request used, when it used one. An identifier, never a credential. */
+  actorKeyId?: string | null;
+  /** The longest wait for one lock, in milliseconds. Defaults to 5 seconds. */
+  lockTimeoutMs?: number;
+}
+
+/**
+ * Reads how many rows a delete without `returning` removed. The postgres.js driver puts it
+ * on the result as `count`. Another driver may not, and then the log entry lists no rows.
+ */
+function affectedRows(result: unknown): number {
+  if (typeof result !== "object" || result === null) return 0;
+  const total: unknown = Reflect.get(result, "count");
+  return typeof total === "number" ? total : 0;
+}
 
 export function companyService(db: Db) {
   const environmentsSvc = environmentService(db);
@@ -536,56 +596,134 @@ export function companyService(db: Db) {
       return result.company;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
-        // Delete from child tables in dependency order
-        const companyRunIds = await tx
-          .select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.companyId, id));
-
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, id));
-        if (companyRunIds.length > 0) {
-          await tx
-            .delete(heartbeatRunEvents)
-            .where(inArray(heartbeatRunEvents.runId, companyRunIds.map((run) => run.id)));
+    /**
+     * Deletes a company and every row it owns, in one transaction. Each table is
+     * deleted only by its own `company_id`, so no delete here names another company's rows.
+     *
+     * Two kinds of reference can still reach another company. A cascade or set-null key
+     * would delete a row of another company, or clear its reference, when it points at a
+     * row of this company: `assertNoCrossCompanyReferences` finds these first, before any
+     * delete, and the call fails with a 409 and the code
+     * `company_delete_cross_company_references`. A key that blocks the delete is stopped by
+     * the database: the call fails with a 409 that names the blocking table. Either way
+     * nothing is deleted.
+     *
+     * The check only holds if no such row can appear after it. So the transaction first
+     * locks the company row and the rows of this company that other rows could point at
+     * (`lockCompanyForRemoval`). A write that would add such a reference waits, and fails
+     * with a foreign-key error once the delete commits. If a lock cannot be had within the
+     * limit, or Postgres ends the transaction to break a deadlock, the call fails with a 409
+     * and the code `company_delete_busy`, and trying again can work.
+     *
+     * After the commit it writes one `company_deleted` log entry with the actor and the
+     * number of rows removed per table. It holds no names and no content.
+     *
+     * The order below is checked against the live foreign keys by
+     * `company-removal-coverage.test.ts`: a table with a blocking key to any row
+     * that this method deletes must be deleted here before that row.
+     */
+    remove: async (id: string, audit: CompanyRemovalOptions = {}) => {
+      try {
+        const outcome = await db.transaction(async (tx) => {
+          await lockCompanyForRemoval(tx, id, audit.lockTimeoutMs);
+          await assertNoCrossCompanyReferences(tx, id);
+          const rowCounts: Record<string, number> = {};
+          const removeOwned = async <TTable extends PgTable & { companyId: AnyPgColumn }>(table: TTable): Promise<void> => {
+            const removed = affectedRows(await tx.delete(table).where(eq(table.companyId, id)));
+            if (removed > 0) rowCounts[getTableName(table)] = removed;
+          };
+          await removeOwned(heartbeatRunEvents);
+          await removeOwned(agentTaskSessions);
+          await removeOwned(activityLog);
+          await removeOwned(runIdentityContexts);
+          await removeOwned(runUsageRecords);
+          await removeOwned(financeEvents);
+          await removeOwned(nativeRunFinalizations);
+          await removeOwned(statusDecisionEffects);
+          await removeOwned(statusDecisions);
+          await removeOwned(costEvents);
+          await removeOwned(decisionTriageEvents);
+          await removeOwned(workAssessments);
+          await removeOwned(browserUseRuns);
+          await removeOwned(decisionBundles);
+          await removeOwned(decisionQueueItems);
+          await removeOwned(decisionQueues);
+          await removeOwned(decisionRetention);
+          await removeOwned(decisionTriage);
+          await removeOwned(decisions);
+          await removeOwned(nativeRunResults);
+          await removeOwned(heartbeatRuns);
+          await removeOwned(agentWakeupRequests);
+          await removeOwned(agentApiKeys);
+          await removeOwned(agentRuntimeState);
+          await removeOwned(chatMessageLinks);
+          await removeOwned(chatPublications);
+          await removeOwned(issueComments);
+          await removeOwned(issueDuplicatePairs);
+          await removeOwned(approvalComments);
+          await removeOwned(budgetIncidents);
+          await removeOwned(approvals);
+          await removeOwned(managedAgentProfiles);
+          await removeOwned(companySecrets);
+          await removeOwned(joinRequests);
+          await removeOwned(invites);
+          await removeOwned(principalPermissionGrants);
+          await removeOwned(companyMemberships);
+          await removeOwned(companySkillTestRuns);
+          await removeOwned(companySkills);
+          await removeOwned(routineRuns);
+          await removeOwned(routineTriggers);
+          await removeOwned(routineRevisions);
+          await removeOwned(routines);
+          await removeOwned(issueReadStates);
+          await removeOwned(browserUseBrowsers);
+          await removeOwned(documents);
+          await removeOwned(browserUseSessions);
+          await removeOwned(chatActions);
+          await removeOwned(chatDeliveries);
+          await removeOwned(completionContracts);
+          await removeOwned(chatConversations);
+          await removeOwned(chatGitHubReviews);
+          await removeOwned(chatTeamsFileTransfers);
+          await removeOwned(issues);
+          await removeOwned(companyLogos);
+          await removeOwned(assets);
+          await removeOwned(projects);
+          await removeOwned(goals);
+          await removeOwned(chatEndpoints);
+          await removeOwned(decisionArchiveNotificationOutbox);
+          await removeOwned(agents);
+          await removeOwned(browserUseSettings);
+          await removeOwned(budgetPolicies);
+          await removeOwned(inboxDismissals);
+          await removeOwned(secretAccessEvents);
+          await removeOwned(workspaceRuntimeServices);
+          await removeOwned(toolMcpGateways);
+          const rows = await tx
+            .delete(companies)
+            .where(eq(companies.id, id))
+            .returning();
+          const company = rows[0] ?? null;
+          if (company) rowCounts[getTableName(companies)] = 1;
+          return { company, rowCounts };
+        });
+        if (outcome.company) {
+          logger.info(
+            {
+              event: "company_deleted",
+              companyId: id,
+              actorUserId: audit.actorUserId ?? null,
+              actorKeyId: audit.actorKeyId ?? null,
+              rowCounts: outcome.rowCounts,
+            },
+            "Company deleted",
+          );
         }
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, id));
-        await tx.delete(activityLog).where(eq(activityLog.companyId, id));
-        await tx.delete(runIdentityContexts).where(eq(runIdentityContexts.companyId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
-        await tx.delete(issueComments).where(eq(issueComments.companyId, id));
-        await tx.delete(costEvents).where(eq(costEvents.companyId, id));
-        await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
-        await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
-        await tx.delete(approvals).where(eq(approvals.companyId, id));
-        await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
-        await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
-        await tx.delete(invites).where(eq(invites.companyId, id));
-        await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
-        await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
-        await tx.delete(companySkills).where(eq(companySkills.companyId, id));
-        await tx.delete(routineRuns).where(eq(routineRuns.companyId, id));
-        await tx.delete(routineTriggers).where(eq(routineTriggers.companyId, id));
-        await tx.delete(routineRevisions).where(eq(routineRevisions.companyId, id));
-        await tx.delete(routines).where(eq(routines.companyId, id));
-        await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
-        await tx.delete(documents).where(eq(documents.companyId, id));
-        await tx.delete(issues).where(eq(issues.companyId, id));
-        await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
-        await tx.delete(assets).where(eq(assets.companyId, id));
-        await tx.delete(goals).where(eq(goals.companyId, id));
-        await tx.delete(projects).where(eq(projects.companyId, id));
-        await tx.delete(agents).where(eq(agents.companyId, id));
-        const rows = await tx
-          .delete(companies)
-          .where(eq(companies.id, id))
-          .returning();
-        return rows[0] ?? null;
-      }),
+        return outcome.company;
+      } catch (error) {
+        throw (await explainBlockedCompanyRemoval(db, id, error)) ?? error;
+      }
+    },
 
     stats: () =>
       Promise.all([

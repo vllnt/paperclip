@@ -1202,7 +1202,7 @@ function JobStatusDot({ status }: { status: string }) {
         : status === "running"
           ? "bg-blue-500 animate-pulse"
           : status === "cancelled"
-            ? "bg-gray-400"
+            ? "bg-status-neutral"
             : "bg-amber-500"; // queued, pending
   return (
     <span

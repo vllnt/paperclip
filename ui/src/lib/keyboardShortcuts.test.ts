@@ -365,6 +365,27 @@ describe("hasBlockingShortcutDialog", () => {
     return root;
   }
 
+  // jsdom has no layout and no checkVisibility, so the content's
+  // getClientRects is stubbed to say whether it renders. `overrides` replaces
+  // other content methods, such as a DOM check that throws.
+  function popup(
+    contentAttributes: Record<string, string>,
+    options: { wrapper?: Record<string, string>; rendered?: boolean; overrides?: Record<string, unknown> } = {},
+  ): HTMLElement {
+    const { wrapper: wrapperAttributes = {}, rendered = true, overrides = {} } = options;
+    const root = document.createElement("div");
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("data-radix-popper-content-wrapper", "");
+    for (const [name, value] of Object.entries(wrapperAttributes)) wrapper.setAttribute(name, value);
+    const content = document.createElement("div");
+    for (const [name, value] of Object.entries(contentAttributes)) content.setAttribute(name, value);
+    const methods = { getClientRects: () => (rendered ? [{ width: 120, height: 40 }] : []), ...overrides };
+    for (const [name, value] of Object.entries(methods)) Object.defineProperty(content, name, { value });
+    wrapper.appendChild(content);
+    root.appendChild(wrapper);
+    return root;
+  }
+
   it("detects open Radix modal contents, which carry no aria-modal", () => {
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "dialog-content", "data-state": "open" }))).toBe(true);
     expect(hasBlockingShortcutDialog(mount({ role: "dialog", "data-slot": "sheet-content", "data-state": "open" }))).toBe(true);
@@ -389,6 +410,7 @@ describe("hasBlockingShortcutDialog", () => {
     const popover = document.createElement("div");
     popover.setAttribute("role", "dialog");
     popover.setAttribute("data-state", "open");
+    Object.defineProperty(popover, "getClientRects", { value: () => [{ width: 120, height: 40 }] });
     wrapper.appendChild(popover);
     root.appendChild(wrapper);
     // A popover is not modal, but it still owns the keyboard while open.
@@ -397,20 +419,51 @@ describe("hasBlockingShortcutDialog", () => {
   });
 
   it("blocks shortcuts while a menu or select is open, but not for a tooltip or a closing popover", () => {
-    function popup(attributes: Record<string, string>) {
-      const root = document.createElement("div");
-      const wrapper = document.createElement("div");
-      wrapper.setAttribute("data-radix-popper-content-wrapper", "");
-      const content = document.createElement("div");
-      for (const [name, value] of Object.entries(attributes)) content.setAttribute(name, value);
-      wrapper.appendChild(content);
-      root.appendChild(wrapper);
-      return root;
-    }
     expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }))).toBe(true);
     expect(hasBlockingShortcutDialog(popup({ role: "listbox", "data-state": "open" }))).toBe(true);
     expect(hasBlockingShortcutDialog(popup({ role: "tooltip", "data-state": "delayed-open" }))).toBe(false);
     expect(hasBlockingShortcutDialog(popup({ role: "dialog", "data-state": "closed" }))).toBe(false);
+  });
+
+  it("ignores popper content that is hidden or aria-hidden, on itself or on an ancestor", () => {
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", hidden: "" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "listbox", "aria-hidden": "true" }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { wrapper: { "aria-hidden": "true" } }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "dialog", "data-state": "open" }, { wrapper: { hidden: "" } }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { wrapper: { "aria-hidden": "false" } }))).toBe(true);
+  });
+
+  it("ignores popper content under a closed ancestor or that does not render", () => {
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { wrapper: { "data-state": "closed" } }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { rendered: false }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { wrapper: { "data-state": "open" } }))).toBe(true);
+  });
+
+  it("asks checkVisibility, with CSS checks, when the browser has it", () => {
+    const calls: unknown[] = [];
+    function checkVisibility(visible: boolean) {
+      return (options: unknown) => {
+        calls.push(options);
+        return visible;
+      };
+    }
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { overrides: { checkVisibility: checkVisibility(false) } }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { rendered: false, overrides: { checkVisibility: checkVisibility(true) } }))).toBe(true);
+    expect(calls).toEqual([{ checkVisibilityCSS: true }, { checkVisibilityCSS: true }]);
+  });
+
+  it("does not block when a DOM check on the content throws", () => {
+    function boom(): never {
+      throw new Error("DOM check failed");
+    }
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { overrides: { closest: boom } }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { overrides: { checkVisibility: boom } }))).toBe(false);
+    // Popover content is also matched as a dialog, which checks closest again.
+    expect(hasBlockingShortcutDialog(popup({ role: "dialog", "data-state": "open" }, { overrides: { closest: boom } }))).toBe(false);
+    // A popup whose check throws does not hide another popup that is open.
+    const root = popup({ role: "menu", "data-state": "open" }, { overrides: { closest: boom } });
+    root.append(...popup({ role: "listbox", "data-state": "open" }).childNodes);
+    expect(hasBlockingShortcutDialog(root)).toBe(true);
   });
 
   it("finds the modal around a popover that is open inside it", () => {

@@ -91,7 +91,7 @@ export function describeRunRetryState(run: RetryAwareRun): RunRetryStateSummary 
   return {
     kind: "attempted",
     badgeLabel: isMaxTurnContinuation ? "Continued run" : "Retried run",
-    tone: "border-slate-500/20 bg-slate-500/10 text-slate-700 dark:text-slate-300",
+    tone: "border-border bg-muted text-muted-foreground",
     detail: joinFragments([attemptLabel, reasonLabel]),
     secondary: null,
     retryOfRunId,

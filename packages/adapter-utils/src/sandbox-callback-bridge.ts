@@ -1,7 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import http2 from "node:http2";
-import os from "node:os";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import {
@@ -20,6 +19,13 @@ import {
   type StartupSpanContext,
 } from "./acpx-engine/startup-timing.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import {
+  buildRemoteProcessRecordLines,
+  buildRemoteProcessStopLines,
+  parseRemoteProcessIdentity,
+  type RemoteProcessIdentity,
+} from "./remote-process-identity.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
 
@@ -61,6 +67,12 @@ const DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS = 10_000;
 // calls). It is larger than one iteration timeout, so a single slow iteration
 // never trips it, and it stays under the in-sandbox 30s response deadline.
 const DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS = 20_000;
+// The host's queue worker rewrites the host lease file this often while it runs.
+const DEFAULT_BRIDGE_HOST_LEASE_REFRESH_MS = 60_000;
+// A file-mode bridge exits when no host rewrote its lease for this long. The
+// watchdog already treats 20 s without a poll as a broken relay, so a live run
+// never comes near it.
+const DEFAULT_BRIDGE_HOST_LEASE_MS = 10 * 60_000;
 // Grace period the recovery path gives an aborted in-flight handler to finalize
 // its own response. The recovery path aborts the handler, then waits this long.
 // A cooperating handler threads the abort signal into its work, rejects, and
@@ -162,12 +174,14 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/]+\/approvals$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/routines$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/skills$/ },
-  // Company skills: read back and file updates. The server's skills.edit policy decides which agents may write;
-  // set a deny-by-default skill policy before relying on this. Id slots exclude ?, #, %, . and \ so a
+  // Company skills: read back, file updates and create. The server's skill policy (skills.edit, skills.create)
+  // decides which agents may write, and it also enforces the company boundary and logs the change; set a
+  // deny-by-default skill policy before relying on this. Id slots exclude ?, #, %, . and \ so a
   // queue_v1 path can't smuggle a query, an encoded segment or a dot segment past the rule.
   { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+$/ },
   { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
   { method: "PATCH", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
+  { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/skills$/ },
   // Decisions: agents ask the board and withdraw their own open asks (the server allows the origin agent only).
   // Listing stays board-only; deciding and dismissing stay human-only.
   { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/decisions$/ },
@@ -291,6 +305,7 @@ export interface SandboxCallbackBridgeDirectories {
   readyFile: string;
   pidFile: string;
   logFile: string;
+  hostLeaseFile: string;
 }
 
 export interface SandboxCallbackBridgeQueueClient {
@@ -503,6 +518,7 @@ export function sandboxCallbackBridgeDirectories(rootDir: string): SandboxCallba
     readyFile: path.posix.join(rootDir, "ready.json"),
     pidFile: path.posix.join(rootDir, "server.pid"),
     logFile: path.posix.join(rootDir, "logs", "bridge.log"),
+    hostLeaseFile: path.posix.join(rootDir, "host-lease"),
   };
 }
 
@@ -515,8 +531,18 @@ export function buildSandboxCallbackBridgeEnv(input: {
   responseTimeoutMs?: number | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  runId?: string | null;
+  hostLeaseMs?: number | null;
+  lifetimeCheckMs?: number | null;
 }): Record<string, string> {
+  const runId = input.runId?.trim();
+  const hostLeaseMs = normalizeTimeoutMs(input.hostLeaseMs, DEFAULT_BRIDGE_HOST_LEASE_MS);
   return {
+    ...(runId ? { PAPERCLIP_BRIDGE_RUN_ID: runId } : {}),
+    PAPERCLIP_BRIDGE_HOST_LEASE_MS: String(hostLeaseMs),
+    PAPERCLIP_BRIDGE_LIFETIME_CHECK_MS: String(
+      normalizeTimeoutMs(input.lifetimeCheckMs, Math.max(100, Math.min(30_000, Math.floor(hostLeaseMs / 4)))),
+    ),
     PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_FILE_MODE,
     PAPERCLIP_BRIDGE_QUEUE_DIR: input.queueDir,
     PAPERCLIP_BRIDGE_TOKEN: input.bridgeToken,
@@ -538,16 +564,18 @@ export function buildSandboxCallbackBridgeEnv(input: {
 }
 
 export async function createSandboxCallbackBridgeAsset(): Promise<SandboxCallbackBridgeAsset> {
-  const localDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-asset-"));
-  const entrypoint = path.join(localDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
-  await fs.writeFile(entrypoint, getSandboxCallbackBridgeServerSource(), "utf8");
-  return {
-    localDir,
-    entrypoint,
-    cleanup: async () => {
-      await fs.rm(localDir, { recursive: true, force: true }).catch(() => undefined);
-    },
+  const localDir = await createPaperclipTempDir("paperclip-bridge-asset-");
+  const cleanup = async () => {
+    await removePaperclipTempDir(localDir).catch(() => undefined);
   };
+  const entrypoint = path.join(localDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
+  try {
+    await fs.writeFile(entrypoint, getSandboxCallbackBridgeServerSource(), "utf8");
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { localDir, entrypoint, cleanup };
 }
 
 export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallbackBridgeQueueClient {
@@ -929,8 +957,14 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // runs under the run parent with no wrapper span, exactly like the earlier
   // behavior.
   runtimeSpan?: RuntimeSpanRunner;
+  // How often the worker rewrites the host lease file while its poll loop runs.
+  // The file-mode bridge exits when the file stops changing for its lease, so
+  // a bridge whose host died (a server restart, a lost run) cannot outlive its
+  // run. Defaults to DEFAULT_BRIDGE_HOST_LEASE_REFRESH_MS.
+  hostLeaseRefreshMs?: number | null;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
+  const hostLeaseRefreshMs = normalizeTimeoutMs(input.hostLeaseRefreshMs, DEFAULT_BRIDGE_HOST_LEASE_REFRESH_MS);
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
   const abortedHandlerGraceMs = normalizeTimeoutMs(
@@ -1589,6 +1623,29 @@ export async function startSandboxCallbackBridgeWorker(input: {
     if (typeof watchdogTimer.unref === "function") {
       watchdogTimer.unref();
     }
+    // The host lease also runs on its own timer, so a slow poll never delays
+    // it and it never delays a poll. It stops with the loop. Each write is
+    // unique, so the bridge sees the file change. Best effort: a missed write
+    // only shortens the lease.
+    let hostLeaseSequence = 0;
+    let hostLeaseWriteInFlight = false;
+    const refreshHostLease = () => {
+      if (settled || stopping || hostLeaseWriteInFlight) return;
+      hostLeaseWriteInFlight = true;
+      hostLeaseSequence += 1;
+      void Promise.resolve().then(() => withTimeout(
+        input.client.writeTextFile(directories.hostLeaseFile, `${hostLeaseSequence} ${new Date().toISOString()}\n`),
+        iterationTimeoutMs,
+        "Sandbox callback bridge host lease",
+      )).catch(() => undefined).finally(() => {
+        hostLeaseWriteInFlight = false;
+      });
+    };
+    refreshHostLease();
+    const hostLeaseTimer = setInterval(refreshHostLease, hostLeaseRefreshMs);
+    if (typeof hostLeaseTimer.unref === "function") {
+      hostLeaseTimer.unref();
+    }
     try {
       // Consecutive transient poll failures. A single failed list call — one
       // reset or slow sandbox exec — must not end the relay for the rest of the
@@ -1708,6 +1765,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       }
     } finally {
       clearInterval(watchdogTimer);
+      clearInterval(hostLeaseTimer);
       settled = true;
       if (settleResolve) {
         settleResolve();
@@ -1872,6 +1930,31 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
   };
 }
 
+// Stops the bridge only after proving it is this bridge (see
+// `remote-process-identity.ts`), then removes the queue metadata only while it
+// still names this bridge, so a newer bridge's stays. A newer bridge can still
+// replace the metadata between the read and the removal.
+function buildSandboxBridgeStopScript(input: {
+  identity: RemoteProcessIdentity | null;
+  argv: string[];
+  instance: string;
+  directories: SandboxCallbackBridgeDirectories;
+}): string {
+  const pidFile = shellQuote(input.directories.pidFile);
+  const readyFile = shellQuote(input.directories.readyFile);
+  return [
+    ...buildRemoteProcessStopLines({
+      identity: input.identity,
+      argv: input.argv,
+      label: "sandbox callback bridge",
+      nonceArg: `--paperclip-bridge-instance=${input.instance}`,
+    }),
+    `instance=${shellQuote(input.instance)}`,
+    `if [ "$(cat ${pidFile} 2>/dev/null)" = "$pid $instance" ]; then rm -f ${pidFile}; fi`,
+    `if grep -Fq '"pid":'"$pid," ${readyFile} 2>/dev/null && grep -Fq '"instance":"'"$instance"'"' ${readyFile} 2>/dev/null; then rm -f ${readyFile}; fi`,
+  ].join("\n");
+}
+
 export async function startSandboxCallbackBridgeServer(input: {
   runner: CommandManagedRuntimeRunner;
   remoteCwd: string;
@@ -1888,6 +1971,11 @@ export async function startSandboxCallbackBridgeServer(input: {
   shellCommand?: "bash" | "sh" | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  // The run the bridge serves. It is added to the bridge's argv and env, so an
+  // operator (or a sweep) can tell which run a bridge process belongs to.
+  runId?: string | null;
+  hostLeaseMs?: number | null;
+  lifetimeCheckMs?: number | null;
 }): Promise<StartedSandboxCallbackBridgeServer> {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
@@ -1913,19 +2001,44 @@ export async function startSandboxCallbackBridgeServer(input: {
     responseTimeoutMs: input.responseTimeoutMs,
     maxQueueDepth: input.maxQueueDepth,
     maxBodyBytes: input.maxBodyBytes,
+    runId: input.runId,
+    hostLeaseMs: input.hostLeaseMs,
+    lifetimeCheckMs: input.lifetimeCheckMs,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
+  const runId = input.runId?.trim();
+  // A random tag for this start. With the start time it tells this bridge
+  // from every other process, also one with the same entrypoint and run.
+  const instance = randomUUID();
+  const bridgeArgv = [
+    nodeCommand,
+    remoteEntrypoint,
+    ...(runId ? [`--paperclip-run-id=${runId}`] : []),
+    `--paperclip-bridge-instance=${instance}`,
+  ];
+  const bridgeCommand =
+    `${bridgeArgv.map((arg) => shellQuote(arg)).join(" ")} >> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`;
   const startResult = await runSandboxBridgeControlCommand(input.runner, {
     command: shellCommand,
     args: shellCommandArgs(
       [
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
-          `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
+        // With `setsid` the bridge leads its own process group, so stop can
+        // signal the whole bridge; otherwise stop signals the process alone.
+        // The background job does not lead a group, so `setsid` does not fork
+        // and `$!` is the bridge itself.
+        "group=0",
+        "if command -v setsid >/dev/null 2>&1; then",
+        `  nohup setsid ${bridgeCommand}`,
+        "  group=1",
+        "else",
+        `  nohup ${bridgeCommand}`,
+        "fi",
         "pid=$!",
-        `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
-        "printf '{\"pid\":%s}\\n' \"$pid\"",
+        `printf '%s %s\\n' \"$pid\" ${shellQuote(instance)} > ${shellQuote(directories.pidFile)}`,
+        // The launch record the stop proves the bridge against.
+        ...buildRemoteProcessRecordLines(),
       ].join("\n"),
     ),
     cwd: input.remoteCwd,
@@ -1935,50 +2048,78 @@ export async function startSandboxCallbackBridgeServer(input: {
     },
     timeoutMs,
   });
-  requireSuccessfulResult("start sandbox callback bridge", startResult);
+  const identity = parseRemoteProcessIdentity(startResult.stdout);
+  const stopBridge = async () => {
+    const stopResult = await runSandboxBridgeControlCommand(input.runner, {
+      command: shellCommand,
+      args: shellCommandArgs(buildSandboxBridgeStopScript({ identity, argv: bridgeArgv, instance, directories })),
+      cwd: input.remoteCwd,
+      env: {
+        [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
+      },
+      timeoutMs,
+    });
+    if (stopResult.timedOut) {
+      throw new Error(buildRunnerFailureMessage("stop sandbox callback bridge", stopResult));
+    }
+  };
 
-  const readyResult = await runShell(
-    input.runner,
-    input.remoteCwd,
-    [
-      "i=0",
-      `while [ \"$i\" -lt 200 ]; do`,
-      `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
-      `    cat ${shellQuote(directories.readyFile)}`,
-      "    exit 0",
-      "  fi",
-      `  if [ -s ${shellQuote(directories.logFile)} ] && ! kill -0 \"$(cat ${shellQuote(directories.pidFile)} 2>/dev/null)\" 2>/dev/null; then`,
-      `    cat ${shellQuote(directories.logFile)} >&2`,
-      "    exit 1",
-      "  fi",
-      "  i=$((i + 1))",
-      "  sleep 0.05",
-      "done",
-      `echo "Timed out waiting for bridge readiness." >&2`,
-      `if [ -s ${shellQuote(directories.logFile)} ]; then cat ${shellQuote(directories.logFile)} >&2; fi`,
-      "exit 1",
-    ].join("\n"),
-    timeoutMs,
-    shellCommand,
-  );
-  requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
+  const readBridgeReadiness = async () => {
+    requireSuccessfulResult("start sandbox callback bridge", startResult);
 
-  let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
-  try {
-    readyData = JSON.parse(readyResult.stdout.trim()) as { host?: string; port?: number; baseUrl?: string; pid?: number };
-  } catch (error) {
-    throw new Error(
-      `Sandbox callback bridge wrote invalid readiness JSON: ${error instanceof Error ? error.message : String(error)}`,
+    const readyResult = await runShell(
+      input.runner,
+      input.remoteCwd,
+      [
+        "i=0",
+        `while [ \"$i\" -lt 200 ]; do`,
+        `  if [ -s ${shellQuote(directories.readyFile)} ]; then`,
+        `    cat ${shellQuote(directories.readyFile)}`,
+        "    exit 0",
+        "  fi",
+        `  if [ -s ${shellQuote(directories.logFile)} ] && ! kill -0 \"$(cut -d' ' -f1 ${shellQuote(directories.pidFile)} 2>/dev/null)\" 2>/dev/null; then`,
+        `    cat ${shellQuote(directories.logFile)} >&2`,
+        "    exit 1",
+        "  fi",
+        "  i=$((i + 1))",
+        "  sleep 0.05",
+        "done",
+        `echo "Timed out waiting for bridge readiness." >&2`,
+        `if [ -s ${shellQuote(directories.logFile)} ]; then cat ${shellQuote(directories.logFile)} >&2; fi`,
+        "exit 1",
+      ].join("\n"),
+      timeoutMs,
+      shellCommand,
     );
-  }
+    requireSuccessfulResult("wait for sandbox callback bridge readiness", readyResult);
 
-  const host = typeof readyData.host === "string" && readyData.host.trim().length > 0
-    ? readyData.host.trim()
-    : "127.0.0.1";
-  const port = typeof readyData.port === "number" && Number.isFinite(readyData.port) ? readyData.port : 0;
-  if (!port) {
-    throw new Error("Sandbox callback bridge did not report a listening port.");
+    let readyData: { host?: string; port?: number; baseUrl?: string; pid?: number };
+    try {
+      readyData = JSON.parse(readyResult.stdout.trim()) as { host?: string; port?: number; baseUrl?: string; pid?: number };
+    } catch (error) {
+      throw new Error(
+        `Sandbox callback bridge wrote invalid readiness JSON: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    const host = typeof readyData.host === "string" && readyData.host.trim().length > 0
+      ? readyData.host.trim()
+      : "127.0.0.1";
+    const port = typeof readyData.port === "number" && Number.isFinite(readyData.port) ? readyData.port : 0;
+    if (!port) {
+      throw new Error("Sandbox callback bridge did not report a listening port.");
+    }
+    return { readyData, host, port };
+  };
+  // A bridge that started but failed readiness must not be left running.
+  let readiness: Awaited<ReturnType<typeof readBridgeReadiness>>;
+  try {
+    readiness = await readBridgeReadiness();
+  } catch (error) {
+    await stopBridge().catch(() => undefined);
+    throw error;
   }
+  const { readyData, host, port } = readiness;
   const baseUrl =
     typeof readyData.baseUrl === "string" && readyData.baseUrl.trim().length > 0
       ? readyData.baseUrl.trim()
@@ -1990,33 +2131,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     port,
     pid: typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : 0,
     directories,
-    stop: async () => {
-      const stopResult = await runSandboxBridgeControlCommand(input.runner, {
-        command: shellCommand,
-        args: shellCommandArgs(
-          [
-            `if [ -s ${shellQuote(directories.pidFile)} ]; then`,
-            `  pid="$(cat ${shellQuote(directories.pidFile)})"`,
-            "  kill \"$pid\" 2>/dev/null || true",
-            "  i=0",
-            "  while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 40 ]; do",
-            "    i=$((i + 1))",
-            "    sleep 0.05",
-            "  done",
-            "fi",
-            `rm -f ${shellQuote(directories.pidFile)} ${shellQuote(directories.readyFile)}`,
-          ].join("\n"),
-        ),
-        cwd: input.remoteCwd,
-        env: {
-          [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
-        },
-        timeoutMs,
-      });
-      if (stopResult.timedOut) {
-        throw new Error(buildRunnerFailureMessage("stop sandbox callback bridge", stopResult));
-      }
-    },
+    stop: stopBridge,
   };
 }
 
@@ -2298,12 +2413,16 @@ export function getSandboxBridgeProcessBodyLedgerSource(): string {
 export function getSandboxCallbackBridgeServerSource(): string {
   return `import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
+import { performance } from "node:perf_hooks";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import http2 from "node:http2";
 import { Duplex } from "node:stream";
 
 const bridgeMode = process.env.PAPERCLIP_API_BRIDGE_MODE || "${SANDBOX_CALLBACK_BRIDGE_FILE_MODE}";
+// The random tag of this start; the host compares it before it removes the ready file.
+const bridgeInstance = (process.argv.find((arg) => arg.startsWith("--paperclip-bridge-instance=")) || "")
+  .slice("--paperclip-bridge-instance=".length);
 const queueDir = process.env.PAPERCLIP_BRIDGE_QUEUE_DIR;
 const bridgeToken = process.env.PAPERCLIP_BRIDGE_TOKEN;
 const host = process.env.PAPERCLIP_BRIDGE_HOST || "127.0.0.1";
@@ -2650,10 +2769,64 @@ async function runFileGateway() {
     server.close(() => {
       process.exit(0);
     });
+    // A request still waiting for its response must not keep a stopped bridge
+    // alive: close every connection, and exit even if one hangs.
+    if (typeof server.closeAllConnections === "function") server.closeAllConnections();
+    setTimeout(() => process.exit(0), 1000).unref();
   }
 
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+
+  // The host's queue worker rewrites the host lease file while the run lives.
+  // Exit when the host stopped (a server restart, a lost run), the run's queue
+  // directory is gone, or a newer bridge took over the queue directory (its
+  // ready file names another process), so the bridge cannot outlive its run.
+  // The lease counts from the last change of the file's content on this
+  // process's monotonic clock, so neither clock skew nor a clock step matters.
+  const hostLeaseFile = path.posix.join(queueDir, "host-lease");
+  const hostLeaseMs = Number(process.env.PAPERCLIP_BRIDGE_HOST_LEASE_MS || "${DEFAULT_BRIDGE_HOST_LEASE_MS}");
+  const lifetimeCheckMs = Number(process.env.PAPERCLIP_BRIDGE_LIFETIME_CHECK_MS || "30000");
+  if (Number.isFinite(hostLeaseMs) && hostLeaseMs > 0) {
+    let leaseContent = await fs.readFile(hostLeaseFile, "utf8").catch(() => "");
+    let leaseChangedAt = performance.now();
+    let queueMissingChecks = 0;
+    let checkingLease = false;
+    const leaseCheck = setInterval(async () => {
+      if (checkingLease) return;
+      checkingLease = true;
+      try {
+        const queueGone = await fs.stat(requestsDir).then(() => false, (error) => Boolean(error && error.code === "ENOENT"));
+        // Two checks in a row, so a directory that is briefly recreated does not end a live bridge.
+        queueMissingChecks = queueGone ? queueMissingChecks + 1 : 0;
+        const content = await fs.readFile(hostLeaseFile, "utf8").catch(() => leaseContent);
+        if (content !== leaseContent) {
+          leaseContent = content;
+          leaseChangedAt = performance.now();
+        }
+        const ready = await fs.readFile(readyFile, "utf8").then((text) => {
+          try {
+            return JSON.parse(text);
+          } catch {
+            return null;
+          }
+        }, () => null);
+        const replaced = Boolean(ready && typeof ready.pid === "number" && ready.pid !== process.pid);
+        const reason = queueMissingChecks >= 2
+          ? "the queue directory is gone"
+          : replaced
+            ? "a newer bridge took over the queue directory"
+            : performance.now() - leaseChangedAt > hostLeaseMs ? "the host lease expired" : "";
+        if (reason) {
+          process.stderr.write("[paperclip-bridge] exiting: " + reason + "\\n");
+          void shutdown();
+        }
+      } finally {
+        checkingLease = false;
+      }
+    }, Number.isFinite(lifetimeCheckMs) && lifetimeCheckMs > 0 ? lifetimeCheckMs : 30000);
+    leaseCheck.unref();
+  }
 
   await fs.mkdir(requestsDir, { recursive: true });
   await fs.mkdir(responsesDir, { recursive: true });
@@ -2683,6 +2856,7 @@ async function runFileGateway() {
     }
     const ready = {
       pid: process.pid,
+      instance: bridgeInstance,
       host,
       port: address.port,
       baseUrl: \`http://\${host}:\${address.port}\`,
