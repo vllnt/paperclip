@@ -42,6 +42,15 @@ function shellQuote(value: string) {
 
 // Shell function shared by the stop scripts: `valid_pid` accepts only an
 // integer id from 2 to the platform maximum.
+// Shell function shared by the launch gate and the stop: prints a launch
+// record's `pid start group uid markerSha256`, or less when either line is not
+// exactly what `buildRemoteRunRecordLines` writes on a worker with `/proc`.
+const RECORD_FIELDS_LINES = [
+  "record_fields() {",
+  "  sed -n -e '1s/^{\"pid\":\\([1-9][0-9]*\\),\"start\":\"\\([0-9][0-9]*\\)\",\"group\":\\([01]\\)}$/\\1 \\2 \\3/p' -e '2s/^{\"uid\":\\([0-9][0-9]*\\),\"marker\":\"\\([0-9a-f]\\{64\\}\\)\"}$/\\1 \\2/p' \"$1\" 2>/dev/null",
+  "}",
+];
+
 const VALID_PID_LINES = [
   "pid_max=\"$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 4194304)\"",
   "valid_pid() {",
@@ -209,8 +218,9 @@ export const REMOTE_RUN_STOPPED_MARK = "stopped";
  * to `<recordDir>/<launchId>.json`: the identity line of
  * {@link buildRemoteProcessRecordLines}, then `{"uid":…,"marker":"<entrySha256>"}`.
  * They write a temporary file and rename it, and exit with 125 when the
- * record is not there afterwards. Then they exit with 143 when the run was
- * already stopped.
+ * record is not there afterwards or, on a worker with `/proc`, does not read
+ * back as the stop reads it. Then they exit with 143 when the run was already
+ * stopped.
  *
  * The order is the handshake with {@link buildRemoteProcessTreeStopLines},
  * which leaves its stop mark before it reads the records: either the stop
@@ -239,8 +249,13 @@ export function buildRemoteRunRecordLines(input: {
     ...buildRemoteProcessRecordLines(),
     `printf '{"uid":%s,"marker":"%s"}\\n' "$(id -u)" ${shellQuote(input.markerSha256)}`,
     `} > ${recordFile}.tmp 2>/dev/null && mv -f ${recordFile}.tmp ${recordFile} 2>/dev/null`,
-    // A launch that no stop could find must not start.
-    `[ -s ${recordFile} ] || { echo "[paperclip] The run's process record could not be written on the worker, so the run was not started." >&2; exit 125; }`,
+    // A launch that no stop could find must not start. Where the stop can
+    // work (with /proc), the record must read back exactly as the stop reads
+    // it; elsewhere the stop fails closed whatever the record holds.
+    ...RECORD_FIELDS_LINES,
+    "paperclip_record_ok=",
+    `if [ ! -s ${recordFile} ]; then :; elif [ -d /proc/self ]; then set -f; set -- $(record_fields ${recordFile}); set +f; [ "$#" -eq 5 ] && [ "$1" = "$pid" ] && paperclip_record_ok=1; else paperclip_record_ok=1; fi`,
+    `[ -n "$paperclip_record_ok" ] || { echo "[paperclip] The run's process record could not be written on the worker, so the run was not started." >&2; exit 125; }`,
     `[ ! -e ${input.recordDir}/${REMOTE_RUN_STOPPED_MARK} ] || exit 143`,
   ];
 }
@@ -311,6 +326,7 @@ export function buildRemoteProcessTreeStopLines(input: {
     "groups=",
     "hashes=",
     ...VALID_PID_LINES,
+    ...RECORD_FIELDS_LINES,
     "note() { [ -n \"$partial\" ] || partial=$1; }",
     `before_signal() { ${input.testOnlyBeforeSignal ?? ":"}; }`,
     // Sets st_state, st_pgrp and st_start without a fork: the scan calls it often.
@@ -380,9 +396,7 @@ export function buildRemoteProcessTreeStopLines(input: {
     "  for f in \"$dir\"/*.json; do",
     "    [ -f \"$f\" ] || continue",
     "    records=$((records + 1))",
-    "    rc_id=\"$(sed -n '1s/^{\"pid\":\\([1-9][0-9]*\\),\"start\":\"\\([0-9][0-9]*\\)\",\"group\":\\([01]\\)}$/\\1 \\2 \\3/p' \"$f\" 2>/dev/null)\"",
-    "    rc_own=\"$(sed -n '2s/^{\"uid\":\\([0-9][0-9]*\\),\"marker\":\"\\([0-9a-f]\\{64\\}\\)\"}$/\\1 \\2/p' \"$f\" 2>/dev/null)\"",
-    "    set -f; set -- $rc_id $rc_own; set +f",
+    "    set -f; set -- $(record_fields \"$f\"); set +f",
     "    if [ \"$#\" -ne 5 ] || ! valid_pid \"$1\"; then note bad_record; continue; fi",
     "    if [ \"$4\" != \"$me\" ]; then note uid_mismatch; continue; fi",
     "    hashes=\"$hashes $5\"",

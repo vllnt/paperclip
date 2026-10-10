@@ -90,7 +90,8 @@ async function writeRecord(dir: string, input: { pid: number | string; group: bo
     pidExpression: String(input.pid),
   });
   const script = input.uid === undefined ? lines.join("\n") : lines.join("\n").replace("$(id -u)", input.uid);
-  await execFileAsync("sh", ["-c", script]);
+  // A deliberately bad record is still written; only the launch gate after it exits 125.
+  await execFileAsync("sh", ["-c", script]).catch(() => undefined);
   return file;
 }
 
@@ -314,6 +315,7 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     root?: string;
     runId?: string;
     stdinPrefix?: string;
+    pathPrefix?: string;
   }) {
     const root = input.root ?? (await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-")));
     await mkdir(path.join(root, "ws"), { recursive: true });
@@ -336,7 +338,10 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     const child = spawn("sh", ["-c", target.args.at(-1)!], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: root,
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: input.home ?? root },
+      env: {
+        PATH: `${input.pathPrefix ? `${input.pathPrefix}:` : ""}${process.env.PATH ?? "/usr/bin:/bin"}`,
+        HOME: input.home ?? root,
+      },
     });
     let stdout = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -376,6 +381,19 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(launch.stdout).not.toContain("started");
     expect(launch.code).toBe(125);
     expect(launch.stderr).toContain("not started");
+  }, 30_000);
+
+  it("does not start a launch whose record is written but cannot be read back as valid", async () => {
+    // A failing `id` leaves the uid empty; a failing `cut` leaves the start time empty.
+    for (const broken of ["id", "cut"]) {
+      const bin = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-bin-"));
+      await writeFile(path.join(bin, broken), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+      const launch = await runLaunch({ command: "echo started", pathPrefix: bin });
+
+      expect(launch.stdout).not.toContain("started");
+      expect(launch.code).toBe(125);
+    }
   }, 30_000);
 
   it("does not start a launch whose marker line is missing or malformed", async () => {
