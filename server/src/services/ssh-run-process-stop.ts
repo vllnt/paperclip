@@ -23,7 +23,7 @@ export interface RemoteRunProcessStopOutcome extends RemoteProcessTreeStopSummar
   outcome: "stopped" | "survived" | "partial";
 }
 
-const NO_STOP: RemoteProcessTreeStopSummary = { records: 0, matched: 0, killed: 0, skipped: 0, survived: 0, partial: null };
+const NO_STOP: RemoteProcessTreeStopSummary = { records: 0, matched: 0, matchedByMarker: 0, matchedByGroup: 0, killed: 0, skipped: 0, survived: 0, partial: null };
 
 // The worker and root the lease was acquired on, as `acquireRunLease` recorded
 // them: an environment edited since then must not send the stop elsewhere.
@@ -201,6 +201,8 @@ export function remoteProcessStopRunEvent(outcome: RemoteRunProcessStopOutcome):
     environmentId: outcome.environmentId,
     records: outcome.records,
     matched: outcome.matched,
+    matchedByMarker: outcome.matchedByMarker,
+    matchedByGroup: outcome.matchedByGroup,
     killed: outcome.killed,
     skipped: outcome.skipped,
     survived: outcome.survived,

@@ -114,6 +114,14 @@ async function writeRecord(run: Run, input: { pid: number | string; group: boole
   return file;
 }
 
+/** Writes a record file directly, as a worker could, bypassing the launch's own checks. */
+async function writeRawRecord(run: Run, input: { pid: string; markerSha256: string }) {
+  await mkdir(run.dir, { recursive: true });
+  const uid = process.getuid!();
+  const body = `{"pid":${input.pid},"start":"1","group":1}\n{"uid":${uid},"marker":"${input.markerSha256}"}\n`;
+  await writeFile(path.join(run.dir, `${randomBytes(8).toString("hex")}.json`), body);
+}
+
 async function stop(run: Run, extra: Partial<Parameters<typeof buildRemoteProcessTreeStopLines>[0]> = {}) {
   const lines = buildRemoteProcessTreeStopLines({ remoteRoot: quote(run.root), runId: run.runId, termWaitSeconds: 1, ...extra });
   const { stdout } = await execFileAsync("sh", ["-c", lines.join("\n")], { timeout: 30_000 });
@@ -146,7 +154,7 @@ describe.skipIf(!isLinux)("remote process tree stop", () => {
     const summary = await stop(run);
     await settle();
 
-    expect(summary).toMatchObject({ records: 1, matched: 4, survived: 0, partial: null });
+    expect(summary).toMatchObject({ records: 1, matched: 4, matchedByMarker: 3, matchedByGroup: 1, survived: 0, partial: null });
     for (const pid of [group.leader!, group.member!, group.envless!, otherSession.leader!]) expect(alive(pid)).toBe(false);
     for (const bystander of bystanders) expect(alive(bystander.leader!)).toBe(true);
     expect(await readdir(dir)).toEqual(["stopped"]);
@@ -306,12 +314,35 @@ describe.skipIf(!isLinux)("remote process tree stop", () => {
     expect(summary).toMatchObject({ killed: 0, survived: 0 });
   }, 30_000);
 
+  it("keeps signalling and counting a member that clears its marker during the SIGTERM wait", async () => {
+    const marker = createRemoteRunMarker();
+    const markerEnv = { [REMOTE_RUN_MARKER_ENV]: marker.value };
+    const run = await newRun();
+    const leader = await startSession("echo ready; while :; do sleep 0.2; done", markerEnv);
+    // It joins by its marker. On SIGTERM it execs with an empty environment
+    // and ignores SIGTERM: same pid, same start time, so the same process.
+    const shedder = await startSession(
+      `trap 'exec env -i /bin/sh -c "trap \\"\\" TERM; while :; do sleep 0.2; done"' TERM; echo ready; while :; do sleep 0.2; done`,
+      markerEnv,
+    );
+    await writeRecord(run, { pid: leader.leader!, group: true, markerSha256: marker.entrySha256 });
+
+    const summary = await stop(run);
+    await settle();
+
+    expect(alive(leader.leader!)).toBe(false);
+    expect(alive(shedder.leader!)).toBe(false);
+    expect(summary?.matchedByMarker).toBeGreaterThanOrEqual(2);
+    expect(summary?.killed).toBeGreaterThanOrEqual(1);
+    expect(summary?.survived).toBe(0);
+  }, 30_000);
+
   it.each([["0"], ["1"], ["-1"], ["12x"], ["99999999999"]])("signals nothing for a record whose pid is %s", async (pid) => {
     const marker = createRemoteRunMarker();
     const run = await newRun();
     const dir = run.dir;
     const bystander = await startSession("", { [REMOTE_RUN_MARKER_ENV]: marker.value }, ["sleep", "600"]);
-    await writeRecord(run, { pid, group: true, markerSha256: marker.entrySha256 });
+    await writeRawRecord(run, { pid, markerSha256: marker.entrySha256 });
 
     const summary = await stop(run);
 
@@ -327,7 +358,9 @@ describe.skipIf(!isLinux)("remote process tree stop", () => {
 
     const summary = await stop(run);
 
-    expect(summary).toEqual({ records: 0, matched: 0, killed: 0, skipped: 0, survived: 0, partial: "no_process_record" });
+    expect(summary).toEqual({
+      records: 0, matched: 0, matchedByMarker: 0, matchedByGroup: 0, killed: 0, skipped: 0, survived: 0, partial: "no_process_record",
+    });
     expect(alive(bystander.leader!)).toBe(true);
   }, 30_000);
 });
@@ -388,6 +421,7 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     root?: string;
     runId?: string;
     stdinPrefix?: string;
+    beforeSpawn?: (remoteScript: string) => Promise<void>;
   }) {
     const root = input.root ?? (await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-")));
     await mkdir(path.join(root, "ws"), { recursive: true });
@@ -407,6 +441,7 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
       env: input.env ?? {},
       processRecord: { runId: input.runId ?? randomUUID() },
     });
+    await input.beforeSpawn?.(target.args.at(-1)!);
     const child = spawn("sh", ["-c", target.args.at(-1)!], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: root,
@@ -507,6 +542,54 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
 
     expect(launch.stdout).not.toContain("started");
     expect(launch.code).toBe(143);
+  }, 30_000);
+
+  it.each([
+    ["a link to a directory outside", (victim: string) => ({ kind: "symlink", target: victim })],
+    ["a link to a file outside", (victim: string) => ({ kind: "symlink", target: path.join(victim, "file") })],
+    ["a dangling link", (victim: string) => ({ kind: "symlink", target: path.join(victim, "missing", "x") })],
+    ["a real directory", () => ({ kind: "directory", target: "" })],
+  ])("does not start a launch whose record name is already taken by %s, and changes nothing outside", async (_kind, plant) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+    await writeFile(path.join(victim, "file"), "outside\n");
+    await mkdir(sshRunProcessRecordDir(root, runId), { recursive: true });
+    const entry = plant(victim);
+
+    const launch = await runLaunch({
+      root,
+      runId,
+      command: "echo started",
+      // The launch id is in the remote command, so a same-user process can plant it.
+      beforeSpawn: async (remoteScript) => {
+        const launchId = /([0-9a-f]{16})\.json/.exec(remoteScript)?.[1];
+        expect(launchId).toBeDefined();
+        const name = path.join(sshRunProcessRecordDir(root, runId), `${launchId}.json`);
+        if (entry.kind === "symlink") await symlink(entry.target, name);
+        else await mkdir(name);
+      },
+    });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    expect(await readdir(victim)).toEqual(["file"]);
+    expect(await readFile(path.join(victim, "file"), "utf8")).toBe("outside\n");
+  }, 30_000);
+
+  it("leaves no record behind when a launch finds the run already stopped, so the stop mark can age out", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    await stop(runOf(root, runId));
+
+    const late = await runLaunch({ root, runId, command: "echo started" });
+
+    expect(late.code).toBe(143);
+    expect(await readdir(sshRunProcessRecordDir(root, runId))).toEqual(["stopped"]);
+    // With no record left, a later stop of another run ages the old mark out.
+    await execFileAsync("touch", ["-d", "10 days ago", path.join(sshRunProcessRecordDir(root, runId), "stopped")]);
+    await stop(runOf(root, randomUUID()));
+    await expect(readdir(sshRunProcessRecordDir(root, runId))).rejects.toThrow();
   }, 30_000);
 
   it("removes stop marks older than a week, and keeps newer ones", async () => {

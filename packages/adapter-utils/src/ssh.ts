@@ -1459,7 +1459,7 @@ export async function buildSshSpawnTarget(input: {
   };
 }
 
-const NO_STOP: RemoteProcessTreeStopSummary = { records: 0, matched: 0, killed: 0, skipped: 0, survived: 0, partial: null };
+const NO_STOP: RemoteProcessTreeStopSummary = { records: 0, matched: 0, matchedByMarker: 0, matchedByGroup: 0, killed: 0, skipped: 0, survived: 0, partial: null };
 
 /**
  * Stops every process that the heartbeat run's recorded launches left on the

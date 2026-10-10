@@ -148,8 +148,12 @@ The server writes one of these events per SSH lease:
 | `remote_processes_survived` | warn | Some processes were still running after `SIGKILL`. |
 | `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_stop_mark`, `unsafe_record_dir`, `no_summary`, `config_unavailable`, `environment_changed` or `environment_deleted`. |
 
-The payload holds the environment id and the counts `records`, `matched`,
-`killed`, `skipped` and `survived`, plus `reason` when there is one. The marker
+The payload holds the environment id and the counts `records`, `matched`
+(split into `matchedByMarker` and `matchedByGroup`, by why each process joined),
+`killed`, `skipped` and `survived`, plus `reason` when there is one. A process's
+identity is its pid, start time and uid: the marker only decides who joins at
+the first scan, so a member that clears it later is still signalled and
+counted. The marker
 value never appears in a run event, a log, argv or the launch record, which
 stores only its SHA-256. The lease metadata keeps the same outcome under
 `remoteProcessStop`. These records stay in the local run log and add no
