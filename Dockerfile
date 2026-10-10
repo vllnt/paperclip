@@ -144,7 +144,7 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm exec vitest run packages/shared/src/company-environment-defaults.test.ts server/src/__tests__/instance-settings-service.test.ts server/src/__tests__/instance-settings-routes.test.ts packages/adapters/codex-local/src/company-model-catalog.test.ts packages/adapters/claude-local/src/current-model-catalog.test.ts ui/src/lib/agent-setup-fields.test.ts ui/src/lib/test-agent-setup.test.ts ui/src/lib/saved-provider-credentials.test.ts packages/adapters/codex-local/src/server/test.remote.test.ts packages/adapters/codex-local/src/server/runtime-config.test.ts packages/adapters/codex-local/src/server/execute.remote.test.ts packages/adapter-utils/src/workspace-restore-merge.test.ts packages/adapter-utils/src/directory-merge-lock.test.ts server/src/__tests__/openapi-routes.test.ts
 RUN pnpm check:token-gates
-RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
+RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx ui/src/lib/safe-match-media.test.ts ui/src/hooks/useMediaQuery.test.tsx ui/src/lib/no-direct-match-media.test.ts
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
 # after the SDK build, so build the SDK before typechecking the UI.
 RUN pnpm --filter @paperclipai/plugin-sdk build
