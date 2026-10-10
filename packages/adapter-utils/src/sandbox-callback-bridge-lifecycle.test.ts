@@ -17,8 +17,8 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const RUN_ID = "11111111-2222-4333-8444-555555555555";
 const BRIDGE_TOKEN = "lifecycle-test-token";
-// The stop proves a process is the bridge through /proc. Without it (macOS)
-// the stop signals nothing, so tests that expect a stopped bridge need Linux.
+// The stop proves a process is the bridge through /proc, or through ps where
+// there is no /proc (macOS). A few tests read /proc themselves.
 const HAS_PROC = existsSync("/proc/self/stat");
 const HAS_BUSYBOX = (() => {
   try {
@@ -191,7 +191,7 @@ afterEach(async () => {
 });
 
 describe("sandbox callback bridge process lifetime", () => {
-  it.runIf(HAS_PROC)("stops the bridge on interrupt even while a request waits for its response", async () => {
+  it("stops the bridge on interrupt even while a request waits for its response", async () => {
     const { bridge, queueDir } = await startBridge();
     expect(bridge.pid).toBeGreaterThan(0);
 
@@ -211,23 +211,24 @@ describe("sandbox callback bridge process lifetime", () => {
     await pending;
   }, 60_000);
 
-  it.runIf(HAS_PROC)("starts the bridge as the leader of its own process group, tagged with its run and start", async () => {
+  it("starts the bridge as the leader of its own process group, tagged with its run and start", async () => {
     const { bridge } = await startBridge();
 
-    const stat = await readFile(`/proc/${bridge.pid}/stat`, "utf8");
-    const processGroup = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2]);
+    const processGroup = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim());
     expect(processGroup).toBe(bridge.pid);
-    const argv = (await readFile(`/proc/${bridge.pid}/cmdline`, "utf8")).split("\0");
-    expect(argv).toContain(`--paperclip-run-id=${RUN_ID}`);
-    expect(argv.some((arg) => /^--paperclip-bridge-instance=[0-9a-f-]{36}$/.test(arg))).toBe(true);
-    const environ = (await readFile(`/proc/${bridge.pid}/environ`, "utf8")).split("\0");
-    expect(environ).toContain(`PAPERCLIP_BRIDGE_RUN_ID=${RUN_ID}`);
+    const command = execFileSync("ps", ["-ww", "-o", "command=", "-p", String(bridge.pid)], { encoding: "utf8" }).trim().split(" ");
+    expect(command).toContain(`--paperclip-run-id=${RUN_ID}`);
+    expect(command.some((arg) => /^--paperclip-bridge-instance=[0-9a-f-]{36}$/.test(arg))).toBe(true);
+    if (HAS_PROC) {
+      const environ = (await readFile(`/proc/${bridge.pid}/environ`, "utf8")).split("\0");
+      expect(environ).toContain(`PAPERCLIP_BRIDGE_RUN_ID=${RUN_ID}`);
+    }
 
     await bridge.stop();
     expect(isAlive(bridge.pid)).toBe(false);
   }, 60_000);
 
-  it.runIf(HAS_PROC)("kills a bridge that ignores SIGTERM", async () => {
+  it("kills a bridge that ignores SIGTERM", async () => {
     const { bridge } = await startBridge({ source: STUBBORN_BRIDGE });
     expect(isAlive(bridge.pid)).toBe(true);
 
@@ -248,6 +249,8 @@ describe("sandbox callback bridge process lifetime", () => {
         rewriteScript: (script) => (stopping ? script.replaceAll("/proc/", `${fakeProc}/`) : script),
       },
     });
+    // `self` tells the stop that this host has /proc.
+    await mkdir(path.join(fakeProc, "self"), { recursive: true });
     await mkdir(path.join(fakeProc, "sys", "kernel"), { recursive: true });
     // /proc files report size 0, so copy their content, not the file.
     await writeFile(path.join(fakeProc, "sys", "kernel", "pid_max"), await readFile("/proc/sys/kernel/pid_max"));
@@ -280,7 +283,7 @@ describe("sandbox callback bridge process lifetime", () => {
     await bridge.stop();
 
     expect(isAlive(bystander.pid ?? 0)).toBe(true);
-    if (HAS_PROC) expect(isAlive(bridge.pid)).toBe(false);
+    expect(isAlive(bridge.pid)).toBe(false);
   }, 60_000);
 
   it("signals nothing for a pid file of 0, -1, 1 or junk, and spares the control shell's group", async () => {
@@ -331,7 +334,7 @@ describe("sandbox callback bridge process lifetime", () => {
     await newer.stop();
   }, 60_000);
 
-  it.runIf(HAS_PROC)("stops a bridge that started but failed its readiness check", async () => {
+  it("stops a bridge that started but failed its readiness check", async () => {
     const { root } = await createRunRoot();
 
     await expect(startBridge({ root, source: BROKEN_READY_BRIDGE })).rejects.toThrow("invalid readiness JSON");
@@ -340,6 +343,18 @@ describe("sandbox callback bridge process lifetime", () => {
     pids.push(pid);
     expect(pid).toBeGreaterThan(0);
     await waitUntilDead(pid, 10_000);
+  }, 60_000);
+
+  it("stops the bridge where only ps can inspect it, as on macOS", async () => {
+    const { root } = await createRunRoot();
+    const hidden = path.join(root, "no-proc");
+    // On Linux the control scripts see no /proc; on macOS there is none.
+    const { bridge } = await startBridge({ root, runner: { rewriteScript: (script) => script.replaceAll("/proc/", `${hidden}/`) } });
+    expect(isAlive(bridge.pid)).toBe(true);
+
+    await bridge.stop();
+
+    expect(isAlive(bridge.pid)).toBe(false);
   }, 60_000);
 
   it.runIf(HAS_PROC && HAS_BUSYBOX)("stops the bridge when the worker shell is busybox ash", async () => {

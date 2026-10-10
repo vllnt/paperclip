@@ -1939,7 +1939,12 @@ function buildSandboxBridgeStopScript(input: {
   const pidFile = shellQuote(input.directories.pidFile);
   const readyFile = shellQuote(input.directories.readyFile);
   return [
-    ...buildRemoteProcessStopLines({ identity: input.identity, argv: input.argv, label: "sandbox callback bridge" }),
+    ...buildRemoteProcessStopLines({
+      identity: input.identity,
+      argv: input.argv,
+      label: "sandbox callback bridge",
+      nonceArg: `--paperclip-bridge-instance=${input.instance}`,
+    }),
     `instance=${shellQuote(input.instance)}`,
     `if [ "$(cat ${pidFile} 2>/dev/null)" = "$pid $instance" ]; then rm -f ${pidFile}; fi`,
     `if grep -Fq '"pid":'"$pid," ${readyFile} 2>/dev/null && grep -Fq '"instance":"'"$instance"'"' ${readyFile} 2>/dev/null; then rm -f ${readyFile}; fi`,
