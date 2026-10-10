@@ -2175,6 +2175,161 @@ describe("SSH run directory reaper", () => {
     }, SSH_FIXTURE_TEST_TIMEOUT_MS);
   });
 
+  describe("a link planted at a name the script writes", () => {
+    const CANARY = "outside file that must not change\n";
+    // A file and a directory outside the run directory, and one path that does not exist, each the target of a planted link.
+    async function outside(host: { rootDir: string }) {
+      const file = path.join(host.rootDir, `canary-${randomUUID()}.txt`);
+      await writeFile(file, CANARY);
+      const dir = path.join(host.rootDir, `canary-dir-${randomUUID()}`);
+      await mkdir(dir);
+      await writeFile(path.join(dir, "keep.txt"), CANARY);
+      const dangling = path.join(host.rootDir, `never-created-${randomUUID()}`);
+      return { file, dir, dangling };
+    }
+    // Every name the script has used for scratch files in the run directory, before this change.
+    const OLD_SCRATCH_NAMES = [
+      ".paperclip-reap-refs", ".paperclip-reap-refs.head", ".paperclip-reap-refs.head.body", ".paperclip-reap-refs.stale",
+      ".paperclip-reap-refs.refs", ".paperclip-reap-refs.stash", ".paperclip-reap-refs.trees", ".paperclip-reap-refs.status",
+      ".paperclip-reap-refs.status.body", ".paperclip-reap-refs.gitlinks", ".paperclip-reap-refs.published",
+      ".paperclip-reap-index", ".paperclip-reap.bundle",
+    ];
+
+    it("does not write through a link planted at any old scratch name, and still saves the work", async () => {
+      const host = await startHost("SSH reaper scratch link test");
+      if (!host) return;
+      const run = await host.gitRun();
+      const clone = await host.hostClone(run.workspace);
+      await writeFile(path.join(run.workspace, "agent.txt"), "agent commit\n");
+      await git(run.workspace, ["add", "agent.txt"]);
+      await git(run.workspace, ["commit", "-q", "-m", "agent work"]);
+      const tip = await git(run.workspace, ["rev-parse", "HEAD"]);
+      await writeFile(path.join(run.workspace, "uncommitted.txt"), "work in progress\n");
+      const targets = await outside(host);
+      const planted: string[] = [];
+      for (const [i, name] of OLD_SCRATCH_NAMES.entries()) {
+        const kind = i % 3 === 0 ? targets.file : i % 3 === 1 ? targets.dangling : targets.dir;
+        await symlink(kind, path.join(run.runDir, name));
+        planted.push(name);
+      }
+
+      const result = await host.reap(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+      await expect(readFile(path.join(targets.dir, "keep.txt"), "utf8")).resolves.toBe(CANARY);
+      expect(await readdir(targets.dir)).toEqual(["keep.txt"]);
+      await expect(stat(targets.dangling)).rejects.toMatchObject({ code: "ENOENT" });
+      const saved = `refs/paperclip/preserved/${run.runId}/head`;
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${saved}:${saved}`]);
+      expect(await git(clone, ["rev-parse", saved])).toBe(tip);
+      expect(planted.length).toBe(OLD_SCRATCH_NAMES.length);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("does not write through a link planted at an old scratch name on the legacy path either", async () => {
+      const host = await startHost("SSH reaper scratch link legacy test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const targets = await outside(host);
+      await symlink(targets.file, path.join(run.runDir, ".paperclip-reap-refs.head"));
+      await symlink(targets.file, path.join(run.runDir, ".paperclip-reap-refs.status"));
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "removed" });
+
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it.each([
+      { kind: "a file", pick: (t: Awaited<ReturnType<typeof outside>>) => t.file },
+      { kind: "a path that does not exist", pick: (t: Awaited<ReturnType<typeof outside>>) => t.dangling },
+      { kind: "a directory", pick: (t: Awaited<ReturnType<typeof outside>>) => t.dir },
+    ])("does not follow a marker that is a link to $kind, and removes the clean legacy folder", async ({ pick }) => {
+      const host = await startHost("SSH reaper marker link test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const targets = await outside(host);
+      await symlink(pick(targets), path.join(run.runDir, SSH_RUN_RESTORED_MARKER));
+
+      const result = await host.reapLegacy(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+      expect(await readdir(targets.dir)).toEqual(["keep.txt"]);
+      await expect(readFile(path.join(targets.dir, "keep.txt"), "utf8")).resolves.toBe(CANARY);
+      await expect(stat(targets.dangling)).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps the folder, and writes nothing outside it, when the marker cannot be created", async () => {
+      const host = await startHost("SSH reaper marker fail closed test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const targets = await outside(host);
+      // A directory at the marker name: it cannot be unlinked with rm -f and cannot be created as a file.
+      const blocker = `mkdir -p '${SSH_RUN_RESTORED_MARKER}' && : > '${SSH_RUN_RESTORED_MARKER}/inner'`;
+      await symlink(targets.file, path.join(run.runDir, ".paperclip-reap-refs.head"));
+
+      const result = await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true,
+        testHooks: { afterRead: `if [ "$rname" = unpushed ]; then ${blocker}; fi` },
+      });
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "rm_failed", detail: "marker" });
+      await expect(stat(path.join(run.workspace, "tracked.txt"))).resolves.toBeTruthy();
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("does not follow a link planted at the marker name when it puts the marker back after a failed removal", async () => {
+      const host = await startHost("SSH reaper marker restore link test");
+      if (!host) return;
+      const run = await host.gitRun({ restored: true });
+      const targets = await outside(host);
+      const swap = `mv '${run.runDir}' '${run.runDir}.moved' && mkdir '${run.runDir}'`;
+      const witness = path.join(host.rootDir, `planted-${randomUUID()}`);
+      const plant = `ln -s '${targets.file}' '${SSH_RUN_RESTORED_MARKER}' && : > '${witness}'`;
+
+      const result = await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed,
+        testHooks: { beforeRemove: swap, beforeMarkerRestore: plant },
+      });
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "rm_failed" });
+      // The link really was planted, at the moment the marker is put back.
+      await expect(stat(witness)).resolves.toBeTruthy();
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+      const restored = path.join(`${run.runDir}.moved`, SSH_RUN_RESTORED_MARKER);
+      expect((await stat(restored)).isFile()).toBe(true);
+      await expect(readlink(restored)).rejects.toMatchObject({ code: "EINVAL" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("leaves no scratch directory behind, whether the folder is removed or kept", async () => {
+      const host = await startHost("SSH reaper scratch cleanup test");
+      if (!host) return;
+      const removed = await host.pushedRun();
+      const kept = await host.pushedRun();
+      await writeFile(path.join(kept.workspace, "only-copy.txt"), "work\n");
+
+      await expect(host.reapLegacy(removed.runId)).resolves.toMatchObject({ outcome: "removed" });
+      await expect(host.reapLegacy(kept.runId)).resolves.toMatchObject({ outcome: "kept", reason: "dirty" });
+
+      expect((await readdir(kept.runDir)).filter((name) => name.startsWith(".paperclip-reap"))).toEqual([]);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("creates its scratch directory with owner-only access", async () => {
+      const host = await startHost("SSH reaper scratch mode test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const modeFile = path.join(host.rootDir, `mode-${randomUUID()}.txt`);
+      const record = `if [ "$rname" = status ]; then stat -c %a "$scratch" > '${modeFile}' 2>/dev/null || stat -f %Lp "$scratch" > '${modeFile}'; fi`;
+
+      await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true, testHooks: { afterRead: record },
+      });
+
+      expect((await readFile(modeFile, "utf8")).trim()).toBe("700");
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
   describe("refs beyond branches, and submodules", () => {
     // A commit that only a ref outside refs/heads holds: made on a scratch branch, then the branch is deleted.
     async function holdOnlyByRef(workspace: string, make: (workspace: string) => Promise<void>) {

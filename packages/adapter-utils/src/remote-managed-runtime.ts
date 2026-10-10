@@ -209,7 +209,7 @@ export async function reapSshRunDirectory(input: {
    */
   legacy?: boolean;
   /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
-  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string; afterRead?: string; beforeRemove?: string };
+  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string; afterRead?: string; beforeRemove?: string; beforeMarkerRestore?: string };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -254,11 +254,31 @@ export async function reapSshRunDirectory(input: {
     'if [ -z "$ino_here" ]; then echo "kept mount_point 0"; exit 0; fi',
     'if [ -z "$dev_here" ] || [ "$dev_here" != "$dev_runs" ]; then echo "kept mount_point 0"; exit 0; fi',
     'if command -v mountpoint >/dev/null 2>&1 && mountpoint -q . 2>/dev/null; then echo "kept mount_point 0"; exit 0; fi',
-    'ws=workspace; list=.paperclip-reap-refs; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"',
+    'ws=workspace; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"; scratch=""; sdir=""; list=""',
     'kb=$(du -sk . 2>/dev/null | cut -f1); kb=${kb:-0}',
     'keep() { echo "kept $1 $kb"; exit 0; }',
     // Keeps the directory and names the git command that failed.
     'fail() { echo "detail $1"; keep "${fail_reason:-preserve_failed}"; }',
+    // Names inside the run directory belong to the worker user, who can plant a link
+    // at any name the script knows in advance, and a plain redirection (>, >>, : >)
+    // follows a link and writes or truncates its target. So the script writes no
+    // fixed name there. Its scratch files live in a directory that mktemp -d creates
+    // fresh for this call (an unpredictable name, mode 700, which cannot already
+    // exist as a link) and that is removed on every way out. The marker, which has
+    // to keep its name, is written by put_marker.
+    'cleanup_scratch() { if [ -n "$scratch" ]; then rm -rf -- "$scratch" 2>/dev/null; fi; }',
+    'trap cleanup_scratch EXIT',
+    'trap "exit 143" HUP INT TERM',
+    'make_scratch() {',
+    '  scratch=$(mktemp -d "./.paperclip-reap.XXXXXX" 2>/dev/null) || scratch=""',
+    '  if [ -z "$scratch" ] || [ ! -d "$scratch" ] || [ -L "$scratch" ]; then scratch=""; fail "scratch directory"; fi',
+    '  sdir=${scratch#./}; list="$scratch/refs"',
+    '}',
+    // rm unlinks a link itself and never its target. The file is then created with
+    // noclobber, which opens it with O_EXCL: that fails on any existing name, a link
+    // that was planted a moment ago and a dangling one included. The subshell keeps
+    // a failed redirection from ending the script. The last test insists on a plain file.
+    'put_marker() { rm -f -- "$marker" 2>/dev/null; ( set -C; : > "$marker" ) 2>/dev/null; [ -f "$marker" ] && [ ! -L "$marker" ]; }',
     'isoid() { case "$1" in ""|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -ge 40 ]; }',
     // Threat model: the worker's git is trusted. A git that exits 0 and prints
     // false output is out of scope. Output that is cut short is in scope, and so is
@@ -269,6 +289,7 @@ export async function reapSshRunDirectory(input: {
     // then in "$list.NAME.body". A read that failed, or whose output lost its end
     // or some of its lines, keeps the directory.
     'rd() {',
+    '  [ -n "$list" ] || fail "scratch directory"',
     '  rname=$1; rlabel=$2; shift 2',
     '  "$@" > "$list.$rname" 2>/dev/null || fail "$rlabel"',
     '  rn=$(wc -l < "$list.$rname" | tr -d " ")',
@@ -300,6 +321,7 @@ export async function reapSshRunDirectory(input: {
     '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
     '  if [ ! -d "$ws/.git" ]; then keep not_git_backed; fi',
     '  if [ -z "$seed" ]; then fail_reason=git_unreadable; fi',
+    '  make_scratch',
     '  G rev-parse --git-dir >/dev/null 2>&1 || fail "git rev-parse"',
     // A submodule is a repository of its own, and its commits and tags are not
     // reached by any check below. Walking nested repositories is more surface than a
@@ -347,7 +369,7 @@ export async function reapSshRunDirectory(input: {
     // Every check passed. The folder is marked as holding no unsynced work before
     // anything is deleted, so a removal that is cut off at its time limit is
     // finished by the next pass, which then needs no checks and no seed.
-    '    : > "$marker" 2>/dev/null || { echo "detail marker"; keep rm_failed; }',
+    '    put_marker || { echo "detail marker"; keep rm_failed; }',
     '    had_marker=1',
     "  else",
     // Every read below fails closed: a command that exits non-zero, whose output
@@ -413,12 +435,12 @@ export async function reapSshRunDirectory(input: {
     // The index file is named relative to the repository, which is `-C workspace`.
     '  rd status "git status" G status --porcelain',
     '  if [ -s "$list.status.body" ]; then',
-    '    idx=../.paperclip-reap-index; rm -f .paperclip-reap-index',
+    '    idx="../$sdir/index"; rm -f -- "$scratch/index"',
     '    if [ -n "$head" ]; then GIT_INDEX_FILE="$idx" G read-tree HEAD || fail "git read-tree"; fi',
     '    GIT_INDEX_FILE="$idx" G add -A || fail "git add"',
     '    tree_id=$(GIT_INDEX_FILE="$idx" G write-tree) || fail "git write-tree"',
     '    if [ -n "$head" ]; then snap=$(G commit-tree "$tree_id" -p "$head" -m "Paperclip preserved worktree") || fail "git commit-tree"; else snap=$(G commit-tree "$tree_id" -m "Paperclip preserved worktree") || fail "git commit-tree"; fi',
-    '    rm -f .paperclip-reap-index',
+    '    rm -f -- "$scratch/index"',
     '    add_ref worktree "$snap"',
     '  fi',
     '  if [ -s "$list" ]; then',
@@ -426,29 +448,29 @@ export async function reapSshRunDirectory(input: {
     '    if [ -n "$seed" ]; then set -- "$@" "^$seed"; fi',
     // Written inside the confined directory first, then moved into the
     // preserved directory, which is confined the same way.
-    '    G bundle create ../.paperclip-reap.bundle "$@" >/dev/null 2>&1 || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
-    '    size=$(du -k .paperclip-reap.bundle 2>/dev/null | cut -f1); size=${size:-0}',
-    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
-    '    mkdir -p "$preserved" 2>/dev/null || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
+    '    G bundle create "../$sdir/bundle" "$@" >/dev/null 2>&1 || { rm -f -- "$scratch/bundle"; keep preserve_failed; }',
+    '    size=$(du -k "$scratch/bundle" 2>/dev/null | cut -f1); size=${size:-0}',
+    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f -- "$scratch/bundle"; keep preserve_failed; fi`,
+    '    mkdir -p "$preserved" 2>/dev/null || { rm -f -- "$scratch/bundle"; keep preserve_failed; }',
     // What is at the published path: nothing (0), a regular file (4), or anything
     // else, a link included (2).
     '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
     '      if [ -L "./$id.bundle" ]; then exit 2; fi',
     '      if [ -e "./$id.bundle" ]; then if [ -f "./$id.bundle" ]; then exit 4; fi; exit 2; fi',
     '      exit 0 ); pub=$?',
-    '    if [ "$pub" != 0 ] && [ "$pub" != 4 ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi',
+    '    if [ "$pub" != 0 ] && [ "$pub" != 4 ]; then rm -f -- "$scratch/bundle"; keep preserve_failed; fi',
     // An existing bundle is reused, untouched, only when its refs are exactly the
     // computed ones. Otherwise the new bundle is moved into the preserved
     // directory under a unique temporary name, verified, flushed to disk, the old
     // bundle is kept as <id>.superseded.bundle (a hard link, so nothing is
     // copied), and the new one is renamed into place.
     '    if [ "$pub" = 4 ] && matches "$bundle"; then',
-    '      rm -f .paperclip-reap.bundle',
+    '      rm -f -- "$scratch/bundle"',
     "    else",
     '      staged=$( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
     '        tmp=$(mktemp "./.$id.bundle.XXXXXX") || exit 2',
-    '        mv -f -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "$tmp" || { rm -f -- "$tmp"; exit 2; }',
-    '        echo "$tmp" ) || { rm -f .paperclip-reap.bundle; fail "bundle staging"; }',
+    '        mv -f -- "$canon/.paperclip-runtime/runs/$id/$sdir/bundle" "$tmp" || { rm -f -- "$tmp"; exit 2; }',
+    '        echo "$tmp" ) || { rm -f -- "$scratch/bundle"; fail "bundle staging"; }',
     '      G bundle verify "$canon/.paperclip-runtime/preserved/$staged" >/dev/null 2>&1 || { ( cd "$preserved" 2>/dev/null && rm -f -- "$staged" ); fail "git bundle verify"; }',
     '      ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
     // The file is flushed before the rename, and the directory after it, so a
@@ -459,7 +481,7 @@ export async function reapSshRunDirectory(input: {
     '        fsync_path .',
     '        exit 0 ) || { ( cd "$preserved" 2>/dev/null && rm -f -- "$staged" ); fail "bundle publish"; }',
     "    fi",
-    '    rm -f .paperclip-reap.bundle',
+    '    rm -f -- "$scratch/bundle"',
     '    matches "$bundle" || fail "bundle check"',
     '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
     "  fi",
@@ -481,7 +503,8 @@ export async function reapSshRunDirectory(input: {
     "else",
     // A failed removal keeps a restored directory removable. A directory that
     // had no marker never gets one, so the next attempt saves its state again.
-    '  if [ "$had_marker" = 1 ]; then : > .paperclip-restored 2>/dev/null || true; fi',
+    ...hook(input.testHooks?.beforeMarkerRestore),
+    '  if [ "$had_marker" = 1 ]; then put_marker || true; fi',
     '  keep rm_failed',
     "fi",
   ].join("\n");

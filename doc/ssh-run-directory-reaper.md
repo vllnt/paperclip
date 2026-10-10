@@ -213,6 +213,29 @@ instead of the run.
   not bundled at all: its directory is removed only under the bounded rule in
   "When a directory is removed", and kept otherwise. A directory that the restore
   marked needs no seed.
+- **Names the worker controls.** The worker user can write in a run directory, so
+  it can plant a link at any name the script knows in advance, and a plain
+  redirection (`>`, `>>`, `: >`) follows a link and writes or truncates its target.
+  The script therefore writes no fixed name in the run directory:
+  - Its scratch files (the git read outputs, the temporary index, the bundle under
+    construction) are in a directory that `mktemp -d` creates fresh for each call,
+    with an unpredictable name and mode 700, and that is removed on every way out,
+    including a kill by the time limit. A call that cannot create it keeps the
+    folder as `preserve_failed` (`detail` is `scratch directory`).
+  - The `.paperclip-restored` marker keeps its name. The script removes whatever is
+    at that name first (`rm` unlinks a link and never follows it), then creates the
+    file exclusively (`O_EXCL`, through the shell's noclobber), which fails on any
+    existing name, including a link planted in between, and then checks that the
+    result is a plain file. This is used both when a clean folder with no seed
+    record is marked before its removal and when a marker is put back after a
+    failed removal. If the marker cannot be created, the folder is kept as
+    `rm_failed` (`detail` is `marker`) and nothing is deleted.
+  - This closes the writes the script itself makes. The worker user and the SSH
+    user are the same account, so it is a guard against corrupting another run's
+    state or a file the account can write, not a privilege boundary. A process of
+    that account that is still running and swaps the scratch directory while the
+    script works is not covered; the run is terminal and its processes are stopped
+    before the reaper starts.
 - **Git reads fail closed.** Every read of the repository before a delete (HEAD,
   the preserved refs, the branches, the stash, the worktree list, and `git status`
   of the workspace and of each extra worktree) must exit 0. Each one is written to
