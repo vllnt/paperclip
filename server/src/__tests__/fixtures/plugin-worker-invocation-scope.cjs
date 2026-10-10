@@ -32,6 +32,14 @@ function sendNestedHostRequest(originalRequest, invocationId) {
         namespace: params.namespace || "ns",
         stateKey: params.stateKey || "key",
       }
+    : hostMethod === "activity.log"
+    ? {
+        // The audit write a plugin makes while it serves an action, such as
+        // ctx.activity.log. The host adds who started the action.
+        companyId: requestedCompanyId,
+        message: params.message || "fixture action",
+        metadata: params.metadata || {},
+      }
     : hostMethod === "events.subscribe"
     ? {
         // The subscribe shape the SDK issues from setup() via

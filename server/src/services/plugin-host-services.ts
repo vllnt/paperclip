@@ -1017,7 +1017,13 @@ export function buildHostServices(
 
   const pluginActivityDetails = (
     details: Record<string, unknown> | null | undefined,
-    actor?: { actorAgentId?: string | null; actorUserId?: string | null; actorRunId?: string | null },
+    actor?: {
+      actorAgentId?: string | null;
+      actorUserId?: string | null;
+      actorRunId?: string | null;
+      actorKeyId?: string | null;
+      actorSource?: string | null;
+    },
   ) => {
     const initiatingActorType = actor?.actorAgentId ? "agent" : actor?.actorUserId ? "user" : null;
     const initiatingActorId = actor?.actorAgentId ?? actor?.actorUserId ?? null;
@@ -1030,8 +1036,30 @@ export function buildHostServices(
       initiatingAgentId: actor?.actorAgentId ?? null,
       initiatingUserId: actor?.actorUserId ?? null,
       initiatingRunId: actor?.actorRunId ?? null,
+      initiatingKeyId: actor?.actorKeyId ?? null,
+      initiatingSource: actor?.actorSource ?? null,
       pluginId,
       pluginKey,
+    };
+  };
+
+  /**
+   * Names who started the plugin action that the worker is serving, from the host's
+   * own invocation record. The record holds the key id and the kind of credential,
+   * never the credential itself.
+   *
+   * @param context - The context of the worker-to-host call.
+   * @returns The initiating actor for the audit row, or undefined for a call outside an action.
+   */
+  const initiatorOfCall = (context: WorkerHostCallContext | undefined) => {
+    const initiator = context?.initiator;
+    if (!initiator) return undefined;
+    return {
+      actorAgentId: initiator.agentId,
+      actorUserId: initiator.userId,
+      actorRunId: initiator.runId,
+      actorKeyId: initiator.keyId ?? null,
+      actorSource: initiator.source ?? null,
     };
   };
 
@@ -1611,7 +1639,7 @@ export function buildHostServices(
     },
 
     activity: {
-      async log(params) {
+      async log(params, context) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         await logActivity(db, {
@@ -1621,7 +1649,7 @@ export function buildHostServices(
           action: params.message,
           entityType: params.entityType ?? "plugin",
           entityId: params.entityId ?? pluginId,
-          details: pluginActivityDetails(params.metadata),
+          details: pluginActivityDetails(params.metadata, initiatorOfCall(context)),
         });
       },
     },

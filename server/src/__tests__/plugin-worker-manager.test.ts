@@ -302,8 +302,110 @@ describe("plugin-worker-manager stderr failure context", () => {
       });
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-a" },
-        { invocationScope: { companyId: "company-a" } },
+        {
+          invocationScope: { companyId: "company-a" },
+          initiator: {
+            type: "agent",
+            userId: null,
+            agentId: "agent-1",
+            runId: "run-1",
+            companyId: "company-a",
+          },
+        },
       );
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("gives worker-to-host handlers the caller that the host authenticated for a performAction", async () => {
+    const activityLog = vi.fn(async () => undefined);
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "activity.log": activityLog as never },
+    });
+
+    try {
+      await handle.start();
+
+      await handle.call("performAction", {
+        key: "probe",
+        params: { mode: "echo", hostMethod: "activity.log", requestedCompanyId: "company-a" },
+        actorContext: {
+          type: "user",
+          userId: "user-1",
+          agentId: null,
+          runId: null,
+          companyId: "company-a",
+          keyId: "key-1",
+          source: "board_key",
+        },
+        renderEnvironment: null,
+      });
+
+      expect(activityLog).toHaveBeenCalledTimes(1);
+      expect(activityLog.mock.calls[0]).toEqual([
+        expect.objectContaining({ companyId: "company-a" }),
+        expect.objectContaining({
+          invocationScope: { companyId: "company-a" },
+          initiator: {
+            type: "user",
+            userId: "user-1",
+            agentId: null,
+            runId: null,
+            companyId: "company-a",
+            keyId: "key-1",
+            source: "board_key",
+          },
+        }),
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops an unknown credential kind and gives no initiator to a call that is not a performAction", async () => {
+    const activityLog = vi.fn(async () => undefined);
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "activity.log": activityLog as never },
+    });
+
+    try {
+      await handle.start();
+
+      await handle.call("performAction", {
+        key: "probe",
+        params: { mode: "echo", hostMethod: "activity.log", requestedCompanyId: "company-a" },
+        actorContext: {
+          type: "user",
+          userId: "user-1",
+          agentId: null,
+          runId: null,
+          companyId: "company-a",
+          keyId: "key-1",
+          source: "root",
+        },
+        renderEnvironment: null,
+      });
+      await handle.call("getData", {
+        key: "probe",
+        params: { mode: "echo", hostMethod: "activity.log", requestedCompanyId: "company-a" },
+      });
+
+      expect(activityLog).toHaveBeenCalledTimes(2);
+      const [performActionContext, getDataContext] = activityLog.mock.calls.map((args) => args[1]);
+      expect(performActionContext).toMatchObject({ initiator: { keyId: "key-1" } });
+      expect(performActionContext?.initiator).not.toHaveProperty("source");
+      expect(getDataContext).not.toHaveProperty("initiator");
     } finally {
       await handle.stop().catch(() => undefined);
     }
