@@ -508,8 +508,10 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // process starts. Known transient preflight failures use dedicated bounded
   // retry paths instead of generic issue continuation recovery.
   "setup_failed",
-  // Setup owns the shared durable retry budget for temporary Git scans.
-  // Generic continuation must not retry permanent failures or reset that budget.
+  // Setup owns the shared durable retry budget for temporary Git scans and
+  // unreachable remote targets. Generic continuation must not retry permanent
+  // failures or reset that budget.
+  "remote_preflight_unavailable",
   "workspace_git_scan_timeout",
   "workspace_git_scan_saturated",
   "workspace_git_scan_cancelled",

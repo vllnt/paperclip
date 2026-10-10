@@ -528,6 +528,9 @@ export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service"] as const;
 export type IssueExecutionMonitorKind = (typeof ISSUE_EXECUTION_MONITOR_KINDS)[number];
 
 export const PROVIDER_QUOTA_MONITOR_SERVICE_NAME = "AI provider quota";
+// Server-owned monitor scheduled after Paperclip stopped a lingering background
+// task at the end of a successful run.
+export const BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME = "Background task re-check";
 
 export const ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES = [
   "wake_owner",

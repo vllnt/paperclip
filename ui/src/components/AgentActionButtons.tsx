@@ -30,6 +30,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { AgentStatusBadge } from "./StatusBadge";
+import { agentDisplayStatus, agentWaitTitle } from "../lib/agent-display-status";
 import { agentsApi } from "../api/agents";
 import { ApiError } from "../api/client";
 import { queryKeys } from "../lib/queryKeys";
@@ -459,7 +460,7 @@ export function AgentActionButtons({
       )}
       {showStatus && (
         <span className="hidden sm:inline">
-          <AgentStatusBadge status={agent.status} />
+          <AgentStatusBadge status={agentDisplayStatus(agent)} title={agentWaitTitle(agent)} />
         </span>
       )}
       {children}

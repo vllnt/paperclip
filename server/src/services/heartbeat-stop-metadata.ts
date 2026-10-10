@@ -79,6 +79,26 @@ export function resolveHeartbeatRunTimeoutPolicy(
   };
 }
 
+const UNMANAGED_BACKGROUND_TASK_STOP_REASON = "unmanaged_background_task_stopped";
+
+/**
+ * True when the provider turn succeeded but Paperclip had to stop the process
+ * because a background task the agent started kept it alive. The adapter names
+ * that stop with `unmanaged_background_task_stopped` only for a successful,
+ * non-refusal result, and the process runner attaches the cleanup evidence.
+ * Such a run is recorded as succeeded with a `backgroundTaskStopped` warning.
+ */
+export function isSuccessfulRunWithStoppedBackgroundTask(input: {
+  errorCode?: string | null;
+  timedOut?: boolean | null;
+  resultJson?: Record<string, unknown> | null;
+}): boolean {
+  if (input.errorCode !== UNMANAGED_BACKGROUND_TASK_STOP_REASON || input.timedOut) return false;
+  const evidence = input.resultJson?.unmanagedBackgroundTask;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return false;
+  return (evidence as Record<string, unknown>).stopped === true;
+}
+
 export function inferHeartbeatRunStopReason(input: {
   outcome: HeartbeatRunOutcome;
   errorCode?: string | null;
@@ -137,9 +157,15 @@ export function mergeHeartbeatRunStopMetadata(
       };
     }
   }
+  // A succeeded run whose lingering background task was stopped keeps that
+  // stop reason, so the run ledger shows the warning next to the success.
+  const backgroundTaskStopReason =
+    metadata.stopReason === "completed" && resultJson?.backgroundTaskStopped === true
+      ? UNMANAGED_BACKGROUND_TASK_STOP_REASON
+      : null;
   return {
     ...(resultJson ?? {}),
-    stopReason: existingMaxTurnStopReason ?? metadata.stopReason,
+    stopReason: existingMaxTurnStopReason ?? backgroundTaskStopReason ?? metadata.stopReason,
     effectiveTimeoutSec: timeoutPolicy.effectiveTimeoutSec,
     timeoutConfigured: timeoutPolicy.timeoutConfigured,
     timeoutSource: timeoutPolicy.timeoutSource,

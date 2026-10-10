@@ -528,6 +528,14 @@ describe("paperclip skill utils", () => {
     expect(skillBody).toContain("`assigneeUserId` is null");
   });
 
+  it("tells agents to end their turn with issue wait instead of a background process", async () => {
+    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+
+    expect(skillBody).toContain("end your turn with `issue wait`; never leave a background process running");
+    expect(skillBody).toContain("npx paperclipai issue wait <issueId> --in 10m --reason");
+    expect(skillBody).toContain("POST /api/issues/{id}/wait");
+  });
+
   it("requires issue-update writes to be verified, not inferred", async () => {
     const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
 

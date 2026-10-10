@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { resolveAdapterExecutionTargetTimeout } from "@paperclipai/adapter-utils/execution-target";
 import {
   buildHeartbeatRunStopMetadata,
+  isSuccessfulRunWithStoppedBackgroundTask,
   mergeHeartbeatRunStopMetadata,
   resolveHeartbeatRunTimeoutPolicy,
 } from "./heartbeat-stop-metadata.js";
@@ -153,6 +154,48 @@ describe("heartbeat stop metadata", () => {
         errorCode: "max_turns_exhausted",
       }).stopReason,
     ).toBe("completed");
+  });
+
+  it("recognizes a successful turn whose lingering background task was stopped", () => {
+    const evidence = {
+      kind: "terminal_result_cleanup",
+      stopped: true,
+      stopReason: "unmanaged_background_task_stopped",
+      reason: "unmanaged background task stopped; no durable live path",
+    };
+    expect(isSuccessfulRunWithStoppedBackgroundTask({
+      errorCode: "unmanaged_background_task_stopped",
+      timedOut: false,
+      resultJson: { unmanagedBackgroundTask: evidence },
+    })).toBe(true);
+    // A real failure, a timeout, or the code without cleanup evidence keeps
+    // today's failed classification.
+    expect(isSuccessfulRunWithStoppedBackgroundTask({
+      errorCode: "adapter_failed",
+      timedOut: false,
+      resultJson: { unmanagedBackgroundTask: evidence },
+    })).toBe(false);
+    expect(isSuccessfulRunWithStoppedBackgroundTask({
+      errorCode: "unmanaged_background_task_stopped",
+      timedOut: true,
+      resultJson: { unmanagedBackgroundTask: evidence },
+    })).toBe(false);
+    expect(isSuccessfulRunWithStoppedBackgroundTask({
+      errorCode: "unmanaged_background_task_stopped",
+      timedOut: false,
+      resultJson: {},
+    })).toBe(false);
+  });
+
+  it("keeps the background-task stop reason on a succeeded run that carries the warning flag", () => {
+    const merged = mergeHeartbeatRunStopMetadata(
+      { backgroundTaskStopped: true },
+      buildHeartbeatRunStopMetadata({ adapterType: "claude_local", adapterConfig: {}, outcome: "succeeded" }),
+    );
+    expect(merged).toMatchObject({
+      backgroundTaskStopped: true,
+      stopReason: "unmanaged_background_task_stopped",
+    });
   });
 
   it("preserves existing result fields when merging stop metadata", () => {

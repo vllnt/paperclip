@@ -1575,6 +1575,18 @@ export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocat
   }
 }
 
+/** Error code of a pre-dispatch remote probe that failed for a transient reason. */
+export const REMOTE_PREFLIGHT_UNAVAILABLE_CODE = "remote_preflight_unavailable";
+
+/**
+ * The remote execution target could not be reached in time before dispatch
+ * (an SSH connection failure, exit 255, or the probe timed out). Retrying
+ * later can succeed, unlike a missing directory or a broken login profile.
+ */
+export class RemotePreflightUnavailableError extends Error {
+  readonly code = REMOTE_PREFLIGHT_UNAVAILABLE_CODE;
+}
+
 async function githubOperationLauncherBasePath(
   target: AdapterCommandCapableExecutionTarget | null,
   env: Record<string, string>,
@@ -1594,7 +1606,10 @@ async function githubOperationLauncherBasePath(
   });
   // Frame the value so login banners cannot become executable search paths.
   const remotePath = result.stdout.match(/\0([^\0]+)\0/)?.[1];
-  if (result.timedOut || result.exitCode !== 0 || !remotePath) {
+  if (result.timedOut || result.exitCode === 255) {
+    throw new RemotePreflightUnavailableError("Could not resolve remote PATH for managed GitHub launchers");
+  }
+  if (result.exitCode !== 0 || !remotePath) {
     throw new Error("Could not resolve remote PATH for managed GitHub launchers");
   }
   return remotePath;

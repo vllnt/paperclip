@@ -7,6 +7,7 @@ import { useCompany } from "../context/CompanyContext";
 import { getAdapterLabel } from "../adapters/adapter-display-registry";
 import { queryKeys } from "../lib/queryKeys";
 import { AgentStatusBadge } from "./StatusBadge";
+import { agentDisplayStatus, agentWaitTitle } from "../lib/agent-display-status";
 import { Identity } from "./Identity";
 import { formatDate, agentUrl } from "../lib/utils";
 import { Separator } from "@/components/ui/separator";
@@ -43,7 +44,7 @@ export function AgentProperties({ agent, runtimeState }: AgentPropertiesProps) {
     <div className="space-y-4">
       <div className="space-y-1">
         <PropertyRow label="Status">
-          <AgentStatusBadge status={agent.status} />
+          <AgentStatusBadge status={agentDisplayStatus(agent)} title={agentWaitTitle(agent)} />
         </PropertyRow>
         {lastErrorIsActive && agent.errorReason && (
           <PropertyRow label="Error reason">

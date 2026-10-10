@@ -79,6 +79,8 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  REMOTE_PREFLIGHT_UNAVAILABLE_CODE,
+  RemotePreflightUnavailableError,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentService } from "./agents.js";
@@ -119,6 +121,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  ISSUE_WAIT_MONITOR_MAX_ATTEMPTS,
   envBindingSchema,
   isEnvironmentDriverSupportedForAdapter,
   isToolConnectionAttentionHealth,
@@ -381,6 +384,7 @@ import {
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
+  isSuccessfulRunWithStoppedBackgroundTask,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
@@ -457,6 +461,9 @@ import {
 } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
+import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
+import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
+import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -464,6 +471,7 @@ import {
 } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRescheduledPatch,
   buildIssueMonitorTriggeredPatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -876,6 +884,12 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
   return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
 }
+// Pre-dispatch failures that a bounded retry can clear. The issue keeps its
+// status while the scheduled retry is pending; after the budget it is handled
+// like any other non-retryable setup failure.
+export function isTransientSetupFailureCode(code: string | null | undefined): boolean {
+  return isTransientWorkspaceGitScanCode(code) || code === REMOTE_PREFLIGHT_UNAVAILABLE_CODE;
+}
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 export {
@@ -927,6 +941,7 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
 // of these codes when a failure happens before `adapter.execute`.
 const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
   "setup_failed",
+  REMOTE_PREFLIGHT_UNAVAILABLE_CODE,
   CONFIGURATION_INCOMPLETE_FAILURE_CODE,
   WORKSPACE_VALIDATION_FAILURE_CODE,
   ...NON_RETRYABLE_PREFLIGHT_FAILURE_CODES,
@@ -8456,8 +8471,21 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const monitorNotes =
+    input.contextSnapshot.source === "issue.monitor"
+      ? readNonEmptyString(input.contextSnapshot.monitorNotes)
+      : null;
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    wait: monitorNotes
+      ? {
+          note: monitorNotes,
+          attempt:
+            typeof input.contextSnapshot.monitorAttemptCount === "number"
+              ? input.contextSnapshot.monitorAttemptCount
+              : null,
+        }
+      : null,
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,
@@ -12060,6 +12088,66 @@ export function heartbeatService(
       });
     }
 
+    const monitorWakeKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
+    // The queue dropped or refused the wake. Keep the monitor armed: count the
+    // attempt, back off, and hand the issue to owner recovery once the attempts
+    // run out, so a permanently blocked agent cannot retry without end.
+    const holdMonitorForRetry = async (message: string, skipReason: string) => {
+      if (nextAttemptCount >= ISSUE_WAIT_MONITOR_MAX_ATTEMPTS) {
+        return clearIssueMonitorAndRecover({
+          claimed,
+          policy,
+          scheduledAtIso,
+          nextAttemptCount,
+          clearReason: "max_attempts_exhausted",
+          recoveryPolicy,
+          monitor,
+          now: input.now,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
+      }
+      const retryAt = new Date(
+        input.now.getTime() + monitorWakeRetryDelayMs(claimed.monitorAttemptCount ?? 0),
+      );
+      const rescheduled = buildIssueMonitorRescheduledPatch({
+        issue: { ...claimed, monitorAttemptCount: nextAttemptCount },
+        policy,
+        nextCheckAt: retryAt,
+      });
+      await db
+        .update(issues)
+        .set(
+          rescheduled
+            ? { ...rescheduled, monitorAttemptCount: nextAttemptCount, updatedAt: new Date() }
+            : { monitorWakeRequestedAt: null, updatedAt: new Date() },
+        )
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_wake_skipped",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: scheduledAtIso,
+          retryAt: retryAt.toISOString(),
+          attemptCount: nextAttemptCount,
+          skipReason,
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "skipped" as const, reason: message };
+    };
+    let monitorWake: Awaited<ReturnType<typeof enqueueWakeup>> | undefined;
+    let monitorWakeStartedAt = input.now;
     try {
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
@@ -12117,12 +12205,20 @@ export function heartbeatService(
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
         }
-      } else
-        await enqueueWakeup(targetAgentId, {
+      } else {
+        // The receipt lookup below compares database timestamps, so the start
+        // mark comes from the database clock too.
+        monitorWakeStartedAt = await db
+          .select({ now: sql<string>`clock_timestamp()` })
+          .from(agents)
+          .where(eq(agents.id, targetAgentId))
+          .limit(1)
+          .then((rows) => (rows[0] ? new Date(rows[0].now) : input.now));
+        monitorWake = await enqueueWakeup(targetAgentId, {
           source: input.source,
           triggerDetail: input.triggerDetail,
           reason: wakeReason,
-          idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
+          idempotencyKey: monitorWakeKey,
           payload: {
             issueId: claimed.id,
             nextCheckAt: scheduledAtIso,
@@ -12148,6 +12244,34 @@ export function heartbeatService(
             manualTrigger: input.activitySource === "manual",
           },
         });
+      }
+
+      // enqueueWakeup returns null for a wake it admitted behind a live run, and
+      // also for one it dropped (wake on demand off, tree hold, pause). Only a
+      // skipped receipt written or touched by this dispatch means the agent
+      // will not run, so the monitor stays armed.
+      if (monitorWake === null) {
+        const skipped = await db
+          .select({ reason: agentWakeupRequests.reason })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, claimed.companyId),
+              eq(agentWakeupRequests.agentId, targetAgentId),
+              eq(agentWakeupRequests.status, "skipped"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${claimed.id}`,
+              gte(agentWakeupRequests.updatedAt, monitorWakeStartedAt),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (skipped) {
+          return holdMonitorForRetry(
+            `Monitor wake skipped (${skipped.reason ?? "skipped"})`,
+            skipped.reason ?? "skipped",
+          );
+        }
+      }
 
       await db
         .update(issues)
@@ -12183,6 +12307,9 @@ export function heartbeatService(
 
       return { outcome: "triggered" as const };
     } catch (err) {
+      if (input.clearOnClientError && isRetryableMonitorWakeBlock(err)) {
+        return holdMonitorForRetry((err as HttpError).message, (err as HttpError).message);
+      }
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
           await db
@@ -12342,6 +12469,8 @@ export function heartbeatService(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
           ),
+          // A paused agent keeps its waits; they fire once after it resumes.
+          sql`not exists (select 1 from ${agents} where ${agents.id} = ${issues.assigneeAgentId} and ${agents.status} = 'paused')`,
         ),
       )
       .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
@@ -12370,6 +12499,7 @@ export function heartbeatService(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
               ),
+              sql`not exists (select 1 from ${agents} where ${agents.id} = ${issues.assigneeAgentId} and ${agents.status} = 'paused')`,
             ),
           )
           .returning();
@@ -13593,6 +13723,7 @@ export function heartbeatService(
           assigneeAgentId: issues.assigneeAgentId,
           executionState: issues.executionState,
           projectId: issues.projectId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
         })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -14678,6 +14809,24 @@ export function heartbeatService(
       readNonEmptyString(contextSnapshot.retryReason) !==
         "missing_issue_comment"
     ) {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
+    // A legitimately waiting issue is not re-run to force a comment: the
+    // wait's wake runs the agent again later, and that run can comment.
+    const waitingIssue = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (waitingIssue && hasActiveIssueWait(waitingIssue)) {
       if (run.issueCommentStatus !== "not_applicable") {
         await patchRunIssueCommentStatus(run.id, {
           issueCommentStatus: "not_applicable",
@@ -16305,7 +16454,7 @@ export function heartbeatService(
         : baseSchedule;
 
     const requiresIssueGate =
-      isTransientWorkspaceGitScanCode(run.errorCode) ||
+      isTransientSetupFailureCode(run.errorCode) ||
       run.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE ||
       hasConversationContinuationPolicy(run.resultJson) ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
@@ -26986,6 +27135,11 @@ export function heartbeatService(
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
+        const backgroundTaskStopped = isSuccessfulRunWithStoppedBackgroundTask({
+          errorCode: adapterResult.errorCode ?? null,
+          timedOut: adapterResult.timedOut,
+          resultJson: parseObject(adapterResult.resultJson),
+        });
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
           outcome = latestRun.status;
@@ -27010,6 +27164,9 @@ export function heartbeatService(
           !adapterResult.signal &&
           !processCancellation?.failed
         ) {
+          outcome = "succeeded";
+        } else if (backgroundTaskStopped && !processCancellation?.failed) {
+          // The turn succeeded; only the lingering background task was stopped.
           outcome = "succeeded";
         } else {
           outcome = "failed";
@@ -27169,6 +27326,14 @@ export function heartbeatService(
                 ...(adapterResult.executionRecovery
                   ? { executionRecovery: adapterResult.executionRecovery }
                   : {}),
+                ...(outcome === "succeeded" && backgroundTaskStopped
+                  ? {
+                      backgroundTaskStopped: true,
+                      backgroundTaskStopWarning: adapterResult.errorMessage
+                        ? redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions)
+                        : null,
+                    }
+                  : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
@@ -27280,6 +27445,9 @@ export function heartbeatService(
             payload: {
               status,
               exitCode: adapterResult.exitCode,
+              ...(outcome === "succeeded" && backgroundTaskStopped
+                ? { backgroundTaskStopped: true, signal: adapterResult.signal ?? null }
+                : {}),
               ...(readRunCancellation(finalizedRun.resultJson) ? { cancellation: readRunCancellation(finalizedRun.resultJson) } : {}),
             },
           });
@@ -27303,6 +27471,19 @@ export function heartbeatService(
           }
           const livenessRun = finalizedRun;
           await refreshContinuationSummaryForRun(livenessRun, agent);
+          // Schedule the re-check before release, continuation and handoff run,
+          // so they see the wait and leave the issue alone until it is due.
+          try {
+            await scheduleBackgroundTaskRecheck(db, issuesSvc, {
+              run: livenessRun,
+              agentRuntimeConfig: agent.runtimeConfig,
+            });
+          } catch (err) {
+            logger.warn(
+              { err, runId: livenessRun.id, issueId },
+              "failed to schedule background task re-check",
+            );
+          }
           const skipRunIssueComment =
             parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
           let resolvedPresentationDecision: RunPresentationDecision | null =
@@ -28063,6 +28244,9 @@ export function heartbeatService(
             : null) ??
           recordedResponsibleUserDenialCode ??
           nonRetryablePreflightCode ??
+          (outerErr instanceof RemotePreflightUnavailableError
+            ? REMOTE_PREFLIGHT_UNAVAILABLE_CODE
+            : null) ??
           "setup_failed";
         logger.error(
           { err: outerErr, runId },
@@ -28185,7 +28369,7 @@ export function heartbeatService(
             // No provider work began. Retry temporary host scan failures with
             // the existing durable failure budget, before releasing execution.
             // Generic recovery must not grant a second budget on exhaustion.
-            await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
+            await (isTransientSetupFailureCode(livenessRun.errorCode)
               ? scheduleBoundedRetryForRun(livenessRun, failedAgent)
               : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
             ).catch((retryError) => {

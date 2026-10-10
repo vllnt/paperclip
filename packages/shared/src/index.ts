@@ -455,6 +455,7 @@ export {
   ISSUE_MONITOR_SCHEDULED_BY,
   ISSUE_EXECUTION_MONITOR_KINDS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME,
   ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES,
   ISSUE_EXECUTION_STATE_STATUSES,
   ISSUE_EXECUTION_MONITOR_STATE_STATUSES,
@@ -921,6 +922,7 @@ export type {
   ManagedSettingMetadata,
   BackupRetentionPolicy,
   Agent,
+  AgentWaitState,
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
@@ -2829,4 +2831,5 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";

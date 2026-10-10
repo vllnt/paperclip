@@ -276,6 +276,7 @@ export type {
 } from "./adapter-skills.js";
 export type {
   Agent,
+  AgentWaitState,
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
