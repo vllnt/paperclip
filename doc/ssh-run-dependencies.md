@@ -42,10 +42,12 @@ absolute path gets no default.
   company.** An environment is a record of the instance, not of one company, so
   every company that may use it shares its root, its `runs` directory and its
   store. Paperclip does not keep two companies' stores apart, and it does not check
-  which companies use an environment. To keep companies apart, give each company
-  its own environment with its own workspace path (for example
-  `/srv/paperclip/<company>`) and use it for that company only. Package files
-  are content-addressed and public packages are the same for everyone, but a store
+  which companies use an environment. The boundary between companies is the host
+  and the worker user, not a path: under one worker user, a run of one company can
+  already write anywhere under the root, so a separate store path would isolate
+  nothing. **Companies that must not share files need separate environments (a
+  separate host or worker user), not separate store paths.** Package files are
+  content-addressed and public packages are the same for everyone, but a store
   also holds whatever a run installed from a private registry, and its files are
   writable (see below).
 - The store only grows. Pruning it (`pnpm store prune`) is not automatic, and a safe
