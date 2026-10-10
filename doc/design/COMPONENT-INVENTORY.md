@@ -274,7 +274,7 @@ Grouped by rough domain area. One line each; variants column is props-based wher
 | `issue-output/` | 5 | Task output file tiles / sections |
 | `issue-properties/` | 5 | Task properties panel (full impl, see 2.1) |
 | `routine-sections/` | 3 | Editable routine section blocks |
-| `search/` | 3 | Search result row, `HighlightedText`, `MatchSourceChip` |
+| `search/` | 1 | `HighlightedText` (the launcher's result rows). The search result row and `MatchSourceChip` were removed with the search page (#95). |
 | `timeline/` | 1 | `WorkTimelineChart.tsx` |
 | `transcript/` | 1 | `RunTranscriptView.tsx` |
 

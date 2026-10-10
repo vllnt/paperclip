@@ -101,7 +101,7 @@ Worst gaps, in priority order (paths under `ui/src/`):
 
 Other findings that the slices use:
 
-- **Search page:**
+- **Search page** (removed by #95, slice 1b):
   - The operator chips render only while the input has focus, so Tab
     removes them (`pages/Search.tsx:497-499`).
   - The page binds its own `/` handler on `window` (`:434-445`). It doesn't
@@ -285,6 +285,9 @@ With a query:
 3. **Search all for "..."**: always present. Cmd/Ctrl+Enter opens `/search`
    from any row. Enter with no match opens `/search`. Both are kept from
    today.
+   > **Replaced by #95 (slice 1b):** the `/search` page is gone. Search
+   > results show in the launcher, and a query with no match offers
+   > "Create task".
 4. **Quick filters**.
 
 The inner `Command` gets `shouldFilter={false}` (passed through a new
@@ -473,6 +476,8 @@ into three PRs, in this order:
   The palette calls `/search` with a 150 ms debounce and cancels stale
   requests. It keeps `issuesApi.list({ q, includeRoutineExecutions: true })`
   for tasks, because that behaviour is tested today.
+  > **Replaced by #95 (slice 1b):** the `/search` page is gone. The launcher
+  > is the only search UI, so new kinds show there only.
 
 ### Slice 4: Jev intent suggestion (tier 2)
 
@@ -507,6 +512,9 @@ uses `createJudgeClient` and the company secret `AI_GATEWAY_API_KEY` from
 | Page actions (status, assign, approve, run) | "This view" rows (2c) | existing routes | existing commands; gaps get follow-ups (2c) |
 | Intent suggestion | "Suggested" row (4) | `POST /companies/:id/command-intent` (4) | `intent` (4) |
 
+> **Replaced by #95 (slice 1b):** web search is the launcher only; the
+> `/search` page is gone.
+
 ## 5. Tests and verification
 
 Every slice:
@@ -521,6 +529,7 @@ Every slice:
   - A timing test: 200 actions ranked in less than 2 ms (median of 50 runs).
 - **UI:** `CommandPalette.test.tsx` keeps all its current cases:
   - Search all, Cmd+Enter and empty Enter go to `/search`;
+    > **Replaced by #95:** these rows and keys went away with the page.
   - the quick-filter chips;
   - the project promotion;
   - `includeRoutineExecutions: true`;
@@ -555,7 +564,7 @@ Every slice:
 
 | Risk | Mitigation |
 | --- | --- |
-| Enter with a query opens a different row than today (cmdk sorted rows by its own score; now our order decides). | Tests pin the first row for each query shape. Cmd+Enter and empty Enter keep going to `/search`. Decision D3. |
+| Enter with a query opens a different row than today (cmdk sorted rows by its own score; now our order decides). | Tests pin the first row for each query shape. Cmd+Enter and empty Enter keep going to `/search` (**replaced by #95:** the page and these keys are gone). Decision D3. |
 | A new chord or bare key fires while the user types, or over a dialog. | Reuse `isKeyboardShortcutTextInputTarget` and `hasBlockingShortcutDialog`. Unit tests for both guards. |
 | Chords collide with page handlers (`IssueDetail` capture phase `g c`/`g f`, Inbox `a y r U`, `IssuesList` j/k). | The catalog test rejects collisions. `IssueDetail` keeps its capture-phase handler. |
 | Two layout shells (`Layout.tsx`, `Layout.production.tsx`) drift. | Both mount the same provider and palette. A test renders each shell. |
@@ -585,6 +594,8 @@ any of them.
   - **(a) Recommended:** Enter opens the best local match (action or
     entity). "Search all" stays one arrow key away, and Cmd/Ctrl+Enter always
     opens `/search`.
+    > **Replaced by #95:** Enter still opens the best match; the `/search`
+    > page and Cmd/Ctrl+Enter to it are gone.
   - **(b)** Keep "Search all" as the first row.
 - **D4. Frecency per browser** (localStorage, like the theme preference), or
   synced per user on the server. Recommended: per browser now; a sync can
