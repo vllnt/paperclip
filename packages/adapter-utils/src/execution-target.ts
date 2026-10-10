@@ -1629,12 +1629,20 @@ export async function prepareRemoteRunTempDirectory(input: RemoteRunTempLocation
 export async function cleanupRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<void> {
   const directory = remoteRunTempDirectory(input);
   if (!directory || input.target?.kind !== "remote") return;
+  // The exit status is `rm`'s. `rm -rf` cannot empty a directory that lacks
+  // owner rwx (a Go module cache, say), so grant it first, as the SSH run
+  // directory reaper does. `find` follows no link, not even the directory
+  // itself if the agent replaced it with one; `chmod -R` would follow that.
   const removeEmptyRunDirectory = input.target.transport === "ssh"
-    ? `; rmdir -- ${shellQuote(path.posix.dirname(directory))} 2>/dev/null || true`
+    ? ` && { rmdir -- ${shellQuote(path.posix.dirname(directory))} 2>/dev/null || true; }`
     : "";
   const result = await adapterExecutionTargetCommandRunner(input.target).execute({
     command: "sh",
-    args: ["-c", `rm -rf -- ${shellQuote(directory)}${removeEmptyRunDirectory}`],
+    args: [
+      "-c",
+      `find ${shellQuote(directory)} -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null; `
+        + `rm -rf -- ${shellQuote(directory)}${removeEmptyRunDirectory}`,
+    ],
     cwd: input.target.remoteCwd,
     timeoutMs: 60_000,
   });
