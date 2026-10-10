@@ -13,6 +13,7 @@ import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
 import { queryKeys } from "../lib/queryKeys";
 import { commandActionIcon } from "../lib/command-action-bindings";
+import { hasBlockingShortcutDialog, shouldOpenCommandLauncher } from "../lib/keyboardShortcuts";
 import {
   CommandDialog,
   CommandEmpty,
@@ -93,10 +94,20 @@ export function CommandPalette() {
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        setOpen(true);
-      }
+      const shouldOpen = shouldOpenCommandLauncher({
+        key: e.key,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        // keyCode 229 marks a key that an IME is still composing (Safari).
+        isComposing: e.isComposing || e.keyCode === 229,
+        defaultPrevented: e.defaultPrevented,
+        target: e.target,
+        hasOpenDialog: hasBlockingShortcutDialog(),
+      });
+      if (!shouldOpen) return;
+      e.preventDefault();
+      setOpen(true);
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
@@ -359,6 +370,8 @@ export function CommandPalette() {
 
   return (
     <CommandDialog
+      title="Command launcher"
+      description="Run a command, or search tasks, agents and projects."
       open={open}
       onOpenChange={setOpen}
       commandProps={{ shouldFilter: false, loop: true }}

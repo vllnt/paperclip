@@ -284,3 +284,34 @@ export function resolveGoChordKeyAction({
   if (normalizedKey === "g") return { type: "arm" };
   return { type: "disarm" };
 }
+
+/**
+ * Cmd/Ctrl+K opens the command launcher, but only from the page itself: a
+ * text field or editor keeps its own Cmd/Ctrl+K (for example "insert link"),
+ * IME composition and keys another handler claimed are left alone, and the
+ * launcher never opens on top of another modal dialog.
+ */
+export function shouldOpenCommandLauncher({
+  key,
+  metaKey,
+  ctrlKey,
+  altKey,
+  isComposing,
+  defaultPrevented,
+  target,
+  hasOpenDialog,
+}: {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  isComposing: boolean;
+  defaultPrevented: boolean;
+  target: EventTarget | null;
+  hasOpenDialog: boolean;
+}): boolean {
+  if (key.toLowerCase() !== "k" || !(metaKey || ctrlKey) || altKey) return false;
+  if (isComposing || defaultPrevented || hasOpenDialog) return false;
+  return !isKeyboardShortcutTextInputTarget(target);
+}
+
