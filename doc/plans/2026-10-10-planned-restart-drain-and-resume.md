@@ -307,6 +307,18 @@ path that finalizes the run honours it:
    Local in-process adapters (acpx, `grok-local`) carry the proof in their result
    earlier. So when the caller decides, every kind of run has its proof or has
    failed to get it. The caller:
+   - **requires a stop proof.** One of two facts that the code records today:
+     - **acknowledged:** `executionCancellation.state` is `"acknowledged"`.
+       `cancelRunInternal` writes it with the ending for a child process with a
+       real pid or process group, after `terminateHeartbeatRunProcess` returns;
+       `acknowledgeRemoteStop` writes it for a remote ACP run; local in-process
+       adapters return it in their result. The intent path keeps this field when
+       it switches the metadata outcome to `interrupted`;
+     - **never started:** a run fenced while still preparing has no child and no
+       acknowledgment. Its proof is the startup-cancellation fence, or bootstrap
+       evidence with `providerWorkStarted: false`.
+
+     Without either, the run goes to `reconciliation`.
    - **keeps the stop-proof contract.** Today a stop that cannot be verified is a
      conflict ("provider termination could not be verified"), and for a remote ACP
      run the proof (`executionCancellation.state: "acknowledged"`, and with it the
@@ -348,8 +360,13 @@ likes. Nothing else starts in between: `startNextQueuedRunForAgent` and
 
 **A stop before the deadline.** The shutdown loop also writes `planned_restart`
 (not `server_shutdown_interrupted`) for a run that it ends while a
-`planned_restart` drain is open, and schedules the resume in place of the
-transient retry, with its existing lock rule. The process exits right after, so
+`planned_restart` drain is open. Today that loop writes no stop proof. Inside a
+drain it writes `executionCancellation.state: "acknowledged"` after
+`terminateHeartbeatRunProcess` returns for a real pid or process group, as
+`cancelRunInternal` does. It then applies the class rules and the same proof rule,
+and schedules the resume in place of the transient retry, with its existing lock
+rule. In-process and remote runs that the loop cannot prove stopped go to
+`reconciliation`. The process exits right after, so
 the race above does not apply. Without a drain, shutdown is unchanged (section 5.1).
 
 Why stop the runs at the deadline, and not at the stop: the stop is controlled by
@@ -583,8 +600,8 @@ One gap: the sweep calls `scheduleRecoveryRetry`, which schedules with the defau
 transient reason and so **spends the failure budget**. If a resume row is lost and
 the sweep schedules the successor of a `planned_restart` run, it must pass
 `planned_restart_resume` as the reason, **and only when the stop was proven**
-(the same proof that section 4.2 step 4 checks:
-`executionCancellation.state` is `"acknowledged"`). A `planned_restart` run with no proof
+(the same stop proof that section 4.2 step 4 defines: acknowledged, or never
+started). A `planned_restart` run with no proof
 goes to the `reconciliation` class and its existing hold, never to a resume:
 its provider may still be working. The same rule applies to every fallback that
 can see a `planned_restart` run (the D2 startup classification too). That is a one-line wiring change in
@@ -690,7 +707,8 @@ D1, embedded Postgres unless noted:
   `cancelled`), the stop metadata outcome is `interrupted`, exactly one successor
   exists and it is `planned_restart_resume` (not a recovery run or
   `transient_failure`), and the issue lock has moved to the resume row. (c) A run
-  that is claimed but still preparing is fenced the same way. (d) A remote ACP run whose
+  that is claimed but still preparing is fenced and resumed on its never-started
+  proof. (d) A remote ACP run whose
   stop is proven (the acknowledgment arrives at its lease release) gets the resume.
   (e) A remote ACP run whose stop is not proven gets no resume, lands in
   `reconciliation`, and the deadline caller sees no `409`. (f) The executor's late
@@ -704,8 +722,10 @@ D1, embedded Postgres unless noted:
 - **Classes.** A conversation-continuation run gets the resume. A legacy run that
   needs reconciliation gets the existing hold and no resume. A run with no
   `issueId` gets nothing. The status counts each class.
-- A `SIGTERM` during a `planned_restart` drain writes `planned_restart`; without a
-  drain it writes `server_shutdown_interrupted` (unchanged).
+- A `SIGTERM` during a `planned_restart` drain writes `planned_restart` with the
+  acknowledged proof for a child-process run, which is resumed, and sends an
+  in-process or remote run to `reconciliation`; without a drain it writes
+  `server_shutdown_interrupted` (unchanged).
 - After a simulated restart (new service instance, open row of another boot): the
   row closes with `process_stopped` before the reap; a suppressed process (worktree
   flag set) leaves the row open; the in-memory drain is off,
@@ -822,6 +842,8 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
 | Run statuses; `error_code` free text | `packages/shared/src/constants.ts:919-928`; `packages/db/src/schema/heartbeat_runs.ts:68` |
 | Retry accounting that does not spend failures | `server/src/services/execution-recovery-attempt.ts`: `historicalFailureCount` `:29-40`, `nonFailureLane` `:45`, `executionRetryAttemptCount` `:59-65`, `accountingForScheduledRetry` `:67-72`; the snapshot written by `scheduleBoundedRetryForRun` `heartbeat.ts:16343-16351` |
 | Reconciliation gate for a retry | `server/src/services/legacy-execution-recovery.ts:19-56` (`legacyExecutionNeedsReconciliation`); refusal in `scheduleBoundedRetryForRun` `heartbeat.ts:16224-16233`; native and chat exclusions `:14802-14808` |
+| Child-process stop acknowledgment | `heartbeat.ts:31676-31685` (written with the ending at `:31656`, after termination `:31603-31614`); none in the shutdown loop `:15593-15608` |
+| Never-started proof | startup-cancellation fence `heartbeat.ts:31515-31527`; bootstrap evidence `legacy-execution-recovery.ts:52-55` |
 | Live-process stop | `heartbeat.ts:31460` (`cancelRunInternal`), options `:31438-31447` (`errorCode`, `suppressImmediateRecovery`, `terminationGraceMs`); settlement map `:1370`, used by the executor `:26938` |
 | Settlement only for child-process adapters | `heartbeat.ts:31545-31550` (`!control`); in-process stop handle registered at `:26586` (`onCancellationReady`); the control branch returns when the executor already finalized `:31628-31646` |
 | Executor's own release (no suppression for a stop) | `heartbeat.ts:27445-27452` |
