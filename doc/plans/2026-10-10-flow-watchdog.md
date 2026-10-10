@@ -59,7 +59,7 @@ The plan adds a new evaluator only where nothing can be reused. This table is th
 |---|---|---|
 | **Stranded-issue reconciler** (#104) | A hard-coded form of rule (a). It re-dispatches an assigned issue that has no live run, to its **owner**, within one sweep. It respects the pause hold, the wake policy, free slots, open recovery actions, a queued wake and the budget | **Stays as it is.** It acts on the owner. Rule (a) acts on a **third party**, and only after the owner had its chance. The two share the same gates (sections 6.1 and 7.1) |
 | **Task watchdog** (`issue_watchdogs`, `task-watchdogs.ts`, the origin kind `task_watchdog`) | The closest precedent. A person or agent watches **one issue's subtree**. When the subtree has stopped (a stable stop fingerprint), the server opens **one deduplicated watchdog issue** assigned to a watchdog agent. It dedups by "observed" and "reviewed" fingerprints, and `issues_active_task_watchdog_uq` is a partial unique index on `issues` | **Stays as it is.** It is per issue and set by hand. The flow watchdog is company-wide rules over many subjects, events and capacity. They copy the same pattern: server-side classifier, one open issue per key, a unique partial index, an assigned agent that wakes. An issue that an **active task watchdog** already watches is an exemption for rule (a), so the two do not report the same stop twice |
-| **Routine stale-tick expiry** (#105) | Expires a routine tick that blocks later ticks. Defines a *progress clock* and a list of *exemptions* | **Shares its evaluator.** The progress clock and the exemptions become one module that #105 and rule (a) both call (section 6.1). Rule (a) reports. #105 cancels. They do not fight: #105's setting is per routine and rule (a) never cancels |
+| **Routine stale-tick expiry** (#105) | Expires a routine tick that blocks later ticks | **Shares one module, defined here.** The exemption set, the progress clock with its clock source, and the atomic close step are defined once in section 6.1. #105 refers to them and defines only what is routine-specific. Rule (a) reports. #105 closes. They do not fight: #105's setting is per routine and rule (a) never closes |
 | **Holds with lift conditions** (#102) | Evaluates conditions on a hold with a checker worker. The checker is built for hold scopes, not for general predicates | **Shares conventions, not the evaluator.** Both use a single-flight worker, the database clock, closed error codes and a generation key in the dedup key. A hold is also an **exemption** for every rule (section 6.2). The checker is not reused because a hold condition is a state machine on one target, and a rule is a query over many subjects |
 | **Flow metrics** (#106) | A read-only report: throughput, scrap by error code, runs per done issue, cost. Defines the scrap classes, the failed-run rate and limits (XmR) | **Source of truth for rule (d).** The failed-run rate is #106's *scrap rate* (section 6.6). The shared function lives in one place. XmR breach is a later threshold type |
 | **Routine triggers** | `routines.runRoutine(id, { variables, payload, idempotencyKey, source })` and a public fire route | **The routine action** (section 7.2). The routine's own concurrency policy and holds still apply |
@@ -84,11 +84,11 @@ active run**, and has **made no progress for `N` minutes**.
 
 - *No active run* is the same test that routines use for "live": no heartbeat run in
   `queued`, `running` or `scheduled_retry` attached to the issue, and no deferred wake.
-- *No progress* is the **progress clock** of #105 (section 6.1), not `issues.updated_at`.
+- *No progress* is the **progress clock** of section 6.1.2, not `issues.updated_at`.
   System writes touch `updated_at`, so the clock would never run out.
-- The **exemptions** of #105 and #104 apply: an armed wait, an open recovery action, a
-  held scope, a tree hold, a pending decision, an exhausted budget. Rule (a) adds one:
-  an issue that an **active task watchdog** already watches.
+- The **exemption set** of section 6.1.1 applies, including a pending interaction, an
+  `in_review` participant and a **pending linked approval**. Rule (a) adds one: an issue
+  that an **active task watchdog** already watches.
 - **The minimum `N` is computed, not fixed.** #104's re-dispatch must always go first.
   Its recent-progress exemption (`STRANDED_RECENT_PROGRESS_EXEMPTION_MS`) is 30 minutes
   by default, it is set by an environment variable, and it is floored at 60 seconds.
@@ -327,28 +327,153 @@ Whether the `issues` table gets a partial unique index for the origin kind is Q1
 
 ## 6. Evaluation
 
-### 6.1 One stall evaluator, shared with #105
+### 6.1 The shared stall module: one definition, used by #105 and by this plan
 
-A pure function (a new module, for example `flow-stall.ts`) that takes an issue and its
-context and returns `{ stalled, sinceMs, exemption }`. It owns:
+A new module (for example `flow-stall.ts`) holds the parts that #105 (routine
+stale-tick expiry) and rule (a) both need. **These parts are defined here, once.** #105
+refers to this section and does not repeat them. The module has three parts:
+the exemption set (6.1.1), the progress clock (6.1.2) and the atomic close step (6.1.3).
 
-- the **progress clock**: the latest of a run reaching `running`, a comment, a status
-  change (from the activity log, because `issues` stores no status-change time), and the
-  issue's creation. A re-dispatch or a requeued wake is **not** progress;
-- the **exemption list**: an armed issue monitor or wait, an open recovery action of any
-  owner, a held scope, a tree hold, a pending decision, an exhausted budget, a deferred
-  wake.
+#104's reconciler is left alone. Moving it onto this module is a later cleanup.
 
-#105's routine check and rule (a) call it. #104's reconciler is left alone in this plan.
-Moving it onto the shared module is a later cleanup, after both have landed.
+#### 6.1.1 The exemption set
+
+`stallExemption(issue, now)` returns the name of the first exemption that applies, or
+`null`. While one applies, the silence is explained, and closing the issue would destroy
+a waiting state. The list is long on purpose: a false close costs more than a late one.
+
+| Exemption | Signal on `main` | Used by |
+|---|---|---|
+| An armed issue monitor or wait | `issues.monitor_next_check_at` is not null | both |
+| An open recovery action of any owner | `issue_recovery_actions` with status `active` or `escalated` | both |
+| A held scope: the routine is paused, or its project, company or assignee agent is paused | `routines.status`, `projects.paused_at`, `companies.paused_at`, `agents.paused_at`; and the holds of #102 once they exist (a hold on any of these scopes) | both |
+| An issue-tree hold | the tree-hold check that automatic recovery already uses | both |
+| **A pending interaction** of any kind | an `issue_thread_interactions` row that is pending | both |
+| **An `in_review` stage with a pending participant** | the issue's execution state: `status = pending` with a current participant | both |
+| **A pending linked approval** | `issue_approvals` joined to `approvals` with `approvals.status = 'pending'`, both company-scoped. Production attention logic reads the same pair when it decides that a review needs a person | both |
+| The assignee is over budget | the budget hard-stop check that wake dispatch already uses | both |
+| A deferred wake waits for the issue's own lock | `agent_wakeup_requests` in `deferred_issue_execution` | both |
+| An active task watchdog watches the issue | `issue_watchdogs` with status `active` | rule (a) only |
+
+**This list must not drift from the attention feed.** Every source that the attention
+feed treats as "waiting on a person" (a pending interaction, a pending approval, a
+review that needs a human participant, a stalled review) is an exemption. R1 adds a
+conformance test: it lists those sources from the attention code and fails if one has no
+matching exemption. A new kind of governed request is then added in one place.
+
+#### 6.1.2 The progress clock, and the clock source
+
+**Progress** is the latest of: a run of the issue reaching `running` (its `started_at`),
+any comment on the issue, an issue status change (read from the activity log, because
+`issues` stores no status-change time), the issue's creation, and the **hold-lift floor**
+below. A re-dispatch (#104) or a requeued wake is **not** progress. Without that rule, a
+loop of failed wakes would reset the clock for ever.
+
+**The hold-lift floor.** Nothing stores the time a hold ended, but the activity log holds
+enough to be safe. The progress clock never starts before the latest of these entries
+that falls inside the timeout window:
+
+- `agent.resumed` for the assignee agent (exact);
+- `company.updated`, `project.updated` or `routine.updated` for the issue's company,
+  project or routine (these cover a resume, and any other edit; reading any of them as a
+  possible lift can only **delay** a close).
+
+The lookup uses the `(entity_type, entity_id)` index and a time bound. When #102 lands,
+its lift time replaces this approximation for the holds it covers.
+
+**The clock source is the database clock.** The step reads `clock_timestamp()` once, at
+the start, and uses that one value for the whole decision. It never mixes in the
+application clock.
+
+- A **backward jump** makes ages smaller, and an age below zero is treated as zero. The
+  result is a late close, which is safe.
+- A **forward jump** makes ages larger and can close early by the size of the jump. The
+  atomic step therefore compares the database clock with the application clock and
+  refuses when they differ by more than 5 minutes. It records `clock_skew` and takes no
+  action. A smaller jump can close early by at most 5 minutes, and the close is visible
+  and recoverable (the next tick or evaluation recreates the work).
+
+#### 6.1.3 The atomic close step
+
+`closeStalledIssue({ companyId, issueId, binding, expectedStatusVersion, targetStatus,
+reason, source })` closes one issue so that no wake can be promoted onto it afterwards.
+#105 uses it with `targetStatus = cancelled`. This plan's `auto_close` (section 7.3)
+uses it with `done` or `cancelled`.
+
+**The race it closes.** The heartbeat cancel ends a run and then runs
+`releaseIssueExecutionAndPromote`, which takes the issue's row lock **under its own,
+later transaction** and promotes the oldest deferred wake to a run. If the issue is
+still open at that moment, the promoted run attaches to an issue that is about to be
+cancelled. A check made before the cancel does not prevent that.
+
+**The fix is an order, and a compare-and-set.** The issue is closed first, under the
+same row lock that promotion takes. A promotion that comes later sees a terminal issue
+and drops the wake. In order:
+
+1. **Lock.** In one database transaction, take the routine row lock if the caller is a
+   dispatch (dispatch already holds it), and then the issue row `FOR UPDATE`, with any
+   issue that references the same live runs, in id order. This is the lock that
+   `withIssueExecutionLock` takes. The order is routine, then issue, then run, the same
+   as the existing paths, so it cannot deadlock with them.
+2. **Re-validate under the lock.** All of these must hold, or the transaction rolls back
+   and the caller does what it did before (a skipped or coalesced tick, or a 409):
+   - the **binding** predicate that the caller passed (for #105: the issue is the
+     routine's current blocker; section 3.6 of #105);
+   - **`issues.status_version` equals `expectedStatusVersion`** (the compare-and-set that
+     closes the status TOCTOU);
+   - no run of the issue is `running`;
+   - `stallExemption` returns `null`, evaluated now, under the lock;
+   - the clock decision (6.1.2) holds, and the skew guard passes.
+3. **Close, in the same transaction:**
+   - set the issue to `targetStatus` through the issue service, passing the transaction
+     (this bumps `status_version`);
+   - cancel every `deferred_issue_execution` wake of the issue, with the reason code;
+   - add the system comment;
+   - end the originating record (for #105, the routine run, through the existing
+     run-status sync, which must accept the transaction);
+   - write the activity entry.
+4. **Commit.** From this point the issue is terminal.
+5. **Cancel the remaining runs, after the commit,** with the heartbeat cancel
+   (`queued`, `scheduled_retry`, and any run that started in the short window since step
+   2). Each cancel calls `releaseIssueExecutionAndPromote`. It finds a terminal issue
+   and promotes nothing: `promoteDeferredWake` cancels a deferred wake for a terminal
+   issue and its assignee, the scheduled-retry gate returns `issue_cancelled`, and
+   `decideQueuedRunStaleness` cancels a queued run on a terminal issue. The cancel
+   passes `suppressImmediateRecovery` so that no recovery run follows.
+
+**Why the run cancel stays outside the transaction.** The heartbeat cancel is not a
+plain status update. It fences native sessions, records the cancellation, and stops
+processes. A queued run has no process, but the same code path handles it, and the plan
+keeps one path. The order above makes this safe: the issue is already terminal.
+
+**What can still revive the issue.** `promoteDeferredWake` reopens a terminal issue for
+a wake that carries a human comment or an explicit resume intent. That is a person
+acting after the close, which is allowed. It is not a leak: it is a new, visible event.
+A queued run that carries a wake comment or a resume intent is not cancelled by the
+staleness check, for the same reason.
+
+**Tests (R1 of #105, S1 of this plan), on embedded Postgres:**
+
+- a wake deferred before the close is cancelled, not promoted, and no run is attached to
+  the closed issue;
+- a wake that arrives between the lock and the commit waits for the lock, then sees a
+  terminal issue;
+- an interleaving test: the heartbeat cancel of a run races the close; the end state is
+  one terminal issue and no live run on it;
+- `status_version` moved between the preview and the close: the step refuses;
+- a run that turns `running` after the check: the transaction rolls back;
+- a pending approval, a pending interaction, and an `in_review` participant each
+  prevent the close;
+- the skew guard, a backward jump and a forward jump.
 
 ### 6.2 Holds are exemptions
 
 For every rule: a company that is held (paused or archived) is not evaluated. The firing
 state is kept, and `last_status` is `skipped_held`. A held **subject** (a held agent, a
-tree hold, a paused project) is an exemption for rule (a). #102 gives each hold a
-reason and a time. Until it lands, "held" means "held now", with the same known gap as
-#105 (a lifted hold is not remembered).
+tree hold, a paused project) is an exemption for rule (a), through the exemption set
+(6.1.1). A hold that ended recently is handled by the hold-lift floor (6.1.2), so a
+tick that waited out a hold does not close on the first evaluation after it. #102 gives
+each hold a reason and a time. When it lands, its lift time replaces the approximation.
 
 ### 6.3 Cadence, claim and single firing across processes
 
@@ -519,7 +644,10 @@ result (the routine run id and its status) goes to the firing.
   ("cleared: ..."). **Recommendation:** the default is `comment`. The issue stays open
   for the agent or a person to close, because closing hides the evidence. `auto_close`
   is opt-in per rule, and it only closes an issue that nobody has touched since the last
-  watchdog comment. `none` writes nothing.
+  watchdog comment. **It closes through the atomic close step (section 6.1.3)**, with the
+  binding "this is the firing's issue", the status version that the watchdog last saw,
+  and the exemption set. The assigned agent may have woken on this issue, and a plain
+  status write could leave a promoted wake on a closed issue. `none` writes nothing.
 - **If the issue is closed by someone while the condition still holds:** the firing
   resolves with `issue_closed`. A new firing may open after the cooldown, counted from
   the closure. A closed issue means "seen", so the rule does not reopen it.
@@ -628,8 +756,12 @@ The shared stall module (section 6.1) makes the three agree on "no progress".
 
 - Rule (a): an issue past `N` with no progress fires once, with an issue assigned to the
   agent and a wake. **Red at `main`:** nothing fires.
-- Each exemption: an armed wait, an open recovery action, a held agent, a tree hold, a
-  pending decision, an exhausted budget, a deferred wake. No firing.
+- Each exemption of section 6.1.1: an armed wait, an open recovery action, a held agent,
+  a tree hold, a pending interaction, an `in_review` participant, a pending linked
+  approval, an exhausted budget, a deferred wake, an active task watchdog. No firing. The
+  conformance test against the attention feed.
+- The atomic close step for `auto_close` (section 6.1.3): the tests listed there.
+- The hold-lift floor: a tick whose agent was resumed inside the window is not stale.
 - A re-dispatch by #104 does not reset the clock.
 - Dedup: 10 evaluations leave exactly one open firing and one issue. A second process
   claiming the same rule at the same time leaves one firing (two-client race).
@@ -710,7 +842,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 
 | ID | Question | Recommendation |
 |---|---|---|
-| **Q1** | **For the reviewer.** Share the stall evaluator with #105 and not with #102? | Yes. Share the progress clock and the exemptions with #105, and the conventions with #102. Do not reuse #102's checker. Leave #104 alone until later. Whoever lands first creates the module |
+| **Q1** | **For the reviewer.** Share the stall module with #105 and not with #102? | Yes. Define the exemption set, the progress clock and the atomic close step once, here (section 6.1), and have #105 refer to them. Share conventions with #102. Do not reuse #102's checker. Leave #104 alone until later. Whoever lands first creates the module |
 | **Q2** | "No update for `N` minutes": the progress clock or `issues.updated_at`? | The progress clock. System writes touch `updated_at` |
 | **Q3** | **For the reviewer.** Event source for pull-request merges | S2 reads `external_objects` for a company on the core GitHub connection (it has the true merge time in `data.mergedAt`) and `issue_work_products` for a company on the plugin sync (no merge time). A generic event table is S3, only if needed |
 | **Q4** | What happens when the condition clears? | `comment` and resolve the firing. The issue stays open. `auto_close` is opt-in and closes only an untouched issue |
@@ -731,6 +863,8 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q19** | Lane-health checks from a separate planning effort | They are rule kinds that depend on this plan: two are filters on rule (a), five are new kinds after S1 (section 3.5). The filter set gets `labelIds` and "no assignee" |
 | **Q20** | The existing task watchdog | Keep it. Add "watched by an active task watchdog" as an exemption for rule (a) |
 | **Q21** | A paused or archived routine as a routine-action target | The watchdog checks the routine and its project itself, and skips (section 7.2) |
+| **Q23** | **For the reviewer.** The atomic close step: an issue-lock-aware order (close the issue first, then cancel the runs) with a `status_version` compare-and-set, in place of one transaction for everything | Yes (section 6.1.3). The heartbeat cancel fences native sessions and stops processes, so it stays a separate, existing path. The terminal issue is what makes the later promotion harmless |
+| **Q24** | The clock source and the hold-lift floor | The database clock, a 5-minute skew guard, and a floor taken from `agent.resumed` and the `*.updated` entries of the company, project and routine (section 6.1.2). #102's lift time replaces it later |
 | **Q22** | A terminated or pending assignee at fire time | Take no action. Record `suppressed: assignee_unavailable` and put the rule in an error state that the rules page shows |
 
 ## Appendix A. Code anchors on `main` at `d9804ac4f`
@@ -772,6 +906,14 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | The comment wake lives in the route; the service comment does not wake | `server/src/routes/issues.ts:17358`, `18233-18236`; `server/src/services/issues.ts:12211` |
 | Pull-request events stored in `external_objects` (`data.mergedAt`, `last_changed_at`) | `server/src/services/github-connection-events.ts:200-260`; `packages/db/src/schema/external_objects.ts` |
 | Recovery progress exemption (an environment value) | `server/src/services/recovery/service.ts:189-192` |
+| The issue lock that promotion takes (`FOR UPDATE` on the issue rows, in id order) | `server/src/modules/wake-queue/adapters/postgres.ts:1171` (`withIssueExecutionLock`) |
+| Release and promote: the drain, and the terminal-issue branch of a promotion | `server/src/modules/wake-queue/application/use-cases.ts:145` (`runReleaseDrain`), `378` (`promoteDeferredWake`), `1024` (`releaseIssueExecution`) |
+| A queued run on a terminal issue is cancelled at the claim (with a bypass for a wake comment or resume intent) | `server/src/modules/run-dispatch/domain/policy.ts:497` (`decideQueuedRunStaleness`), `614-623` |
+| The scheduled-retry gate returns `issue_cancelled` | `server/src/modules/run-dispatch/domain/policy.ts:382-389` |
+| The heartbeat cancel (native fence, process stop) | `server/src/services/heartbeat.ts:31507` (`cancelRunInternal`) |
+| Pending linked approvals (the pair that attention reads) | `packages/db/src/schema/issue_approvals.ts:7-22`, `packages/db/src/schema/approvals.ts:5-19`, `server/src/services/attention.ts:1591-1617` |
+| Pause and resume are logged (`agent.paused`, `agent.resumed`) | `server/src/routes/agents.ts:5915`, `5950` |
+| Issue `status_version` is bumped on a status change | `server/src/services/issues.ts:11029`, `11047` |
 | Scheduling suppression gate on the recovery pass | `server/src/index.ts:1827` |
 | Batch claim with `FOR UPDATE SKIP LOCKED` (precedent) | `server/src/services/chat-run-publications.ts:334`; `server/src/services/execution-recovery-resolution.ts:326` |
 | Labels on issues | `packages/db/src/schema/issue_labels.ts`, `labels.ts` |
