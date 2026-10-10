@@ -58,6 +58,15 @@ describe("search parity command", () => {
     expect(lines[1]).toContain("type=agent");
   });
 
+  it("asks for words instead of sending a search with no text, like the board launcher", async () => {
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>()
+      .mockImplementation(() => Promise.resolve(jsonResponse(searchResponse())));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(run(["search", " ", "--company-id", COMPANY_ID, "--scope", "issues"])).rejects.toThrow(/needs words/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects an unknown scope without calling the API", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

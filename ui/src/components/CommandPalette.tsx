@@ -1,5 +1,5 @@
 import { AgentIdentity } from "@/components/AgentIdentity";
-import { Fragment, useState, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
+import { Fragment, useState, useEffect, useLayoutEffect, useMemo, useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { useNavigate } from "@/lib/router";
 import { keepPreviousData, useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { COMPANY_SEARCH_MAX_OFFSET, type CompanySearchResult, type CompanySearchResultType } from "@paperclipai/shared";
@@ -95,6 +95,12 @@ function ShortcutHint({ keys }: { keys: readonly string[] | undefined }) {
   );
 }
 
+/** True for the keys cmdk uses to move the selection (arrows, Home/End, Ctrl+N/P/J/K). */
+function movesSelection(event: ReactKeyboardEvent): boolean {
+  if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return true;
+  return event.ctrlKey && ["n", "p", "j", "k"].includes(event.key);
+}
+
 /** True when `element` sits outside the viewport sideways, like a closed off-canvas drawer. */
 function isOffCanvas(element: HTMLElement): boolean {
   const rect = element.getBoundingClientRect();
@@ -175,6 +181,7 @@ export function CommandPalette() {
       return;
     }
     setOpenedAt(Date.now());
+    setMovedForQuery(null);
     ranFromPaletteRef.current = false;
     if (isMobile) setSidebarOpen(false);
   }, [open, isMobile, setSidebarOpen]);
@@ -222,15 +229,13 @@ export function CommandPalette() {
   // Company search: the same endpoint as `paperclipai search`. Typed
   // operators become its filters; scope: and sort: pick kind and order.
   // Debounced as a string: a fresh object every render would never settle.
-  const searchRequestKey = useDebouncedValue(
-    JSON.stringify({
-      q: parsedQuery.query,
-      ...parsedQuery.filters,
-      ...(parsedQuery.scope ? { scope: parsedQuery.scope } : {}),
-      ...(parsedQuery.sort ? { sort: parsedQuery.sort } : {}),
-    }),
-    SEARCH_DEBOUNCE_MS,
-  );
+  const liveRequestKey = JSON.stringify({
+    q: parsedQuery.query,
+    ...parsedQuery.filters,
+    ...(parsedQuery.scope ? { scope: parsedQuery.scope } : {}),
+    ...(parsedQuery.sort ? { sort: parsedQuery.sort } : {}),
+  });
+  const searchRequestKey = useDebouncedValue(liveRequestKey, SEARCH_DEBOUNCE_MS);
   const searchRequest = useMemo(() => JSON.parse(searchRequestKey) as CompanySearchParams, [searchRequestKey]);
   const searchEnabled = !!selectedCompanyId && open
     && (searchRequest.q.length > 0 || hasSearchFilters(searchRequest));
@@ -254,6 +259,16 @@ export function CommandPalette() {
     [search.data, searchEnabled],
   );
   const searchCounts = searchEnabled ? search.data?.pages[0]?.countsByType : undefined;
+  // While the next query is typed or loads, the previous query's rows stay on
+  // screen (keepPreviousData) so the list does not jump. They are stale: shown
+  // dimmed and disabled, so Enter never opens a result of an older query.
+  const resultsAreStale = searchEnabled && (liveRequestKey !== searchRequestKey || search.isPlaceholderData);
+  // scope: and sort: only shape a search. Without words or a filter the
+  // server matches nothing (as `paperclipai search` needs words), so the
+  // launcher asks for them instead of sending an empty search.
+  const needsSearchTerms = parsedQuery.query.trim().length === 0
+    && !hasSearchFilters(parsedQuery.filters)
+    && Boolean(parsedQuery.scope || parsedQuery.sort);
   const recentSearches = useMemo(
     () => (open && selectedCompanyId ? loadRecentSearches(selectedCompanyId) : []),
     [open, selectedCompanyId],
@@ -289,18 +304,21 @@ export function CommandPalette() {
 
   // cmdk selects the first row when the text changes, but search results
   // arrive later and replace that row, which left Enter with no target. Keep
-  // the selection controlled and move it to the best row whenever that
-  // changes, so Enter always opens the best match.
-  const firstResult = searchResults[0];
+  // the selection controlled and move it to the best current row, until the
+  // user moves it with the keyboard: then results that arrive late leave it
+  // alone. A new query follows the best row again.
+  const firstResult = resultsAreStale ? undefined : searchResults[0];
   const bestRowValue = !hasQuery
     ? undefined
     : strongActionMatch || !firstResult
       ? actionMatches[0] ? `action:${actionMatches[0].action.id}` : undefined
       : `result:${firstResult.type}:${firstResult.id}`;
   const [selectedValue, setSelectedValue] = useState("");
+  const [movedForQuery, setMovedForQuery] = useState<string | null>(null);
+  const followsBestRow = movedForQuery !== query;
   useEffect(() => {
-    if (bestRowValue) setSelectedValue(bestRowValue);
-  }, [bestRowValue]);
+    if (followsBestRow && bestRowValue) setSelectedValue(bestRowValue);
+  }, [bestRowValue, followsBestRow]);
 
   function renderAction(action: AvailableCommandAction, testId = "command-action") {
     const Icon = commandActionIcon(action.id);
@@ -415,6 +433,7 @@ export function CommandPalette() {
               key={`${result.type}:${result.id}`}
               value={`result:${result.type}:${result.id}`}
               onSelect={() => openResult(result)}
+              disabled={resultsAreStale}
               data-testid="command-search-result"
             >
               <Icon className="mr-2 h-4 w-4 shrink-0" />
@@ -438,6 +457,17 @@ export function CommandPalette() {
     }
   };
   const searchStatusSection = () => {
+    if (needsSearchTerms) {
+      sections.push({
+        key: "search-hint",
+        node: (
+          <div role="status" className="px-4 py-3 text-sm text-muted-foreground" data-testid="command-search-hint">
+            Add words or a filter to search. scope: and sort: only shape the results.
+          </div>
+        ),
+      });
+      return;
+    }
     if (!searchEnabled) return;
     if (search.isError) {
       const message = search.error instanceof Error ? search.error.message : "Search failed";
@@ -450,7 +480,7 @@ export function CommandPalette() {
       ]);
       return;
     }
-    if (search.isPending) {
+    if (search.isPending || resultsAreStale) {
       sections.push({
         key: "search-loading",
         node: <div role="status" className="px-4 py-3 text-sm text-muted-foreground">Searching…</div>,
@@ -561,7 +591,15 @@ export function CommandPalette() {
       description="Run a command, or search tasks, agents and projects."
       open={open}
       onOpenChange={setOpen}
-      commandProps={{ shouldFilter: false, loop: true, value: selectedValue, onValueChange: setSelectedValue }}
+      commandProps={{
+        shouldFilter: false,
+        loop: true,
+        value: selectedValue,
+        onValueChange: setSelectedValue,
+        onKeyDown: (event) => {
+          if (movesSelection(event)) setMovedForQuery(query);
+        },
+      }}
       onCloseAutoFocus={(event) => {
         // Radix would focus the dialog's trigger, and the launcher has none,
         // which left focus on <body>.

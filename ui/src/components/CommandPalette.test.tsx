@@ -589,6 +589,38 @@ describe("CommandPalette", () => {
     });
   });
 
+  it("does not search scope: or sort: alone, says to add words or a filter, and searches once they are added", async () => {
+    const { root } = renderWithQueryClient(<CommandPalette />, container);
+    openPalette();
+    const hint = () => container.querySelector('[data-testid="command-search-hint"]')?.textContent ?? "";
+
+    for (const query of ["scope:issues", "sort:updated", "scope:issues sort:updated"]) {
+      typeQuery(container, query);
+      await settleDebounce();
+      expect(mockSearchApi.search).not.toHaveBeenCalled();
+      expect(hint()).toContain("Add words or a filter");
+    }
+
+    typeQuery(container, "scope:issues sort:updated deploy");
+    await settleDebounce();
+    await waitForAssertion(() => {
+      expect(mockSearchApi.search).toHaveBeenCalledTimes(1);
+    });
+    expect(mockSearchApi.search).toHaveBeenCalledWith("company-1", { q: "deploy", scope: "issues", sort: "updated", limit: 20, offset: 0 });
+    expect(hint()).toBe("");
+
+    typeQuery(container, "scope:issues status:todo");
+    await settleDebounce();
+    await waitForAssertion(() => {
+      expect(mockSearchApi.search).toHaveBeenCalledTimes(2);
+    });
+    expect(mockSearchApi.search).toHaveBeenLastCalledWith("company-1", { q: "", status: ["todo"], scope: "issues", limit: 20, offset: 0 });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("groups results by kind with the best match first, and opens one", async () => {
     mockSearchApi.search.mockImplementation(() => Promise.resolve(searchResponse([
       searchResult("project", "p1", "Mobile App"),
