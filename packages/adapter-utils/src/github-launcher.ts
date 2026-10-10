@@ -327,15 +327,15 @@ async function brokerPost(env, route, body) {
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   const startedAt = Date.now();
   let transportFailures = 0, slowTries = 0, index = 0, response, result;
-  // One busy or timed-out request: count it, give up when the tries are spent, else pause (none when moving to another route).
-  const slowTry = (reason, wait) => {
+  // One busy or timed-out request: count it, give up when the tries are spent, else pause.
+  const slowTry = reason => {
     slowTries += 1;
     if (slowTries >= TRIES) {
       const error = new Error('credentials unavailable after ' + slowTries + ' tries over ' + Math.round((Date.now() - startedAt) / 1000) + ' s: ' + reason);
       error.diagnostic = error.message;
       throw error;
     }
-    return wait ? pause(Math.round(BACKOFF_MS[slowTries - 1] * (0.5 + Math.random() / 2))) : undefined;
+    return pause(Math.round(BACKOFF_MS[slowTries - 1] * (0.5 + Math.random() / 2)));
   };
   for (;;) {
     try {
@@ -347,7 +347,7 @@ async function brokerPost(env, route, body) {
       });
       if (response.status === 409) {
         await response.arrayBuffer();
-        await slowTry('the Paperclip server is busy (HTTP 409)', true);
+        await slowTry('the Paperclip server is busy (HTTP 409)');
         continue;
       }
       // A failed read of a successful answer is retried; an error answer is read best-effort.
@@ -358,7 +358,7 @@ async function brokerPost(env, route, body) {
       // A route that is slow or busy is still the route that works (a sandbox's own bridge, whose answer the broker URL
       // may not even reach), so it is asked again. Only a route that cannot be reached at all gives way to the next one.
       if (error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
-        await slowTry('the Paperclip server did not answer within 10 s', true);
+        await slowTry('the Paperclip server did not answer within 10 s');
         continue;
       }
       if (index < urls.length - 1) { index += 1; continue; }
