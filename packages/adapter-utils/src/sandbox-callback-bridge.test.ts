@@ -1567,6 +1567,45 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("admits the agent wakeup route and nothing next to it", () => {
+    expect(
+      authorizeSandboxCallbackBridgeRequestWithRoutes({
+        method: "POST",
+        path: "/api/agents/6c75cff9-f7cf-4745-a84c-4ddf8eea7e76/wakeup",
+      }),
+    ).toBeNull();
+
+    const denied: Array<{ method: string; path: string }> = [
+      { method: "GET", path: "/api/agents/agent-1/wakeup" },
+      { method: "PUT", path: "/api/agents/agent-1/wakeup" },
+      { method: "PATCH", path: "/api/agents/agent-1/wakeup" },
+      { method: "DELETE", path: "/api/agents/agent-1/wakeup" },
+      // The legacy wake route reads its body without schema validation; it stays denied.
+      { method: "POST", path: "/api/agents/agent-1/heartbeat/invoke" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup/x" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup/" },
+      { method: "POST", path: "/api/agents/agent-1/x/wakeup" },
+      { method: "POST", path: "/api/agents//wakeup" },
+      // queue_v1 forwards the raw path: no encoded, dot, query, fragment or backslash segment may ride on the rule.
+      { method: "POST", path: "/api/agents/agent-1%2fx/wakeup" },
+      { method: "POST", path: "/api/agents/..%2Fagent-1/wakeup" },
+      { method: "POST", path: "/api/agents/../wakeup" },
+      { method: "POST", path: "/api/agents/./wakeup" },
+      { method: "POST", path: "/api/agents/%2e%2e/wakeup" },
+      { method: "POST", path: "/api/agents/agent.1/wakeup" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup?failedRunId=run-1" },
+      { method: "POST", path: "/api/agents/agent-1?/wakeup" },
+      { method: "POST", path: "/api/agents/agent-1#/wakeup" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup#x" },
+      { method: "POST", path: "/api/agents/agent-1\\x/wakeup" },
+    ];
+    for (const request of denied) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
+        `Route not allowed: ${request.method} ${request.path}`,
+      );
+    }
+  });
+
   it("admits listing, uploads and downloads on the default queue route list", () => {
     const attachmentRequests: Array<{ method: string; path: string }> = [
       { method: "GET", path: "/api/issues/issue-1/attachments" },
