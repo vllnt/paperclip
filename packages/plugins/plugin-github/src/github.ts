@@ -91,6 +91,13 @@ const dateOf = (res: Response) => typeof res.headers?.get === "function" ? res.h
 /** A response that moves the learned clock by more than this was answered to a JWT dated by the old clock. */
 const JWT_RESIGN_MS = 30_000;
 
+/**
+ * The one request this plugin sends without credentials: GitHub's one-time App manifest conversion, whose code is its only
+ * authentication. GitHub allows 60 unauthenticated requests an hour per IP address, and everything behind one egress IP shares
+ * them, so any other request without a token is refused here, whatever the caller meant (a missing, empty or blank token).
+ */
+const UNAUTHENTICATED_PATH = /^\/app-manifests\/[A-Za-z0-9_-]{10,200}\/conversions$/;
+
 export class GitHubClient {
   /** GitHub's clock, learned from every response: App JWTs and token expiry follow it, not this host's clock. */
   readonly clock = new GitHubClock();
@@ -137,6 +144,7 @@ export class GitHubClient {
   }
   async request<T>(path: string, token?: string, body?: unknown, method?: "POST" | "PATCH" | "PUT" | "DELETE"): Promise<{ data: T; next: boolean }> {
     if (!path.startsWith("/") || path.startsWith("//")) throw new Error("Invalid GitHub path.");
+    if (!token?.trim() && !UNAUTHENTICATED_PATH.test(path)) throw new Error("Paperclip does not call GitHub without credentials.");
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 20_000);
     const startedAt = this.clock.started();
