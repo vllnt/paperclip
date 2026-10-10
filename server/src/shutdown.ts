@@ -212,6 +212,73 @@ export function resolveShutdownBudgetMs(env: Record<string, string | undefined> 
     : Math.floor(stopTimeoutMs / 2);
 }
 
+/** What a graceful shutdown did with one running run. */
+export type ShutdownRunOutcome =
+  | { runId: string; outcome: "interrupted" | "restart_suspended" | "not_running" | "foreign_owner" | "native_runner_owned" }
+  | { runId: string; outcome: "terminate_failed" | "finalize_failed"; error: string };
+
+/** `terminateLocalService` waits this long after SIGKILL to verify the exit. */
+const SHUTDOWN_TERMINATE_VERIFY_MS = 2_000;
+const SHUTDOWN_TERMINATE_MIN_GRACE_MS = 100;
+
+/**
+ * A run's grace before SIGKILL during shutdown: its adapter's `graceSec`, cut so
+ * that the SIGKILL and its verify still end by the drain deadline (epoch ms).
+ */
+export function shutdownTerminationGraceMs(graceSec: number, deadlineAt: number | undefined, now = Date.now()): number {
+  const graceMs = Math.max(1, graceSec) * 1000;
+  if (deadlineAt === undefined) return graceMs;
+  const untilDeadlineMs = deadlineAt - now - SHUTDOWN_TERMINATE_VERIFY_MS;
+  return Math.max(SHUTDOWN_TERMINATE_MIN_GRACE_MS, Math.min(graceMs, untilDeadlineMs));
+}
+
+/**
+ * Stops one run's process for shutdown. Returns `null` when it stopped, or a
+ * `terminate_failed` outcome when it could not be stopped: the process may still
+ * be alive, so the caller must not mark the run ended and leaves it for the
+ * reaper after the restart.
+ */
+export async function stopRunProcessForShutdown(input: {
+  runId: string;
+  signal: "SIGINT" | "SIGTERM";
+  stop: () => Promise<void>;
+  log: ShutdownLogger;
+}): Promise<ShutdownRunOutcome | null> {
+  try {
+    await input.stop();
+    return null;
+  } catch (err) {
+    input.log.error({ err, runId: input.runId, signal: input.signal }, "failed to stop a run for graceful shutdown");
+    return { runId: input.runId, outcome: "terminate_failed", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Ends every run at once, not one after another, so the drain takes as long as
+ * its slowest run. One run that throws does not stop the others: it is reported
+ * `finalize_failed`. Every run gets one outcome, logged as `shutdown run outcome`.
+ */
+export async function drainRunsInParallel<T>(input: {
+  rows: readonly T[];
+  runIdOf: (row: T) => string;
+  drainOne: (row: T) => Promise<ShutdownRunOutcome>;
+  signal: "SIGINT" | "SIGTERM";
+  log: ShutdownLogger;
+}): Promise<ShutdownRunOutcome[]> {
+  return Promise.all(input.rows.map(async (row) => {
+    let outcome: ShutdownRunOutcome;
+    try {
+      outcome = await input.drainOne(row);
+    } catch (err) {
+      const runId = input.runIdOf(row);
+      input.log.error({ err, runId, signal: input.signal }, "failed to finalize a run for graceful shutdown");
+      outcome = { runId, outcome: "finalize_failed", error: err instanceof Error ? err.message : String(err) };
+    }
+    input.log.info({ signal: input.signal, ...outcome }, "shutdown run outcome");
+    return outcome;
+  }));
+}
+
 type ShutdownStepOutcome = "done" | "timed_out" | "failed";
 
 /**

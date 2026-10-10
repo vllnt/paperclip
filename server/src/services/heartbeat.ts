@@ -690,6 +690,12 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import {
+  drainRunsInParallel,
+  shutdownTerminationGraceMs,
+  stopRunProcessForShutdown,
+  type ShutdownRunOutcome,
+} from "../shutdown.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -9326,26 +9332,6 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
-/** What a graceful shutdown did with one running run. */
-type ShutdownRunOutcome =
-  | { runId: string; outcome: "interrupted" | "restart_suspended" | "not_running" | "foreign_owner" | "native_runner_owned" }
-  | { runId: string; outcome: "terminate_failed" | "finalize_failed"; error: string };
-
-/** `terminateLocalService` waits this long after SIGKILL to verify the exit. */
-const SHUTDOWN_TERMINATE_VERIFY_MS = 2_000;
-const SHUTDOWN_TERMINATE_MIN_GRACE_MS = 100;
-
-/**
- * A run's grace before SIGKILL during shutdown: its adapter's `graceSec`, cut so
- * that the SIGKILL and its verify still end by the drain deadline.
- */
-function shutdownTerminationGraceMs(graceSec: number, deadlineAt: number | undefined): number {
-  const graceMs = Math.max(1, graceSec) * 1000;
-  if (deadlineAt === undefined) return graceMs;
-  const untilDeadlineMs = deadlineAt - Date.now() - SHUTDOWN_TERMINATE_VERIFY_MS;
-  return Math.max(SHUTDOWN_TERMINATE_MIN_GRACE_MS, Math.min(graceMs, untilDeadlineMs));
-}
-
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -15626,34 +15612,35 @@ export function heartbeatService(
       }
       const message = `Interrupted by graceful server shutdown (${signal})`;
       const running = runningProcesses.get(run.id);
+      let stopFailure: ShutdownRunOutcome | null;
       try {
-        if (run.runtimeMode === "native") {
-          await cancelHeartbeatNativeRun({
-            db,
-            runId: run.id,
-            reason: message,
-            runtimeMode: run.runtimeMode,
-          });
-        }
-        if (running) {
-          await terminateHeartbeatRunProcess({
-            pid: running.child.pid,
-            processGroupId: running.processGroupId,
-            graceMs: shutdownTerminationGraceMs(running.graceSec, opts.deadlineAt),
-          });
-        }
-      } catch (err) {
-        // The process may still be alive, so the run is not marked ended here.
-        // The reaper ends it after the restart, when the process is gone.
-        logger.error({ err, runId: run.id, signal }, "failed to stop a run for graceful shutdown");
-        return {
+        stopFailure = await stopRunProcessForShutdown({
           runId: run.id,
-          outcome: "terminate_failed",
-          error: err instanceof Error ? err.message : String(err),
-        };
+          signal,
+          log: logger,
+          stop: async () => {
+            if (run.runtimeMode === "native") {
+              await cancelHeartbeatNativeRun({
+                db,
+                runId: run.id,
+                reason: message,
+                runtimeMode: run.runtimeMode,
+              });
+            }
+            if (running) {
+              await terminateHeartbeatRunProcess({
+                pid: running.child.pid,
+                processGroupId: running.processGroupId,
+                graceMs: shutdownTerminationGraceMs(running.graceSec, opts.deadlineAt),
+              });
+            }
+          },
+        });
       } finally {
         runningProcesses.delete(run.id);
       }
+      // A run whose process may still be alive is left for the reaper.
+      if (stopFailure) return stopFailure;
 
       const persistedCancellationResult =
         run.runtimeMode === "native"
@@ -15725,16 +15712,12 @@ export function heartbeatService(
       return { runId: run.id, outcome: "interrupted" };
     };
 
-    await Promise.all(activeRuns.map(async (row) => {
-      let outcome: ShutdownRunOutcome;
-      try {
-        outcome = await drainOne(row);
-      } catch (err) {
-        logger.error({ err, runId: row.run.id, signal }, "failed to finalize a run for graceful shutdown");
-        outcome = { runId: row.run.id, outcome: "finalize_failed", error: err instanceof Error ? err.message : String(err) };
-      }
-      outcomes.push(outcome);
-      logger.info({ signal, ...outcome }, "shutdown run outcome");
+    outcomes.push(...await drainRunsInParallel({
+      rows: activeRuns,
+      runIdOf: (row) => row.run.id,
+      drainOne,
+      signal,
+      log: logger,
     }));
 
     if (interruptedRunIds.length > 0) {
