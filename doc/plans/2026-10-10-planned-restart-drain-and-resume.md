@@ -294,17 +294,32 @@ path that finalizes the run honours it:
      metadata with outcome `interrupted` (not `cancelled`), including the
      `runUsedConversationAdapter` result that the shutdown loop passes today, so
      the class test of section 4.5 reads the same facts;
+   - **keeps the stop-proof contract.** Today a stop that cannot be verified is a
+     conflict ("provider termination could not be verified"), and for a remote ACP
+     run the proof (`executionCancellation.state: "acknowledged"`, and with it the
+     conversation-continuation policy) is written only by `acknowledgeRemoteStop`,
+     which accepts only `status: "cancelled"`. The intent path extends that check
+     and `acknowledgeRemoteStop` to accept `interrupted` with `plannedRestartStop`.
+     A resume is scheduled **only after** the stop is acknowledged. A run whose stop
+     is not proven goes to the `reconciliation` class: no resume, because the
+     provider may still be working and the same work could run twice. The deadline
+     caller records this outcome and does not surface the conflict as an error;
    - classifies the run (section 4.5) and, when it is `resumed`, schedules the
      resume **before** any release;
-   - **keeps the issue lock** when the resume was scheduled, and does **not** call
-     `releaseIssueExecutionAndPromote`. This is the shutdown loop's rule today
-     (`enqueueProcessLossRetry`; release only when no retry was made). When no
-     resume was scheduled (other classes), it releases with
-     `suppressImmediateRecovery: true`.
+   - when the resume was scheduled, does **not** call
+     `releaseIssueExecutionAndPromote`. `scheduleBoundedRetryForRun` already moves
+     the issue lock to the resume row in the same transaction that creates it
+     (`executionRunId` set to the resume, only where it still points at the
+     stopped run), so no deferred wake can take the lock in between, the resume's
+     claim keeps it, and the stale-lock sweep leaves it (the resume is not
+     terminal). This matches the shutdown loop's rule today (release only when no
+     retry was made). When no resume was scheduled (other classes), it releases
+     with `suppressImmediateRecovery: true`.
 4. **Clear** the intent from the map when the run is terminal.
 
-So the resume is always the first successor, no deferred wake takes the lock in
-between, and the ending is the same whichever path wins. Section 9 tests both
+So the resume is always the first successor, it holds the issue lock from the
+moment it exists, it exists only when the stop is proven, and the ending is the
+same whichever path wins. Section 9 tests both
 branches.
 
 **Concurrency.** At most 8 runs are stopped at a time, so the deadline does not
@@ -653,7 +668,9 @@ D1, embedded Postgres unless noted:
   `cancelled`), the stop metadata outcome is `interrupted`, exactly one successor
   exists and it is `planned_restart_resume` (not a recovery run or
   `transient_failure`), and the issue lock stays with the stopped run. (c) A run
-  that is claimed but still preparing is fenced the same way.
+  that is claimed but still preparing is fenced the same way. (d) An acpx run whose
+  remote stop is not proven gets no resume, lands in `reconciliation`, and the
+  deadline caller sees no `409`.
 - **No promotion into the lock.** An issue with a parked deferred wake: after the
   deadline stop, the wake is still parked and the lock is not held by a new run;
   after the restart, the resume runs first.
@@ -782,6 +799,9 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
 | Settlement only for child-process adapters | `heartbeat.ts:31545-31550` (`!control`); in-process stop handle registered at `:26586` (`onCancellationReady`); the control branch returns when the executor already finalized `:31628-31646` |
 | Executor's own release (no suppression for a stop) | `heartbeat.ts:27445-27452` |
 | Shutdown keeps the lock when a retry is scheduled | `heartbeat.ts:15629-15634` |
+| The retry row takes the issue lock in its own transaction | `heartbeat.ts:16879-16902` |
+| Stop proof: conflict when not acknowledged; remote acknowledgment only for `cancelled` | `heartbeat.ts:31626-31643`; `acknowledgeRemoteStop` `:10634-10657` |
+| A late release cannot promote past a live successor | wake-queue `adapters/postgres.ts:1229-1236`, `:1283-1290` |
 | Release promotes the next deferred wake | wake-queue `application/use-cases.ts` (`runReleaseDrain`), lock write in `adapters/postgres.ts` |
 | Retry dedup by `retryOfRunId` | `heartbeat.ts:16446-16461` (returns any existing successor, whatever its reason) |
 | Consumers of `server_shutdown_interrupted` | `run-cancellation.ts:50`; `heartbeat.ts:28354`; `legacy-execution-recovery.ts:190`; `execution-recovery-resolution.ts:501`; `conversation-continuation.ts:80` (matches status) |
