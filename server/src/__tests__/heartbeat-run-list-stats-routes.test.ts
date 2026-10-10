@@ -245,6 +245,81 @@ describeEmbeddedPostgres("heartbeat run list filters and stats", () => {
     expect(uncappedStats).toMatchObject({ maxDailyRuns: null, capReached: false });
   });
 
+  it.each([
+    {
+      label: "forgives provider quota failures up to the daily allowance",
+      providerQuotaRetry: { enabled: true, maxDailyUncountedRuns: 2 },
+      quotaFailures: 3,
+      succeeded: 2,
+      counted: 3,
+    },
+    {
+      label: "counts the provider quota failures past the allowance again",
+      providerQuotaRetry: { enabled: true, maxDailyUncountedRuns: 1 },
+      quotaFailures: 4,
+      succeeded: 0,
+      counted: 3,
+    },
+    {
+      label: "forgives nothing when the quota retry is off",
+      providerQuotaRetry: { enabled: false, maxDailyUncountedRuns: 2 },
+      quotaFailures: 3,
+      succeeded: 0,
+      counted: 3,
+    },
+  ])(
+    "reports runsToday equal to the usage the daily cap enforces when it $label",
+    async ({ providerQuotaRetry, quotaFailures, succeeded, counted }) => {
+      const { company, capped } = await seed(db);
+      await db
+        .update(agents)
+        .set({ runtimeConfig: { heartbeat: { enabled: true, maxDailyRuns: 3, providerQuotaRetry } } })
+        .where(eq(agents.id, capped.id));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, capped.id));
+      const dayStart = startOfUtcDay();
+      const startedAt = (minutes: number) => new Date(dayStart.getTime() + minutes * 60 * 1000);
+      await db.insert(heartbeatRuns).values([
+        ...Array.from({ length: quotaFailures }, (_, index) => ({
+          companyId: company.id,
+          agentId: capped.id,
+          status: "failed",
+          errorCode: "provider_quota",
+          createdAt: startedAt(index + 1),
+          startedAt: startedAt(index + 1),
+          contextSnapshot: {},
+          resultJson: { errorFamily: "provider_quota", providerQuotaBeforeUsefulAction: true },
+        })),
+        ...Array.from({ length: succeeded }, (_, index) => ({
+          companyId: company.id,
+          agentId: capped.id,
+          status: "succeeded",
+          createdAt: startedAt(quotaFailures + index + 1),
+          startedAt: startedAt(quotaFailures + index + 1),
+          contextSnapshot: {},
+        })),
+      ]);
+
+      const stats = await request(createApp(db, boardKeyActor(company.id))).get(
+        `/api/companies/${company.id}/heartbeat-runs/stats`,
+      );
+      expect(stats.status, JSON.stringify(stats.body)).toBe(200);
+      const cappedStats = stats.body.agents.find((agent: { agentId: string }) => agent.agentId === capped.id);
+
+      const wake = await heartbeatService(db).wakeup(capped.id, { source: "on_demand", triggerDetail: "manual" });
+      expect(wake).toBeNull();
+      const [skipped] = await db
+        .select({ reason: agentWakeupRequests.reason, payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, capped.id), eq(agentWakeupRequests.status, "skipped")));
+      expect(skipped).toMatchObject({ reason: "heartbeat.daily_run_limit" });
+      const heartbeatSkip = (skipped?.payload as { heartbeatSkip?: { observed: number; limit: number } }).heartbeatSkip;
+
+      expect(heartbeatSkip?.observed, "what the cap counted").toBe(counted);
+      expect(cappedStats.runsToday, "what the stats report").toBe(heartbeatSkip?.observed);
+      expect(cappedStats).toMatchObject({ maxDailyRuns: 3, remainingToday: 0, capReached: true });
+    },
+  );
+
   it("defaults the stats window to the last 24 hours and narrows to one agent", async () => {
     const { company, capped } = await seed(db);
     const res = await request(createApp(db, boardKeyActor(company.id))).get(

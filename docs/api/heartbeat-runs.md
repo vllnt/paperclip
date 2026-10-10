@@ -55,5 +55,7 @@ Counts runs created in the window (default: the last 24 hours; at most 90 days).
 - `unsuccessful` counts failed, cancelled and timed-out runs.
 - `runsToday` is the number the daily cap compares against `maxDailyRuns`. The cap check and the stats call one
   function, so they agree by construction: today that is runs started in the current UTC day (`dailyCapWindow`)
-  that are not queued or waiting to retry, and any exemption from the cap lands in both. `maxDailyRuns` is `null`
-  when the agent has no cap.
+  that are not queued or waiting to retry, less the provider quota failures that the cap forgives (a run that
+  failed on a provider quota before any useful action, up to `providerQuotaRetry.maxDailyUncountedRuns` per agent
+  and day; later ones count again, and none are forgiven when `providerQuotaRetry.enabled` is false). Any other
+  exemption from the cap lands in both. `maxDailyRuns` is `null` when the agent has no cap.
