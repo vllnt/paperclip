@@ -38,6 +38,8 @@ status.
   step again and are kept again, for another window, if it still fails. Retries
   stop once the lease is older than the sweep's 14-day look-back. `symlink` and
   `root_mismatch` stay kept.
+- The age thresholds and the keep window are capped at one year; a larger value
+  counts as one year.
 
 A directory with the `.paperclip-restored` marker holds no unsynced work and is
 removed at once. Without the marker the worker may hold the only copy of the

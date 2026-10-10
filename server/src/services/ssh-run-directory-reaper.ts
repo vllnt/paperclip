@@ -39,9 +39,14 @@ const REAP_CLAIM_STALE_MS = REAP_TIMEOUT_MS + 5 * 60 * 1000;
 // longer than the timeout above still holds the claim as long as its owner lives.
 const REAP_CLAIM_RENEW_MS = 60 * 1000;
 
+// The longest any of these settings may be. A larger value (for example
+// `1e308`) would overflow into an invalid date and fail every sweep.
+const MAX_SETTING_MS = 365 * 24 * 60 * 60 * 1000;
+
 function minutesFromEnv(name: string, fallbackMinutes: number): number {
   const configured = Number(process.env[name]);
-  return (Number.isFinite(configured) && configured >= 1 ? configured : fallbackMinutes) * 60 * 1000;
+  const minutes = Number.isFinite(configured) && configured >= 1 ? configured : fallbackMinutes;
+  return Math.min(minutes * 60 * 1000, MAX_SETTING_MS);
 }
 
 /**
@@ -64,7 +69,8 @@ export function sshRunReaperPressureMinAgeMs(): number {
  */
 export function sshRunReaperKeepWindowMs(): number {
   const configured = Number(process.env.PAPERCLIP_SSH_RUN_REAPER_KEEP_WINDOW_HOURS);
-  return (Number.isFinite(configured) && configured > 0 ? configured : 24) * 60 * 60 * 1000;
+  const hours = Number.isFinite(configured) && configured > 0 ? configured : 24;
+  return Math.min(hours * 60 * 60 * 1000, MAX_SETTING_MS);
 }
 
 // Kept decisions that the sweep reconsiders once the keep window is over.
