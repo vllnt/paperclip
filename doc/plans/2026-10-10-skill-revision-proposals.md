@@ -7,9 +7,9 @@ are relative to `/api/companies/:companyId`.
 Related: #13 (agents read and edit skill files from a sandbox run, `7056769b0`), #59 (agents create skills from a
 sandbox run, `338936dca`), the open follow-up on skill import (fetch policy and key-conflict authorization).
 Decisions: the manager answered Q1 to Q12 on 2026-10-10 at 17:09 UTC and confirmed server-side protection, the disk-bytes
-base check, the advisory `local_trusted` stance and the filesystem gap at 18:11 UTC (section 8). Four independent review
-passes of the first drafts and the captain's review of `1fc2185d6` (verdict CHANGES, four P1s) are folded in; the review
-trail is in the pull request.
+base check, the advisory `local_trusted` stance and the filesystem gap at 18:11 UTC (section 8). Five independent review
+passes and the captain's review of `1fc2185d6` (verdict CHANGES, four P1s) are folded in; the review trail is in the pull
+request.
 
 ## 1. Summary
 
@@ -20,8 +20,8 @@ holds the bytes the proposal was written against. It reads the result back, keep
 before-image, and writes an activity entry for every step. The board can revert an applied proposal while nothing has
 changed since. A company can also **protect** skills: on a protected skill the server refuses every direct text, head or
 source change by an agent on the routes that carry the skill's id, so a proposal is the only way in. It also refuses an agent's overwrite of a protected skill through the by-key import paths and through a plugin's managed-skill
-reset, and it makes that check inside the write transaction, under a lock that a change of the protection must also take
-(section 4.9).
+reset, and it takes that check under a lock that every such write holds for its whole body and that a change of the protection
+must also take (section 4.9).
 
 ```
  author (agent)            server                         approver (board, later an agent)
@@ -153,9 +153,10 @@ policed at all today. The protected-skills guard of section 4.9 lives at these s
 | `installFromCatalog` | svc `:5714` | install-catalog; the shipped-team install | the request actor (the team install gets none today) |
 | `publish` for managed sources | `server/src/services/skill-sources.ts:72-115` | skill-source create, refresh, patch | the request actor |
 | `managedSkills.reset` and `reconcile` | `server/src/services/plugin-managed-skills.ts:274-352` | a plugin's bridge action; a plugin's own timers and events | the plugin-call principal of section 4.9 |
-| `importBundledSkill` | `server/src/services/built-in-agents.ts:1181` | built-in agents | `system`: the bytes are the shipped bundle |
+| `importBundledSkill` | `server/src/services/built-in-agents.ts:1181` | the built-in agents' reconcile and reset routes, which need only `agents:create` (`server/src/routes/built-in-agents.ts:88-97`, `:261-328`) | the request actor: the bytes are shipped, but the caller chose the moment, and `replace` overwrites the row that matches the bundle's key or slug (svc `:6162-6179`) |
+| `importPackageFiles` for a company import | `server/src/services/company-portability.ts:5518-5519` | company import; `board_full` can replace, any other mode skips or renames (`:259-262`) | the request actor |
 
-Bundled-skill seeding (svc `:3018`, `:3020`) is also `system`. Folder moves (`server/src/services/folders.ts:393`) change a
+Only boot-time bundled-skill seeding (svc `:3018`, `:3020`) is `system`. Folder moves (`server/src/services/folders.ts:393`) change a
 folder id, not text. Comments, stars, test inputs, templates and audit change no skill text.
 
 ## 3. What else exists, and why it does not host this
@@ -430,7 +431,8 @@ from `proposed_sha256`, the decision is refused.
 For `approve`, in one outer transaction (the same shape the idempotent file-update route already uses with a
 transaction-scoped service, `company-skills.ts:1242-1258`):
 
-1. Take the skill's **name advisory lock first** (the key `withSkillFileMutation` uses, svc `:4639-4664`; advisory
+1. For an agent approver (S2) run the whole apply inside `withProtectionGuard` (section 4.9), so that the protection key is
+   the first lock taken. Then take the skill's **name advisory lock** (the key `withSkillFileMutation` uses, svc `:4639-4664`; advisory
    locks are re-entrant in a session), then lock the proposal row, then the skill row. `deleteSkill` takes the advisory
    lock and then deletes the skill row, which cascades to proposal rows (svc `:7150-7206`); locking the proposal row
    before the advisory lock could deadlock against it. Re-read the slug after the lock. If a rename moved it, the transaction ends and the whole decision starts
@@ -513,16 +515,25 @@ The policy engine cannot give the guarantee "only a reviewed proposal changes th
 does not cover the by-key paths (section 2.1), the policy is not asked by every writer (section 2.3), and a company must
 hand-write the right deny rules. So the server enforces it.
 
-**One principal, three outcomes.** Every write site of section 2.3 takes a principal from its caller:
+**One principal, three outcomes.** Every write site of section 2.3 takes a **required** principal from its caller. There
+is no default: the parameter is required on `upsertImportedSkills`, `installFromCatalog`, `importPackageFiles`,
+`installUpdate`, `resetSkill`, `deleteSkill`, `renameSkill`, `forkSkill`, `createVersion`, `updateFile`, `deleteFile`,
+`updateSkill` and `publish`, so a caller that forgets it does not compile. An optional argument would default to
+unguarded, and a forgotten caller is exactly how the first design missed the built-in agents.
 
 - `person`: a board actor (the implicit board of `local_trusted` included, section 4.15), or a plugin host call that the
   host recorded as started by a person (below). Not checked.
-- `system`: bytes that come from the shipped build and that no actor chooses: bundled-skill seeding and the built-in
-  agents' stock bundle. Not checked.
+- `system`: boot-time seeding of the bundled skills only (svc `:3018`, `:3020`). The bytes are the shipped build, and the
+  seeding runs the same way whoever's request happens to trigger it. Not checked.
 - `other`: an agent, a plugin call not recorded as a person's, or any call whose origin the host cannot establish. On a
   protected skill it is refused.
 
-The guard fails closed: unknown is `other`.
+The guard fails closed: unknown is `other`. The built-in agents are **not** `system`. Their reconcile and reset routes need
+only `agents:create` (`server/src/routes/built-in-agents.ts:88-97`, `:261-328`), and `importBundledSkill` calls
+`importPackageFiles(..., { onConflict: "replace" })` (`built-in-agents.ts:1181`) on reset, or when the stock is missing or
+has an update (`:1226-1230`). Replace overwrites the existing row that matches the bundle's key or its slug (svc
+`:6162-6179`). The bytes are shipped, but an agent with `agents:create` chose the moment, so the write carries the request
+principal.
 
 **The invariant.** While `enabled` is true and a skill is protected, a write site refuses an `other` principal's change to
 that skill's text, head or source with 403 `skill_protected_use_proposal`. It is evaluated twice, and only the second
@@ -530,7 +541,7 @@ evaluation is authoritative:
 
 1. at the route gate (`assertCanMutateCompanySkills`, `company-skills.ts:209-251`) as a fast refusal before a transaction
    opens;
-2. inside the write site's own transaction, under the lock described next.
+2. inside `withProtectionGuard`, the wrapper described next, which holds the lock for the whole body of the write.
 
 The route-gate check is keyed on neither the action string nor the raw URL id:
 
@@ -549,22 +560,48 @@ A person is not affected: the board edits directly, as today. A proposal is the 
 **Checked under the write lock (the settings-to-write race).** A check at the route followed by a transactional write has
 a gap. `PATCH …/files` checks at `company-skills.ts:1233` and writes at `:1255` (the idempotent branch) or `:1287`;
 managed-source refresh authorizes at `skill-sources.ts:171-185` and `publish` rewrites the existing row in a later
-transaction (`:186-190`, `:103`). A board that protects the skill in between would not stop the write. So:
+transaction (`:186-190`, `:103`). A board that protects the skill in between would not stop the write. The first revision
+of this plan put a check after each site's row lock; the fifth review pass showed that this cannot work, so the design is:
 
-- Each write site calls `assertSkillWritable(tx, companyId, skillRow, principal)` after it holds its skill row lock and
-  before its first write, to disk or to the database. For an `other` principal it takes `pg_advisory_xact_lock_shared` on a
-  per-company protection key, then reads the settings row and the protected set. The read comes after the lock, so it sees
-  every committed change. For `person` and `system` it does nothing and takes no lock.
+- Every write by an `other` principal runs inside `withProtectionGuard(principal, companyId, fn)`:
+  1. it opens a transaction;
+  2. it takes `pg_advisory_xact_lock_shared(hashtext('skill-protection'), hashtext(companyId))`, the **outermost** lock: before
+     any name lock, source row, proposal row or skill row;
+  3. it reads the settings row and the protected set, a plain select that comes after the lock and so sees every committed
+     change;
+  4. it runs `fn(protection)`, the site's entire body: its disk copies, and its own transactions or pool writes;
+  5. the transaction ends after `fn`, which releases the key.
+
+  Inside `fn` the site calls `protection.assertWritable(skillRow)` as soon as it has the target row (by canonical id, or by
+  key for the by-key paths) and before its first write to disk or to the database. For `person` and `system` the wrapper does
+  nothing and takes no lock.
+- Because the wrapper's transaction holds the key for the whole body, the sites need no transaction or row lock of their own
+  for the check to be sound. That matters, because several have none: `upsertImportedSkills` runs on the pool from
+  `importFromSource`, scan-projects, install-update and `importPackageFiles` (svc `:6377`, `:5398`, `:5455`, `:4944`,
+  `:6232`); `installFromCatalog` writes the `__catalog__` files first (svc `:5776-5785`) and its row on the pool afterwards
+  (`:5836-5847`); install-update's catalog branch copies at `:4889` before its update at `:4916`; `resetSkill` copies at
+  `:5006` before its update at `:5010`; `deleteSkill` takes the name lock and no row lock (`:7183-7206`). A guard "after the
+  row lock" could not be placed at these sites, and a guard on the pool handle would release its advisory lock when the
+  statement ended. The disk copies must be inside the wrapper, and the check must run before them.
 - `PUT /skill-proposal-settings` takes the same key **exclusively** before it compares `expectedRevision` and writes. It
-  waits for the `other` writes in flight, and it blocks new ones until it commits.
+  waits for the `other` writes in flight.
 - The result is linear: a write commits before the protection takes effect (it was allowed when it was checked), or it is
   refused. No `other` write commits after a settings change without having been checked against it.
-- Lock order is name advisory lock(s), then the skill row, then the protection lock (shared). The settings write takes only
-  the protection lock and its own row, so no cycle exists. The proposal apply takes name lock, proposal row, skill row
-  (section 4.8); for an agent approver (S2) it also takes the protection lock shared and re-reads the protected set before it
-  applies, because a protected skill is never decided by an agent.
-- Where a write site reads the existing row before its transaction (`installFromCatalog` reads the library with `listFull`,
-  svc `:5728`), it re-reads the row inside the transaction before it calls the guard.
+- **Why the key must be outermost.** A waiting exclusive request makes later shared requests queue behind it (this is how the
+  Postgres lock manager works; it was not run here). With the key anywhere else, a cycle exists: writer A holds the shared key
+  and wants the row that writer B holds; B holds that row and queues for the shared key behind the waiting settings write; the
+  settings write waits for A. Taken first, no `other` writer ever waits for the key while it holds anything, so no cycle can
+  form. The settings write takes only the key and its own row.
+- *Key space.* The two-integer form is a different key space from the name locks, which use the single 64-bit
+  `hashtextextended(companyId:slug)` form (svc `:4652`, `:4515`), so no skill slug can collide with the protection key.
+- *Savepoints.* The wrapper takes the key in the outermost transaction, never inside a savepoint, because a rollback to a
+  savepoint releases the locks taken after it.
+- The proposal apply by an agent approver (S2) runs inside the same wrapper with an `other` principal. It takes the key
+  first, then the name lock, the proposal row and the skill row (section 4.8), and then refuses a protected skill, which is the
+  rule "a protected skill is never decided by an agent". A person's apply takes no protection key.
+- *Cost.* An `other` write holds one extra connection and a transaction open for its whole body, file copies included. The
+  bundles are small. The pool must allow at least two connections per concurrent `other` write; section 7 tests that this
+  does not exhaust it.
 
 **Plugin-managed skills (the reachable writer the first draft missed).** A plugin's `reset` replaces a skill's files by key,
 and it is reachable by any authenticated actor through the plugin bridge (section 2.1). It never asks the skill policy, so
@@ -590,9 +627,18 @@ the interim policy of Appendix B does not close it either. S1 closes it at the h
 - Not chosen: making the action unavailable to agents. The bridge action is generic (the plugin decides what a key does), so
   the skills feature would have to know the action names of every plugin.
 - The `plugin.managed_skill.reset` activity entry gains `callerKind` (`person`, `agent` or `unattributed`).
-- No other plugin path replaces a skill: the only `onConflict: "replace"` callers are `plugin-managed-skills.ts:289` and
-  `built-in-agents.ts:1181`, and the second is the shipped bundle (`system`). The attribution fix covers only the skills host
-  mutations; the other host mutations keep today's behavior (section 8.1).
+- *What this attribution is, and is not.* `actorContext` is built by the host from the authenticated request
+  (`routes/plugins.ts:771-799`, `:1537-1547`), so a caller cannot forge `person`. The worker, though, supplies the invocation
+  id on each host call, and the host cannot prove which concurrent invocation produced it (the comment at
+  `plugin-worker-manager.ts:1250-1262` says so for notifications, and host calls read the same record, `:2743-2750`). A
+  confused or compromised worker could echo the id of a live person-started invocation. Until now the id only ever
+  restricted a call; with `person: true` it also grants one. So the guard protects against an agent reaching a plugin
+  action. It does not protect against a hostile worker, which already runs on the host and could write the skill directory
+  directly. Installing a plugin is the board's decision.
+- The `onConflict: "replace"` callers are `plugin-managed-skills.ts:289`, `built-in-agents.ts:1181` (the request principal,
+  above) and company import (`company-portability.ts:5518-5519`), which can replace only in `board_full` mode
+  (`:259-262`). The attribution fix covers only the skills host mutations; the other host mutations keep today's behavior
+  (section 8.1).
 
 **By-key paths: guards where the overwrite happens.** Five routes can overwrite a skill's row by key without naming its id:
 import, scan-projects, install-update, catalog install and the shipped-team install. They end in two places:
@@ -606,14 +652,15 @@ import, scan-projects, install-update, catalog install and the shipped-team inst
   by key (svc `:5728`) and overwrites it when the same catalog entry has a changed hash, or when `force` is set
   (svc `:5734` onward). An agent could therefore move a protected catalog skill to newer shipped bytes.
 
-S1 gives each of the two an optional `guard` argument: a callback run inside the transaction with the existing row, after
-the row is re-read under the write lock and before anything is written. It calls `assertSkillWritable` with the principal.
-The routes build the principal from `req.actor`: import, scan-projects, install-update, catalog install, and the
-shipped-team install (`server/src/services/teams-catalog.ts:880`, `:892` call `installFromCatalog` and `importFromSource`
-with no actor; its route requires `agents:create`, `server/src/routes/teams-catalog.ts:36-60`, so an agent can reach it). The
-plugin path passes the plugin-call principal above. Internal callers pass `system` or none: bundled seeding, the built-in
-agents' bundle, fork and create make new rows or already conflict on an existing slug. An import that creates a new key
-still works. Managed-source create and refresh are not by-key: they write rows directly under new unique keys, and
+The routes build the principal from `req.actor` and wrap the whole body of the site in `withProtectionGuard`. Inside it,
+`upsertImportedSkills` and `installFromCatalog` call `protection.assertWritable(existingRow)` as soon as they have resolved
+the row by key, and before the first disk or database write. For `installFromCatalog` that is before the `__catalog__`
+files are written (svc `:5776-5785`), not before its row write; the same holds for install-update's catalog branch and for
+reset. The sites that pass a principal are: import, scan-projects, install-update, catalog install, the shipped-team install
+(`server/src/services/teams-catalog.ts:880`, `:892` call `installFromCatalog` and `importFromSource` with no actor; its route
+requires `agents:create`, `server/src/routes/teams-catalog.ts:36-60`, so an agent can reach it), company import, the
+built-in agents' reconcile and reset, and the plugin path above. Bundled boot seeding passes `system`. Fork and create make
+new rows or already conflict on an existing slug. An import that creates a new key still works. Managed-source create and refresh are not by-key: they write rows directly under new unique keys, and
 `publish` calls the guard for each existing row it updates (`skill-sources.ts:97-115`). Company import never overwrites an
 existing row outside the board's full mode (it skips or renames, `server/src/services/company-portability.ts:259-262`).
 The guards do not replace the import follow-up of section 8.1, which everyone else still needs. The bridge does not admit
@@ -666,21 +713,29 @@ different thing. The plan defines one, and labels it **advisory**.
 **The model of record.** The first draft asked for "the model the run resolved". No such value is stored: `heartbeat_runs`
 has no model column (`packages/db/src/schema/heartbeat_runs.ts:42-43` holds only `usage_json` and `result_json`, filled
 after the run, and `:96` the context snapshot), and `run_usage_records.model` is a derived fact written when the run ends. So
-the plan defines the input as what the server can read at the moment of the call and an agent cannot change on itself:
+the plan defines the input as what the server can read at the moment of the call:
 
 - the agent's `adapterType` (15 values, `packages/shared/src/constants.ts:27-43`), `adapterConfig.model`,
   `adapterConfig.provider`, `adapterConfig.engine` and `adapterConfig.acpxAgent`, and, when `runtimeConfig.aiConnection` is
   set, the provider of that binding (`packages/shared/src/ai-connections.ts`: `anthropic`, `openai`, `openrouter`, `xai`);
-- all of these are on the self-protected list that #20 added: an agent may not change its own adapter type, `model`,
-  `provider`, `engine`, `acpxAgent` or `runtimeConfig.aiConnection`
-  (`server/src/services/agent-self-config-authz.ts:12-48`, `:227-228`). A person, or an agent that holds `agents:configure`
-  for that agent, can change them. The earlier concern, that an agent could change its family by editing its own config,
-  does not apply.
+- **merged the way the run merges them.** A run's configuration is the agent's, with the task issue's
+  `assigneeAdapterOverrides.adapterConfig` spread over it when that issue's assignee is the agent
+  (`server/src/services/heartbeat.ts:22320-22325`, `:23197-23199`). The override schema accepts any key
+  (`packages/shared/src/validators/issue.ts:297-302`), and the only check on it is for workspace command paths
+  (`server/src/routes/workspace-command-authz.ts:121-152`). So an agent can set `model`, `provider` or `engine` for its own
+  task, and the run uses it. The snapshot therefore merges the same override from the issue row that `projectToolContext`
+  already returns for the run (`server/src/services/project-tool-context.ts:8-28`), for the author at submit and for an
+  agent approver at the decision;
+- on the agent row itself the keys are on the self-protected list that #20 added: an agent may not change its own adapter
+  type, `model`, `provider`, `engine`, `acpxAgent` or `runtimeConfig.aiConnection`
+  (`server/src/services/agent-self-config-authz.ts:12-48`, `:227-228`). That holds for `PATCH /agents/:id` on itself, for an
+  agent without `agents:configure`. It does **not** hold for the issue override above; section 8.1 lists that as a
+  dependency.
 
-The server reads these from the agent row when it takes the submit, and again when it takes the decision, and stores the
-values it used in the S2 columns (section 4.2). The decision uses the snapshot it just took. A later config change cannot
-rewrite the record. Because the stored value is the configured model and not the one a run happened to use, the rule is
-advisory, and the PR and the settings say so.
+The server reads these when it takes the submit and again when it takes the decision, and stores the values it used in the S2
+columns (section 4.2). The decision uses the snapshot it just took. A later config change cannot rewrite the record. Because
+the stored value is the configured model and not the one a run happened to use, the rule is advisory, and the PR and the
+settings say so.
 
 **The family.**
 
@@ -774,14 +829,21 @@ leaves the logged body as it is (`logger.ts:185-194`). Adding the proposal paths
 submitted markdown on a route-level 422, 409 or 500. So S1 defines **one list and one predicate and uses them in both
 places**:
 
-- `SKILL_TEXT_HTTP_PATHS` and `isSkillTextHttpRequest(method, url)` in `http-log-policy.ts`. The list covers the proposal
-  routes (`/skills/:skillId/proposals`, `/skill-proposals/...`, `/skill-proposal-settings`) and, because a refused edit of a
-  protected skill returns 403 with the file text still in the request body, `PATCH …/skills/:skillId/files` and
-  `POST …/skills`. The last two are existing routes; adding them is a small change that closes the same leak for direct
-  writes, and it can be dropped without touching the rest.
-- The logger gets a branch in front of the error-context branch, shaped like the private-webhook branch: for a status of 400
-  or more, `reqBody: "[REDACTED]"` and an `errorContext` marker, with or without a context.
-- `SECRET_SENSITIVE_HTTP_PATHS` is built from the same list, so the error handler and the crash reporter see only a marker.
+- `SKILL_TEXT_HTTP_PATHS` in `http-log-policy.ts` is **one list**. Each entry has two flags, and
+  `isSkillTextHttpRequest(method, url)` returns them. `redactBody` is set on every entry. `scrubErrors` is set on the
+  proposal routes only (`/skills/:skillId/proposals`, `/skill-proposals/...`, `/skill-proposal-settings`). The list also
+  holds `PATCH …/skills/:skillId/files` and `POST …/skills` with `redactBody` only, because a refused edit of a protected skill
+  returns 403 with the file text still in the request body. Those two are existing routes; adding them is a small change that
+  closes the same leak for direct writes, and it can be dropped without touching the rest.
+- `redactBody`: the logger gets a branch in front of the error-context branch, shaped like the private-webhook branch: for a
+  status of 400 or more, `reqBody: "[REDACTED]"`, with or without a context.
+- `scrubErrors`: `SECRET_SENSITIVE_HTTP_PATHS` is built from the entries with that flag, so the error handler and the crash
+  reporter keep only a type marker. That changes what a client and an operator see for a 5xx on those routes: a constant
+  `{ error: "Internal server error" }` with no code (`error-handler.ts:182-188`) and a generic crash report without a stack
+  (`:68-75`, `:165-181`, `:277-294`). That is right for the proposal routes. It is **not** applied to the two existing routes,
+  so their stack traces and 5xx bodies do not change. For those two, a database error can still quote the bound text
+  (`updateFile` binds the full markdown, svc `:4730-4732`); whether drizzle's error message includes bound parameters is not
+  verified here.
 - Malformed JSON never reaches either control: the handler answers with a constant body and keeps the raw error out of the
   context (`error-handler.ts:243-250`).
 
@@ -873,9 +935,10 @@ options (`server/src/app.ts:666-667`), so the implementation passes `deploymentM
 | T18 | An agent changes what agents follow without editing an existing skill: creates a new skill (#59), re-points agents with skill sync, or forks a protected skill and reassigns | The invariant also covers fork (it carries the skill id). New-skill creation and agent skill assignment are **non-goals** of this plan and are governed by their own permissions |
 | T19 | The diff hides an invisible character or a homoglyph | Invisible and control characters are refused in the text (4.7). Homoglyphs are not refused; the rendered diff escapes non-ASCII characters (4.14) |
 | T20 | An agent with file access edits a protected skill's files directly, or edits them and starts a test run so the edit becomes the head | **Partly accepted in S1.** The test-run start is refused on drift (4.9); an edit to `SKILL.md` makes pending proposals stale; settings report where each protected skill lives. The edit itself is not preventable at the API; S3 can serve protected skills from the head snapshot (Q15) |
-| T21 | An agent replaces a protected plugin-managed skill through a plugin action, which never asks the skill policy | A guard in `upsertImportedSkills` with the plugin-call principal; positive person attribution on the invocation; unattributed calls are refused (4.9, "Plugin-managed skills") |
-| T22 | A board protects a skill between a writer's check and its write, or a settings change races a write | The check runs inside the write transaction under a shared per-company lock, and the settings write takes it exclusively (4.9, "Checked under the write lock") |
-| T23 | The model family is read from a config that the agent can edit | The inputs are on the self-protected list (4.10); the values are snapshotted at submit and at decision; the rule is advisory |
+| T21 | An agent replaces a protected plugin-managed skill through a plugin action, which never asks the skill policy | The plugin-call principal and the guard in `upsertImportedSkills`; positive person attribution on the invocation; unattributed calls are refused (4.9, "Plugin-managed skills"). Limit: the worker supplies the invocation id, so a hostile worker could echo a person's; the guard stops an agent reaching an action, not a compromised worker |
+| T22 | A board protects a skill between a writer's check and its write, or a settings change races a write | `withProtectionGuard` holds a shared per-company key, outermost, for the whole body of every `other` write, and the settings write takes it exclusively (4.9). Outermost is what keeps it deadlock-free |
+| T23 | The model family is read from a config that the agent can edit | The inputs are self-protected on the agent row (4.10), but a task issue's adapter override can set them for a run, so the snapshot merges that override as the run does; the values are snapshotted at submit and at decision; the rule is advisory; the override gap is a named dependency (8.1) |
+| T24 | An agent with `agents:create` resets or reconciles a built-in agent, and the replace overwrites a protected skill that shares the bundle's key or slug | The built-in agents carry the request principal, not `system` (4.9) |
 
 ## 6. Slices
 
@@ -883,16 +946,18 @@ Each slice ships web, API, CLI and tests, and lands single after review (securit
 company until `enabled` is set, so each slice can ship without behavior change.
 
 - **S1: propose, humans decide and apply, revert, protected skills.** Tables and migration; `skills.propose`; settings
-  (without agent approval), including `humanApprovers` and `protectedSkills`; the principal and `assertSkillWritable` at every
-  write site of section 2.3, with the shared protection lock and its exclusive side in the settings write; the route-gate
-  check in `assertCanMutateCompanySkills`; the guards in `upsertImportedSkills` and `installFromCatalog`, with the principal
-  passed from the five routes that call them; the guard in `publish` for managed sources; the plugin person attribution
+  (without agent approval), including `humanApprovers` and `protectedSkills`; a **required** principal parameter on every
+  write site of section 2.3; `withProtectionGuard` around each `other` write, with the shared protection key taken
+  outermost, and the exclusive side in the settings write; the route-gate check in `assertCanMutateCompanySkills`; the
+  guards in `upsertImportedSkills` and `installFromCatalog` and the principal passed from every route that calls them
+  (import, scan-projects, install-update, catalog install, the shipped-team install, company import, the built-in agents'
+  reconcile and reset); the guard in `publish` for managed sources; the plugin person attribution
   (`plugin-worker-manager.ts`, `plugin-host-call-actor.ts`) and the plugin-call principal in `managedReset` and
   `managedReconcile`; the test-run drift refusal; the location report in the settings; the `expectedPreviousSha256` and
   `versionLabel` parameters of `updateFile`; submit, list, show, decision (human), withdraw, revert; caps; effective status
   computed on read; author wake; attention item; bridge rules; OpenAPI; CLI; Studio tab; launcher action; the shared log
-  predicate and its two uses; deployment reporting (4.15). S1 touches the plugin runtime and the request logger, which are
-  not skills code; the review should say who owns them.
+  list with its two flags; deployment reporting (4.15). S1 touches the plugin runtime and the request logger, which are not
+  skills code; the review should say who owns them.
 - **S2: agent approvers.** `skills.approve` (closed by default, `agents` subjects only); `agentApproval` settings; the
   model family table and rule; decision by agent; awaiting-my-decision listing; the agent and family columns.
 - **S3: hardening.** Serving protected skills from the head snapshot (Q15); retention job; sweeper to persist stale and expired rows; optional "require a passing skill test
@@ -943,23 +1008,30 @@ are additive. Applied changes stay as ordinary versions.
 - `ensureSkillInventoryCurrent` inside the outer transaction (4.8) does not delete or change a skill other than the
   target.
 - Write sites: one table-driven test over the sites of section 2.3 asserts that a protected skill is refused for `other` and
-  allowed for `person` and for `system` (bundled seeding, the built-in agents' bundle).
+  allowed for `person` and for `system` (boot seeding only), and that on refusal **nothing is written to disk or to the
+  database**, including for catalog install, install-update's catalog branch, reset and delete, which copy or remove files
+  before their row write. A type-level test fails to compile a call to any write site without a principal.
+- Built-in agents: an agent with `agents:create` resets or reconciles a built-in agent whose bundle key or slug matches a
+  protected skill, and the call is refused with the skill unchanged; a board user's call succeeds.
 - Plugin-managed skills: an agent invokes a plugin's reset action through `POST /api/plugins/:pluginId/bridge/action`
   against a protected plugin-managed skill, and the host mutation refuses with 403 `skill_protected_use_proposal` and the skill
   is unchanged; a board user's call succeeds; a plugin's own timer call (no invocation id) is refused; a worker that omits the
   invocation id during a live invocation is refused; an unprotected skill still resets for an agent as it does today;
   `reconcile` with the row present relinks without writing; the activity entry carries `callerKind`.
-- Settings-to-write race, deterministic with barriers: (a) a writer passes the check and holds the shared lock, the settings
+- Settings-to-write race, deterministic with barriers: (a) a writer passes the check and holds the shared key, the settings
   write starts and waits, the writer commits, the settings write commits: the write landed; (b) the settings write commits
   first, the writer is refused and the file on disk is unchanged; (c) the same pair for the file PATCH, a managed-source
-  refresh (authorize, then protect, then publish: refused), an import and a catalog install; (d) no deadlock between a
-  writer and the settings write, and none between a writer and `deleteSkill`.
+  refresh (authorize, then protect, then publish: refused), an import, a catalog install, install-update and reset; (d) a
+  three-way barrier with a multi-row writer (a managed-source refresh that updates two skills), a single-row writer on the
+  second skill, and the settings write: no deadlock and no 40P01; (e) no deadlock between a writer and `deleteSkill`; (f) with
+  the pool at its minimum size, concurrent `other` writes do not exhaust the connections.
 - Logs: the predicate matches the listed routes for POST, PUT and PATCH and no others; a sentinel string placed in the
   markdown never appears in any log line or crash-report payload on a route-level 422 (too large), 409 (stale), 403
   (protected) and a forced 500 from a database error, nor on a 413; malformed JSON gives the constant response.
 - Inventory refresh: a transaction that ran an inventory refresh and then rolls back leaves no deleted skill and no removed
   directory, and a second request that starts while the first is open sees only committed inventory.
-- S2: unknown family refuses; same family refuses when required; a protected skill cannot be decided by an agent; the stored
+- S2: unknown family refuses; same family refuses when required; a protected skill cannot be decided by an agent; an author
+  whose task issue carries an `assigneeAdapterOverrides.adapterConfig.model` is snapshotted with the overridden model; the stored
   author and decision snapshots equal the agent row at submit and at decision, and a config change between the two does not
   alter the author snapshot; a config that names no model gives `unknown`.
 
@@ -1038,6 +1110,13 @@ These exist on `main`. This plan does not change them, and its guarantees are we
 5. **Agent skill assignment and new-skill creation** are governed by their own permissions (T18). A company that needs
    them gated has to gate them there.
 
+
+6. **Issue adapter overrides are not checked for protected keys.** `assigneeAdapterOverrides.adapterConfig` accepts any key and
+   wins over the agent's configuration for that task's runs (`heartbeat.ts:22320-22325`, `:23197-23199`;
+   `validators/issue.ts:297-302`); the only check is for workspace command paths (`workspace-command-authz.ts:121-152`). S2
+   reads the merged value (section 4.10), but an agent can still choose its own model for a task. Follow-up: run the
+   self-protected-key check on issue overrides.
+
 ## Appendix A. Code anchors checked on `main` at `38819d350`
 
 - Bridge skill rules: `packages/adapter-utils/src/sandbox-callback-bridge.ts:176-184`; skill sync `:160`
@@ -1093,6 +1172,13 @@ These exist on `main`. This plan does not change them, and its guarantees are we
   `server/src/services/plugin-host-call-actor.ts:1-26`; `packages/plugins/sdk/src/worker-rpc-host.ts:436`, `:453`,
   `:778-788`; `packages/plugins/plugin-llm-wiki/src/worker.ts:761-767`; `server/src/services/built-in-agents.ts:1181`;
   `server/src/services/skill-sources.ts:97-115`, `:168-190`; `server/src/routes/teams-catalog.ts:92-122`
+- Fifth-pass additions: built-in agents `server/src/routes/built-in-agents.ts:88-97`, `:261-328`,
+  `server/src/services/built-in-agents.ts:1180-1181`, `:1226-1230`; `importPackageFiles` replace semantics svc `:6150-6182`;
+  company import `server/src/services/company-portability.ts:259-262`, `:5518-5519`; write ordering svc `:4889`, `:4916`,
+  `:5006`, `:5010`, `:5776-5785`, `:5836-5847`, `:7183-7206`; run config merge `server/src/services/heartbeat.ts:22320-22325`,
+  `:23197-23199`; issue override schema `packages/shared/src/validators/issue.ts:297-302`;
+  `server/src/routes/workspace-command-authz.ts:121-152`; plugin invocation trust comment
+  `server/src/services/plugin-worker-manager.ts:1250-1262`; error handler constant 500 `server/src/middleware/error-handler.ts:182-188`
 - Model of record: `packages/db/src/schema/heartbeat_runs.ts:42-43`, `:96`; `server/src/services/agent-self-config-authz.ts:12-48`,
   `:227-228`; `packages/shared/src/ai-connections.ts` (providers)
 - Logging: `server/src/middleware/redact-sensitive.ts:14-93`, `:137-157`; `server/src/middleware/logger.ts:170-179`,
@@ -1151,6 +1237,9 @@ What it does not do:
 - It does not touch the writers that never ask the policy: a plugin's managed-skill reset, the shipped-team install and the
   built-in agents' bundle import (section 2.3).
 - It does not stop an agent with file access from editing a `local_path` skill's files (section 4.9, "The filesystem limit").
+- It does not deny `skills.test`, so an agent can still start a test run, and a test-run start cuts a head version from
+  whatever is on disk when the files differ from the head (svc `:6589-6604`, `:6710`). An agent with file access can therefore
+  make its own edit the head. S1 refuses that on a protected skill (section 4.9).
 - In a `local_trusted` deployment an agent that talks to the server directly is the implicit board and is not matched by the
   rule (section 4.15).
 - An agent holding `users:manage_permissions` can replace the policy again (section 8.1).
