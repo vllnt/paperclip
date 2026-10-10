@@ -5,7 +5,8 @@ Status: Plan only. This pull request changes no code and claims no migration num
 Branch: `docs/routine-stale-tick-expiry`
 Code anchors: `main` at `38819d350` (see Appendix A). Line numbers drift; names do not.
 Shared design: PR #113 (flow watchdog) defines, once, the **exemption set**, the **progress clock and clock source**, and the **atomic close step** (its section 6.1). They live in **one module, `server/src/services/flow-stall.ts`, which this plan's slice R1 builds first** and #113's S1 reuses (section 4). This plan refers to them and defines only what is routine-specific: the `staleTickTimeoutMinutes` setting, the binding to the routine's current blocker, the one-open-copy rule (section 3.10), and the surfaces.
-Revision 3 (this one) applies the review decisions: the close uses a real compare-and-set on `status_version` (choice B, no migration); the exemption set gains open decisions, user-assigned reviews and stalled reviews; one shared module with one owner; at most one open copy per fingerprint; a bounded hold-lift floor; the queued human or resume wake rule.
+Revision 4 fixes the review of revision 3: the open-copy check runs first (section 3.1); the S4 close needs an issue-keyed lock variant from #103 (section 3.4, Q19); the hold-lift floor uses a new lift record with a total bound (section 3.5, Q18); the close locks the scope rows `FOR SHARE` (PR #113, section 6.1.3); one owner and one order in all three plans; the `always_enqueue` form text (section 3.6); the #120 r2b dependency (section 3.3).
+Revision 3 applied the review decisions: the close uses a real compare-and-set on `status_version` (choice B, no migration); the exemption set gains open decisions, user-assigned reviews and stalled reviews; one shared module with one owner; at most one open copy per fingerprint; a bounded hold-lift floor; the queued human or resume wake rule.
 
 ## 1. Goal and constraints
 
@@ -87,10 +88,20 @@ Two findings follow:
 
 ### 3.1 Principle: expire at dispatch, under the lock that dispatch already holds
 
-Slice 1 adds no job. The check runs inside `dispatchRoutineRun`, after
-`findLiveExecutionIssue` returns a blocker and before the tick is skipped or coalesced.
-Dispatch already holds the routine row lock, so two ticks cannot expire the same issue,
-and the new tick runs in the same call.
+Slice 1 adds no job. Two checks run inside `dispatchRoutineRun`, **in this order**, both
+under the routine row lock that dispatch already holds:
+
+1. **The open-copy check (section 3.10) comes first.** It looks for an open copy of the
+   same routine, origin and fingerprint **whatever the state of its runs**. An idle copy
+   (state S4) has no live run, so `findLiveExecutionIssue` returns nothing for it
+   (`routines.ts:1514-1571`). If this check ran after that query, S4 copies would pile up,
+   which is the failure this plan exists to stop.
+2. **The live-blocker check (section 3.3)** runs only when step 1 found no open copy to
+   skip or expire. It handles a blocker with a live run, and then the tick is skipped or
+   coalesced, or the blocker is expired by the same close.
+
+The routine lock means two ticks cannot expire the same issue, and the new tick runs in
+the same call.
 
 Why not a sweeper: a sweeper needs the hold rules, the ordering with PR #104 and its
 own alert. A routine only suffers when a tick arrives. The lazy check fires exactly then.
@@ -148,8 +159,12 @@ intent is not dropped by the close: the existing staleness decision keeps it
 (`run-dispatch/domain/policy.ts:610-625`). Before the close, a person's comment is
 progress (PR #113, section 6.1.2), so a tick with a fresh human comment is not stale.
 After the close, the kept run starts through the normal queue and the queued-run
-starter retries it on every pass, like any queued run of that agent. This plan adds no
-sweep for it. R1 tests that the kept run starts, and that it does not revive the closed
+starter retries it on every pass, like any queued run of that agent. **That guarantee
+depends on PR #120 r2b (head `bbfc8e1c3`)**: on `main`, `resumeQueuedRuns` has no catch
+per agent and the recovery pass is one promise chain, so one claim error stops the later
+agents and steps. #120 r2b adds a catch per agent and puts each recovery step under its
+own catch. R1 lands after #120 and tests the kept run through the real recovery function.
+This plan adds no sweep for it. R1 tests that the kept run starts, and that it does not revive the closed
 issue unless it carries a reopen intent. A resume intent without a comment sets no
 progress time, so before the close it relies on the exemption row for a queued wake
 (PR #113, section 6.1.1), and after the close on the keep rule above. A routine that is paused is a held
@@ -173,6 +188,8 @@ arrives after the re-check and is promoted onto an issue that is then cancelled.
 step, its order and its tests are in #113 and are not repeated here.
 
 **The lock helper is not defined here.** `withIssueExecutionLock` clears `execution_run_id`, `execution_locked_at` and `checkout_run_id` before it calls its callback (`wake-queue/adapters/postgres.ts:1171-1232`), so it cannot hold the issue lock for the close. There is **one lock-preserving, transaction-aware variant**, and **PR #103's plan (D1) owns its name, path and API**. The first code slice that needs it implements it exactly to that spec. R1 does so only if R1 is ready before #103 D1. #105 R1 and #113 S1 otherwise reuse it unchanged. This plan adds no second variant and no copy, and no slice waits for another's code only for this helper.
+
+**What this plan needs from that variant** (a request to #103 D1, not a design here; the full list is in PR #113, section 6.1.3): it must be **keyed by the issue with the run optional**, because the idle copy of section 3.10 has no run to pass, and the run-keyed form on `main` cannot lock it. It must keep the three execution columns, run in the caller's transaction, and fix one lock order. Until #103 D1 ships such a form, R1 **cannot close an idle copy (S4)**. The fallback is stated so nobody builds around it by accident: R1 would then expire only copies that have a run, and an exempt or idle copy would make the tick skip (section 3.10) with no second copy created. The routine would stay quiet until a person acts. That is worse than the goal, so the issue-keyed form is a dependency, tracked as Q19.
 
 **What is routine-specific, inside the same transaction as the close:**
 
@@ -223,14 +240,17 @@ Two rules make the ordering hold:
   the exemption must hold on its own.
 
 **Hold lifts.** A hold that ended recently is handled by the **hold-lift floor** of PR
-#113, section 6.1.2. The progress clock never starts before the latest **real lift
-event** inside the timeout window. Only these count: `agent.resumed` for the assignee,
-and a `company.updated`, `project.updated` or `routine.updated` entry whose `details`
-show that the pause state changed to not paused. An ordinary edit of a routine or
-company is not a lift. So each lift delays an expiry by **at most one timeout**, and a
-routine that is edited often cannot suppress expiry. A tick that waited out a hold does
-not expire on the first tick after the hold lifts. When #102 lands, its lift time
-replaces the approximation.
+#113, section 6.1.2. The existing update entries cannot show a lift: the project entry
+carries only the changed keys, the routine entry only the title, and the company entry
+the request body with no previous state. So the floor is built on a **new lift record**
+that R1 adds (`scope.pause_lifted`, written by every writer that clears a pause), plus
+`agent.resumed` for the assignee. The progress clock never starts before the latest lift
+record inside the timeout window, and **never later than `lastRealProgress + 2 x
+timeout`**. So one lift delays an expiry by at most one timeout, a loop of pauses and
+resumes by at most two timeouts after the last real progress, and an ordinary edit not at
+all. A held scope stays exempt for as long as it is held. The two-timeout residual is
+accepted and stated. If R1 does not build the lift record, the fallback is
+`agent.resumed` only (Q18). When #102 lands, its lift time replaces the approximation.
 
 ### 3.6 Surfaces
 
@@ -265,7 +285,12 @@ commands: `routine ticks:stale` (the preview, which prints the `statusVersion`) 
 
 **Web.** In the routine edit form, next to the concurrency policy: a field "Expire a
 stuck tick after (minutes)", empty means off, with help text that says what counts as
-stuck. On the routine list and detail pages: a "Blocked by a stuck tick" badge with
+stuck. **The help text states the policy effect.** For every policy it says: "While an
+open run of this routine is waiting for a person or a hold, the next tick is skipped. When
+an open run has made no progress for this long, it is closed and the next tick runs." When
+the policy is `always_enqueue` it adds: "With this setting on, a tick that finds an open
+run that has not yet timed out is skipped, not queued." With the field empty, no text
+changes behavior, and the form shows no such sentence. On the routine list and detail pages: a "Blocked by a stuck tick" badge with
 the age, the exemption if any, and an **Expire** button that sends the `statusVersion` it showed. The routines page gets a
 "Stuck ticks" filter backed by the preview.
 
@@ -346,8 +371,11 @@ grace window is the same `staleTickTimeoutMinutes`, so no new setting exists. If
 reviewer wants immediate expiry, the change is one condition in the table (the clock
 test is dropped for copies with no live run), and the tests of section 5 change with it.
 
-**Race and lock order.** The routine row lock serializes ticks. The close takes the issue
-lock after it (routine, then issue, then run, the order in PR #113, section 6.1.3). If
+**Race and lock order.** The routine row lock serializes ticks. The close takes its
+locks after it in the order of PR #113, section 6.1.3: the scope rows `FOR SHARE`
+(company, project, agent), then the issue's runs (none for an idle copy), then the issue.
+That is the order of the lock helper on `main` (run, then issue), not "routine, issue,
+run". If
 the close refuses (a changed status version, a new exemption, a run that is `running`),
 the tick is skipped or coalesced, as in section 3.4.
 
@@ -359,7 +387,7 @@ no longer arises from the schedule trigger. #120 stays as the **backstop** for t
 this rule does not cover: a routine with the setting off, copies that were created before
 the rule, and a race between a wake and a tick. An expired copy is terminal, so a queued
 run of the older copy meets the terminal-status rule of the staleness decision
-(`policy.ts:631` in #120 at `8dcc3e0f9`) before the superseded rule (`policy.ts:704`, the same file). R1 has a test for each of
+(`policy.ts:631` in #120 at `bbfc8e1c3`) before the superseded rule (`policy.ts:704`, the same file). R1 has a test for each of
 these. The two changes do not share code, and neither needs the other to land first.
 
 **Not covered.** Managed plugin routines (Q10). Webhook ticks with a different
@@ -401,7 +429,11 @@ surfaces. R2 is the named follow-up for the preview and the manual action.
   - PR #120 still holds as the backstop: with the setting off, waking the older copy beside a live newer copy cancels the run `routine_execution_superseded`; an expired copy's queued run is cancelled by the terminal-status rule instead.
 - **The shared module, built in R1:** the conformance test of the exemption set (one issue for each issue-scoped feed source, `stallExemption` is not `null`), the compare-and-set (a status change by a writer that bypasses the service makes the close refuse; an A, B, A change refuses), and the writer audit test.
 - **A queued human or resume wake:** a queued run with a wake comment or a resume intent is kept after the close and starts; one without is cancelled. A human comment resets the progress clock.
-- **The hold-lift floor is bounded:** a routine edited every minute still expires; one real lift delays the expiry by at most one timeout.
+- **The hold-lift floor is bounded:** a routine edited every minute still expires; one real lift delays the expiry by at most one timeout; a scope paused and resumed every minute still expires after two timeouts from the last real progress.
+- **The lift record:** every writer that clears a pause writes `scope.pause_lifted` (a source test lists the writers and fails on an unlisted one); the old `*.updated` entries are not read as lifts.
+- **The close against a pause:** a pause (budget, agent, project, routine, company) that starts while the close holds the scope rows waits for it, and one that committed before is seen by the exemption check. Two-connection test, run for each scope.
+- **An idle copy (S4) is closed** through the issue-keyed lock variant (blocked until #103 D1 ships it, Q19). A tree hold created on an ancestor during the close is seen, and a tree-hold restore cannot undo a close.
+- **The kept human or resume wake** is retried through the real `runPeriodicHeartbeatRecovery` (PR #120 r2b), with a failing first agent.
 - A re-dispatch does not reset the progress clock.
 - A held agent, project or company: no expiry while it is held.
 - The re-check race: a run that becomes `running` rolls the close back.
@@ -443,11 +475,13 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 |---|---|---|
 | **Q1** | **Decided, with one point to confirm (Q14).** The report said "an issue with no run blocks later ticks". On `main`, that state (S4) does not block; S1 does. Production then showed S4 piling up: three open copies of one fingerprint, with no live run on two of them. | At most one open copy per fingerprint (section 3.10). An exempt older copy makes the tick `skipped`. A stale, non-exempt one is expired atomically, then the new tick runs. PR #120 stays as the backstop. Appendix B still gives the counts before R1 starts |
 | **Q14** | **For the reviewer.** A non-exempt older copy that is not yet stale. The decision says to expire it at once | **Accepted by the manager (18:29), with a condition:** until the timeout, the tick skips or merges and never creates a second open copy, under any policy including `always_enqueue` (section 3.10, Q17). Plan: wait for the timeout (section 3.10). Reason: PR #104's re-dispatch may be about to wake it. Immediate expiry is one condition away if the reviewer prefers it |
-| **Q15** | Who owns the shared module and the lock helper? | `flow-stall.ts` is built first by R1 (section 4). The lock-preserving variant of `withIssueExecutionLock` is owned by PR #103's plan (D1); the first slice that needs it implements it to that spec, the others reuse it |
+| **Q15** | Who owns the shared module and the lock helper? | `flow-stall.ts` is built first by R1 (section 4). The lock-preserving variant of `withIssueExecutionLock` is owned by PR #103's plan (D1), and must be keyed by the issue with the run optional (Q19). The first slice that needs it implements it to that spec; the others reuse it |
 | **Q16** | The queued human or resume wake | Kept after the close by the existing staleness decision (section 3.3). A human comment is progress. No new sweep |
 | **Q2** | Default: off, or a value? Instance-wide default or per routine? | Per routine only in R1, `null` (off). No instance default. Decide a default in R3 from the preview data. A guard that is off will not catch the next incident, so R2's preview and badge are the answer to that, not a hidden default |
 | **Q3** | Should `coalesce_if_active` expire too? It has the same block: ticks merge into the stuck issue | Yes, for the live-blocker expiry (section 3.3). `always_enqueue` has no live-blocker expiry, but it **is** covered by the one-open-copy rule (section 3.10, Q17) |
-| **Q17** | An open copy that is not stale, under `always_enqueue` (manager decision with Q14) | The tick never creates a second open copy under any policy. `always_enqueue` skips, because it has no merge. Reviewer: confirm skip, or ask for a merge into the copy |
+| **Q17** | An open copy that is not stale, under `always_enqueue` (manager decision with Q14) | The tick never creates a second open copy under any policy. `always_enqueue` skips, because it has no merge. The form says so in words (section 3.6). Reviewer: confirm skip, or ask for a merge into the copy |
+| **Q18** | **For the reviewer.** Build the lift record, or narrow the floor? | Build it in R1: one activity entry per pause-clearing writer, and a source test that lists the writers. The fallback is `agent.resumed` only, with the known gap that a tick which waited out a company, project or routine hold may expire on the first tick after the lift |
+| **Q19** | The S4 close needs an issue-keyed lock variant | A request to #103 D1: keyed by the issue, run optional, one lock order. Without it R1 cannot close an idle copy (section 3.4). Listed here so R1 does not start before #103 answers |
 | **Q4** | Who may set the timeout? | Board users only, on top of the routine manage check. An agent should not set a timer that cancels issues |
 | **Q5** | The range | 30 to 10080 minutes. 30 keeps the timeout above PR #104's re-dispatch grace period. 7 days covers weekly routines |
 | **Q6** | **For the reviewer.** A `running` run is excluded from expiry. Is that right? | Yes in R1. The reaper and the silent-run watchdog own `running`. A running run with output is not stuck, and a dead one is the reaper's. Revisit only if the data shows a `running` run that the watchdog does not catch |
@@ -455,7 +489,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q8** | Lazy check or sweeper? | Lazy in R1 (section 3.1). Add a sweeper only if the preview shows blocked routines whose ticks are rare |
 | **Q9** | Restoring an old revision | Sets the column to `null` (section 3.2) |
 | **Q10** | **For the reviewer.** Managed plugin routines | Out of R1. Their tick issues use the origin kind `plugin:<key>:operation`, which the unique index and `syncRunStatusForIssue` do not cover. R3 extends both, and then manifests may set the timeout. The wiki plugin's routines use `skip_if_active` today, so they are the likely first users, and Appendix B1 counts them |
-| **Q11** | **For the reviewer.** A lifted hold is not remembered | Closed for R1 by the bounded hold-lift floor (PR #113, section 6.1.2). Only `agent.resumed` and the update entries that show an unpause count, so one lift delays an expiry by at most one timeout. #102's lift time replaces it |
+| **Q11** | **For the reviewer.** A lifted hold is not remembered | A new lift record (`scope.pause_lifted`) that R1 adds, plus `agent.resumed`, with a total bound of `lastRealProgress + 2 x timeout` (PR #113, section 6.1.2). The existing update entries cannot identify a lift. Fallback in Q18. #102's lift time replaces it |
 | **Q12** | **For the reviewer.** One definition of the exemptions and the atomic close | Yes: in PR #113, section 6.1, in `flow-stall.ts`. **R1 builds it first** and S1 reuses it. The compare is choice B (section 3.4) |
 | **Q13** | What does a manual expire need to prove? | The issue is the routine's current blocker, the status version matches, no exemption applies, and no run is `running` (section 3.6). Anything else is a 409 |
 
@@ -503,6 +537,8 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | `withIssueExecutionLock` clears the execution columns before its callback | `server/src/modules/wake-queue/adapters/postgres.ts:1171-1232` |
 | Attention feed source kinds (the base of the exemption set) | `packages/shared/src/types/attention.ts:8-21` |
 | Queued run kept for a wake comment or resume intent; terminal-status rule | `server/src/modules/run-dispatch/domain/policy.ts:610-625` (on `main`); `631` and `704` (the superseded rule) are in PR #120 at `8dcc3e0f9` |
+| Pause and resume writers that take no issue lock | `server/src/services/budgets.ts:214-297`; project, routine and company update routes: `server/src/routes/projects.ts:372-387`, `server/src/routes/routines.ts:394-405`, `server/src/routes/companies.ts:1336-1348` |
+| Tree-hold restore without a row lock | `server/src/services/issue-tree-control.ts:976-998` |
 | Plugin routines that use `skip_if_active` | `packages/plugins/plugin-llm-wiki/src/manifest.ts:245`, `272`, `299` |
 
 ## Appendix B. Read-only queries for Q1
