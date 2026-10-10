@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -228,10 +228,18 @@ export type ExecutionWorkspaceServiceOptions = {
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
   beforeTerminalWorkspaceCleanup?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
+  // Test seam: runs after the sweep's checks pass and before the archive
+  // statement re-checks them under the lifecycle lock.
+  beforeTerminalWorkspaceArchive?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
   // The terminal-workspace reaper waits this many days after an issue tree
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
   workspaceReaperCooldownDays?: number;
+  // A terminal workspace with no local-only work (no modified or untracked
+  // files, no commits ahead of its base ref) waits this many hours instead,
+  // never longer than the cooldown. A value of 0 archives it on the same sweep.
+  // The default is 24 hours.
+  workspaceReaperNoLocalWorkRetentionHours?: number;
   inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
     git: ExecutionWorkspaceCloseGitReadiness | null;
     warnings: string[];
@@ -267,6 +275,35 @@ export function deriveExecutionWorkspaceDeliveryState(input: {
   if (input.isMergedIntoBase === true) return "merged_by_ancestry";
   if (input.isMergedIntoBase === false && !input.pullRequestStateUnknown) return "unmerged";
   return "unknown";
+}
+
+/**
+ * What one terminal-workspace sweep did. `skippedUndelivered` totals the five
+ * reasons after it (unverified git status, modified tracked files, untracked
+ * files, commits ahead of the base ref, unknown delivery); `skippedCooldown`
+ * counts workspaces still inside the cooldown or, with no local-only work, the
+ * shorter retention.
+ */
+function emptyTerminalSweepResult() {
+  return {
+    checked: 0,
+    eligible: 0,
+    archived: 0,
+    cleanupFailed: 0,
+    skippedActiveRun: 0,
+    skippedNonTerminalTree: 0,
+    skippedUndelivered: 0,
+    skippedUnverifiedStatus: 0,
+    skippedDirty: 0,
+    skippedUntracked: 0,
+    skippedAheadOfBase: 0,
+    skippedUnknownDelivery: 0,
+    skippedOpenLinkedIssue: 0,
+    skippedRace: 0,
+    skippedReopened: 0,
+    skippedCooldown: 0,
+    clearedStaleReopenPending: 0,
+  };
 }
 
 export type ExecutionWorkspaceBranchReconcileMode = "forward" | "override" | "quarantine_restore";
@@ -791,6 +828,16 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
+// A base ref that names the workspace's own HEAD or branch compares HEAD with
+// itself: it always shows nothing ahead and "merged", so it proves nothing
+// about delivery. Branch detection falls back to the literal "HEAD" when a
+// repository has no default branch.
+function baseRefTracksWorkspaceHead(baseRef: string, branchName: string | null): boolean {
+  const ref = baseRef.trim();
+  if (ref === "HEAD" || ref === "@") return true;
+  return Boolean(branchName) && (ref === branchName || ref === `heads/${branchName}` || ref === `refs/heads/${branchName}`);
+}
+
 async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
@@ -890,7 +937,11 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   let isMergedIntoBase: boolean | null = null;
   const baseRef = workspace.baseRef;
 
-  if (repoRoot && baseRef) {
+  if (repoRoot && baseRef && baseRefTracksWorkspaceHead(baseRef, branchName)) {
+    warnings.push(
+      `The base ref "${baseRef}" is this workspace's own HEAD, so Paperclip cannot tell whether its commits were delivered.`,
+    );
+  } else if (repoRoot && baseRef) {
     try {
       const counts = (await runGit(["rev-list", "--left-right", "--count", `${baseRef}...HEAD`], workspacePath)).stdout.trim();
       const [behindRaw, aheadRaw] = counts.split(/\s+/);
@@ -1289,6 +1340,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     0,
     (opts.workspaceReaperCooldownDays ?? 7) * 24 * 60 * 60 * 1000,
   );
+  // Deleting a workspace with no local-only work loses nothing, and a reopen
+  // provisions a fresh one, so it waits less. It never waits longer than a
+  // workspace whose work was delivered.
+  const workspaceReaperNoLocalWorkRetentionMs = Math.min(
+    workspaceReaperCooldownMs,
+    Math.max(0, (opts.workspaceReaperNoLocalWorkRetentionHours ?? 24) * 60 * 60 * 1000),
+  );
   const pullRequestStateCache = new Map<
     string,
     {
@@ -1499,6 +1557,19 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const { git } = await inspectDisplay(workspace);
     const assessment = await assessDelivery(row, git);
     return toExecutionWorkspace(row, runtimeServices, assessment.deliveryState);
+  }
+
+  async function workspaceHasOpenLinkedIssue(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId">) {
+    const open = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, workspace.companyId),
+        eq(issues.executionWorkspaceId, workspace.id),
+        notInArray(issues.status, [...TERMINAL_ISSUE_STATUSES]),
+      ))
+      .limit(1);
+    return open.length > 0;
   }
 
   async function workspaceHasActiveRun(workspace: Pick<ExecutionWorkspaceRow, "id" | "companyId" | "sourceIssueId">) {
@@ -2535,19 +2606,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // the cursor and the boundary and could corrupt the rotation state. A
       // skipped tick is safe: the next tick runs the sweep with intact state.
       if (terminalSweepInProgress) {
-        return {
-          checked: 0,
-          eligible: 0,
-          archived: 0,
-          cleanupFailed: 0,
-          skippedActiveRun: 0,
-          skippedNonTerminalTree: 0,
-          skippedUndelivered: 0,
-          skippedRace: 0,
-          skippedReopened: 0,
-          skippedCooldown: 0,
-          clearedStaleReopenPending: 0,
-        };
+        return emptyTerminalSweepResult();
       }
       terminalSweepInProgress = true;
       try {
@@ -2599,25 +2658,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         const lastCandidate = candidates[candidates.length - 1]!;
         terminalSweepCursor = { updatedAt: lastCandidate.updatedAt, id: lastCandidate.id };
       }
-      const result = {
-        checked: candidates.length,
-        eligible: 0,
-        archived: 0,
-        cleanupFailed: 0,
-        skippedActiveRun: 0,
-        skippedNonTerminalTree: 0,
-        skippedUndelivered: 0,
-        skippedRace: 0,
-        skippedReopened: 0,
-        skippedCooldown: 0,
-        clearedStaleReopenPending: 0,
-      };
+      const result = { ...emptyTerminalSweepResult(), checked: candidates.length };
 
       for (const workspace of candidates) {
         const executionWorkspace = toExecutionWorkspace(workspace);
         const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
         if (!statusInspectionSucceeded) {
           result.skippedUndelivered += 1;
+          result.skippedUnverifiedStatus += 1;
           continue;
         }
         const assessment = await assessDelivery(workspace, git);
@@ -2642,6 +2690,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         if (assessment.workspaceDirty) {
           result.skippedUndelivered += 1;
+          if (git?.hasDirtyTrackedFiles) result.skippedDirty += 1;
+          else result.skippedUntracked += 1;
           continue;
         }
         if (
@@ -2649,16 +2699,29 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           && assessment.deliveryState !== "merged_by_ancestry"
         ) {
           result.skippedUndelivered += 1;
+          if ((git?.aheadCount ?? 0) > 0) result.skippedAheadOfBase += 1;
+          else result.skippedUnknownDelivery += 1;
           continue;
         }
-        // Hold the archive during the cooldown window. The anchor is the most
-        // recent terminal timestamp across the issue tree. A person can reopen
-        // the work inside this window. A cooldown of 0 disables the check, so the
-        // reaper archives the workspace on the same sweep. The archive statement
-        // below re-checks the same cutoff under the lifecycle lock, so the loop
-        // check and the guarded statement agree.
-        const cooldownCutoff = workspaceReaperCooldownMs > 0
-          ? new Date(now().getTime() - workspaceReaperCooldownMs)
+        // No local-only work: the clean git worktree (checked above) has no
+        // commit that its base ref lacks (delivered by ancestry), so deleting
+        // it loses nothing and it waits only the shorter retention. Only a git
+        // worktree qualifies, because its cleanup re-verifies HEAD and status
+        // under the cleanup lock before it removes anything.
+        const noLocalWork =
+          workspace.providerType === "git_worktree"
+          && Boolean(git?.repoRoot)
+          && git?.aheadCount === 0;
+        // Hold the archive during the cooldown window, or the shorter retention
+        // when there is no local-only work. The anchor is the most recent
+        // terminal timestamp across the issue tree. A person can reopen the work
+        // inside this window. A hold of 0 disables the check, so the reaper
+        // archives the workspace on the same sweep. The archive statement below
+        // re-checks the same cutoff under the lifecycle lock, so the loop check
+        // and the guarded statement agree.
+        const holdMs = noLocalWork ? workspaceReaperNoLocalWorkRetentionMs : workspaceReaperCooldownMs;
+        const cooldownCutoff = holdMs > 0
+          ? new Date(now().getTime() - holdMs)
           : null;
         if (
           cooldownCutoff
@@ -2723,11 +2786,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
           continue;
         }
+        // An open issue outside the source tree that still uses this isolated
+        // workspace (a follow-up that inherited it) keeps it, as it blocks a
+        // board close. A shared workspace session only detaches such issues.
+        const guardOpenLinkedIssues = workspace.mode !== "shared_workspace";
+        if (guardOpenLinkedIssues && await workspaceHasOpenLinkedIssue(workspace)) {
+          result.skippedOpenLinkedIssue += 1;
+          continue;
+        }
         if (await workspaceHasActiveRun(workspace)) {
           result.skippedActiveRun += 1;
           continue;
         }
         result.eligible += 1;
+        await opts.beforeTerminalWorkspaceArchive?.(workspace);
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures
         // this generation and re-checks it before it deletes the worktree, so a
@@ -2779,6 +2851,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   AND live_run.company_id = ${workspace.companyId}
                   AND live_run.status IN ('queued', 'running')
               )`,
+              guardOpenLinkedIssues
+                ? sql<boolean>`NOT EXISTS (
+                SELECT 1
+                FROM ${issues} linked_issue
+                WHERE linked_issue.company_id = ${workspace.companyId}
+                  AND linked_issue.execution_workspace_id = ${workspace.id}
+                  AND linked_issue.status NOT IN ('done', 'cancelled')
+              )`
+                : undefined,
               sql<boolean>`NOT EXISTS (
                 WITH RECURSIVE issue_tree(id, status) AS (
                   SELECT root.id, root.status
@@ -2840,6 +2921,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           details: {
             sourceIssueId: archived.sourceIssueId,
             deliveryState: assessment.deliveryState,
+            noLocalWork,
             cleanupEligibleAt: archived.cleanupEligibleAt?.toISOString() ?? null,
             cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
           },

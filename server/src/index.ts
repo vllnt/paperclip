@@ -1378,6 +1378,7 @@ async function startServerWithDatabaseTeardown(
     });
     const terminalWorkspaces = executionWorkspaceService(db as any, {
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+      workspaceReaperNoLocalWorkRetentionHours: config.workspaceReaperNoLocalWorkRetentionHours,
     });
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;
@@ -1411,7 +1412,8 @@ async function startServerWithDatabaseTeardown(
             + result.skippedNonTerminalTree
             + result.skippedUndelivered
             + result.skippedRace
-            + result.skippedCooldown;
+            + result.skippedCooldown
+            + result.skippedOpenLinkedIssue;
           const nowMs = Date.now();
           if (skipped > 0 && nowMs - lastTerminalWorkspaceSkipLogAt >= terminalWorkspaceSkipLogIntervalMs) {
             lastTerminalWorkspaceSkipLogAt = nowMs;

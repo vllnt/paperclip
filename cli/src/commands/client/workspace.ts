@@ -47,6 +47,7 @@ export function registerWorkspaceCommands(program: Command): void {
   addIdGet(workspace, "close-readiness", "Check execution workspace close readiness", "execution-workspaces", "close-readiness");
   addIdGet(workspace, "operations", "List execution workspace operations", "execution-workspaces", "workspace-operations");
   addPatchJson(workspace, "update", "Update an execution workspace", "execution-workspaces");
+  addWorkspaceArchive(workspace);
   addRuntimeAction(workspace, "runtime-service", "Control an execution workspace runtime service", "execution-workspaces", "runtime-services");
   addRuntimeAction(workspace, "runtime-command", "Run an execution workspace runtime command", "execution-workspaces", "runtime-commands");
 
@@ -227,6 +228,47 @@ function addIdGet(parent: Command, name: string, description: string, resource: 
         try {
           const ctx = resolveCommandContext(opts);
           const result = await ctx.api.get(`/api/${resource}/${encodeURIComponent(id)}${suffix ? `/${suffix}` : ""}`);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+}
+
+interface WorkspaceArchiveOptions extends BaseClientOptions {
+  yes?: boolean;
+}
+
+// Archives an execution workspace as the board's close dialog does: it reads
+// close readiness first, refuses while that is blocked, and shows the warnings
+// (uncommitted files, commits not merged) that archiving would discard, which
+// the caller must accept with --yes. The server checks readiness again before
+// it archives and removes the workspace.
+function addWorkspaceArchive(parent: Command): void {
+  addCommonClientOptions(
+    parent
+      .command("archive")
+      .description("Archive an execution workspace and remove its worktree, unless close readiness is blocked")
+      .argument("<id>", "Execution workspace ID")
+      .option("--yes", "Archive even when close readiness lists warnings")
+      .action(async (id: string, opts: WorkspaceArchiveOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const workspacePath = `/api/execution-workspaces/${encodeURIComponent(id)}`;
+          const readiness = await ctx.api.get<{ state?: string; blockingReasons?: string[]; warnings?: string[] }>(
+            `${workspacePath}/close-readiness`,
+          );
+          if (!readiness?.state) throw new Error(`Could not read the close readiness of workspace ${id}.`);
+          if (readiness.state === "blocked") {
+            throw new Error(`Workspace ${id} cannot be archived: ${(readiness.blockingReasons ?? []).join(" ")}`);
+          }
+          if (readiness.state !== "ready" && !opts.yes) {
+            throw new Error(
+              `Archiving workspace ${id} would discard: ${(readiness.warnings ?? []).join(" ")} Run again with --yes to archive it anyway.`,
+            );
+          }
+          const result = await ctx.api.patch(workspacePath, { status: "archived" });
           printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
