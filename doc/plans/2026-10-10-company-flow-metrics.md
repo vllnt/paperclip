@@ -26,9 +26,10 @@ or noise.
 Constraints, all binding:
 
 - **Read only.** The report reads existing tables and writes nothing, so it writes
-  no activity entry. It needs no migration. One prerequisite (slice F0, section 7)
-  changes which runs the usage record covers. That is a code change with a version
-  bump and no migration.
+  no activity entry. It needs no migration, with one possible exception: slice F1
+  may add an index on `issues` if the measured evidence needs it (section 6, Q7). One
+  prerequisite (slice F0, section 7) changes which runs the usage record covers. It is
+  a code change with a classifier version bump and no migration.
 - **Company scope.** Every query filters on `company_id`. The report never mixes
   companies.
 - **Web, API (listed in OpenAPI) and CLI** for the report, in the same slice or
@@ -58,7 +59,7 @@ Not in scope:
 | Need | On `main` | Gap |
 |---|---|---|
 | One row of facts per terminal run: status, `error_code`, closed cause, `cost_micros`, `issue_id`, `is_retry`, `provider_work_started`, `finished_at` | `run_usage_records` (pull request #70, merged). Index `(company_id, finished_at, run_id)` and a partial index `(company_id, issue_id)` | **It covers four statuses only: `succeeded`, `failed`, `cancelled`, `timed_out`.** A run that a shutdown or the orphan backstop ends has the status `interrupted` and gets **no record**. It is also derived after a 10 minute settle (`RUN_USAGE_SETTLE_MS`) |
-| Closed failure causes | 14 causes in `RUN_FAILURE_CAUSES`. Restart losses are `interrupted_graceful` and `interrupted_crash` | The orphan backstop codes `orphaned_running_run` and `orphaned_running_run_issue_terminal` have no cause mapping, so they read as `unknown` |
+| Closed failure causes | 14 causes in `RUN_FAILURE_CAUSES`. Restart losses are `interrupted_graceful` and `interrupted_crash` | The orphan backstop code `orphaned_running_run` (the only orphan code that lands on an `interrupted` run) and `lease_released_before_terminal` have no cause mapping, so they read as `unknown` |
 | When an issue was done | `issues.completed_at`, set when a write carries `status: done` and cleared when a write sets a non-done status | **No index** on `(company_id, completed_at)`. Only `(company_id, status)` exists. A `done` to `done` write sets it again |
 | Which issues the board lists | `visibleIssueCondition()`, no conversation issues, and `nonIdleSlackIssueCondition()` in the list query | A metric must use the same rule or it counts a different set |
 | Run counts by status and `error_code` | **Not on `main`.** Pull request #28 adds `GET /heartbeat-runs/stats` | It counts by **creation time** from `heartbeat_runs`, up to 90 days, with daily cap usage per agent |
@@ -116,9 +117,10 @@ The report is a contract. Each term is defined once.
 
 A window ends at **`asOf`**, not at the wall clock: `asOf = now - settle`, where
 `settle` is `RUN_USAGE_SETTLE_MS` plus one worker interval (the interval is
-configurable, 60 seconds by default, so the plan does not hard code the sum). If the
-observability health data reports a larger derivation lag, `asOf` moves back by that
-lag. Every metric of one response uses the same `asOf`, and the response returns it.
+configurable, 60 seconds by default, so the plan does not hard code the sum). The
+health data does not move `asOf`: its `oldestPendingAt` is the *creation* time of the
+oldest pending run, so one long run that just finished would move it back by hours.
+Every metric of one response uses the same `asOf`, and the response returns it.
 
 The window is `[asOf - length, asOf)`. The previous window is
 `[asOf - 2 x length, asOf - length)`.
@@ -167,7 +169,7 @@ and on `provider_work_started`:
 | `succeeded` | status `succeeded` |
 | **`scrap`** | status `failed`, `timed_out` or `interrupted` |
 | `stopped` | status `cancelled`, and provider work had started. A person or the control plane chose to stop it |
-| `deferred` | status `cancelled`, and provider work had **not** started. The run waited and was held back (a busy workspace, a busy AI connection, a daily cap) |
+| `deferred` | status `cancelled`, and the run never started provider work. It was cancelled while queued, or held back by a busy workspace or a busy AI connection |
 
 The identity `succeeded + scrap + stopped + deferred = runs` always holds, and a test
 checks it. A `cancelled` run is never scrap, even when its cause reads `unknown`,
@@ -187,23 +189,29 @@ The difference from #28 is stated in Q3.
 `interrupted_crash`. After slice F0 it includes the three kinds of restart loss
 (`process_lost`, `orphaned_running_run`, `server_shutdown_interrupted`).
 
-**Deploy windows** come from the company's drain entries. For each `started` entry:
+**Deploy windows** come from the company's drain entries. For each `started` entry
+the window ends at the **earliest** of:
 
-1. The window ends at the earliest of: the first later `stopped` entry whose
-   `details.wasActive` is true (a stop that found no drain does not end a window),
-   and `details.expiresAt` when it is not null.
-2. If neither exists, the window ends **60 minutes** after the start. (A drain with
-   no expiry ends in a restart that clears the memory state and writes no stop. The
-   planned restart plan measured about 17 minutes between the two stops of one
-   deploy.)
-3. The window then gets a **30 minute grace** at its end, because a lost run is
-   finalized when the new process boots, after the drain ended.
+1. the first later `stopped` entry, whatever its `details.wasActive` (a stop that
+   found no drain proves that the drain was already off);
+2. `details.expiresAt`, when it is not null;
+3. **60 minutes** after the start.
+
+The window then gets a **30 minute grace** at its end, because a lost run is finalized
+when the new process boots, after the drain ended.
+
+The cap in rule 3 applies even when an expiry exists. The drain state is in process
+memory, so a restart clears it and writes no stop entry. If the window followed
+`expiresAt` (up to 24 hours), a day of crash losses after a deploy would count as
+planned. The cost of the cap: a drain that waits longer than 60 minutes before its
+restart shows that restart's losses as unplanned. The planned restart plan measured
+about 17 minutes between the two stops of one deploy.
 
 A restart loss is *inside* when its `finished_at` falls in a window, and *outside*
 otherwise. A restart without a drain leaves no marker, so it counts as outside: a hot
 restart shows as unplanned. The response says so in its notes. Drain rows are written
 to every company in one transaction, so the windows are the same for all companies of
-an instance. `windowsOpenEnded` counts the windows that used rule 2. The numbers 60
+an instance. `windowsOpenEnded` counts the windows that the cap closed. The numbers 60
 and 30 are constants, not settings, in F1.
 
 ### 3.5 Runs per done issue
@@ -237,9 +245,11 @@ report says so in its `basis` field, and a test explains the known differences
 
 ### 3.7 Data quality
 
-Each response carries `dataQuality`: `asOf`, the settle in seconds, the derivation lag
-from the observability health route, `dataFrom`, and the number of runs of the window
-that still have no usage record.
+Each response carries `dataQuality`: `asOf`, the settle in seconds, `dataFrom`, and the
+counts that the observability health service already computes (`pendingRuns`,
+`unreconciledRuns30d`, `lastDerivedAt`). The report reuses the health numbers and adds
+no new scan. The health call runs three joins on `heartbeat_runs` (section 6), so F1
+measures it and caches it.
 
 ## 4. Process limits (XmR)
 
@@ -256,6 +266,10 @@ For a series of points x₁…xₙ:
   mR̄ is computed again once. Without this, a spike widens the limits that are meant
   to catch it (fixture B2).
 - A count cannot be negative, so a lower limit below 0 is shown as 0.
+- **No collapse.** If the revised mR̄ is 0, or fewer than 4 ranges remain after the
+  revision, the unrevised mR̄ is used. If the unrevised mR̄ is also 0 (a flat series),
+  `limits` is null with `reason: "no_variation"` and no point signals. Otherwise the
+  limits shrink to the mean and every point fires (fixture G).
 - **A gap breaks the chain.** A null point is skipped, and no moving range spans it.
   mR̄ uses only ranges between two adjacent points.
 - **At least 8 points and 4 moving ranges** (partial buckets and null points
@@ -268,20 +282,26 @@ For a series of points x₁…xₙ:
 | Rule | Signal | Windows |
 |---|---|---|
 | 1 | A point beyond a natural process limit | all |
-| 4 | Eight points in a row on the same side of the mean | `7d` and `30d` only |
+| 4 | Eight points in a row on the same side of the mean | `30d` only |
 
-Rule 4 is off for `1h` and `24h`. A company that works in the day has a daily cycle:
-over 24 hourly points, the night is a run of 8 or more points below the mean, and
-rule 4 would fire every day (fixture E). On the one hour window the counts are mostly
-0 to 2, and a run below the mean is only quiet. Both would teach readers to ignore
-the badge. The two other common rules (two of three points in the outer third, four of
-five beyond one sigma) are an extension. Each point carries the rules it breaks, and
-the series gets a `signals` list.
+Rule 4 is off for `1h`, `24h` and `7d`:
 
-**What the limits do not do.** The limits describe variation around a stable level.
-They do not model a daily or weekly cycle. A company with a strong cycle sees its
-peaks near the upper limit. A previous-period baseline (F3) is the better tool for
-those series.
+- On `24h`, a company that works in the day has a night of 8 or more hourly points
+  below the mean (fixture E).
+- On `7d`, the 6 hour buckets make a weekend of 8 buckets. A company that works Monday
+  to Friday would fire rule 4 every week.
+- On `1h` the counts are mostly 0 to 2, and a run below the mean is only quiet.
+
+The two other common rules (two of three points in the outer third, four of five beyond
+one sigma) are an extension. Each point carries the rules it breaks, and the series gets
+a `signals` list. A partial bucket is shown but never tested.
+
+**What the limits do not do.** The limits describe variation around a stable level. They
+do not model a daily or weekly cycle. For a strongly cyclic series, rule 1 fires on the
+troughs (fixture E). So the API returns the signals for every window, and the card
+(slice F2) shows a **badge only for `7d` and `30d`**. On `1h` and `24h` it shows the
+series and the limit band without a badge (Q13). A previous-period baseline (F3) is the
+better tool for cyclic series.
 
 ### 4.3 Series that get limits
 
@@ -293,23 +313,31 @@ those series.
 
 ### 4.4 Fixtures
 
-These numbers are the tests. Each was computed by a script.
+These numbers are the tests. A script computed each one with the constants of 4.1.
 
-| Series | Points | x̄ | mR̄ after revision | Upper | Lower | Result |
+| Series | Points | x̄ | mR̄ used | Upper | Lower | Result |
 |---|---|---|---|---|---|---|
-| A | 12 15 11 14 13 16 12 15 13 14 12 15 | 13.5 | 2.6364 (none dropped) | 20.5127 | 6.4873 | no signal |
-| B1 | A with the last point 30 | 14.75 | 2.6 (one dropped; before: 4.0) | 21.666 | 7.834 | rule 1 on 30 |
-| B2 | A with the last point **23** | 14.1667 | 2.6 (one dropped; before: 3.3636) | 21.0827 | 7.2507 | rule 1 on 23, **only after the revision**. Without it the upper limit is 23.1139 and 23 does not fire |
-| Z | 0 1 0 2 1 0 1 0 2 1 | 0.8 | 1.2222 | 4.0511 | −2.4511, shown as 0 | no signal |
-| D | 10 10 11 10 12 12 13 12 13 13 12 13 | 11.75 | 0.8182 | 13.9264 | 9.5736 | rule 4 fires at the 12th point; rule 1 does not |
+| A | 12 15 11 14 13 16 12 15 13 14 12 15 | 13.5 | 2.6364 | 20.5127 | 6.4873 | no signal |
+| B1 | A with the last point 30 | 14.75 | 2.6 (1 dropped; before: 4) | 21.666 | 7.834 | rule 1 on 30 |
+| B2 | A with the last point **23** | 14.1667 | 2.6 (1 dropped; before: 3.3636) | 21.0827 | 7.2507 | rule 1 on 23, **only after the revision** (without it the upper limit is 23.1139). The dropped range is 11 against a range limit of 10.992, so this fixture sits on the edge on purpose: it fails if the revision step or a constant changes |
+| B3 | A with the last point **25** | 14.3333 | 2.6 (1 dropped; before: 3.5455) | 21.2493 | 7.4173 | rule 1 on 25. The dropped range is 13 against a limit of 11.587, a clear margin |
+| Z | 0 1 0 2 1 0 1 0 2 1 | 0.8 | 1.2222 | 4.0511 | -2.4511, shown as 0 | no signal |
+| D | 10 10 11 10 12 12 13 12 13 13 12 13 | 11.75 | 0.8182 | 13.9264 | 9.5736 | rule 4 fires at the 12th point (30 day window); rule 1 does not |
+| G | eleven 0s and one 1 | 0.0833 | 0.0909 (unrevised; the revised value would be 0) | 0.3252 | -0.1585, shown as 0 | The revised mR̄ would be 0, so the unrevised one is used (the no-collapse rule). Rule 1 fires on the 1 |
 
-- **Fixture E (a cycle).** A square wave of 12 hours at 2 and 12 hours at 10 over 24
-  hourly points has runs of 8 or more on each side of the mean. It must give *no*
-  rule 4 signal on `24h` and must give one on `30d` if the same wave covers 30 daily
-  points with a long step. This pins section 4.2.
-- **Fixture F (a rate).** Scrap `1 0 3 2 0 9 1 0` over runs `5 6 8 6 5 40 5 6` has a
-  mean of bucket rates of 0.1667 and a pooled rate of 0.1975. The centre line must be
-  0.1975.
+- **Flat series.** Twelve 0s have an mR̄ of 0, so `limits` is null with
+  `no_variation`, and no point signals.
+- **Fixture E (a noisy daily cycle).** 24 hourly points: `1 0 1 1 0 1 0 2` at night,
+  then `9 10 8 11 9 10 12 9 10 8 9 11 10 9 8 10` by day. The mean is 6.625 and
+  the limits are 2.7559 to 10.4941. Rule 1 fires on 11 of the 24
+  points, **all eight night points among them**, and the longest run on one side of the
+  mean is 16, so rule 4 would fire too. Both signals only describe the cycle. This
+  fixture pins why rule 4 is off for `1h`, `24h` and `7d`, and why the card shows
+  no badge for `1h` and `24h` (section 4.2).
+- **Fixture F (a rate).** Scrap `1 0 3 2 0 9 1 0` over runs `5 6 8 6 5 40 5 6` gives
+  the rates `0.2 0 0.375 0.333 0 0.225 0.2 0`. The mean of the bucket rates is 0.1667
+  and the pooled rate is 0.1975. The centre line must be 0.1975, and the limits are 0
+  to 0.7295 (mR̄ 0.2, clamped to [0, 1]). It has exactly 8 points, the minimum.
 
 ### 4.5 Where the limits live
 
@@ -345,7 +373,7 @@ Response, in short:
 {
   "companyId": "…", "window": "24h", "bucketMinutes": 60,
   "asOf": "2026-10-10T12:49:00.000Z", "generatedAt": "…",
-  "dataQuality": { "settleSeconds": 660, "derivationLagSeconds": 42, "dataFrom": "2026-10-09T18:00:00.000Z", "runsWithoutRecord": 0 },
+  "dataQuality": { "settleSeconds": 660, "pendingRuns": 0, "unreconciledRuns30d": 0, "lastDerivedAt": "…", "dataFrom": "2026-10-09T18:00:00.000Z" },
   "throughput": { "total": 31, "previous": 27, "byOrigin": { "…": 0 }, "series": [ { "t": "…", "value": 2, "partial": false, "signals": [] } ], "limits": { "method": "xmr.v1", "mean": 1.3, "mRBar": 1.1, "upper": 4.2, "lower": 0, "droppedRanges": 0 }, "signals": [] },
   "runs": { "total": 290, "retryShare": 0.12, "series": [ ], "limits": { } },
   "scrap": { "count": 51, "rate": 0.18, "stopped": { }, "deferred": 6, "byErrorCode": [ ], "otherCount": 4, "byCause": { }, "restartLoss": { "total": 9, "insideDeployWindow": 7, "outsideDeployWindow": 2, "windowsFound": 1, "windowsOpenEnded": 0 }, "series": [ ] },
@@ -368,7 +396,7 @@ change without a second call.
 | A low-trust agent, a skill-test token, a task bridge key | **Refused.** The authorization service lists `company_scope:read` in each of these three deny blocks |
 | An agent of another company | Refused by `assertCompanyAccess` |
 
-The test matrix covers all six rows.
+The test matrix covers all five rows.
 
 Two decisions come out of this.
 
@@ -416,8 +444,8 @@ or a threshold, those mutations write entries.
 | Runs, scrap, cost | One grouped scan of `run_usage_records` for both windows, bucketed by `floor(epoch / bucket)` | `(company_id, finished_at, run_id)` |
 | Runs per done issue | Done visible issues of the window joined to usage records by `issue_id` and `company_id` | partial `(company_id, issue_id)` on usage records |
 | Throughput | Done issues with `completed_at` in the range | **None on `completed_at`.** The issues table is medium sized (about 1,609 rows locally, estimated at 250 times that), so the evidence below decides |
-| Drain windows | The drain entries of the company, from 24 hours before the window start | `(entity_type, entity_id)` on the activity log, then filter by company and time. The `(company_id, created_at)` index would scan all company activity, and the activity log is the largest table |
-| `runsWithoutRecord` | An anti-join of terminal runs in the window against usage records | `heartbeat_runs`. It is the one query on the large table. F1 measures it and may drop it or bound it |
+| Drain windows | The drain entries of the company, from 90 minutes (60 plus the grace) before the window start. A window never lasts longer than 60 minutes | `(entity_type, entity_id)` on the activity log, then filter by company, action and time. The `(company_id, created_at)` index would scan all company activity, and the activity log is the largest table |
+| Data quality counts | The health service numbers (`pendingRuns`, `unreconciledRuns30d`, `lastDerivedAt`) | The health call runs three joins on `heartbeat_runs`. F1 measures it and caches it for 30 seconds. It is the one place where this report touches the large table |
 
 The report uses `floor(epoch / seconds)` for the buckets, which works on every
 supported PostgreSQL version, and not `date_bin`.
@@ -428,7 +456,7 @@ arithmetic, so it stays one scan. The issues side reads the same range once.
 
 **Evidence first.** The earlier observability work measured 2,000,000 usage records:
 the slowest report took 874 ms and most took under 120 ms. The usage side is covered.
-The issues side and the anti-join are not measured. Slice F1 extends the existing
+The issues side and the health call are not measured. Slice F1 extends the existing
 EXPLAIN script to the issues table at a realistic size and applies a budget of **1
 second median for the 30 day window**. If a query misses it, F1 adds a partial index
 `(company_id, completed_at) WHERE status = 'done'`. The migration safety check has a
@@ -446,7 +474,7 @@ adds it only if the evidence shows repeated reads.
 
 | Slice | Scope | Needs |
 |---|---|---|
-| **F0** | **Prerequisite, a small change to the merged usage record code.** Add `interrupted` to `RUN_USAGE_TERMINAL_STATUSES`. Map `orphaned_running_run` and `orphaned_running_run_issue_terminal` to `interrupted_crash`. Bump `RUN_USAGE_RECORD_SCHEMA_VERSION`, so the worker and the backfill command derive the missing rows (`--rederive`). Update the health counts and the docs. No migration (`status` is text). It widens the `status` filter of #73 too | none |
+| **F0** | **Prerequisite, a small change to the merged usage record code.** Add `interrupted` to `RUN_USAGE_TERMINAL_STATUSES`. Map `orphaned_running_run` to `interrupted_crash` and bump `RUN_FAILURE_CAUSE_RULES_VERSION`. `lease_released_before_terminal` stays `unknown`, and the docs say so. **No schema version bump is needed to add rows**: the worker's missing-row pass (runs up to 48 hours old) and the daily 30 day sweep derive them. Runs older than that need `pnpm observability:backfill`, and a `30d` report compares with a window that reaches back 60 days. `lateRecords30d` in the health data will jump once, and the docs say why. The scan, the health counts and the #73 status filter all read the one constant. No migration (`status` is text) | none |
 | **F1** | Shared contract; the pure XmR function with the fixtures of 4.4; the service for runs, scrap, stopped, deferred, restart split, cost, throughput and runs per done issue; `GET .../observability/flow`; OpenAPI; CLI; the **UI client method**; the EXPLAIN evidence for the issues side and the anti-join (the index only if needed) | F0, and #73 merged (its window and report helpers), or the helpers extracted (Q8) |
 | **F2** | The web card and panel (section 5.4). `MetricCard` shows a number only, so F2 adds a small chart component for the series, the limit band and the signal marks | F1 |
 | **F3** | Options: a baseline from the previous period; the two more rules; a p-chart for rates; the signal as an attention item | F1, F2 |
@@ -463,9 +491,12 @@ Tests are written red first.
 
 - A run with the status `interrupted` gets a record, with the cause
   `interrupted_graceful` for `server_shutdown_interrupted` and `interrupted_crash` for
-  `orphaned_running_run` and its sibling.
-- Records that exist at the old version are replaced by the rederive pass. Records of
-  the four old statuses keep their values.
+  `orphaned_running_run`. A run ended by `lease_released_before_terminal` gets a record
+  with the cause `unknown`.
+- An `interrupted` run has a `finished_at`, so it can be bucketed.
+- The worker's missing-row pass and the daily sweep create the rows for old
+  `interrupted` runs. A row that already exists is not changed. Runs of the four old
+  statuses keep their values.
 - The health denominators and the #73 status filter include `interrupted`.
 - The derivation reads the run row only, so it does not depend on run events that a
   retention job may have removed.
@@ -475,13 +506,15 @@ Tests are written red first.
 - **Limits.** The fixtures of 4.4 give the exact values. The revision step drops the
   right range, and fixture B2 fires only after it. A series of fewer than 8 points
   gives `insufficient_data`. A negative lower limit is shown as 0. A gap breaks the
-  moving range chain. Rule 1 fires on B1 and B2 and on nothing in A. Rule 4 fires on D
-  for `7d` and `30d`, and **never for `1h` and `24h`** (fixture E).
+  moving range chain. Rule 1 fires on B1, B2 and B3 and on nothing in A. Rule 4 fires on D
+  for `30d` only, and **never for `1h`, `24h` and `7d`** (fixture E). Fixture G gives
+  a signal on its one 1, and a flat series gives `no_variation`.
 - **Rates.** The centre line is the pooled rate (fixture F), limits are clamped to
   [0, 1], and a bucket under 5 runs is a gap.
 - **Classes.** A fixture with every status, `provider_work_started` true and false, and
   null and unknown causes: `succeeded + scrap + stopped + deferred = runs`. A cancelled
-  run with a null `error_code` is `stopped`, not scrap. A literal error code `other`
+  run with a null `error_code` is `stopped`, not scrap. A queued run that was cancelled
+  before it started is `deferred`. A literal error code `other`
   does not collide with `otherCount`.
 - **Settle and windows.** `asOf` is before the clock by the settle, the edge buckets are
   flagged partial and left out of the limits, a run newer than `asOf` is not counted,
@@ -494,18 +527,22 @@ Tests are written red first.
   3 gives a null point. A cohort before `dataFrom` is marked incomplete.
 - **Restart split.** Cases: a loss inside a window plus the grace; one after it; a
   `started` entry with a later `stopped` entry; one with an `expiresAt` and no stop; one
-  with neither (the 60 minute rule, counted in `windowsOpenEnded`); two `started`
-  entries and one `stopped`; a `stopped` entry that says nothing was active; a company
-  created during a drain; a loss with no drain at all (outside).
+  with an `expiresAt` far later than 60 minutes after the start (the cap closes it, and a
+  crash loss 3 hours later is *outside*); one with neither (the cap, counted in
+  `windowsOpenEnded`); two `started` entries and one `stopped`; a `stopped` entry with
+  `wasActive: false` (it ends the window); a company created during a drain; a loss with
+  no drain at all (outside).
 - **Company isolation.** Company A never sees company B in any field, through the API
   and the CLI.
-- **Authorization matrix** of 5.2, with all six rows.
+- **Authorization matrix** of 5.2, with all five rows.
+- **Data quality.** `dataQuality` reuses the health numbers and adds no scan, and `asOf`
+  does not move when a long run finishes.
 - **Cost.** Reported cost only, null when no run reported, the estimate never added, and
   `perDoneIssueMicros` equal to the cohort cost over the cohort size.
 - **Parity.** Every OpenAPI path under `/observability/flow` has a CLI command and a
   UI client method, and the OpenAPI route test passes.
 - **Evidence.** The EXPLAIN script output for 30 days at the chosen size is in the pull
-  request, for the issues scan, the cohort join, the drain lookup and the anti-join.
+  request, for the issues scan, the cohort join, the drain lookup and the health call.
 
 **F2** is checked in a real browser at desktop and mobile widths with zero console
 errors, with a company that has a signal and one that has no data.
@@ -520,7 +557,7 @@ errors, with a company that has a signal and one that has no data.
 | Limits from a baseline period by default | Better at catching a shift, but a second query and two bucket sizes. Kept as an option |
 | Put the card data in the dashboard summary | The dashboard route has the weaker guard, and this data has per run detail (5.2) |
 | A rate as the only scrap view | Hides a rise in volume. The count and the rate are both shown |
-| End a drain window 24 hours after its start when it has no stop | In a normal restart the stop never comes, so a day of crash losses would count as planned |
+| End a drain window at `expiresAt`, or 24 hours after the start when it has no stop | In a normal restart the stop never comes and the memory state is cleared, so a day of crash losses would count as planned |
 
 ## 10. Open questions
 
@@ -553,14 +590,19 @@ Each has a recommendation. The slice plan assumes it.
 - **Q10. Agents and cost.** Every actor that can read run telemetry can read cost here
   (recommended, for consistency with the costs routes). A later plan can add field level
   limits. Say if cost should be board only.
-- **Q11. The deploy window.** Drain entries with the end rules of 3.4 and a 30 minute
-  grace now (recommended). A hot restart shows as unplanned. A run level marker from the
-  planned restart plan would replace the time window, and `server_boot_events` would
-  also catch restarts without a drain.
+- **Q11. The deploy window.** Drain entries with the end rules of 3.4 (earliest of the
+  stop, the expiry and a 60 minute cap) and a 30 minute grace now (recommended). A hot
+  restart shows as unplanned, and so does a restart that follows a drain of more than 60
+  minutes. A run level marker from the planned restart plan would replace the time
+  window, and `server_boot_events` would also catch restarts without a drain.
 - **Q12. Widening the usage record to `interrupted` runs (slice F0).** Do it before
-  F1 (recommended). It is a change to merged code, with a version bump and a rederive.
-  The alternative is to read `heartbeat_runs` for interrupted runs, which adds a second
-  source and the large table to every request.
+  F1 (recommended). It is a change to merged code, with a classifier version bump and
+  no migration. The alternative is to read `heartbeat_runs` for interrupted runs, which
+  adds a second source and the large table to every request.
+- **Q13. Signal badges on a cyclic company.** The API returns signals for every window.
+  The card shows a badge only for `7d` and `30d` (recommended). The alternative is a
+  badge everywhere, which would fire every night for a company that works in the day,
+  or no limits at all on `1h` and `24h`.
 
 ## Appendix A. Code anchors
 
@@ -571,10 +613,10 @@ On `main` at `38819d350`:
 | Usage record columns | `packages/db/src/schema/run_usage_records.ts:24` (`issue_id`), `:38` (`is_retry`), `:43` (`status`), `:44` (`error_code`), `:45` (`cause_family`), `:60` (`cost_micros`), `:62` (`cost_status`), `:66` (`finished_at`), `:67` (`day`) |
 | Usage record indexes | `run_usage_records.ts:86` (company, finished, run), `:96` (company, issue) |
 | Statuses that get a record | `packages/shared/src/run-usage-record.ts:30` and `:31` (`RUN_USAGE_TERMINAL_STATUSES`); `server/src/services/run-usage-record-derive.ts:175` (returns null for any other status); `server/src/services/run-usage-records.ts:160` (the scan filter) |
-| Deferral flag | `server/src/services/run-usage-record-derive.ts:61` (`DEFERRAL_ERROR_CODES`), `:222` (`providerWorkStarted`) |
-| Settle delay | `server/src/services/run-usage-records.ts:43` (`RUN_USAGE_SETTLE_MS`) |
-| Closed failure causes | `packages/shared/src/run-failure-cause.ts:6` (list), `:7` and `:8` (restart losses), `:17` and `:18` (deliberate stops), `:33` (shutdown mapping), `:196` (fall through to `unknown`). No mapping for `orphaned_running_run` |
-| Where interrupted runs come from | `server/src/services/heartbeat.ts:15599` (`server_shutdown_interrupted`); `:20462` (`process_lost`, status failed); `server/src/services/recovery/service.ts:6076` and `:6077` (`orphaned_running_run_issue_terminal`, `orphaned_running_run`) |
+| Deferral flag | `server/src/services/run-usage-record-derive.ts:61` (`DEFERRAL_ERROR_CODES`), `:222` (`providerWorkStarted`, false for a run with no `started_at` too) |
+| Settle delay and health | `server/src/services/run-usage-records.ts:43` (`RUN_USAGE_SETTLE_MS`); `:452` to `:500` (the health counts, three joins on `heartbeat_runs`, `oldestPendingAt` is a creation time); `:164` to `:168` (the missing-row condition); `:47` and `:48` (30 day sweep, daily) |
+| Closed failure causes | `packages/shared/src/run-failure-cause.ts:6` (list), `:7` and `:8` (restart losses), `:17` and `:18` (deliberate stops), `:33` (shutdown mapping), `:196` (fall through to `unknown`), `:26` (`RUN_FAILURE_CAUSE_RULES_VERSION`). No mapping for `orphaned_running_run` |
+| Where interrupted runs come from | `server/src/services/heartbeat.ts:15599` (`server_shutdown_interrupted`); `:20462` (`process_lost`, status failed); `:13396` (`lease_released_before_terminal`, unmapped); `server/src/services/recovery/service.ts:6074` to `:6094` (`orphaned_running_run`, written only when the status is `interrupted`; the `_issue_terminal` variant never reaches an `interrupted` run) |
 | Issue completion | `packages/db/src/schema/issues.ts:44` (`status`), `:88` (`completed_at`), `:106` (the only status index) |
 | `completed_at` set and cleared | `server/src/services/issues.ts:322`, `:10236` (set); `:10950` (cleared on a non-done status) |
 | Board issue list rule | `server/src/services/issues.ts:7935` to `:7943` (`visibleIssueCondition`, no conversation issues, `nonIdleSlackIssueCondition`) |
