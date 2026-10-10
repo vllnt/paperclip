@@ -315,8 +315,13 @@ path that finalizes the run honours it:
        adapters return it in their result. The intent path keeps this field when
        it switches the metadata outcome to `interrupted`;
      - **never started:** a run fenced while still preparing has no child and no
-       acknowledgment. Its proof is the startup-cancellation fence, or bootstrap
-       evidence with `providerWorkStarted: false`.
+       acknowledgment. The startup-cancellation fence only records the stop
+       request; it is not the proof. The proof is the executor's settled receipt
+       `startupPreparationSettledAt`, or bootstrap evidence with
+       `providerWorkStarted: false`. Step 4 runs after the executor settles, so the
+       receipt exists by then. That receipt is written today only where the run's
+       status is `cancelled`; the intent path widens the condition to `interrupted`
+       with `plannedRestartStop`, as it does for `acknowledgeRemoteStop`.
 
      Without either, the run goes to `reconciliation`.
    - **keeps the stop-proof contract.** Today a stop that cannot be verified is a
@@ -843,7 +848,7 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
 | Retry accounting that does not spend failures | `server/src/services/execution-recovery-attempt.ts`: `historicalFailureCount` `:29-40`, `nonFailureLane` `:45`, `executionRetryAttemptCount` `:59-65`, `accountingForScheduledRetry` `:67-72`; the snapshot written by `scheduleBoundedRetryForRun` `heartbeat.ts:16343-16351` |
 | Reconciliation gate for a retry | `server/src/services/legacy-execution-recovery.ts:19-56` (`legacyExecutionNeedsReconciliation`); refusal in `scheduleBoundedRetryForRun` `heartbeat.ts:16224-16233`; native and chat exclusions `:14802-14808` |
 | Child-process stop acknowledgment | `heartbeat.ts:31676-31685` (written with the ending at `:31656`, after termination `:31603-31614`); none in the shutdown loop `:15593-15608` |
-| Never-started proof | startup-cancellation fence `heartbeat.ts:31515-31527`; bootstrap evidence `legacy-execution-recovery.ts:52-55` |
+| Never-started proof | settled receipt `startupPreparationSettledAt` `heartbeat.ts:28360-28369` (written only for `cancelled` today); bootstrap evidence `legacy-execution-recovery.ts:52-55`; the startup-cancellation fence `:31515-31527` is the request, not the proof |
 | Live-process stop | `heartbeat.ts:31460` (`cancelRunInternal`), options `:31438-31447` (`errorCode`, `suppressImmediateRecovery`, `terminationGraceMs`); settlement map `:1370`, used by the executor `:26938` |
 | Settlement only for child-process adapters | `heartbeat.ts:31545-31550` (`!control`); in-process stop handle registered at `:26586` (`onCancellationReady`); the control branch returns when the executor already finalized `:31628-31646` |
 | Executor's own release (no suppression for a stop) | `heartbeat.ts:27445-27452` |
