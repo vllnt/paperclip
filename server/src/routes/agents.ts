@@ -54,6 +54,9 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  heartbeatRunListQuerySchema,
+  heartbeatRunStatsQuerySchema,
+  HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
   startAdapterAuthSessionRequestSchema,
@@ -7123,11 +7126,17 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
-    const agentId = req.query.agentId as string | undefined;
+    const filters = heartbeatRunListQuerySchema.parse(req.query);
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const runs = await heartbeat.list(companyId, agentId, limit, { summary });
+    const runs = await heartbeat.list(companyId, filters.agentId, limit, {
+      summary,
+      statuses: filters.status,
+      errorCodes: filters.errorCode,
+      since: filters.since ? new Date(filters.since) : undefined,
+      until: filters.until ? new Date(filters.until) : undefined,
+    });
     res.json(await runRedactions.redactForRuns(companyId, runs));
   });
 
@@ -7140,6 +7149,20 @@ export function agentRoutes(
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
     res.set("Cache-Control", "no-cache, no-store");
     res.json(await heartbeat.getDeferredWakeStats(companyId));
+  });
+
+  router.get("/companies/:companyId/heartbeat-runs/stats", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
+    const query = heartbeatRunStatsQuerySchema.parse(req.query);
+    const until = query.until ? new Date(query.until) : new Date();
+    const since = query.since ? new Date(query.since) : new Date(until.getTime() - 24 * 60 * 60 * 1000);
+    if (since >= until) throw badRequest("since must be earlier than until");
+    if (until.getTime() - since.getTime() > HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS * 24 * 60 * 60 * 1000) {
+      throw badRequest(`The stats window can be at most ${HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS} days`);
+    }
+    res.json(await heartbeat.runStats(companyId, { since, until, agentId: query.agentId }));
   });
 
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
