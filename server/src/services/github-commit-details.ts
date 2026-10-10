@@ -92,12 +92,15 @@ export function createGitHubCommitDiffDetailsResolver(
   return async (companyId, reference) => {
     try {
       const token = (typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider)?.trim() || null;
+      // GitHub allows 60 unauthenticated requests an hour per IP address, shared by a host's whole egress, and one commit takes
+      // up to 30 pages: without a token GitHub is not asked, and the details are unavailable (null).
+      if (!token) return null;
       const headers: Record<string, string> = {
         accept: "application/vnd.github+json",
         "user-agent": "paperclip-work-product-resolver",
         "x-github-api-version": "2022-11-28",
+        authorization: `Bearer ${token}`,
       };
-      if (token) headers.authorization = `Bearer ${token}`;
 
       const commitUrl = `${gitHubApiBase(reference.host)}/repos/${encodeURIComponent(reference.owner)}/${encodeURIComponent(reference.repo)}/commits/${encodeURIComponent(reference.sha)}`;
       let additions: number | null = null;

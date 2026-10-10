@@ -85,6 +85,16 @@ function identity(raw: any): AppIdentity {
 /** I-RO (an App-user company's App only reads) lives with the one mint function Paperclip has. */
 export { assertReadOnlyInstallationToken, GITHUB_READ_ONLY_INSTALLATION_SCOPES as READ_ONLY_INSTALLATION_SCOPES } from "@paperclipai/shared/github-installation-token";
 
+/**
+ * The one request this plugin sends without credentials: GitHub's one-time App manifest conversion, whose code is its only
+ * authentication. It is a POST to the conversion path with the empty object as its body. GitHub allows 60 unauthenticated
+ * requests an hour per IP address, and everything behind one egress IP shares them, so any other request without a token is
+ * refused here, whatever the caller meant (a missing, empty or blank token, another method, or another body on that path).
+ */
+const UNAUTHENTICATED_PATH = /^\/app-manifests\/[A-Za-z0-9_-]{10,200}\/conversions$/;
+const isManifestConversion = (verb: string, path: string, body: unknown) =>
+  verb === "POST" && UNAUTHENTICATED_PATH.test(path) && typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 0;
+
 export class GitHubClient {
   constructor(private fetchImpl: typeof fetch = fetch) {}
   /**
@@ -116,11 +126,13 @@ export class GitHubClient {
   }
   async request<T>(path: string, token?: string, body?: unknown, method?: "POST" | "PATCH" | "PUT" | "DELETE"): Promise<{ data: T; next: boolean }> {
     if (!path.startsWith("/") || path.startsWith("//")) throw new Error("Invalid GitHub path.");
+    const verb = method ?? (body === undefined ? "GET" : "POST");
+    if (!token?.trim() && !isManifestConversion(verb, path, body)) throw new Error("Paperclip does not call GitHub without credentials.");
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 20_000);
     try {
       const res = await this.fetchImpl(`https://api.github.com${path}`, {
-        method: method ?? (body === undefined ? "GET" : "POST"), redirect: "error", signal: abort.signal,
+        method: verb, redirect: "error", signal: abort.signal,
         headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "paperclip-github-plugin",
           ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) })
