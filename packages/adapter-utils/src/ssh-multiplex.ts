@@ -54,9 +54,11 @@ export interface SshMultiplexChannel {
   /**
    * Ends the command's hold on its channel slot. `killed`: this process killed
    * the command (timeout or abort), so the master may be dead or hung; it is
-   * then retired and the next command connects again. Safe to call more than once.
+   * then retired, and the returned promise settles once it no longer takes
+   * commands, so the next command connects again. A command from an older
+   * master than the current one retires nothing. Safe to call more than once.
    */
-  done(outcome?: { killed?: boolean }): void;
+  done(outcome?: { killed?: boolean }): Promise<void> | void;
 }
 
 /** One user's hold on a scope. */
@@ -77,7 +79,8 @@ interface ScopeState {
   resolvedDir: string | null;
   users: number;
   channels: number;
-  retiring: boolean;
+  // Bumped when the master is retired; a channel retires only its own master.
+  generation: number;
 }
 
 // Kept on globalThis so two loaded copies of this module share one registry,
@@ -137,15 +140,16 @@ export function sshControlDirFits(dir: string): boolean {
 }
 
 // A parent another user may write could have the directory swapped for one of
-// theirs after it is made: it must be sticky or writable by its owner only, and
-// owned by this user or root. The directory itself must be this user's, 0700.
+// theirs after it is made: it must be sticky or writable by its owner only (no
+// group or other write), and owned by this user or root. The directory itself
+// must be this user's, 0700.
 async function controlDirIsPrivate(root: string, dir: string): Promise<boolean> {
   const uid = process.getuid?.();
   if (uid === undefined) return false;
   // The root may be a link (macOS `/tmp`); what it points at is checked.
   const [parent, own] = await Promise.all([fs.stat(root), fs.lstat(dir)]);
   const parentSafe = parent.isDirectory() && (parent.uid === uid || parent.uid === 0)
-    && ((parent.mode & 0o002) === 0 || (parent.mode & 0o1000) !== 0);
+    && ((parent.mode & 0o022) === 0 || (parent.mode & 0o1000) !== 0);
   return parentSafe && own.isDirectory() && own.uid === uid && (own.mode & 0o777) === 0o700;
 }
 
@@ -163,7 +167,8 @@ async function createControlDir(): Promise<string | null> {
     } catch {
       // Try the next root; with none, the scope uses direct connections.
     }
-    if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    // Still empty: nothing used it.
+    if (dir) await fs.rmdir(dir).catch(() => undefined);
   }
   return null;
 }
@@ -205,7 +210,7 @@ export function openSshMultiplex(config: SshConnectionConfig, scopeId: string | 
       resolvedDir: null,
       users: 0,
       channels: 0,
-      retiring: false,
+      generation: 0,
     };
     void created.dir.then((dir) => {
       created.resolvedDir = dir;
@@ -218,13 +223,12 @@ export function openSshMultiplex(config: SshConnectionConfig, scopeId: string | 
   let released = false;
 
   // Stops the master from taking new commands (`-O stop`); the next command
-  // starts a new one. Commands already on it finish. Once at a time.
-  const retire = (dir: string) => {
-    if (scope.retiring) return;
-    scope.retiring = true;
-    void controlMaster(scope, dir, "stop").finally(() => {
-      scope.retiring = false;
-    });
+  // starts a new one. Commands already on it finish. Only for the master the
+  // killed command ran on: a later master is left alone.
+  const retire = (dir: string, generation: number): Promise<void> | void => {
+    if (generation !== scope.generation) return;
+    scope.generation += 1;
+    return controlMaster(scope, dir, "stop");
   };
 
   return {
@@ -233,22 +237,23 @@ export function openSshMultiplex(config: SshConnectionConfig, scopeId: string | 
       const dir = await scope.dir;
       if (released || !dir || scope.channels >= SSH_MULTIPLEX_MAX_CHANNELS) return DIRECT_CHANNEL;
       scope.channels += 1;
+      const generation = scope.generation;
       let open = true;
       return {
         args: [
           "-o", "ControlMaster=auto",
           "-o", `ControlPath=${path.join(dir, "%C")}`,
           "-o", `ControlPersist=${SSH_MULTIPLEX_PERSIST_SECONDS}s`,
-          // A master whose connection died silently exits within about 10 s,
-          // under the bridge worker's 20 s watchdog.
-          "-o", "ServerAliveInterval=5",
-          "-o", "ServerAliveCountMax=2",
+          // A master whose connection died silently exits within about 30 s.
+          // A command this process kills retires its master sooner.
+          "-o", "ServerAliveInterval=10",
+          "-o", "ServerAliveCountMax=3",
         ],
         done: (outcome) => {
           if (!open) return;
           open = false;
           scope.channels -= 1;
-          if (outcome?.killed) retire(dir);
+          return outcome?.killed ? retire(dir, generation) : undefined;
         },
       };
     },

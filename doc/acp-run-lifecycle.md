@@ -106,12 +106,17 @@ master connection instead of one login each (`packages/adapter-utils/src/ssh-mul
   is `<os.tmpdir() or /tmp>/paperclip-ssh-mux-XXXXXX/%C`, in a 0700 directory
   that only that scope uses. The longest path on Linux is about 70 bytes, under
   the 104-byte socket limit of macOS.
+- The directory must belong to the server's user with mode 0700. The temp
+  root (followed if it is a link) must belong to that user or root, and be
+  sticky or writable by its owner only. Otherwise the server tries `/tmp`,
+  then connects directly.
 - At most 10 commands share a master at a time, the stock sshd default
   `MaxSessions 10`. A command over that cap connects directly. When sshd
   refuses a channel anyway, or the master died, OpenSSH connects directly to
   the same target. A command the server kills (timeout or abort) retires its
-  master (`ssh -O stop`), so a master whose connection hangs does not hold
-  later commands; the next one connects again.
+  master (`ssh -O stop`, and only the master it ran on), so a master whose
+  connection hangs does not hold later commands; the next one connects again.
+  Keep-alives end a silent master within about 30 seconds in any case.
 - A target without an environment id, and any other target or credentials
   than the hold's own, connect directly.
 - The agent's own session, workspace sync and every other SSH command stay on
@@ -122,7 +127,9 @@ master connection instead of one login each (`packages/adapter-utils/src/ssh-mul
   and removes the directory. A process that exits
   without stopping its runs still removes the directories it holds, so no
   later process can reach those masters; each master exits after 60 seconds
-  idle.
+  idle. A command that got its channel just before the last release can still
+  start a master between the stop and the removal; that master has no socket
+  and exits after 60 seconds idle.
 
 When the worker gives up on a queue listing, or on the recovery path's read,
 it aborts that read, and the SSH runner stops its `ssh` process. A request's

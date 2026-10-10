@@ -1371,10 +1371,10 @@ export async function runSshCommand(
           signal: options.signal,
         });
   } catch (error) {
-    killed = options.signal?.aborted === true || (error as { killed?: unknown }).killed === true;
+    killed = options.signal?.aborted === true || (error as { killed?: unknown } | null)?.killed === true;
     throw error;
   } finally {
-    channel?.done({ killed });
+    await channel?.done({ killed });
     await cleanup();
   }
 }
