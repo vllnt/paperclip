@@ -148,6 +148,8 @@ RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.te
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
 # after the SDK build, so build the SDK before typechecking the UI.
 RUN pnpm --filter @paperclipai/plugin-sdk build
+# Provider-quota classification of the Codex and Claude adapters (no database).
+RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
