@@ -76,6 +76,11 @@ import {
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
 import {
+  cleanupHeartbeatRemoteRunTemp,
+  prepareHeartbeatRemoteRunTemp,
+  type HeartbeatRemoteRunTemp,
+} from "./heartbeat-remote-run-temp.js";
+import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
   startAdapterExecutionTargetPaperclipBridge,
@@ -21921,6 +21926,10 @@ export function heartbeatService(
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
+    let remoteRunTempLocation: HeartbeatRemoteRunTemp["cleanupLocation"] | null = null;
+    // Set when the adapter proves its last remote process exited, which a
+    // timeout or a dropped SSH channel does not.
+    let remoteProviderStopped = false;
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
@@ -24326,6 +24335,30 @@ export function heartbeatService(
         }
       } else {
         delete context.paperclipScratch;
+        // A remote run gets its own temp directory on the target, so agents
+        // do not fill the worker's shared /tmp.
+        try {
+          const existingRuntimeEnv = parseObject(runtimeConfig.env);
+          const remoteTemp = await prepareHeartbeatRemoteRunTemp({
+            native: agent.adapterType === "paperclip_runner",
+            runId: run.id,
+            target: executionTarget,
+            env: existingRuntimeEnv,
+          });
+          if (remoteTemp) {
+            remoteRunTempLocation = remoteTemp.cleanupLocation;
+            runtimeConfig = {
+              ...runtimeConfig,
+              env: { ...existingRuntimeEnv, ...remoteTemp.env },
+            };
+            context.paperclipScratch = remoteTemp.scratchContext;
+          }
+        } catch (remoteTempError) {
+          logger.warn(
+            { err: remoteTempError, runId: run.id, agentId: agent.id },
+            "failed to prepare the remote run temp directory; continuing without it",
+          );
+        }
       }
       const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
         target: executionTarget,
@@ -26409,6 +26442,7 @@ export function heartbeatService(
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
+                  remoteProviderStopped = false;
                   return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
                     getFreshSessionHandoff,
                     runId: run.id,
@@ -26442,7 +26476,10 @@ export function heartbeatService(
                         issueId,
                       );
                     },
-                    onProviderStopped: collectStoppedInstructions,
+                    onProviderStopped: async () => {
+                      remoteProviderStopped = true;
+                      await collectStoppedInstructions();
+                    },
                     onDispatch: markDispatchStarted,
                     signal: executionControl.controller.signal,
                     ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
@@ -28153,6 +28190,35 @@ export function heartbeatService(
                 );
               },
             );
+          }
+          if (
+            remoteRunTempLocation &&
+            latestRun &&
+            isHeartbeatRunTerminalStatus(latestRun.status)
+          ) {
+            // Without proof that the remote process stopped, the directory
+            // stays for the SSH run directory reaper; a sandbox keeps it until
+            // the sandbox goes away. No dispatched adapter means no process.
+            const remoteTempCleanup = await cleanupHeartbeatRemoteRunTemp({
+              location: remoteRunTempLocation,
+              stopProven:
+                remoteProviderStopped ||
+                !(legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld),
+            }).catch((err) => {
+              logger.warn(
+                { err, runId: run.id },
+                "failed to remove the remote run temp directory",
+              );
+              return null;
+            });
+            if (remoteTempCleanup === "stop_unproven" || remoteTempCleanup === "symlink") {
+              logger.warn(
+                { runId: run.id, reason: remoteTempCleanup },
+                remoteTempCleanup === "symlink"
+                  ? "kept the remote run temp directory: a link or a file replaced a directory in its path"
+                  : "kept the remote run temp directory: nothing proves the remote process stopped",
+              );
+            }
           }
           // A retained or unverified process stays above this release boundary.
           // If no stopped-copy capture occurred, preserve an explicit loss report.

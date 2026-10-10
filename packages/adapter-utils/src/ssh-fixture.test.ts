@@ -28,6 +28,11 @@ import {
   SSH_RUN_RESTORED_MARKER,
   sshRunDirectory,
 } from "./remote-managed-runtime.js";
+import {
+  cleanupRemoteRunTempDirectory,
+  prepareRemoteRunTempDirectory,
+  type AdapterExecutionTarget,
+} from "./execution-target.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 const execFileAsync = promisify(execFile);
@@ -2003,4 +2008,105 @@ describe("SSH run directory reaper path swaps", () => {
     const spec = { host: "ssh.invalid", port: 22, username: "paperclip", remoteWorkspacePath: "/tmp", remoteCwd: "/tmp", privateKey: "x", knownHosts: "x", strictHostKeyChecking: true } as never;
     await expect(reapSshRunDirectory({ spec, remoteRoot: "/tmp", runId: randomUUID() })).rejects.toThrow(/not deep enough|too shallow/);
   });
+});
+
+// A run's TMPDIR is runs/<runId>/tmp. The heartbeat makes it before the
+// adapter prepares runs/<runId>/workspace beside it.
+describe("SSH run temp directory", () => {
+  afterEach(drainFixtureTeardowns);
+  afterAll(drainFixtureTeardowns);
+
+  async function startHost(label: string) {
+    const rootDir = await createFixtureRootDir();
+    const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), label);
+    if (!started) return null;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const target: AdapterExecutionTarget = { kind: "remote", transport: "ssh", remoteCwd: spec.remoteCwd, spec };
+    return { rootDir, spec, target };
+  }
+
+  // A run as the heartbeat and the adapter leave it: temp files in tmp/, the
+  // workspace prepared and restored beside it.
+  async function restoredRun(host: NonNullable<Awaited<ReturnType<typeof startHost>>>) {
+    const runId = randomUUID();
+    const localDir = path.join(host.rootDir, `local-${runId}`);
+    await mkdir(localDir);
+    await writeFile(path.join(localDir, "tracked.txt"), "base\n");
+    const tmp = await prepareRemoteRunTempDirectory({ runId, target: host.target }) ?? "";
+    expect(tmp).toBe(path.posix.join(sshRunDirectory(host.spec.remoteCwd, runId), "tmp"));
+    await writeFile(path.join(tmp, "f"), "scratch\n");
+    const prepared = await prepareRemoteManagedRuntime({ spec: host.spec, runId, adapterKey: "test-adapter", workspaceLocalDir: localDir });
+    await prepared.restoreWorkspace();
+    return { runId, localDir, tmp };
+  }
+
+  it("keeps temp files out of the workspace sync, and the reaper removes the run directory with them", async () => {
+    const host = await startHost("SSH run temp layout test");
+    if (!host) return;
+    const run = await restoredRun(host);
+
+    await expect(readFile(path.join(run.tmp, "f"), "utf8")).resolves.toBe("scratch\n");
+    expect((await readdir(run.localDir)).sort()).toEqual(["tracked.txt"]);
+    await expect(reapSshRunDirectory({ spec: host.spec, remoteRoot: host.spec.remoteCwd, runId: run.runId }))
+      .resolves.toMatchObject({ outcome: "removed" });
+    await expect(stat(sshRunDirectory(host.spec.remoteCwd, run.runId))).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("removes only the temp directory when the workspace is beside it", async () => {
+    const host = await startHost("SSH run temp cleanup test");
+    if (!host) return;
+    const run = await restoredRun(host);
+
+    await expect(cleanupRemoteRunTempDirectory({ runId: run.runId, target: host.target })).resolves.toBe("removed");
+
+    await expect(stat(run.tmp)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(path.join(path.dirname(run.tmp), "workspace", "tracked.txt"), "utf8")).resolves.toBe("base\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  // An agent can replace any directory in runs/<id>/tmp's path with a link.
+  // Neither call may follow it: the files it points at stay, nothing is created there.
+  it.each([
+    [".paperclip-runtime", ["runs", "<id>", "tmp"]],
+    [".paperclip-runtime/runs", ["<id>", "tmp"]],
+    [".paperclip-runtime/runs/<id>", ["tmp"]],
+  ])("changes nothing through a link that replaced %s", async (linked, below) => {
+    const host = await startHost(`SSH run temp link test (${linked})`);
+    if (!host) return;
+    const runId = randomUUID();
+    const named = (entry: string) => entry.replace("<id>", runId);
+    const outside = path.join(host.rootDir, "outside");
+    const canary = path.join(outside, ...below.map(named), "canary");
+    await mkdir(path.dirname(canary), { recursive: true });
+    await writeFile(canary, "keep\n");
+    const link = path.join(host.spec.remoteCwd, named(linked));
+    await mkdir(path.dirname(link), { recursive: true });
+    await symlink(outside, link);
+
+    await expect(cleanupRemoteRunTempDirectory({ runId, target: host.target })).resolves.toBe("symlink");
+    await expect(prepareRemoteRunTempDirectory({ runId, target: host.target })).rejects.toThrow("link");
+
+    await expect(readFile(canary, "utf8")).resolves.toBe("keep\n");
+    expect(await readdir(path.dirname(canary))).toEqual(["canary"]);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  // Root removes it whatever the parent's mode.
+  it.skipIf(process.getuid?.() === 0)("reports a temp directory it could not remove", async () => {
+    const host = await startHost("SSH run temp removal failure test");
+    if (!host) return;
+    const runId = randomUUID();
+    const tmp = await prepareRemoteRunTempDirectory({ runId, target: host.target }) ?? "";
+    await writeFile(path.join(tmp, "f"), "scratch\n");
+    const runDir = path.dirname(tmp);
+    await chmod(runDir, 0o555);
+    try {
+      await expect(cleanupRemoteRunTempDirectory({ runId, target: host.target }))
+        .rejects.toThrow("Could not remove the run temp directory");
+    } finally {
+      await chmod(runDir, 0o755);
+    }
+
+    await cleanupRemoteRunTempDirectory({ runId, target: host.target });
+    await expect(stat(runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 });

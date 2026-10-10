@@ -1,14 +1,26 @@
 # SSH run directory reaper
 
 Every SSH run works in its own `<remote root>/.paperclip-runtime/runs/<runId>`
-directory on the worker. The directory holds a full copy of the workspace, so
-finished runs fill the worker's disk if nothing removes them (519 directories,
-67 GB on 2026-10-08; about 35 runs and 17 GB an hour on one worker on
-2026-10-09). The reaper removes them for every worker and every terminal run
-status.
+directory on the worker. It holds a full copy of the workspace in `workspace/`
+and the run's `TMPDIR` in `tmp/`, so finished runs fill the worker's disk if
+nothing removes them (519 directories, 67 GB on 2026-10-08; about 35 runs and
+17 GB an hour on one worker on 2026-10-09). The reaper removes them for every
+worker and every terminal run status.
 
 ## When a directory is removed
 
+- **At the end of the run, `tmp/` only.** Before it releases the lease, the
+  heartbeat removes `tmp/`, and the run directory too when nothing else is left
+  in it (a run that never synced a workspace). It does so only when the adapter
+  proved that the run's remote process exited, or never started one. A
+  timeout or a dropped SSH channel proves nothing, since the process may still
+  use `tmp/`, so `tmp/` stays. Like the reaper, the removal resolves the root
+  once, enters each directory below it, refuses a link, and checks the
+  physical path, so a link an agent planted cannot redirect it; with a link in
+  the path it keeps `tmp/`. A root that is not absolute and normalized, or is
+  `/`, gets no `tmp/`. A `tmp/` left without a stop proof, after a failed
+  removal, or by a server that stopped first goes with the rest of the
+  directory as below, except the `tmp/`-only case under `not_git_backed`.
 - **On lease release.** When an ephemeral SSH lease releases, expires, or
   fails, and its run is `succeeded`, `failed`, `cancelled`, `interrupted`, or
   `timed_out`, the server removes `runs/<runId>`. The release does not wait for
@@ -35,7 +47,8 @@ run's work, so the reaper first saves what is local-only.
 Written to `refs/paperclip/preserved/<runId>/*` in the run's repository and
 bundled into `<remote root>/.paperclip-runtime/preserved/<runId>.bundle`. The
 bundle stores only objects after the commit the run started from, so it is
-small. Bundles older than 30 days are removed.
+small. Bundles older than 30 days are removed. Only git state in `workspace/`
+is saved; `tmp/` holds scratch files and is deleted with the directory.
 
 | Local-only state | Ref |
 | --- | --- |
@@ -60,7 +73,12 @@ Git runs with the repository's `core.fsmonitor` and hooks switched off.
 The directory stays, with a reason in the activity entry and in the lease's
 `metadata.sshRunDirectory`:
 
-- `not_git_backed`: no marker and not a git repository, so nothing can be saved.
+- `not_git_backed`: no marker and `workspace/` is missing or not a git
+  repository, so nothing can be saved. This includes a directory that holds only
+  `tmp/`, which a server that stops before the run ends leaves behind when the
+  run has no `workspace/` yet: the heartbeat makes `tmp/` before the workspace
+  sync, and an in-place run (`syncWorkspace: false`) never syncs one. The reaper
+  keeps such a directory.
 - `worktree_dirty`: an extra worktree has uncommitted work.
 - `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
   verify; or `.git` is a link or a file; or the start commit is unknown.
@@ -85,14 +103,15 @@ things keep true:
 1. **One builder, one segment.** `sshRunDirectory` is the only code that makes the
    path, and it throws for a run id that is not one plain path segment (empty,
    `.`, `..`, or containing `/` or NUL). Distinct ids never share a directory.
-2. **A run prepares only its own id on the target's root.** The heartbeat acquires
-   the run's lease with `heartbeatRunId: run.id`, builds the target from that
-   lease's `remoteCwd`, and gives the adapter `runId: run.id`. The other callers
-   of `prepareAdapterExecutionTargetRuntime` pass their own base
+2. **A run prepares only its own id on the target's root.** The heartbeat
+   acquires the run's lease with `heartbeatRunId: run.id`, builds the target from
+   that lease's `remoteCwd`, makes `runs/<run.id>/tmp` there, and gives the
+   adapter `runId: run.id`. The other callers of
+   `prepareAdapterExecutionTargetRuntime` pass their own base
    (`agent-files/<agent>/<run>`, which nests the run directory away from
-   `<root>/.paperclip-runtime/runs/`) or `syncWorkspace: false` (no run
-   directory). The reaper acts only on a lease whose run id is a UUID with a
-   finished `heartbeat_runs` row, and refuses any other id, such as the login
+   `<root>/.paperclip-runtime/runs/`) or `syncWorkspace: false` (that call makes
+   no run directory). The reaper acts only on a lease whose run id is a UUID with
+   a finished `heartbeat_runs` row, and refuses any other id, such as the login
    flows' `claude-login-<uuid>`.
 3. **Tests.** `remote-managed-runtime.test.ts` pins the builder,
    `ssh-run-directory-callers.test.ts` fails when a new file starts preparing a

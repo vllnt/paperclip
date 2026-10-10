@@ -38,8 +38,9 @@ const REMOTE_ADDITIONAL_SOURCE_HEAVY_DIR_EXCLUDES = [
 
 /**
  * A synced SSH run works in `<remoteRoot>/.paperclip-runtime/runs/<runId>/workspace`.
- * Nothing else writes under `runs/<runId>`, so that directory holds only the
- * run's own copy of the workspace.
+ * The only other entry is the run's temp directory `runs/<runId>/tmp` (its
+ * `TMPDIR`), so that directory holds only the run's own workspace copy and
+ * scratch files.
  *
  * This is the only place that builds the path, and the run id is one plain
  * path segment, so two run ids never share a directory. The reaper's claim
@@ -61,6 +62,16 @@ export function sshRunDirectory(remoteRoot: string, runId: string): string {
  * the directory.
  */
 export const SSH_RUN_RESTORED_MARKER = ".paperclip-restored";
+
+/**
+ * Whether a remote root may hold `.paperclip-runtime` directories that
+ * Paperclip deletes from: an absolute, normalized path other than `/`, with no
+ * trailing slash. An empty or relative root would resolve against the
+ * command's working directory.
+ */
+export function isNormalizedRemoteRoot(root: string): boolean {
+  return path.posix.isAbsolute(root) && root !== "/" && path.posix.normalize(root) === root && !root.endsWith("/");
+}
 
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -85,7 +96,7 @@ export async function removeRestoredSshRunDirectory(input: {
     throw new Error("Refusing to remove an SSH run directory for a run id that is not a UUID.");
   }
   const root = input.remoteRoot;
-  if (!path.posix.isAbsolute(root) || root === "/" || path.posix.normalize(root) !== root || root.endsWith("/")) {
+  if (!isNormalizedRemoteRoot(root)) {
     throw new Error("Refusing to remove an SSH run directory under a root that is not a normalized absolute path.");
   }
   const runtimeDir = path.posix.join(root, ".paperclip-runtime");
@@ -176,7 +187,7 @@ export async function reapSshRunDirectory(input: {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
   }
   const root = input.remoteRoot;
-  if (!path.posix.isAbsolute(root) || root === "/" || path.posix.normalize(root) !== root || root.endsWith("/")) {
+  if (!isNormalizedRemoteRoot(root)) {
     throw new Error("Refusing to reap an SSH run directory under a root that is not a normalized absolute path.");
   }
   // `/tmp` or `/home` is a place many things live, not a runtime base.
