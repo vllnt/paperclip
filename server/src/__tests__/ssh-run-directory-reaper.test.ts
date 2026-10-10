@@ -294,6 +294,26 @@ describeReaper("SSH run directory reaper", () => {
     expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "removed" } });
   });
 
+  it("checks a directory kept for an outside worktree again even past the 14-day look-back", async () => {
+    const run = await startRun({ status: "failed" });
+    // The outside worktree is gone by now; the lease is three weeks old.
+    await db.update(environmentLeases).set({
+      status: "released",
+      releasedAt: new Date(Date.now() - 21 * 24 * HOUR_MS),
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+        sshRunDirectory: {
+          state: "kept", reason: "external_worktree", externalWorktree: "/gone", at: new Date(Date.now() - 48 * HOUR_MS).toISOString(),
+          trigger: "sweep", bytes: 0,
+        },
+      })}::jsonb`,
+    }).where(eq(environmentLeases.id, run.leaseId));
+
+    await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+    expect(await exists(run.runDir)).toBe(false);
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "removed" } });
+  });
+
   it("saves the uncommitted work of an extra worktree into the bundle, then deletes the directory", async () => {
     const run = await startRun({ status: "interrupted" });
     const tree = path.join(run.runDir, "wt-agent");

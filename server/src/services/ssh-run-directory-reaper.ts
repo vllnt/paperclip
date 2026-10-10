@@ -573,7 +573,10 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: SshRunDirec
             isNotNull(environmentLeases.heartbeatRunId),
             isNotNull(environmentLeases.environmentId),
             sql`${environmentLeases.metadata} ->> 'remoteCwd' is not null`,
-            sql`${finishedAt} > ${new Date(now.getTime() - SWEEP_LOOKBACK_MS).toISOString()}::timestamptz`,
+            // A directory kept for an outside worktree is checked again however
+            // old its lease is, so it goes once that worktree does.
+            sql`(${finishedAt} > ${new Date(now.getTime() - SWEEP_LOOKBACK_MS).toISOString()}::timestamptz
+              or (${decision} ->> 'state' = 'kept' and ${decision} ->> 'reason' = 'external_worktree'))`,
             sql`(${decision} is null
               or (${decision} ->> 'reason' = 'rm_failed' and coalesce((${decision} ->> 'attempts')::int, 0) < ${MAX_REMOVAL_ATTEMPTS})
               or ${keptPastWindow(now)}

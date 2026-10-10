@@ -192,6 +192,28 @@ describe("reapSshRunDirectory and a worktree outside the run directory", () => {
     await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "external_worktree" });
   });
 
+  it.each([
+    ["a sibling whose name starts with the run directory's", (run: { runDir: string }) => `${run.runDir}-sibling`],
+    ["a folder whose name has a backslash", (run: { root: string }) => path.join(run.root, "wt\\c")],
+  ])("keeps it for %s", async (_label, where) => {
+    const run = await finishedRun();
+    const tree = where(run as { root: string; runDir: string });
+    await git(run.workspace, ["worktree", "add", "-q", "-b", "agent/edge", tree]);
+
+    await expect(run.reap()).resolves.toMatchObject({
+      outcome: "kept", reason: "external_worktree", externalWorktree: await realpath(tree),
+    });
+  });
+
+  it("keeps it when git records the worktree with a relative path", async () => {
+    const run = await finishedRun();
+    const tree = path.join(run.root, ".paperclip-runtime", "wt-relative");
+    // Git 2.48 and later write a relative gitdir with this setting; older git ignores it.
+    await git(run.workspace, ["-c", "worktree.useRelativePaths=true", "worktree", "add", "-q", "-b", "agent/relative", tree]);
+
+    await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "external_worktree" });
+  });
+
   it("removes the run directory once the outside worktree is gone", async () => {
     const run = await finishedRun();
     const tree = await outsideWorktree(run);

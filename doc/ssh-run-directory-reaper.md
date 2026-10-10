@@ -95,8 +95,9 @@ leases:list`:
   repository, so the directory stays, with the folder's path in
   `externalWorktree`. This applies to restored runs too. The reaper reads git's
   registration files (`workspace/.git/worktrees/*/gitdir`) and runs no git in
-  the folder. After each keep window it looks again, and removes the run
-  directory once the folder is gone. It never removes the folder itself.
+  the folder. After each keep window it looks again, also past the sweep's
+  14-day look-back, and removes the run directory once the folder is gone. It
+  never removes the folder itself.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
 - `root_mismatch`: the root recorded on the lease is not the root the environment
   is configured with now (or the lease did not record that root), or it is too

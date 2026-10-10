@@ -242,7 +242,7 @@ export async function reapSshRunDirectory(input: {
     '  case "$p" in /*) ;; *) p="${gd%/gitdir}/$p" ;; esac',
     '  [ -e "$p" ] || continue',
     '  d=$(cd "${p%/.git}" 2>/dev/null && pwd -P) || continue',
-    '  case "$d/" in "$here/"*) ;; *) echo "external $d"; keep external_worktree ;; esac',
+    '  case "$d/" in "$here/"*) ;; *) printf "external %s\\n" "$d"; keep external_worktree ;; esac',
     "done",
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
     'had_marker=0; git_backed=0',
