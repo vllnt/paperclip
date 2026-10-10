@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,7 +16,11 @@ const RUN_ID = "11111111-2222-4333-8444-555555555555";
 const roots: string[] = [];
 
 afterEach(async () => {
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) {
+    // A test may leave read-only trees behind.
+    spawnSync("chmod", ["-R", "u+rwx", root]);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 // A sandbox whose commands run on this host, with `remoteCwd` as its working directory.
@@ -79,6 +83,37 @@ describe("prepareRemoteRunTempDirectory and cleanupRemoteRunTempDirectory", () =
     expect(existsSync(other ?? "")).toBe(true);
     // A second cleanup, as a replayed teardown, is harmless.
     await cleanupRemoteRunTempDirectory({ runId: RUN_ID, target });
+  });
+
+  // Root removes them without the grant.
+  it.skipIf(process.getuid?.() === 0)("removes read-only trees in the run's directory", async () => {
+    const { target } = await localSandbox();
+    const dir = await prepareRemoteRunTempDirectory({ runId: RUN_ID, target });
+    // A Go module cache, for example, is read-only.
+    const cache = path.join(dir ?? "", "modcache");
+    await mkdir(path.join(cache, "sealed"), { recursive: true });
+    await writeFile(path.join(cache, "sealed", "inner.txt"), "x");
+    await chmod(path.join(cache, "sealed"), 0o000);
+    await chmod(cache, 0o555);
+
+    await cleanupRemoteRunTempDirectory({ runId: RUN_ID, target });
+
+    expect(existsSync(dir ?? "")).toBe(false);
+  });
+
+  it("changes no mode through a link that replaced the run's directory", async () => {
+    const { root, target } = await localSandbox();
+    const dir = await prepareRemoteRunTempDirectory({ runId: RUN_ID, target }) ?? "";
+    const outside = path.join(root, "outside");
+    await mkdir(path.join(outside, "sealed"), { recursive: true });
+    await chmod(path.join(outside, "sealed"), 0o500);
+    await rm(dir, { recursive: true });
+    await symlink(outside, dir);
+
+    await cleanupRemoteRunTempDirectory({ runId: RUN_ID, target });
+
+    expect(existsSync(dir)).toBe(false);
+    expect((await stat(path.join(outside, "sealed"))).mode & 0o777).toBe(0o500);
   });
 
   it("does nothing for a local run", async () => {
