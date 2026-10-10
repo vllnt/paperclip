@@ -330,7 +330,14 @@ One row per company: `company_id` (primary key), `enabled` (the company kill swi
 
 1. **The instance experimental flag `enableFlowWatchdog` is on** (default off). It is
    read once at the top of each pass, with the same accessor as the other experimental
-   flags (`instanceSettingsService(db).getExperimental()`). When off, the pass returns
+   flags (`instanceSettingsService(db).getExperimental()`, `instance-settings.ts:528`).
+   Adding the flag means registering it in each place that `enableAgentChat` is: the type
+   (`packages/shared/src/types/instance.ts:81`), the validator with a default
+   (`validators/instance.ts:60`), the feature catalog with a title, description, tier and
+   defaults (`feature-catalog.ts:148`, enforced by `feature-catalog.test.ts`), the
+   normalizer and the defaults (`instance-settings.ts:240-264`, `284-308`), the settings
+   page toggle (`ui/src/pages/InstanceExperimentalSettings.tsx`) and its test. The CLI
+   reaches the flag through the generic `settings:experimental` commands When off, the pass returns
    at once: no claim, no evaluation, no recovery retry, no issue, no wake.
 2. **The company has a settings row with `enabled = true`.** A missing row means off.
 3. **The rule is enabled and not archived.**
@@ -352,12 +359,21 @@ Whether the `issues` table gets a partial unique index for the origin kind is Q1
 
 ## 6. Evaluation
 
-### 6.1 The shared stall module: one definition, used by #105 and by this plan
+### 6.1 The shared stall module: one path, one owner, built first by #105 R1
 
-A new module (for example `flow-stall.ts`) holds the parts that #105 (routine
-stale-tick expiry) and rule (a) both need. **These parts are defined here, once.** #105
-refers to this section and does not repeat them. The module has three parts:
+The module is **`server/src/services/flow-stall.ts`**. It holds the parts that #105
+(routine stale-tick expiry) and rule (a) both need. **These parts are defined here,
+once.** #105 refers to this section and does not repeat them. The module has three parts:
 the exemption set (6.1.1), the progress clock (6.1.2) and the atomic close step (6.1.3).
+
+**Owner and order.** **#105's R1 builds `flow-stall.ts` first**, because the pile-up of
+open routine copies is live in production. #113's S1 then **reuses** it and adds the
+watchdog parts. S1 never makes a second copy. If S1 needs a change in the module, it
+changes that same file, with a test. Both plans and both pull request bodies name this
+path. The exported API is:
+`stallExemption(issue, now)`, `stallClock(issue, now)` and
+`closeStalledIssue(input)`. The compare-and-set in `issueService.update` and the writer
+audit test (6.1.3) are part of the same first slice.
 
 #104's reconciler is left alone. Moving it onto this module is a later cleanup.
 
@@ -370,17 +386,17 @@ a waiting state. The list is long on purpose: a false close costs more than a la
 | Exemption | Signal on `main` | Used by |
 |---|---|---|
 | An armed issue monitor or wait | `issues.monitor_next_check_at` is not null | both |
-| An open recovery action of any owner | `issue_recovery_actions` with status `active` or `escalated` (the feed lists the user and board owned ones) | both |
+| An open recovery action of any owner | `issue_recovery_actions` with status `active` or `escalated`. **The feed reader lists only user and board owned ones** (`attention.ts:1440`, `HUMAN_RECOVERY_OWNER_TYPES`), so the stall module has its own query for "any owner"; an agent-owned action is also a live recovery path | both |
 | A held scope: the routine is paused, or its project, company or assignee agent is paused; an assignee agent in `error` | `routines.status`, `projects.paused_at`, `companies.paused_at`, `agents.paused_at`, `agents.status = 'error'`; and the holds of #102 once they exist | both |
 | An issue-tree hold | the tree-hold check that automatic recovery already uses | both |
 | **A pending interaction** of any kind | `issue_thread_interactions.status = 'pending'` | both |
-| **A pending linked approval** | `issue_approvals` joined to `approvals` with `approvals.status = 'pending'`, both company-scoped | both |
+| **A pending linked approval** | `issue_approvals` joined to `approvals` with `approvals.status = 'pending'`, both company-scoped. The feed shows an approval on its first linked issue only; the stall module exempts **every** linked issue, which is the safe side | both |
 | **An open decision about the issue** | `decisions.status = 'open'` and `decisions.origin_issue_id` is the issue (feed source `decision`) | both |
 | **A blocker that needs a person** | the issue is `blocked` with a human-owned `unblockDescriptor`, or it is a terminal blocker with a non-live blocker-attention state (feed source `blocker_attention`) | both |
 | **An issue owned by a person** | `issues.assignee_user_id` is set. A user-assigned `in_review` issue is the case the feed lists | both |
 | **A review that needs a person** | `in_review` with a pending human participant, or a **stalled review with no maintained path** (feed source `review`). The feed already shows the stalled review to the board, so closing it would hide it | both |
 | A failed run whose bounded retry is exhausted | the feed source `failed_run` (a person must decide) | both |
-| The assignee is over budget | the budget hard-stop check that wake dispatch already uses (feed source `budget_alert`) | both |
+| The assignee is over budget | the budget hard-stop check that wake dispatch already uses. The feed source `budget_alert` is scope level (a budget incident) and lists a hard incident, or a soft one at 85% of the limit; the issue exemption follows the hard stop only | both |
 | An unresolved dependency | the issue is blocked by an open issue (`listDependencyReadiness`) | both |
 | A deferred or queued wake waits for the issue | `agent_wakeup_requests` in `deferred_issue_execution` or `queued` for the issue | both |
 | An active task watchdog watches the issue | `issue_watchdogs` with status `active` | rule (a) only |
@@ -395,7 +411,7 @@ a waiting state. The list is long on purpose: a false close costs more than a la
    their predicates. A change to a reader reaches the stall module with no edit here.
 2. **A compile-time table.** The stall module holds
    `Record<AttentionSourceKind, StallExemption | "not_issue_scoped">`.
-   `ATTENTION_SOURCE_KINDS` is an exported tuple in `packages/shared`, so a new feed
+   `ATTENTION_SOURCE_KINDS` is an exported tuple in `packages/shared` (`types/attention.ts:8-21`; the service holds a second array of the same name at `attention.ts:69`, and the stall module uses the shared one), so a new feed
    source makes this table fail to compile until someone decides how it is handled. The
    mapping today: `approval` and `issue_thread_interaction` and `decision` and
    `recovery_action` and `blocker_attention` and `review` and `failed_run` and
@@ -442,28 +458,62 @@ application clock.
   action. A smaller jump can close early by at most 5 minutes, and the close is visible
   and recoverable (the next tick or evaluation recreates the work).
 
-#### 6.1.3 The atomic close step (choice A: the row lock and a value compare)
+#### 6.1.3 The atomic close step (choice B: the row lock and a compare-and-set on `status_version`)
 
 `closeStalledIssue({ companyId, issueId, binding, observed, targetStatus, reason,
 source })` closes one issue so that no wake can be promoted onto it afterwards.
 #105 uses it with `targetStatus = cancelled`. This plan's `auto_close` (section 7.3)
-uses it with `done` or `cancelled`. #103 may cite this section for its own locked step.
+uses it with `done` or `cancelled`.
 
-**The choice.** `main` has no status compare-and-set, so this plan does not use one.
-`issues.status_version` is **not** a status version: the issue service bumps it only
-when the assignee changes and when `blocked` is asserted again
-(`issues.ts:11025-11047`), and the service write has no expected-version argument.
-A same-owner status change leaves it unchanged. So the step does **not** read or
-write `status_version`. It takes the issue row lock and compares **values**.
-(The alternative, a real compare-and-set with a bump at every status writer, is
-recorded in section 11 and is not needed.)
+**The version, and what `main` has.** Migration `0227_modern_pandemic.sql:146-158`
+creates the function `paperclip_bump_issue_status_version()` and the trigger
+`paperclip_issue_status_version_trigger` (`BEFORE UPDATE OF status ON issues`, for each
+row). When `status` changes to a new value, it sets `status_version := old + 1`. No
+later migration drops it, and `packages/db/src/client.test.ts:1895-1940` asserts that it
+exists after a migration replay. So **every update that changes `status` bumps the
+version, whatever code issues it**, including writers that bypass the issue service. The
+application also bumps it for an assignee change and for a repeated `blocked` assertion
+(`issues.ts:11025-11047`), in `settleConversationTurn` (`agent-conversations.ts:375`),
+and through the native status-decision effect `increment_status_version`
+(`status-decision-committer.ts:1214-1226`). So it is a "status or assignment changed"
+counter. An extra bump only makes a compare refuse, never pass wrongly.
 
-**What `observed` is.** The values the evaluation or the preview saw when it decided:
-`{ status, assigneeAgentId, assigneeUserId, executionRunId, checkoutRunId,
-monitorNextCheckAt, updatedAt }`. The API returns it as an opaque `observedToken`
-(a digest of these values). A person's manual call sends the token that the preview
-showed. Values are compared, not counted, so a change that goes A, B, A is harmless:
-the decision depends on the values.
+**What `main` lacks** is a writer that does the compare. Nothing runs
+`… WHERE status_version = :seen`, and `issueService.update` takes no expected version
+(`issues.ts:10654-10689`). The shared module slice adds it. It needs **no migration**.
+(An earlier draft of this plan said that `status_version` is not a status version. That
+was wrong: it read the application code and missed the trigger.)
+
+**The compare-and-set, built in the shared module slice.**
+
+1. `issueService.update` accepts an optional `expectedStatusVersion`. In `runUpdate`,
+   after the `SELECT … FOR UPDATE` (`issues.ts:10981`), if the argument is given and the
+   locked row's `status_version` differs, the update throws a conflict (`stale_view`) and
+   writes nothing. A caller that omits the argument sees no change.
+2. `closeStalledIssue` does the same compare itself, in its own transaction, because it
+   needs the lock and the other checks around the write.
+
+**What `observed` is.** The values that the evaluation or the preview saw:
+`{ statusVersion, assigneeAgentId, assigneeUserId, executionRunId, checkoutRunId,
+monitorNextCheckAt }`. The version covers the status. The other fields are compared by
+value, because some writers change them without a bump (for example `access.ts` writes
+assignee fields only). The API returns `observed` as an opaque `observedToken`, and a
+person's manual call sends the token that the preview showed. A status that goes A, B, A
+bumps the version twice, so the compare refuses: that is the safe direction.
+
+**The lock, and the one shared helper.** The row lock must still be held when the compare
+runs, and the execution columns must still hold what the decision saw.
+`withIssueExecutionLock` does not give that: it takes the lock and then **clears
+`execution_run_id`, `execution_locked_at` and `checkout_run_id`** before it calls its
+callback (`wake-queue/adapters/postgres.ts:1171-1232`, the two updates after the lock).
+So "take the issue lock first" through that helper does not keep what the close needs to
+compare. There is **one lock-preserving, transaction-aware variant** of that helper.
+**#103's plan (D1) owns its name, path and API, and no other plan defines or names
+them.** The slice that needs it first implements it exactly to #103's spec: that is
+#103 D1, or #105 R1 if R1 is ready earlier. The others reuse it unchanged. A change to it
+goes through #103's plan. This plan, #105 and #113 S1 add no second variant and no copy,
+and no slice waits for another slice's code only for this helper. Until #103's plan
+defines it, the close step cannot be built, which is a dependency on the spec.
 
 **The race it closes.** The heartbeat cancel ends a run and then runs
 `releaseIssueExecutionAndPromote`, which takes the issue's row lock **under its own,
@@ -471,100 +521,114 @@ later transaction** and promotes the oldest deferred wake to a run. If the issue
 still open at that moment, the promoted run attaches to an issue that is about to be
 cancelled. A check made before the cancel does not prevent that.
 
-**The fix is an order, and a value compare under the lock.** The issue is closed
+**The fix is an order, and a compare-and-set under the lock.** The issue is closed
 first, under the row lock that promotion also takes. A promotion that comes later sees
 a terminal issue and drops the wake. In order:
 
 1. **Lock.** In one database transaction, take the routine row lock if the caller is a
-   dispatch (dispatch already holds it), and then the issue row `FOR UPDATE`, with any
-   issue that references the same live runs, in id order. This is the lock that
-   `withIssueExecutionLock` takes. The order is routine, then issue, then run, the same
-   as the existing paths, so it cannot deadlock with them.
+   dispatch (dispatch already holds it), and then the issue row `FOR UPDATE` (with any
+   issue that references the same live runs, in id order) through the lock-preserving
+   variant above. The order is routine, then issue, then run, the same as the existing
+   paths, so it cannot deadlock with them.
 2. **Re-validate under the lock.** All of these must hold, or the transaction rolls back
    and the caller does what it did before (a skipped or coalesced tick, or a 409):
    - the **binding** predicate that the caller passed (for #105: the issue is the
-     routine's current blocker; section 3.6 of #105);
-   - the locked row's values **equal `observed`** (fail closed: any difference aborts);
+     routine's current blocker, section 3.6 of #105);
+   - **`status_version` equals `observed.statusVersion`**, and the other `observed`
+     values equal the locked row (fail closed: any difference aborts);
    - no run of the issue is `running`;
    - `stallExemption` returns `null`, evaluated now, **under the lock**;
    - the clock decision (6.1.2) holds, and the skew guard passes.
 3. **Close, in the same transaction:**
-   - set the issue to `targetStatus` through the issue service, passing the transaction;
+   - set the issue to `targetStatus` through the issue service, passing the transaction
+     and `expectedStatusVersion`;
    - cancel every `deferred_issue_execution` wake of the issue, with the reason code;
    - add the system comment;
    - end the originating record (for #105, the routine run, through the existing
      run-status sync, which must accept the transaction);
    - write the activity entry.
 4. **Commit.** From this point the issue is terminal.
-5. **Cancel the remaining runs, after the commit,** with the heartbeat cancel
-   (`queued`, `scheduled_retry`, and any run that started in the short window since step
-   2). Each cancel calls `releaseIssueExecutionAndPromote`. It finds a terminal issue
-   and promotes nothing: `promoteDeferredWake` cancels a deferred wake for a terminal
-   issue and its assignee, the scheduled-retry gate returns `issue_cancelled`, and
-   `decideQueuedRunStaleness` cancels a queued run on a terminal issue. The cancel
-   passes `suppressImmediateRecovery` so that no recovery run follows.
+5. **Deal with the remaining runs, after the commit.**
+   - A `queued` run goes through the **existing staleness decision**
+     (`cancelStaleQueuedRun`), which cancels a queued run on a terminal issue and
+     **keeps one that carries a wake comment or a resume intent**
+     (`run-dispatch/domain/policy.ts:610-625`). A kept run starts through the normal
+     queue and is retried like any queued run. No sweep removes it. It reads the
+     comment, and it cannot revive a cancelled issue unless it carries a reopen intent.
+   - A `scheduled_retry` run is refused at promotion by the retry gate
+     (`issue_cancelled`, `policy.ts:382-389`). The step also cancels it with the
+     heartbeat cancel.
+   - A run that started in the short window since step 2 is cancelled with the heartbeat
+     cancel, unless it carries a wake comment or a resume intent. The cancel passes
+     `suppressImmediateRecovery`.
+   - Each cancel calls `releaseIssueExecutionAndPromote`. It finds a terminal issue and
+     promotes nothing: `promoteDeferredWake` cancels a deferred wake for a terminal issue
+     and its assignee.
 
-**Why a writer that does not take the lock cannot fool the compare.** A row update takes
-a row-level write lock until its transaction ends. So an update that commits before the
-close takes its lock is visible in step 2 and fails the compare, and an update that
-starts after the close has taken the lock waits for the close to commit. Inserts into
-the tables that the exemptions read (`issue_approvals`, `issue_thread_interactions`,
-`issue_recovery_actions`, `issue_comments`) all have a foreign key to `issues`. Such an
-insert takes a `KEY SHARE` lock on the issue row, and `FOR UPDATE` conflicts with it.
-So an approval or interaction that is created while the close holds the lock waits,
-and one that was committed before is seen by the exemption check. S0 proves both with
-race tests.
+**Why a writer that does not take the lock cannot fool the compare.** The trigger bumps
+`status_version` for every status write, so a status change committed before the close
+takes its lock is seen in step 2, whichever writer made it. A row update takes a row-level
+write lock until its transaction ends, so an update that starts after the close has taken
+the lock waits for the close to commit. Inserts into the tables that the exemptions read
+(`issue_approvals`, `issue_thread_interactions`, `issue_recovery_actions`,
+`issue_comments`, `decisions`) all have a foreign key to `issues`. Such an insert takes a
+`KEY SHARE` lock on the issue row, and `FOR UPDATE` conflicts with it. So an approval or
+interaction that is created while the close holds the lock waits, and one that was
+committed before is seen by the exemption check. `agent_wakeup_requests` and
+`heartbeat_runs` have no foreign key to issues: only the explicit locks protect them,
+which is why step 3 cancels the deferred wakes inside the transaction and step 5 uses the
+existing staleness decision. S1 proves these with race tests.
 
-**The one real hazard: a writer that reads without the lock and writes after the close.**
-Such a writer decided on a row it read earlier, and its update lands after the commit.
-It could move a `cancelled` issue to another status. This hazard exists today for every
-cancel, an operator's included. It is not made worse here, and the list below is the
-audit that S0 starts with.
+**The one hazard that remains: a writer that decides from an old read and writes after
+the close.** Its update lands after the commit and could move a closed issue to another
+status. This hazard exists today for every cancel, an operator's included. The compare
+removes it for callers that pass `expectedStatusVersion`. For the others, the list below
+is the audit.
 
-**Writers of the compared fields.** Found by reading `main` at `d9804ac4f`. The list is
-a **lower bound**: the scan finds a status write only when `status:` appears in the
-`set` object, so a writer that passes a variable is missed. S0 begins with an exhaustive
-audit and a test (below).
+**Writers of the compared fields.** Found by reading `main` at `d9804ac4f`, and checked
+by a second reader. The list is a **lower bound**: a scan finds a status write only when
+`status:` is in the `set` object. The shared module slice begins with an exhaustive audit
+and a source test (below).
 
-| Writer | Fields it changes | Row lock |
+| Writer | Fields it changes | Row lock on `issues` |
 |---|---|---|
-| `issueService.update` (`issues.ts:10654`, lock at `10981`) | status, assignee, and the rest | **Yes**: `SELECT … FOR UPDATE` at the start of the write transaction |
-| `issueService.release`, `checkout` (`issues.ts:11531`, `11905`) | assignee, status, execution and checkout locks | `release`: in the same function as the lock (verify in the S1 audit). `checkout`: the write has its own status predicate (verify) |
-| Execution claim and release (`heartbeat.ts` `lockIssueExecutionClaim`; `wake-queue` `withIssueExecutionLock`, `postgres.ts:1171`) | `execution_run_id`, `execution_locked_at` | **Yes**: `FOR UPDATE` on the issue rows |
-| Execution-recovery settle (`execution-recovery-resolution.ts:487`) | status `blocked`, locks | **Yes**: the task row is locked `FOR UPDATE` in the same transaction |
-| Slack conversation resume (`slack-conversation-state.ts:48`) | status `todo` | **Yes** by its own comment: it runs while the admission transaction owns the issue lock |
-| Pre-dispatch block (`heartbeat.ts:30215`) | status `blocked`, clears the locks | **No lock seen** in the code read. **S1 prerequisite** |
-| Conversation reactivation (`agent-conversations.ts:259`) | `conversation_state`, status `in_progress` | **No lock seen.** Conversation issues are excluded from the close (below) |
-| Slack conversation wait (`slack-conversation-lifecycle.ts:91`) | status `in_review` | **No lock seen.** Conversation issues are excluded from the close (below) |
-| Member archive (`access.ts:696`, `708`) | status | Locked in scope by a text scan; verify |
-| Monitor claim, trigger and clear (`heartbeat.ts:11927`, `12153`, `12189`) | the monitor columns and execution state, not `status` | No lock seen. The monitor column is an exemption that is re-read under the close lock |
+| `issueService.update` (`issues.ts:10654`) | status, assignee, and the rest | **Yes**, at `10981` in `runUpdate`. **But** `existing` is read earlier without a lock (`:10685`), `assertTransition` (`:305`) only rejects an unknown status, and the write has no status predicate. A caller that decided from an old read can overwrite a just-closed issue. The new `expectedStatusVersion` closes this for callers that pass it |
+| `issueService.release` (`issues.ts:11855-11905`) | assignee, locks | **Yes**, `select … for update` first. It keeps a terminal status |
+| `issueService.checkout` (`issues.ts:11531`, `11655`) | assignee, status `in_progress`, locks | The write has `status in expectedStatuses`. The caller supplies that list, and the validator allows any status, so it protects against an old read only when the caller leaves out the terminal ones |
+| Execution claim and release (`heartbeat.ts` `lockIssueExecutionClaim` at `18523`; `withIssueExecutionLock`, `postgres.ts:1171`) | `execution_run_id`, `execution_locked_at`, `checkout_run_id` | **Yes** |
+| Execution-recovery settle (`execution-recovery-resolution.ts:487`) | status `blocked`, locks | **Yes**, the task row, `:410-419` |
+| Pre-dispatch block (`heartbeat.ts:30215`) | status `blocked`, clears the locks | **Yes**: it is inside the admission transaction that runs `select id from issues … for update` at `:29160-29162` |
+| Slack conversation wait and resume (`slack-conversation-lifecycle.ts:91`, `slack-conversation-state.ts:48`) | status `in_review`, `todo` | **Yes**: `:21-22`, and by the comment at `:44`. A caller of `resumeSlackConversation` at `chat-channels.ts:16319` is not verified |
+| Conversation turns (`agent-conversations.ts:259`, `:371`) | `conversation_state`, status, `status_version` | **Yes**: `:128-132` and `:291-296` |
+| Member archive (`access.ts:696`, `708`) | status, assignee | The lock at `:680` is on the membership row, not on `issues`. Both updates carry `status not in ('done','cancelled')` (`:688-692`), so they cannot move a closed issue |
+| Tree-hold release (`issue-tree-control.ts:981`) | restores `cancelled` issues to their snapshot status | **No lock seen.** It restores by design. S1 audit decides whether a close by this module can be undone by a release, and records the answer |
+| Monitor claim, trigger and clear (`heartbeat.ts:11927`, `12153`, `12189`) | the monitor columns and execution state, not `status` | The monitor column is an exemption that is re-read under the close lock |
+| `cli/src/commands/worktree.ts:1334` | status | A local seeding command, not server runtime |
 
-**S0 prerequisites from this audit (each with its own test):**
+**Prerequisites from this audit, built in the shared module slice (#105 R1), each with its
+own test:**
 
-1. **No unlocked writer may overwrite a terminal status.** Each writer in the table
-   without a lock gets `status not in ('done', 'cancelled')` in its `WHERE` predicate
-   (the minimal change), or takes the row lock. This removes the hazard above for the
-   writers found. It touches `heartbeat.ts` (heartbeat core), so it is a single, with
-   its own review.
+1. **The compare-and-set** (above): `issueService.update` with `expectedStatusVersion`,
+   and the compare inside `closeStalledIssue`. Tests: a status change made by a writer
+   that bypasses the service between the preview and the close makes the close refuse
+   (the trigger bumped the version); an A, B, A status change refuses; a mismatch in
+   `update` is a conflict and writes nothing.
 2. **The audit is a test.** A source test lists the known direct writers of `issues.status`
    by file and function. A new unlisted writer fails the test and forces a decision.
 3. **Conversation issues are never closed by this module.** An issue with a
    `conversation_agent_id`, or with the origin kind `chat_channel`, is an exemption
-   (added to the set in 6.1.1). The issue service already refuses `done` and `cancelled`
-   for a conversation issue.
+   (6.1.1). The issue service already refuses `done` and `cancelled` for a conversation
+   issue.
 
 **Why the run cancel stays outside the transaction.** The heartbeat cancel is not a
 plain status update. It fences native sessions, records the cancellation, and stops
-processes. A queued run has no process, but the same code path handles it, and the plan
-keeps one path. The order above makes this safe: the issue is already terminal.
+processes. The order above makes this safe: the issue is already terminal.
 
 **What can still revive the issue.** `promoteDeferredWake` reopens a terminal issue for
 a wake that carries a human comment or an explicit resume intent. That is a person
 acting after the close, which is allowed. It is not a leak: it is a new, visible event.
-A queued run that carries a wake comment or a resume intent is not cancelled by the
-staleness check, for the same reason.
 
-**Tests (S0 of this plan, R1 of #105), on embedded Postgres:**
+**Tests (the shared module slice, #105 R1), on embedded Postgres:**
 
 - a wake deferred before the close is cancelled, not promoted, and no run is attached to
   the closed issue;
@@ -572,19 +636,15 @@ staleness check, for the same reason.
   terminal issue;
 - an interleaving test: the heartbeat cancel of a run races the close; the end state is
   one terminal issue and no live run on it;
-- **the value compare:** a status change made by a non-service writer after the
-  preview makes the close refuse, although `status_version` is unchanged (the case that
-  the old contract missed);
-- **an A, B, A change** of the status between the preview and the close does not make
-  the close refuse, and it re-checks the exemptions;
+- the compare-and-set tests of prerequisite 1;
+- **a queued run that carries a wake comment or a resume intent is kept** after the close
+  and starts through the normal queue; a queued run without one is cancelled;
 - an approval, an interaction and a recovery action inserted while the close holds the
   lock each wait for it (the foreign key lock), and a close never leaves a pending one
   unseen;
 - a run that turns `running` after the check: the transaction rolls back;
 - a pending approval, a pending interaction, and an `in_review` participant each
   prevent the close;
-- each writer in the table that gets the terminal-status predicate cannot move a
-  closed issue back;
 - the skew guard, a backward jump and a forward jump.
 
 ### 6.2 Holds are exemptions
@@ -916,8 +976,8 @@ The system actor is `flow-watchdog`. The entities are the rule, or the issue.
 
 | Slice | Content | Migration | Lane |
 |---|---|---|---|
-| **S0** | The audit prerequisites of section 6.1.3: a terminal-status guard in the unlocked status writers, the source test that lists the writers, and the conversation-issue exemption. The shared stall module and the atomic close step with their race tests | No | `heartbeat.ts` is touched (the pre-dispatch block writer), so a single |
-| **S1** | Three tables, the experimental flag and the kill switch. The evaluator framework (claim, bounds, firing reconcile, the recovery of pending actions, cap). Rule (a) and rule (d) `provider_errors`. The issue action. Dry run. API, CLI and web | Yes | Risky slot. It adds a scheduler step, creates issues and wakes agents |
+| **Shared module** (not a slice of this plan) | **Built first by #105 R1**: `server/src/services/flow-stall.ts`, the compare-and-set in `issueService.update`, the writer audit test and the conversation-issue exemption (section 6.1). It needs the lock-preserving variant that #103's plan (D1) defines | No | `heartbeat.ts` and the issue service are touched. A single |
+| **S1** | **Starts after the shared module has landed** (#105 R1). Three tables, the experimental flag and the kill switch. The evaluator framework (claim, bounds, firing reconcile, the recovery of pending actions, cap). Rule (a) and rule (d) `provider_errors`. The issue action. Dry run. API, CLI and web | Yes | Risky slot. It adds a scheduler step, creates issues and wakes agents |
 | **S2** | Rule (b) (sources `issue_done`, `external_object`, `work_product`), rule (c), rule (d) `failed_rate` (after #106's measure has landed), the routine action with the `requireActive` dispatch flag, agent read of open firings | No | The dispatch flag touches `routines.ts`. A single |
 | **S3** | The `plugin_event` source: one event table written at the plugin bus | Yes | Single. Only if S2 is not enough |
 | **Later** | Lane-health kinds (section 3.5). A hold action for rule (d) (section 9.4). XmR breach as a threshold. Moving #104's reconciler onto the shared stall module | Only for a new source table | |
@@ -929,9 +989,28 @@ steps one after another: the orphan reaper, `promoteDueScheduledRetries`,
 `resumeQueuedRuns` and the stranded-issue reconciliation (#104), the dependency-wake
 reconciliation, the task-watchdog reconciliation, the silent-active-run scan, and the
 stale-issue-lock sweep (`index.ts:1827-1873`). **The watchdog pass is the last step of
-that chain**, so in one process it sees the result of every sweep before it. It keeps its
-own per-rule claims. Across processes, the per-subject check under the issue lock covers
-what the order cannot.
+that chain**, so it sees the result of every sweep before it, when the chain reaches it.
+Three limits of the chain are stated here, because the pass inherits them:
+
+- **The chain stops at the first failing step.** A throw in an earlier step goes to the
+  single `.catch` (`index.ts:1871`), and the later steps, the watchdog pass included, are
+  skipped for that tick. (The #120 incident came from this: the claim error in
+  `resumeQueuedRuns` skipped the stale-lock sweep that would have cleared the cause.) The
+  watchdog pass therefore catches its own errors, and it does not rely on being reached
+  every tick.
+- **The interval callback has no in-flight guard** for this chain (`index.ts:1692`,
+  `1214`), so two ticks can overlap in one process. The per-rule claims (6.3) and the
+  per-subject lock re-check make an overlap safe. "In one process it sees every sweep
+  first" is a best effort and not a guarantee.
+- **The chain runs only when scheduling is not suppressed** (`index.ts:1712`). The
+  watchdog inherits that.
+
+**The startup chain is not extended.** A second chain runs once before the server listens
+(`index.ts:1500-1631`). The watchdog is not added to it. The first pass runs at the first
+periodic tick.
+
+It keeps its own per-rule claims. Across processes, the per-subject check under the issue
+lock covers what the order cannot.
 
 | Step in the chain | What it does | How rule (a) avoids racing it |
 |---|---|---|
@@ -946,11 +1025,11 @@ what the order cannot.
 
 ### 9.3 Tests per slice
 
-**S0**, on embedded Postgres: the audit source test; the terminal-status guard in each
-unlocked writer (a late writer cannot move a closed issue back); the conversation-issue
-exemption; the atomic close step and the exemption conformance test (section 6.1.3 and
-6.1.1); the clock source and the bounded hold-lift floor, including a routine edited
-every minute that still becomes stale (section 6.1.2).
+**The shared module (#105 R1)**, on embedded Postgres: the compare-and-set and its tests;
+the audit source test; the conversation-issue exemption; the atomic close step and the
+exemption conformance test (sections 6.1.3 and 6.1.1); the clock source and the bounded
+hold-lift floor, including a routine edited every minute that still becomes stale
+(section 6.1.2). #113's S1 re-runs none of these and adds its own tests on top.
 
 **S1**, on embedded Postgres:
 
@@ -1053,7 +1132,7 @@ that produced an action. The estimate must be redone with that number.
 | Dedup by title or by #40 duplicate detection | A title match can merge issues of two rules. Semantic matching is the wrong tool for a key we control |
 | Rely on the firing row's index alone, with no index on `issues` | It works, but `issues` already has narrow partial unique indexes for other origin kinds (`task_watchdog`, `harness_liveness_escalation`). The same index here guards any path that creates such an issue outside the firing transaction (Q12) |
 | A global advisory lock for the pass | One process evaluates everything. Per-rule claims scale with the rules and survive a crashed process |
-| A real compare-and-set on `status_version` (choice B for the close step) | It needs a bump at every status writer and an expected-version argument on the issue service write. There are direct writers outside the service. The value compare under the row lock gives the same guarantee for the close with no change to the locked writers (section 6.1.3) |
+| Compare values only, without the version (choice A) | It works under the row lock, but the trigger already gives a version for every status writer at no cost. A value compare cannot tell that a status went A, B, A, and cannot see a change by a writer that leaves the compared fields alone. The version plus a value compare of the other fields is stronger (section 6.1.3) |
 | Evaluate in the unclog agent | That is the cost this plan removes |
 | Create a new issue on every fire | A persistent clog would flood the board |
 
@@ -1063,7 +1142,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 
 | ID | Question | Recommendation |
 |---|---|---|
-| **Q1** | **For the reviewer.** Share the stall module with #105 and not with #102? | Yes. Define the exemption set, the progress clock and the atomic close step once, here (section 6.1), and have #105 refer to them. Share conventions with #102. Do not reuse #102's checker. Leave #104 alone until later. Whoever lands first creates the module |
+| **Q1** | **For the reviewer.** Share the stall module with #105 and not with #102? | Yes. Define the exemption set, the progress clock and the atomic close step once, here (section 6.1). **#105 R1 builds `server/src/services/flow-stall.ts` first and #113 S1 reuses it.** No "whoever lands first". Share conventions with #102. Do not reuse #102's checker. Leave #104 alone until later. Whoever lands first creates the module |
 | **Q2** | "No update for `N` minutes": the progress clock or `issues.updated_at`? | The progress clock. System writes touch `updated_at` |
 | **Q3** | **For the reviewer.** Event source for pull-request merges | S2 reads `external_objects` for a company on the core GitHub connection (it has the true merge time in `data.mergedAt`) and `issue_work_products` for a company on the plugin sync (no merge time). A generic event table is S3, only if needed |
 | **Q4** | What happens when the condition clears? | `comment` and resolve the firing. The issue stays open. `auto_close` is opt-in and closes only an untouched issue |
@@ -1084,7 +1163,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q19** | Lane-health checks from a separate planning effort | They are rule kinds that depend on this plan: two are filters on rule (a), five are new kinds after S1 (section 3.5). The filter set gets `labelIds` and "no assignee" |
 | **Q20** | The existing task watchdog | Keep it. Add "watched by an active task watchdog" as an exemption for rule (a) |
 | **Q21** | A paused or archived routine as a routine-action target | The watchdog checks the routine and its project itself, and skips (section 7.2) |
-| **Q23** | **For the reviewer.** The atomic close contract on what `main` provides: **choice A**, the issue row lock plus a compare of values (`observed`), with no `status_version`. Choice B (a real compare-and-set with a bump at every status writer) is not used | A (section 6.1.3). `status_version` is bumped only for an assignee change or a blocked re-assertion, so it cannot guard a status change. The value compare is correct under the row lock, needs no change to the writers that already lock, and S0 adds a terminal-status guard to the few that do not. The heartbeat cancel stays a separate, existing path; the terminal issue is what makes the later promotion harmless |
+| **Q23** | **For the reviewer.** The atomic close contract on what `main` provides: **choice B**, the issue row lock plus a compare-and-set on `status_version`. The trigger of migration `0227_modern_pandemic.sql:146-158` bumps it on every status change, so no migration is needed | B (section 6.1.3). `main` lacks only a writer that does the compare. The shared module slice adds `expectedStatusVersion` to `issueService.update` and the compare in the close step. Values of the non-status fields are compared too, because some writers change them without a bump |
 | **Q24** | The clock source and the hold-lift floor | The database clock, a 5-minute skew guard, and a floor taken from `agent.resumed` and the `*.updated` entries of the company, project and routine (section 6.1.2). #102's lift time replaces it later |
 | **Q22** | A terminated or pending assignee at fire time | Take no action. Record `suppressed: assignee_unavailable` and put the rule in an error state that the rules page shows |
 | **Q25** | **For the reviewer.** Where is the exemption set derived from? | From the attention feed: the stall module calls the feed's readers, and a `Record<AttentionSourceKind, …>` table fails to compile when the feed gains a source (section 6.1.1) |
@@ -1095,7 +1174,8 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q30** | Off behavior | An instance flag `enableFlowWatchdog` (default off), and a company settings row with `enabled` (a missing row means off). Both are in the claim (section 5.3) |
 | **Q31** | The hold-lift floor | Only real lift events: `agent.resumed`, and the company, project or routine update entries that show an unpause. S1 verifies the `details` shape; if it cannot be read, those three are dropped (section 6.1.2) |
 | **Q32** | A crash between the firing and the action | `action_state = pending`, retried by the next pass with an idempotency key, at most 5 attempts (section 6.3) |
-| **Q33** | The new slice S0 | The shared stall module, the atomic close and the writer audit come first, as a single, because they touch `heartbeat.ts` and are reused by #103 and #105 (section 9.1) |
+| **Q33** | Who builds the shared module, and in which order? | #105 R1, first, as a single, at `server/src/services/flow-stall.ts`. #113 S1 reuses it (sections 6.1 and 9.1) |
+| **Q34** | The lock-preserving variant of `withIssueExecutionLock` | One variant, owned by #103 D1. The first slice that needs it implements it to #103's spec; the others reuse it unchanged (section 6.1.3) |
 
 ## Appendix A. Code anchors on `main` at `d9804ac4f`
 
@@ -1150,7 +1230,10 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | The heartbeat cancel (native fence, process stop) | `server/src/services/heartbeat.ts:31507` (`cancelRunInternal`) |
 | Pending linked approvals (the pair that attention reads) | `packages/db/src/schema/issue_approvals.ts:7-22`, `packages/db/src/schema/approvals.ts:5-19`, `server/src/services/attention.ts:1591-1617` |
 | Pause and resume are logged (`agent.paused`, `agent.resumed`) | `server/src/routes/agents.ts:5915`, `5950` |
-| `status_version` is bumped only for an assignee change and a blocked re-assertion (so it is not a status guard); the issue service takes `FOR UPDATE` at the start of its write | `server/src/services/issues.ts:11025-11047`, `10981` |
+| The status-version trigger: bumps on every status change; asserted after migration replay | `packages/db/src/migrations/0227_modern_pandemic.sql:146-158`; `packages/db/src/client.test.ts:1895-1940` |
+| Other bumps of the version (assignee change, repeated `blocked`, conversation turn, native status effect); the issue service takes `FOR UPDATE` at the start of its write | `server/src/services/issues.ts:11025-11047`, `10981`; `agent-conversations.ts:375`; `native-runtime/status-decision-committer.ts:1214-1226` |
+| `withIssueExecutionLock` clears the execution and checkout columns before its callback | `server/src/modules/wake-queue/adapters/postgres.ts:1171-1232` |
+| Tree-hold release restores cancelled issues | `server/src/services/issue-tree-control.ts:981` |
 | Scheduling suppression gate on the recovery pass | `server/src/index.ts:1827` |
 | Batch claim with `FOR UPDATE SKIP LOCKED` (precedent) | `server/src/services/chat-run-publications.ts:334`; `server/src/services/execution-recovery-resolution.ts:326` |
 | Labels on issues | `packages/db/src/schema/issue_labels.ts`, `labels.ts` |
