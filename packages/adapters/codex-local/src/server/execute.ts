@@ -1474,11 +1474,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const providerQuota =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
-        isCodexProviderQuotaError({
-          stdout: attempt.proc.stdout,
-          stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
-        });
+        isCodexProviderQuotaError({ errorMessage: parsedError });
       const transientUpstream =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&

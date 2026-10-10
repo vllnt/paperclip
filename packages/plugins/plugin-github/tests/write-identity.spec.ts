@@ -404,6 +404,48 @@ describe("GitHub write identity: App user (anthm)", () => {
     expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: { requiredChecks: ["e2e"] } } });
   });
 
+  it("counts a required check that was skipped as passing, as GitHub does, and no other result that is not a success", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    const merge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: ["adminMerge"], pullRequest: 7, expectedHeadSha: "a".repeat(40) });
+    const run = (name: string, conclusion: string | null, extra: Record<string, unknown> = {}) => ({ name, status: "completed", conclusion, app: { id: 15368 }, ...extra });
+    // A docs-only change: the job behind "typecheck" is skipped by its path filter. Both checks are required.
+    f.github.checkRuns = [run("lint", "success"), run("typecheck", "skipped")];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: {
+      requiredChecks: ["lint", "typecheck"], checks: [{ name: "lint", result: "success" }, { name: "typecheck", result: "skipped" }],
+    } } });
+    f.github.checkRuns = [run("lint", "skipped"), run("typecheck", "skipped")];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" } });
+    // A skipped check does not cover another required check, and every other result still blocks the merge.
+    const blocked: Array<[string, unknown[], string[]]> = [
+      ["a skipped check next to a failed one", [run("lint", "skipped"), run("typecheck", "failure")], ["typecheck"]],
+      ["a required check that never reported", [run("lint", "skipped")], ["typecheck"]],
+      ["a required check in progress", [run("lint", "skipped"), run("typecheck", null, { status: "in_progress" })], ["typecheck"]],
+      ["a required check queued", [run("lint", "success"), run("typecheck", null, { status: "queued" })], ["typecheck"]],
+      ...["neutral", "cancelled", "timed_out", "action_required", "stale", "startup_failure", "failure"].map((conclusion): [string, unknown[], string[]] =>
+        [`a ${conclusion} required check`, [run("lint", "success"), run("typecheck", conclusion)], ["typecheck"]]),
+      // The ruleset pins lint to one integration: a skipped run from another app is not that check.
+      ["a skipped run from another app than the pinned one", [run("lint", "skipped", { app: { id: 1 } }), run("typecheck", "success")], ["lint"]],
+    ];
+    for (const [label, runs, failing] of blocked) {
+      f.github.checkRuns = runs;
+      const decision = await merge();
+      expect(decision, label).toMatchObject({ identity: "user", unavailable: expect.stringContaining(failing.join(", ")), evidence: { failing } });
+      expect(decision, label).not.toHaveProperty("credential");
+    }
+    // Only the latest run of a check counts: a skipped rerun after a failure passes, a failed rerun after a skip does not.
+    f.github.checkRuns = [{ id: 1, ...run("lint", "failure") }, { id: 2, ...run("lint", "skipped") }, run("typecheck", "success")];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" } });
+    f.github.checkRuns = [{ id: 1, ...run("lint", "skipped") }, { id: 2, ...run("lint", "failure") }, run("typecheck", "success")];
+    expect(await merge()).toMatchObject({ unavailable: expect.stringContaining("lint"), evidence: { failing: ["lint"] } });
+    // A commit status has no skipped state: only success counts there.
+    f.github.checkRuns = [run("lint", "success")];
+    f.github.statuses = [{ context: "typecheck", state: "skipped" }];
+    expect(await merge()).toMatchObject({ unavailable: expect.stringContaining("typecheck"), evidence: { failing: ["typecheck"] } });
+    f.github.statuses = [{ context: "typecheck", state: "success" }];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
   // An admin merge is bounded only where the base branch binds administrators and requires a check.
   async function adminMergeFixture() {
     const f = await appFixture();

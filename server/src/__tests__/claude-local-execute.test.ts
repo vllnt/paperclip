@@ -1431,6 +1431,62 @@ describe("claude execute", () => {
     }
   }, 15_000);
 
+  it.each([
+    ["plain process output", async (commandPath: string) => writeTextFailingClaudeCommand(commandPath, {
+      stdout: "Running make...\nusage limit reached\n",
+      stderr: "Claude usage limit reached\n",
+    })],
+    ["a result that Claude did not mark as an error", async (commandPath: string) => writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "error_during_execution",
+        session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        is_error: false,
+        result: "The build tool printed: usage limit reached",
+      },
+    })],
+  ])("does not classify usage-limit wording from %s as provider quota", async (_label, writeCommand) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-tool-quota-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    try {
+      const result = await execute({
+        runId: "run-claude-tool-quota",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).not.toBe("provider_quota");
+      expect(result.errorFamily).not.toBe("provider_quota");
+      expect(result.resultJson?.errorFamily).not.toBe("provider_quota");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies Claude 'out of extra usage' failures as provider quota errors", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-transient-"));
     const workspace = path.join(root, "workspace");

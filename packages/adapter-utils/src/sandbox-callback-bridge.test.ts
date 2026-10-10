@@ -1725,7 +1725,7 @@ describe("sandbox callback bridge", () => {
         execute: vi.fn(async (input: { args?: string[]; env?: Record<string, string> }) => {
           const script = input.args?.[1] ?? "";
           if ((stage === "start" && script.includes("nohup")) ||
-              (stage === "stop" && script.includes('kill "$pid"'))) {
+              (stage === "stop" && script.includes("kill -TERM"))) {
             return new Promise<RunProcessResult>(() => {});
           }
           return {
