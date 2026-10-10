@@ -85,6 +85,7 @@ If you change schema/API behavior, update all impacted layers:
 - `packages/shared` types/constants/validators
 - `server` routes/services
 - `ui` API clients and pages
+- `cli` commands (`paperclipai`)
 
 3. Preserve control-plane invariants.
 - Single-assignee task model
@@ -130,6 +131,14 @@ Apply a review level that matches the path:
 - **Run-log change (no extra review).** A run-log change needs neither review level above, because the data stays in the instance database.
 
 **Exclusion.** The word "observability" in a file such as `server/src/services/recovery-observability.ts` names a different concept. Apply this rule by path, not by word match.
+
+8. Keep the web UI, the REST API, and the CLI at parity.
+Every user-facing capability ships on all three surfaces: the web UI, the REST API (documented in the OpenAPI document, `server/src/routes/openapi.ts`), and the `paperclipai` CLI. Land them in the same pull request, or link a follow-up pull request that closes the gap. Reason: an agent must be able to do through the API and the CLI anything a person can do in the UI.
+
+- **Parity of surfaces is not parity of permissions.** Board-only actions, approval gates, and company boundaries (rules 1 and 3) apply to agents exactly as before. A new CLI command or API route must not give an agent an action that only the board may take.
+- **Allowed exceptions.** Name each one in the pull request body:
+  - a purely visual UI affordance (layout, animation, theme, a hover or focus effect)
+  - a CLI command that exists only for local development (for example `worktree` or `doctor`)
 
 ## 6. Database Change Workflow
 
