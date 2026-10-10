@@ -229,6 +229,71 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
     return { ...fixture, runId };
   }
 
+  /** An issue-bound run that already ended, locks released (the production shapes after a restart). */
+  async function seedEndedIssueRun(label: string, run: { status: string; errorCode: string | null; resultJson?: Record<string, unknown>; invocationSource?: string; requestedByActorType?: "user" | "system" }) {
+    const fixture = await seedAssignedTodo(label);
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const finishedAt = new Date(Date.now() - 20 * 60_000);
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId, companyId: fixture.companyId, agentId: fixture.agentId,
+      source: run.invocationSource ?? "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: fixture.issueId }, status: "failed", runId, claimedAt: finishedAt,
+      requestedByActorType: run.requestedByActorType ?? "system", requestedByActorId: run.requestedByActorType === "user" ? "responsible-user" : null,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId: fixture.companyId, agentId: fixture.agentId, invocationSource: run.invocationSource ?? "assignment",
+      triggerDetail: "system", status: run.status, wakeupRequestId, errorCode: run.errorCode, resultJson: run.resultJson ?? null,
+      contextSnapshot: { issueId: fixture.issueId, taskId: fixture.issueId, wakeReason: "issue_assigned" },
+      nextEventSeq: 2, startedAt: new Date(finishedAt.getTime() - 60_000), finishedAt,
+    });
+    await db.insert(heartbeatRunEvents).values({ companyId: fixture.companyId, agentId: fixture.agentId, runId,
+      seq: 1, eventType: "adapter.invoke", payload: { adapterType: "codex_local" } });
+    await db.update(issues).set({ status: "in_progress", startedAt: new Date(finishedAt.getTime() - 60_000) }).where(eq(issues.id, fixture.issueId));
+    return { ...fixture, runId };
+  }
+
+  it.each([
+    ["process_lost", "failed"],
+    ["execution_reconciliation_required", "cancelled"],
+  ] as const)("retries a conversation run that ended %s instead of looping hold and fold", async (errorCode, status) => {
+    const fixture = await seedEndedIssueRun(errorCode, { status, errorCode });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const [repaired] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    expect(repaired!.resultJson).toMatchObject({ conversationContinuation: "continue_conversation_v1" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, fixture.runId))).toHaveLength(1);
+    await settleUnrecoverableExecutions(db);
+    await heartbeat.reconcileStrandedAssignedIssues();
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId))).toEqual([]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, fixture.runId))).toHaveLength(1);
+  });
+
+  it("keeps a cancelled adapter_failed run on hold and blocks the issue", async () => {
+    const fixture = await seedEndedIssueRun("cancel-adapter", { status: "cancelled", errorCode: "adapter_failed" });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await settleUnrecoverableExecutions(db);
+    const [issue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issue?.status).toBe("blocked");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, fixture.runId))).toHaveLength(0);
+  });
+
+  it("continues an issue whose last run succeeded without moving it", async () => {
+    const fixture = await seedEndedIssueRun("succeeded", { status: "succeeded", errorCode: null, invocationSource: "on_demand", requestedByActorType: "user" });
+    holdNextExecution();
+
+    const sweep = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(sweep.issueIds).toContain(fixture.issueId);
+    const next = await waitFor(async () => {
+      const rows = (await issueBoundRuns(fixture.issueId)).filter((row) => row.id !== fixture.runId);
+      return rows.length > 0 ? rows : null;
+    });
+    expect(next).toHaveLength(1);
+  });
+
   it("leaves the issue in_progress with no issue-bound run after an issue-less run checks it out and finishes", async () => {
     const fixture = await seedAssignedTodo("evidence");
     const runId = await strandThroughIssueLessRun(fixture);

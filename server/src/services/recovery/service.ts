@@ -162,6 +162,9 @@ const conversationContinuationResult = sql`coalesce(${heartbeatRuns.resultJson},
   conversationContinuation: CONVERSATION_CONTINUATION_POLICY,
 })}::jsonb`;
 
+/** Endings the settle sweep folds as conversation continuations (besides any interrupted run). */
+const CONVERSATION_FOLD_ERROR_CODES = new Set(["process_lost", "server_shutdown_interrupted", "execution_reconciliation_required"]);
+
 /** The system actor of a stranded in_progress dispatch that has no source run. */
 const STRANDED_ISSUE_RECOVERY_ACTOR_ID = "stranded_issue_recovery";
 
@@ -1170,17 +1173,26 @@ export function recoveryService(
     return run.runtimeMode === "legacy" && (await runUsedConversationAdapter(db, run));
   }
 
-  /** Adds the marker to an orphaned conversation run written before the writer recorded it. */
-  async function repairOrphanedConversationContinuation(companyId: string, runId: string) {
+  /**
+   * Adds the marker to a conversation run that ended the way execution
+   * recovery already treats as a conversation continuation: interrupted, or
+   * `process_lost`, `server_shutdown_interrupted` or
+   * `execution_reconciliation_required` (the settle sweep's fold predicate,
+   * `conversationRecoveryActionPredicate`). Without it this sweep opens a
+   * reconciliation hold that the settle sweep folds again: hold, fold, hold,
+   * with the issue still in_progress. With it the run gets the bounded retry.
+   */
+  async function repairConversationContinuation(companyId: string, runId: string) {
     const [run] = await db
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
     if (
       !run ||
-      run.status !== "interrupted" ||
-      run.errorCode !== "orphaned_running_run" ||
+      !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) ||
+      !(run.status === "interrupted" || CONVERSATION_FOLD_ERROR_CODES.has(run.errorCode ?? "")) ||
       run.resultJson?.conversationContinuation === CONVERSATION_CONTINUATION_POLICY ||
+      run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" ||
       !(await continuesAsConversation(run))
     )
       return;
@@ -1190,8 +1202,7 @@ export function recoveryService(
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.id, runId),
-        eq(heartbeatRuns.status, "interrupted"),
-        eq(heartbeatRuns.errorCode, "orphaned_running_run"),
+        eq(heartbeatRuns.status, run.status),
       ));
   }
 
@@ -4817,9 +4828,9 @@ export function recoveryService(
           executionRecoverySource.status,
         )
       ) {
-        // Rows the orphan writer ended before it recorded conversation
-        // continuation get the marker now, the same rule as for new rows.
-        await repairOrphanedConversationContinuation(issue.companyId, executionRecoverySource.id);
+        // A conversation run whose ending execution recovery treats as a
+        // continuation gets the marker before the reconciliation check.
+        await repairConversationContinuation(issue.companyId, executionRecoverySource.id);
         const [source] = await db
           .select()
           .from(heartbeatRuns)
