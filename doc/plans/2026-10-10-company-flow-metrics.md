@@ -189,8 +189,9 @@ The difference from #28 is stated in Q3.
 
 **Deploy windows** come from the company's drain entries. For each `started` entry:
 
-1. The window ends at the earliest of: the first later `stopped` entry, and
-   `details.expiresAt` when it is not null.
+1. The window ends at the earliest of: the first later `stopped` entry whose
+   `details.wasActive` is true (a stop that found no drain does not end a window),
+   and `details.expiresAt` when it is not null.
 2. If neither exists, the window ends **60 minutes** after the start. (A drain with
    no expiry ends in a restart that clears the memory state and writes no stop. The
    planned restart plan measured about 17 minutes between the two stops of one
@@ -583,7 +584,7 @@ On `main` at `38819d350`:
 | `company_scope:read` has no permission key | `server/src/services/authorization.ts:167` (inside the group that returns null) |
 | Deny blocks that list `company_scope:read` | `authorization.ts:1033` (low trust), `:1217` (task bridge keys), `:1287` (skill-test tokens). Viewers: `:1855` |
 | Dashboard route and cost source | `server/src/routes/dashboard.ts:27`; `server/src/services/dashboard.ts:92` (month spend from `cost_events`) |
-| Drain markers | `server/src/routes/instance-settings.ts:343` (`started`), `:346` to `:349` (`startedAt`, `expiresAt`), `:396` (`stopped`) |
+| Drain markers | `server/src/routes/instance-settings.ts:343` (`started`), `:346` to `:349` (`startedAt`, `expiresAt`), `:396` (`stopped`), `:399` and `:400` (`details.wasActive`) |
 | Drain state in memory, optional expiry | `server/src/services/heartbeat.ts:1411` (`taskDrainState`); `packages/shared/src/validators/instance.ts:127` (24 hour cap), `:130` (`ttlMs` nullable) |
 | Activity log indexes | `packages/db/src/schema/activity_log.ts:23` (company, created), `:35` (entity type and id) |
 | Migration safety for indexes | `packages/db/src/check-migration-safety.ts:18` (`large-create-index-not-concurrently`) |
