@@ -398,6 +398,22 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
     expect(await issueRuns(companyId, [lostRunId])).toEqual([]);
   });
 
+  it("keeps a wake parked on a done issue while a run still holds the issue, for that run's release", async () => {
+    const { companyId, agentId, issueId } = await seed({ issueStatus: "done", process: "none" });
+    const holderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
+      status: "running", startedAt: new Date(), contextSnapshot: { issueId, taskId: issueId },
+    });
+    await db.update(issues).set({ executionRunId: holderRunId, executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+    const { wakeId } = await parkWake({ kind: "comment", companyId, agentId, issueId, parkedMinutesAgo: 30 });
+
+    await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
+
+    expect((await parkedWakes(companyId)).map((wake) => wake.id)).toEqual([wakeId]);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, holderRunId));
+  });
+
   it("holds a wake behind a provider process that is really still running, and records why once", async () => {
     const { companyId, agentId, issueId, lostRunId } = await seed({ issueStatus: "todo", process: "live" });
     await parkWake({ kind: "assignment", companyId, agentId, issueId, parkedMinutesAgo: 30 });

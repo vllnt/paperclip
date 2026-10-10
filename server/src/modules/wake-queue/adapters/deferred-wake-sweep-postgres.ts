@@ -108,19 +108,21 @@ export async function listOrphanedDeferredWakes(
 }
 
 /**
- * Finalizes deferred wakes whose issue is done or cancelled. The orphan scan
- * skips them so an old wake cannot revive a closed task, and a cancelled task
- * has no next run whose release would retire them, so without this they stay
- * parked forever. They get the existing terminal status `cancelled`, the one a
- * release uses for a wake that lost its authority. Wakes owned by another sweep
- * are left to it.
+ * Finalizes deferred wakes whose issue is done or cancelled and has no run left
+ * to release it. The orphan scan skips them so an old wake cannot revive a
+ * closed task, and with no execution lock and no live run nothing will ever
+ * promote or retire them, so without this they stay parked forever. A wake
+ * behind a run that still holds the task is left for that run's release, which
+ * may still deliver accepted feedback to a done child. Finalized wakes get the
+ * existing terminal status `cancelled`, the one a release uses for a wake that
+ * lost its authority. Wakes owned by another sweep are left to it.
  *
- * @returns The ids of the finalized wakes.
+ * @returns The finalized wakes.
  */
 export async function retireClosedIssueDeferredWakes(
   db: Db,
   input: { now: Date; minAgeMs: number },
-): Promise<string[]> {
+): Promise<Array<{ id: string; companyId: string }>> {
   const rows = await db
     .update(agentWakeupRequests)
     .set({
@@ -136,14 +138,24 @@ export async function retireClosedIssueDeferredWakes(
         eq(issues.id, wakeIssueId),
         eq(issues.companyId, agentWakeupRequests.companyId),
         inArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+        isNull(issues.executionRunId),
         lte(agentWakeupRequests.requestedAt, new Date(input.now.getTime() - input.minAgeMs)),
         sql`${agentWakeupRequests.payload} -> 'queuedCommentInterrupt' is null`,
         sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}::text is null`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+        sql`not exists (
+          select 1 from ${heartbeatRuns} holder
+          where holder.company_id = ${issues.companyId}
+            and holder.status in (${sql.join(
+              EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.map((status) => sql`${status}`),
+              sql`, `,
+            )})
+            and holder.context_snapshot ->> 'issueId' = ${issues.id}::text
+        )`,
       ),
     )
-    .returning({ id: agentWakeupRequests.id });
-  return rows.map((row) => row.id);
+    .returning({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId });
+  return rows;
 }
 
 /**

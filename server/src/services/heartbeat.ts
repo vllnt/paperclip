@@ -19995,6 +19995,7 @@ export function heartbeatService(
         minAgeMs: DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
       });
       result.retired += retiredClosed.length;
+      for (const wake of retiredClosed) countersForCompany(wake.companyId).retired += 1;
     }
 
     const orphans = await wakeQueue.listOrphanedDeferredWakes({

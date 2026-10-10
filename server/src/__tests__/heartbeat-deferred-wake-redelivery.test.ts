@@ -718,7 +718,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
 
   describe("closed tasks", () => {
     it.each(["done", "cancelled"])(
-      "never revives a %s task from an old parked wake, with or without a finished run",
+      "never revives a %s task from an old parked wake and finalizes the wake, with or without a finished run",
       async (status) => {
         const companyId = await seedCompany();
         const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
@@ -735,9 +735,11 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
         await heartbeat.sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
         await heartbeat.drainActiveRunExecutions();
 
+        // No run will ever release these wakes, so the periodic pass finalizes
+        // them as cancelled instead of keeping them parked.
         for (const wakeId of wakeIds) {
           const wake = await wakeRow(wakeId);
-          expect(wake.status).toBe("deferred_issue_execution");
+          expect(wake.status).toBe("cancelled");
           expect(wake.runId).toBeNull();
         }
         expect(await runsForIssue(anchorlessIssueId)).toHaveLength(0);
@@ -887,8 +889,9 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       const agentA = await seedAgent(companyA, { name: "ReviewerA", maxConcurrentRuns: 3 });
       const agentB = await seedAgent(companyB, { name: "ReviewerB", maxConcurrentRuns: 3 });
       const issueA = await seedIssue(companyA, { assigneeAgentId: agentA });
-      // Company B has a wake that the sweep will never read (a closed task).
-      const issueB = await seedIssue(companyB, { assigneeAgentId: agentB, status: "done" });
+      // Company B has a wake that the sweep will never read (a hidden task).
+      const issueB = await seedIssue(companyB, { assigneeAgentId: agentB });
+      await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, issueB));
       await seedDeferredWake(companyA, agentA, issueA, { ageMs: 30 * MINUTE_MS });
       await seedDeferredWake(companyB, agentB, issueB, { ageMs: 30 * MINUTE_MS });
 
