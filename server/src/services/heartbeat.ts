@@ -9424,10 +9424,14 @@ function isRoutineExecutionSlotConflict(error: unknown) {
   return isUniqueViolation(error, ROUTINE_EXECUTION_SLOT_INDEX);
 }
 
-function logRoutineExecutionSlotConflict(runId: string, issueId: string | null) {
+function logRoutineExecutionSlotConflict(
+  runId: string,
+  issueId: string | null,
+  site: "claimQueuedRun" | "enqueueWakeup" = "claimQueuedRun",
+) {
   logger.warn(
     { runId, issueId, index: ROUTINE_EXECUTION_SLOT_INDEX },
-    "claimQueuedRun: another open copy of this routine execution holds the execution slot; the run stays queued",
+    `${site}: another open copy of this routine execution holds the execution slot; the run stays queued`,
   );
 }
 
@@ -30101,23 +30105,36 @@ export function heartbeatService(
               if (await cancelStaleScheduledRetry(legacyRun)) {
                 activeExecutionRun = null;
               } else {
-                activeExecutionRun = legacyRun;
                 const legacyAgent = await tx
                   .select({ name: agents.name })
                   .from(agents)
                   .where(eq(agents.id, legacyRun.agentId))
                   .then((rows) => rows[0] ?? null);
-                await tx
-                  .update(issues)
-                  .set({
-                    executionRunId: legacyRun.id,
-                    executionAgentNameKey: normalizeAgentNameKey(
-                      legacyAgent?.name,
-                    ),
-                    executionLockedAt: new Date(),
-                    updatedAt: new Date(),
-                  })
-                  .where(eq(issues.id, issue.id));
+                try {
+                  // A savepoint, so a lost race on the routine execution slot rolls back
+                  // this update alone and not the whole wake.
+                  await tx.transaction(async (rebindTx) => {
+                    await rebindTx
+                      .update(issues)
+                      .set({
+                        executionRunId: legacyRun.id,
+                        executionAgentNameKey: normalizeAgentNameKey(
+                          legacyAgent?.name,
+                        ),
+                        executionLockedAt: new Date(),
+                        updatedAt: new Date(),
+                      })
+                      .where(eq(issues.id, issue.id));
+                  });
+                  activeExecutionRun = legacyRun;
+                } catch (error) {
+                  // Another open copy of the same routine execution holds the slot. This
+                  // issue cannot take it, so treat it as having no lock: the wake goes on
+                  // as a new queued run, and the claim cancels or defers it like any
+                  // other run of this copy.
+                  if (!isRoutineExecutionSlotConflict(error)) throw error;
+                  logRoutineExecutionSlotConflict(legacyRun.id, issue.id, "enqueueWakeup");
+                }
               }
             }
           }
