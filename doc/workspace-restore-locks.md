@@ -24,6 +24,13 @@ to 1 hour) to change that budget. Other writers, such as credential files, keep
 a 30-second budget with the same rule. A timeout still fails the run with
 `restore_lock_timeout` and the owner diagnostics below.
 
+While a workspace restore waits, it writes a line to the run log about every 30
+seconds, for example `[paperclip] Waiting for the workspace merge lock: another
+run has held it for 95s, 2 queued ahead (waited 60s).` The line holds wait times
+and a count only, never the lock path, the target path, or a process id. The
+report is not awaited, so a slow or stuck run log cannot delay the restore or
+the contenders queued behind it.
+
 A run that fails on this timeout ends with the error code
 `workspace_restore_lock_timeout`, not `adapter_failed`, and its result carries
 `workspaceRestoreFailure: "restore_lock_timeout"`. The server then asks for a
