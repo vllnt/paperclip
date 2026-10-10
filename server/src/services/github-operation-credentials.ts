@@ -1,15 +1,19 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { isUuidLike } from "@paperclipai/shared";
 import {
   agents,
+  companySecrets,
+  connectionGrants,
   heartbeatRuns,
   issues,
   projects,
   runIdentityContexts,
+  toolConnections,
   type Db,
 } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 import { captureRunIdentity } from "./run-identity.js";
+import { createReadDecisionCache } from "./github-read-decision-cache.js";
 import {
   buildGitAuthInvocation,
   resolveManagedGitHubCredential,
@@ -47,7 +51,7 @@ export type GitHubCredentialSummary = {
 /** A raw GitHub token cannot enforce the low-trust read-only tool boundary. */
 async function allowsGitHubCredentialExport(
   db: Db,
-  run: typeof heartbeatRuns.$inferSelect,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "agentId" | "companyId" | "contextSnapshot" | "nativeIssueId">,
 ) {
   const issueId =
     run.contextSnapshot?.issueId ??
@@ -161,6 +165,35 @@ async function runIssueKey(db: Db, run: typeof heartbeatRuns.$inferSelect): Prom
     .from(issues)
     .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
   return issue?.identifier ?? null;
+}
+
+/** The caller of the credential route (the launcher, through the bridge) stopped waiting: no work is started for it. */
+export class CallerGaveUp extends Error {
+  constructor() {
+    super("The caller stopped waiting for the GitHub credential.");
+    this.name = "CallerGaveUp";
+  }
+}
+function stopIfCallerGone(signal: AbortSignal | undefined) {
+  if (signal?.aborted) throw new CallerGaveUp();
+}
+
+type ResolveOptions = {
+  signal?: AbortSignal;
+  /** The policy the caller already loaded; the resolver then does not load it again. */
+  policy?: GitHubIdentityPolicyRecord | null;
+  /** Told which grant and secret a managed credential came from, and when its token expires. */
+  observe?: (credential: { grantId?: string; connectionId?: string; accessSecretId?: string; expiresAt?: number }) => void;
+};
+
+/** The summary as stored: no undefined fields, keys in a fixed order, so two equal summaries compare equal. */
+const summaryKey = (summary: unknown) => JSON.stringify(Object.entries((summary ?? {}) as Record<string, unknown>)
+  .filter(([, value]) => value !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+
+/** Stores the run's last GitHub summary, only when it differs from the stored one (most operations end with the same one). */
+async function recordGitHubSummary(db: Db, context: { id: string; github?: unknown }, summary: GitHubCredentialSummary) {
+  if (summaryKey(context.github) === summaryKey(summary)) return;
+  await db.update(runIdentityContexts).set({ github: summary }).where(eq(runIdentityContexts.id, context.id));
 }
 
 const isWrite = (operation: ClassifiedGitHubOperation) => operation.access === "write" || operation.privileged.length > 0;
@@ -288,18 +321,20 @@ async function pluginDecisionResult(
  *
  * No company secrets or ambient credentials are consulted by this path.
  */
-export async function resolveGitHubOperationCredentials(
+async function resolveUncached(
   db: Db,
   input: {
     companyId: string;
     agentId: string;
     runId: string;
   },
-  operation: GitHubOperation | typeof UNREADABLE_GITHUB_OPERATION | null = null,
+  operation: GitHubOperation | typeof UNREADABLE_GITHUB_OPERATION | null,
+  options: ResolveOptions,
 ): Promise<GitHubOperationCredentials> {
+  stopIfCallerGone(options.signal);
   const { run, context } = await captureRunIdentity(db, input);
   if (!context) throw forbidden("This run predates managed GitHub credentials");
-  const policy = await loadGitHubIdentityPolicy(db, input.companyId);
+  const policy = options.policy !== undefined ? options.policy : await loadGitHubIdentityPolicy(db, input.companyId);
   // Agent gh text is marked unless the company's policy turns the footer off.
   const attribution = !policy || (policy.policy !== "invalid" && policy.policy.bodyFooter) ? await operationAttribution(db, run) : undefined;
   let summary: GitHubCredentialSummary;
@@ -314,10 +349,7 @@ export async function resolveGitHubOperationCredentials(
       reason:
         "GitHub credentials are not available to low-trust or unverified executions; use authorized read-only tools.",
     };
-    await db
-      .update(runIdentityContexts)
-      .set({ github: summary })
-      .where(eq(runIdentityContexts.id, context.id));
+    await recordGitHubSummary(db, context, summary);
     return {
       identityContextId: context.id,
       revision: context.revision,
@@ -343,6 +375,7 @@ export async function resolveGitHubOperationCredentials(
     }
     const appUser = policy.policy === "invalid" || policy.policy.userSource === "app";
     if (appUser) {
+      stopIfCallerGone(options.signal);
       const decision = await resolveGitHubWriteIdentityDecision(db, { companyId: input.companyId, operation: classified }, policy);
       // A plugin that defers here is broken; the run's own identity is never used for an App-user company.
       const answered = !decision || "missingUserConnection" in decision
@@ -358,12 +391,15 @@ export async function resolveGitHubOperationCredentials(
     }
   }
   const governed = classified.action !== null || classified.privileged.length > 0;
+  if (policy && governed) stopIfCallerGone(options.signal);
   const decision = policy && governed
     ? await resolveGitHubWriteIdentityDecision(db, { companyId: input.companyId, operation: classified }, policy)
     : null;
   if (decision && !("missingUserConnection" in decision)) {
     return pluginDecisionResult(db, run, context, classified, await stillAppWrites(db, input.companyId, decision), attribution);
   }
+  // The secret store is read (and audited) below: not for a caller that has gone.
+  stopIfCallerGone(options.signal);
   try {
     const resolved = await resolveManagedGitHubCredential(
       db,
@@ -384,6 +420,7 @@ export async function resolveGitHubOperationCredentials(
       },
     );
     if (resolved.credential) {
+      options.observe?.({ grantId: resolved.credential.grantId, connectionId: resolved.credential.connectionId, accessSecretId: resolved.credential.accessSecretId, expiresAt: resolved.credential.expiresAt });
       summary = {
         status: "available",
         source: resolved.credential.identitySource,
@@ -407,14 +444,11 @@ export async function resolveGitHubOperationCredentials(
       reason: "GitHub credentials are temporarily unavailable",
     };
   }
-  if (context)
-    await db
-      .update(runIdentityContexts)
-      .set({ github: summary })
-      .where(eq(runIdentityContexts.id, context.id));
+  if (context) await recordGitHubSummary(db, context, summary);
   if (withholdToken) for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "PAPERCLIP_GIT_TOKEN"]) delete env[key];
   if (decision && governed) {
     if (summary.status !== "available" && decision.missingUserConnection === "use_bot") {
+      stopIfCallerGone(options.signal);
       const fallback = await resolveGitHubWriteIdentityDecision(db, { companyId: input.companyId, operation: classified, fallback: true }, policy);
       if (fallback && !("missingUserConnection" in fallback)) return pluginDecisionResult(db, run, context, classified, await stillAppWrites(db, input.companyId, fallback), attribution);
     }
@@ -438,6 +472,138 @@ export async function resolveGitHubOperationCredentials(
     ...(summary.status === "available" && classified.repository ? { repository: classified.repository } : {}),
     env,
   };
+}
+
+/**
+ * What one run's ordinary reads may share. An entry is one successful answer, with what it was made under: the run's
+ * identity context, the write-identity policy, and (for a managed credential) the grant, connection and secret behind it.
+ */
+type CachedRead = {
+  response: GitHubOperationCredentials;
+  contextId: string;
+  policyKey: string;
+  grant: { grantId: string; connectionId: string; accessSecretId: string } | null;
+  grantKey: string | null;
+};
+const readCache = createReadDecisionCache<CachedRead>();
+
+/** Test hook: forget every cached answer. */
+export function clearGitHubReadDecisionCache() {
+  readCache.clear();
+}
+
+const policyKey = (policy: GitHubIdentityPolicyRecord | null) =>
+  JSON.stringify(policy ? [policy.pluginId, policy.ready, policy.policy, policy.ambiguous ?? false] : null);
+
+/**
+ * The part of a read that is cached: a command that reaches no write, no refusal and no signing. Nothing that needs a
+ * decision of its own (a write, an audit record, a signing window) is ever cached.
+ * @returns The part of the key that names the operation, or null when the operation is not cached.
+ */
+function readShape(operation: GitHubOperation | typeof UNREADABLE_GITHUB_OPERATION | null): string | null {
+  if (!operation || operation === UNREADABLE_GITHUB_OPERATION) return null;
+  const classified = classifyGitHubOperation(operation);
+  if (classified.denied || classified.integrity || classified.signing || isWrite(classified) || classified.action !== null) return null;
+  return JSON.stringify([classified.access, classified.repository, classified.wiki, classified.pullRequest, classified.expectedHeadSha]);
+}
+
+/**
+ * What the grant, its connection and the secret behind a managed credential are now. Null when any of them is not
+ * active, so such an answer is never kept. A change to any of them changes the key.
+ */
+async function managedGrantKey(db: Db, companyId: string, grant: { grantId: string; accessSecretId: string }): Promise<string | null> {
+  const [row] = await db
+    .select({
+      grantStatus: connectionGrants.status,
+      grantUpdatedAt: connectionGrants.updatedAt,
+      connectionEnabled: toolConnections.enabled,
+      connectionStatus: toolConnections.status,
+      secretStatus: companySecrets.status,
+      secretDeletedAt: companySecrets.deletedAt,
+      secretVersion: companySecrets.latestVersion,
+    })
+    .from(connectionGrants)
+    .innerJoin(toolConnections, eq(toolConnections.id, connectionGrants.connectionId))
+    .leftJoin(companySecrets, and(eq(companySecrets.id, grant.accessSecretId), eq(companySecrets.companyId, companyId)))
+    .where(and(eq(connectionGrants.id, grant.grantId), eq(connectionGrants.companyId, companyId)));
+  if (!row || row.grantStatus !== "active" || !row.connectionEnabled || row.connectionStatus !== "active") return null;
+  if (row.secretStatus !== "active" || row.secretDeletedAt) return null;
+  return JSON.stringify([row.grantUpdatedAt?.getTime() ?? null, row.secretVersion]);
+}
+
+/**
+ * Serves a cached answer only after checking, with reads that take no lock and write nothing, everything that can
+ * change within its short life: the run is still running with the same identity (and none is waiting to be accepted),
+ * the policy is the one it was made under, the trust gate still allows a token, and the grant, connection and secret
+ * are as they were. Anything else drops the entry and resolves in full.
+ */
+async function serveCachedRead(db: Db, input: { companyId: string; agentId: string; runId: string }, key: string): Promise<GitHubOperationCredentials | null> {
+  const entry = readCache.get(key)?.value;
+  if (!entry) return null;
+  const refuse = () => { readCache.drop(key); return null; };
+  const [run] = await db
+    .select({
+      status: heartbeatRuns.status,
+      activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
+      agentId: heartbeatRuns.agentId,
+      companyId: heartbeatRuns.companyId,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      // The run id is a parameter, not a column: drizzle writes a column of the outer table without its table name,
+      // which inside the subquery would name the subquery's own column.
+      pending: sql<boolean>`exists (select 1 from run_identity_contexts pending where pending.run_id = ${input.runId} and pending.status = 'pending')`,
+    })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId)));
+  if (!run || run.status !== "running" || run.pending || run.activeIdentityContextId !== entry.contextId) return refuse();
+  if (policyKey(await loadGitHubIdentityPolicy(db, input.companyId)) !== entry.policyKey) return refuse();
+  if (!(await allowsGitHubCredentialExport(db, run))) return refuse();
+  if (entry.grant && (await managedGrantKey(db, input.companyId, entry.grant)) !== entry.grantKey) return refuse();
+  return structuredClone(entry.response);
+}
+
+/**
+ * Resolves the credential for one managed git/gh operation.
+ *
+ * A read (no write, refusal or signing) is answered from a short per-run cache when it can be (see serveCachedRead),
+ * and concurrent identical reads share one resolution, so a caller that gave up and asks again joins the work that is
+ * still running. Everything else is resolved in full for each operation, as before. Pass `signal` to stop work for a
+ * caller that is gone: nothing is started for it, and the expensive steps (secret store, plugin) are skipped.
+ */
+export async function resolveGitHubOperationCredentials(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+  },
+  operation: GitHubOperation | typeof UNREADABLE_GITHUB_OPERATION | null = null,
+  options: { signal?: AbortSignal } = {},
+): Promise<GitHubOperationCredentials> {
+  stopIfCallerGone(options.signal);
+  const shape = readCache.enabled ? readShape(operation) : null;
+  if (shape === null) return resolveUncached(db, input, operation, options);
+  const key = readCache.key(input, shape);
+  const cached = await serveCachedRead(db, input, key);
+  if (cached) return cached;
+  // The shared resolution is not tied to this caller's signal: a caller that leaves does not fail the ones that wait.
+  const shared = readCache.shared(key, async () => {
+    const policy = await loadGitHubIdentityPolicy(db, input.companyId);
+    const seen: { grantId?: string; connectionId?: string; accessSecretId?: string; expiresAt?: number } = {};
+    const response = await resolveUncached(db, input, operation, { policy, observe: credential => { Object.assign(seen, credential); } });
+    const grant = seen.grantId && seen.connectionId && seen.accessSecretId
+      ? { grantId: seen.grantId, connectionId: seen.connectionId, accessSecretId: seen.accessSecretId } : null;
+    const grantKey = grant ? await managedGrantKey(db, input.companyId, grant) : null;
+    if (response.status === "available" && response.identityContextId && !response.failClosed && (!grant || grantKey !== null)) {
+      readCache.put(key, { response: structuredClone(response), contextId: response.identityContextId, policyKey: policyKey(policy), grant, grantKey }, seen.expiresAt);
+    }
+    return response;
+  });
+  const callerGone = options.signal
+    ? new Promise<never>((_resolve, reject) => options.signal!.addEventListener("abort", () => reject(new CallerGaveUp()), { once: true }))
+    : null;
+  const response = await (callerGone ? Promise.race([shared, callerGone]) : shared);
+  return structuredClone(response);
 }
 
 /** Largest git object the run bridge forwards for signing. */
