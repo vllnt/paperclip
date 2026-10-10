@@ -1,10 +1,19 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+// Lets one test know a launch's id before it starts, to take its record name.
+const launchIdBytes = vi.hoisted(() => ({ value: null as Buffer | null }));
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:crypto")>();
+  const randomBytes = (size: number) =>
+    size === 8 && launchIdBytes.value ? Buffer.from(launchIdBytes.value) : actual.randomBytes(size);
+  return { ...actual, randomBytes, default: { ...actual, randomBytes } };
+});
 import { eq } from "drizzle-orm";
 import {
   agents,
@@ -301,6 +310,44 @@ describeStop("SSH remote process stop", () => {
 
     expect(outcomes).toMatchObject([{ outcome: "partial", partial: "environment_deleted", matched: 0 }]);
     expect((await lease(run.leaseId)).metadata?.remoteProcessStop).toMatchObject({ outcome: "partial", partial: "environment_deleted" });
+  }, 60_000);
+
+  it("gives a launch refused for a taken record name exactly one unsafe_record_dir event", async () => {
+    const environment = await seedEnvironment(sshConfig);
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, invocationSource: "on_demand", status: "running",
+      processPid: await deadPid(), processLossRetryCount: 9, nextEventSeq: 1, startedAt: new Date(),
+      updatedAt: new Date(Date.now() - 60_000),
+    });
+    await runtime.acquireRunLease({
+      companyId, environment, issueId: null, heartbeatRunId: runId, persistedExecutionWorkspace: null,
+    });
+    const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+    const recordDir = path.join(sshConfig.remoteWorkspacePath, ".paperclip-runtime", "processes", runId);
+    await mkdir(recordDir, { recursive: true });
+    launchIdBytes.value = Buffer.from("0123456789abcdef", "hex");
+    let result: Awaited<ReturnType<typeof runChildProcess>>;
+    try {
+      await symlink(victim, path.join(recordDir, "0123456789abcdef.json"));
+      result = await runChildProcess(runId, "sh", ["-c", "echo started"], {
+        cwd: process.cwd(), env: {}, timeoutSec: 30, graceSec: 1, onLog: async () => {},
+        remoteExecution: { ...sshConfig, remoteCwd: sshConfig.remoteWorkspacePath },
+      });
+    } finally {
+      launchIdBytes.value = null;
+    }
+    expect(result.exitCode).toBe(125);
+    expect(result.stdout).not.toContain("started");
+    runningProcesses.delete(runId);
+
+    await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
+
+    const remote = (await runEvents(runId))
+      .filter((event) => event.eventType.startsWith("remote_"))
+      .map((event) => [event.eventType, (event.payload as { reason?: string }).reason]);
+    expect(remote).toEqual([["remote_kill_partial", "unsafe_record_dir"]]);
+    expect(await readdir(victim)).toEqual([]);
   }, 60_000);
 
   it("keeps the run marker out of argv, logs, run events, lease metadata and the process record", async () => {

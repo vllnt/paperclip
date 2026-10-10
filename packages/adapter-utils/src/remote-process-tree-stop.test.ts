@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash as sha256Hash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -112,6 +112,28 @@ async function writeRecord(run: Run, input: { pid: number | string; group: boole
   // A deliberately bad record is still written; only the launch gate after it exits 125.
   await execFileAsync("sh", ["-c", script]).catch(() => undefined);
   return file;
+}
+
+/** Runs a launch's record lines for `pid`, as the leader does, and returns how they ended. */
+async function publish(run: Run, input: { pid: number; testOnlyToolDirs?: string[] }) {
+  const lines = buildRemoteRunRecordLines({
+    remoteRoot: quote(run.root),
+    runId: run.runId,
+    launchId: randomBytes(8).toString("hex"),
+    markerSha256: "0".repeat(64),
+    group: true,
+    pidExpression: String(input.pid),
+    ...(input.testOnlyToolDirs ? { testOnlyToolDirs: input.testOnlyToolDirs } : {}),
+  });
+  return new Promise<{ code: number; stderr: string }>((resolve) => {
+    execFile("sh", ["-c", lines.join("\n")], (error, _stdout, stderr) => {
+      resolve({ code: error ? Number(error.code) : 0, stderr });
+    });
+  });
+}
+
+async function recordNames(run: Run): Promise<string[]> {
+  return (await readdir(run.dir).catch(() => [] as string[])).filter((name) => name.endsWith(".json"));
 }
 
 /** Writes a record file directly, as a worker could, bypassing the launch's own checks. */
@@ -464,7 +486,7 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
   it("does not start a launch whose run was already stopped, so a stop cannot miss a late record", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
     const runId = randomUUID();
-    // The stop runs first, while the launch is still sourcing profiles.
+    // The stop runs first, before the launch writes its record.
     const early = await stop(runOf(root, runId));
     expect(early).toMatchObject({ records: 0, partial: "no_process_record" });
 
@@ -487,24 +509,113 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(launch.stderr).toContain("not started");
   }, 30_000);
 
-  it("does not start a launch whose record is written but cannot be read back as valid", async () => {
-    // A failing `id` leaves the uid empty; a failing `cut` leaves the start time empty.
-    // The failing tool goes on PATH from the login profile, which the launch
-    // sources after /etc/profile: Debian's /etc/profile (the production image)
-    // sets PATH outright, so a PATH handed in from outside never reaches it.
-    for (const broken of ["id", "cut"]) {
-      const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
-      const bin = path.join(home, "bin");
-      await mkdir(bin);
-      await writeFile(path.join(bin, broken), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
-      await writeFile(path.join(home, ".profile"), `PATH=${bin}:$PATH; export PATH\n`);
-
-      const launch = await runLaunch({ command: "echo started", home });
-
-      expect(launch.stdout).not.toContain("started");
-      expect(launch.code).toBe(125);
+  it("never runs a tool that the run's login profile puts first on PATH", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
+    const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+    const bin = path.join(home, "bin");
+    await mkdir(bin);
+    // Each fake leaves a trace, the fake link also copies the record outside,
+    // then each runs the real tool, so the launch would still look fine.
+    for (const tool of ["link", "setsid", "id", "ls", "mkdir", "rm", "sed", "cut", "awk", "readlink"]) {
+      await writeFile(
+        path.join(bin, tool),
+        `#!/bin/sh\n: > '${victim}/${tool}'\n${tool === "link" ? `cp "$1" '${victim}/stolen' 2>/dev/null\n` : ""}for d in /usr/bin /bin; do [ -x "$d/${tool}" ] && exec "$d/${tool}" "$@"; done\nexit 127\n`,
+        { mode: 0o755 },
+      );
     }
+    await writeFile(path.join(home, ".profile"), `PATH=${bin}:$PATH; export PATH\n`);
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+
+    const launch = await runLaunch({ root, runId, home, command: "echo started" });
+
+    expect(await readdir(victim)).toEqual([]);
+    expect(launch.stdout).toContain("started");
+    expect(launch.code).toBe(0);
+    expect(await recordNames(runOf(root, runId))).toHaveLength(1);
   }, 30_000);
+
+  it("does not publish a record that cannot be read back as the stop reads it, and leaves none", async () => {
+    const run = await newRun();
+    // A process that is gone has no start time to record.
+    const gone = spawn("true");
+    await new Promise((resolve) => gone.on("close", resolve));
+
+    const result = await publish(run, { pid: gone.pid! });
+
+    expect(result.code).toBe(125);
+    expect(result.stderr).toContain("not started");
+    expect(await recordNames(run)).toEqual([]);
+  }, 30_000);
+
+  it("does not publish without a link utility that only root can change", async () => {
+    // A directory under /tmp: owned by this user, or by root inside a directory every user can write.
+    const tools = await mkdtemp(path.join(os.tmpdir(), "paperclip-tools-"));
+    await symlink("/usr/bin/link", path.join(tools, "link"));
+    const run = await newRun();
+
+    const result = await publish(run, { pid: process.pid, testOnlyToolDirs: [tools] });
+
+    expect(result.code).toBe(125);
+    expect(result.stderr).toContain("link utility");
+    expect(await recordNames(run)).toEqual([]);
+    // The real system directories qualify.
+    expect((await publish(run, { pid: process.pid })).code).toBe(0);
+  }, 30_000);
+
+  it.skipIf(!isRoot)("publishes only with a link that is a regular file owned by root and writable by root only", async () => {
+    // Directories under / so that every directory above the tool is root's.
+    const tools = path.join("/", `paperclip-tools-${randomUUID()}`);
+    const elsewhere = await mkdtemp(path.join(os.tmpdir(), "paperclip-tools-"));
+    const tool = path.join(tools, "link");
+    const real = await realpath("/usr/bin/link");
+    await mkdir(tools, { mode: 0o755 });
+    try {
+      const cases: Array<[string, () => Promise<void>, number]> = [
+        ["a root-owned copy", async () => {}, 0],
+        ["a group-writable copy", () => chmod(tool, 0o775), 125],
+        ["a copy owned by another user", async () => {
+          await chmod(tool, 0o755);
+          await chown(tool, 65534, 65534);
+        }, 125],
+        ["a link to a copy in a directory every user can write", async () => {
+          await rm(tool);
+          await copyFile(real, path.join(elsewhere, "link"));
+          await chmod(path.join(elsewhere, "link"), 0o755);
+          await symlink(path.join(elsewhere, "link"), tool);
+        }, 125],
+        ["a copy in a group-writable directory", async () => {
+          await rm(tool);
+          await copyFile(real, tool);
+          await chmod(tool, 0o755);
+          await chmod(tools, 0o775);
+        }, 125],
+      ];
+      await copyFile(real, tool);
+      await chmod(tool, 0o755);
+      for (const [label, arrange, code] of cases) {
+        await arrange();
+        const run = await newRun();
+        const result = await publish(run, { pid: process.pid, testOnlyToolDirs: [tools] });
+        expect({ label, code: result.code, records: (await recordNames(run)).length })
+          .toEqual({ label, code, records: code === 0 ? 1 : 0 });
+      }
+
+      // The record name is taken right before link(2) runs: the launch
+      // refuses and leaves the note that the run's stop reports.
+      await chmod(tools, 0o755);
+      await rm(tool);
+      await writeFile(tool, `#!/bin/sh\nln -s /nonexistent "$2"\nexec '${real}' "$@"\n`);
+      await chmod(tool, 0o755);
+      const raced = await newRun();
+      const result = await publish(raced, { pid: process.pid, testOnlyToolDirs: [tools] });
+      expect(result.code).toBe(125);
+      expect(result.stderr).toContain("already taken");
+      expect((await stop(raced))?.partial).toBe("unsafe_record_dir");
+    } finally {
+      await rm(tools, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it("does not start a launch whose marker line is missing or malformed", async () => {
     for (const stdinPrefix of ["\n", "not-a-marker\n", `${"a".repeat(31)}\n`]) {
@@ -575,6 +686,8 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(launch.code).toBe(125);
     expect(await readdir(victim)).toEqual(["file"]);
     expect(await readFile(path.join(victim, "file"), "utf8")).toBe("outside\n");
+    // The run's stop reports the refusal, not a missing record.
+    expect((await stop(runOf(root, runId)))?.partial).toBe("unsafe_record_dir");
   }, 30_000);
 
   it("leaves no record behind when a launch finds the run already stopped, so the stop mark can age out", async () => {
@@ -616,16 +729,39 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(stdout.trim()).toBe(`${REMOTE_RUN_MARKER_ENV}=${marker}`);
   }, 30_000);
 
-  it("hides the marker and the command's stdin from login profiles", async () => {
+  it("keeps the marker line and the command's stdin from login profiles", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
     await writeFile(
       path.join(home, ".profile"),
-      'read -r stolen; printf %s "$stolen" > "$HOME/stolen"; printf %s "$paperclip_run_marker" > "$HOME/seen"\n',
+      'read -r stolen; printf %s "$stolen" > "$HOME/stolen"\n',
     );
     const { stdout } = await runLaunch({ home, command: "cat" });
     expect(stdout).toBe("hello\n");
     expect(await readFile(path.join(home, "stolen"), "utf8")).toBe("");
-    expect(await readFile(path.join(home, "seen"), "utf8")).toBe("");
+  }, 30_000);
+
+  it("stops a launch that is still sourcing its login profiles, with what the profiles started", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    // The profile starts a background process, then waits until it is stopped.
+    await writeFile(path.join(home, ".profile"), 'sleep 600 & echo "$!" > "$HOME/child"; while :; do sleep 0.1; done\n');
+    const launch = runLaunch({ root, runId, home, command: "echo started" });
+    let child = 0;
+    for (const deadline = Date.now() + 10_000; !child && Date.now() < deadline; await settle()) {
+      child = Number((await readFile(path.join(home, "child"), "utf8").catch(() => "")).trim());
+    }
+    expect(child).toBeGreaterThan(0);
+
+    const summary = await stop(runOf(root, runId));
+    const { stdout, code } = await launch;
+    await settle();
+
+    expect(summary).toMatchObject({ records: 1, survived: 0, partial: null });
+    expect(summary?.matched).toBeGreaterThanOrEqual(2);
+    expect(alive(child)).toBe(false);
+    expect(stdout).not.toContain("started");
+    expect(code).toBe(143);
   }, 30_000);
 
   it("leaves a launch without a run record unchanged", async () => {

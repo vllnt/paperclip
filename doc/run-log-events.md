@@ -133,7 +133,12 @@ process group or carry an exact recorded marker, and checks each start time
 again before `SIGKILL`; `SIGKILL` and the final count use only what the first
 scan found. Both the launch and the stop work only inside that directory after
 checking that each part is a real directory owned by the worker user, never a
-link (`unsafe_record_dir` otherwise, and the launch does not start). The stop
+link (`unsafe_record_dir` otherwise, and the launch does not start). A launch
+whose record name is already taken does not start either; it leaves a `refused`
+note there, so the run's stop reports `unsafe_record_dir` too. The launch writes
+its record before any login profile runs and the stop sources none: both use
+only the tools in `/usr/bin` and `/bin`, and the launch publishes its record
+with a `link` from there that only root can change, or does not start. The stop
 first leaves a `stopped` mark there, so a launch that has not written its
 record yet does not start; marks older than a week are removed once their run
 has no record left. A lease's stop is claimed before any remote work, so two

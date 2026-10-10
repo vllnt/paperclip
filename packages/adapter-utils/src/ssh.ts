@@ -19,6 +19,7 @@ import {
   REMOTE_RUN_MARKER_ENV,
   buildRemoteProcessTreeStopLines,
   buildRemoteRunRecordLines,
+  buildTrustedToolLines,
   createRemoteRunMarker,
   parseRemoteProcessTreeStopSummary,
   type RemoteProcessTreeStopSummary,
@@ -1274,6 +1275,8 @@ export async function runSshCommand(
     stdin?: string;
     timeoutMs?: number;
     maxBuffer?: number;
+    /** `false`: source no login profile and start `/bin/sh` and `/usr/bin/env` by path. */
+    loginProfiles?: boolean;
   } = {},
 ): Promise<SshCommandResult> {
   let cleanup: () => Promise<void> = () => Promise.resolve();
@@ -1301,21 +1304,27 @@ export async function runSshCommand(
     // directly when no .bash_profile exists, so a host that adds nvm in
     // .bashrc still resolves node without a double-run of the setup.
     const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
+    const profiles = options.loginProfiles !== false;
+    const [env, sh] = profiles ? ["env", "sh"] : ["/usr/bin/env", "/bin/sh"];
     const remoteScript = [
-      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+      ...(profiles
+        ? [
+            'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+            'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+            'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+            'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+          ]
+        : []),
       envArgs.length > 0
-        ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-        : `exec sh -c ${shellQuote(remoteCommand)}`,
+        ? `exec ${env} ${envArgs.join(" ")} ${sh} -c ${shellQuote(remoteCommand)}`
+        : `exec ${sh} -c ${shellQuote(remoteCommand)}`,
     ].join(" && ");
 
     sshArgs.push(
       "-p",
       String(config.port),
       `${config.username}@${config.host}`,
-      `sh -c ${shellQuote(remoteScript)}`,
+      `${sh} -c ${shellQuote(remoteScript)}`,
     );
 
     return options.stdin != null
@@ -1361,8 +1370,9 @@ function sshRemoteRootWord(remoteRoot: string): string {
  * With `processRecord` for a heartbeat run, the command can later be stopped
  * with its whole process tree by {@link stopSshRunProcesses}: it starts in a
  * session of its own (`setsid`), with a fresh run marker in its environment,
- * and writes a launch record before it execs. The marker reaches the worker on
- * stdin (`stdinPrefix`, which the caller must write first), never in argv.
+ * and writes a launch record before any login profile runs, then sources the
+ * profiles and execs. The marker reaches the worker on stdin (`stdinPrefix`,
+ * which the caller must write first), never in argv.
  */
 export async function buildSshSpawnTarget(input: {
   spec: SshRemoteExecutionSpec;
@@ -1417,38 +1427,45 @@ export async function buildSshSpawnTarget(input: {
   } else {
     const remoteRoot = sshRemoteRootWord(input.spec.remoteWorkspacePath);
     const launchId = randomBytes(8).toString("hex");
-    // The leader records itself, stops if the run was already stopped, then
-    // execs the command with the same pid.
+    // The leader records itself before any login profile runs, so no tool of
+    // the record step comes from a profile or a PATH it sets. It stops if the
+    // run was already stopped, sources the profiles, then execs the command
+    // with the same pid. The marker is in its environment from the start, so
+    // a stop that comes meanwhile still proves its group.
     const leaderScript = (group: boolean) => [
       ...buildRemoteRunRecordLines({ remoteRoot, runId, launchId, markerSha256: marker.entrySha256, group }),
+      ...profileLines("</dev/null >/dev/null 2>&1"),
+      `cd ${shellQuote(input.spec.remoteCwd)} || exit $?`,
       execLine,
     ].join("\n");
-    // The profiles read no stdin, so they can neither take the marker line
-    // nor the command's input, and the marker is read only after them. The
-    // subshell does not lead a process group, so `setsid` starts the session
-    // without forking, and the status line after it keeps the subshell from
-    // being run in place of this shell, which leads one.
+    // This shell sources no profile, and finds `sh` and `setsid` by path. It
+    // reads the marker line before any profile runs, and the profiles read no
+    // stdin, so they can take neither that line nor the command's input; they
+    // see the marker in their environment, as every process of the launch
+    // does. The subshell does not lead a process group, so `setsid`
+    // starts the session without forking, and the status line after it keeps
+    // the subshell from being run in place of this shell, which leads one.
     remoteScript = [
-      ...profileLines("</dev/null >/dev/null 2>&1"),
-      `cd ${shellQuote(input.spec.remoteCwd)}`,
       "{ IFS= read -r paperclip_run_marker || :; }",
       // Without a valid marker the stop could not find the run's processes.
       "case \"$paperclip_run_marker\" in *[!0-9a-f]*|'') paperclip_run_marker= ;; esac",
-      "{ [ \"${#paperclip_run_marker}\" -eq 32 ] || { echo \"[paperclip] The run marker did not reach the worker, so the run was not started.\" >&2; exit 125; }; }",
+      "[ \"${#paperclip_run_marker}\" -eq 32 ] || { echo \"[paperclip] The run marker did not reach the worker, so the run was not started.\" >&2; exit 125; }",
       `export ${REMOTE_RUN_MARKER_ENV}="$paperclip_run_marker"`,
       "unset paperclip_run_marker",
-      "{ if command -v setsid >/dev/null 2>&1; then "
-        + `( exec setsid sh -c ${shellQuote(leaderScript(true))} paperclip-run ); `
-        + `else ( exec sh -c ${shellQuote(leaderScript(false))} paperclip-run ); fi; `
-        + "paperclip_run_status=$?; exit \"$paperclip_run_status\"; }",
-    ].join(" && ");
+      ...buildTrustedToolLines(),
+      "paperclip_setsid=\"$(PATH=/usr/bin:/bin; trusted_tool setsid)\" || paperclip_setsid=",
+      "if [ -n \"$paperclip_setsid\" ]; then "
+        + `( exec "$paperclip_setsid" /bin/sh -c ${shellQuote(leaderScript(true))} paperclip-run ); `
+        + `else ( exec /bin/sh -c ${shellQuote(leaderScript(false))} paperclip-run ); fi`,
+      "exit $?",
+    ].join("\n");
   }
 
   sshArgs.push(
     "-p",
     String(input.spec.port),
     `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(remoteScript)}`,
+    `${runId && marker ? "/bin/sh" : "sh"} -c ${shellQuote(remoteScript)}`,
   );
 
   return {
@@ -1489,7 +1506,12 @@ export async function stopSshRunProcesses(
     return { ...NO_STOP, partial: "no_process_record" };
   }
   try {
-    const result = await runSshCommand(config, script, { timeoutMs: options.timeoutMs ?? 20_000, maxBuffer: 64 * 1024 });
+    // No login profile: the stop uses system tools only, never the run's.
+    const result = await runSshCommand(config, script, {
+      timeoutMs: options.timeoutMs ?? 20_000,
+      maxBuffer: 64 * 1024,
+      loginProfiles: false,
+    });
     return parseRemoteProcessTreeStopSummary(result.stdout) ?? { ...NO_STOP, partial: "no_summary" };
   } catch {
     return { ...NO_STOP, partial: "worker_unreachable" };

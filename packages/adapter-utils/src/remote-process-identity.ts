@@ -74,6 +74,66 @@ const PIN_RECORD_DIR_LINES = [
   "}",
 ];
 
+// The launch's record step and the stop take tools only from these
+// directories, never from a PATH that a login profile the wrapper sources
+// could set. (The login shell's own startup files run before the wrapper,
+// out of its reach.)
+const TRUSTED_TOOL_DIRS = ["/usr/bin", "/bin"];
+const TRUSTED_TOOL_PATH = TRUSTED_TOOL_DIRS.join(":");
+
+// Shell function `trusted_tool <name>`: prints the first `<dir>/<name>` that
+// is, after its links, a regular executable file owned by root that no group
+// or other user may write, reached only through directories that are owned by
+// root and writable by root only, up to `/`. So no process of the worker user
+// can swap it before it runs. It prints the path it checked, not the file the
+// links lead to: a multicall binary (uutils, busybox) picks its tool by the
+// name it was run as. The other tools come from the same directories by PATH.
+function trustedToolLines(dirs: readonly string[]): string[] {
+  return [
+    "root_only() {",
+    "  ro_ls=\"$(ls -dn -- \"$1\" 2>/dev/null)\" || return 1",
+    "  set -f; set -- $ro_ls; set +f",
+    "  [ \"$#\" -ge 3 ] && [ \"$3\" = 0 ] || return 1",
+    "  case $1 in ?????w*|????????w*) return 1 ;; esac",
+    "}",
+    "root_only_dirs() {",
+    "  rd=$1",
+    "  while root_only \"$rd\"; do",
+    "    [ \"$rd\" != / ] || return 0",
+    "    rd=${rd%/*}",
+    "    [ -n \"$rd\" ] || rd=/",
+    "  done",
+    "  return 1",
+    "}",
+    "trusted_tool() {",
+    `  for tt_tool in ${dirs.map((dir) => `${shellQuote(dir)}/"$1"`).join(" ")}; do`,
+    "    tt_path=$tt_tool; tt_hops=0",
+    "    while :; do",
+    "      tt_dir=\"$(cd -P -- \"${tt_path%/*}/\" 2>/dev/null && pwd -P)\" && root_only_dirs \"$tt_dir\" || continue 2",
+    "      tt_path=${tt_dir%/}/${tt_path##*/}",
+    "      [ -L \"$tt_path\" ] || break",
+    "      tt_hops=$((tt_hops + 1))",
+    "      tt_link=\"$(readlink -- \"$tt_path\" 2>/dev/null)\" && [ -n \"$tt_link\" ] && [ \"$tt_hops\" -le 8 ] || continue 2",
+    "      case $tt_link in /*) tt_path=$tt_link ;; *) tt_path=${tt_dir%/}/$tt_link ;; esac",
+    "    done",
+    "    [ -f \"$tt_path\" ] && [ -x \"$tt_path\" ] && root_only \"$tt_path\" && { printf '%s\\n' \"$tt_tool\"; return 0; }",
+    "  done",
+    "  return 1",
+    "}",
+  ];
+}
+
+/**
+ * Shell lines that define `trusted_tool <name>`, which prints the path of a
+ * system utility in `/usr/bin` or `/bin` that only root can change, or fails.
+ * Call it with `PATH=/usr/bin:/bin`.
+ *
+ * @returns Lines for a launch script.
+ */
+export function buildTrustedToolLines(): string[] {
+  return trustedToolLines(TRUSTED_TOOL_DIRS);
+}
+
 function assertRunId(runId: string) {
   if (!/^[0-9A-Za-z-]+$/.test(runId)) throw new Error("invalid run id");
 }
@@ -240,18 +300,24 @@ export function createRemoteRunMarker(): RemoteRunMarker {
 /** The file a stop leaves in a run's record directory; a launch that finds it does not start. */
 export const REMOTE_RUN_STOPPED_MARK = "stopped";
 
+/** The note a launch leaves when its record name was taken; the run's stop reports it as `unsafe_record_dir`. */
+export const REMOTE_RUN_REFUSED_MARK = "refused";
+
 /**
  * Shell lines that write the launch record of the process in `pidExpression`
  * to `<launchId>.json` in the run's record directory: the identity line of
  * {@link buildRemoteProcessRecordLines}, then `{"uid":…,"marker":"<entrySha256>"}`.
  * They work in a subshell inside the pinned directory (see
- * `pin_record_dir`): they exit with 143 at once when the run was already
- * stopped (any `stopped` entry counts, a dangling link included), write a
- * temporary file create-exclusive and publish it with `link`, on names that
- * must be free. They exit with 125 when the directory cannot be pinned, a name
- * is taken, `link` is missing, or the record is not a regular file afterwards
- * or, on a worker with `/proc`, does not read back as the stop reads it. When
- * the run was stopped meanwhile, they delete their own record and exit 143.
+ * `pin_record_dir`), with `PATH=/usr/bin:/bin`: run them before any login
+ * profile, so that no tool they use comes from the run. They exit with 143 at
+ * once when the run was already stopped (any `stopped` entry counts, a
+ * dangling link included), write a temporary file create-exclusive and
+ * publish it with the `link` utility of `trusted_tool`, on names that must be
+ * free. They exit with 125 when the directory cannot be pinned, a name is
+ * taken (they leave a `refused` note for the stop), no such `link` exists, or
+ * the record is not a regular file afterwards or, on a worker with `/proc`,
+ * does not read back as the stop reads it. When the run was stopped
+ * meanwhile, they delete their own record and exit 143.
  *
  * The order is the handshake with {@link buildRemoteProcessTreeStopLines},
  * which leaves its stop mark before it reads the records: either the stop
@@ -263,6 +329,7 @@ export const REMOTE_RUN_STOPPED_MARK = "stopped";
  * @param input.markerSha256 - {@link RemoteRunMarker.entrySha256}.
  * @param input.group - Whether the launch made the process lead its own session (`setsid`).
  * @param input.pidExpression - The process; `$$` (the running shell) by default.
+ * @param input.testOnlyToolDirs - Test seam: where `link` may come from instead of `/usr/bin` and `/bin`.
  * @returns Lines for a launch script.
  */
 export function buildRemoteRunRecordLines(input: {
@@ -272,6 +339,7 @@ export function buildRemoteRunRecordLines(input: {
   markerSha256: string;
   group: boolean;
   pidExpression?: string;
+  testOnlyToolDirs?: string[];
 }): string[] {
   assertRunId(input.runId);
   if (!/^[0-9a-zA-Z]+$/.test(input.launchId)) throw new Error("invalid launch id");
@@ -281,14 +349,19 @@ export function buildRemoteRunRecordLines(input: {
     `group=${input.group ? 1 : 0}`,
     ...PIN_RECORD_DIR_LINES,
     ...RECORD_FIELDS_LINES,
+    ...trustedToolLines(input.testOnlyToolDirs ?? TRUSTED_TOOL_DIRS),
     "(",
+    `  PATH=${TRUSTED_TOOL_PATH}; export PATH`,
     `  pin_record_dir ${input.remoteRoot} ${shellQuote(input.runId)} || { echo "[paperclip] The run's process record directory on the worker is not a real directory owned by the worker user, so the run was not started." >&2; exit 125; }`,
     // A run that was already stopped gets no record at all.
     `  if [ -e ${REMOTE_RUN_STOPPED_MARK} ] || [ -L ${REMOTE_RUN_STOPPED_MARK} ]; then exit 143; fi`,
+    // The note tells the run's stop why there is no record. mkdir never
+    // follows an existing name.
+    `  refuse_taken() { mkdir -- ${REMOTE_RUN_REFUSED_MARK} 2>/dev/null; echo "[paperclip] The run's process record name was already taken on the worker, so the run was not started." >&2; exit 125; }`,
     // The launch id is visible in the remote command, so anything may already
     // be at the record's names: refuse rather than write through it.
-    `  if [ -e ${record} ] || [ -L ${record} ] || [ -e ${record}.tmp ] || [ -L ${record}.tmp ]; then echo "[paperclip] The run's process record name was already taken on the worker, so the run was not started." >&2; exit 125; fi`,
-    `  command -v link >/dev/null 2>&1 || { echo "[paperclip] The worker has no link utility to publish the run's process record, so the run was not started." >&2; exit 125; }`,
+    `  if [ -e ${record} ] || [ -L ${record} ] || [ -e ${record}.tmp ] || [ -L ${record}.tmp ]; then refuse_taken; fi`,
+    `  paperclip_link="$(trusted_tool link)" || { echo "[paperclip] The worker has no link utility in /usr/bin or /bin that only root can change, so the run was not started." >&2; exit 125; }`,
     // Readers never see a half-written record: write a tmp file, then publish
     // it with link(2), which fails on any existing name and never follows one
     // or puts the file inside a directory (mv and ln both do).
@@ -297,8 +370,10 @@ export function buildRemoteRunRecordLines(input: {
     "  {",
     ...buildRemoteProcessRecordLines(),
     `  printf '{"uid":%s,"marker":"%s"}\\n' "$(id -u)" ${shellQuote(input.markerSha256)}`,
-    `  } > ${record}.tmp ) 2>/dev/null && link ${record}.tmp ${record} 2>/dev/null && paperclip_record_written=1`,
+    `  } > ${record}.tmp ) 2>/dev/null && "$paperclip_link" ${record}.tmp ${record} 2>/dev/null && paperclip_record_written=1`,
     `  rm -f -- ${record}.tmp 2>/dev/null`,
+    // Something took the name between the check and link(2).
+    `  [ -n "$paperclip_record_written" ] || { [ ! -e ${record} ] && [ ! -L ${record} ]; } || refuse_taken`,
     // A launch that no stop could find must not start. Where the stop can
     // work (with /proc), the record must read back exactly as the stop reads
     // it; elsewhere the stop fails closed whatever the record holds.
@@ -353,7 +428,10 @@ const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
  *
  * Nothing is signalled without a valid record, when the record directory
  * cannot be pinned (`unsafe_record_dir`), or when `/proc`, `awk`, `grep`, `tr`
- * or `sha256sum` is missing; the summary names the reason. It never matches
+ * or `sha256sum` is missing in `/usr/bin` and `/bin`, the only tools it uses;
+ * the summary names the reason. A launch refused because its record name was
+ * taken leaves a `refused` note, which makes the stop `unsafe_record_dir`
+ * too. It never matches
  * command lines. Inside the pinned directory it leaves a stop mark first,
  * create-exclusive (see {@link buildRemoteRunRecordLines}); a mark it cannot
  * leave makes the stop partial (`no_stop_mark`). It deletes the records it
@@ -374,6 +452,7 @@ export function buildRemoteProcessTreeStopLines(input: {
   assertRunId(input.runId);
   const termWaitSteps = Math.max(1, Math.round((input.termWaitSeconds ?? 2) * 20));
   return [
+    `PATH=${TRUSTED_TOOL_PATH}; export PATH`,
     `name=${REMOTE_RUN_MARKER_ENV}`,
     "self=$$",
     "parent=$PPID",
@@ -447,6 +526,8 @@ export function buildRemoteProcessTreeStopLines(input: {
     "}",
     // Work only inside the pinned record directory, by relative names.
     `pinned=; if pin_record_dir ${input.remoteRoot} ${shellQuote(input.runId)}; then pinned=1; else note unsafe_record_dir; fi`,
+    // A launch of the run was refused because its record name was taken.
+    `[ -z "$pinned" ] || { [ ! -e ${REMOTE_RUN_REFUSED_MARK} ] && [ ! -L ${REMOTE_RUN_REFUSED_MARK} ]; } || { note unsafe_record_dir; rmdir -- ${REMOTE_RUN_REFUSED_MARK} 2>/dev/null || rm -f -- ${REMOTE_RUN_REFUSED_MARK} 2>/dev/null; }`,
     // Leave the stop mark before reading any record: a launch that has not
     // written its record yet will find the mark and not start. A subshell
     // keeps a failed redirection from ending the script.
