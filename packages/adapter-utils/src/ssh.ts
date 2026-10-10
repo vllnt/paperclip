@@ -1375,8 +1375,9 @@ export async function buildSshSpawnTarget(input: {
   }
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
+  // The run marker is Paperclip's own: a caller's value would replace it.
   const envArgs = Object.entries(input.env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[0] !== REMOTE_RUN_MARKER_ENV)
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
   // Source the login profiles first, then run `env KEY=VAL cmd` so
@@ -1390,11 +1391,11 @@ export async function buildSshSpawnTarget(input: {
   // .bash_profile typically sources .bashrc itself; only source .bashrc
   // directly when no .bash_profile exists, so a host that adds nvm in
   // .bashrc still resolves node without a double-run of the setup.
-  const profileLines = [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+  const profileLines = (redirect: string) => [
+    `if [ -f /etc/profile ]; then . /etc/profile ${redirect} || true; fi`,
+    `if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" ${redirect} || true; fi`,
+    `if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" ${redirect} || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" ${redirect} || true; fi`,
+    `if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" ${redirect} || true; fi`,
   ];
   const execLine = envArgs.length > 0
     ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
@@ -1403,7 +1404,7 @@ export async function buildSshSpawnTarget(input: {
   const marker = runId && SSH_RUN_ID_PATTERN.test(runId) ? createRemoteRunMarker() : null;
   let remoteScript: string;
   if (!runId || !marker) {
-    remoteScript = [...profileLines, `cd ${shellQuote(input.spec.remoteCwd)}`, execLine].join(" && ");
+    remoteScript = [...profileLines(">/dev/null 2>&1"), `cd ${shellQuote(input.spec.remoteCwd)}`, execLine].join(" && ");
   } else {
     const recordDir = sshRunProcessRecordDirWord(input.spec.remoteWorkspacePath, runId);
     const recordFile = `${recordDir}/${randomBytes(8).toString("hex")}.json`;
@@ -1412,24 +1413,23 @@ export async function buildSshSpawnTarget(input: {
       ...buildRemoteRunRecordLines({ recordFile, markerSha256: marker.entrySha256, group }),
       execLine,
     ].join("\n");
-    // Read the marker before the profiles can touch stdin. The subshell does
-    // not lead a process group, so `setsid` starts the session without
-    // forking, and the status line after it keeps the subshell from being
-    // run in place of this shell, which leads one.
+    // The profiles read no stdin, so they can neither take the marker line
+    // nor the command's input, and the marker is read only after them. The
+    // subshell does not lead a process group, so `setsid` starts the session
+    // without forking, and the status line after it keeps the subshell from
+    // being run in place of this shell, which leads one.
     remoteScript = [
-      "IFS= read -r paperclip_run_marker || :",
-      [
-        ...profileLines,
-        `{ mkdir -p ${recordDir} 2>/dev/null || :; }`,
-        `cd ${shellQuote(input.spec.remoteCwd)}`,
-        `{ [ -z "$paperclip_run_marker" ] || export ${REMOTE_RUN_MARKER_ENV}="$paperclip_run_marker"; }`,
-        "unset paperclip_run_marker",
-        "{ if command -v setsid >/dev/null 2>&1; then "
-          + `( exec setsid sh -c ${shellQuote(leaderScript(true))} paperclip-run ); `
-          + `else ( exec sh -c ${shellQuote(leaderScript(false))} paperclip-run ); fi; `
-          + "paperclip_run_status=$?; exit \"$paperclip_run_status\"; }",
-      ].join(" && "),
-    ].join("; ");
+      ...profileLines("</dev/null >/dev/null 2>&1"),
+      `{ mkdir -p ${recordDir} 2>/dev/null || :; }`,
+      `cd ${shellQuote(input.spec.remoteCwd)}`,
+      "{ IFS= read -r paperclip_run_marker || :; }",
+      `{ [ -z "$paperclip_run_marker" ] || export ${REMOTE_RUN_MARKER_ENV}="$paperclip_run_marker"; }`,
+      "unset paperclip_run_marker",
+      "{ if command -v setsid >/dev/null 2>&1; then "
+        + `( exec setsid sh -c ${shellQuote(leaderScript(true))} paperclip-run ); `
+        + `else ( exec sh -c ${shellQuote(leaderScript(false))} paperclip-run ); fi; `
+        + "paperclip_run_status=$?; exit \"$paperclip_run_status\"; }",
+    ].join(" && ");
   }
 
   sshArgs.push(

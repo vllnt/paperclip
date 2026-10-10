@@ -195,6 +195,27 @@ describe.skipIf(!isLinux)("remote process tree stop", () => {
     expect((summary?.survived ?? 0)).toBeGreaterThanOrEqual(1);
   }, 30_000);
 
+  it("does not use a group whose leader can no longer be proven after the first scan", async () => {
+    const marker = createRemoteRunMarker();
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-tree-stop-"));
+    const lateFile = path.join(dir, "late.pid");
+    // On SIGTERM the leader starts a new member of its group that carries no
+    // marker, then exits: the group can no longer be proven by its leader.
+    const leader = await startSession(
+      `trap 'env -i /bin/sh -c "exec sleep 600" & echo $! > ${lateFile}; exit 0' TERM; echo ready; while :; do sleep 0.2; done`,
+      { [REMOTE_RUN_MARKER_ENV]: marker.value },
+    );
+    const recordDir = path.join(dir, "records");
+    await writeRecord(recordDir, { pid: leader.leader!, group: true, markerSha256: marker.entrySha256 });
+
+    await stop(recordDir);
+    const late = Number((await readFile(lateFile, "utf8")).trim());
+
+    expect(alive(leader.leader!)).toBe(false);
+    expect(late).toBeGreaterThan(1);
+    expect(alive(late)).toBe(true);
+  }, 30_000);
+
   it.each([["0"], ["1"], ["-1"], ["12x"], ["99999999999"]])("signals nothing for a record whose pid is %s", async (pid) => {
     const marker = createRemoteRunMarker();
     const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-tree-stop-"));
@@ -267,6 +288,60 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(record).not.toContain(markerValue);
     const marker = createHash(`${REMOTE_RUN_MARKER_ENV}=${markerValue}`);
     expect(record).toContain(`"marker":"${marker}"`);
+  }, 30_000);
+
+  async function runLaunch(input: { env?: Record<string, string>; home?: string; command: string }) {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    await mkdir(path.join(root, "ws"), { recursive: true });
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: path.join(root, "ws"),
+        remoteWorkspacePath: root,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "sh",
+      args: ["-c", input.command],
+      env: input.env ?? {},
+      processRecord: { runId: randomUUID() },
+    });
+    const child = spawn("sh", ["-c", target.args.at(-1)!], {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: root,
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: input.home ?? root },
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stdin.end(`${target.stdinPrefix}hello\n`);
+    await new Promise((resolve) => child.on("close", resolve));
+    await target.cleanup();
+    return { stdout, marker: target.stdinPrefix!.trim() };
+  }
+
+  it("keeps its own marker when the caller's environment names the same variable", async () => {
+    const { stdout, marker } = await runLaunch({
+      env: { [REMOTE_RUN_MARKER_ENV]: "0".repeat(32) },
+      command: `tr '\\000' '\\n' < /proc/$$/environ | grep '^${REMOTE_RUN_MARKER_ENV}='`,
+    });
+    expect(stdout.trim()).toBe(`${REMOTE_RUN_MARKER_ENV}=${marker}`);
+  }, 30_000);
+
+  it("hides the marker and the command's stdin from login profiles", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
+    await writeFile(
+      path.join(home, ".profile"),
+      'read -r stolen; printf %s "$stolen" > "$HOME/stolen"; printf %s "$paperclip_run_marker" > "$HOME/seen"\n',
+    );
+    const { stdout } = await runLaunch({ home, command: "cat" });
+    expect(stdout).toBe("hello\n");
+    expect(await readFile(path.join(home, "stolen"), "utf8")).toBe("");
+    expect(await readFile(path.join(home, "seen"), "utf8")).toBe("");
   }, 30_000);
 
   it("leaves a launch without a run record unchanged", async () => {

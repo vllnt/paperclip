@@ -22,6 +22,8 @@ export interface RemoteRunProcessStopOutcome extends RemoteProcessTreeStopSummar
   outcome: "stopped" | "survived" | "partial";
 }
 
+const NO_STOP: RemoteProcessTreeStopSummary = { records: 0, matched: 0, killed: 0, skipped: 0, survived: 0, partial: null };
+
 function classify(summary: RemoteProcessTreeStopSummary): RemoteRunProcessStopOutcome["outcome"] {
   if (summary.survived > 0) return "survived";
   return summary.partial ? "partial" : "stopped";
@@ -41,7 +43,7 @@ export async function stopSshLeaseRunProcesses(
   input: { environment: Environment | null; lease: EnvironmentLease },
 ): Promise<RemoteRunProcessStopOutcome | null> {
   const { environment, lease } = input;
-  if (lease.provider !== "ssh" || !lease.heartbeatRunId || !environment) return null;
+  if (lease.provider !== "ssh" || !lease.heartbeatRunId) return null;
   if (lease.metadata?.[REMOTE_PROCESS_STOP_METADATA_KEY]) return null;
   try {
     const run = await db
@@ -52,14 +54,20 @@ export async function stopSshLeaseRunProcesses(
     if (run?.runtimeMode === "native") return null;
 
     let summary: RemoteProcessTreeStopSummary;
-    try {
-      const parsed = await resolveEnvironmentDriverConfigForRuntime(db, lease.companyId, environment, {
-        heartbeatRunId: lease.heartbeatRunId,
-      });
-      if (parsed.driver !== "ssh") return null;
-      summary = await stopSshRunProcesses(parsed.config, lease.heartbeatRunId);
-    } catch {
-      summary = { records: 0, matched: 0, killed: 0, skipped: 0, survived: 0, partial: "config_unavailable" };
+    if (!environment) {
+      // The worker's credentials went with the environment row, so nothing can
+      // reach the worker. Record that rather than release in silence.
+      summary = { ...NO_STOP, partial: "environment_deleted" };
+    } else {
+      try {
+        const parsed = await resolveEnvironmentDriverConfigForRuntime(db, lease.companyId, environment, {
+          heartbeatRunId: lease.heartbeatRunId,
+        });
+        if (parsed.driver !== "ssh") return null;
+        summary = await stopSshRunProcesses(parsed.config, lease.heartbeatRunId);
+      } catch {
+        summary = { ...NO_STOP, partial: "config_unavailable" };
+      }
     }
     const stored = { ...summary, outcome: classify(summary), at: new Date().toISOString() };
     const outcome: RemoteRunProcessStopOutcome = {

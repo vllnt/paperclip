@@ -138,7 +138,7 @@ The server writes one of these events per SSH lease:
 |---|---|---|
 | `remote_processes_stopped` | info | Nothing of the run is left on the worker. |
 | `remote_processes_survived` | warn | Some processes were still running after `SIGKILL`. |
-| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_summary` or `config_unavailable`. |
+| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_summary`, `config_unavailable` or `environment_deleted`. |
 
 The payload holds the environment id and the counts `records`, `matched`,
 `killed`, `skipped` and `survived`, plus `reason` when there is one. The marker

@@ -255,10 +255,12 @@ const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
  * - its real uid is the uid recorded at launch, which is also the stopper's;
  * - its id is an integer from 2 to the platform maximum, and it is not the
  *   stopper or the stopper's parent;
- * - it is in the process group of a recorded leader that is proven by its
- *   start time, by still leading its group and by carrying the marker, or its
- *   `/proc/<pid>/environ` holds an entry whose SHA-256 is a recorded marker
- *   hash (one NUL-separated entry, matched whole);
+ * - it is in the process group of a recorded leader that is proven, right
+ *   before the first scan, by its start time, by still leading its group and
+ *   by carrying the marker, or its `/proc/<pid>/environ` holds an entry whose
+ *   SHA-256 is a recorded marker hash (one NUL-separated entry, matched
+ *   whole). The `SIGKILL` pass and the final count use the first scan's
+ *   processes and marker carriers only, never a group proven earlier;
  * - its start time, read by the scan, is unchanged right before `SIGTERM` and
  *   again right before `SIGKILL`.
  *
@@ -320,10 +322,18 @@ export function buildRemoteProcessTreeStopLines(input: {
     "      st[$1] = f[1]; pg[$1] = f[3]; start[$1] = f[20] }",
     "    END { for (p in st) if ((p in uid) && uid[p] == me && st[p] !~ /^[ZXx]$/) print p, pg[p], start[p] }'",
     "}",
+    // Prints the `pid start` pairs of $1 that still run with the same start time.
+    "still_running() {",
+    "  set -f; set -- $1; set +f",
+    "  while [ \"$#\" -ge 2 ]; do",
+    "    if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ] && [ \"$st_state\" != Z ]; then echo \"$1 $2\"; fi",
+    "    shift 2",
+    "  done",
+    "}",
     "scan() {",
     "  candidates | while read -r sc_pid sc_pgrp sc_start; do",
     "    valid_pid \"$sc_pid\" || continue",
-    "    [ \"$sc_pid\" = \"$self\" ] || [ \"$sc_pid\" = \"$parent\" ] && continue",
+    "    case \"$sc_pid\" in \"$self\"|\"$parent\") continue ;; esac",
     "    sc_hit=0",
     "    for sc_group in $groups; do [ \"$sc_pgrp\" = \"$sc_group\" ] && sc_hit=1; done",
     "    [ \"$sc_hit\" = 1 ] || marker_matches \"$sc_pid\" || continue",
@@ -331,7 +341,7 @@ export function buildRemoteProcessTreeStopLines(input: {
     "  done",
     "}",
     "if [ ! -r /proc/self/stat ]; then note no_proc",
-    "elif [ -z \"$me\" ] || ! command -v awk >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1; then note no_tools",
+    "elif [ -z \"$me\" ] || ! command -v awk >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1; then note no_tools",
     "elif ! command -v sha256sum >/dev/null 2>&1; then note no_sha256sum",
     "else",
     "  for f in \"$dir\"/*.json; do",
@@ -355,27 +365,25 @@ export function buildRemoteProcessTreeStopLines(input: {
     "  done",
     "  [ \"$records\" -gt 0 ] || note no_process_record",
     "  if [ -n \"$hashes\" ]; then",
-    "    targets=\"$(scan)\"",
-    "    set -f; set -- $targets; set +f",
+    "    first=\"$(scan)\"",
+    // A group is proven by its leader only right before this first scan. A
+    // leader that exits later leaves its id free for reuse, so later scans
+    // find processes by their marker alone.
+    "    groups=",
+    "    set -f; set -- $first; set +f",
     "    while [ \"$#\" -ge 2 ]; do",
     "      matched=$((matched + 1))",
     "      if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ]; then kill -TERM \"$1\" 2>/dev/null || :; else skipped=$((skipped + 1)); fi",
     "      shift 2",
     "    done",
     "    i=0",
-    `    while [ "$i" -lt ${termWaitSteps} ]; do`,
-    "      set -f; set -- $targets; set +f",
-    "      left=0",
-    "      while [ \"$#\" -ge 2 ]; do",
-    "        if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ] && [ \"$st_state\" != Z ]; then left=1; break; fi",
-    "        shift 2",
-    "      done",
-    "      [ \"$left\" = 1 ] || break",
+    `    while [ "$i" -lt ${termWaitSteps} ] && [ -n "$(still_running "$first")" ]; do`,
     "      i=$((i + 1))",
     "      sleep 0.05",
     "    done",
-    // Scan again: it also finds children forked during the wait.
-    "    targets=\"$(scan)\"",
+    // The first scan's processes that still run, and any marker carrier,
+    // including a child forked during the wait.
+    "    targets=\"$( { still_running \"$first\"; scan; } | sort -u)\"",
     "    set -f; set -- $targets; set +f",
     "    while [ \"$#\" -ge 2 ]; do",
     "      t_pid=$1; t_start=$2; shift 2",
@@ -387,9 +395,7 @@ export function buildRemoteProcessTreeStopLines(input: {
     "      fi",
     "    done",
     "    sleep 0.1",
-    "    targets=\"$(scan)\"",
-    "    set -f; set -- $targets; set +f",
-    "    survived=$(($# / 2))",
+    "    survived=\"$( { still_running \"$first\"; scan; } | cut -d' ' -f1 | sort -u | grep -c .)\"",
     "  fi",
     // The records only serve this stop; the lease that started the launches is being released.
     "  [ \"$records\" -eq 0 ] || { rm -f -- \"$dir\"/*.json \"$dir\"/*.json.tmp 2>/dev/null; rmdir -- \"$dir\" 2>/dev/null; }",

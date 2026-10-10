@@ -255,6 +255,20 @@ describeStop("SSH remote process stop", () => {
     expect(partial[0]!.payload).toMatchObject({ reason: "worker_unreachable" });
   }, 90_000);
 
+  it("records a partial stop, not silence, when the lease's environment was deleted", async () => {
+    const environment = await seedEnvironment(sshConfig);
+    const run = await startRun({ environment });
+    signalRunningProcess(runningProcesses.get(run.runId)!, "SIGKILL");
+    await run.done;
+    runningProcesses.delete(run.runId);
+    await db.delete(environments).where(eq(environments.id, environment.id));
+
+    const outcomes = await runtime.stopRunProcesses(run.runId);
+
+    expect(outcomes).toMatchObject([{ outcome: "partial", partial: "environment_deleted", matched: 0 }]);
+    expect((await lease(run.leaseId)).metadata?.remoteProcessStop).toMatchObject({ outcome: "partial", partial: "environment_deleted" });
+  }, 60_000);
+
   it("keeps the run marker out of argv, logs, run events, lease metadata and the process record", async () => {
     const environment = await seedEnvironment(sshConfig);
     const run = await startRun({ environment });
