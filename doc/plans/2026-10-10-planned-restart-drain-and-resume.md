@@ -222,7 +222,8 @@ arms one in-process timer for the next event of the open drain: the deadline, th
 alert time (`deadlineAt + 10 minutes`) and the expiry. Each event re-arms it for
 the next. The timer writes the activity rows, closes the row on expiry, and logs
 the `warn` line at the alert time. Today's lazy expiry in `readTaskDrain` stays as
-a guard and also closes the row.
+a guard for admission; it is synchronous and on the hot path, so it only wakes the
+timer, which closes the row and writes the activity.
 
 **What a drain holds, as on `main`:**
 
@@ -255,31 +256,69 @@ neither field and no reason is a `manual` drain with no expiry, as today.
 ### 4.2 The deadline: stop the remaining runs through the live-process path
 
 When `deadlineAt` passes and the drain is still on, the server stops every run
-that this boot still runs, except native-runner (`paperclip_runner`) runs:
+that this boot still runs, except native-runner (`paperclip_runner`) runs.
 
-- **Path.** `cancelRunInternal`, not the shutdown loop. It is the path that stops a
-  run inside a live process: it registers the cancellation settlement that the
-  executor waits for, aborts in-process adapters, fences a run that is still
-  preparing, releases the issue lock and promotes the queue. The shutdown loop
-  (section 2.2) does none of this and would race the executor.
-- **Options.** `errorCode: "planned_restart"`, `suppressImmediateRecovery: true`
-  (the caller schedules the successor), the adapter's own grace period, and a new
-  option `terminalStatus: "interrupted"`. Today `cancelRunInternal` always writes
-  `cancelled`; a planned restart is an interruption, not an operator cancel, and
-  the conversation-continuation and reconciliation rules already treat
-  `interrupted` that way (question Q11).
-- **Concurrency.** At most 8 runs at a time, so the deadline does not fork-bomb
-  terminations; each run's grace period still applies.
-- **Successor.** After each run is stopped, the caller schedules the resume when
-  the run is resumable (section 4.5).
-- The process keeps running, with the drain on. The deploy job stops it when it
-  likes.
+**Path.** `cancelRunInternal`, not the shutdown loop. It is the path that stops a
+run inside a live process: it aborts in-process adapters, waits for a child to
+exit, and fences a run that is still preparing. The shutdown loop (section 2.2)
+does none of this and would race the executor.
+
+**`cancelRunInternal` alone is not enough.** It has two branches, and in both the
+ending and the successor can be written by someone other than the caller:
+
+- For an adapter with an in-process stop handle (`onCancellationReady`, for
+  example the acpx engine and `grok-local`), it aborts and waits; the **executor**
+  then writes the ending (`cancelled`) and releases the issue **without**
+  `suppressImmediateRecovery`, so the release queues a recovery run first.
+- For a child-process adapter, it registers a settlement and writes the ending
+  itself, then calls `releaseIssueExecutionAndPromote`. That release promotes the
+  issue's next deferred wake into a queued run that takes the issue lock, before
+  any resume exists.
+
+In both cases the `retryOfRunId` dedup would then hand the resume call an existing
+successor of the wrong kind, or the resume would meet a lock held by another run.
+
+**The stop intent.** So a planned-restart stop records an intent first, and every
+path that finalizes the run honours it:
+
+1. **Record.** Before it aborts or signals anything, the deadline caller records
+   `{ kind: "planned_restart", drainId }` for the run, in a process-local map next
+   to `processRunCancellationSettlements`, and in the run's `resultJson`
+   (`plannedRestartStop`) so the record survives if the executor reads the row.
+2. **Stop.** It calls `cancelRunInternal` with `errorCode: "planned_restart"`, the
+   adapter's own grace period, and a new option `terminalStatus: "interrupted"`.
+3. **Finalize, in whichever path writes the ending** (`cancelRunInternal`'s own
+   write, or the executor's ending write after an abort). When it sees the intent,
+   it:
+   - writes `status: "interrupted"`, `errorCode: "planned_restart"`, and the stop
+     metadata with outcome `interrupted` (not `cancelled`), including the
+     `runUsedConversationAdapter` result that the shutdown loop passes today, so
+     the class test of section 4.5 reads the same facts;
+   - classifies the run (section 4.5) and, when it is `resumed`, schedules the
+     resume **before** any release;
+   - **keeps the issue lock** when the resume was scheduled, and does **not** call
+     `releaseIssueExecutionAndPromote`. This is the shutdown loop's rule today
+     (`enqueueProcessLossRetry`; release only when no retry was made). When no
+     resume was scheduled (other classes), it releases with
+     `suppressImmediateRecovery: true`.
+4. **Clear** the intent from the map when the run is terminal.
+
+So the resume is always the first successor, no deferred wake takes the lock in
+between, and the ending is the same whichever path wins. Section 9 tests both
+branches.
+
+**Concurrency.** At most 8 runs are stopped at a time, so the deadline does not
+start dozens of terminations at once; each run's grace period still applies.
+
+The process keeps running, with the drain on. The deploy job stops it when it
+likes. Nothing else starts in between: `startNextQueuedRunForAgent` and
+`sweepDeferredWakes` are suppressed during the drain.
 
 **A stop before the deadline.** The shutdown loop also writes `planned_restart`
 (not `server_shutdown_interrupted`) for a run that it ends while a
 `planned_restart` drain is open, and schedules the resume in place of the
-transient retry. The process exits right after, so the race in section 2.2 does
-not apply. Without a drain, shutdown is unchanged (section 5.1).
+transient retry, with its existing lock rule. The process exits right after, so
+the race above does not apply. Without a drain, shutdown is unchanged (section 5.1).
 
 Why stop the runs at the deadline, and not at the stop: the stop is controlled by
 the deploy job and the container runtime. A short stop timeout kills the process
@@ -387,9 +426,11 @@ state is set from the row when the row is opened and cleared when it is closed.
 **Who closes the row at a restart.** The old process closes it with
 `process_stopped` in its shutdown handler, after the run loop. If the old process
 was killed first, the new process closes every open row whose `boot_id` is not its
-own, with `process_stopped`, as the first step of startup recovery: before the
-suppression check (`index.ts:1501`), because it is a database write only, and
-before the reap (`index.ts:1554`), because D2 reads it there. It **never**
+own, with `process_stopped`, as the first step of startup recovery: inside the
+block that runs only when scheduling is **not** suppressed (`index.ts:1501`), and
+before the reap (`index.ts:1554`), because D2 reads it there. A suppressed process
+(a worktree instance, a database restore) never closes a row: it may share the
+database with a live instance whose drain is open. It **never**
 re-applies a drain from the table. A drain that survived a restart would hold
 admission and skip startup recovery.
 
@@ -422,9 +463,9 @@ delay 0, and the wake reason `planned_restart_resume`. It writes a
 `retryOfRunId` dedup means the reaper, the shutdown loop and the stranded sweep
 cannot schedule a second successor for the same run. The dedup returns **any**
 existing successor, whatever its reason, so the resume must be the first successor
-written. The deadline path guarantees this: `cancelRunInternal` settles the
-executor before it records an ending of its own, and `suppressImmediateRecovery`
-keeps the release path from scheduling one (section 9 tests the race).
+written. The stop intent of section 4.2 guarantees this: whichever path
+writes the ending also writes the resume, before any release (section 9 tests
+both branches).
 
 **Slots and budget.** The claim enforces them: `startNextQueuedRunForAgent` checks
 `maxConcurrentRuns`, and `claimQueuedRun` checks `budgets.getInvocationBlock` and
@@ -591,7 +632,7 @@ normal retry event, in the run's own company.
 
 | Slice | Content | Depends on |
 |---|---|---|
-| **D1** | `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the deadline stop through `cancelRunInternal` (with `terminalStatus`) and the shutdown ending inside a drain; `planned_restart` code, its consumers and the cause-rules bump; the run classes; the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries | none |
+| **D1** | `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the deadline stop through `cancelRunInternal` with the planned-restart stop intent honoured by both finalize paths (section 4.2), and the shutdown ending inside a drain; `planned_restart` code, its consumers and the cause-rules bump; the run classes; the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries | none |
 | **D2** | Startup classification of runs killed during a drain (section 5.2); `orphaned_running_run` cause mapping; `stop_grace_period` in `deploy/compose.yaml` (question Q9) | D1 |
 
 D1 is useful alone: the deploy job can drain, and the runs end clean and resume.
@@ -606,11 +647,16 @@ D1, embedded Postgres unless noted:
 - The start table of section 4.1, one test per row, including the upgrade from
   `manual`, the `409` and the `422`; `{ ttlMs }` alone still replaces a `manual`
   drain as today.
-- **The deadline race.** A run whose executor is waiting on its adapter is stopped
-  at the deadline: the row ends `interrupted` / `planned_restart` (not `failed`),
-  exactly one successor row exists and it is `planned_restart_resume` (not
-  `transient_failure`). Also for an in-process adapter (aborted) and for a run that
-  is claimed but still preparing (fenced).
+- **The deadline race, both branches.** (a) A child-process adapter run and (b) an
+  in-process-stop adapter run (the acpx engine) are stopped at the deadline. For
+  each: the row ends `interrupted` / `planned_restart` (not `failed` or
+  `cancelled`), the stop metadata outcome is `interrupted`, exactly one successor
+  exists and it is `planned_restart_resume` (not a recovery run or
+  `transient_failure`), and the issue lock stays with the stopped run. (c) A run
+  that is claimed but still preparing is fenced the same way.
+- **No promotion into the lock.** An issue with a parked deferred wake: after the
+  deadline stop, the wake is still parked and the lock is not held by a new run;
+  after the restart, the resume runs first.
 - At the deadline, a native-runner run is not stopped; `phase` becomes
   `ended_at_deadline` only after the in-process counts reach 0.
 - **Classes.** A conversation-continuation run gets the resume. A legacy run that
@@ -619,7 +665,8 @@ D1, embedded Postgres unless noted:
 - A `SIGTERM` during a `planned_restart` drain writes `planned_restart`; without a
   drain it writes `server_shutdown_interrupted` (unchanged).
 - After a simulated restart (new service instance, open row of another boot): the
-  row closes with `process_stopped` before the reap, the in-memory drain is off,
+  row closes with `process_stopped` before the reap; a suppressed process (worktree
+  flag set) leaves the row open; the in-memory drain is off,
   startup recovery runs, the resume starts on the same issue with the note,
   `failureRetries` is unchanged, `transientRetryBudgetSpent` stays false, and the
   reconciliation gate does not trip.
@@ -654,6 +701,7 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
 | A new drain mode next to the task drain | Two admission switches for one need. The task drain already holds admission correctly, including queued wakes |
 | End the runs only at the stop | The stop timeout is outside the server's control; a short one turns the clean ending into `process_lost` (section 2.2) |
 | Reuse the shutdown loop at the deadline | It races the executor in a live process (section 2.2); `cancelRunInternal` is the live-process path |
+| Call `cancelRunInternal` with options only | Its in-process-stop branch lets the executor write the ending and queue a recovery run, and its release promotes a deferred wake into the lock first (section 4.2); a stop intent that every finalizer honours is needed |
 | Persist the drain and re-apply it after a restart | A drain that survives the restart would skip startup recovery and hold admission with no deploy job left to lift it |
 | Resume every interrupted run | A run that needs reconciliation may have done its tool actions already; running it again could repeat them (section 2.5) |
 | Resume through a new wake and not a retry row | A second dispatch path. The retry row already has the issue, the agent and the slot and budget checks at claim |
@@ -694,7 +742,8 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
   where the instance has a Cloud identity; otherwise an instance-admin board API key
   stored as a deploy secret. Never an agent key.
 - **Q11. Status of a run stopped at the deadline?** Recommend: `interrupted`,
-  through a new `terminalStatus` option on `cancelRunInternal`. `cancelled` would
+  through the stop intent and a `terminalStatus` option on `cancelRunInternal`
+  (section 4.2), with the stop metadata outcome following it. `cancelled` would
   read as an operator decision, and the conversation-continuation rule matches
   `interrupted`. Alternative: keep `cancelled` and teach each consumer about
   `planned_restart`; more places to change.
@@ -730,6 +779,10 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
 | Retry accounting that does not spend failures | `server/src/services/execution-recovery-attempt.ts`: `historicalFailureCount` `:29-40`, `nonFailureLane` `:45`, `executionRetryAttemptCount` `:59-65`, `accountingForScheduledRetry` `:67-72`; the snapshot written by `scheduleBoundedRetryForRun` `heartbeat.ts:16343-16351` |
 | Reconciliation gate for a retry | `server/src/services/legacy-execution-recovery.ts:19-56` (`legacyExecutionNeedsReconciliation`); refusal in `scheduleBoundedRetryForRun` `heartbeat.ts:16224-16233`; native and chat exclusions `:14802-14808` |
 | Live-process stop | `heartbeat.ts:31460` (`cancelRunInternal`), options `:31438-31447` (`errorCode`, `suppressImmediateRecovery`, `terminationGraceMs`); settlement map `:1370`, used by the executor `:26938` |
+| Settlement only for child-process adapters | `heartbeat.ts:31545-31550` (`!control`); in-process stop handle registered at `:26586` (`onCancellationReady`); the control branch returns when the executor already finalized `:31628-31646` |
+| Executor's own release (no suppression for a stop) | `heartbeat.ts:27445-27452` |
+| Shutdown keeps the lock when a retry is scheduled | `heartbeat.ts:15629-15634` |
+| Release promotes the next deferred wake | wake-queue `application/use-cases.ts` (`runReleaseDrain`), lock write in `adapters/postgres.ts` |
 | Retry dedup by `retryOfRunId` | `heartbeat.ts:16446-16461` (returns any existing successor, whatever its reason) |
 | Consumers of `server_shutdown_interrupted` | `run-cancellation.ts:50`; `heartbeat.ts:28354`; `legacy-execution-recovery.ts:190`; `execution-recovery-resolution.ts:501`; `conversation-continuation.ts:80` (matches status) |
 | Periodic recovery gated on suppression | `index.ts:1827`; timers return early `heartbeat.ts:32304-32311` |
