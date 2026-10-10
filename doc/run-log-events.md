@@ -130,9 +130,14 @@ lease. Each launch records its leader in
 child a random marker in the `PAPERCLIP_RUN_MARKER` environment variable; the
 stop signals only the worker user's processes that are in the verified leader's
 process group or carry an exact recorded marker, and checks each start time
-again before `SIGKILL`. The stop first leaves a `stopped` mark in that
-directory, so a launch that has not written its record yet does not start;
-marks older than a week are removed. It connects to the worker and root
+again before `SIGKILL`; `SIGKILL` and the final count use only what the first
+scan found. Both the launch and the stop work only inside that directory after
+checking that each part is a real directory owned by the worker user, never a
+link (`unsafe_record_dir` otherwise, and the launch does not start). The stop
+first leaves a `stopped` mark there, so a launch that has not written its
+record yet does not start; marks older than a week are removed once their run
+has no record left. A lease's stop is claimed before any remote work, so two
+release paths never stop the same lease twice. It connects to the worker and root
 recorded when the lease was acquired, even if the environment was edited since.
 
 The server writes one of these events per SSH lease:
@@ -141,7 +146,7 @@ The server writes one of these events per SSH lease:
 |---|---|---|
 | `remote_processes_stopped` | info | Nothing of the run is left on the worker. |
 | `remote_processes_survived` | warn | Some processes were still running after `SIGKILL`. |
-| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_stop_mark`, `no_summary`, `config_unavailable`, `environment_changed` or `environment_deleted`. |
+| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_stop_mark`, `unsafe_record_dir`, `no_summary`, `config_unavailable`, `environment_changed` or `environment_deleted`. |
 
 The payload holds the environment id and the counts `records`, `matched`,
 `killed`, `skipped` and `survived`, plus `reason` when there is one. The marker

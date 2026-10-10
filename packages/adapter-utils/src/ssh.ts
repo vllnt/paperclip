@@ -1341,9 +1341,8 @@ export function sshRunProcessRecordDir(remoteRoot: string, runId: string): strin
 }
 
 // A relative root is relative to the login directory, as `ensureSshWorkspaceReady` resolves it.
-function sshRunProcessRecordDirWord(remoteRoot: string, runId: string): string {
-  const dir = sshRunProcessRecordDir(remoteRoot, runId);
-  return dir.startsWith("/") ? shellQuote(dir) : `"$HOME"/${shellQuote(dir)}`;
+function sshRemoteRootWord(remoteRoot: string): string {
+  return remoteRoot.startsWith("/") ? shellQuote(remoteRoot) : `"$HOME"/${shellQuote(remoteRoot)}`;
 }
 
 /**
@@ -1406,12 +1405,12 @@ export async function buildSshSpawnTarget(input: {
   if (!runId || !marker) {
     remoteScript = [...profileLines(">/dev/null 2>&1"), `cd ${shellQuote(input.spec.remoteCwd)}`, execLine].join(" && ");
   } else {
-    const recordDir = sshRunProcessRecordDirWord(input.spec.remoteWorkspacePath, runId);
+    const remoteRoot = sshRemoteRootWord(input.spec.remoteWorkspacePath);
     const launchId = randomBytes(8).toString("hex");
     // The leader records itself, stops if the run was already stopped, then
     // execs the command with the same pid.
     const leaderScript = (group: boolean) => [
-      ...buildRemoteRunRecordLines({ recordDir, launchId, markerSha256: marker.entrySha256, group }),
+      ...buildRemoteRunRecordLines({ remoteRoot, runId, launchId, markerSha256: marker.entrySha256, group }),
       execLine,
     ].join("\n");
     // The profiles read no stdin, so they can neither take the marker line
@@ -1421,7 +1420,6 @@ export async function buildSshSpawnTarget(input: {
     // being run in place of this shell, which leads one.
     remoteScript = [
       ...profileLines("</dev/null >/dev/null 2>&1"),
-      `{ mkdir -p ${recordDir} 2>/dev/null || :; }`,
       `cd ${shellQuote(input.spec.remoteCwd)}`,
       "{ IFS= read -r paperclip_run_marker || :; }",
       // Without a valid marker the stop could not find the run's processes.
@@ -1471,8 +1469,10 @@ export async function stopSshRunProcesses(
 ): Promise<RemoteProcessTreeStopSummary> {
   let script: string;
   try {
+    sshRunProcessRecordDir(config.remoteWorkspacePath, runId);
     script = buildRemoteProcessTreeStopLines({
-      recordDir: sshRunProcessRecordDirWord(config.remoteWorkspacePath, runId),
+      remoteRoot: sshRemoteRootWord(config.remoteWorkspacePath),
+      runId,
       termWaitSeconds: options.termWaitSeconds ?? 5,
     }).join("\n");
   } catch {

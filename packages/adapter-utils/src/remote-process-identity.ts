@@ -51,6 +51,33 @@ const RECORD_FIELDS_LINES = [
   "}",
 ];
 
+// Shell function shared by the launch and the stop: enters the run's record
+// directory, `<root>/.paperclip-runtime/processes/<run>`, only when each of
+// the three parts is a real directory (never a link) owned by the worker user,
+// creating a missing part, and the physical path is the expected one. Callers
+// then use relative names only, so a path swapped after the check redirects
+// nothing.
+const PIN_RECORD_DIR_LINES = [
+  "pin_record_dir() {",
+  "  cd -P -- \"$1\" 2>/dev/null || return 1",
+  "  pr_base=\"$(pwd -P)\"",
+  "  [ \"$pr_base\" != / ] || pr_base=",
+  "  pr_me=\"$(id -u 2>/dev/null)\"",
+  "  [ -n \"$pr_me\" ] || return 1",
+  "  for pr_part in .paperclip-runtime processes \"$2\"; do",
+  "    [ -e \"$pr_part\" ] || [ -L \"$pr_part\" ] || mkdir -- \"$pr_part\" 2>/dev/null || :",
+  "    [ -d \"$pr_part\" ] && [ ! -L \"$pr_part\" ] || return 1",
+  "    [ \"$(ls -dn -- \"$pr_part\" 2>/dev/null | awk '{print $3}')\" = \"$pr_me\" ] || return 1",
+  "    cd -P -- \"$pr_part\" 2>/dev/null || return 1",
+  "  done",
+  "  [ \"$(pwd -P)\" = \"$pr_base/.paperclip-runtime/processes/$2\" ]",
+  "}",
+];
+
+function assertRunId(runId: string) {
+  if (!/^[0-9A-Za-z-]+$/.test(runId)) throw new Error("invalid run id");
+}
+
 const VALID_PID_LINES = [
   "pid_max=\"$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 4194304)\"",
   "valid_pid() {",
@@ -215,18 +242,21 @@ export const REMOTE_RUN_STOPPED_MARK = "stopped";
 
 /**
  * Shell lines that write the launch record of the process in `pidExpression`
- * to `<recordDir>/<launchId>.json`: the identity line of
+ * to `<launchId>.json` in the run's record directory: the identity line of
  * {@link buildRemoteProcessRecordLines}, then `{"uid":…,"marker":"<entrySha256>"}`.
- * They write a temporary file and rename it, and exit with 125 when the
- * record is not there afterwards or, on a worker with `/proc`, does not read
- * back as the stop reads it. Then they exit with 143 when the run was already
- * stopped.
+ * They work in a subshell inside the pinned directory (see
+ * `pin_record_dir`), write a temporary file create-exclusive and rename it,
+ * and exit with 125 when the directory cannot be pinned or the record is not
+ * there afterwards or, on a worker with `/proc`, does not read back as the
+ * stop reads it. Then they exit with 143 when the run was already stopped:
+ * any `stopped` entry counts, a dangling link included.
  *
  * The order is the handshake with {@link buildRemoteProcessTreeStopLines},
  * which leaves its stop mark before it reads the records: either the stop
  * reads this record and finds the process, or this check finds the mark.
  *
- * @param input.recordDir - A shell word naming the run's record directory.
+ * @param input.remoteRoot - A shell word naming the environment's remote workspace root.
+ * @param input.runId - The heartbeat run id; letters, digits and dashes only.
  * @param input.launchId - Names this launch's record; letters and digits only.
  * @param input.markerSha256 - {@link RemoteRunMarker.entrySha256}.
  * @param input.group - Whether the launch made the process lead its own session (`setsid`).
@@ -234,29 +264,37 @@ export const REMOTE_RUN_STOPPED_MARK = "stopped";
  * @returns Lines for a launch script.
  */
 export function buildRemoteRunRecordLines(input: {
-  recordDir: string;
+  remoteRoot: string;
+  runId: string;
   launchId: string;
   markerSha256: string;
   group: boolean;
   pidExpression?: string;
 }): string[] {
+  assertRunId(input.runId);
   if (!/^[0-9a-zA-Z]+$/.test(input.launchId)) throw new Error("invalid launch id");
-  const recordFile = `${input.recordDir}/${input.launchId}.json`;
+  const record = `${input.launchId}.json`;
   return [
     `pid=${input.pidExpression ?? "$$"}`,
     `group=${input.group ? 1 : 0}`,
-    "{",
+    ...PIN_RECORD_DIR_LINES,
+    ...RECORD_FIELDS_LINES,
+    "(",
+    `  pin_record_dir ${input.remoteRoot} ${shellQuote(input.runId)} || { echo "[paperclip] The run's process record directory on the worker is not a real directory owned by the worker user, so the run was not started." >&2; exit 125; }`,
+    `  rm -f -- ${record}.tmp 2>/dev/null`,
+    "  ( set -C",
+    "  {",
     ...buildRemoteProcessRecordLines(),
-    `printf '{"uid":%s,"marker":"%s"}\\n' "$(id -u)" ${shellQuote(input.markerSha256)}`,
-    `} > ${recordFile}.tmp 2>/dev/null && mv -f ${recordFile}.tmp ${recordFile} 2>/dev/null`,
+    `  printf '{"uid":%s,"marker":"%s"}\\n' "$(id -u)" ${shellQuote(input.markerSha256)}`,
+    `  } > ${record}.tmp ) 2>/dev/null && mv -f -- ${record}.tmp ${record} 2>/dev/null`,
     // A launch that no stop could find must not start. Where the stop can
     // work (with /proc), the record must read back exactly as the stop reads
     // it; elsewhere the stop fails closed whatever the record holds.
-    ...RECORD_FIELDS_LINES,
-    "paperclip_record_ok=",
-    `if [ ! -s ${recordFile} ]; then :; elif [ -d /proc/self ]; then set -f; set -- $(record_fields ${recordFile}); set +f; [ "$#" -eq 5 ] && [ "$1" = "$pid" ] && paperclip_record_ok=1; else paperclip_record_ok=1; fi`,
-    `[ -n "$paperclip_record_ok" ] || { echo "[paperclip] The run's process record could not be written on the worker, so the run was not started." >&2; exit 125; }`,
-    `[ ! -e ${input.recordDir}/${REMOTE_RUN_STOPPED_MARK} ] || exit 143`,
+    "  paperclip_record_ok=",
+    `  if [ ! -s ${record} ]; then :; elif [ -d /proc/self ]; then set -f; set -- $(record_fields ${record}); set +f; [ "$#" -eq 5 ] && [ "$1" = "$pid" ] && paperclip_record_ok=1; else paperclip_record_ok=1; fi`,
+    `  [ -n "$paperclip_record_ok" ] || { echo "[paperclip] The run's process record could not be written on the worker, so the run was not started." >&2; exit 125; }`,
+    `  if [ -e ${REMOTE_RUN_STOPPED_MARK} ] || [ -L ${REMOTE_RUN_STOPPED_MARK} ]; then exit 143; fi`,
+    ") || exit $?",
   ];
 }
 
@@ -279,45 +317,45 @@ export interface RemoteProcessTreeStopSummary {
 const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
 
 /**
- * Shell lines that stop every process of the launches recorded in `recordDir`
+ * Shell lines that stop every process of the launches recorded for `runId`
  * and print one summary line. A process is signalled only when all of these
  * hold, checked again right before each signal:
  *
  * - its real uid is the uid recorded at launch, which is also the stopper's;
  * - its id is an integer from 2 to the platform maximum, and it is not the
  *   stopper or the stopper's parent;
- * - it is in the process group of a recorded leader that is proven, right
- *   before the first scan, by its start time, by still leading its group and
- *   by carrying the marker, or its `/proc/<pid>/environ` holds an entry whose
- *   SHA-256 is a recorded marker hash (one NUL-separated entry, matched
- *   whole). The `SIGKILL` pass and the final count use the first scan's
- *   processes and marker carriers only, never a group proven earlier;
+ * - the first scan found it: in the process group of a recorded leader that
+ *   is proven, right before that scan, by its start time, by still leading its
+ *   group and by carrying the marker, or with a `/proc/<pid>/environ` entry
+ *   whose SHA-256 is a recorded marker hash (one NUL-separated entry, matched
+ *   whole). The `SIGKILL` pass and the final count use that set only;
  * - its start time, read by the scan, and its real uid are unchanged right
  *   before `SIGTERM` and again right before `SIGKILL`.
  *
- * Nothing is signalled without a valid record, or when `/proc`, `awk`, `grep`,
- * `tr` or `sha256sum` is missing; the summary names the reason. It never
- * matches command lines. It leaves a stop mark first (see
- * {@link buildRemoteRunRecordLines}), deletes the records it read, and drops
- * stop marks older than a week.
+ * Nothing is signalled without a valid record, when the record directory
+ * cannot be pinned (`unsafe_record_dir`), or when `/proc`, `awk`, `grep`, `tr`
+ * or `sha256sum` is missing; the summary names the reason. It never matches
+ * command lines. Inside the pinned directory it leaves a stop mark first,
+ * create-exclusive (see {@link buildRemoteRunRecordLines}); a mark it cannot
+ * leave makes the stop partial (`no_stop_mark`). It deletes the records it
+ * read, and drops stop marks older than a week whose run has no record left.
  *
- * @param input.recordDir - A shell word naming the directory of launch records.
+ * @param input.remoteRoot - A shell word naming the environment's remote workspace root.
+ * @param input.runId - The heartbeat run id; letters, digits and dashes only.
  * @param input.termWaitSeconds - How long to wait after `SIGTERM`; 2 by default.
  * @param input.testOnlyBeforeSignal - Test seam: a shell function body run with the pid and `TERM` or `KILL` before each recheck.
  * @returns Lines for a stop script.
  */
 export function buildRemoteProcessTreeStopLines(input: {
-  recordDir: string;
+  remoteRoot: string;
+  runId: string;
   termWaitSeconds?: number;
   testOnlyBeforeSignal?: string;
 }): string[] {
+  assertRunId(input.runId);
   const termWaitSteps = Math.max(1, Math.round((input.termWaitSeconds ?? 2) * 20));
   return [
-    `dir=${input.recordDir}`,
     `name=${REMOTE_RUN_MARKER_ENV}`,
-    // Leave the stop mark before reading any record: a launch that has not
-    // written its record yet will find the mark and not start.
-    `stop_mark_failed=; mkdir -p "$dir" 2>/dev/null; : > "$dir/${REMOTE_RUN_STOPPED_MARK}" 2>/dev/null || stop_mark_failed=1`,
     "self=$$",
     "parent=$PPID",
     "me=\"$(id -u 2>/dev/null)\"",
@@ -326,6 +364,7 @@ export function buildRemoteProcessTreeStopLines(input: {
     "groups=",
     "hashes=",
     ...VALID_PID_LINES,
+    ...PIN_RECORD_DIR_LINES,
     ...RECORD_FIELDS_LINES,
     "note() { [ -n \"$partial\" ] || partial=$1; }",
     `before_signal() { ${input.testOnlyBeforeSignal ?? ":"}; }`,
@@ -388,13 +427,19 @@ export function buildRemoteProcessTreeStopLines(input: {
     "    echo \"$sc_pid $sc_start\"",
     "  done",
     "}",
-    "[ -z \"$stop_mark_failed\" ] || note no_stop_mark",
-    "if [ ! -r /proc/self/stat ]; then note no_proc",
-    "elif [ -z \"$me\" ] || ! command -v awk >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1; then note no_tools",
+    // Work only inside the pinned record directory, by relative names.
+    `pinned=; if pin_record_dir ${input.remoteRoot} ${shellQuote(input.runId)}; then pinned=1; else note unsafe_record_dir; fi`,
+    // Leave the stop mark before reading any record: a launch that has not
+    // written its record yet will find the mark and not start. A subshell
+    // keeps a failed redirection from ending the script.
+    `[ -z "$pinned" ] || { rm -f -- ${REMOTE_RUN_STOPPED_MARK} 2>/dev/null; ( set -C; : > ${REMOTE_RUN_STOPPED_MARK} ) 2>/dev/null || note no_stop_mark; }`,
+    "if [ -z \"$pinned\" ]; then :",
+    "elif [ ! -r /proc/self/stat ]; then note no_proc",
+    "elif [ -z \"$me\" ] || ! command -v awk >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1; then note no_tools",
     "elif ! command -v sha256sum >/dev/null 2>&1; then note no_sha256sum",
     "else",
-    "  for f in \"$dir\"/*.json; do",
-    "    [ -f \"$f\" ] || continue",
+    "  for f in *.json; do",
+    "    [ -f \"$f\" ] && [ ! -L \"$f\" ] || continue",
     "    records=$((records + 1))",
     "    set -f; set -- $(record_fields \"$f\"); set +f",
     "    if [ \"$#\" -ne 5 ] || ! valid_pid \"$1\"; then note bad_record; continue; fi",
@@ -429,9 +474,8 @@ export function buildRemoteProcessTreeStopLines(input: {
     "      i=$((i + 1))",
     "      sleep 0.05",
     "    done",
-    // The first scan's processes that still run, and any marker carrier,
-    // including a child forked during the wait.
-    "    targets=\"$( { still_running \"$first\"; scan; } | sort -u)\"",
+    // Only the first scan's processes that are still the same ones.
+    "    targets=\"$(still_running \"$first\")\"",
     "    set -f; set -- $targets; set +f",
     "    while [ \"$#\" -ge 2 ]; do",
     "      t_pid=$1; t_start=$2; shift 2",
@@ -443,15 +487,16 @@ export function buildRemoteProcessTreeStopLines(input: {
     "      fi",
     "    done",
     "    sleep 0.1",
-    "    survived=\"$( { still_running \"$first\"; scan; } | cut -d' ' -f1 | sort -u | grep -c .)\"",
+    "    survived=\"$(still_running \"$first\" | grep -c .)\"",
     "  fi",
     // The records only serve this stop; the lease that started the launches
     // is being released. The stop mark stays.
-    "  [ \"$records\" -eq 0 ] || rm -f -- \"$dir\"/*.json \"$dir\"/*.json.tmp 2>/dev/null",
+    "  [ \"$records\" -eq 0 ] || rm -f -- *.json *.json.tmp 2>/dev/null",
     "fi",
-    // No launch of a run starts a week after its stop: drop older marks and
-    // their directories.
-    `find "\${dir%/*}" -mindepth 2 -maxdepth 2 -type f -name ${REMOTE_RUN_STOPPED_MARK} -mtime +7 -exec sh -c 'for f; do rm -f -- "$f"; rmdir -- "\${f%/*}" 2>/dev/null; done' sh {} + 2>/dev/null`,
+    // No launch of a run starts a week after its stop: from the pinned
+    // `processes` directory, drop older marks and their directories, but keep
+    // a mark while its run still has a record.
+    `[ -z "$pinned" ] || ! cd -P .. 2>/dev/null || find . -mindepth 2 -maxdepth 2 -type f -name ${REMOTE_RUN_STOPPED_MARK} -mtime +7 -exec sh -c 'for f; do d=\${f%/*}; for r in "$d"/*.json "$d"/*.json.tmp; do [ -e "$r" ] && continue 2; done; rm -f -- "$f"; rmdir -- "$d" 2>/dev/null; done' sh {} + 2>/dev/null`,
     `printf '${STOP_SUMMARY_PREFIX} records=%s matched=%s killed=%s skipped=%s survived=%s partial=%s\\n' "$records" "$matched" "$killed" "$skipped" "$survived" "\${partial:--}"`,
     "exit 0",
   ];
