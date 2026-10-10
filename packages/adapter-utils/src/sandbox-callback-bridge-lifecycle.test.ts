@@ -1,8 +1,8 @@
-import { execFile as execFileCallback, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createFileSystemSandboxCallbackBridgeQueueClient,
@@ -15,9 +15,11 @@ import {
 } from "./sandbox-callback-bridge.js";
 import type { RunProcessResult } from "./server-utils.js";
 
-const execFile = promisify(execFileCallback);
 const RUN_ID = "11111111-2222-4333-8444-555555555555";
 const BRIDGE_TOKEN = "lifecycle-test-token";
+// The stop proves a process is the bridge through /proc. Without it (macOS)
+// the stop signals nothing, so tests that expect a stopped bridge need Linux.
+const HAS_PROC = existsSync("/proc/self/stat");
 const HAS_BUSYBOX = (() => {
   try {
     execFileSync("busybox", ["true"]);
@@ -27,9 +29,22 @@ const HAS_BUSYBOX = (() => {
   }
 })();
 
+interface RunnerOptions {
+  // The worker's `sh`.
+  shell?: string[];
+  // Run the stop's control shell in a new process group with a `sleep`
+  // bystander, whose id goes to this file. A signal to the control shell's
+  // group would reach the bystander.
+  groupBystanderFile?: string;
+  // Rewrite a control script before it runs, as a worker with other files would see it.
+  rewriteScript?: (script: string) => string;
+  // Rewrite a control command's output.
+  rewriteStdout?: (stdout: string, script: string) => string;
+}
+
 // Runs the bridge control commands on this host, the way an SSH runner runs
-// them on a worker. `shell` is the worker's `sh`.
-function createRunner(shell: string[] = ["/bin/sh"]) {
+// them on a worker.
+function createRunner(options: RunnerOptions = {}) {
   return {
     execute: async (input: {
       command: string;
@@ -39,28 +54,38 @@ function createRunner(shell: string[] = ["/bin/sh"]) {
       timeoutMs?: number;
     }): Promise<RunProcessResult> => {
       const startedAt = new Date().toISOString();
-      const [command = "/bin/sh", ...prefix] = input.command === "bash" ? ["/bin/bash"] : shell;
-      try {
-        const result = await execFile(command, [...prefix, ...(input.args ?? [])], {
-          cwd: input.cwd,
-          env: { ...process.env, ...input.env },
-          timeout: input.timeoutMs,
-        });
-        return { exitCode: 0, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
-      } catch (error) {
-        const failure = error instanceof Error ? Object.assign({ stdout: "", stderr: "" }, error) : { stdout: "", stderr: String(error) };
-        return { exitCode: 1, signal: null, timedOut: false, stdout: String(failure.stdout), stderr: String(failure.stderr), pid: null, startedAt };
-      }
+      const [command = "/bin/sh", ...prefix] = input.command === "bash" ? ["/bin/bash"] : options.shell ?? ["/bin/sh"];
+      const args = [...(input.args ?? [])];
+      const original = args[1] ?? "";
+      let script = options.rewriteScript ? options.rewriteScript(original) : original;
+      const isStop = original.includes("kill -TERM");
+      if (options.groupBystanderFile && isStop) script = `sleep 60 >/dev/null 2>&1 & echo $! > '${options.groupBystanderFile}'\n${script}`;
+      args[1] = script;
+      const child = spawn(command, [...prefix, ...args], {
+        cwd: input.cwd,
+        env: { ...process.env, ...input.env },
+        detached: Boolean(options.groupBystanderFile) && isStop,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk) => { stdout += chunk; });
+      child.stderr?.on("data", (chunk) => { stderr += chunk; });
+      const exitCode: number | null = await new Promise((resolve) => child.on("close", (code) => resolve(code)));
+      if (options.rewriteStdout) stdout = options.rewriteStdout(stdout, original);
+      return { exitCode, signal: null, timedOut: false, stdout, stderr, pid: null, startedAt };
     },
   };
 }
 
-// A stand-in bridge that reports ready and then ignores SIGTERM.
+// A stand-in bridge that reports ready and then ignores SIGTERM. It marks a
+// received SIGTERM in `term-received`.
 const STUBBORN_BRIDGE = `
 import { createServer } from "node:http";
-import { promises as fs } from "node:fs";
-process.on("SIGTERM", () => {});
-const ready = process.env.PAPERCLIP_BRIDGE_QUEUE_DIR + "/ready.json";
+import { promises as fs, writeFileSync } from "node:fs";
+const queueDir = process.env.PAPERCLIP_BRIDGE_QUEUE_DIR;
+process.on("SIGTERM", () => writeFileSync(queueDir + "/term-received", ""));
+const ready = queueDir + "/ready.json";
 const server = createServer((req, res) => res.end("{}"));
 server.listen(0, "127.0.0.1", async () => {
   await fs.writeFile(ready + ".tmp", JSON.stringify({ pid: process.pid, host: "127.0.0.1", port: server.address().port }));
@@ -103,15 +128,16 @@ async function startBridge(options: {
   root?: string;
   hostLeaseMs?: number;
   source?: string;
-  shell?: string[];
-} = {}): Promise<{ bridge: StartedSandboxCallbackBridgeServer; queueDir: string }> {
+  runner?: RunnerOptions;
+} = {}): Promise<{ bridge: StartedSandboxCallbackBridgeServer; queueDir: string; entrypoint: string }> {
   const root = options.root ?? (await createRunRoot()).root;
   const assetRemoteDir = path.join(root, "server");
   await mkdir(assetRemoteDir, { recursive: true });
-  await writeFile(path.join(assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT), options.source ?? getSandboxCallbackBridgeServerSource());
+  const entrypoint = path.join(assetRemoteDir, SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT);
+  await writeFile(entrypoint, options.source ?? getSandboxCallbackBridgeServerSource());
   const queueDir = path.join(root, "queue");
   const bridge = await startSandboxCallbackBridgeServer({
-    runner: createRunner(options.shell),
+    runner: createRunner(options.runner),
     remoteCwd: root,
     assetRemoteDir,
     queueDir,
@@ -123,13 +149,23 @@ async function startBridge(options: {
     lifetimeCheckMs: 200,
   });
   pids.push(bridge.pid);
-  return { bridge, queueDir };
+  return { bridge, queueDir, entrypoint };
+}
+
+// A process that is not the bridge but whose argv names its entrypoint and run.
+function spawnBystander(entrypoint: string): ChildProcess {
+  const bystander = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", entrypoint, `--paperclip-run-id=${RUN_ID}`], {
+    detached: true,
+    stdio: "ignore",
+  });
+  pids.push(bystander.pid ?? 0);
+  return bystander;
 }
 
 afterEach(async () => {
   for (const stop of stopFns.splice(0)) await stop().catch(() => undefined);
   for (const pid of pids.splice(0)) {
-    if (!(pid > 0)) continue;
+    if (!(pid > 1)) continue;
     for (const target of [-pid, pid]) {
       try {
         process.kill(target, "SIGKILL");
@@ -139,13 +175,15 @@ afterEach(async () => {
     }
   }
   for (const root of roots.splice(0)) {
-    // A stand-in bridge records its own pid here, in case its test failed early.
-    const standIn = Number(await readFile(path.join(root, "bridge.pid"), "utf8").catch(() => "0"));
-    if (standIn > 0) {
-      try {
-        process.kill(standIn, "SIGKILL");
-      } catch {
-        // Already gone.
+    // Stand-ins and bystanders record their own pid here, in case a test failed early.
+    for (const file of ["bridge.pid", "bystander.pid"]) {
+      const pid = Number(await readFile(path.join(root, file), "utf8").catch(() => "0"));
+      if (pid > 1) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
       }
     }
     await rm(root, { recursive: true, force: true });
@@ -153,7 +191,7 @@ afterEach(async () => {
 });
 
 describe("sandbox callback bridge process lifetime", () => {
-  it("stops the bridge on interrupt even while a request waits for its response", async () => {
+  it.runIf(HAS_PROC)("stops the bridge on interrupt even while a request waits for its response", async () => {
     const { bridge, queueDir } = await startBridge();
     expect(bridge.pid).toBeGreaterThan(0);
 
@@ -173,7 +211,7 @@ describe("sandbox callback bridge process lifetime", () => {
     await pending;
   }, 60_000);
 
-  it.runIf(process.platform === "linux")("starts the bridge as the leader of its own process group, tagged with its run", async () => {
+  it.runIf(HAS_PROC)("starts the bridge as the leader of its own process group, tagged with its run and start", async () => {
     const { bridge } = await startBridge();
 
     const stat = await readFile(`/proc/${bridge.pid}/stat`, "utf8");
@@ -181,6 +219,7 @@ describe("sandbox callback bridge process lifetime", () => {
     expect(processGroup).toBe(bridge.pid);
     const argv = (await readFile(`/proc/${bridge.pid}/cmdline`, "utf8")).split("\0");
     expect(argv).toContain(`--paperclip-run-id=${RUN_ID}`);
+    expect(argv.some((arg) => /^--paperclip-bridge-instance=[0-9a-f-]{36}$/.test(arg))).toBe(true);
     const environ = (await readFile(`/proc/${bridge.pid}/environ`, "utf8")).split("\0");
     expect(environ).toContain(`PAPERCLIP_BRIDGE_RUN_ID=${RUN_ID}`);
 
@@ -188,7 +227,7 @@ describe("sandbox callback bridge process lifetime", () => {
     expect(isAlive(bridge.pid)).toBe(false);
   }, 60_000);
 
-  it("kills a bridge that ignores SIGTERM", async () => {
+  it.runIf(HAS_PROC)("kills a bridge that ignores SIGTERM", async () => {
     const { bridge } = await startBridge({ source: STUBBORN_BRIDGE });
     expect(isAlive(bridge.pid)).toBe(true);
 
@@ -197,20 +236,102 @@ describe("sandbox callback bridge process lifetime", () => {
     expect(isAlive(bridge.pid)).toBe(false);
   }, 60_000);
 
-  it("never signals an unrelated process that the pid file names", async () => {
-    const { bridge, queueDir } = await startBridge();
-    const unrelated: ChildProcess = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
-    pids.push(unrelated.pid ?? 0);
-    await writeFile(sandboxCallbackBridgeDirectories(queueDir).pidFile, `${unrelated.pid}\n`);
+  it.runIf(HAS_PROC)("sends no SIGKILL when the process id was reused after SIGTERM (fake /proc)", async () => {
+    const { root } = await createRunRoot();
+    const fakeProc = path.join(root, "fake-proc");
+    let stopping = false;
+    const { bridge, queueDir } = await startBridge({
+      root,
+      source: STUBBORN_BRIDGE,
+      runner: {
+        // Only the stop reads the fake /proc; the launch records the real start time.
+        rewriteScript: (script) => (stopping ? script.replaceAll("/proc/", `${fakeProc}/`) : script),
+      },
+    });
+    await mkdir(path.join(fakeProc, "sys", "kernel"), { recursive: true });
+    // /proc files report size 0, so copy their content, not the file.
+    await writeFile(path.join(fakeProc, "sys", "kernel", "pid_max"), await readFile("/proc/sys/kernel/pid_max"));
+    const fakeDir = path.join(fakeProc, String(bridge.pid));
+    await mkdir(fakeDir);
+    const realStat = await readFile(`/proc/${bridge.pid}/stat`, "utf8");
+    await writeFile(path.join(fakeDir, "stat"), realStat);
+    await writeFile(path.join(fakeDir, "cmdline"), await readFile(`/proc/${bridge.pid}/cmdline`));
+
+    stopping = true;
+    const stopped = bridge.stop();
+    // Right after SIGTERM the process id belongs to another process: the
+    // start time changes.
+    await vi.waitFor(() => expect(existsSync(path.join(queueDir, "term-received"))).toBe(true), { timeout: 10_000, interval: 10 });
+    const head = realStat.slice(0, realStat.lastIndexOf(")") + 2);
+    const fields = realStat.slice(head.length).trim().split(" ");
+    fields[19] = String(Number(fields[19]) + 1);
+    await writeFile(path.join(fakeDir, "stat"), `${head}${fields.join(" ")}\n`);
+    await stopped;
+
+    // The stand-in ignores SIGTERM, so only a SIGKILL could have ended it.
+    expect(isAlive(bridge.pid)).toBe(true);
+  }, 60_000);
+
+  it("never signals a bystander whose argv names the bridge's entrypoint and run", async () => {
+    const { bridge, queueDir, entrypoint } = await startBridge();
+    const bystander = spawnBystander(entrypoint);
+    await writeFile(sandboxCallbackBridgeDirectories(queueDir).pidFile, `${bystander.pid}\n`);
 
     await bridge.stop();
 
-    expect(isAlive(unrelated.pid ?? 0)).toBe(true);
-    // The process the bridge reported as ready is still stopped.
-    expect(isAlive(bridge.pid)).toBe(false);
+    expect(isAlive(bystander.pid ?? 0)).toBe(true);
+    if (HAS_PROC) expect(isAlive(bridge.pid)).toBe(false);
   }, 60_000);
 
-  it("stops a bridge that started but failed its readiness check", async () => {
+  it("signals nothing for a pid file of 0, -1, 1 or junk, and spares the control shell's group", async () => {
+    for (const recorded of ["0", "-1", "1", "junk"]) {
+      const { root } = await createRunRoot();
+      const bystanderFile = path.join(root, "bystander.pid");
+      const { bridge, queueDir } = await startBridge({ root, runner: { groupBystanderFile: bystanderFile } });
+      await writeFile(sandboxCallbackBridgeDirectories(queueDir).pidFile, `${recorded}\n`);
+
+      await bridge.stop();
+
+      const bystander = Number(await readFile(bystanderFile, "utf8"));
+      expect(isAlive(bystander), `pid file ${recorded}`).toBe(true);
+    }
+  }, 120_000);
+
+  it("signals nothing when the launch recorded process id 0", async () => {
+    const { root } = await createRunRoot();
+    const bystanderFile = path.join(root, "bystander.pid");
+    const { bridge } = await startBridge({
+      root,
+      runner: {
+        groupBystanderFile: bystanderFile,
+        rewriteStdout: (stdout, script) => (script.includes("setsid") ? stdout.replace(/"pid":\d+/, "\"pid\":0") : stdout),
+      },
+    });
+
+    await bridge.stop();
+
+    expect(isAlive(Number(await readFile(bystanderFile, "utf8")))).toBe(true);
+    // Unproven, so left to its own lease.
+    expect(isAlive(bridge.pid)).toBe(true);
+  }, 60_000);
+
+  it("leaves a newer bridge's process and metadata when an older bridge stops", async () => {
+    const { root } = await createRunRoot();
+    const { bridge: older } = await startBridge({ root });
+    const { bridge: newer, queueDir } = await startBridge({ root });
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const pidFile = await readFile(directories.pidFile, "utf8");
+    const readyFile = await readFile(directories.readyFile, "utf8");
+
+    await older.stop();
+
+    expect(isAlive(newer.pid)).toBe(true);
+    expect(await readFile(directories.pidFile, "utf8")).toBe(pidFile);
+    expect(await readFile(directories.readyFile, "utf8")).toBe(readyFile);
+    await newer.stop();
+  }, 60_000);
+
+  it.runIf(HAS_PROC)("stops a bridge that started but failed its readiness check", async () => {
     const { root } = await createRunRoot();
 
     await expect(startBridge({ root, source: BROKEN_READY_BRIDGE })).rejects.toThrow("invalid readiness JSON");
@@ -221,8 +342,8 @@ describe("sandbox callback bridge process lifetime", () => {
     await waitUntilDead(pid, 10_000);
   }, 60_000);
 
-  it.runIf(HAS_BUSYBOX)("stops the bridge when the worker shell is busybox ash", async () => {
-    const { bridge } = await startBridge({ shell: ["busybox", "sh"] });
+  it.runIf(HAS_PROC && HAS_BUSYBOX)("stops the bridge when the worker shell is busybox ash", async () => {
+    const { bridge } = await startBridge({ runner: { shell: ["busybox", "sh"] } });
 
     await bridge.stop();
 
@@ -269,9 +390,6 @@ describe("sandbox callback bridge process lifetime", () => {
 
     await waitUntilDead(earlier.pid, 15_000);
     expect(isAlive(newer.pid)).toBe(true);
-
-    await newer.stop();
-    expect(isAlive(newer.pid)).toBe(false);
   }, 60_000);
 
   it("exits when its queue directory is removed", async () => {

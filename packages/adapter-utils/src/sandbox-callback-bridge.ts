@@ -20,6 +20,12 @@ import {
   type StartupSpanContext,
 } from "./acpx-engine/startup-timing.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import {
+  buildRemoteProcessRecordLines,
+  buildRemoteProcessStopLines,
+  parseRemoteProcessIdentity,
+  type RemoteProcessIdentity,
+} from "./remote-process-identity.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
 
@@ -1920,6 +1926,26 @@ export async function syncSandboxCallbackBridgeEntrypoint(input: {
   };
 }
 
+// Stops the bridge only after proving it is this bridge (see
+// `remote-process-identity.ts`), then removes the queue metadata only while it
+// still names this bridge, so a newer bridge's stays. A newer bridge can still
+// replace the metadata between the read and the removal.
+function buildSandboxBridgeStopScript(input: {
+  identity: RemoteProcessIdentity | null;
+  argv: string[];
+  instance: string;
+  directories: SandboxCallbackBridgeDirectories;
+}): string {
+  const pidFile = shellQuote(input.directories.pidFile);
+  const readyFile = shellQuote(input.directories.readyFile);
+  return [
+    ...buildRemoteProcessStopLines({ identity: input.identity, argv: input.argv, label: "sandbox callback bridge" }),
+    `instance=${shellQuote(input.instance)}`,
+    `if [ "$(cat ${pidFile} 2>/dev/null)" = "$pid $instance" ]; then rm -f ${pidFile}; fi`,
+    `if grep -Fq '"pid":'"$pid," ${readyFile} 2>/dev/null && grep -Fq '"instance":"'"$instance"'"' ${readyFile} 2>/dev/null; then rm -f ${readyFile}; fi`,
+  ].join("\n");
+}
+
 export async function startSandboxCallbackBridgeServer(input: {
   runner: CommandManagedRuntimeRunner;
   remoteCwd: string;
@@ -1972,28 +1998,38 @@ export async function startSandboxCallbackBridgeServer(input: {
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
   const runId = input.runId?.trim();
+  // A random tag for this start. With the start time it tells this bridge
+  // from every other process, also one with the same entrypoint and run.
+  const instance = randomUUID();
+  const bridgeArgv = [
+    nodeCommand,
+    remoteEntrypoint,
+    ...(runId ? [`--paperclip-run-id=${runId}`] : []),
+    `--paperclip-bridge-instance=${instance}`,
+  ];
   const bridgeCommand =
-    `${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)}` +
-    (runId ? ` ${shellQuote(`--paperclip-run-id=${runId}`)}` : "") +
-    ` >> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`;
+    `${bridgeArgv.map((arg) => shellQuote(arg)).join(" ")} >> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`;
   const startResult = await runSandboxBridgeControlCommand(input.runner, {
     command: shellCommand,
     args: shellCommandArgs(
       [
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        // Lead a new process group, so stop can signal the whole bridge. Without
-        // `setsid`, bash job control gives the same; otherwise stop signals
-        // the process alone.
+        // With `setsid` the bridge leads its own process group, so stop can
+        // signal the whole bridge; otherwise stop signals the process alone.
+        // The background job does not lead a group, so `setsid` does not fork
+        // and `$!` is the bridge itself.
+        "group=0",
         "if command -v setsid >/dev/null 2>&1; then",
         `  nohup setsid ${bridgeCommand}`,
+        "  group=1",
         "else",
-        "  set -m 2>/dev/null || true",
         `  nohup ${bridgeCommand}`,
         "fi",
         "pid=$!",
-        `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
-        "printf '{\"pid\":%s}\\n' \"$pid\"",
+        `printf '%s %s\\n' \"$pid\" ${shellQuote(instance)} > ${shellQuote(directories.pidFile)}`,
+        // The launch record the stop proves the bridge against.
+        ...buildRemoteProcessRecordLines(),
       ].join("\n"),
     ),
     cwd: input.remoteCwd,
@@ -2003,52 +2039,11 @@ export async function startSandboxCallbackBridgeServer(input: {
     },
     timeoutMs,
   });
-  // Stops every recorded process of this bridge that still runs this
-  // entrypoint (for this run). The ready file's process covers a launcher that
-  // `$!` named and that already exited.
-  const runTag = runId ? `--paperclip-run-id=${runId}` : null;
-  const identityPattern = `*${shellQuote(remoteEntrypoint)}*${runTag ? `${shellQuote(runTag)}*` : ""}`;
-  const stopBridge = async (readyPid: number | null) => {
+  const identity = parseRemoteProcessIdentity(startResult.stdout);
+  const stopBridge = async () => {
     const stopResult = await runSandboxBridgeControlCommand(input.runner, {
       command: shellCommand,
-      args: shellCommandArgs(
-        [
-          `pids="$(cat ${shellQuote(directories.pidFile)} 2>/dev/null || true)${readyPid ? ` ${readyPid}` : ""}"`,
-          "seen=''",
-          "for pid in $pids; do",
-          "  case \"$pid\" in ''|*[!0-9]*) continue ;; esac",
-          "  case \" $seen \" in *\" $pid \"*) continue ;; esac",
-          "  seen=\"$seen $pid\"",
-          // Skip a reused process identifier: signal only a process that runs
-          // this bridge. When neither /proc nor ps can tell, signal it as before.
-          "  args=\"$(tr '\\000' ' ' < /proc/$pid/cmdline 2>/dev/null || ps -ww -o args= -p \"$pid\" 2>/dev/null || true)\"",
-          "  case \"$args\" in",
-          `    ''|${identityPattern}) ;;`,
-          "    *) continue ;;",
-          "  esac",
-          // A process group with the bridge's id exists only when the bridge
-          // leads it. `kill -SIG` without `-s` or `--` works in dash, bash and
-          // busybox ash alike.
-          "  target=\"$pid\"",
-          "  if kill -0 -\"$pid\" 2>/dev/null; then target=\"-$pid\"; fi",
-          "  kill -TERM \"$target\" 2>/dev/null || true",
-          "  i=0",
-          "  while kill -0 \"$target\" 2>/dev/null && [ \"$i\" -lt 40 ]; do",
-          "    i=$((i + 1))",
-          "    sleep 0.05",
-          "  done",
-          "  if kill -0 \"$target\" 2>/dev/null; then",
-          "    kill -KILL \"$target\" 2>/dev/null || true",
-          "    i=0",
-          "    while kill -0 \"$target\" 2>/dev/null && [ \"$i\" -lt 20 ]; do",
-          "      i=$((i + 1))",
-          "      sleep 0.05",
-          "    done",
-          "  fi",
-          "done",
-          `rm -f ${shellQuote(directories.pidFile)} ${shellQuote(directories.readyFile)}`,
-        ].join("\n"),
-      ),
+      args: shellCommandArgs(buildSandboxBridgeStopScript({ identity, argv: bridgeArgv, instance, directories })),
       cwd: input.remoteCwd,
       env: {
         [SANDBOX_EXEC_CHANNEL_ENV]: SANDBOX_EXEC_CHANNEL_BRIDGE,
@@ -2060,8 +2055,6 @@ export async function startSandboxCallbackBridgeServer(input: {
     }
   };
 
-  // The process the bridge reported, once its ready file parsed.
-  let reportedPid: number | null = null;
   const readBridgeReadiness = async () => {
     requireSuccessfulResult("start sandbox callback bridge", startResult);
 
@@ -2075,7 +2068,7 @@ export async function startSandboxCallbackBridgeServer(input: {
         `    cat ${shellQuote(directories.readyFile)}`,
         "    exit 0",
         "  fi",
-        `  if [ -s ${shellQuote(directories.logFile)} ] && ! kill -0 \"$(cat ${shellQuote(directories.pidFile)} 2>/dev/null)\" 2>/dev/null; then`,
+        `  if [ -s ${shellQuote(directories.logFile)} ] && ! kill -0 \"$(cut -d' ' -f1 ${shellQuote(directories.pidFile)} 2>/dev/null)\" 2>/dev/null; then`,
         `    cat ${shellQuote(directories.logFile)} >&2`,
         "    exit 1",
         "  fi",
@@ -2099,7 +2092,6 @@ export async function startSandboxCallbackBridgeServer(input: {
         `Sandbox callback bridge wrote invalid readiness JSON: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    reportedPid = typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : null;
 
     const host = typeof readyData.host === "string" && readyData.host.trim().length > 0
       ? readyData.host.trim()
@@ -2115,7 +2107,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   try {
     readiness = await readBridgeReadiness();
   } catch (error) {
-    await stopBridge(reportedPid).catch(() => undefined);
+    await stopBridge().catch(() => undefined);
     throw error;
   }
   const { readyData, host, port } = readiness;
@@ -2130,7 +2122,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     port,
     pid: typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : 0,
     directories,
-    stop: () => stopBridge(typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : null),
+    stop: stopBridge,
   };
 }
 
@@ -2419,6 +2411,9 @@ import http2 from "node:http2";
 import { Duplex } from "node:stream";
 
 const bridgeMode = process.env.PAPERCLIP_API_BRIDGE_MODE || "${SANDBOX_CALLBACK_BRIDGE_FILE_MODE}";
+// The random tag of this start; the host compares it before it removes the ready file.
+const bridgeInstance = (process.argv.find((arg) => arg.startsWith("--paperclip-bridge-instance=")) || "")
+  .slice("--paperclip-bridge-instance=".length);
 const queueDir = process.env.PAPERCLIP_BRIDGE_QUEUE_DIR;
 const bridgeToken = process.env.PAPERCLIP_BRIDGE_TOKEN;
 const host = process.env.PAPERCLIP_BRIDGE_HOST || "127.0.0.1";
@@ -2852,6 +2847,7 @@ async function runFileGateway() {
     }
     const ready = {
       pid: process.pid,
+      instance: bridgeInstance,
       host,
       port: address.port,
       baseUrl: \`http://\${host}:\${address.port}\`,
