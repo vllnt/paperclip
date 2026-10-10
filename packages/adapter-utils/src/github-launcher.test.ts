@@ -1,15 +1,17 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmod, cp, mkdtemp, mkdir, readFile, stat, symlink, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
+import { githubBrokerEnvironment, githubLauncherSource, type GithubLauncherOptions } from "./github-launcher.js";
 import { classifyGitHubCommand } from "@paperclipai/shared";
 import { runInNewContext } from "node:vm";
 const exec = promisify(execFile);
+/** The directories a launcher takes a credentialed git from when it is staged as it is. */
+const SYSTEM_DIRS = ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/bin"];
 // A test run inside a Paperclip run must not hand the launcher that run's API route.
 const hostEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PAPERCLIP_")));
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -378,13 +380,20 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(operations.find(op => op.args[0] === "issue")).toMatchObject({ program: "gh", remote: "https://github.com/vllnt/paperclip.git" });
   }, 30_000); // many launcher runs, each spawning git
   // A managed launcher directory, a recording real `gh`, and a broker answering `answer(body, path)`.
-  async function brokered(answer: (body: any, url: string) => { status?: number; body: unknown } | null) {
+  /**
+   * Where a credentialed git comes from in a test. "fixture": the fixture's `real` directory first (a stand-in git placed there is
+   * the one that runs), then the system ones, with nobody-can-change-it not required. "system": the launcher exactly as it is
+   * staged. Or the options themselves.
+   */
+  type Trust = "fixture" | "system" | GithubLauncherOptions;
+  async function brokered(answer: (body: any, url: string) => { status?: number; body: unknown } | null, trust: Trust = "fixture") {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-brokered-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed"), realBin = path.join(root, "real"), repo = path.join(root, "repo"), log = path.join(root, "gh-calls.jsonl");
     for (const dir of [bin, realBin, repo]) await mkdir(dir, { recursive: true });
     await writeFile(path.join(bin, "package.json"), '{"type":"commonjs"}\n');
-    for (const name of ["git", "gh", "paperclip-ssh-sign"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
+    const source = githubLauncherSource(trust === "system" ? {} : trust === "fixture" ? { trustedDirs: [realBin, ...SYSTEM_DIRS], requireProtectedDirs: false } : trust);
+    for (const name of ["git", "gh", "paperclip-ssh-sign"]) await writeFile(path.join(bin, name), source, { mode: 0o700 });
     // Like the worker's wrapper, this "real" gh would write as a bot when GH_TOKEN is empty.
     await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
 require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args: process.argv.slice(2), token: process.env.GH_TOKEN || 'bot-token' }) + '\\n');
@@ -433,7 +442,11 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     await f.run("git", ["push"]);
     await f.run("git", ["fetch", "origin"]);
     await f.run("gh", ["pr", "view", "1"]);
-    const ops = f.requests.map(request => request.body.operation);
+    // A push reported free of workflow changes is read against the refs GitHub lists before it runs. GitHub cannot be read
+    // here (a made-up token), so each such push is asked about a second time, as one that may change them.
+    const asked = f.requests.map(request => request.body.operation);
+    const ops = asked.filter(op => !(op.args[0] === "push" && op.touchesWorkflows === null));
+    expect(asked.filter(op => op.touchesWorkflows === null).map(op => op.args)).toEqual([["push", "origin", "feature/x"], ["push", "origin", "engine@1.4.0"]]);
     const head = (ref: string) => git("rev-parse", ref).toString().trim();
     expect(ops[0]).toMatchObject({ args: ["push", "origin", "feature/x"], remote: "https://github.com/Anthm-FR/songtrivia.git", currentBranch: "feature/x",
       refs: { "feature/x": "refs/heads/feature/x" }, shas: [head("HEAD~1")], touchesWorkflows: false });
@@ -442,6 +455,1469 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     expect(ops[3]).toEqual({ program: "git", args: ["fetch", "origin"], remote: "https://github.com/Anthm-FR/songtrivia.git" });
     expect(ops[4]).toEqual({ program: "gh", args: ["pr", "view", "1"], remote: "https://github.com/Anthm-FR/songtrivia.git" });
   }, 30_000); // many launcher runs, each spawning git
+
+  describe("workflow changes in a push", () => {
+    const W = ".github/workflows";
+    const ci = `${W}/ci.yml`;
+    /** A checkout whose remote has main (two workflow files) and feature/x. The broker refuses every command, so nothing is pushed. */
+    async function workflowRepo() {
+      const f = await brokered(() => ({ body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } }));
+      const git = (...args: string[]) => execFileSync("git", args, { cwd: f.repo, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).toString().trim();
+      const write = async (file: string, text: string) => { await mkdir(path.dirname(path.join(f.repo, file)), { recursive: true }); await writeFile(path.join(f.repo, file), text); };
+      const push = async (cwd: string, ...args: string[]) => { await f.run("git", ["push", ...args], cwd); return f.requests.at(-1)!.body.operation; };
+      const sha = (ref: string) => git("rev-parse", ref);
+      const blob = (ref: string, file: string) => git("rev-parse", `${ref}:${file}`);
+      /** The remote branch now has everything up to this ref (as after a fetch or an accepted push). */
+      const remote = (ref: string, branch: string) => git("update-ref", `refs/remotes/origin/${branch}`, sha(ref));
+      git("init", "-b", "main");
+      git("remote", "add", "origin", "https://github.com/Anthm-FR/songtrivia.git");
+      await write(ci, "on: push\n");
+      await write(`${W}/release.yml`, "on: release\n");
+      await write("app.ts", "x\n");
+      git("add", "."); git("commit", "-m", "base");
+      const base = sha("HEAD");
+      remote("HEAD", "main");
+      git("checkout", "-b", "feature/x");
+      await write("app.ts", "y\n");
+      git("add", "."); git("commit", "-m", "app");
+      remote("HEAD", "feature/x");
+      /** main edits ci.yml, adds deploy.yml and deletes release.yml. */
+      const mainMovesOn = async () => {
+        git("checkout", "-q", "main");
+        await write(ci, "on: [push, pull_request]\n");
+        await write(`${W}/deploy.yml`, "on: workflow_dispatch\n");
+        git("rm", "-q", `${W}/release.yml`);
+        git("add", "."); git("commit", "-m", "main workflows");
+        remote("HEAD", "main");
+        git("checkout", "-q", "feature/x");
+        return sha("origin/main");
+      };
+      return { ...f, git, write, push: (...args: string[]) => push(f.repo, ...args), pushFrom: push, sha, blob, remote, base, mainMovesOn };
+    }
+
+    it("reports a merge of the base branch as one commit with its parents and the paths it brings in, and where its history joins the remote", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      const main = await r.mainMovesOn();
+      r.git("merge", "--no-edit", "origin/main");
+      const report = await r.push("origin", "feature/x");
+      expect(report).toMatchObject({ touchesWorkflows: true, shas: [r.sha("HEAD")] });
+      expect(report.workflowCommits).toEqual([{ sha: r.sha("HEAD"), parents: [feature, main], changes: [
+        { path: ci, mode: "100644", oid: r.blob("origin/main", ci) },
+        { path: `${W}/deploy.yml`, mode: "100644", oid: r.blob("origin/main", `${W}/deploy.yml`) },
+        { path: `${W}/release.yml`, mode: null, oid: null },
+      ] }]);
+      expect([...report.workflowEntries].sort()).toEqual([feature, main].sort());
+      // Every workflow file the pushed commit has.
+      expect(report.workflowFiles).toEqual([
+        { path: ci, mode: "100644", oid: r.blob("HEAD", ci) },
+        { path: `${W}/deploy.yml`, mode: "100644", oid: r.blob("HEAD", `${W}/deploy.yml`) },
+      ]);
+    }, 60_000);
+
+    it("reports every new commit that changes a workflow, so a clean tip cannot hide an earlier edit", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const edit = r.sha("HEAD");
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "restore ci");
+      const restore = r.sha("HEAD");
+      const report = await r.push("origin", "feature/x");
+      expect(report).toMatchObject({ touchesWorkflows: true, shas: [restore] });
+      expect(report.workflowCommits.map((commit: any) => commit.sha).sort()).toEqual([edit, restore].sort());
+      expect(report.workflowCommits.find((commit: any) => commit.sha === edit)).toEqual({ sha: edit, parents: [feature], changes: [{ path: ci, mode: "100644", oid: r.blob(edit, ci) }] });
+      expect(report.workflowEntries).toEqual([feature]);
+      // The tip alone looks clean: it has the file as main does.
+      expect(report.workflowFiles).toContainEqual({ path: ci, mode: "100644", oid: r.blob("origin/main", ci) });
+    }, 60_000);
+
+    it("counts a push that moves the branch to a commit the remote already has as a workflow change when the files differ from the branch it replaces", async () => {
+      const r = await workflowRepo();
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const edit = r.sha("HEAD");
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "restore ci");
+      // The remote branch holds both commits now; one is pushed back over the other.
+      r.remote("HEAD", "feature/x");
+      r.git("branch", "rewind", edit);
+      const rewind = await r.push("--force", "origin", "rewind:feature/x");
+      expect(rewind).toMatchObject({ touchesWorkflows: true, shas: [edit], workflowCommits: [], workflowEntries: [edit] });
+      expect(rewind.workflowFiles).toContainEqual({ path: ci, mode: "100644", oid: r.blob(edit, ci) });
+      // Pushing what the remote branch already is changes nothing.
+      const same = await r.push("origin", "feature/x");
+      expect(same).toMatchObject({ touchesWorkflows: false });
+      expect(same.workflowFiles).toBeUndefined();
+      expect(same.workflowCommits).toBeUndefined();
+    }, 60_000);
+
+    it("reports an octopus merge with all its parents", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      const main = await r.mainMovesOn();
+      r.git("checkout", "-q", "-b", "side", r.base);
+      await r.write("side.txt", "side\n");
+      r.git("add", "."); r.git("commit", "-m", "side");
+      r.remote("HEAD", "side");
+      const side = r.sha("HEAD");
+      r.git("checkout", "-q", "feature/x");
+      r.git("branch", "-q", "-D", "side");
+      r.git("merge", "--no-edit", "origin/main", "origin/side");
+      expect(r.git("rev-list", "--parents", "-n", "1", "HEAD").split(" ")).toHaveLength(4);
+      const report = await r.push("origin", "feature/x");
+      expect(report.workflowCommits).toHaveLength(1);
+      expect(report.workflowCommits[0].parents).toEqual([feature, main, side]);
+      expect(report.workflowCommits[0].changes.map((change: any) => change.path)).toContain(ci);
+      expect([...report.workflowEntries].sort()).toEqual([feature, main, side].sort());
+    }, 60_000);
+
+    it("reports a merge whose second parent is not the base branch's, with that parent as an entry", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      await r.mainMovesOn();
+      // Another remote branch has the same ci.yml as main now, but is not part of main.
+      r.git("checkout", "-q", "-b", "wip", r.base);
+      await r.write(ci, "on: [push, pull_request]\n");
+      r.git("commit", "-a", "-m", "wip ci");
+      r.remote("HEAD", "wip");
+      const wip = r.sha("HEAD");
+      r.git("checkout", "-q", "feature/x");
+      r.git("branch", "-q", "-D", "wip");
+      r.git("merge", "--no-edit", "origin/wip");
+      expect(r.blob("HEAD", ci)).toBe(r.blob("origin/main", ci));
+      const report = await r.push("origin", "feature/x");
+      expect(report.workflowCommits).toEqual([{ sha: r.sha("HEAD"), parents: [feature, wip], changes: [{ path: ci, mode: "100644", oid: r.blob("origin/main", ci) }] }]);
+      expect([...report.workflowEntries].sort()).toEqual([feature, wip].sort());
+    }, 60_000);
+
+    it("reports a commit whose parent is a remote ref the checkout only claims to have, as an entry for the broker to check", async () => {
+      const r = await workflowRepo();
+      const feature = r.sha("HEAD");
+      // A commit with an edit sits behind a made-up remote ref, so it is "already on the remote" for this checkout.
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const hidden = r.sha("HEAD");
+      r.remote("HEAD", "made-up");
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "restore ci");
+      const report = await r.push("origin", "feature/x");
+      expect(report.workflowEntries).toEqual([hidden]);
+      expect(report.workflowEntries).not.toContain(feature);
+    }, 60_000);
+
+    it("reads names whole from a subdirectory, and reports no paths when there are too many commits, files or characters", async () => {
+      const r = await workflowRepo();
+      const names = [`${W}/büild.yml`, `${W}/two words.yml`, `${W}/new\nline.yml`];
+      for (const name of names) await r.write(name, `on: push # ${name.length}\n`);
+      r.git("add", "."); r.git("commit", "-m", "odd names");
+      await mkdir(path.join(r.repo, "src"), { recursive: true });
+      const sub = await r.pushFrom(path.join(r.repo, "src"), "origin", "feature/x");
+      expect(sub.workflowCommits).toHaveLength(1);
+      expect(sub.workflowCommits[0].changes.map((change: any) => change.path)).toEqual([...names].sort());
+      expect(sub.workflowFiles.map((file: any) => file.path)).toEqual([ci, ...names, `${W}/release.yml`].sort());
+      r.remote("HEAD", "feature/x");
+
+      // A commit that touches nothing in .github/workflows reports nothing.
+      await r.write("src/more.ts", "y\n");
+      r.git("add", "."); r.git("commit", "-m", "app only");
+      const plain = await r.push("origin", "feature/x");
+      expect(plain).toMatchObject({ touchesWorkflows: false });
+      expect(plain.workflowCommits).toBeUndefined();
+      r.remote("HEAD", "feature/x");
+
+      // .github replaced by a symlink: every workflow file is gone from the tip, and each deletion is reported.
+      const before = r.sha("HEAD");
+      r.git("rm", "-r", "-q", ".github");
+      await symlink("elsewhere", path.join(r.repo, ".github"));
+      r.git("add", "."); r.git("commit", "-m", "symlinked .github");
+      const replaced = await r.push("origin", "feature/x");
+      expect(replaced.touchesWorkflows).toBe(true);
+      expect(replaced.workflowFiles).toEqual([]);
+      expect(replaced.workflowCommits[0].changes.every((change: any) => change.mode === null && change.oid === null)).toBe(true);
+      expect(replaced.workflowCommits[0].changes.map((change: any) => change.path)).toEqual([ci, ...names, `${W}/release.yml`].sort());
+      r.git("reset", "-q", "--hard", before);
+
+      // A file replaced by a directory of the same name: the file is gone, the new files are there.
+      await r.write(`${W}/sub`, "on: push\n");
+      r.git("add", "."); r.git("commit", "-m", "sub is a file");
+      r.remote("HEAD", "feature/x");
+      r.git("rm", "-q", `${W}/sub`);
+      await r.write(`${W}/sub/inner.yml`, "on: push\n");
+      r.git("add", "."); r.git("commit", "-m", "sub is a directory");
+      const swapped = await r.push("origin", "feature/x");
+      expect(swapped.workflowCommits[0].changes).toEqual([
+        { path: `${W}/sub`, mode: null, oid: null },
+        { path: `${W}/sub/inner.yml`, mode: "100644", oid: r.blob("HEAD", `${W}/sub/inner.yml`) },
+      ]);
+      r.remote("HEAD", "feature/x");
+
+      // A path longer than the broker reads.
+      await r.write(`${W}/${"d".repeat(100)}/${"e".repeat(100)}/${"f".repeat(100)}/ci.yml`, "on: push\n");
+      r.git("add", "."); r.git("commit", "-m", "deep");
+      const deep = await r.push("origin", "feature/x");
+      expect(deep).toMatchObject({ touchesWorkflows: true });
+      expect(deep.workflowCommits).toBeUndefined();
+      expect(deep.workflowFiles).toBeUndefined();
+      r.git("reset", "-q", "--hard", "HEAD~1");
+
+      // More new commits than the broker reads, one of them with a workflow edit.
+      for (let index = 0; index < 101; index += 1) r.git("commit", "--allow-empty", "-m", `empty ${index}`);
+      await r.write(ci, "on: push\nenv:\n  A: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      const many = await r.push("origin", "feature/x");
+      expect(many).toMatchObject({ touchesWorkflows: true });
+      expect(many.workflowCommits).toBeUndefined();
+      r.remote("HEAD", "feature/x");
+
+      // More workflow files than the broker reads.
+      for (let index = 0; index < 101; index += 1) await r.write(`${W}/bulk-${index}.yml`, `on: push # ${index}\n`);
+      r.git("add", "."); r.git("commit", "-m", "bulk files");
+      r.remote("HEAD", "feature/x");
+      await r.write(ci, "on: push\nenv:\n  B: 1\n");
+      r.git("commit", "-a", "-m", "edit ci again");
+      const bulk = await r.push("origin", "feature/x");
+      expect(bulk).toMatchObject({ touchesWorkflows: true });
+      expect(bulk.workflowFiles).toBeUndefined();
+    }, 180_000);
+  });
+
+  // The remote-tracking refs of a checkout are the agent's to write. A push that the checkout calls free of workflow changes
+  // is therefore read once more, against the refs GitHub lists, before it runs with a credential. A local bare repository
+  // stands in for GitHub here: `git ls-remote` against it is the same read.
+  describe("a push reported free of workflow changes is read against the refs GitHub lists", () => {
+    const W = ".github/workflows";
+    const ci = `${W}/ci.yml`;
+    const refusal = { body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } };
+    /** origin is the bare repository (main and feature/x are on it, and this checkout has both); the broker allows the first question and answers a second one with `second`. */
+    async function githubLike(second: { body: unknown } = refusal, token = "t", trust: Trust = "fixture") {
+      let asked = 0;
+      // Something the checkout's owner does while the broker is answering the first question.
+      const hooks: { first: (() => void) | null } = { first: null };
+      const f = await brokered(() => {
+        if (asked++ > 0) return second;
+        hooks.first?.();
+        return { body: { status: "available", env: { GH_TOKEN: token, ...identity } } };
+      }, trust);
+      const sys = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "file" } }).toString().trim();
+      const bare = path.join(f.root, "github.git");
+      await mkdir(bare);
+      sys(bare, "init", "--bare", "-b", "main");
+      const git = (...args: string[]) => sys(f.repo, ...args);
+      const write = async (file: string, text: string) => { await mkdir(path.dirname(path.join(f.repo, file)), { recursive: true }); await writeFile(path.join(f.repo, file), text); };
+      git("init", "-b", "main");
+      git("remote", "add", "origin", bare);
+      await write(ci, "on: push\n");
+      await write("app.ts", "x\n");
+      git("add", "."); git("commit", "-m", "base");
+      git("push", "origin", "main");
+      git("checkout", "-b", "feature/x");
+      await write("app.ts", "y\n");
+      git("commit", "-a", "-m", "app");
+      git("push", "origin", "feature/x");
+      const onGitHub = (branch: string) => sys(bare, "rev-parse", `refs/heads/${branch}`);
+      const push = (...args: string[]) => f.run("git", ["push", ...args]);
+      return { ...f, git, sys, write, bare, onGitHub, push, hooks, tip: () => git("rev-parse", "HEAD") };
+    }
+    type GithubLike = Awaited<ReturnType<typeof githubLike>>;
+
+    /** A commit that edits a workflow, on the branch, that GitHub does not have. */
+    async function editWorkflow(r: GithubLike) {
+      await r.write(ci, "on: push\nenv:\n  EVIL: 1\n");
+      r.git("commit", "-a", "-m", "edit ci");
+      return r.tip();
+    }
+
+    // The branch is the one pushed. For feature/x, GitHub has it, and the forged ref is the one this checkout last saw it at;
+    // for feature/z it is a new branch, and any remote-tracking ref hides what it reaches.
+    it.each([
+      ["a remote-tracking ref of origin for the branch pushed", "feature/x", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/origin/feature/x", edit); }],
+      ["a packed remote-tracking ref for the branch pushed", "feature/x", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/origin/feature/x", edit); r.git("pack-refs", "--all"); }],
+      ["a remote-tracking ref that a fetch from this checkout writes", "feature/x", (r: GithubLike) => { r.git("fetch", ".", "HEAD:refs/remotes/origin/feature/x"); }],
+      ["a remote-tracking ref that a fetch refspec of another remote writes", "feature/x", (r: GithubLike) => {
+        r.git("remote", "add", "mirror", ".");
+        r.git("config", "remote.mirror.fetch", "+HEAD:refs/remotes/origin/feature/x");
+        r.git("fetch", "mirror");
+      }],
+      ["a remote-tracking ref of another remote, for a new branch", "feature/z", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/fork/anything", edit); }],
+      ["a remote-tracking ref of origin's main, for a new branch", "feature/z", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/origin/main", edit); }],
+      ["a packed remote-tracking ref of another remote, for a new branch", "feature/z", (r: GithubLike, edit: string) => { r.git("update-ref", "refs/remotes/fork/anything", edit); r.git("pack-refs", "--all"); }],
+    ])("does not take %s for what GitHub has: the push is asked about again, as one that edits a workflow", async (_label, branch, forge) => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      if (branch !== "feature/x") r.git("checkout", "-q", "-b", branch);
+      forge(r, edit);
+      const result = await r.push("origin", branch);
+      // The checkout, trusting the forged ref, called the push clean; GitHub's refs say otherwise, and the broker was asked again.
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [edit] });
+      expect(r.requests[1].body.operation).toMatchObject({
+        touchesWorkflows: true, shas: [edit], workflowFiles: [{ path: ci }],
+        workflowCommits: [{ sha: edit, changes: [{ path: ci }] }], workflowEntries: [before],
+      });
+      // The second answer was a refusal, and the push never ran.
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("refused in this test");
+      expect(r.onGitHub("feature/x")).toBe(before);
+      expect(() => r.onGitHub(branch === "feature/x" ? "nothing" : branch)).toThrow();
+    }, 60_000);
+
+    it("keeps a local branch from hiding anything: it is no remote ref, so the first report already says so", async () => {
+      const r = await githubLike();
+      const edit = await editWorkflow(r);
+      r.git("update-ref", "refs/heads/mirror", edit);
+      r.git("update-ref", "refs/heads/feature/y", edit);
+      await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, workflowCommits: [{ sha: edit }] });
+    }, 60_000);
+
+    it("hides a workflow edit behind a made-up remote ref even when a later commit undoes it", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "undo");
+      const tip = r.tip();
+      // The made-up ref is at the tip, so neither commit looks new, and the tip's workflow files are GitHub's own.
+      r.git("update-ref", "refs/remotes/origin/feature/x", tip);
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [tip] });
+      // Both commits are new to GitHub: the edit and the undo are each reported, and the history joins GitHub's at its branch.
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true, workflowEntries: [before] });
+      expect(r.requests[1].body.operation.workflowCommits.map((commit: { sha: string }) => commit.sha).sort()).toEqual([edit, tip].sort());
+      expect(result.code).toBe(1);
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("runs a push that GitHub's refs confirm carries no workflow change, after one question", async () => {
+      const r = await githubLike();
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      const result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [tip] });
+      expect(r.onGitHub("feature/x")).toBe(tip);
+    }, 60_000);
+
+    it("uses the answer to the second question for the push, when the broker allows it", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "second", ...identity } } });
+      const edit = await editWorkflow(r);
+      r.git("update-ref", "refs/remotes/origin/feature/x", edit);
+      const result = await r.push("origin", "feature/x");
+      // A company that grants the agent editWorkflows lets it through: the push runs on the second answer.
+      expect(r.requests).toHaveLength(2);
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(edit);
+    }, 60_000);
+
+    it("treats a push as one that may change workflows when GitHub's refs cannot be read, and says so", async () => {
+      const r = await githubLike();
+      r.git("remote", "set-url", "--push", "origin", path.join(r.root, "missing.git"));
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false });
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: null });
+      expect(r.requests[1].body.operation).not.toHaveProperty("workflowCommits");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("could not be read");
+    }, 60_000);
+
+    it("cannot compare a branch GitHub has with a commit this checkout lacks, so the push is asked about again", async () => {
+      const r = await githubLike();
+      // Someone else moves feature/x on GitHub; this checkout never fetches it.
+      const other = path.join(r.root, "other");
+      await mkdir(other);
+      r.sys(other, "clone", "-q", r.bare, ".");
+      r.sys(other, "checkout", "-q", "feature/x");
+      await writeFile(path.join(other, "other.ts"), "o\n");
+      r.sys(other, "add", ".");
+      r.sys(other, "commit", "-q", "-m", "someone else");
+      r.sys(other, "push", "-q", "origin", "feature/x");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      await r.push("--force", "origin", "feature/x");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false });
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: null });
+    }, 60_000);
+
+    // Review r3, finding 1: what was listed and authorised must be where the push goes.
+    it.each([
+      ["its URL", (r: GithubLike, attacker: string) => { r.git("remote", "set-url", "origin", attacker); }],
+      ["its push URL", (r: GithubLike, attacker: string) => { r.git("config", "remote.origin.pushurl", attacker); }],
+    ])("does not run a push whose remote changed while the broker answered: %s", async (_label, change) => {
+      const r = await githubLike();
+      const attacker = path.join(r.root, "attacker.git");
+      await mkdir(attacker);
+      r.sys(attacker, "init", "--bare", "-b", "main");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const before = r.onGitHub("feature/x");
+      r.hooks.first = () => change(r, attacker);
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("changed while Paperclip checked it");
+      // Nothing was written to the old destination or to the new one.
+      expect(r.onGitHub("feature/x")).toBe(before);
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+    }, 60_000);
+
+    // Before review r7 the listing of GitHub's branches followed the rewrite to the attacker's repository, which made the push look
+    // like a workflow change and so reached the broker a second time, with urlRewrites. The listing is sealed now: it reads the
+    // URL that was authorised, finds the push clean, and the check right before the command stops it, as for a changed URL.
+    it("stops a push when a URL rewrite appears while the broker answers", async () => {
+      const r = await githubLike();
+      const attacker = path.join(r.root, "attacker.git");
+      await mkdir(attacker);
+      r.sys(attacker, "init", "--bare", "-b", "main");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const before = r.onGitHub("feature/x");
+      r.hooks.first = () => { r.git("config", `url.${attacker}.insteadOf`, r.bare); };
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("changed while Paperclip checked it");
+      expect(r.onGitHub("feature/x")).toBe(before);
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+    }, 60_000);
+
+    it("asks the broker about the commit a clean push moved to while the broker answered", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      r.git("checkout", "-q", "-b", "elsewhere", before);
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      r.hooks.first = () => { r.git("update-ref", "refs/heads/elsewhere", edit); };
+      const result = await r.push("origin", "elsewhere:refs/heads/feature/x");
+      // The first answer was for the clean commit; the second question is about the commit the push would now send.
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true, shas: [edit] });
+      expect(result.code).toBe(1);
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("does not run a push whose commit changed while the broker answered, when it was not asked about again", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const first = await editWorkflow(r);
+      // The push already changes workflow files, so it is not asked about again (a company that grants editWorkflows allows it).
+      r.git("checkout", "-q", "-b", "later");
+      await r.write(ci, "on: push\nenv:\n  EVIL: 2\n");
+      r.git("commit", "-a", "-m", "second edit");
+      const second = r.tip();
+      r.git("checkout", "-q", "feature/x");
+      r.hooks.first = () => { r.git("update-ref", "refs/heads/feature/x", second); };
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, shas: [first] });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("changed while Paperclip checked it");
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    // Review r3, finding 2: replace refs and the commit-graph file are the agent's to write.
+    it("reads the real history, not what git replace refs show", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      // Every read of the workflow edit now shows the commit GitHub already has; the push still sends the edit.
+      r.git("replace", edit, before);
+      r.git("checkout", "-q", "-b", "feature/y");
+      await r.push("origin", "feature/y");
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, shas: [edit], workflowCommits: [{ sha: edit, changes: [{ path: ci }] }] });
+    }, 60_000);
+
+    it("is not misled by a replace ref together with a forged remote ref at the tip", async () => {
+      const r = await githubLike();
+      const edit = await editWorkflow(r);
+      r.git("checkout", "-q", "-b", "feature/y");
+      await r.write("app.ts", "w\n");
+      r.git("commit", "-a", "-m", "on top");
+      r.git("replace", edit, r.git("rev-parse", `${edit}^`));
+      r.git("update-ref", "refs/remotes/origin/feature/y", r.tip());
+      await r.push("origin", "feature/y");
+      // The remote ref is forged, so the push is asked about again; the edit is read as it is, not as its replacement.
+      expect(r.requests.at(-1)!.body.operation).toMatchObject({ touchesWorkflows: true, workflowCommits: [{ sha: edit }] });
+    }, 60_000);
+
+    // Review r3, finding 3: a commit GitHub already has is not new, but a ref created or moved onto it carries its workflow files.
+    it.each([
+      ["a branch that is new on GitHub, at a commit another branch has", false],
+      ["the same, with a forged remote-tracking ref at that commit", true],
+    ])("asks about %s, as a change to workflow files", async (_label, forge) => {
+      const r = await githubLike();
+      const edit = await editWorkflow(r);
+      // GitHub has the workflow edit already, on another branch.
+      r.git("push", "origin", `${edit}:refs/heads/other`);
+      r.git("checkout", "-q", "-b", "feature/z");
+      if (forge) r.git("update-ref", "refs/remotes/origin/feature/z", edit);
+      const result = await r.push("origin", "feature/z");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [edit] });
+      // Nothing is new, and the commit is where the push joins GitHub: the broker (the plugin) decides whether it is the base's.
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true, shas: [edit], workflowFiles: [{ path: ci }], workflowCommits: [], workflowEntries: [edit] });
+      expect(result.code).toBe(1);
+      expect(() => r.onGitHub("feature/z")).toThrow();
+    }, 60_000);
+
+    it("asks about a new branch that adds an ordinary commit on top of a commit another branch has", async () => {
+      const r = await githubLike();
+      const edit = await editWorkflow(r);
+      r.git("push", "origin", `${edit}:refs/heads/other`);
+      r.git("checkout", "-q", "-b", "feature/z");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "on top");
+      const tip = r.tip();
+      await r.push("origin", "feature/z");
+      // The new commit changes no workflow, but the branch inherits the edit.
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [tip] });
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true, shas: [tip], workflowCommits: [], workflowEntries: [edit] });
+    }, 60_000);
+
+    it("asks about several refs at once when one of them carries workflow files GitHub's default branch does not have", async () => {
+      const r = await githubLike();
+      const edit = await editWorkflow(r);
+      r.git("push", "origin", `${edit}:refs/heads/other`);
+      r.git("branch", "q1", edit);
+      r.git("checkout", "-q", "-b", "q2", "main");
+      await r.write("app.ts", "q\n");
+      r.git("commit", "-a", "-m", "plain");
+      await r.push("origin", "q1", "q2");
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false });
+      // More than one commit: no workflow history is reported, so a grant decides.
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true });
+      expect(r.requests[1].body.operation).not.toHaveProperty("workflowCommits");
+    }, 60_000);
+
+    it("lets a new branch cut from GitHub's default branch go through after one question", async () => {
+      const r = await githubLike();
+      r.git("checkout", "-q", "-b", "feature/new", "main");
+      await r.write("app.ts", "n\n");
+      r.git("commit", "-a", "-m", "new work");
+      const tip = r.tip();
+      const result = await r.push("origin", "feature/new");
+      expect(result.code).toBe(0);
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: false, shas: [tip] });
+      expect(r.onGitHub("feature/new")).toBe(tip);
+    }, 60_000);
+
+    it("asks about a new branch again when GitHub's default branch has moved past this checkout, and reports where it joins", async () => {
+      const r = await githubLike();
+      const base = r.sys(r.repo, "rev-parse", "main");
+      // Someone moves main on GitHub; this checkout never fetches it.
+      const other = path.join(r.root, "other");
+      await mkdir(other);
+      r.sys(other, "clone", "-q", r.bare, ".");
+      await writeFile(path.join(other, "later.ts"), "l\n");
+      r.sys(other, "add", ".");
+      r.sys(other, "commit", "-q", "-m", "main moves on");
+      r.sys(other, "push", "-q", "origin", "main");
+      r.git("checkout", "-q", "-b", "feature/new", "main");
+      await r.write("app.ts", "n\n");
+      r.git("commit", "-a", "-m", "new work");
+      const tip = r.tip();
+      await r.push("origin", "feature/new");
+      // The default branch's commit is one this checkout lacks, so its workflow files cannot be compared here.
+      expect(r.requests).toHaveLength(2);
+      expect(r.requests[1].body.operation).toMatchObject({ touchesWorkflows: true, shas: [tip], workflowCommits: [], workflowEntries: [base] });
+    }, 60_000);
+
+    // Review r4: the push that runs with the credential is sealed. A stand-in for the real git applies the attacker's change at
+    // the last moment, as the child starts (after every check the launcher makes), and records the child's arguments and
+    // environment.
+    // `privateConfig` is text appended to the push child's own private git config as it starts, after chmod (a plain write is
+    // tried first and its outcome kept in private.json). `listing` is for the read of GitHub's branches (`git ls-remote`): its
+    // actions run once, right after the first read, and `fail` makes every read fail.
+    async function childShim(r: GithubLike, actions: string[][] = [], privateConfig = "", listing: { actions?: string[][]; fail?: boolean } = {}) {
+      const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
+      const dir = path.join(r.root, "real");
+      await writeFile(path.join(dir, "plan.json"), JSON.stringify({ repo: r.repo, actions, privateConfig, listing }));
+      // The interpreter by its path: a credentialed git has only the trusted directories as its PATH, and node is not in them.
+      await writeFile(path.join(dir, "git"), `#!${process.execPath}
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const REAL = ${JSON.stringify(realGit)};
+const args = process.argv.slice(2);
+const plan = JSON.parse(fs.readFileSync(path.join(__dirname, "plan.json"), "utf8"));
+const act = list => {
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  for (const key of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|CONFIG_(COUNT|KEY_.*|VALUE_.*))$/.test(key)) delete env[key];
+  for (const action of list) spawnSync(REAL, action, { cwd: plan.repo, env, stdio: "ignore" });
+};
+if (args.includes("ls-remote")) {
+  if (plan.listing.fail) process.exit(128);
+  const listed = spawnSync(REAL, args, { encoding: "utf8" });
+  const read = path.join(__dirname, "listing.done");
+  if ((plan.listing.actions || []).length && !fs.existsSync(read)) {
+    fs.writeFileSync(read, "1");
+    act(plan.listing.actions);
+  }
+  process.stdout.write(listed.stdout);
+  process.exit(listed.status === null ? 1 : listed.status);
+}
+if (args.includes("push")) {
+  fs.appendFileSync(path.join(__dirname, "child.jsonl"), JSON.stringify({ args, env: process.env, cwd: process.cwd() }) + "\\n");
+  const done = path.join(__dirname, "plan.done");
+  if (!fs.existsSync(done)) {
+    fs.writeFileSync(done, "1");
+    act(plan.actions);
+    if (plan.privateConfig && process.env.GIT_DIR) {
+      const file = path.join(process.env.GIT_DIR, "config");
+      let plain = "written";
+      try { fs.appendFileSync(file, "# a plain write\\n"); } catch (error) { plain = error.code; }
+      fs.writeFileSync(path.join(__dirname, "private.json"), JSON.stringify({ plain }));
+      fs.chmodSync(file, 0o600);
+      fs.appendFileSync(file, plan.privateConfig);
+    }
+  }
+}
+const result = spawnSync(REAL, args, { stdio: "inherit" });
+process.exit(result.status === null ? 1 : result.status);
+`, { mode: 0o700 });
+      return { children: async () => (await readFile(path.join(dir, "child.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) };
+    }
+    const bareRepository = async (r: GithubLike, name: string) => {
+      const bare = path.join(r.root, name);
+      await mkdir(bare);
+      r.sys(bare, "init", "--bare", "-b", "main");
+      return bare;
+    };
+
+    it.each([
+      ["its URL", (r: GithubLike, attacker: string) => [["remote", "set-url", "origin", attacker]]],
+      ["its push URL", (r: GithubLike, attacker: string) => [["config", "remote.origin.pushurl", attacker]]],
+      ["a URL rewrite", (r: GithubLike, attacker: string) => [["config", `url.${attacker}.insteadOf`, r.bare]]],
+    ])("sends the push to the URL that was authorised, even when the remote changes as the command starts: %s", async (_label, changes) => {
+      const r = await githubLike();
+      const attacker = await bareRepository(r, "attacker.git");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      await childShim(r, changes(r, attacker));
+      const result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.requests).toHaveLength(1);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+      // As git does for a push to a configured remote, the checkout's remote-tracking ref moves.
+      expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(tip);
+    }, 60_000);
+
+    it("sends a push whose target is a URL to that URL, even when a URL rewrite for it appears as the command starts", async () => {
+      const r = await githubLike();
+      const attacker = await bareRepository(r, "attacker.git");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      await childShim(r, [["config", `url.${attacker}.insteadOf`, r.bare]]);
+      const result = await r.push(r.bare, "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+    }, 60_000);
+
+    it("sends only the refs it was told about, even when push settings appear as the command starts", async () => {
+      const r = await githubLike();
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      r.git("tag", "-a", "v1", "-m", "a tag");
+      r.git("branch", "other");
+      // Without refspecs, these settings would make `git push origin` send every branch and tag (or mirror the checkout).
+      await childShim(r, [["config", "push.followTags", "true"], ["config", "remote.origin.push", "refs/heads/*:refs/heads/*"], ["config", "remote.origin.mirror", "true"]]);
+      const result = await r.push("origin");
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.onGitHub("other")).toThrow();
+      expect(() => r.sys(r.bare, "rev-parse", "refs/tags/v1")).toThrow();
+    }, 60_000);
+
+    it("does not run the checkout's hooks or helpers with the credential, and gives the push an environment of its own", async () => {
+      const r = await githubLike();
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      const stolen = path.join(r.root, "stolen");
+      for (const [dir, name] of [[path.join(r.repo, ".git", "hooks"), "pre-push"]] as const) await writeFile(path.join(dir, name), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-hook\nexit 0\n`, { mode: 0o755 });
+      // A hooks path in the repository's own config, and a helper that git would find through GIT_EXEC_PATH.
+      const hooksDir = path.join(r.root, "my-hooks");
+      await mkdir(hooksDir);
+      await writeFile(path.join(hooksDir, "pre-push"), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-hookspath\nexit 0\n`, { mode: 0o755 });
+      r.git("config", "core.hooksPath", hooksDir);
+      const fakeExec = path.join(r.root, "fake-exec");
+      await mkdir(fakeExec);
+      await writeFile(path.join(fakeExec, "git-receive-pack"), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-exec\nexit 1\n`, { mode: 0o755 });
+      const shim = await childShim(r);
+      const ran = await exec(path.join(r.bin, "git"), ["push", "origin", "feature/x"], { cwd: r.repo, env: { ...r.env, GIT_EXEC_PATH: fakeExec, GIT_TRACE: path.join(r.root, "trace"), GIT_ASKPASS: "/bin/false", GIT_INDEX_FILE: "/nonexistent" } })
+        .then(() => 0, (error: any) => error.code as number);
+      expect(ran).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      for (const kind of ["hook", "hookspath", "exec"]) expect(await readFile(`${stolen}-${kind}`, "utf8").catch(() => null), kind).toBeNull();
+      // The environment of the push: the credential and what git needs, and none of the checkout's steering.
+      const [child] = await shim.children();
+      expect(child!.env.GH_TOKEN).toBe("t");
+      expect(child!.env.GIT_DIR).toMatch(/push-[^/]+\/git$/);
+      expect(Object.keys(child!.env).filter(key => /^GIT_(EXEC_PATH|TRACE.*|ASKPASS|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|WORK_TREE|NAMESPACE|TEMPLATE_DIR|SSH)$/.test(key))).toEqual([]);
+      expect(child!.args).toEqual(expect.arrayContaining(["--no-verify", "--no-follow-tags", "--no-recurse-submodules"]));
+      // The URL is the literal target, and the ref is the object and its full name: nothing is resolved from config or refs.
+      expect(child!.args.slice(-3)).toEqual(["--", r.bare, `${tip}:refs/heads/feature/x`]);
+      expect(child!.args).not.toContain("origin");
+    }, 60_000);
+
+    // Review r5: the push child's own private config is the agent's UID's to write too.
+    it("sends the push to the captured URL, with the captured refs, even when the child's private config is rewritten as it starts", async () => {
+      const r = await githubLike();
+      const attacker = await bareRepository(r, "attacker.git");
+      const evilHooks = path.join(r.root, "evil-hooks");
+      await mkdir(evilHooks);
+      await writeFile(path.join(evilHooks, "pre-push"), `#!/bin/sh\nprintenv GH_TOKEN > ${path.join(r.root, "stolen")}\nexit 0\n`, { mode: 0o755 });
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const tip = r.tip();
+      r.git("branch", "other");
+      const shim = await childShim(r, [], [
+        `[remote "origin"]`, `\turl = ${attacker}`, `\tpushurl = ${attacker}`, `[remote "${r.bare}"]`, `\turl = ${attacker}`,
+        `[core]`, `\thooksPath = ${evilHooks}`, `[push]`, `\tfollowTags = true`, `\tdefault = matching`, ``,
+      ].join("\n"));
+      const result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(tip);
+      expect(() => r.onGitHub("other")).toThrow();
+      expect(() => r.sys(attacker, "rev-parse", "refs/heads/feature/x")).toThrow();
+      expect(await readFile(path.join(r.root, "stolen"), "utf8").catch(() => null)).toBeNull();
+      // Defence in depth: a plain write to the read-only config is refused (the owner can still chmod it, as the test does).
+      if (process.getuid && process.getuid() !== 0) expect(JSON.parse(await readFile(path.join(r.root, "real", "private.json"), "utf8")).plain).toBe("EACCES");
+      expect((await shim.children()).at(-1)!.args.slice(-2)).toEqual([r.bare, `${tip}:refs/heads/feature/x`]);
+    }, 60_000);
+
+    it("gives the child an explicit expected commit for --force-with-lease, and keeps one that was named", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "1\n");
+      r.git("commit", "-a", "-m", "one");
+      expect((await r.push("-u", "origin", "feature/x")).code).toBe(0);
+      const shim = await childShim(r);
+      r.git("commit", "--amend", "--allow-empty", "-m", "one again");
+      const again = r.tip();
+      const seen = r.git("rev-parse", "refs/remotes/origin/feature/x");
+      expect((await r.push("--force-with-lease", "origin", "feature/x")).code).toBe(0);
+      let child = (await shim.children()).at(-1)!;
+      expect(child.args.slice(-2)).toEqual([r.bare, `${again}:refs/heads/feature/x`]);
+      expect(child.args).toContain(`--force-with-lease=refs/heads/feature/x:${seen}`);
+      expect(child.args).not.toContain("--force-with-lease");
+      // A value that was named is kept (resolved to a commit).
+      r.git("commit", "--amend", "--allow-empty", "-m", "one more time");
+      const third = r.tip();
+      expect((await r.push(`--force-with-lease=feature/x:${again}`, "origin", "feature/x")).code).toBe(0);
+      child = (await shim.children()).at(-1)!;
+      expect(child.args).toContain(`--force-with-lease=refs/heads/feature/x:${again}`);
+      expect(r.onGitHub("feature/x")).toBe(third);
+      // A name that this checkout resolves is accepted when GitHub lists the same commit, and the child is given that commit.
+      r.git("commit", "--amend", "--allow-empty", "-m", "once more");
+      const fourth = r.tip();
+      expect((await r.push("--force-with-lease=feature/x:origin/feature/x", "origin", "feature/x")).code).toBe(0);
+      child = (await shim.children()).at(-1)!;
+      expect(child.args).toContain(`--force-with-lease=refs/heads/feature/x:${third}`);
+      expect(r.onGitHub("feature/x")).toBe(fourth);
+    }, 120_000);
+
+    // Review r6: the expected commit of a lease that comes out of this checkout's refs is tied to what GitHub lists. Someone
+    // else's commit `elsewhere` is on GitHub's feature/x by the time the push runs; a push that is not a descendant of it
+    // would replace it, if the checkout's remote-tracking ref (the agent's to write) could say that was the expected commit.
+    async function elsewhere(r: GithubLike) {
+      r.git("checkout", "-q", "-b", "elsewhere", "main");
+      await r.write("else.ts", "e\n");
+      r.git("add", ".");
+      r.git("commit", "-m", "elsewhere");
+      const commit = r.tip();
+      r.git("push", "origin", "elsewhere");
+      r.git("checkout", "-q", "feature/x");
+      return commit;
+    }
+    const movedTo = (r: GithubLike, commit: string) => [["-C", r.bare, "update-ref", "refs/heads/feature/x", commit], ["update-ref", "refs/remotes/origin/feature/x", commit]];
+
+    it.each([
+      ["a lease without a value", ["--force-with-lease"]],
+      ["a lease for the ref", ["--force-with-lease=feature/x"]],
+      ["a lease named by a remote-tracking ref", ["--force-with-lease=feature/x:origin/feature/x"]],
+    ])("does not let a moved remote-tracking ref set the expected commit of %s: GitHub's branch and the checkout's ref must agree", async (_label, lease) => {
+      const r = await githubLike();
+      const other = await elsewhere(r);
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      // As the branches are read for the check, feature/x is where the checkout has it; right after, it is not, and the
+      // checkout's ref is made to say the same.
+      const shim = await childShim(r, [], "", { actions: movedTo(r, other) });
+      const result = await r.push(...lease, "origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("is not where this checkout last saw it");
+      expect(await shim.children()).toHaveLength(0);
+      expect(r.onGitHub("feature/x")).toBe(other);
+    }, 60_000);
+
+    it("gives the child the commit GitHub listed for a lease, and a branch that moves as the child starts is not replaced", async () => {
+      const r = await githubLike();
+      const other = await elsewhere(r);
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const listed = r.onGitHub("feature/x");
+      const shim = await childShim(r, movedTo(r, other));
+      const result = await r.push("--force-with-lease", "origin", "feature/x");
+      const [child] = await shim.children();
+      // Neither the move of the checkout's ref nor the move of the branch changes what the child expects.
+      expect(child!.args).toContain(`--force-with-lease=refs/heads/feature/x:${listed}`);
+      expect(result.code).not.toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(other);
+    }, 60_000);
+
+    it("ties a lease to GitHub's branches also when the check did not read them", async () => {
+      const r = await githubLike();
+      const other = await elsewhere(r);
+      const listed = r.onGitHub("feature/x");
+      await editWorkflow(r);
+      // The first report already says the push edits a workflow, so GitHub's branches are read only for the lease.
+      r.hooks.first = () => { r.git("update-ref", "refs/remotes/origin/feature/x", other); };
+      const shim = await childShim(r);
+      const result = await r.push("--force-with-lease", "origin", "feature/x");
+      expect(r.requests).toHaveLength(1);
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("is not where this checkout last saw it");
+      expect(await shim.children()).toHaveLength(0);
+      expect(r.onGitHub("feature/x")).toBe(listed);
+    }, 60_000);
+
+    it("refuses a lease when GitHub's branches cannot be read to tie it to", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const before = r.onGitHub("feature/x");
+      const shim = await childShim(r, [], "", { fail: true });
+      const result = await r.push("--force-with-lease", "origin", "feature/x");
+      // The check could not read them either, so the broker was asked again (and allowed it).
+      expect(r.requests).toHaveLength(2);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("--force-with-lease expects");
+      expect(await shim.children()).toHaveLength(0);
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("pushes an annotated tag as the tag object, and deletes by name with a colon", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      r.git("tag", "-a", "v1", "-m", "release one");
+      const tag = r.git("rev-parse", "refs/tags/v1");
+      expect((await r.push("origin", "v1")).code).toBe(0);
+      expect(r.sys(r.bare, "rev-parse", "refs/tags/v1")).toBe(tag);
+      expect(r.sys(r.bare, "cat-file", "-t", "refs/tags/v1")).toBe("tag");
+      expect((await r.push("origin", ":feature/x")).code).toBe(0);
+      expect(() => r.onGitHub("feature/x")).toThrow();
+    }, 60_000);
+
+    it.each([
+      ["a pattern", "refs/heads/*:refs/heads/*"],
+      ["a source that is not a ref and has no full destination", "HEAD~1:renamed"],
+      ["a destination that is not whole", "feature/x:refs/heads/a b"],
+    ])("refuses a refspec with %s: it cannot be written as an object and a full name", async (_label, refspec) => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const before = r.onGitHub("feature/x");
+      const result = await r.push("origin", refspec);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("cannot run with a GitHub credential");
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it.each([
+      ["--mirror"], ["--all"], ["--tags"], ["--follow-tags"], ["--prune"], ["--signed"], ["--receive-pack=/bin/true"], ["--exec=/bin/true"], ["--no-such-option"], ["-X"],
+    ])("refuses a push with %s: it cannot be reduced to one URL and a list of refs", async option => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const result = await r.push(option, "origin", "feature/x");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("cannot run with a GitHub credential");
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("refuses a push whose refs repository config decides, and one that goes to more than one URL", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      const before = r.onGitHub("feature/x");
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      r.git("config", "remote.origin.push", "refs/heads/*:refs/heads/*");
+      let result = await r.push("origin");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("repository configuration decides which refs it sends");
+      r.git("config", "--unset-all", "remote.origin.push");
+      r.git("config", "--add", "remote.origin.pushurl", r.bare);
+      r.git("config", "--add", "remote.origin.pushurl", path.join(r.root, "second.git"));
+      result = await r.push("origin", "feature/x");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("exactly one destination");
+      expect(r.onGitHub("feature/x")).toBe(before);
+    }, 60_000);
+
+    it("keeps what git does for a push to a configured remote: no arguments, HEAD, -u, tracking refs, --force-with-lease and --delete", async () => {
+      const r = await githubLike({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } });
+      await r.write("app.ts", "1\n");
+      r.git("commit", "-a", "-m", "one");
+      expect((await r.push()).code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(r.tip());
+      await r.write("app.ts", "2\n");
+      r.git("commit", "-a", "-m", "two");
+      expect((await r.push("origin", "HEAD")).code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(r.tip());
+      await r.write("app.ts", "3\n");
+      r.git("commit", "-a", "-m", "three");
+      const three = r.tip();
+      expect((await r.push("-u", "origin", "feature/x")).code).toBe(0);
+      expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(three);
+      expect(r.git("config", "branch.feature/x.remote")).toBe("origin");
+      expect(r.git("config", "branch.feature/x.merge")).toBe("refs/heads/feature/x");
+      // The lease holds while this checkout's view of the branch is GitHub's, and fails once someone else moved it.
+      r.git("commit", "--amend", "--allow-empty", "-m", "three again");
+      const again = r.tip();
+      expect((await r.push("--force-with-lease", "origin", "feature/x")).code).toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(again);
+      const other = path.join(r.root, "other");
+      await mkdir(other);
+      r.sys(other, "clone", "-q", r.bare, ".");
+      r.sys(other, "checkout", "-q", "feature/x");
+      await writeFile(path.join(other, "other.ts"), "o\n");
+      r.sys(other, "add", ".");
+      r.sys(other, "commit", "-q", "-m", "someone else");
+      r.sys(other, "push", "-q", "origin", "feature/x");
+      const theirs = r.onGitHub("feature/x");
+      r.git("commit", "--amend", "--allow-empty", "-m", "three once more");
+      expect((await r.push("--force-with-lease", "origin", "feature/x")).code).not.toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(theirs);
+      // Deleting a branch removes the checkout's remote-tracking ref too.
+      expect((await r.push("origin", "--delete", "feature/x")).code).toBe(0);
+      expect(() => r.onGitHub("feature/x")).toThrow();
+      expect(() => r.git("rev-parse", "refs/remotes/origin/feature/x")).toThrow();
+    }, 120_000);
+
+    // The reviewer also asked for grafts and a shallow boundary among the adversarial cases.
+    it("reads the real parents, not what info/grafts says", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      await writeFile(path.join(r.repo, ".git", "info", "grafts"), `${edit} ${r.sys(r.repo, "rev-parse", "main")}\n`);
+      await r.push("origin", "feature/x");
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, workflowCommits: [{ sha: edit, parents: [before] }] });
+    }, 60_000);
+
+    it("is not hidden by a shallow boundary: the commit that becomes a root lists all its files", async () => {
+      const r = await githubLike();
+      const before = r.onGitHub("feature/x");
+      const edit = await editWorkflow(r);
+      await r.write(ci, "on: push\n");
+      r.git("commit", "-a", "-m", "undo");
+      const undo = r.tip();
+      // Everything below `undo` (the edit included) is cut off.
+      await writeFile(path.join(r.repo, ".git", "shallow"), `${undo}\n`);
+      const result = await r.push("origin", "feature/x");
+      expect(r.requests[0].body.operation).toMatchObject({ touchesWorkflows: true, shas: [undo] });
+      expect(r.requests[0].body.operation.workflowCommits.map((commit: { sha: string }) => commit.sha)).toEqual([undo]);
+      // Nor does the push carry the edit to GitHub: it needs the parent that the shallow boundary left out.
+      expect(result.code).not.toBe(0);
+      expect(r.onGitHub("feature/x")).toBe(before);
+      expect(edit).not.toBe(before);
+    }, 60_000);
+
+    // Review r7: a fetch, a pull or an ls-remote that holds the credential used to run from the checkout, whose config, hooks and
+    // refs the agent's UID can write after the broker has answered. Like a push, it runs sealed: in a git directory of its own, with
+    // the URL and the few settings it needs given as environment config, and an environment of its own. What it changed is applied to
+    // the checkout afterwards, by processes that do not hold the credential.
+    describe("a fetch, pull or ls-remote that holds the credential is sealed (review r7)", () => {
+      const TOKEN = "fake-token-fake-token-fake-token";
+      const sealedDir = /\/(push|fetch|ls|list)-[^/]+\/git$/;
+      /** The broker allows every question (these tests run several commands), with a credential that is easy to recognise. */
+      const allowed = (trust: Trust = "fixture") => githubLike({ body: { status: "available", env: { GH_TOKEN: TOKEN, ...identity } } }, TOKEN, trust);
+      const NETWORK = ["push", "fetch", "ls-remote"];
+      /** A stand-in for the real git that logs every call (with whether it held the credential) and applies `actions` to the checkout when the first fetch, pull or ls-remote starts. */
+      async function readShim(r: GithubLike, actions: string[][] = []) {
+        const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
+        const dir = path.join(r.root, "real");
+        await writeFile(path.join(dir, "reads.json"), JSON.stringify({ repo: r.repo, actions }));
+        await writeFile(path.join(dir, "git"), `#!${process.execPath}
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const plan = JSON.parse(fs.readFileSync(path.join(__dirname, "reads.json"), "utf8"));
+let at = 0;
+while (at < args.length && args[at].startsWith("-")) at += args[at] === "-c" || args[at] === "-C" ? 2 : 1;
+const sub = args[at];
+const network = ["fetch", "pull", "ls-remote", "push"].includes(sub);
+fs.appendFileSync(path.join(__dirname, "calls.jsonl"), JSON.stringify({ sub, args, token: process.env.GH_TOKEN || null, gitDir: process.env.GIT_DIR || null, env: network ? process.env : undefined }) + "\\n");
+const done = path.join(__dirname, "reads.done");
+if (["fetch", "pull", "ls-remote"].includes(sub) && !fs.existsSync(done) && plan.actions.length) {
+  fs.writeFileSync(done, "1");
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  for (const key of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|OBJECT_DIRECTORY|CONFIG_(COUNT|KEY_.*|VALUE_.*))$/.test(key)) delete env[key];
+  for (const action of plan.actions) spawnSync(${JSON.stringify(realGit)}, action, { cwd: plan.repo, env, stdio: "ignore" });
+}
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" });
+process.exit(result.status === null ? 1 : result.status);
+`, { mode: 0o700 });
+        return { calls: async () => (await readFile(path.join(dir, "calls.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) as Array<{ sub: string; args: string[]; token: string | null; gitDir: string | null; env?: Record<string, string> }> };
+      }
+      /** Someone else puts a commit on feature/x, a new branch and a tag on GitHub; this checkout has none of them. */
+      async function someoneElse(r: GithubLike) {
+        const other = path.join(r.root, "other");
+        await mkdir(other);
+        r.sys(other, "clone", "-q", r.bare, ".");
+        r.sys(other, "checkout", "-q", "feature/x");
+        await writeFile(path.join(other, "other.ts"), "o\n");
+        r.sys(other, "add", ".");
+        r.sys(other, "commit", "-q", "-m", "someone else");
+        r.sys(other, "branch", "other-branch");
+        r.sys(other, "tag", "v2");
+        r.sys(other, "push", "-q", "origin", "feature/x", "other-branch", "v2");
+        return r.onGitHub("feature/x");
+      }
+      /** A repository that has a different commit on feature/x: where the agent would like the command to read from. */
+      async function attackerWithItsOwnCommit(r: GithubLike) {
+        const attacker = await bareRepository(r, "attacker.git");
+        const work = path.join(r.root, "evil");
+        await mkdir(work);
+        r.sys(work, "clone", "-q", r.bare, ".");
+        r.sys(work, "checkout", "-q", "feature/x");
+        await writeFile(path.join(work, "evil.ts"), "e\n");
+        r.sys(work, "add", ".");
+        r.sys(work, "commit", "-q", "-m", "evil");
+        r.sys(work, "push", "-q", attacker, "feature/x");
+        return { attacker, evil: r.sys(work, "rev-parse", "HEAD") };
+      }
+      const fetchHead = (r: GithubLike) => readFile(path.join(r.repo, ".git", "FETCH_HEAD"), "utf8").catch(() => "");
+
+      it.each([
+        ["its URL", (_r: GithubLike, attacker: string) => [["remote", "set-url", "origin", attacker]]],
+        ["a URL rewrite", (r: GithubLike, attacker: string) => [["config", `url.${attacker}.insteadOf`, r.bare]]],
+      ])("fetches from the URL that was authorised, even when the remote changes as the command starts: %s", async (_label, changes) => {
+        const r = await githubLike();
+        const theirs = await someoneElse(r);
+        const { attacker, evil } = await attackerWithItsOwnCommit(r);
+        await readShim(r, changes(r, attacker));
+        const result = await r.run("git", ["fetch", "origin"]);
+        expect(result.code).toBe(0);
+        expect(r.requests).toHaveLength(1);
+        expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(theirs);
+        expect(await fetchHead(r)).toContain(theirs);
+        expect(await fetchHead(r)).not.toContain(evil);
+        expect(() => r.git("cat-file", "-e", evil)).toThrow();
+      }, 60_000);
+
+      // The report of `git fetch` with no remote names origin; git itself reads the current branch's remote first.
+      it.each([["fetch"], ["ls-remote"]])("refuses git %s when git would default to another remote than the one the broker was told about", async (subcommand) => {
+        const r = await allowed();
+        const { attacker, evil } = await attackerWithItsOwnCommit(r);
+        r.git("remote", "add", "upstream", attacker);
+        r.git("config", "branch.feature/x.remote", "upstream");
+        r.git("config", "branch.feature/x.merge", "refs/heads/feature/x");
+        const shim = await readShim(r);
+        const result = await r.run("git", [subcommand]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("is not the repository that the broker was told about");
+        expect(result.stdout).not.toContain(evil);
+        expect((await shim.calls()).filter(call => call.token !== null)).toEqual([]);
+        expect(() => r.git("cat-file", "-e", evil)).toThrow();
+      }, 60_000);
+
+      it("lists the authorised repository for ls-remote, even when the remote changes as the command starts", async () => {
+        const r = await githubLike();
+        const theirs = await someoneElse(r);
+        const { attacker, evil } = await attackerWithItsOwnCommit(r);
+        await readShim(r, [["remote", "set-url", "origin", attacker]]);
+        const result = await r.run("git", ["ls-remote", "origin"]);
+        expect(result.code).toBe(0);
+        expect(result.stdout).toContain(`${theirs}\trefs/heads/feature/x`);
+        expect(result.stdout).not.toContain(evil);
+      }, 60_000);
+
+      it("does not run the checkout's upload-pack command or hooks with the credential, and gives the fetch an environment of its own", async () => {
+        const r = await allowed();
+        await someoneElse(r);
+        const stolen = path.join(r.root, "stolen");
+        const uploadPack = path.join(r.root, "my-upload-pack");
+        await writeFile(uploadPack, `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-uploadpack\nexec git upload-pack "$@"\n`, { mode: 0o755 });
+        r.git("config", "remote.origin.uploadpack", uploadPack);
+        // reference-transaction is the hook a fetch runs when it updates refs.
+        await writeFile(path.join(r.repo, ".git", "hooks", "reference-transaction"), `#!/bin/sh\nprintenv GH_TOKEN >> ${stolen}-hook\nexit 0\n`, { mode: 0o755 });
+        const shim = await readShim(r);
+        const result = await exec(path.join(r.bin, "git"), ["fetch", "origin"], { cwd: r.repo, env: { ...r.env, GIT_EXEC_PATH: path.join(r.root, "nowhere"), GIT_TRACE: path.join(r.root, "trace"), GIT_ASKPASS: "/bin/false", GIT_INDEX_FILE: "/nonexistent" } })
+          .then(() => 0, (error: any) => error.code as number);
+        expect(result).toBe(0);
+        expect(await readFile(`${stolen}-uploadpack`, "utf8").catch(() => null)).toBeNull();
+        expect(await readFile(`${stolen}-hook`, "utf8").catch(() => "")).not.toContain(TOKEN);
+        const [child] = (await shim.calls()).filter(call => call.sub === "fetch");
+        expect(child!.env!.GH_TOKEN).toBe(TOKEN);
+        expect(child!.gitDir).toMatch(sealedDir);
+        expect(Object.keys(child!.env!).filter(key => /^GIT_(EXEC_PATH|TRACE.*|ASKPASS|INDEX_FILE|WORK_TREE|NAMESPACE|TEMPLATE_DIR|SSH)$/.test(key))).toEqual([]);
+        expect(child!.args).toEqual(expect.arrayContaining(["--no-recurse-submodules"]));
+        expect(child!.args.slice(-2)).toEqual(["--", "origin"]);
+        // Where "origin" is comes from the launcher's own environment config (the URL the broker was told), not from a file.
+        const keys = Object.entries(child!.env!).filter(([key]) => key.startsWith("GIT_CONFIG_KEY_")).map(([key, value]) => [value, child!.env![key.replace("KEY", "VALUE")]]);
+        expect(keys).toContainEqual(["remote.origin.url", r.bare]);
+      }, 60_000);
+
+      it("passes the credential to no git process of the launcher except the command that needs it", async () => {
+        const r = await allowed();
+        const shim = await readShim(r);
+        await r.write("app.ts", "z\n");
+        r.git("commit", "-a", "-m", "more app");
+        const pushed = await r.push("origin", "feature/x");
+        expect(pushed.code, pushed.stderr).toBe(0);
+        await someoneElse(r);
+        const fetched = await r.run("git", ["fetch", "origin"]);
+        expect(fetched.code, fetched.stderr).toBe(0);
+        const listed = await r.run("git", ["ls-remote", "origin"]);
+        expect(listed.code, listed.stderr).toBe(0);
+        const calls = await shim.calls();
+        expect(calls.filter(call => call.token !== null).map(call => call.sub).sort()).toEqual(["fetch", "ls-remote", "ls-remote", "push"]);
+        for (const call of calls.filter(call => call.token !== null)) {
+          expect(call.token).toBe(TOKEN);
+          expect(call.gitDir, call.args.join(" ")).toMatch(sealedDir);
+        }
+        // The branches GitHub lists for the push are read in a git directory of their own, from the literal URL.
+        const listing = calls.find(call => call.sub === "ls-remote" && call.args.includes("--symref"))!;
+        expect(listing.gitDir).toMatch(/\/list-[^/]+\/git$/);
+        expect(listing.args.slice(-5)).toEqual(["--", r.bare, "HEAD", "refs/heads/*", "refs/tags/*"]);
+      }, 120_000);
+
+      /** The checkout after the same fetch, run by plain git on a copy: the refs, FETCH_HEAD and shallow boundary must be the same. */
+      async function sameAsGit(r: GithubLike, args: string[]) {
+        const copy = path.join(r.root, "oracle");
+        await cp(r.repo, copy, { recursive: true });
+        let plainOk = true;
+        try { r.sys(copy, "fetch", ...args); } catch { plainOk = false; }
+        const sealed = await r.run("git", ["fetch", ...args]);
+        expect(sealed.code === 0, sealed.stderr).toBe(plainOk);
+        const state = async (dir: string) => ({
+          refs: r.sys(dir, "for-each-ref", "--format=%(objectname) %(refname) %(symref)"),
+          fetchHead: await readFile(path.join(dir, ".git", "FETCH_HEAD"), "utf8").catch(() => ""),
+          shallow: await readFile(path.join(dir, ".git", "shallow"), "utf8").catch(() => ""),
+          head: r.sys(dir, "rev-parse", "HEAD"),
+        });
+        expect(await state(r.repo)).toEqual(await state(copy));
+      }
+      it.each([
+        ["with no arguments", (_r: GithubLike) => []],
+        ["a remote", (_r: GithubLike) => ["origin"]],
+        ["a remote and a branch", (_r: GithubLike) => ["origin", "feature/x"]],
+        ["a remote and the tag", (_r: GithubLike) => ["origin", "v2"]],
+        ["--tags", (_r: GithubLike) => ["--tags", "origin"]],
+        ["--prune", (_r: GithubLike) => ["--prune", "origin"]],
+        ["--no-tags", (_r: GithubLike) => ["--no-tags", "origin"]],
+        ["a refspec with a pattern", (_r: GithubLike) => ["origin", "+refs/heads/*:refs/remotes/up/*"]],
+        ["a refspec for a new local branch", (_r: GithubLike) => ["origin", "feature/x:refs/heads/copied"]],
+        ["a URL and a branch", (r: GithubLike) => [r.bare, "feature/x"]],
+        ["--depth", (_r: GithubLike) => ["--depth=1", "origin"]],
+        ["the current branch as a destination (git refuses)", (_r: GithubLike) => ["origin", "feature/x:feature/x"]],
+        ["--dry-run", (_r: GithubLike) => ["--dry-run", "origin"]],
+      ])("updates the checkout as git does: git fetch %s", async (_label, argsFor) => {
+        const r = await githubLike();
+        await someoneElse(r);
+        r.git("branch", "--set-upstream-to=origin/feature/x");
+        r.git("update-ref", "refs/remotes/origin/gone", r.tip());
+        await sameAsGit(r, argsFor(r));
+      }, 90_000);
+
+      it.each([
+        ["--all"], ["--multiple", "origin"], ["--upload-pack=/bin/true", "origin"], ["--filter=blob:none", "origin"], ["--set-upstream", "origin", "feature/x"],
+      ])("refuses git fetch %s: it cannot be reduced to one URL and one list of refs", async (...args) => {
+        const r = await allowed();
+        const shim = await readShim(r);
+        const result = await r.run("git", ["fetch", ...args]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("cannot run with a GitHub credential");
+        expect((await shim.calls()).filter(call => call.sub === "fetch")).toEqual([]);
+      }, 60_000);
+
+      it("does not run git pull with the credential: it fetches and merges in one command, with the checkout's hooks and config", async () => {
+        const r = await allowed();
+        const theirs = await someoneElse(r);
+        const stolen = path.join(r.root, "stolen");
+        for (const name of ["post-merge", "post-rewrite", "pre-merge-commit", "post-checkout"]) {
+          await writeFile(path.join(r.repo, ".git", "hooks", name), `#!/bin/sh\nprintenv GH_TOKEN > ${stolen}-${name}\nexit 0\n`, { mode: 0o755 });
+        }
+        r.git("branch", "--set-upstream-to=origin/feature/x");
+        const before = r.tip();
+        const shim = await readShim(r);
+        const result = await r.run("git", ["pull", "origin", "feature/x"]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("git pull cannot run with a GitHub credential");
+        expect(result.stderr).toContain("git fetch");
+        expect(r.tip()).toBe(before);
+        for (const name of ["post-merge", "post-rewrite", "pre-merge-commit", "post-checkout"]) expect(await readFile(`${stolen}-${name}`, "utf8").catch(() => null), name).toBeNull();
+        expect((await shim.calls()).filter(call => call.token !== null)).toEqual([]);
+        // The way the message points still works: fetch (sealed), then merge, which holds no credential.
+        const fetched = await r.run("git", ["fetch", "origin", "feature/x"]);
+        expect(fetched.code, fetched.stderr).toBe(0);
+        expect(r.git("rev-parse", "FETCH_HEAD")).toBe(theirs);
+        r.git("merge", "--ff-only", "FETCH_HEAD");
+        expect(r.tip()).toBe(theirs);
+      }, 60_000);
+
+      it.each([
+        ["with no arguments", (_r: GithubLike) => []],
+        ["a remote", (_r: GithubLike) => ["origin"]],
+        ["--heads", (_r: GithubLike) => ["--heads", "origin"]],
+        ["--refs and a pattern", (_r: GithubLike) => ["--refs", "origin", "refs/tags/*"]],
+        ["--get-url", (_r: GithubLike) => ["--get-url", "origin"]],
+        ["a URL", (r: GithubLike) => [r.bare]],
+      ])("prints what git prints: git ls-remote %s", async (_label, argsFor) => {
+        const r = await githubLike();
+        await someoneElse(r);
+        const args = argsFor(r);
+        const result = await r.run("git", ["ls-remote", ...args]);
+        expect(result.code).toBe(0);
+        expect(result.stdout).toBe(`${r.sys(r.repo, "ls-remote", ...args)}\n`);
+      }, 60_000);
+
+      it.each([
+        ["--upload-pack=/bin/true", "origin"], ["--exec=/bin/true", "origin"],
+      ])("refuses git ls-remote %s: it would run a program with the credential", async (...args) => {
+        const r = await allowed();
+        const shim = await readShim(r);
+        const result = await r.run("git", ["ls-remote", ...args]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("cannot run with a GitHub credential");
+        expect((await shim.calls()).filter(call => NETWORK.includes(call.sub))).toEqual([]);
+      }, 60_000);
+
+      // Review r8: the git that holds the credential is chosen by the launcher, never through the caller's PATH, and the network
+      // commands that are not sealed do not run with a credential at all.
+      describe("a credentialed git is one the caller's PATH cannot choose, and what is not sealed does not run with a credential (review r8)", () => {
+        const systemGit = SYSTEM_DIRS.some(dir => existsSync(path.join(dir, "git")));
+        const isRoot = process.getuid?.() === 0;
+        const unlessRoot = isRoot ? it.skip : it;
+        const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
+        const hasToken = (call: { token: string | null }) => call.token !== null;
+        /** Runs the launcher with the agent's own directory first in PATH. */
+        const runWith = (r: GithubLike, first: string, args: string[], cwd = r.repo, extra: Record<string, string> = {}) =>
+          exec(path.join(r.bin, "git"), args, { cwd, env: { ...r.env, ...extra, PATH: `${r.bin}:${first}:${r.env.PATH}` } })
+            .then(result => ({ code: 0, ...result }), (error: any) => ({ code: error.code as number, stdout: String(error.stdout ?? ""), stderr: String(error.stderr ?? "") }));
+        /** A `git` that records, for each call, whether the credential reached it, and then runs the real one. */
+        async function wrapperFirst(r: GithubLike) {
+          const evil = path.join(r.root, "evil");
+          await mkdir(evil);
+          const seen = path.join(evil, "seen.jsonl");
+          await writeFile(path.join(evil, "git"), `#!${process.execPath}
+const { spawnSync } = require("node:child_process");
+require("node:fs").appendFileSync(${JSON.stringify(seen)}, JSON.stringify({ sub: process.argv[2], token: process.env.GH_TOKEN || process.env.PAPERCLIP_GIT_TOKEN || null }) + "\\n");
+process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), { stdio: "inherit" }).status ?? 1);
+`, { mode: 0o700 });
+          return { dir: evil, seen: async () => (await readFile(seen, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { sub: string; token: string | null }) };
+        }
+        /** A directory of the test's own, with a `git` in it that records that it ran. */
+        async function ownGit() {
+          const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-owngit-"));
+          cleanups.push(() => rm(dir, { recursive: true, force: true }).catch(() => undefined));
+          await writeFile(path.join(dir, "git"), `#!/bin/sh\necho ran > ${path.join(dir, "ran")}\nexit 1\n`, { mode: 0o755 });
+          return dir;
+        }
+
+        (systemGit ? it : it.skip)("never starts a git found through PATH with the credential: a wrapper first in PATH sees neither the listing, the fetch, the ls-remote nor the push", async () => {
+          const r = await allowed("system");
+          const wrapper = await wrapperFirst(r);
+          await r.write("app.ts", "z\n");
+          r.git("commit", "-a", "-m", "more app");
+          const tip = r.tip();
+          const pushed = await runWith(r, wrapper.dir, ["push", "origin", "feature/x"]);
+          expect(pushed.code, pushed.stderr).toBe(0);
+          expect(r.onGitHub("feature/x")).toBe(tip);
+          const theirs = await someoneElse(r);
+          const fetched = await runWith(r, wrapper.dir, ["fetch", "origin"]);
+          expect(fetched.code, fetched.stderr).toBe(0);
+          expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(theirs);
+          const listed = await runWith(r, wrapper.dir, ["ls-remote", "origin"]);
+          expect(listed.code, listed.stderr).toBe(0);
+          expect(listed.stdout).toContain(`${theirs}\trefs/heads/feature/x`);
+          // The wrapper is on PATH and runs the launcher's own reads of the checkout, which hold no credential; it never gets one.
+          const seen = await wrapper.seen();
+          expect(seen.length).toBeGreaterThan(0);
+          expect(seen.filter(hasToken)).toEqual([]);
+        }, 120_000);
+
+        it("gives a credentialed git the trusted directories as its PATH and nothing of the agent's", async () => {
+          const r = await allowed();
+          await someoneElse(r);
+          const shim = await readShim(r);
+          const agent = path.join(r.root, "agent-bin");
+          await mkdir(agent);
+          expect((await runWith(r, agent, ["fetch", "origin"])).code).toBe(0);
+          expect((await runWith(r, agent, ["ls-remote", "origin"])).code).toBe(0);
+          const credentialed = (await shim.calls()).filter(hasToken);
+          expect(credentialed.map(call => call.sub).sort()).toEqual(["fetch", "ls-remote"]);
+          for (const call of credentialed) expect(call.env!.PATH, call.sub).toBe([path.join(r.root, "real"), ...SYSTEM_DIRS].join(path.delimiter));
+        }, 60_000);
+
+        it("does not reach the credential through GIT_EXEC_PATH either: a helper of the agent's is not started by the listing, the fetch, the ls-remote or the push", async () => {
+          const r = await allowed();
+          const stolen = path.join(r.root, "stolen");
+          const exec_ = path.join(r.root, "fake-exec");
+          await mkdir(exec_);
+          for (const helper of ["git-upload-pack", "git-receive-pack"]) await writeFile(path.join(exec_, helper), `#!/bin/sh\nprintenv GH_TOKEN >> ${stolen}\nexit 1\n`, { mode: 0o755 });
+          await r.write("app.ts", "z\n");
+          r.git("commit", "-a", "-m", "more app");
+          const tip = r.tip();
+          const empty = path.join(r.root, "agent-bin");
+          await mkdir(empty);
+          const env = { GIT_EXEC_PATH: exec_ };
+          const pushed = await runWith(r, empty, ["push", "origin", "feature/x"], r.repo, env);
+          expect(pushed.code, pushed.stderr).toBe(0);
+          expect(r.onGitHub("feature/x")).toBe(tip);
+          expect((await runWith(r, empty, ["fetch", "origin"], r.repo, env)).code).toBe(0);
+          expect((await runWith(r, empty, ["ls-remote", "origin"], r.repo, env)).code).toBe(0);
+          expect(await readFile(stolen, "utf8").catch(() => null)).toBeNull();
+        }, 60_000);
+
+        // The trust rules. A git that this user owns or may write to, in a directory that it owns or may write to, protects nothing.
+        for (const [label, mode] of [["a directory this user can write to", 0o700], ["a directory this user owns and cannot write to (the owner can change that)", 0o555]] as const) {
+          unlessRoot(`refuses every credentialed command when the only git is in ${label}, and never starts it`, async () => {
+            const own = await ownGit();
+            await chmod(own, mode);
+            cleanups.push(() => chmod(own, 0o700));
+            const r = await allowed({ trustedDirs: [own], requireProtectedDirs: true });
+            await r.write("app.ts", "z\n");
+            r.git("commit", "-a", "-m", "more app");
+            const before = r.onGitHub("feature/x");
+            for (const args of [["fetch", "origin"], ["ls-remote", "origin"], ["push", "origin", "feature/x"]]) {
+              const result = await r.run("git", args);
+              expect(result.code, args.join(" ")).toBe(1);
+              expect(result.stderr, args.join(" ")).toContain(`git ${args[0]} cannot run with a GitHub credential`);
+              expect(result.stderr, args.join(" ")).toContain("belongs to this user");
+            }
+            expect(r.onGitHub("feature/x")).toBe(before);
+            expect(existsSync(path.join(own, "ran"))).toBe(false);
+          }, 60_000);
+        }
+
+        it("refuses a credentialed command when no git is in the trusted directories, and says where it looked", async () => {
+          const empty = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-nogit-"));
+          cleanups.push(() => rm(empty, { recursive: true, force: true }));
+          const r = await allowed({ trustedDirs: [empty], requireProtectedDirs: true });
+          const result = await r.run("git", ["fetch", "origin"]);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain("git fetch cannot run with a GitHub credential");
+          expect(result.stderr).toContain(`no git was found in ${empty}`);
+        }, 60_000);
+
+        /** A broker that gives no credential, and a repository with one branch on a bare "GitHub". */
+        async function withoutCredential(trust: Trust = "fixture") {
+          const f = await brokered(() => ({ body: { status: "unavailable", reason: "no credential in this test", env: {} } }), trust);
+          const bare = path.join(f.root, "github.git");
+          await mkdir(bare);
+          const sys = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "file" } }).toString().trim();
+          sys(bare, "init", "--bare", "-b", "main");
+          sys(f.repo, "init", "-b", "main");
+          await writeFile(path.join(f.repo, "app.ts"), "x\n");
+          sys(f.repo, "add", ".");
+          sys(f.repo, "commit", "-m", "base");
+          sys(f.repo, "push", bare, "main");
+          return { ...f, bare, sys };
+        }
+
+        it("leaves a command that holds no credential on the git that PATH finds", async () => {
+          const empty = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-nogit-"));
+          cleanups.push(() => rm(empty, { recursive: true, force: true }));
+          const r = await withoutCredential({ trustedDirs: [empty], requireProtectedDirs: true });
+          const result = await r.run("git", ["ls-remote", r.bare]);
+          expect(result.code, result.stderr).toBe(0);
+          expect(result.stdout).toContain("refs/heads/main");
+          expect(result.stderr).not.toContain("cannot run with a GitHub credential");
+        }, 60_000);
+
+        // Clone, submodule and Git LFS reach the network and are not sealed: with a credential they do not run.
+        async function recorder() {
+          const r = await allowed();
+          const shim = await readShim(r);
+          return { r, shim };
+        }
+        it("refuses a clone that would hold the credential, says how to fetch instead, and the credential reaches no git", async () => {
+          const { r, shim } = await recorder();
+          const target = path.join(r.root, "cloned");
+          const result = await r.run("git", ["clone", r.bare, target]);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain("git clone cannot run with a GitHub credential");
+          expect(result.stderr).toContain("git init <dir> && cd <dir> && git fetch <url> <branch> && git checkout FETCH_HEAD");
+          expect(await stat(target).catch(() => null)).toBeNull();
+          expect((await shim.calls()).filter(hasToken)).toEqual([]);
+        }, 60_000);
+
+        it.each([
+          [["submodule", "update", "--init"], "git submodule update"],
+          [["submodule", "update", "--init", "--recursive"], "git submodule update"],
+          [["-c", "protocol.file.allow=always", "submodule", "update", "--init"], "git submodule update"],
+          [["submodule", "add", "REPO", "second"], "git submodule add"],
+        ])("refuses git %j that would hold the credential, and the credential reaches no git", async (args, message) => {
+          const { r, shim } = await recorder();
+          r.git("-c", "protocol.file.allow=always", "submodule", "add", r.bare, "first");
+          r.git("commit", "-m", "a submodule");
+          const result = await r.run("git", args.map(arg => (arg === "REPO" ? r.bare : arg)));
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain(`${message} cannot run with a GitHub credential`);
+          expect(existsSync(path.join(r.repo, "second"))).toBe(false);
+          expect((await shim.calls()).filter(hasToken)).toEqual([]);
+        }, 60_000);
+
+        it.each([["fetch"], ["pull"], ["push", "origin", "feature/x"], ["locks"], ["lock", "x"], ["prune"]])("refuses git lfs %s, which transfers or locks objects, and the credential reaches no git", async (...args) => {
+          const { r, shim } = await recorder();
+          const result = await r.run("git", ["lfs", ...args]);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain(`git lfs ${args[0]} cannot run with a GitHub credential`);
+          expect((await shim.calls()).filter(hasToken)).toEqual([]);
+        }, 60_000);
+
+        it.each([[["submodule", "status"]], [["submodule", "foreach", "true"]], [["lfs", "env"]], [["lfs", "track"]], [["lfs", "ls-files"]], [["lfs", "version"]], [["lfs"]]])("still runs the local command git %j", async (args) => {
+          const { r } = await recorder();
+          const result = await r.run("git", args);
+          expect(result.stderr).not.toContain("cannot run with a GitHub credential");
+        }, 60_000);
+
+        it("keeps a clone that holds no credential working", async () => {
+          const r = await withoutCredential();
+          const target = path.join(r.root, "cloned");
+          const result = await r.run("git", ["clone", r.bare, target]);
+          expect(result.code, result.stderr).toBe(0);
+          expect(existsSync(path.join(target, ".git"))).toBe(true);
+          expect(result.stderr).not.toContain("cannot run with a GitHub credential");
+        }, 60_000);
+
+        it("lets the fetch that the refusal suggests do the work of a clone", async () => {
+          const r = await allowed();
+          const tip = r.onGitHub("feature/x");
+          const target = path.join(r.root, "fetched");
+          await mkdir(target);
+          expect((await r.run("git", ["init", "-q", target], target)).code).toBe(0);
+          const fetched = await r.run("git", ["fetch", r.bare, "feature/x"], target);
+          expect(fetched.code, fetched.stderr).toBe(0);
+          r.sys(target, "checkout", "-q", "FETCH_HEAD");
+          expect(r.sys(target, "rev-parse", "HEAD")).toBe(tip);
+        }, 60_000);
+      });
+    });
+  });
 
   it("reports where a push really goes and what could make it go elsewhere", async () => {
     const f = await brokered(() => ({ body: { status: "available", env: { GH_TOKEN: "t", ...identity } } }));

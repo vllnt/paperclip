@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1514,6 +1514,407 @@ describe("security review round 5 (attack regressions)", () => {
     for (const filename of ["paperclip", ".github", "scripts"]) {
       f.github.prFiles = [{ filename }];
       expect(await merge(f), filename).toMatchObject({ unavailable: expect.stringContaining(`protected paths (${filename})`) });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A push may carry workflow changes without editWorkflows only when all the history it adds is the base branch's own.
+// ---------------------------------------------------------------------------
+
+describe("workflow changes that arrive by merging the base branch", () => {
+  const W = ".github/workflows";
+  type Entry = { mode: string; oid: string };
+  const blob = (text: string, mode = "100644"): Entry => ({ mode, oid: createHash("sha1").update(`blob ${Buffer.byteLength(text)}\0${text}`).digest("hex") });
+  const id = (n: number) => n.toString(16).padStart(40, "0");
+  const change = (file: string, entry: Entry | null) => ({ path: `${W}/${file}`, mode: entry?.mode ?? null, oid: entry?.oid ?? null });
+  const listed = (files: Record<string, Entry>) => Object.entries(files).map(([file, entry]) => ({ path: `${W}/${file}`, ...entry })).sort((a, b) => a.path < b.path ? -1 : 1);
+  // main moved on: it edited ci.yml, added deploy.yml and deleted release.yml, which feature/x still has.
+  const oldCi = blob("on: push # before\n"), ci = blob("on: push\n"), deploy = blob("on: workflow_dispatch\n"), release = blob("on: release\n"), releaseCi = blob("on: [push, release]\n");
+  const mainOld = id(900), featureOld = id(901), earlier = id(902), mergeSha = id(5000), evilSha = id(5001), restoreSha = id(5002), unknown = id(5003), localSha = id(5004);
+  const toggle = "editWorkflows";
+  const edit = blob("on: push\nenv:\n  EVIL: 1\n");
+
+  async function pushFixture() {
+    const f = await appFixture();
+    await f.authorize();
+    const state = {
+      /** The workflow files of each branch on GitHub, by name under .github/workflows; feature/x is the pushed branch. */
+      branches: {
+        main: { "ci.yml": ci, "deploy.yml": deploy },
+        "release/1": { "ci.yml": releaseCi },
+        wip: { "ci.yml": blob("on: unreviewed\n") },
+        "feature/x": { "ci.yml": oldCi, "release.yml": release },
+      } as Record<string, Record<string, Entry>>,
+      /** Branches with branch protection (the default branch, main, has none here). */
+      protectedBranches: new Set(["release/1"]),
+      /** Whether the pushed branch exists on GitHub yet. */
+      destination: true,
+      /** The open pull requests of the pushed branch feature/x (their base; a fork's head repository is another one; ref is their head branch). */
+      prs: [] as Array<{ base: string; fork?: boolean; ref?: string }>,
+      defaultBranch: "main",
+      /** Requests GitHub fails on. */
+      failing: [] as RegExp[],
+      truncated: false,
+      githubDirectory: "tree" as "tree" | "none" | "symlink",
+      /** The commits GitHub has, by their parents. */
+      graph: {} as Record<string, string[]>,
+      /** Every request the checks made. */
+      calls: [] as string[],
+    };
+    const names = () => Object.keys(state.branches);
+    const ids = (name: string) => { const first = 100 + names().indexOf(name) * 10; return { commit: id(first + 1), root: id(first + 2), github: id(first + 3), workflows: id(first + 4) }; };
+    const tip = (name: string) => ids(name).commit;
+    state.graph = { [tip("main")]: [mainOld], [mainOld]: [earlier], [earlier]: [], [tip("feature/x")]: [featureOld], [featureOld]: [earlier], [tip("release/1")]: [earlier], [tip("wip")]: [earlier] };
+    const ancestors = (sha: string) => {
+      const seen = new Set<string>();
+      const walk = (at: string) => { for (const parent of state.graph[at] ?? []) if (!seen.has(parent)) { seen.add(parent); walk(parent); } };
+      walk(sha);
+      return seen;
+    };
+    const repo = "/repos/anthm-fr/songtrivia";
+    const original = f.request.getMockImplementation()!;
+    const answer = (data: unknown) => ({ data: data as any, next: false });
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      const mine = path === repo || path.startsWith(`${repo}/pulls?`) || path.startsWith(`${repo}/git/trees/`) || path.startsWith(`${repo}/compare/`)
+        || path.startsWith(`${repo}/branches/`) && names().some(name => path === `${repo}/branches/${encodeURIComponent(name)}`);
+      if (!mine) return (original as any)(path, ...rest);
+      state.calls.push(path);
+      if (state.failing.some(pattern => pattern.test(path))) throw new GitHubError(500);
+      if (path.startsWith(`${repo}/pulls?`)) {
+        return answer(state.prs.map(pr => ({ base: { ref: pr.base }, head: { ref: pr.ref ?? "feature/x", repo: { full_name: pr.fork ? "someone/songtrivia" : "Anthm-FR/songtrivia" } } })));
+      }
+      if (path === repo) return answer({ default_branch: state.defaultBranch });
+      const compared = /\/compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})\?per_page=1$/.exec(path);
+      if (compared) {
+        const [, a, b] = compared as unknown as [string, string, string];
+        if (!(a in state.graph) || !(b in state.graph)) throw new GitHubError(404);
+        return answer({ status: a === b ? "identical" : ancestors(b).has(a) ? "ahead" : ancestors(a).has(b) ? "behind" : "diverged" });
+      }
+      const branch = names().find(name => path === `${repo}/branches/${encodeURIComponent(name)}`);
+      if (branch) {
+        if (branch === "feature/x" && !state.destination) throw new GitHubError(404);
+        return answer({ name: branch, protected: state.protectedBranches.has(branch), commit: { sha: ids(branch).commit, commit: { tree: { sha: ids(branch).root } } } });
+      }
+      const [, sha, recursive] = /\/git\/trees\/([0-9a-f]{40})(\?recursive=1)?$/.exec(path) ?? [];
+      const entry = (name: string, mode: string, type: string, oid: string) => ({ path: name, mode, type, sha: oid });
+      for (const name of names()) {
+        const tree = ids(name);
+        if (sha === tree.root) {
+          const github = state.githubDirectory === "tree" ? [entry(".github", "040000", "tree", tree.github)] : state.githubDirectory === "symlink" ? [entry(".github", "120000", "blob", id(7))] : [];
+          return answer({ sha, truncated: false, tree: [entry("README.md", "100644", "blob", id(1)), ...github] });
+        }
+        if (sha === tree.github) return answer({ sha, truncated: false, tree: [entry("CODEOWNERS", "100644", "blob", id(2)), entry("workflows", "040000", "tree", tree.workflows)] });
+        if (sha === tree.workflows) {
+          if (!recursive) throw new Error("The workflow files are read recursively.");
+          const files = state.githubDirectory === "none" ? {} : state.branches[name]!;
+          return answer({ sha, truncated: state.truncated, tree: Object.entries(files).map(([file, found]) => entry(file, found.mode, "blob", found.oid)) });
+        }
+      }
+      throw new GitHubError(404);
+    });
+    /** The push of one commit to feature/x that merges `base` into it: the base's files, and the paths where they differ from the branch's. */
+    const mergeOf = (base = "main", extra: Record<string, unknown> = {}) => {
+      const files = state.branches[base]!, dest = state.branches["feature/x"]!;
+      const same = (a?: Entry, b?: Entry) => a?.mode === b?.mode && a?.oid === b?.oid;
+      const changes = [...new Set([...Object.keys(files), ...Object.keys(dest)])].sort().filter(file => !same(files[file], dest[file])).map(file => change(file, files[file] ?? null));
+      return {
+        branch: "feature/x", tip: mergeSha, files: listed(files),
+        commits: [{ sha: mergeSha, parents: [tip("feature/x"), tip(base)], changes }], entries: [tip("feature/x"), tip(base)], ...extra,
+      };
+    };
+    const push = (workflowPush: unknown, extra: Record<string, unknown> = {}) => f.write("anthm-fr/songtrivia", { action: "push", privileged: [toggle], workflowPush, ...extra });
+    const refused = (decision: any, reason: string | RegExp) => {
+      expect(decision).toMatchObject({ identity: "user", unavailable: typeof reason === "string" ? expect.stringContaining(reason) : expect.stringMatching(reason) });
+      expect(decision).not.toHaveProperty("credential");
+      return decision;
+    };
+    return { ...f, state, ids, tip, push, mergeOf, refused };
+  }
+
+  it("allows a merge of the base branch with the toggle off, and reads the base fresh for every push", async () => {
+    const f = await pushFixture();
+    const granted = await f.push(f.mergeOf());
+    expect(granted).toMatchObject({ identity: "user", credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: {
+      branch: "feature/x", tip: mergeSha, base: "main", baseSha: f.tip("main"), destinationSha: f.tip("feature/x"), commits: [mergeSha],
+      paths: [`${W}/ci.yml`, `${W}/deploy.yml`, `${W}/release.yml`],
+    } } });
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+    // The pushed branch's pull requests, the base branch, the branch and their trees are read from GitHub for this push.
+    const lookup = new URLSearchParams(f.state.calls.find(call => call.includes("/pulls?"))!.split("?")[1]);
+    expect(lookup.get("state")).toBe("open");
+    expect(lookup.get("head")).toBe("Anthm-FR:feature/x");
+    expect(f.state.calls.filter(call => call.includes("/git/trees/"))).toHaveLength(6);
+    // A merge of an older commit of the base branch (main has not touched workflows since) is a merge of the base branch too.
+    f.state.calls.length = 0;
+    const older = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), mainOld] }], entries: [f.tip("feature/x"), mainOld] });
+    expect(await f.push(older)).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.state.calls.some(call => call.includes("/compare/"))).toBe(true);
+    // The next push reads the base again: main moved on its ci.yml after the checkout fetched it.
+    const fetched = f.mergeOf();
+    const reads = f.state.calls.length;
+    f.state.branches.main["ci.yml"] = blob("on: pull_request\n");
+    f.refused(await f.push(fetched), `${W}/ci.yml`);
+    expect(f.state.calls.length).toBeGreaterThan(reads);
+  });
+
+  it("refuses a clean tip that hides an earlier workflow edit in a commit the push adds (regression)", async () => {
+    const f = await pushFixture();
+    // A edits ci.yml and B puts main's file back: the tip alone is exactly the base branch's.
+    const laundered = {
+      branch: "feature/x", tip: restoreSha, files: listed({ "ci.yml": ci, "deploy.yml": deploy }),
+      commits: [
+        { sha: restoreSha, parents: [evilSha], changes: [change("ci.yml", ci)] },
+        { sha: evilSha, parents: [f.tip("feature/x")], changes: [change("ci.yml", edit)] },
+      ],
+      entries: [f.tip("feature/x")],
+    };
+    const decision = f.refused(await f.push(laundered), new RegExp(`Commit ${restoreSha.slice(0, 8)} changes workflow files.*is not a merge of main.*editWorkflows is turned off`, "s"));
+    expect(decision.evidence).toMatchObject({ base: "main", offendingCommits: [restoreSha, evilSha] });
+    // The same push with the earlier commit the only change is refused too.
+    f.refused(await f.push({ ...laundered, tip: evilSha, files: listed({ "ci.yml": edit, "deploy.yml": deploy }), commits: [laundered.commits[1]] }), new RegExp(`Commit ${evilSha.slice(0, 8)}`));
+  });
+
+  it("judges a new branch on an existing commit by where it joins GitHub: the base branch's own history passes, another branch's does not (regression)", async () => {
+    const f = await pushFixture();
+    f.state.destination = false;
+    // The launcher reports a ref created on a commit GitHub has (nothing is new) as a push whose history joins GitHub at that commit.
+    const onto = (commit: string, files: Record<string, Entry>) => ({ branch: "feature/x", tip: commit, files: listed(files), commits: [], entries: [commit] });
+    // The base branch's tip, and an older commit of it: its own workflow files, so the toggle can stay off.
+    expect(await f.push(onto(f.tip("main"), f.state.branches.main!))).toMatchObject({ credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: { base: "main", commits: [], paths: [] } } });
+    expect(await f.push(onto(mainOld, f.state.branches.main!))).toMatchObject({ credential: { login: "agent-owner" } });
+    // A commit that only another branch has (wip, never reviewed), whatever its files: refused, with the board's grant to ask for.
+    f.refused(await f.push(onto(f.tip("wip"), f.state.branches.wip!)), /builds on commit .*not part of main.*editWorkflows is turned off/s);
+    // A commit GitHub does not have at all.
+    f.refused(await f.push(onto(unknown, { "ci.yml": edit })), /builds on commit .*not part of main/);
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+  });
+
+  it("refuses moving the branch to a commit GitHub has when its workflow files differ from the branch's and are not the base branch's (regression)", async () => {
+    const f = await pushFixture();
+    // The branch is clean now; behind it is a commit with an edit, which GitHub has as part of the branch's history.
+    f.state.branches["feature/x"] = { "ci.yml": ci, "deploy.yml": deploy };
+    f.state.graph[evilSha] = [featureOld];
+    f.state.graph[f.tip("feature/x")] = [evilSha];
+    const rewind = { branch: "feature/x", tip: evilSha, files: listed({ "ci.yml": edit, "deploy.yml": deploy }), commits: [], entries: [evilSha] };
+    f.refused(await f.push(rewind), /differ from main \(\.github\/workflows\/ci\.yml\).*editWorkflows is turned off/s);
+    // Moving it to an older commit with the same files as the branch has changes no workflow file.
+    const harmless = await f.push({ ...rewind, tip: featureOld, files: listed({ "ci.yml": ci, "deploy.yml": deploy }), entries: [featureOld] });
+    expect(harmless).toMatchObject({ credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: { paths: [], commits: [] } } });
+  });
+
+  it("refuses a merge of more than two parents, whatever else is right about it", async () => {
+    const f = await pushFixture();
+    const octopus = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), f.tip("main"), f.tip("release/1")] }], entries: [f.tip("feature/x"), f.tip("main"), f.tip("release/1")] });
+    f.refused(await f.push(octopus), new RegExp(`Commit ${mergeSha.slice(0, 8)} merges more than two parents.*editWorkflows is turned off`, "s"));
+  });
+
+  it("refuses a merge whose second parent is not part of the base branch, on GitHub or not (regression)", async () => {
+    const f = await pushFixture();
+    // wip has the same ci.yml as main now in the merge, but wip is not part of main.
+    const crafted = (second: string) => f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), second] }], entries: [f.tip("feature/x"), second] });
+    f.refused(await f.push(crafted(f.tip("wip"))), new RegExp(`${f.tip("wip").slice(0, 8)}, which is not part of main.*editWorkflows is turned off`, "s"));
+    f.refused(await f.push(crafted(unknown)), new RegExp(`${unknown.slice(0, 8)}, which is not part of main`));
+  });
+
+  it("refuses new history that builds on a commit GitHub does not have, or one that is on neither the branch nor the base", async () => {
+    const f = await pushFixture();
+    // The first parent is where the new history joins what exists: it must be the branch (or part of it) or part of the base.
+    const built = (first: string) => f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [first, f.tip("main")] }], entries: [first, f.tip("main")] });
+    f.refused(await f.push(built(unknown)), new RegExp(`builds on commit ${unknown.slice(0, 8)}, which is neither on feature/x nor on main on GitHub.*editWorkflows is turned off`, "s"));
+    f.refused(await f.push(built(f.tip("wip"))), /neither on feature\/x nor on main/);
+    // Part of the branch's own history, or of main, is fine.
+    expect(await f.push(built(featureOld))).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await f.push(built(mainOld))).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("refuses an agent's own workflow edit, a merge that resolves to something else, a rename and a mode change", async () => {
+    const f = await pushFixture();
+    const dest = f.tip("feature/x");
+    // One commit editing ci.yml is not a merge of main.
+    f.refused(await f.push({ branch: "feature/x", tip: evilSha, files: listed({ "ci.yml": edit, "release.yml": release }), commits: [{ sha: evilSha, parents: [dest], changes: [change("ci.yml", edit)] }], entries: [dest] }), /is not a merge of main/);
+    // A merge of main that ends up with an edit of the agent's own in a workflow file.
+    const resolved = (changes: unknown[], files: Record<string, Entry>) => f.mergeOf("main", { files: listed(files), commits: [{ ...f.mergeOf().commits[0], changes }] });
+    f.refused(await f.push(resolved([change("ci.yml", edit), change("deploy.yml", deploy), change("release.yml", null)], { "ci.yml": edit, "deploy.yml": deploy })), /differ from main \(\.github\/workflows\/ci\.yml\)/);
+    // A rename of ci.yml: the old name gone, a new name main does not have.
+    f.refused(await f.push(resolved([change("ci.yml", null), change("build.yml", ci), change("deploy.yml", deploy), change("release.yml", null)], { "build.yml": ci, "deploy.yml": deploy })), /build\.yml/);
+    // A mode change keeps the blob and differs in the mode.
+    f.refused(await f.push(resolved([change("ci.yml", { ...ci, mode: "100755" }), change("deploy.yml", deploy), change("release.yml", null)], { "ci.yml": { ...ci, mode: "100755" }, "deploy.yml": deploy })), `${W}/ci.yml`);
+    // A deletion main does not share.
+    f.refused(await f.push(resolved([change("ci.yml", ci), change("deploy.yml", null), change("release.yml", null)], { "ci.yml": ci })), `${W}/deploy.yml`);
+    // The base branch with the same rename or mode passes.
+    f.state.branches.main = { "build.yml": ci, "deploy.yml": { ...deploy, mode: "100755" } };
+    expect(await f.push(f.mergeOf())).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("never lets a symlink, a submodule or a symlinked directory through, even when the base branch has the same", async () => {
+    const f = await pushFixture();
+    const link = { mode: "120000", oid: id(55) }, module = { mode: "160000", oid: id(56) };
+    f.state.branches.main = { "link.yml": link, "module.yml": module };
+    for (const [label, changes] of [
+      ["a symlink the base has", [change("link.yml", link)]],
+      ["a symlink the base lacks", [change("other.yml", link)]],
+      ["a submodule", [change("module.yml", module)]],
+      ["the directory replaced by a symlink", [{ path: W, mode: "120000", oid: id(57) }]],
+    ] as const) {
+      f.refused(await f.push(f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], changes }] })), /not regular files/);
+      expect(f.state.calls, label).toEqual([]);
+    }
+  });
+
+  it("refuses when it cannot read what it must compare: pull requests, branches, trees, ancestry, or a base that is no directory", async () => {
+    const f = await pushFixture();
+    const older = () => f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), mainOld] }], entries: [f.tip("feature/x"), mainOld] });
+    for (const [label, pattern] of [["the pull request lookup", /\/pulls\?/], ["a branch", /\/branches\//], ["a tree", /\/git\/trees\//], ["an ancestry check", /\/compare\//]] as const) {
+      f.state.failing = [pattern];
+      f.refused(await f.push(older()), /cannot read the workflow files of .*editWorkflows is turned off/s);
+      expect(f.state.calls.length, label).toBeGreaterThan(0);
+      f.state.calls.length = 0;
+    }
+    // Without a pull request the default branch is read; failing that refuses too.
+    f.state.failing = [/^\/repos\/anthm-fr\/songtrivia$/];
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files/);
+    f.state.failing = [];
+    // A branch GitHub does not know.
+    f.state.prs = [{ base: "ghost" }];
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files of ghost/);
+    f.state.prs = [];
+    // A tree GitHub cut short does not show every workflow file.
+    f.state.truncated = true;
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files/);
+    f.state.truncated = false;
+    // A branch whose .github is no directory cannot be compared.
+    f.state.githubDirectory = "symlink";
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files/);
+    // Neither branch has workflow files: only what leaves them as they are passes.
+    f.state.githubDirectory = "none";
+    f.refused(await f.push(f.mergeOf()), `${W}/ci.yml`);
+    expect(await f.push({ ...f.mergeOf(), files: [], commits: [{ ...f.mergeOf().commits[0], changes: [change("ci.yml", null)] }] })).toMatchObject({ credential: { login: "agent-owner" } });
+    // Fixed, the same push passes.
+    f.state.githubDirectory = "tree";
+    expect(await f.push(f.mergeOf())).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("allows a new branch that merges the base branch, and refuses one that builds on anything else", async () => {
+    const f = await pushFixture();
+    f.state.destination = false;
+    // The agent's own commit on top of an older main (no workflow change in it), then a merge of main.
+    const fresh = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [localSha, f.tip("main")] }], entries: [mainOld, f.tip("main")] });
+    expect(await f.push(fresh)).toMatchObject({ credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: { base: "main", destinationSha: null, commits: [mergeSha] } } });
+    f.refused(await f.push({ ...fresh, entries: [f.tip("wip"), f.tip("main")] }), /builds on commit .*not part of main/);
+    f.refused(await f.push({ ...fresh, entries: [unknown, f.tip("main")] }), /builds on commit .*not part of main/);
+  });
+
+  it("compares with the pull request's base, with the default branch when there is none, and refuses when the base is unclear", async () => {
+    const f = await pushFixture();
+    // The pull request into release/1 is compared with release/1, not with main.
+    f.state.prs = [{ base: "release/1" }];
+    f.refused(await f.push(f.mergeOf("main")), /differ from release\/1/);
+    expect(await f.push(f.mergeOf("release/1"))).toMatchObject({ evidence: { workflowBaseMerge: { base: "release/1", baseSha: f.tip("release/1") } } });
+    // Two pull requests into one base are one base; two bases are none.
+    f.state.prs = [{ base: "main" }, { base: "main" }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    f.state.prs = [{ base: "main" }, { base: "release/1" }];
+    f.refused(await f.push(f.mergeOf()), /more than one base branch \(main, release\/1\).*editWorkflows is turned off/s);
+    // A pull request from a fork, or from another branch, is not this branch's.
+    f.state.prs = [{ base: "release/1", fork: true }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    f.state.prs = [{ base: "release/1", ref: "other" }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    // No pull request: the repository's default branch.
+    f.state.prs = [];
+    f.state.defaultBranch = "release/1";
+    f.refused(await f.push(f.mergeOf("main")), /differ from release\/1/);
+    expect(await f.push(f.mergeOf("release/1"))).toMatchObject({ evidence: { workflowBaseMerge: { base: "release/1" } } });
+  });
+
+  it("takes a pull request's base only when it is the default branch or protected, since whoever opens the pull request chooses it", async () => {
+    const f = await pushFixture();
+    // An agent can open a pull request into any branch; workflow files on a branch nobody protects are not reviewed.
+    f.state.prs = [{ base: "wip" }];
+    f.refused(await f.push(f.mergeOf("wip")), /wip is neither the default branch nor protected.*editWorkflows is turned off/s);
+    f.state.protectedBranches.add("wip");
+    expect(await f.push(f.mergeOf("wip"))).toMatchObject({ evidence: { workflowBaseMerge: { base: "wip" } } });
+    f.state.prs = [{ base: "main" }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    // A default branch GitHub does not name cannot be told from any other unprotected branch.
+    f.state.protectedBranches.delete("wip");
+    f.state.prs = [{ base: "wip" }];
+    f.state.defaultBranch = "";
+    f.refused(await f.push(f.mergeOf("wip")), /neither the default branch nor protected/);
+  });
+
+  it("leaves the run identity as it was: the toggle decides and GitHub is not asked", async () => {
+    const f = await pushFixture();
+    await f.setPolicy({ ...anthmPolicy, userSource: "run" });
+    f.refused(await f.push(f.mergeOf()), /privileged GitHub action \(editWorkflows\) and it is turned off/);
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("asks nothing of GitHub when the company allows workflow edits, and falls back to the toggle without a usable report", async () => {
+    const f = await pushFixture();
+    const good = f.mergeOf();
+    const commit = good.commits[0]!;
+    const file = good.files[0]!;
+    // The toggle decides when the report is missing or not exactly what the launcher sends.
+    for (const workflowPush of [undefined, null, "ci.yml", { branch: "feature/x" }, { ...good, branch: "" }, { ...good, tip: "xyz" }, { ...good, files: "x" }, { ...good, files: [{ ...file, oid: null }] },
+      { ...good, files: [{ ...file, path: "src/app.ts" }] }, { ...good, files: Array.from({ length: 101 }, () => file) }, { ...good, commits: "x" }, { ...good, commits: Array.from({ length: 101 }, () => commit) },
+      { ...good, commits: [{ ...commit, sha: "xyz" }] }, { ...good, commits: [{ ...commit, parents: ["xyz"] }] }, { ...good, commits: [{ ...commit, parents: Array.from({ length: 17 }, () => commit.sha) }] },
+      { ...good, commits: [{ ...commit, changes: [] }] }, { ...good, commits: [{ ...commit, changes: [{ path: "src/app.ts", mode: null, oid: null }] }] },
+      { ...good, commits: [{ ...commit, changes: [{ path: `${W}/ci.yml`, mode: "100644", oid: null }] }] }, { ...good, commits: [{ ...commit, changes: [{ path: `${W}/ci.yml`, mode: null, oid: ci.oid }] }] },
+      { ...good, commits: [{ ...commit, changes: [{ path: `${W}/${"x".repeat(300)}.yml`, mode: null, oid: null }] }] },
+      { ...good, entries: [] }, { ...good, entries: ["xyz"] }, { ...good, entries: Array.from({ length: 9 }, () => commit.sha) }]) {
+      const decision = await f.write("anthm-fr/songtrivia", { action: "push", privileged: [toggle], ...(workflowPush === undefined ? {} : { workflowPush }) });
+      f.refused(decision, /privileged GitHub action \(editWorkflows\) and it is turned off/);
+    }
+    expect(f.state.calls).toEqual([]);
+    // With the toggle on, anything goes through without a comparison.
+    await f.setPolicy({ ...anthmPolicy, privileged: { editWorkflows: true } });
+    expect(await f.push({ ...good, commits: [{ sha: evilSha, parents: [f.tip("feature/x")], changes: [change("ci.yml", edit)] }] })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await f.write("anthm-fr/songtrivia", { action: "push", privileged: [toggle] })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("does not unlock any other privileged action, and the kill switch still refuses", async () => {
+    const f = await pushFixture();
+    const decision = f.refused(await f.push(f.mergeOf(), { privileged: [toggle, "pushToMain"] }), /\(pushToMain\)/);
+    expect(decision.unavailable).not.toContain("editWorkflows");
+    f.refused(await f.push(f.mergeOf(), { privileged: [toggle, "tagPush"] }), /\(tagPush\)/);
+    expect(f.state.calls).toEqual([]);
+    // The kill switch flipped during the base read refuses the push.
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let waiting = false;
+    const inner = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      if (path.includes("/git/trees/")) { waiting = true; await gate; }
+      return (inner as any)(path, ...rest);
+    });
+    const racing = f.push(f.mergeOf());
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    release();
+    f.refused(await racing, /kill switch/);
+  });
+
+  it("keeps a refusal within the server's 500 characters however many files and commits differ, and keeps them all in the evidence", async () => {
+    const f = await pushFixture();
+    const other = blob("on: other\n");
+    const files = Array.from({ length: 60 }, (_, index) => `agent-workflow-with-a-rather-long-name-number-${index}.yml`);
+    const many = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], changes: files.map(file => change(file, other)) }] });
+    const decision = f.refused(await f.push(many), /differ from main/);
+    expect(decision.unavailable.length).toBeLessThanOrEqual(500);
+    expect(decision.unavailable).toMatch(/and 5\d more/);
+    expect(decision.evidence.offending).toHaveLength(60);
+    f.state.prs = [{ base: "release/1" }];
+    const long = `${"x".repeat(250)}.yml`;
+    expect((await f.push(f.mergeOf("release/1", { commits: [{ ...f.mergeOf("release/1").commits[0], changes: [change(long, other)] }] }))).unavailable.length).toBeLessThanOrEqual(500);
+    for (const [label, push] of [
+      ["a clean tip", { ...f.mergeOf("release/1"), commits: [{ sha: restoreSha, parents: [evilSha], changes: [change(long, other)] }] }],
+      ["history on nothing GitHub has", { ...f.mergeOf("release/1"), entries: [unknown, f.tip("release/1")], commits: [{ ...f.mergeOf("release/1").commits[0], parents: [unknown, f.tip("release/1")] }] }],
+      ["an octopus", { ...f.mergeOf("release/1"), commits: [{ ...f.mergeOf("release/1").commits[0], parents: [f.tip("feature/x"), f.tip("release/1"), f.tip("wip")], changes: files.map(file => change(file, other)) }] }],
+    ] as const) {
+      expect((await f.push(push)).unavailable.length, label).toBeLessThanOrEqual(500);
     }
   });
 });

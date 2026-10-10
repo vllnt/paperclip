@@ -255,6 +255,257 @@ admin-merge guard; and the throttle (`perMinute`, `perHour` per GitHub user).
 | `pushToMain` | pushes or API writes to `main`/`master`, `gh repo sync`, `merge-upstream` | off |
 | `editWorkflows` | a push whose new commits change `.github/workflows/**`, contents API writes there | off |
 
+**Workflow files and the base branch.** A push whose new commits change
+`.github/workflows/**` needs `editWorkflows`, with one exception: an agent keeps
+a pull request current by merging its base branch, and the base branch's own
+workflow changes come in with that merge. With `editWorkflows` off, the plugin
+lets such a push through only when all the history it adds is the base branch's
+own. It checks that against GitHub at that moment, with the App's read-only
+token, and not against the checkout alone:
+
+- Every new commit that changes a workflow file (the checkout reports them with
+  their parents) must be a merge of exactly two parents. The files it changes
+  must be byte for byte what the base branch has now (same git mode and blob),
+  or gone from both, and its second parent must be part of the base branch.
+  A commit of one parent that changes a workflow file, an octopus merge, and a
+  second parent that is not on the base branch are refused. So a clean tip
+  cannot hide an earlier edit: the commit that made the edit is refused too.
+- Every parent where the new history joins commits that already exist (the
+  checkout reports these) must be on the pushed branch or on the base branch on
+  GitHub. A remote ref that only the checkout has hides nothing: the commit
+  behind it is not on GitHub, so the push is refused.
+- The pushed commit's workflow files, wherever they differ from the branch it
+  replaces on GitHub (the branch's actual tip, not what the checkout last
+  fetched), must be the base branch's. Moving a branch to an older commit that
+  GitHub already has, or onto a commit from another branch, is a change to its
+  workflow files and is judged the same way. The checkout also marks such a push
+  as touching workflow files when the files differ from the branch tip it last
+  saw, so it is not skipped for having no new commit.
+
+**What counts as already on GitHub.** The launcher works out which commits a
+push adds, and whether any of them changes a workflow file, as the commits that
+the refs of the destination do not reach. The remote-tracking refs of a checkout
+(`refs/remotes/*`) are not that: the agent can write them with `git update-ref`
+or a fetch refspec, and a commit that edits a workflow behind one of them looks
+like old history. So a push that the checkout reports as free of workflow
+changes is read once more before it runs with a credential. The launcher lists
+the branches and tags of the push's destination, and its default branch, from
+GitHub itself (`git ls-remote --symref`, with the credential the broker has just
+given this command, over the same verified connection), leaves out only the
+commits those refs reach, and works out again what the push adds. If that is
+free of workflow changes too, the push runs on the first answer. If it is not,
+the broker is asked again about the push as GitHub's refs describe it (with its
+new commits, and where they join GitHub), and its answer replaces the first.
+Anything that cannot be settled counts as a change that may touch workflow
+files, so `editWorkflows` decides: the refs cannot be read in full (a network or
+credential failure, a list of more than 2,000 lines, more than one push URL),
+or the branch being pushed to exists on GitHub at a commit that the checkout does
+not have (a replacement it cannot compare). This costs one more read of GitHub
+per such push, and one more broker question only when the answer changes. Local
+branches (`refs/heads/*`) were never part of what already exists, and
+`packed-refs` are read like loose refs. Pushes that the checkout already reports
+as changing workflow files go to the plugin as before, which checks where their
+history joins GitHub.
+
+**A ref that moves onto an existing commit.** A commit that GitHub already has
+(on another branch, say) is not new, but a ref that is created or moved onto it
+holds its workflow files. So a push is also judged by what its refs would hold,
+whichever commits are new: a push to a branch that GitHub has must carry that
+branch's workflow files (as GitHub lists the branch, not as the checkout last
+saw it), and a new branch, or a push of several refs, must carry the workflow
+files of GitHub's default branch. Where they differ, or the default branch's
+commit is one the checkout does not have (the default branch has moved on since
+the last fetch), the push is reported as changing workflow files, with the
+pushed commit as the place where it joins GitHub, and the plugin decides as for
+any other workflow change: a branch cut from an older commit of the base branch
+passes, and a branch that inherits workflow files from another branch's commit
+does not. The common cases cost nothing more: a push to a branch that GitHub has,
+and a new branch cut from a default branch the checkout has fetched, carry
+workflow files equal to what they are compared with.
+
+**What the history is read from.** Every launcher git command reads the real
+objects. `GIT_NO_REPLACE_OBJECTS` and `GIT_GRAFT_FILE=/dev/null` are set for all
+of them and for the command that runs, because `git replace` refs and
+`info/grafts` are the agent's to write and make every read show another commit
+than the one the push sends. (`core.graftFile` does not turn grafts off; the
+variable does.) A shallow boundary cannot hide a commit: the commit that becomes
+a root lists all its files, and a push that needs the parents the boundary left
+out is refused by GitHub. `GIT_EXEC_PATH` is dropped from the environment of
+every launcher command, so a helper found through it (`git-remote-*`,
+`git-receive-pack`) never runs with the credential.
+
+**A command that goes to the network with a credential is sealed.** A push, a
+fetch and an `ls-remote` do not run in the checkout, whose config, hooks and refs
+the agent's UID can change after the broker has answered. Each runs in a git
+directory that the launcher makes for it. That directory holds none of the
+checkout's remotes, refs, hooks or settings. The command gets the URL the broker
+was told as its literal target, `core.hooksPath` pointing at an empty directory,
+`protocol.ext.allow=never`, and an environment of its own. Command-line config
+cannot do this job: a `url.*.insteadOf` rule, or a URL-scoped `http.<url>.proxy`,
+in the repository's own config ties with it or outranks it. The only way to know
+that a setting of the checkout is not read is that the command does not read the
+checkout's config. What the launcher itself reads of the checkout before and
+after (remotes, refs, commits, the refs that it applies after a fetch) runs
+without the credential in the environment, so a hook or helper that the checkout
+configures never sees it. The next paragraphs say how each command is sealed.
+
+**The git that holds a credential is not found through the caller's `PATH`.**
+Whoever sets `PATH` (the agent) would be handed the credential by a program named
+`git`. A sealed command runs the first `git` in `/usr/bin`, `/usr/local/bin`,
+`/opt/homebrew/bin` and `/bin` (in that order) that the user running the launcher
+cannot change: the file, once its symlinks are followed, and every directory above
+it, and the directory it was found in, are owned by someone else and not writable
+by this user. A `git` that fails that test is skipped, and when none passes the
+command is refused with the reason ("no git that this user cannot change was found
+in …"). The command's `PATH` is those four directories and nothing else, so a
+helper it starts (`ssh`, a credential helper) is a system one too; its other
+variables are the short list above, so `GIT_EXEC_PATH`, `LD_PRELOAD` and the like
+never reach it. Root can change any file, so for root no check is possible: only
+the four directories count. Commands that hold no credential still use the `git`
+that `PATH` finds, and so do the launcher's own reads of the checkout, which run
+without one.
+
+| Command, when a managed credential is supplied | What happens |
+|---|---|
+| `git push`, `git fetch`, `git ls-remote`, and the launcher's own listing of GitHub's branches | Sealed: a private git directory, the URL the broker was told, no hooks, the trusted `git` and `PATH` above |
+| `git pull` | Refused: `git fetch <remote> <branch>`, then `git merge FETCH_HEAD` or `git rebase <remote>/<branch>` |
+| `git clone` | Refused: `git init <dir> && cd <dir> && git fetch <url> <branch> && git checkout FETCH_HEAD` |
+| `git submodule add`, `git submodule update` | Refused: fetch the submodule's repository the same way |
+| `git lfs` fetch, pull, push, locks, lock, unlock, prune and every other verb that is not local | Refused |
+| `git lfs` install, track, untrack, ls-files, env, pointer, status, version, checkout, fsck, ext, update, migrate and the like; `git submodule status`, `foreach`, `init`, `sync` | Run as before (local commands get no token) |
+| `gh` | Unchanged: found through `PATH`, runs with the token (see the limits) |
+
+The same commands run as before when no credential is supplied, for example a
+clone of a public repository.
+
+**A push with a credential is sealed.** Once the broker has answered, the push
+does not run as typed. Its destination and its refs are arguments, not names that
+git looks up. The command is `git -c core.hooksPath=<empty> -c
+push.followTags=false -c push.recurseSubmodules=no -c protocol.ext.allow=never
+push <options> --no-verify --no-follow-tags --no-recurse-submodules -- <the
+URL> <object>:<full ref>…`: the URL is the one the broker was told about and is
+the literal target (never the remote's name), and each refspec is the object
+(a tag object stays a tag object) and the full name it goes to, or `:<full name>`
+to delete. The commits are read again and must be the ones in the report the
+broker answered. `--force-with-lease` becomes `--force-with-lease=<full
+ref>:<commit>` for each ref. A commit that the command names (or none, for a ref
+that must not exist) is used as typed. A value that comes out of the checkout's
+refs (a lease without a value, which means the remote-tracking ref, or a name
+such as `origin/x`) is the checkout's to write, so it is taken only when it is
+the commit GitHub lists for that branch: as read for the check of the report, or,
+when the check did not read the branches, as read when the push is planned. The
+child is given that listed commit. A checkout that disagrees with GitHub, or
+branches that cannot be read, is refused, as git refuses a lease whose remote has
+moved: fetch, look at what is new on that branch, and run it again. A value from
+the checkout's refs for a ref that is not a branch is refused too (name the
+commit: `--force-with-lease=<ref>:<commit>`). The
+environment holds only the credential, `PATH`, the locale and what git needs, and
+none of the checkout's steering (`GIT_DIR`, `GIT_EXEC_PATH`, `GIT_TRACE*`,
+`GIT_SSH`, object and index paths); `HOME` is the private directory.
+
+The git directory it runs in is made for it, under the launcher's private
+directory. It holds nothing the push resolves: no remote, no refs, no push
+settings, no hooks. It has the checkout's objects as an alternate (and the
+shallow boundary), and its config, which the launcher makes read-only (as is the
+directory). What the checkout's config, hooks, remote names, refspecs, refs or
+environment say after the check, even in the instant git starts, cannot reach the
+destination or the refs: they are in the arguments. A process of the same user
+that finds the private directory can still make its config writable again and add
+settings such as a `url.*.insteadOf` rewrite before git reads it; the read-only
+mode makes a plain write fail and narrows nothing else. That is the same
+boundary as reading the credential from the running command's environment (see
+the limits below).
+
+A push that cannot be reduced to one URL and a list of refs is refused, with the
+reason: `--all`, `--mirror`, `--tags`, `--follow-tags`, `--prune`, `--signed`,
+`--receive-pack`, `--exec`, any option that is not listed, a destination with
+more than one push URL, and a push without refspecs when the repository's config
+(`push.default`, `remote.<name>.push`, `mirror`) decides what it sends. Name one
+remote and the branches. A refspec with a pattern, or one whose destination
+cannot be written as a full name (a source that is not a branch or tag and has no
+`refs/` destination), is refused too. These options are forwarded:
+`-f`/`--force`, `--force-if-includes`, `-n`, `-q`, `-v`, `-o`/`--push-option`,
+`--atomic`, `--porcelain`, `--progress`, `--thin` and the IPv4/IPv6 switches; `-d`
+and `--delete` become deletions in the refspecs, and `-u` and
+`--force-with-lease` are done as described. A push without refspecs sends the
+current branch to the branch of the same name, which is what the broker was told;
+git itself would stop for want of an upstream. Because the push goes to a URL,
+git does not do what it does for a configured remote, so the launcher does it in
+the checkout after a push that succeeded (not after `-n`): it moves or deletes the
+remote-tracking refs of the branches the push changed, and `-u` records the
+upstream. If the push fails, the tracking refs stay as they were. The
+checkout's own hooks (a `pre-push` hook, `core.hooksPath`) do not run for a
+push that holds a credential.
+
+A **fetch** is sealed the same way. Its git directory has the checkout's refs (so
+git negotiates, fast-forwards, follows tags and prunes as it does in the
+checkout), its shallow boundary, and the checkout's object directory, so what it
+fetches lands there. What git needs to know about the remote comes as
+environment config of the launcher's own, not from a file: the URL the broker
+was told, where the remote's branches go (`remote.<name>.fetch`), its tag and
+prune settings, and the upstream of the current branch. The remote has to be the
+repository the broker was told about: one that points elsewhere now, or that git
+would default to instead of the `origin` that was reported, is refused. When the
+command has finished, the launcher applies what it did to the checkout, with
+processes that do not hold the credential: the refs it changed (each only if the
+checkout still has the value the fetch started from; the checkout's
+`reference-transaction` hook runs for them as for any ref update), the symbolic
+refs it made, `FETCH_HEAD` and the shallow boundary. A fetch into a branch that
+is checked out is refused as git refuses it (nothing is applied, exit 128).
+Submodules are not fetched and no maintenance (`gc`, commit graphs) runs. These
+are refused, with the reason: `--all` and `--multiple` (each remote needs its own
+URL), `--upload-pack`, `--filter` and partial clones, `--set-upstream`,
+`--refetch`, `--prefetch`, `--stdin`, `--negotiate-only`, and any option that is
+not listed. Name one remote and its refspecs.
+
+An **`ls-remote`** is sealed with the literal URL; `--upload-pack` and `--exec`
+are refused. The launcher's own read of the branches and tags that GitHub lists
+for a push (above) is sealed the same way, so it cannot be redirected either.
+
+A **`pull`** is not run with a credential. It fetches and then merges or rebases
+in one command, and the merge runs the checkout's hooks (`post-merge`,
+`post-rewrite`) and config while it holds the credential. It cannot be split
+without redoing git's own handling of the `pull` options, of the merge
+descriptions in `FETCH_HEAD` and of a rebase's fork point. The refusal says what
+to do: `git fetch <remote> <branch>`, then `git merge FETCH_HEAD` or
+`git rebase <remote>/<branch>`.
+
+A **`clone`**, a **`git submodule add|update`** and the **Git LFS** verbs that
+transfer or lock objects also reach the network, and they are not sealed: a clone
+runs templates, hooks and filters and fetches submodules, a submodule command
+clones each submodule with the checkout's config, and Git LFS has a transfer agent
+and a credential helper of its own. With a credential they do not run, and the
+message says what to do instead (above). This is not a change for public
+repositories: a command that is given no credential runs as it did. A push does
+not upload Git LFS objects either, because its `pre-push` hook does not run (see
+above); a branch that adds LFS files has to have its objects uploaded another
+way.
+
+The base is the base of the same-repository open pull request whose head is the
+pushed branch, else the repository's default branch. Whoever opens a pull
+request chooses its base, so the base counts only when it is the default branch
+or a protected branch; workflow files on any other branch are not taken as
+reviewed. The push must be one commit to one named branch, with at most 100
+new commits and 100 workflow files and no path longer than 300 characters;
+otherwise the checkout reports no history and the toggle decides. Anything that
+cannot be read in full (a pull request lookup, a branch, a tree, a comparison),
+two open pull requests into different bases, and every symlink or submodule among
+the changed paths (whether or not the base branch has the same) refuse. The
+refusal names the commit or the paths that differ; the audit record lists all of
+them, and the base branch and its commit when the check passed. An agent's own
+edit, a rename, a mode change, or a deletion the base branch does not share is
+refused as before. This applies to the App user identity only (with
+`userSource: "run"` the toggle decides as before), and it unlocks no other
+toggle: `pushToMain`, `tagPush` and the rest still apply.
+
+This lifts Paperclip's refusal only. GitHub has its own: it refuses a push that
+changes workflow files from an App without the Workflows write permission, which
+is why the hard limit below is to keep that permission off. Whether GitHub counts
+a merge of the base branch's own workflow files as such a change was not
+verified. If it does, these pushes still fail at GitHub until a human grants the
+permission, and then the checkout's report of the pushed paths is the only gate
+that remains.
+
 Release tags (`name@version`) and bulk tag pushes (`--tags`, `--follow-tags`,
 `--mirror`, tag patterns) are refused whatever the toggles: only the
 repository's release workflow creates release tags. Writes are also refused
@@ -480,12 +731,24 @@ a proxy or other TLS trust (URL-specific `http.<url>.proxy` or `sslVerify`,
 `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE` and git's curl tracing variables from
 it; gh always gets a fresh private `GH_CONFIG_DIR`. Such a command therefore
 cannot use a proxy the network needs. The allowlist, toggles, throttle and
-guard hold on the managed path only. An agent that captures a user token (for example from a git hook, a
-program named `gh` later in `PATH`, or a gh extension, which all run with the
-token in their environment) can skip them for at most 8 hours; the hard limits are GitHub's: the App
+guard hold on the managed path only. An agent that captures a user token (for example from the git hook of a
+command other than a push, a fetch or an `ls-remote` (a `gh` command runs unsealed), a program named `gh`
+later in `PATH`, or a gh extension, which all run with the token in their environment, and the `node` that
+`#!/usr/bin/env node` finds for the launcher itself; or a process of the same user that reads the environment
+of the running command) can skip them for at most 8 hours; the hard limits are GitHub's: the App
 installation's repositories and permissions (keep Workflows write off so
 workflow files cannot change), and the repositories' rulesets. The
-`editWorkflows` check reads the checkout's history, which an agent controls.
+`editWorkflows` check reads the checkout's objects, which an agent controls. It
+trusts the checkout for what the push contains (its commits and their parents,
+and the pushed commit's files: git objects, which cannot change without changing
+their IDs) and takes what already exists from GitHub: the base branch, the pushed
+branch and the ancestry for the base-branch check, and the branches and tags of
+the destination for a push that the checkout calls free of workflow changes (see
+"What counts as already on GitHub"). A remote-tracking ref that the checkout
+wrote hides nothing. The launcher itself runs as the agent, with the run's broker
+capability in its environment, so an agent that does not use it, and sends the
+broker a report of its own, is not stopped by this check: the hard limits are
+GitHub's.
 `pushToMain` knows `main` and `master` only.
 
 With `userSource: "run"`, the kill switch withholds the run's token entirely
