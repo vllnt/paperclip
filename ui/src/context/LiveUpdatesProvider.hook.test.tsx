@@ -243,7 +243,10 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
     await vi.waitFor(() => expect(sockets).toHaveLength(2));
-    expect(invalidate).toHaveBeenCalledExactlyOnceWith({ type: "active" }, { cancelRefetch: false });
+    expect(invalidate).toHaveBeenCalledExactlyOnceWith(
+      { type: "active", predicate: expect.any(Function) },
+      { cancelRefetch: false },
+    );
   });
 
   it.each(["parent-agent", "child-agent"])("shows an unrelated retryable failure without issueId for %s", async (agentId) => {
