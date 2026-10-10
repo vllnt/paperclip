@@ -17,6 +17,7 @@ import {
   heartbeatRuns,
   runIdentityContexts,
   heartbeatRunEvents,
+  runUsageRecords,
   costEvents,
   financeEvents,
   issueReadStates,
@@ -625,6 +626,7 @@ export function companyService(db: Db) {
           await removeOwned(agentTaskSessions);
           await removeOwned(activityLog);
           await removeOwned(runIdentityContexts);
+          await removeOwned(runUsageRecords);
           await removeOwned(financeEvents);
           await removeOwned(nativeRunFinalizations);
           await removeOwned(statusDecisionEffects);
