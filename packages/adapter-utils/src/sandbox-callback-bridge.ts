@@ -32,15 +32,24 @@ import type { RunProcessResult } from "./server-utils.js";
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
 // The longest wait between two empty request listings of the host queue
-// worker. Each listing is one remote command, and over SSH one new connection,
-// so an idle run that listed 100 ms after each empty listing cost the worker up
-// to ten logins a second. The wait starts at the poll interval after a request
-// and doubles while the queue stays empty. While listings succeed, a request
-// that arrives while idle waits at most this long, plus the listing in
-// progress and the next one, before the worker picks it up. A worker with a
-// short watchdog waits at most a quarter of the watchdog instead, so an idle
-// wait never looks like a stalled loop.
+// worker, before jitter. Each listing is one remote command, and over SSH one
+// new connection, so an idle run that listed 100 ms after each empty listing
+// cost the worker up to ten logins a second. The wait starts at the poll
+// interval after a request and doubles while the queue stays empty. It is
+// counted from the start of the previous listing, never below the poll
+// interval, so a slow listing adds no wait: in the worst case (a request lands
+// just after a slow listing started) the pickup takes what it took with a
+// fixed poll interval. A worker with a short watchdog waits at most a quarter
+// of the watchdog instead, so an idle wait never looks like a stalled loop.
 const MAX_BRIDGE_IDLE_POLL_WAIT_MS = 3_000;
+// Each idle wait is spread by up to this share either way, so runs that start
+// together do not list in step.
+const BRIDGE_IDLE_POLL_JITTER = 0.2;
+// A request that waited longer than this between being queued and its handler
+// starting is reported (`onSlowPickup`): longer than the longest idle wait
+// with jitter (3.6 s) plus a fast listing, so a report means the host or the
+// channel was slow.
+const BRIDGE_SLOW_PICKUP_MS = 4_000;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
@@ -339,6 +348,26 @@ export interface SandboxCallbackBridgeQueueClient {
   ): Promise<{ wrote: boolean }>;
   rename(fromPath: string, toPath: string): Promise<void>;
   remove(remotePath: string): Promise<void>;
+}
+
+/** A request the host worker picked up late; see `onSlowPickup`. */
+export interface SandboxCallbackBridgeSlowPickup {
+  requestId: string;
+  method: string;
+  /** When the sandbox queued the request (its own clock). */
+  queuedAt: string;
+  /** When the listing that found the request returned. */
+  listedAt: string;
+  /** When the handler started. */
+  startedAt: string;
+  /** `startedAt` minus `queuedAt`. */
+  pickupMs: number;
+}
+
+/** The run-log line for a request the host worker picked up late. */
+export function formatSandboxCallbackBridgeSlowPickup(pickup: SandboxCallbackBridgeSlowPickup): string {
+  return `[paperclip] Bridge request ${pickup.method} ${pickup.requestId} waited ${(pickup.pickupMs / 1000).toFixed(1)} s ` +
+    `for the host (queued ${pickup.queuedAt}, listed ${pickup.listedAt}, started ${pickup.startedAt}).\n`;
 }
 
 export interface SandboxCallbackBridgeWorkerHandle {
@@ -927,9 +956,15 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   // The wait after the first empty listing that follows a request. Each
-  // further empty listing doubles the wait, up to MAX_BRIDGE_IDLE_POLL_WAIT_MS.
-  // It is also the first step of the backoff after a failed listing.
+  // further empty listing doubles the wait, up to MAX_BRIDGE_IDLE_POLL_WAIT_MS
+  // or a quarter of the watchdog, whichever is shorter, but never below this
+  // value: a poll interval above the watchdog trips it, as it always did. It is
+  // also the first step of the backoff after a failed listing.
   pollIntervalMs?: number | null;
+  // Called when a request waited more than BRIDGE_SLOW_PICKUP_MS between being
+  // queued (`createdAt`, the sandbox's clock) and its handler starting. The
+  // bridge writes it to the run log. Errors in the callback are ignored.
+  onSlowPickup?: (pickup: SandboxCallbackBridgeSlowPickup) => void;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
   // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
@@ -1083,7 +1118,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   };
   const inFlightRequestGuards = new Map<string, RequestFinalizeGuard>();
 
-  const processRequestFile = async (fileName: string) => {
+  const processRequestFile = async (fileName: string, listedAt: number) => {
     // Skip a request that already has an active attempt. The guard map holds only
     // in-flight attempts; the attempt's finally removes its guard when it ends. A
     // file that still has a guard is in flight, or it waits for its aborted-handler
@@ -1257,6 +1292,23 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // the handler writes the real response.
       if (!claimForHandler()) {
         return;
+      }
+
+      const startedAt = Date.now();
+      const queuedAt = Date.parse(request.createdAt);
+      if (input.onSlowPickup && Number.isFinite(queuedAt) && startedAt - queuedAt > BRIDGE_SLOW_PICKUP_MS) {
+        try {
+          input.onSlowPickup({
+            requestId: request.id,
+            method: request.method,
+            queuedAt: new Date(queuedAt).toISOString(),
+            listedAt: new Date(listedAt).toISOString(),
+            startedAt: new Date(startedAt).toISOString(),
+            pickupMs: startedAt - queuedAt,
+          });
+        } catch {
+          // A report must never fail the request.
+        }
       }
 
       // Build the response, then finalize once. The handler already holds the
@@ -1680,10 +1732,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
       let consecutivePollFailures = 0;
       // The wait after the next empty listing. It doubles while the queue stays
       // empty, up to `maxIdleWaitMs`, and goes back to `pollIntervalMs` after
-      // the loop handles a request.
+      // the loop handles a request, sees one still in flight, or fails to list.
       let idleWaitMs = pollIntervalMs;
       while (true) {
         let fileNames: string[];
+        const listingStartedAt = Date.now();
         try {
           fileNames = await withTimeout(
             input.client.listJsonFiles(directories.requestsDir),
@@ -1708,9 +1761,11 @@ export async function startSandboxCallbackBridgeWorker(input: {
             pollIntervalMs * 2 ** consecutivePollFailures,
             MAX_TRANSIENT_ITERATION_BACKOFF_MS,
           );
+          idleWaitMs = pollIntervalMs;
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;
         }
+        const listedAt = Date.now();
         // A file whose attempt is still in flight (or waiting on its 504
         // backstop) is not actionable: `processRequestFile` would skip it via
         // the guard map. Treat an all-guarded listing like an empty one and
@@ -1724,16 +1779,24 @@ export async function startSandboxCallbackBridgeWorker(input: {
           if (stopping) {
             break;
           }
+          // Only an empty queue backs off. Files that are all still in flight
+          // (a request that outlived its iteration timeout) mean a busy run, so
+          // the next request must not wait behind a long idle wait.
+          const busy = fileNames.length > 0;
+          const baseMs = busy ? pollIntervalMs : idleWaitMs;
+          const jitter = 1 - BRIDGE_IDLE_POLL_JITTER + 2 * BRIDGE_IDLE_POLL_JITTER * Math.random();
+          // Counted from the start of the listing that just returned.
+          const waitMs = Math.max(pollIntervalMs, Math.round(baseMs * jitter) - (listedAt - listingStartedAt));
           await new Promise<void>((resolve) => {
             const wake = () => {
               clearTimeout(timer);
               wakeIdleWait = null;
               resolve();
             };
-            const timer = setTimeout(wake, idleWaitMs);
+            const timer = setTimeout(wake, waitMs);
             wakeIdleWait = wake;
           });
-          idleWaitMs = Math.min(Math.max(1, idleWaitMs * 2), maxIdleWaitMs);
+          idleWaitMs = busy ? pollIntervalMs : Math.min(Math.max(1, idleWaitMs * 2), maxIdleWaitMs);
           continue;
         }
         idleWaitMs = pollIntervalMs;
@@ -1753,10 +1816,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
             await withTimeout(
               input.runtimeSpan
                 ? input.runtimeSpan(CALLBACK_BRIDGE_RELAY_REQUEST_SPAN, () =>
-                    processRequestFile(fileName),
+                    processRequestFile(fileName, listedAt),
                   )
                 : runWithRuntimeParent(input.getRuntimeParentContext?.(), () =>
-                    processRequestFile(fileName),
+                    processRequestFile(fileName, listedAt),
                   ),
               iterationTimeoutMs,
               `Sandbox callback bridge process request ${fileName}`,

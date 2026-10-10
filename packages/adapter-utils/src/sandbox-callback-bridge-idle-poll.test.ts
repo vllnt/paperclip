@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
+  formatSandboxCallbackBridgeSlowPickup,
   sandboxCallbackBridgeDirectories,
   startSandboxCallbackBridgeWorker,
   type SandboxCallbackBridgeQueueClient,
@@ -26,20 +27,29 @@ const QUEUE_DIR = "/queue";
 const REQUESTS_DIR = sandboxCallbackBridgeDirectories(QUEUE_DIR).requestsDir;
 const RESPONSES_DIR = sandboxCallbackBridgeDirectories(QUEUE_DIR).responsesDir;
 
-function createMemoryClient() {
+function createMemoryClient(options: { listDelayMs?: number } = {}) {
   const files = new Map<string, string>();
   const listedAt: number[] = [];
   const listed: string[][] = [];
   // Runs right after a listing returns, before the worker sees it.
   let afterList: (() => void) | null = null;
+  // Runs when a listing starts. A slow listing returns what was there then.
+  let atListStart: (() => void) | null = null;
+  let failNextList = false;
   const client: SandboxCallbackBridgeQueueClient = {
     makeDir: async () => {},
     makeDirs: async () => {},
     listJsonFiles: async (dir) => {
+      if (failNextList) {
+        failNextList = false;
+        throw new Error("listing failed");
+      }
       const names = [...files.keys()]
         .filter((file) => path.posix.dirname(file) === dir && file.endsWith(".json"))
         .map((file) => path.posix.basename(file))
         .sort();
+      atListStart?.();
+      if (options.listDelayMs) await new Promise((resolve) => setTimeout(resolve, options.listDelayMs));
       listedAt.push(Date.now());
       listed.push(names);
       afterList?.();
@@ -82,7 +92,16 @@ function createMemoryClient() {
       fn();
     };
   };
-  return { client, listedAt, listed, enqueue, response, onNextList };
+  const onNextListStart = (fn: () => void) => {
+    atListStart = () => {
+      atListStart = null;
+      fn();
+    };
+  };
+  const failTheNextList = () => {
+    failNextList = true;
+  };
+  return { client, listedAt, listed, enqueue, response, onNextList, onNextListStart, failTheNextList };
 }
 
 function gaps(times: number[]): number[] {
@@ -96,19 +115,30 @@ describe("sandbox callback bridge worker idle polling", () => {
     const running = worker;
     worker = null;
     if (running) {
-      const stopped = running.stop();
-      await vi.advanceTimersByTimeAsync(5_000).catch(() => undefined);
+      let done = false;
+      const stopped = running.stop().finally(() => {
+        done = true;
+      });
+      // A slow listing in progress holds the stop until it returns.
+      while (!done) await vi.advanceTimersByTimeAsync(1_000);
       await stopped;
     }
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
+  type Handler = Parameters<typeof startSandboxCallbackBridgeWorker>[0]["handleRequest"];
+
+  // Jitter off (`random` 0.5) unless a test sets it, so the schedule is exact.
   async function startIdleWorker(
-    handleRequest = vi.fn(async () => ({ status: 200, body: "{}" })),
-    options: { watchdogTimeoutMs?: number } = {},
+    handleRequest: Handler = vi.fn(async () => ({ status: 200, body: "{}" })),
+    options: Partial<Parameters<typeof startSandboxCallbackBridgeWorker>[0]> = {},
+    client: { listDelayMs?: number; random?: number } = {},
   ) {
     vi.useFakeTimers();
-    const memory = createMemoryClient();
+    vi.spyOn(Math, "random").mockReturnValue(client.random ?? 0.5);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const memory = createMemoryClient({ listDelayMs: client.listDelayMs });
     worker = await startSandboxCallbackBridgeWorker({
       client: memory.client,
       queueDir: QUEUE_DIR,
@@ -122,7 +152,7 @@ describe("sandbox callback bridge worker idle polling", () => {
       const listings = memory.listedAt.length;
       while (memory.listedAt.length === listings) await vi.advanceTimersByTimeAsync(1);
     };
-    return { ...memory, handleRequest, untilNextListing };
+    return { ...memory, handleRequest: handleRequest as ReturnType<typeof vi.fn>, untilNextListing };
   }
 
   it("lists an idle queue at most six times in four seconds, doubling the wait each time", async () => {
@@ -176,6 +206,118 @@ describe("sandbox callback bridge worker idle polling", () => {
     enqueue("burst-2");
     await vi.advanceTimersByTimeAsync(200);
     expect(handleRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([0, 0.999999])("keeps the worst case with slow listings at what a fixed 100 ms poll gives (random %d)", async (random) => {
+    const LIST_MS = 9_900;
+    const HANDLER_MS = 8_000;
+    const handleRequest = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, HANDLER_MS));
+      return { status: 200, body: "{}" };
+    });
+    const onSlowPickup = vi.fn();
+    const { enqueue, response, onNextListStart } = await startIdleWorker(handleRequest, { onSlowPickup }, {
+      listDelayMs: LIST_MS, random,
+    });
+    // Long enough to reach the longest idle wait on an idle-backoff schedule.
+    await vi.advanceTimersByTimeAsync(120_000);
+    // The worst case: the request lands just after a slow listing started, so
+    // that listing misses it.
+    let queuedAt = 0;
+    onNextListStart(() => {
+      enqueue("late");
+      queuedAt = Date.now();
+    });
+    while (!queuedAt) await vi.advanceTimersByTimeAsync(1);
+    while (!response("late")) await vi.advanceTimersByTimeAsync(10);
+
+    // A fixed 100 ms poll: the listing in progress, 100 ms, the next listing,
+    // then the handler. The idle backoff adds nothing to that.
+    console.info(`slow listings, random ${random}: answered ${Date.now() - queuedAt} ms after queueing`);
+    expect(Date.now() - queuedAt).toBeLessThanOrEqual(LIST_MS + 100 + LIST_MS + HANDLER_MS + 20);
+    expect(onSlowPickup).toHaveBeenCalledTimes(1);
+    const pickup = onSlowPickup.mock.calls[0]![0];
+    expect(pickup).toMatchObject({ requestId: "late", method: "GET" });
+    expect(pickup.pickupMs).toBeGreaterThanOrEqual(LIST_MS + 100 + LIST_MS);
+    expect(formatSandboxCallbackBridgeSlowPickup(pickup)).toMatch(
+      /^\[paperclip\] Bridge request GET late waited 19\.\d s for the host \(queued .+, listed .+, started .+\)\.\n$/,
+    );
+  });
+
+  it("does not report a request picked up within the idle bound", async () => {
+    const onSlowPickup = vi.fn();
+    const { enqueue, response, onNextList, untilNextListing } = await startIdleWorker(undefined, { onSlowPickup });
+    await vi.advanceTimersByTimeAsync(30_000);
+    onNextList(() => enqueue("on-time"));
+    await untilNextListing();
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    expect(response("on-time")?.status).toBe(200);
+    expect(onSlowPickup).not.toHaveBeenCalled();
+  });
+
+  it("keeps the 100 ms wait while a request that outlived its iteration timeout is still in flight", async () => {
+    const started: string[] = [];
+    const handleRequest = vi.fn(async (request: { id: string }) => {
+      started.push(request.id);
+      if (request.id === "stuck") return new Promise<never>(() => {});
+      return { status: 200, body: "{}" };
+    });
+    const { enqueue, listedAt, onNextList, untilNextListing } = await startIdleWorker(handleRequest as Handler, {
+      iterationTimeoutMs: 1_000, abortedHandlerGraceMs: 120_000,
+    });
+    enqueue("stuck");
+    // The stuck request stays listed (its 504 backstop is far off), so every
+    // listing finds only a request in flight.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(gaps(listedAt.slice(-6))).toEqual(Array(5).fill(100));
+
+    onNextList(() => enqueue("next"));
+    await untilNextListing();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(started).toEqual(["stuck", "next"]);
+  });
+
+  it("picks up a request queued during a long request as soon as that request ends", async () => {
+    const times: Record<string, { start: number; end?: number }> = {};
+    const handleRequest = vi.fn(async (request: { id: string }) => {
+      times[request.id] = { start: Date.now() };
+      if (request.id === "long") await new Promise((resolve) => setTimeout(resolve, 8_000));
+      times[request.id]!.end = Date.now();
+      return { status: 200, body: "{}" };
+    });
+    const { enqueue } = await startIdleWorker(handleRequest as Handler);
+    enqueue("long");
+    await vi.advanceTimersByTimeAsync(2_000);
+    enqueue("second");
+    await vi.advanceTimersByTimeAsync(6_200);
+
+    expect(times.second?.start).toBeDefined();
+    expect(times.second!.start - times.long!.end!).toBeLessThanOrEqual(100);
+  });
+
+  it.each([
+    [0, 0.8],
+    [0.999999, 1.2],
+  ])("spreads each idle wait by at most 20 percent (random %d)", async (random, factor) => {
+    const { listedAt } = await startIdleWorker(undefined, {}, { random });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const bases = [100, 200, 400, 800, 1_600, 3_000, 3_000, 3_000];
+    expect(gaps(listedAt).slice(0, bases.length)).toEqual(bases.map((base) => Math.max(100, Math.round(base * factor))));
+  });
+
+  it("starts the idle wait again from 100 ms after a failed listing", async () => {
+    const { listedAt, failTheNextList, untilNextListing } = await startIdleWorker();
+    await vi.advanceTimersByTimeAsync(30_000);
+    failTheNextList();
+    // The failed listing records nothing; its retry comes 200 ms later.
+    await untilNextListing();
+    const recovered = listedAt.length;
+    await untilNextListing();
+
+    expect(listedAt[recovered]! - listedAt[recovered - 1]!).toBe(100);
   });
 
   it("stops without waiting out a long idle wait and still serves a queued request", async () => {

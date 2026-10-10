@@ -97,14 +97,28 @@ directory reaper removed the run's directory), or when a newer bridge took over
 its queue directory.
 
 The host's queue worker lists the request queue with one remote command (over
-SSH, one new connection). After it handles a request it lists again at once,
-then waits 100 ms after the first empty listing and doubles the wait after each
-further empty one, up to 3 seconds (or a quarter of the worker's watchdog, if
-that is shorter). So an idle run lists about 20 times a minute. While listings
-succeed, a request that arrives while the run is idle is picked up within
-3 seconds plus a listing round trip. After a failed listing, the existing retry
-backoff applies instead. `stop_transport` ends the wait early; the worker lists
-once more and still serves the requests already queued.
+SSH, one new connection). After it handles a request it lists again at once.
+After an empty listing it waits: 100 ms at first, doubling after each further
+empty listing, up to 3 seconds (or a quarter of the worker's watchdog, if that
+is shorter). Each wait is spread by up to 20% either way, so runs that start
+together do not list in step. The wait counts from the start of the listing
+before it and is never shorter than 100 ms, so a slow listing adds no wait. A
+listing that finds only requests still in flight, and a failed listing, set the
+wait back to 100 ms. An idle run lists about 20 times a minute.
+
+How long a request waits for the worker:
+- With fast listings, a request that arrives while the run is idle is picked up
+  within 3.6 seconds plus a listing round trip.
+- In the worst case, a request lands just after a slow listing started. Its
+  pickup then takes what it took with a fixed 100 ms wait: the listing in
+  progress, 100 ms, and the next listing.
+- A request that waited more than 4 seconds for its handler writes a run-log
+  line: `[paperclip] Bridge request <method> <id> waited <n> s for the host
+  (queued …, listed …, started …)`. The queued time comes from the sandbox's
+  clock.
+
+`stop_transport` ends the wait early; the worker lists once more and still
+serves the requests already queued.
 
 ## The server-owned staging lease outer context
 

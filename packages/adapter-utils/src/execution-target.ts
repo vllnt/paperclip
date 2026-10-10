@@ -34,6 +34,7 @@ export type {
 } from "./sandbox-managed-runtime.js";
 import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
+  formatSandboxCallbackBridgeSlowPickup,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
@@ -4864,6 +4865,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       maxBodyBytes,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
+      // A request the worker picked up late goes to the run log, without
+      // waiting for it: the operator's measure of pickup delay.
+      onSlowPickup: (pickup) => {
+        void Promise.resolve().then(() => onLog("stdout", formatSandboxCallbackBridgeSlowPickup(pickup))).catch(() => undefined);
+      },
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
