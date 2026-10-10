@@ -38,8 +38,9 @@ const REMOTE_ADDITIONAL_SOURCE_HEAVY_DIR_EXCLUDES = [
 
 /**
  * A synced SSH run works in `<remoteRoot>/.paperclip-runtime/runs/<runId>/workspace`.
- * Nothing else writes under `runs/<runId>`, so that directory holds only the
- * run's own copy of the workspace.
+ * The only other entry is the run's temp directory `runs/<runId>/tmp` (its
+ * `TMPDIR`), so that directory holds only the run's own workspace copy and
+ * scratch files.
  *
  * This is the only place that builds the path, and the run id is one plain
  * path segment, so two run ids never share a directory. The reaper's claim
