@@ -6,6 +6,8 @@ import { styles } from "./styles.js";
 import { RepositoryWorkspace } from "./management-repository.js";
 /** `queued`: a request waits for the scheduled job (`queuedAt` is when it was made); `busy`: a sync is running now. */
 export interface SyncStatus { configured: boolean; settings: SyncSettings; busy: boolean; queued?: boolean; queuedAt?: string | null; report: SyncReport | null; pendingCount: number }
+/** What every "Sync now" control says after the action answers: the request waits for the scheduled job, it has not run. */
+export const SYNC_QUEUED_NOTICE = "Sync queued. It runs with the next scheduled sync.";
 export function GitHubTaskList({ context }: PluginWidgetProps) {
   return context.companyId ? <TaskSync key={context.companyId} companyId={context.companyId} projectId={context.projectId ?? undefined} /> : null;
 }
