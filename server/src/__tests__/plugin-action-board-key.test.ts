@@ -183,6 +183,17 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     await tempDb?.cleanup();
   });
 
+  /**
+   * The hashes that the database holds for every board and agent key. Reading the
+   * stored values, and not hashing a token in the test, checks the real credential
+   * verifiers and keeps this file from running a hash over a key it just made.
+   */
+  async function storedKeyHashes(): Promise<string[]> {
+    const board = await db.select({ hash: boardApiKeys.keyHash }).from(boardApiKeys);
+    const agent = await db.select({ hash: agentApiKeys.keyHash }).from(agentApiKeys);
+    return [...board, ...agent].map((row) => row.hash);
+  }
+
   it("reaches the plugin as the key's board user, with instance admin and the authorized company", async () => {
     const { company, adminKey } = await seed(db);
     const call = vi.fn().mockResolvedValue({ ok: true });
@@ -265,8 +276,10 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     const serialized = JSON.stringify(contexts);
     for (const secret of [adminKey.token, memberKey.token, agentToken]) {
       expect(serialized).not.toContain(secret);
-      expect(serialized).not.toContain(hashBearerToken(secret));
     }
+    const hashes = await storedKeyHashes();
+    expect(hashes).toHaveLength(3);
+    for (const hash of hashes) expect(serialized).not.toContain(hash);
   });
 
   /**
@@ -365,8 +378,10 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
     const serialized = JSON.stringify(rows);
     for (const secret of [adminKey.token, memberKey.token, agentToken]) {
       expect(serialized).not.toContain(secret);
-      expect(serialized).not.toContain(hashBearerToken(secret));
     }
+    const hashes = await storedKeyHashes();
+    expect(hashes).toHaveLength(3);
+    for (const hash of hashes) expect(serialized).not.toContain(hash);
   }, 60_000);
 
   it("rejects a revoked board key", async () => {
