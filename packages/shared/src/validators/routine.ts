@@ -62,6 +62,47 @@ export const routineVariableSchema = z.object({
   }
 });
 
+/** Values of the routine list `trigger` filter: a trigger kind, or `manual` for a routine with no trigger. */
+export const ROUTINE_LIST_TRIGGER_FILTERS = [...ROUTINE_TRIGGER_KINDS, "manual"] as const;
+export type RoutineListTriggerFilter = (typeof ROUTINE_LIST_TRIGGER_FILTERS)[number];
+/** Longest text the routine list `q` filter accepts. */
+export const ROUTINE_LIST_QUERY_MAX_LENGTH = 200;
+
+/**
+ * Query of `GET /companies/:companyId/routines`. Every filter is optional and they combine with AND;
+ * with none set the list is unchanged. Parse request input with {@link parseListRoutinesQuery}.
+ */
+export const listRoutinesQuerySchema = z.object({
+  /** Case-insensitive text matched against the title and the description. */
+  q: z
+    .string()
+    .trim()
+    .min(1)
+    .max(ROUTINE_LIST_QUERY_MAX_LENGTH)
+    .refine((value) => !value.includes("\u0000"), "q must not contain a NUL character")
+    .optional(),
+  assigneeAgentId: z.string().guid().optional(),
+  /** A folder id, or `none` for routines in no folder. */
+  folderId: z.union([z.literal("none"), z.string().guid()]).optional(),
+  projectId: z.string().guid().optional(),
+  status: z.enum(ROUTINE_STATUSES).optional(),
+  /** A routine matches a trigger kind when it has a non-archived trigger of that kind; `manual` means it has none. */
+  trigger: z.enum(ROUTINE_LIST_TRIGGER_FILTERS).optional(),
+});
+export type ListRoutinesQuery = z.infer<typeof listRoutinesQuerySchema>;
+
+/**
+ * Parses the routine list query from raw URL parameters. A blank value (empty or only spaces) counts as
+ * not set, so `?q=` lists everything like no parameter. Unknown parameters are ignored.
+ * @throws ZodError when a value is invalid, including a repeated parameter.
+ */
+export function parseListRoutinesQuery(raw: Record<string, unknown>): ListRoutinesQuery {
+  const present = Object.fromEntries(
+    Object.entries(raw).filter(([, value]) => !(typeof value === "string" && value.trim() === "")),
+  );
+  return listRoutinesQuerySchema.parse(present);
+}
+
 export const createRoutineSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   folderId: z.string().guid().optional().nullable(),

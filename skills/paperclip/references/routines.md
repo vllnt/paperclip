@@ -228,4 +228,6 @@ GET /api/routines/{routineId}
 GET /api/routines/{routineId}/runs?limit=50
 ```
 
+The list takes optional filters that combine with AND: `q` (case-insensitive text in the title or the description), `assigneeAgentId`, `projectId`, `folderId` (`none` for routines in no folder), `status` (`active`, `paused` or `archived`) and `trigger` (`schedule`, `webhook`, `api`, or `manual` for a routine with no trigger). For example, `GET /api/companies/{companyId}/routines?assigneeAgentId={agentId}&status=active` lists one agent's active routines. The CLI takes the same filters: `paperclipai routine list --agent-id <id> --status active`.
+
 Use the generic API endpoint tables in `skills/paperclip/references/api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.

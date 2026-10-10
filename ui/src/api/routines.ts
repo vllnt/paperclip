@@ -1,5 +1,6 @@
 import type {
   ActivityEvent,
+  ListRoutinesQuery,
   Routine,
   RoutineDetail,
   RoutineListItem,
@@ -34,10 +35,15 @@ export interface RestoreRoutineRevisionResponse {
   secretMaterials: RestoreRoutineRevisionSecretMaterial[];
 }
 
+/** Filters of the company routine list; each one maps to a `GET .../routines` query parameter. */
+export type RoutineListFilters = { [K in keyof ListRoutinesQuery]?: ListRoutinesQuery[K] | null };
+
 export const routinesApi = {
-  list: (companyId: string, filters?: { projectId?: string | null }) => {
+  list: (companyId: string, filters: RoutineListFilters = {}) => {
     const params = new URLSearchParams();
-    if (filters?.projectId) params.set("projectId", filters.projectId);
+    for (const [key, value] of Object.entries(filters)) {
+      if (typeof value === "string" && value) params.set(key, value);
+    }
     const query = params.toString();
     return api.get<RoutineListItem[]>(`/companies/${companyId}/routines${query ? `?${query}` : ""}`);
   },

@@ -600,7 +600,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "GET /api/companies/{}/routines": {
     "section": "Routines",
-    "description": "List all routines in company"
+    "description": "List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `manual`)"
   },
   "GET /api/routines/{}": {
     "section": "Routines",

@@ -13,6 +13,7 @@ describe("agent detail navigation", () => {
       "overview",
       "instructions",
       "skills",
+      "routines",
       "runtime",
       "secrets",
       "tools",
@@ -27,6 +28,8 @@ describe("agent detail navigation", () => {
     expect(parseAgentDetailView("dashboard")).toBe("overview");
     expect(parseAgentDetailView("configuration")).toBe("runtime");
     expect(parseAgentDetailView("prompts")).toBe("instructions");
+    expect(parseAgentDetailView("routines")).toBe("routines");
+    expect(agentDetailHref("ceo", "routines")).toBe("/agents/ceo/routines");
     expect(agentDetailHref("codexcoder", "permissions")).toBe("/agents/codexcoder/permissions");
   });
 

@@ -1,7 +1,7 @@
 import { verifyAppWebhook } from "./app-webhook.js";
 import crypto from "node:crypto";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, ilike, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -32,6 +32,7 @@ import {
 import type {
   CreateRoutine,
   CreateRoutineTrigger,
+  ListRoutinesQuery,
   Routine,
   RoutineDetail,
   RoutineDescriptionDocument,
@@ -2055,10 +2056,31 @@ export function routineService(
 
     list: async (
       companyId: string,
-      filters?: { projectId?: string | null },
+      filters: ListRoutinesQuery = {},
     ): Promise<RoutineListItem[]> => {
       const conditions = [eq(routines.companyId, companyId)];
-      if (filters?.projectId) conditions.push(eq(routines.projectId, filters.projectId));
+      if (filters.projectId) conditions.push(eq(routines.projectId, filters.projectId));
+      if (filters.assigneeAgentId) conditions.push(eq(routines.assigneeAgentId, filters.assigneeAgentId));
+      if (filters.folderId === "none") conditions.push(isNull(routines.folderId));
+      else if (filters.folderId) conditions.push(eq(routines.folderId, filters.folderId));
+      if (filters.status) conditions.push(eq(routines.status, filters.status));
+      if (filters.q) {
+        const pattern = `%${filters.q.replace(/[\\%_]/g, (character) => `\\${character}`)}%`;
+        const textMatch = or(ilike(routines.title, pattern), ilike(routines.description, pattern));
+        if (textMatch) conditions.push(textMatch);
+      }
+      if (filters.trigger) {
+        const liveTriggers = db
+          .select({ id: routineTriggers.id })
+          .from(routineTriggers)
+          .where(and(
+            eq(routineTriggers.companyId, companyId),
+            eq(routineTriggers.routineId, routines.id),
+            eq(routineTriggers.archived, false),
+            ...(filters.trigger === "manual" ? [] : [eq(routineTriggers.kind, filters.trigger)]),
+          ));
+        conditions.push(filters.trigger === "manual" ? not(exists(liveTriggers)) : exists(liveTriggers));
+      }
 
       const rows = await db
         .select()

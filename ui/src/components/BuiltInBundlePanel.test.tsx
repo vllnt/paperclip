@@ -102,6 +102,7 @@ describe("BuiltInBundlePanel (PAP-13099)", () => {
     onRunRoutine: (routineKey: string) => void;
     onEnableSchedule: (routineKey: string) => void;
     onDisableSchedule: (routineKey: string) => void;
+    sections: "all" | "resources" | "routine";
   }> = {}) {
     root = createRoot(container);
     flushSync(() => {
@@ -114,6 +115,7 @@ describe("BuiltInBundlePanel (PAP-13099)", () => {
           onRunRoutine={handlers.onRunRoutine ?? (() => {})}
           onEnableSchedule={handlers.onEnableSchedule ?? (() => {})}
           onDisableSchedule={handlers.onDisableSchedule ?? (() => {})}
+          sections={handlers.sections}
         />,
       );
     });
@@ -228,6 +230,56 @@ describe("BuiltInBundlePanel (PAP-13099)", () => {
     expect(configureBtn).toBeTruthy();
     flushSync(() => configureBtn!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(onConfigure).toHaveBeenCalledTimes(1);
+  });
+
+  it("resources section keeps the readiness rows and points the routine row at the Routines tab", () => {
+    render(makeState("ready", [
+      resource("skill", "stock_current"),
+      resource("instructions", "stock_current"),
+      resource("routine", "operator_modified", {
+        pendingUpdateInteractionId: "interaction-1",
+        pendingUpdateIssueId: "issue-1",
+        pendingUpdateIssueIdentifier: "PAP-42",
+      }),
+    ]), { sections: "resources" });
+    const text = container.textContent ?? "";
+    expect(text).toContain("Bundle status");
+    expect(text).toContain("Adapter");
+    expect(text).toContain("Skill");
+    expect(text).toContain("Instructions");
+    expect(text).toContain("Recent agent reflection");
+    expect(text).toContain("Schedule off");
+    expect(text).toContain("Drifted");
+    expect(text).toContain("Routines tab");
+    // The routine's controls and proposal live in the Routines tab, not here.
+    expect(text).not.toContain("Run once");
+    expect(text).not.toContain("Enable weekly");
+    expect(text).not.toContain("Review proposal");
+    const routinesLink = container.querySelector('a[href="/agents/reflectioncoach/routines"]');
+    expect(routinesLink?.textContent).toBe("View");
+  });
+
+  it("routine section shows only the routine controls and its proposal", () => {
+    const onRunRoutine = vi.fn();
+    render(makeState("ready", [
+      resource("skill", "stock_current"),
+      resource("instructions", "stock_current"),
+      resource("routine", "stock_current", {
+        pendingUpdateInteractionId: "interaction-1",
+        pendingUpdateIssueId: "issue-1",
+        pendingUpdateIssueIdentifier: "PAP-42",
+      }),
+    ]), { sections: "routine", onRunRoutine });
+    const text = container.textContent ?? "";
+    expect(text).toContain("Built-in routine");
+    expect(text).not.toContain("Bundle status");
+    expect(text).not.toContain("Adapter");
+    expect(text).not.toContain("Instructions");
+    expect(text).toContain("Recent agent reflection");
+    expect(text).toContain("Run once");
+    expect(text).toContain("Enable weekly");
+    expect(text).toContain("Review proposal");
+    expect(container.querySelector("section")?.getAttribute("aria-label")).toBe("Built-in routine");
   });
 
   it("renders nothing for a built-in without a bundle", () => {

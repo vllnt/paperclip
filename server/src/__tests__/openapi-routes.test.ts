@@ -291,6 +291,28 @@ describe("openapi routes", () => {
       required: false,
       schema: { type: "string", enum: ["accessible"] },
     });
+    const routineListParameters: Array<{ name: string; in: string; required: boolean }> =
+      res.body.paths["/api/companies/{companyId}/routines"].get.parameters;
+    expect(routineListParameters.filter((param) => param.in === "query").map((param) => [param.name, param.required])).toEqual([
+      ["q", false],
+      ["assigneeAgentId", false],
+      ["folderId", false],
+      ["projectId", false],
+      ["status", false],
+      ["trigger", false],
+    ]);
+    expect(routineListParameters).toContainEqual({
+      name: "status",
+      in: "query",
+      required: false,
+      schema: { type: "string", enum: ["active", "paused", "archived"] },
+    });
+    expect(routineListParameters).toContainEqual({
+      name: "trigger",
+      in: "query",
+      required: false,
+      schema: { type: "string", enum: ["schedule", "webhook", "api", "manual"] },
+    });
     expect(res.body.paths["/api/companies"].get.responses["403"]).toBeDefined();
     expect(res.body.paths["/api/companies"].get.responses["400"]).toBeDefined();
     expect(
