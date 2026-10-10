@@ -11003,7 +11003,9 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
-        if (actorAgentId) assertAgentMayChangeBlock(receiptExisting, issueData);
+        // Only a human lifts a human-owned block. An agent, and any write that names no actor at
+        // all, is refused. A named system actor is held by the `WHERE` of the write instead.
+        if (actorAgentId || (!actorUserId && !systemActor)) assertAgentMayChangeBlock(receiptExisting, issueData);
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

@@ -39,7 +39,11 @@ import {
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
-import { NATIVE_STATUS_PROJECTION_ACTOR } from "../routable-blocked.js";
+import {
+  isHumanOwnedBlock,
+  NATIVE_STATUS_PROJECTION_ACTOR,
+  notHumanOwnedBlockCondition,
+} from "../routable-blocked.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
@@ -760,10 +764,33 @@ async function materializeDecisionEffect(input: {
         and(
           eq(issues.id, input.issue.id),
           eq(issues.companyId, input.companyId),
+          notHumanOwnedBlockCondition(issues),
         ),
       )
       .returning({ id: issues.id });
-    if (!bound) throw new Error("native_blocker_binding_not_persisted");
+    if (!bound) {
+      // A block that the board or a person owns keeps its descriptor, and nobody is woken for the
+      // owner that the run asked for. The effect row records why.
+      const [current] = await input.tx
+        .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+        .from(issues)
+        .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.companyId)))
+        .limit(1);
+      if (current && isHumanOwnedBlock(current)) {
+        return {
+          effectKind: effect.kind,
+          targetType: "issue_unblock_descriptor",
+          targetId: input.issue.id,
+          payload: {
+            owner: effect.owner,
+            action: effect.action,
+            wakeId: null,
+            heldReason: "human_owned_block",
+          },
+        };
+      }
+      throw new Error("native_blocker_binding_not_persisted");
+    }
     let wakeId: string | null = null;
     if (effect.owner !== "board") {
       wakeId = await enqueueWake({

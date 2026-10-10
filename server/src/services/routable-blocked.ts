@@ -128,11 +128,11 @@ export const NATIVE_STATUS_PROJECTION_ACTOR: NativeStatusProjectionActor = {
 };
 
 /**
- * Refuses a change by an agent that would leave a human-owned block or rewrite
- * its descriptor: a new status other than `blocked`, or any descriptor that
- * differs from the stored one, including clearing it. Re-sending the same
- * descriptor, or changing other fields, is allowed. Call it with the row as it is
- * locked for the write.
+ * Refuses a change by a caller that is not a human that would leave a human-owned block or
+ * rewrite its descriptor: a new status other than `blocked`, or any descriptor that
+ * differs from the stored one, including clearing it. An agent is such a caller, and so is a
+ * write that names no actor at all. Re-sending the same descriptor, or changing other fields,
+ * is allowed. Call it with the row as it is locked for the write.
  *
  * @param stored - The status and descriptor of the issue as stored.
  * @param requested - The status and descriptor the caller asks for. A field left undefined is not changed.

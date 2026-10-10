@@ -17629,6 +17629,7 @@ export function issueRoutes(
         const reopenedIssue = await svc.update(id, {
           status: "todo",
           ...(actor.agentId ? { actorAgentId: actor.agentId } : {}),
+          ...(actor.actorType === "user" ? { actorUserId: actor.actorId } : {}),
         });
         if (!reopenedIssue) {
           res.status(404).json({ error: "Issue not found" });

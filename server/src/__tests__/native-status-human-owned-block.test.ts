@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  agentWakeupRequests,
   companies,
   completionContracts,
   createDb,
@@ -75,31 +76,46 @@ describeEmbeddedPostgres("the native status projection and blocks that wait for 
   });
 
   /** One company, agent and issue with the records that a native run leaves before its status decision. */
-  async function seed(input: { status: string; descriptor: IssueUnblockDescriptor | null }) {
+  /**
+   * One company, agent and issue with the records that a native run leaves before its status
+   * decision. With `existing`, only a further run and its records are added to that issue.
+   */
+  async function seed(
+    input: { status: string; descriptor: IssueUnblockDescriptor | null },
+    existing?: { companyId: string; agentId: string; issueId: string },
+  ) {
     const nonce = randomUUID().slice(0, 8);
-    const [company] = await db
-      .insert(companies)
-      .values({ name: `Native ${nonce}`, issuePrefix: `NB${nonce.slice(0, 4).toUpperCase()}` })
-      .returning();
-    const companyId = company!.id;
-    const [agent] = await db
-      .insert(agents)
-      .values({ companyId, name: `Agent ${nonce}`, role: "engineer", adapterType: "codex_local", status: "running" })
-      .returning();
-    const [issue] = await db
-      .insert(issues)
-      .values({
-        companyId,
-        title: "Waiting on a human",
-        status: input.status,
-        priority: "medium",
-        assigneeAgentId: agent!.id,
-        workMode: "standard",
-        unblockDescriptor: input.descriptor,
-        blockedTransitionAt: input.status === "blocked" ? BLOCKED_AT : null,
-      })
-      .returning();
-    const issueId = issue!.id;
+    let companyId: string;
+    let agentId: string;
+    let issueId: string;
+    if (existing) {
+      ({ companyId, agentId, issueId } = existing);
+    } else {
+      const [company] = await db
+        .insert(companies)
+        .values({ name: `Native ${nonce}`, issuePrefix: `NB${nonce.slice(0, 4).toUpperCase()}` })
+        .returning();
+      companyId = company!.id;
+      const [agent] = await db
+        .insert(agents)
+        .values({ companyId, name: `Agent ${nonce}`, role: "engineer", adapterType: "codex_local", status: "running" })
+        .returning();
+      agentId = agent!.id;
+      const [issue] = await db
+        .insert(issues)
+        .values({
+          companyId,
+          title: "Waiting on a human",
+          status: input.status,
+          priority: "medium",
+          assigneeAgentId: agentId,
+          workMode: "standard",
+          unblockDescriptor: input.descriptor,
+          blockedTransitionAt: input.status === "blocked" ? BLOCKED_AT : null,
+        })
+        .returning();
+      issueId = issue!.id;
+    }
     const runId = randomUUID();
     const contractId = randomUUID();
     const resultId = randomUUID();
@@ -107,7 +123,7 @@ describeEmbeddedPostgres("the native status projection and blocks that wait for 
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
-      agentId: agent!.id,
+      agentId,
       status: "succeeded",
       runtimeMode: "native",
       runtimeModeResolvedAt: new Date(),
@@ -120,7 +136,7 @@ describeEmbeddedPostgres("the native status projection and blocks that wait for 
       id: contractId,
       companyId,
       issueId,
-      revision: 1,
+      revision: existing ? 2 : 1,
       schemaVersion: "paperclip.completion-contract.v1",
       policyVersion: "phase6-v1",
       risk: "standard",
@@ -165,7 +181,7 @@ describeEmbeddedPostgres("the native status projection and blocks that wait for 
       resultId,
       assessmentId,
     });
-    return { companyId, issueId, runId, assessmentId };
+    return { companyId, agentId, issueId, runId, assessmentId };
   }
 
   function commit(seeded: Awaited<ReturnType<typeof seed>>, priorStatus: string, decision: NativeStatusDecision) {
@@ -324,6 +340,85 @@ describeEmbeddedPostgres("the native status projection and blocks that wait for 
       await exhaust(seeded);
 
       expect((await readIssue(seeded.issueId)).status).toBe("in_review");
+    });
+  });
+
+  describe("a bind_blocker effect", () => {
+    function bindBlockerDecision(owner: { agentId: string } | "board", action: string): NativeStatusDecision {
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "blocked",
+        toStatus: "blocked",
+        reasonCode: "agent_owned_wait",
+        unblockDescriptor: { owner, action },
+        effects: [{ kind: "bind_blocker", owner, action }],
+      };
+    }
+
+    async function wakesFor(companyId: string) {
+      return db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    }
+
+    it.each([
+      ["the board", BOARD_BLOCK],
+      ["a person", PERSON_BLOCK],
+    ])(
+      "leaves a block owned by %s as it is, wakes nobody, and says why in the effect row",
+      async (_label, descriptor) => {
+        const seeded = await seed({ status: "blocked", descriptor });
+        const laundering = { agentId: seeded.agentId };
+
+        const committed = await commit(seeded, "blocked", bindBlockerDecision(laundering, "Wait for the build"));
+
+        const after = await readIssue(seeded.issueId);
+        expect(after.status).toBe("blocked");
+        expect(after.unblockDescriptor).toEqual(descriptor);
+        expect(Number(after.statusVersion)).toBe(0);
+        expect(await wakesFor(seeded.companyId), "no wake for the owner that the run asked for").toHaveLength(0);
+        const effects = await db
+          .select()
+          .from(statusDecisionEffects)
+          .where(and(eq(statusDecisionEffects.decisionId, committed.decision.id), eq(statusDecisionEffects.effectKind, "bind_blocker")));
+        expect(effects).toHaveLength(1);
+        expect(effects[0]?.payload).toMatchObject({ heldReason: "human_owned_block", wakeId: null, owner: laundering });
+        expect(committed.decision.applicationState).toBe("applied");
+      },
+    );
+
+    it("does not let the next status projection move the issue, because the descriptor was never changed", async () => {
+      const first = await seed({ status: "blocked", descriptor: BOARD_BLOCK });
+      await commit(first, "blocked", bindBlockerDecision({ agentId: first.agentId }, "Wait for the build"));
+      const second = await seed({ status: "blocked", descriptor: BOARD_BLOCK }, first);
+
+      await commit(second, "blocked", inProgressDecision("live_continuation_registered"));
+
+      const after = await readIssue(first.issueId);
+      expect(after.status).toBe("blocked");
+      expect(after.unblockDescriptor).toEqual(BOARD_BLOCK);
+    });
+
+    it("still binds a board owner to an issue that is not blocked yet, and wakes nobody", async () => {
+      const seeded = await seed({ status: "in_progress", descriptor: null });
+
+      await commit(seeded, "in_progress", bindBlockerDecision("board", "Approve the deploy"));
+
+      const after = await readIssue(seeded.issueId);
+      expect(after.status).toBe("blocked");
+      expect(after.unblockDescriptor).toEqual({ owner: "board", action: "Approve the deploy" });
+      expect(await wakesFor(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("still binds an agent owner, replaces the descriptor of a block that an agent owns, and wakes that agent", async () => {
+      const seeded = await seed({ status: "blocked", descriptor: null });
+      await db
+        .update(issues)
+        .set({ unblockDescriptor: { owner: { agentId: seeded.agentId }, action: "Old wait" } })
+        .where(eq(issues.id, seeded.issueId));
+
+      await commit(seeded, "blocked", bindBlockerDecision({ agentId: seeded.agentId }, "New wait"));
+
+      expect((await readIssue(seeded.issueId)).unblockDescriptor).toEqual({ owner: { agentId: seeded.agentId }, action: "New wait" });
+      expect(await wakesFor(seeded.companyId)).toHaveLength(1);
     });
   });
 

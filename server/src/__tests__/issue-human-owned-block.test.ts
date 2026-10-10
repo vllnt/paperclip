@@ -27,6 +27,7 @@ import {
   HEARTBEAT_CHECKOUT_ACTOR,
   HUMAN_OWNED_BLOCK_MESSAGE,
   isHumanOwnedBlock,
+  NATIVE_STATUS_PROJECTION_ACTOR,
   notHumanOwnedBlockCondition,
   ROUTABLE_BLOCKED_ROLLOUT_AT,
 } from "../services/routable-blocked.js";
@@ -205,18 +206,53 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
       expect(after.blockedTransitionAt).toEqual(BLOCKED_AT);
     });
 
-    it("lets a board user and a system caller unblock the issue", async () => {
-      const byUser = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
-      const bySystem = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
+    it("lets a board user unblock the issue", async () => {
+      const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
 
-      await issueService(db).update(byUser.issue.id, { status: "todo", actorUserId: "board-user" });
-      await issueService(db).update(bySystem.issue.id, { status: "todo" });
+      await issueService(db).update(fixture.issue.id, { status: "todo", actorUserId: "board-user" });
 
-      for (const fixture of [byUser, bySystem]) {
+      const after = await readIssue(fixture.issue.id);
+      expect(after.status).toBe("todo");
+      expect(after.unblockDescriptor).toBeNull();
+    });
+
+    it.each(refusedChanges)(
+      "refuses a write that names no actor at all when it %s, because only a human lifts the block",
+      async (_label, change) => {
+        const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
+        const before = await readIssue(fixture.issue.id);
+
+        const failure = await refusal(issueService(db).update(fixture.issue.id, { ...change }));
+
+        expect(failure).toMatchObject({ status: 403, message: HUMAN_OWNED_BLOCK_MESSAGE });
         const after = await readIssue(fixture.issue.id);
-        expect(after.status).toBe("todo");
-        expect(after.unblockDescriptor).toBeNull();
-      }
+        expect(after.status).toBe("blocked");
+        expect(after.unblockDescriptor).toEqual(BOARD_BLOCK);
+        expect(after.updatedAt).toEqual(before.updatedAt);
+      },
+    );
+
+    it("lets a write with no actor change other fields of a board-owned block, and lift a block that nobody human owns", async () => {
+      const owned = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
+      const own = await seed({ descriptor: null, blockedTransitionAt: BLOCKED_AT });
+
+      await issueService(db).update(owned.issue.id, { title: "Renamed by the system" });
+      await issueService(db).update(own.issue.id, { status: "todo" });
+
+      expect(await readIssue(owned.issue.id)).toMatchObject({ title: "Renamed by the system", status: "blocked", unblockDescriptor: BOARD_BLOCK });
+      expect((await readIssue(own.issue.id)).status).toBe("todo");
+    });
+
+    it("holds a named system actor in the write instead: the call resolves with the block as it is", async () => {
+      const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
+
+      const held = await issueService(db).update(fixture.issue.id, {
+        status: "in_progress",
+        systemActor: NATIVE_STATUS_PROJECTION_ACTOR,
+      });
+
+      expect(held).toMatchObject({ id: fixture.issue.id, status: "blocked", unblockDescriptor: BOARD_BLOCK });
+      expect((await readIssue(fixture.issue.id)).status).toBe("blocked");
     });
 
     it("stamps a new transition time when an agent hands a legacy blocked issue to the board, and the board sees it once", async () => {
