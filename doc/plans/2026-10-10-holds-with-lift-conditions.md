@@ -138,7 +138,8 @@ company removal path deletes these rows in its own transaction. A test proves it
 | `last_evaluated_at` | timestamptz, null | Written only when `met_at`, `last_error` or `last_observed` changes, and otherwise at most once every 15 minutes (section 3.5) |
 | `last_observed` | jsonb, null | Bounded. For a metric: value, unit, sample time. Never free text |
 | `last_error` | text, null | A closed code: `issue_not_found`, `metric_stale`, `lift_failed`, `auto_lift_not_authorized` |
-| `created_by_*` | actor type, agent id, user id, run id | Same shape as `issue_tree_holds`. This is the **setter**: `created_by_user_id` is checked again before an automatic lift (section 3.7) |
+| `last_error_at` | timestamptz, null | Changes only when `last_error` changes. It is the `activityAt` of the `broken` alert (section 3.9) |
+| `created_by_*` | actor type, agent id, user id, run id | Same shape as `issue_tree_holds`. This is the **setter**: `created_by_user_id` is checked again before an automatic lift, and it is replaced when the condition is replaced (section 3.7) |
 | `closed_at`, `closed_by_*`, `close_reason` | | `close_reason`: `manual_lift`, `auto_lift`, `withdrawn`, `superseded`, `target_gone` |
 | `created_at`, `updated_at` | timestamptz | |
 
@@ -174,13 +175,16 @@ same hold" as a predicate on the target:
 The predicate is used in two ways:
 
 1. **To decide `superseded`.** The checker applies it to `armed` **and** `met` rows.
-   Target not held, or a different generation: close the row as `superseded` (or
-   `target_gone` when the target is terminated or deleted). No alert. No lift.
+   Target deleted or terminated: close the row as `target_gone`. Target not held,
+   or a different generation (this includes an agent that the company archive
+   paused again with a new reason and time): close the row as `superseded`. No
+   alert. No lift.
    When the target is *still held under a new generation*, the close writes the
    activity entry `hold.condition_closed` with the reason, so the change is visible
    and the nudge (section 3.12) covers the new hold.
 2. **As the guard of the lift itself.** A lift is a **compare-and-set**: one
-   transaction that locks the target row and the condition row (`FOR UPDATE`), or
+   transaction that locks the target row first and the condition row second (`FOR UPDATE`; the
+   same order in every path, so that two paths cannot deadlock), or
    one `UPDATE` whose `WHERE` holds `id`, `company_id` and the predicate. It marks
    the condition `lifted` in the same transaction. Zero rows updated means the hold
    changed: close as `superseded` and lift nothing. Reading the target "just before"
@@ -195,7 +199,11 @@ Prerequisites, because the code does not allow this today:
   existing routes call it without a generation (their behaviour does not change).
   The adapter calls it with one. For the agent, the route-level refusal of a resume
   when the org chain is invalid moves into the shared resume function, so that no
-  caller can skip it.
+  caller can skip it. For the issue tree hold, `releaseHold` gains the predicate
+  `status = 'active'` in its `UPDATE` (it only reads the status today). The optional
+  wake step of the release route (the `getExecutionBlocker` check and the wake loop,
+  which run only when `metadata.wakeAgents === true`) moves into the shared release
+  function, so that **Lift now** can offer it (section 4.1).
 - **H2, company.** Today `PATCH /companies/:id` with `status: "paused"` leaves
   `paused_at` and `pause_reason` NULL, and `status: "active"` does not clear them
   (only the budget service writes them). A pause, resume, pause cycle would give the
@@ -247,12 +255,12 @@ callers cannot write two `hold.lifted` or two `hold.condition_met` entries.
 A worker, built like the usage record worker, with two corrections:
 
 - one unref'd, single-flight interval (default 60 seconds, configurable);
-- single-flight by a **session-level** advisory lock held on one connection for the
-  whole pass. Each row is handled in its **own** transaction, so one failed
+- single-flight by a **session-level** advisory lock held on one dedicated connection
+  (`withDedicatedDbConnection`) for the whole pass. Each row is handled in its **own** transaction, so one failed
   statement does not abort the pass (a transaction-level lock would);
 - it reads rows in bounded batches through the partial index and makes **two
   passes**: `armed` rows (evaluate the condition) and `met` rows (re-check the
-  generation, supersede a stale row, and retry an automatic lift that failed);
+  generation, supersede a stale row, and retry an automatic lift that failed, with the backoff of section 3.7);
 - it uses the **database clock** (`now()`), never a host clock;
 - **an error is caught per row**, recorded as `last_error`, logged once per
   interval, and never reaches a run. A lagging or dead checker delays alerts. It
@@ -266,7 +274,8 @@ automatic lift of an issue tree hold is a release **without** the optional wake
 step: the release route runs that step only when `metadata.wakeAgents === true`,
 after a `getExecutionBlocker` check. So the wakeups that the hold cancelled stay
 cancelled, and `hold.lifted` says `wakesSent: false`. A person who wants the wake
-uses **Lift now** and the existing option.
+chooses it on **Lift now**: the lift body takes `wakeAgents`, for issue tree holds
+and board users only. The automatic lift always sends false.
 
 Write churn. `last_evaluated_at` would change every pass for every armed row. It is
 bookkeeping, not a user-visible change. It is written only when `met_at`,
@@ -307,7 +316,14 @@ bounces around the threshold does not trigger early.
 
 | Type | `condition_params` | Met when | `auto_lift` | Attach is refused when |
 |---|---|---|---|---|
-| `active_runs_finished` | `{}` | no run is `queued` or `running` for any issue in the hold's tree | allowed | the scope is not `issue_tree_hold`, or no run is active already (it would be met at once) |
+| `active_runs_finished` | `{}` | no run is `queued` or `running` for any issue in the hold's tree | **refused** (below) | the scope is not `issue_tree_hold`, or the condition is already true. The backfill below is exempt |
+
+**Why `auto_lift` is refused on this type.** Creating a pause hold cancels the
+tree's active runs and its unclaimed wakeups (the create route does both). So a
+pause hold is almost always past this condition at once, and only a verified
+interaction wake can start a run later. An automatic lift would undo the pause
+within one checker pass. The type exists for the old rows below, and for the rare
+hold that still has a run.
 
 #### Retiring the unused release strategy
 
@@ -321,6 +337,14 @@ the condition type above. This is what happens to the data:
   `mode = 'pause'`, stores `after_active_runs_finish` and has no condition, it
   creates an `active_runs_finished` condition with **`auto_lift = false`**.
   Released holds are not touched: they are history. The backfill lifts nothing.
+  These rows are the reason the type exists. Each is an active hold whose own
+  stated release condition (the runs are done) is usually already met. So the
+  backfill creates the condition already satisfied, and the first checker pass
+  raises **one `hold_lift` alert for each active pause hold that stores the old
+  strategy**. That is the intended result, not a flood. The operator can count them
+  first with a read-only query: `select count(*) from issue_tree_holds where status
+  = 'active' and mode = 'pause' and release_policy->>'strategy' =
+  'after_active_runs_finish'`.
 - **Why `auto_lift = false`.** The strategy name suggests an automatic release, but
   that never happened. Making holds that have been inert for days release
   themselves would be a silent change of behaviour, which is what this plan
@@ -329,10 +353,11 @@ the condition type above. This is what happens to the data:
   on the row.
 - **New writes.** The column and the field stay (the migration rule is additive only,
   so the column is never dropped). For two releases the validator still accepts the
-  strategy. It is marked deprecated in OpenAPI and in the CLI help. A create with it
-  makes the same condition with `auto_lift = false`, in the same transaction, and the
-  response carries a deprecation notice. After two releases the validator rejects it
-  with 422 and a message that names `liftCondition`.
+  strategy, marked deprecated in OpenAPI and in the CLI help, and **stores it as it
+  does today without creating a condition**. A new pause hold cancels the tree's
+  runs, so the condition would be met at once and would only raise a useless alert.
+  The response carries a deprecation notice. After two releases the validator
+  rejects the strategy with 422 and a message that names `liftCondition`.
 - **`manual` and the `note` field** are unchanged.
 
 **Later:** `any_of` (several conditions, the first one wins).
@@ -343,18 +368,22 @@ natural lift is "an agent is assigned". That is a later condition type, not slic
 
 ### 3.7 `auto_lift` rules, and which holds may carry a condition
 
-**Which holds.** Slice 1 accepts a condition only on a hold whose reason is
-**exactly `manual`**. The agent `pause_reason` is free text in practice (section 2,
-F2b), so a denylist of `budget`, `company_archived` and `import` would let
-built-in and plugin-managed pauses through, and those have their own owner (the
-provisioning code and the plugin host also pause and resume those agents). An
-allowlist is the safe form. If a path starts writing `system` for agents, adding it
-is a one-line decision then.
+**Which holds.** For an **agent, a company or a routine**, slice 1 accepts a
+condition only on a hold whose reason is **exactly `manual`**. The agent
+`pause_reason` is free text in practice (section 2, F2b), so a denylist of
+`budget`, `company_archived` and `import` would let built-in and plugin-managed
+pauses through, and those have their own owner (the provisioning code and the
+plugin host also pause and resume those agents). An allowlist is the safe form. If
+a path starts writing `system` for agents, adding it is a one-line decision then.
+An **issue tree hold** has no pause reason (`held_reason` is null). Every tree hold
+with `mode = 'pause'` qualifies: `createHold` is called from one place, the
+board-only create route, so each one was made on purpose by a board user.
 
 `auto_lift` is off by default. Each rule below is enforced by the service and has
 a test.
 
-1. Only a **board user** can set it. An agent actor cannot.
+1. Only a **board user** can set it, and only a user who passes `canLift` for
+   that scope at that moment (at attach and at replace). An agent actor cannot.
 2. It is refused with `review_date`.
 3. It is allowed only on a hold whose reason is `manual` (above).
 4. **Compare-and-set at the lift** (section 3.3). A resume plus a new pause between
@@ -364,9 +393,14 @@ a test.
    asks the scope adapter whether the stored setter (`created_by_user_id`) still
    passes the scope's own resume check. If not, nothing is lifted, the row stays
    `met` with `last_error = 'auto_lift_not_authorized'`, and the alert says that
-   the automatic lift is no longer authorized.
+   the automatic lift is no longer authorized. On **replace**, the setter becomes
+   the person who replaces the condition, and `autoLift` survives only if that
+   person passes `canLift`. Otherwise the replace is refused with 422. No one
+   inherits another person's pre-authorization.
 6. A failed lift leaves the hold on, the row `met`, `last_error = 'lift_failed'`,
-   and the alert in place. A failed auto-lift is never silent.
+   and the alert in place. A failed auto-lift is never silent. It is retried with
+   a backoff (1, 2, 4 minutes and so on, at most one hour), and at once when the
+   target's `updated_at` changes. It is not retried on every pass.
 7. A successful auto-lift writes `hold.lifted` with the actor `system` and
    `auto: true`, **and** the target's own entry (`agent.resumed`,
    `issue.tree_hold_released`, and so on). The operator pre-authorized the act, so
@@ -379,7 +413,8 @@ methods:
 
 ```
 isHeld(companyId, scopeId)
-  -> { held: boolean, generation: { since: Date, reason: string | null } | null }
+  -> { exists: boolean, held: boolean,
+       generation: { since: Date, reason: string | null } | null }
 lift(companyId, scopeId, expected: Generation, actor, tx)
   -> "lifted" | "stale"        // a compare-and-set (section 3.3)
 canLift(userId, companyId, scopeId) -> boolean
@@ -391,7 +426,10 @@ canLift(userId, companyId, scopeId) -> boolean
 the same validation and side effects as the route. It does not write the target's
 columns itself. `canLift` is a request-free form of the check the route makes. H1
 extracts it from the route helpers so that the route and the adapter share one
-implementation.
+implementation. It builds the actor from the database for the stored user:
+membership and role (a viewer is refused) and instance admin. The route actor
+carries more, such as how the request was authenticated. So the test matrix covers
+the local, authenticated and cloud-tenant modes, and the predicate fails closed.
 
 | Scope | `isHeld` reads | `lift` calls | `canLift` is |
 |---|---|---|---|
@@ -450,8 +488,14 @@ the feed works today:
   types, the `decisionAttentionSourceKindSchema`, the exhaustive switches in
   `services/decision-queues.ts` (`sourceIssueId` and `canReadDecisionSource`), the
   UI map in `ui/src/lib/attention.ts`, and handlers for the new verb ids.
+- **The other two states.** The `broken` alert uses the condition id as `subject.id`
+  and `last_error_at` as `activityAt`. The nudge (section 3.12) uses its `dedupKey`
+  as `subject.id` and `heldSince` as `activityAt`. The key contains the generation,
+  so the retention job may archive an idle nudge, and a later pause of the same
+  target is a new item.
 - **Item shape tests.** The existing attention service test lists every source
-  kind. It gets the new kind and the three states.
+  kind. It gets the new kind and its states: `met` and `broken` in H1, `no
+  condition` in H1b.
 
 ### 3.10 Authorization: no new permission
 
@@ -467,7 +511,7 @@ and the lift condition routes call.
 | Action | Who | Same check as |
 |---|---|---|
 | Attach, replace, withdraw a condition | A board user | **pausing** that scope: for an agent `assertBoard` and `getAccessibleAgent`; for a tree hold the tree-hold routes' access check and `assertBoard`; for a routine `assertCanManageExistingRoutine`; for a company the company update route |
-| Set `auto_lift` | A board user | stricter than pausing (section 3.7) |
+| Set `auto_lift` | A board user who also passes `canLift` for that scope at that moment | stricter than pausing (section 3.7) |
 | Lift now | The actor that may **resume** that scope | the scope's own resume or release route; for an agent actor `assertCanResumeAgent`, which needs the `agent_config:update` change grant and, for itself, an explicit target grant |
 | List and read | A board user with access to the company | the attention feed |
 | Automatic lift | The system actor, only when a board user set `auto_lift` and that user still passes `canLift` | section 3.7 rule 5 |
@@ -490,14 +534,15 @@ reads issues by `(id, company_id)`.
 | Target resumed by another path | The next check (armed **or** met row) closes the row as `superseded`. No alert |
 | Target paused again later | New generation. The old row is closed as `superseded`, with a visible `hold.condition_closed` entry. No lift |
 | A `met` row whose target was resumed, then paused again with a condition | The attach supersedes the stale row inside its own transaction. No 409 |
-| Target terminated, deleted or its company archived | Close as `target_gone` |
+| Target deleted or terminated | Close as `target_gone` |
+| The company archive pauses an agent again, with a new reason and time | A new generation: close as `superseded` |
 | Condition already true at attach | Refused with 422 and a message. No instant alert |
 | Two attaches at once | The partial unique index decides. The loser gets 409 |
 | Attach after a re-pause the operator did not see | 409 on `expectedHeldSince`. Nothing is bound |
 | Pause with a condition on an agent that is already paused | 409. A re-pause would rewrite the reason to `manual` and turn a budget, import or plugin hold into one that passes the allowlist |
-| Hold reason is not `manual` | Attach refused in slice 1 (their owner decides) |
+| Agent, company or routine hold whose reason is not `manual` | Attach refused in slice 1 (their owner decides). An issue tree hold has no reason and always qualifies |
 | Company paused before H2 (no `paused_at`) | Attach refused until it is paused again |
-| Replace a `met` condition | Allowed. It is **Keep holding**: the row goes back to `armed` |
+| Replace a `met` condition | Allowed. It is **Keep holding**: the row goes back to `armed`, and the replacer becomes the setter |
 | The setter loses the right to resume | No automatic lift. The row stays `met`, `last_error = 'auto_lift_not_authorized'`, and the alert says so |
 | Checker and a person act on one row at the same moment | The compare-and-set picks one winner. One activity entry |
 | Company removed | Rows deleted in the removal transaction |
@@ -517,7 +562,8 @@ Rules:
 - **Which holds.** A hold that has been on for at least the threshold and has no
   `armed` or `met` condition. The scopes are the ones that have an adapter:
   agent and issue tree hold in H1b, company and routine when H2 lands. Only holds
-  whose reason is `manual` count (the same allowlist as section 3.7). Built-in and
+  whose reason is `manual` count for an agent, a company or a routine (the same
+  allowlist as section 3.7). Every pause-mode issue tree hold counts. Built-in and
   plugin-managed agents are paused on purpose by their own provisioning, and the
   budget, archive and import pauses have their own owner, so a nudge there would
   only be noise.
@@ -560,9 +606,9 @@ and every response is company-scoped.
 |---|---|
 | `GET /companies/:companyId/lift-conditions` | List, joined with the live state of the target. Filters: `status`, `scopeType`, `scopeId`. Keyset pagination |
 | `GET /companies/:companyId/lift-conditions/:id` | One condition |
-| `POST /companies/:companyId/lift-conditions` | Attach to a held target: `{ scopeType, scopeId, expectedHeldSince, expectedHeldReason, condition, autoLift?, note? }`. 409 if the generation differs or a condition is active already (use `PATCH`). 422 if the reason is not `manual` or the condition is already met |
-| `PATCH /companies/:companyId/lift-conditions/:id` | Replace the condition while it is `armed` or `met`. A `met` row goes back to `armed` (**Keep holding**) |
-| `POST /companies/:companyId/lift-conditions/:id/lift` | Deliberate lift. Calls the scope's own lift. Body: `{ reason? }` |
+| `POST /companies/:companyId/lift-conditions` | Attach to a held target: `{ scopeType, scopeId, expectedHeldSince, expectedHeldReason, condition, autoLift?, note? }`. 409 if the generation differs or a condition is active already (use `PATCH`). 422 if an agent, company or routine hold has a reason other than `manual`, if the condition is already met, or if `autoLift` is set by a user who fails `canLift` |
+| `PATCH /companies/:companyId/lift-conditions/:id` | Replace the condition while it is `armed` or `met`. The body carries `expectedHeldSince`. A `met` row goes back to `armed` (**Keep holding**). The replacer becomes the setter, and `autoLift` survives only if the replacer passes `canLift` (else 422) |
+| `POST /companies/:companyId/lift-conditions/:id/lift` | Deliberate lift. Calls the scope's own lift. Body: `{ reason?, wakeAgents? }`. `wakeAgents` is for issue tree holds and board users only, and the automatic lift always sends false |
 | `POST /companies/:companyId/lift-conditions/:id/withdraw` | Remove the condition. The hold stays |
 
 For convenience, the existing routes accept the condition in the same call:
@@ -596,7 +642,9 @@ The new route file is added to the `apiPrefixes` map and to the coverage in
 | `paperclipai lift-condition withdraw <id>` | `POST .../withdraw` |
 | `paperclipai agent pause <agentId> [--lift-at <iso> \| --lift-when-issue-closed <id> \| --review-on <date>] [--auto-lift]` | `POST /agents/:id/pause` with the condition |
 
-Every command takes `--json` and the common client options. The existing
+Every command takes `--json` and the common client options. `lift-condition set` and
+`agent pause` read the target's pause time and reason themselves and send them as
+`expectedHeldSince` and `expectedHeldReason`, so the operator does not type them. The existing
 `agent pause` sends an empty body today, so its option parsing is a small change.
 `company update` takes a JSON payload only, so slice 2 adds the condition to that
 payload and to `lift-condition set`, not a new flag.
@@ -631,7 +679,7 @@ own tests and docs. Each migration is numbered just in time.
 |---|---|---|
 | **H1** | Table and migration; shared contract; service; checker; agent and tree hold adapters; condition types `time`, `review_date`, `issue_closed`; API, OpenAPI, CLI; activity entries; the `hold_lift` alert; web: pause dialog for agents, badge, inbox card | none |
 | **H1b** | The no-condition nudge (section 3.12): the `no_condition` state of the `hold_lift` alert, the instance setting `holdNoConditionNudgeHours` (default 24, 0 turns it off) in the API, the CLI and the web settings page. No migration. Kept out of H1's diff | H1 |
-| **H2** | Company and routine adapters; `routines.paused_at` and `pause_reason` (a second, small migration); the lift conditions list page; the same options on the company and routine routes, CLI and dialogs; `active_runs_finished`, the backfill, and the deprecation of `after_active_runs_finish` (section 3.6); the nudge for the company and routine scopes | H1 |
+| **H2** | Company and routine adapters; the dedicated company pause and resume path (section 3.3); `routines.paused_at` and `pause_reason` (a second, small migration) and an explicit pause-reason parameter on the routine update, written only on a transition (built-in routines call the same update as the `PATCH`, so `system` cannot be guessed); the lift conditions list page; the same options on the company and routine routes, CLI and dialogs; `active_runs_finished`, the backfill, and the deprecation of `after_active_runs_finish` (section 3.6); the nudge for the company and routine scopes | H1 |
 | **H3** | `metric_below` on environment disk; the reserved `environment` scope; the link with disk-aware dispatch | H1 and the resource capacity samples on `main` |
 | **Later** | `any_of`; the condition "an agent is assigned" for system-paused draft routines; agent read access (with the plan for agents acting on other agents' work); a chat message for an alert | n/a |
 
@@ -642,7 +690,7 @@ own tests and docs. Each migration is numbered just in time.
    refusal inside the shared agent resume.
 2. Request-free `canLift` predicates extracted from the route helpers.
 3. The shared types, the `decision-queues` cases and the UI map for the new kind
-   (section 3.9).
+   (section 3.9), and the retention change that keeps a live alert.
 
 H1 is large because the rule is that each slice reaches all three surfaces. If the
 reviewer prefers, H1 splits at the web work: API, CLI and the alert first, the
@@ -685,6 +733,18 @@ without the code.
 - **No cross-company oracle.** A missing issue id and an issue id in another
   company return the same response.
 - **One winner.** Two simultaneous transitions write one activity entry.
+- **Replace.** The replacer becomes the setter. `autoLift` is kept only if the
+  replacer passes `canLift`, else the replace is a 422. A user who cannot lift
+  cannot set `autoLift` at attach either.
+- **Tree holds qualify.** A pause-mode tree hold (null reason) accepts a condition.
+- **Lift now on a tree hold** can wake agents (with the `getExecutionBlocker`
+  check), and the automatic lift never does.
+- **Backoff.** A failed automatic lift is not retried on every pass, and is retried
+  when the target changes.
+- **Lock order.** An attach and a checker pass on the same row, run against each
+  other many times, never deadlock.
+- **`canLift` modes.** The same user gets the same answer from the predicate and
+  from the route in the local, authenticated and cloud-tenant modes.
 - **Each condition type**, met and not met, with the database clock faked; attach
   refusals (past time, closed issue, issue in another company).
 - **`auto_lift` rules** one by one (section 3.7), including a failed lift that
@@ -717,7 +777,9 @@ without the code.
   the same target after a resume gives a new item.
 - **Removal.** Attaching a condition, lifting the hold, or resuming it by another
   path removes the item.
-- **Read only.** Reading the feed changes no row and writes no activity entry.
+- **No side effects.** Reading the feed creates or changes no hold, condition or
+  target and writes no activity entry. (The decision retention job keeps its own
+  bookkeeping rows, as it does for every other kind.)
 - **Instance setting.** The default is 24 on an instance that never set it. The
   update needs `assertCanManageInstanceSettings` and writes
   `instance.settings.general_updated`. The CLI and the web page round-trip the value.
@@ -731,11 +793,13 @@ tests the `routines` column migration on a table with rows. It also tests:
   `auto_lift = false` for each active pause hold that stores the old strategy and has
   no condition. It is idempotent (a second run adds nothing). It skips released
   holds and holds that already have a condition. It lifts nothing.
-- **Deprecation.** A create with the old strategy makes the same condition in the
-  same transaction and returns the notice. The OpenAPI document marks the field
-  deprecated.
+- **Deprecation.** A create with the old strategy is stored as it is today,
+  creates no condition and returns the notice. The OpenAPI document marks the field
+  deprecated. After two releases it is a 422.
 - **`active_runs_finished`.** Not met while a run is queued or running anywhere in
-  the tree, met when the last one ends, and refused on any other scope.
+  the tree, met when the last one ends. Refused on any other scope, refused with
+  `auto_lift`, and refused at attach when already true (the backfill is exempt, and
+  its first checker pass raises one alert for each row).
 
 **H3** adds the stale sample rule, the hysteresis test, and an end-to-end test
 with a fixture capacity sample.
@@ -774,10 +838,15 @@ them:
 - The backfill makes `auto_lift = false` conditions for old holds (section 3.6).
 - The old strategy is accepted for two releases and then rejected (section 3.6).
 - The nudge setting is a whole number from 1 to 720, and 0 means off (section 3.12).
-- Only holds whose reason is exactly `manual` can carry a condition or get a nudge
-  (sections 3.7 and 3.12). This is narrower than the draft, and the reason is that
+- An agent, company or routine hold can carry a condition or get a nudge only if its
+  reason is exactly `manual` (sections 3.7 and 3.12). An issue tree hold has no
+  reason and always qualifies. This is narrower than the draft for agents, because
   the agent pause reason is free text in practice.
 - Replacing a `met` condition is allowed and is the **Keep holding** action.
+- `active_runs_finished` refuses `auto_lift`, and a new write with the old strategy
+  creates no condition. The create route cancels the tree's runs, so the condition
+  would be met at once (section 3.6). This refines Q5. It does not reverse it: the
+  type is implemented and the old rows are converted.
 - The lead example of the brief, a disk metric, ships in H3, after the capacity
   samples land (section 5).
 
