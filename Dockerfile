@@ -150,7 +150,7 @@ ARG PAPERCLIP_BUILD_COMMIT=""
 RUN node --test scripts/ci/run-image-build-vitest.test.mjs
 RUN sh scripts/ci/run-image-build-vitest.sh
 RUN pnpm check:token-gates
-RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
+RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx ui/src/lib/safe-match-media.test.ts ui/src/hooks/useMediaQuery.test.tsx ui/src/lib/no-direct-match-media.test.ts
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
 # after the SDK build, so build the SDK before typechecking the UI.
 RUN pnpm --filter @paperclipai/plugin-sdk build
