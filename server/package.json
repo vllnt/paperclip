@@ -39,6 +39,7 @@
     "prepack": "pnpm run prepare:ui-dist && pnpm run build",
     "postpack": "rm -rf ui-dist",
     "clean": "rm -rf dist",
+    "calibrate:duplicates": "tsx scripts/duplicate-calibration.ts",
     "start": "node dist/index.js",
     "prepare:runner-vendor": "pnpm --filter @paperclipai/paperclip-runner build",
     "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
@@ -73,6 +74,7 @@
     "@vercel/connect": "2.3.3",
     "acorn": "8.18.0",
     "acpx": "0.13.1",
+    "ai": "7.0.136",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "better-auth": "1.7.2",
