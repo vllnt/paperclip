@@ -279,7 +279,13 @@ A legacy `provider_quota` failure before any useful action records
 carries `providerQuotaRetryPhase` (`backoff` or `slow`); a slow-phase receipt
 reads `Scheduled provider quota retry N at the hourly recovery cadence`. The
 retry context carries `providerQuotaRetryStartedAt`, the start of the backoff
-window.
+window, and `providerQuotaKey`, the agent's adapter type and model
+(`codex_local:gpt-5` or just the adapter type) that groups probes per company
+and provider. A chain that reaches its ceiling writes
+`Bounded retry exhausted after N scheduled attempts` on the failed run; a
+waiting retry cancelled at its ceiling has `errorCode: provider_quota_exhausted`
+and reads `Provider capacity retries stopped: the chain reached its retry
+ceiling while waiting for the provider.`
 
 Bounded retry exhaustion writes one lifecycle receipt per run, retry reason,
 scheduled attempt, and retry limit. Repeated or concurrent recovery checks reuse

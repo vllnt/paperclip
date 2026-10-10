@@ -106,6 +106,7 @@ import {
   notInArray,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -404,7 +405,9 @@ import {
 } from "./issue-rewake-throttle.js";
 import {
   logActivity,
+  publishActivity,
   publishPluginDomainEvent,
+  type ActivityPublication,
   type LogActivityInput,
 } from "./activity-log.js";
 import {
@@ -431,7 +434,11 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import {
+  executeIssuePostCommitActions,
+  issueService,
+  type IssuePostCommitAction,
+} from "./issues.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -1120,13 +1127,14 @@ function resolveCodexTransientFallbackMode(
   return "fresh_session_safer_invocation";
 }
 
+/**
+ * The persisted, adapter-set errorCode wins over a family carried in the run
+ * result. Only that errorCode can claim provider_quota, because the family
+ * unlocks the provider-quota retry lane and its cap exemption.
+ */
 function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
-  const resultJson = parseObject(run.resultJson);
-  const persistedFamily = readNonEmptyString(resultJson.errorFamily);
-  if (persistedFamily) return persistedFamily;
-
   if (run.errorCode === "provider_quota") {
     return "provider_quota";
   }
@@ -1137,7 +1145,10 @@ function readHeartbeatRunErrorFamily(
   ) {
     return "transient_upstream";
   }
-  return null;
+  const persistedFamily = readNonEmptyString(
+    parseObject(run.resultJson).errorFamily,
+  );
+  return persistedFamily === "provider_quota" ? null : persistedFamily;
 }
 
 function isMaxTurnExhaustionRun(
@@ -2041,6 +2052,7 @@ const PROVIDER_QUOTA_RETRY_MAX_BACKOFF_DELAY_MS = 30 * 60 * 1000;
 const PROVIDER_QUOTA_RETRY_JITTER_RATIO = 0.2;
 const PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION =
   "heartbeat.provider_quota_cap_exemption_exhausted";
+const PROVIDER_QUOTA_EXHAUSTED_ACTION = "heartbeat.provider_quota_exhausted";
 
 export interface ProviderQuotaRetryPolicy {
   /** False restores the default transient retry budget and charges every quota failure. */
@@ -2049,8 +2061,23 @@ export interface ProviderQuotaRetryPolicy {
   maxAttempts: number;
   /** Backoff window measured from the chain's first quota failure. */
   windowMs: number;
+  /** Hard ceiling: retries in the chain, backoff and hourly phases together. */
+  maxTotalAttempts: number;
+  /** Hard ceiling: no retry is scheduled later than this after the chain's first failure. */
+  maxRetryMs: number;
   /** Per agent and UTC day: quota failures exempt from maxDailyRuns. Later ones count. */
   maxDailyUncountedRuns: number;
+}
+
+/**
+ * Groups provider-quota probes: the adapter and its configured model, so a
+ * model at capacity does not hold back agents on another model.
+ */
+function providerQuotaKeyForAgent(
+  agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
+) {
+  const model = readNonEmptyString(parseObject(agent.adapterConfig).model);
+  return model ? `${agent.adapterType}:${model}` : agent.adapterType;
 }
 
 /** Reads `runtimeConfig.heartbeat.providerQuotaRetry`. */
@@ -2062,6 +2089,8 @@ function parseProviderQuotaRetryPolicy(value: unknown): ProviderQuotaRetryPolicy
     enabled: asBoolean(configured.enabled, true),
     maxAttempts: bounded(configured.maxAttempts, 8, 50),
     windowMs: bounded(configured.windowMinutes, 120, 24 * 60) * 60 * 1000,
+    maxTotalAttempts: bounded(configured.maxTotalAttempts, 24, 500),
+    maxRetryMs: bounded(configured.maxRetryHours, 24, 7 * 24) * 60 * 60 * 1000,
     maxDailyUncountedRuns: bounded(configured.maxDailyUncountedRuns, 48, 1000),
   };
 }
@@ -2070,10 +2099,12 @@ function parseProviderQuotaRetryPolicy(value: unknown): ProviderQuotaRetryPolicy
  * Schedules the next retry after a provider-quota failure that happened
  * before any useful action. Delays double from one minute up to thirty, with
  * ±20% jitter, while both the attempt budget and the window that started with
- * the chain's first failure hold. After that the chain keeps probing at the
- * hourly quota-recovery cadence so the issue is never left without a run.
+ * the chain's first failure hold. After that the chain probes at the hourly
+ * quota-recovery cadence until a hard ceiling: `maxTotalAttempts` retries or
+ * `maxRetryMs` after the first failure, whichever comes first.
  *
- * @returns The schedule, or null for an invalid attempt number.
+ * @returns The schedule, or null for an invalid attempt number or once the
+ *   next retry would pass either ceiling.
  */
 export function computeProviderQuotaRetrySchedule(input: {
   attempt: number;
@@ -2100,12 +2131,19 @@ export function computeProviderQuotaRetrySchedule(input: {
   const delayMs = Math.round(
     baseDelayMs * (1 + (sample * 2 - 1) * PROVIDER_QUOTA_RETRY_JITTER_RATIO),
   );
+  const dueAt = new Date(now.getTime() + delayMs);
+  if (
+    attempt > policy.maxTotalAttempts ||
+    dueAt.getTime() > input.chainStartedAt.getTime() + policy.maxRetryMs
+  ) {
+    return null;
+  }
   return {
     attempt,
     baseDelayMs,
     delayMs,
-    dueAt: new Date(now.getTime() + delayMs),
-    maxAttempts: policy.maxAttempts,
+    dueAt,
+    maxAttempts: policy.maxTotalAttempts,
     phase,
   };
 }
@@ -9810,7 +9848,7 @@ export function heartbeatService(
     // Mirrors scheduleBoundedRetryForRun's default transient budget check: a
     // failed or interrupted run that has already consumed every bounded
     // transient attempt cannot be retried again through this lane. A
-    // provider-quota failure before useful action has no fixed ceiling there;
+    // provider-quota failure before useful action has its own ceiling there;
     // recovery routes it to the quota branch before it can reach this check.
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
@@ -15567,9 +15605,9 @@ export function heartbeatService(
 
   /**
    * The provider-quota retry lane applies to a run that failed before any
-   * useful action. It does not stop on its own: past the backoff window it
-   * keeps one retry per hour, and the daily run cap bounds a permanent
-   * outage once the agent's uncounted allowance is spent.
+   * useful action. Past the backoff window it keeps one retry per hour until
+   * the chain's hard ceiling (`maxTotalAttempts` or `maxRetryMs`), then stops
+   * and blocks the issue. It does not depend on maxDailyRuns being set.
    */
   function resolveProviderQuotaRetry(
     run: typeof heartbeatRuns.$inferSelect,
@@ -15608,21 +15646,13 @@ export function heartbeatService(
         return;
       }
       const { start } = currentUtcDayWindow();
-      const [alreadyRecorded] = await db
-        .select({ id: activityLog.id })
-        .from(activityLog)
-        .where(
-          and(
-            eq(activityLog.companyId, agent.companyId),
-            eq(activityLog.action, PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION),
-            eq(activityLog.entityType, "agent"),
-            eq(activityLog.entityId, agent.id),
-            gte(activityLog.createdAt, start),
-          ),
-        )
-        .limit(1);
-      if (alreadyRecorded) return;
-      await logActivity(db, {
+      await logActivityOnce({
+        lockKey: `provider-quota-cap-alarm:${agent.id}:${start.toISOString()}`,
+        alreadyRecorded: and(
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, agent.id),
+          gte(activityLog.createdAt, start),
+        ),
         companyId: agent.companyId,
         actorType: "system",
         actorId: "heartbeat",
@@ -15643,6 +15673,159 @@ export function heartbeatService(
         "failed to record the provider quota cap exemption alarm",
       );
     }
+  }
+
+  /**
+   * Writes an activity entry unless one with the same action and
+   * `alreadyRecorded` condition exists. The advisory lock on `lockKey`
+   * serializes writers, so the check and the insert cannot race. `andThen`
+   * runs in the same transaction, after the insert; its issue updates publish
+   * only after the commit.
+   *
+   * @returns True when this call wrote the entry.
+   */
+  async function logActivityOnce(
+    input: LogActivityInput & {
+      lockKey: string;
+      alreadyRecorded: SQL | undefined;
+    },
+    andThen?: (
+      tx: Db,
+      postCommit: {
+        publications: ActivityPublication[];
+        actions: IssuePostCommitAction[];
+      },
+    ) => Promise<void>,
+  ) {
+    const { lockKey, alreadyRecorded, ...entry } = input;
+    const postCommit = {
+      publications: [] as ActivityPublication[],
+      actions: [] as IssuePostCommitAction[],
+    };
+    const recorded = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`,
+      );
+      const [existing] = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, entry.companyId),
+            eq(activityLog.action, entry.action),
+            alreadyRecorded,
+          ),
+        )
+        .limit(1);
+      if (existing) return false;
+      await logActivity(txDb, entry, postCommit.publications);
+      await andThen?.(txDb, postCommit);
+      return true;
+    });
+    for (const publication of postCommit.publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommit.actions);
+    return recorded;
+  }
+
+  /**
+   * Stops a provider-quota retry chain at its ceiling. In one transaction it
+   * writes one `heartbeat.provider_quota_exhausted` activity per chain and
+   * blocks an open issue with an unblock reason, so the stop is visible and a
+   * failed block is retried on the next call instead of being skipped. Best
+   * effort: the caller continues if this fails.
+   *
+   * @returns False when the stop could not be recorded.
+   */
+  async function recordProviderQuotaExhausted(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    chainStartedAt: Date;
+    attempts: number;
+  }) {
+    const { run, agent } = input;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return true;
+    const chainStartedAt = input.chainStartedAt.toISOString();
+    const hours = Math.round(
+      (Date.now() - input.chainStartedAt.getTime()) / (60 * 60 * 1000),
+    );
+    const reason =
+      `The provider (${agent.adapterType}) stayed at capacity for about ${hours} h ` +
+      `across ${input.attempts} automatic retries, so automatic retries stopped. ` +
+      "Unblock the issue once the provider is available.";
+    let blocked = false;
+    try {
+      await logActivityOnce(
+        {
+          lockKey: `provider-quota-exhausted:${run.companyId}:${issueId}:${chainStartedAt}`,
+          alreadyRecorded: and(
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issueId),
+            sql`${activityLog.details} ->> 'chainStartedAt' = ${chainStartedAt}`,
+          ),
+          companyId: run.companyId,
+          actorType: "system",
+          actorId: "heartbeat",
+          agentId: agent.id,
+          runId: run.id,
+          action: PROVIDER_QUOTA_EXHAUSTED_ACTION,
+          entityType: "issue",
+          entityId: issueId,
+          details: {
+            chainStartedAt,
+            attempts: input.attempts,
+            provider: agent.adapterType,
+            runId: run.id,
+          },
+        },
+        async (tx, postCommit) => {
+          const [issue] = await tx
+            .select({ status: issues.status })
+            .from(issues)
+            .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+            .for("update");
+          if (
+            issue?.status !== "todo" &&
+            issue?.status !== "in_progress" &&
+            issue?.status !== "in_review"
+          ) {
+            return;
+          }
+          await issuesSvc.update(
+            issueId,
+            {
+              status: "blocked",
+              unblockDescriptor: { owner: "board", action: reason },
+              companyGuard: run.companyId,
+            },
+            tx,
+            postCommit.publications,
+            postCommit.actions,
+          );
+          blocked = true;
+        },
+      );
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, issueId },
+        "failed to record provider quota retry exhaustion",
+      );
+      return false;
+    }
+    if (blocked) {
+      await issuesSvc
+        .addComment(
+          issueId,
+          `Provider capacity retries stopped. ${reason}`,
+          { runId: run.id },
+          { authorType: "system" },
+        )
+        .catch((err) => {
+          logger.warn({ err, runId: run.id, issueId }, "failed to comment on provider quota retry exhaustion");
+        });
+    }
+    return true;
   }
 
   async function scheduleBoundedRetryForRun(
@@ -15682,7 +15865,7 @@ export function heartbeatService(
       0,
       Math.floor(
         opts?.maxAttempts ??
-          providerQuotaRetry?.policy.maxAttempts ??
+          providerQuotaRetry?.policy.maxTotalAttempts ??
           BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       ),
     );
@@ -15697,9 +15880,9 @@ export function heartbeatService(
           random: opts?.random,
         })
       : null;
-    const computedBaseSchedule =
-      providerQuotaSchedule ??
-      (opts?.delayMs != null
+    const computedBaseSchedule = providerQuotaRetry
+      ? providerQuotaSchedule
+      : (opts?.delayMs != null
         ? nextAttempt <= maxAttempts
           ? {
               attempt: nextAttempt,
@@ -15748,6 +15931,14 @@ export function heartbeatService(
         payload: exhaustion,
         retryExhaustion: exhaustion,
       });
+      if (providerQuotaRetry) {
+        await recordProviderQuotaExhausted({
+          run,
+          agent,
+          chainStartedAt: providerQuotaRetry.chainStartedAt,
+          attempts: consumedAttempts,
+        });
+      }
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         await escalatePlanApprovalResumeFailureNeedsAttention({
           run,
@@ -15930,10 +16121,14 @@ export function heartbeatService(
             }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-        // Only a quota-lane retry carries the chain start; any other retry
-        // drops it so a later quota failure starts a fresh backoff window.
+        // Only a quota-lane retry carries the chain start and the provider
+        // key; any other retry drops them so a later quota failure starts a
+        // fresh chain. The key groups probes per company and provider.
         providerQuotaRetryStartedAt:
           providerQuotaRetry?.chainStartedAt.toISOString(),
+        providerQuotaKey: providerQuotaRetry
+          ? providerQuotaKeyForAgent(agent)
+          : undefined,
       },
       "normal_model",
     );
@@ -16821,7 +17016,186 @@ export function heartbeatService(
     });
   }
 
+  /**
+   * Coalesces provider-quota retries per company and provider (the agent's
+   * adapter type and model). While the provider is in quota state, one retry probes at
+   * a time: the retry of the oldest chain. Other due retries wait one base
+   * delay past the probe's next attempt, or past a probe that is running, so
+   * at most one probe runs per backoff interval. Once a probe succeeds, every
+   * waiting retry is released. A waiting retry that would pass its chain's
+   * ceiling is cancelled and its issue blocked. An operator "retry now" is
+   * not held back; it exempts only the retry it was requested for.
+   */
+  async function coalesceProviderQuotaRetries(now: Date) {
+    const providerKey = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey'`;
+    const groups = await db
+      .selectDistinct({ companyId: heartbeatRuns.companyId, key: providerKey })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          sql`${providerKey} is not null`,
+        ),
+      );
+    for (const group of groups) {
+      try {
+        await coalesceProviderQuotaGroup(group.companyId, group.key, now);
+      } catch (err) {
+        logger.warn(
+          { err, companyId: group.companyId, provider: group.key },
+          "failed to coalesce provider quota retries",
+        );
+      }
+    }
+  }
+
+  /**
+   * True when an operator asked to retry this scheduled row now. Successor
+   * retries copy the context, so a request older than the row belongs to an
+   * earlier retry in the chain and does not exempt this one.
+   */
+  function operatorRequestedRetryNow(run: typeof heartbeatRuns.$inferSelect) {
+    const requestedAt = dateValue(parseObject(run.contextSnapshot).retryNowRequestedAt);
+    return requestedAt !== null && requestedAt.getTime() >= run.createdAt.getTime();
+  }
+
+  async function coalesceProviderQuotaGroup(
+    companyId: string,
+    key: string,
+    now: Date,
+  ) {
+    const inGroup = and(
+      eq(heartbeatRuns.companyId, companyId),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey' = ${key}`,
+    );
+    const chainStartOf = (run: typeof heartbeatRuns.$inferSelect) =>
+      dateValue(parseObject(run.contextSnapshot).providerQuotaRetryStartedAt) ??
+      run.createdAt;
+    const expired = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`provider-quota-probe:${companyId}:${key}`}, 0))`,
+      );
+      const waiting = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(inGroup, eq(heartbeatRuns.status, "scheduled_retry")))
+        .for("update");
+      if (waiting.length === 0) return [];
+
+      const newestWaitingAt = new Date(
+        Math.max(...waiting.map((run) => run.createdAt.getTime())),
+      );
+      const [recovered] = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            inGroup,
+            eq(heartbeatRuns.status, "succeeded"),
+            gt(heartbeatRuns.finishedAt, newestWaitingAt),
+          ),
+        )
+        .limit(1);
+      if (recovered) {
+        await tx
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: now, updatedAt: now })
+          .where(
+            and(
+              inGroup,
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              gt(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          );
+        return [];
+      }
+
+      const [inFlight] = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(inGroup, inArray(heartbeatRuns.status, ["queued", "running"])))
+        .limit(1);
+      const leader = inFlight
+        ? null
+        : [...waiting].sort(
+            (a, b) =>
+              chainStartOf(a).getTime() - chainStartOf(b).getTime() ||
+              (a.scheduledRetryAt?.getTime() ?? 0) -
+                (b.scheduledRetryAt?.getTime() ?? 0) ||
+              a.id.localeCompare(b.id),
+          )[0];
+      // Hold until just after the probe's next attempt, but re-check at
+      // least at the hourly cadence: a probe that waits for a provider reset
+      // days away must not push followers past their ceilings at once.
+      const holdUntil = new Date(
+        Math.min(
+          Math.max(now.getTime(), leader?.scheduledRetryAt?.getTime() ?? 0),
+          now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+        ) + PROVIDER_QUOTA_RETRY_BASE_DELAY_MS,
+      );
+      const held = waiting.filter(
+        (run) =>
+          run.id !== leader?.id &&
+          run.scheduledRetryAt !== null &&
+          run.scheduledRetryAt.getTime() <= now.getTime() &&
+          !operatorRequestedRetryNow(run),
+      );
+      if (held.length === 0) return [];
+      await tx
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAt: holdUntil, updatedAt: now })
+        .where(
+          and(
+            inArray(heartbeatRuns.id, held.map((run) => run.id)),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            lte(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        );
+      const heldAgents = await tx
+        .select()
+        .from(agents)
+        .where(inArray(agents.id, [...new Set(held.map((run) => run.agentId))]));
+      return held.flatMap((run) => {
+        const agent = heldAgents.find((row) => row.id === run.agentId);
+        if (!agent) return [];
+        const { maxRetryMs } = parseHeartbeatPolicy(agent).providerQuotaRetry;
+        return holdUntil.getTime() > chainStartOf(run).getTime() + maxRetryMs
+          ? [{ run, agent }]
+          : [];
+      });
+    });
+
+    for (const { run, agent } of expired) {
+      try {
+        // Stop and block first: if that fails, the row is still a scheduled
+        // retry and the next sweep tries again. Recording is idempotent.
+        const source = run.retryOfRunId ? await getRun(run.retryOfRunId) : null;
+        const stopped = await recordProviderQuotaExhausted({
+          run: source ?? run,
+          agent,
+          chainStartedAt: chainStartOf(run),
+          attempts: Math.max(0, (run.scheduledRetryAttempt ?? 1) - 1),
+        });
+        if (!stopped) continue;
+        // No immediate recovery: a continuation run would be another probe.
+        await cancelRunInternal(
+          run.id,
+          "Provider capacity retries stopped: the chain reached its retry ceiling while waiting for the provider.",
+          { errorCode: "provider_quota_exhausted", suppressImmediateRecovery: true },
+        );
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id },
+          "failed to stop a provider quota retry past its ceiling",
+        );
+      }
+    }
+  }
+
   async function promoteDueScheduledRetries(now = new Date()) {
+    await coalesceProviderQuotaRetries(now).catch((err) => {
+      logger.warn({ err }, "failed to coalesce provider quota retries");
+    });
     const cutoff = await getWorktreeExecutionCutoff();
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
@@ -18746,9 +19120,10 @@ export function heartbeatService(
   /**
    * Marks a provider-quota failure that happened before any useful action:
    * the model produced no output and the run left no comment, document,
-   * work product or activity. Adapter runtime events are not counted because
-   * they carry diagnostics such as startup timings, not task actions. The
-   * server owns the marker, so an adapter-supplied value is dropped.
+   * work product, activity or run event beyond lifecycle, invocation and
+   * error records. Any tool or action event counts as useful action, so a run
+   * that may have caused an external side effect is never replayed for free.
+   * The server owns the marker, so an adapter-supplied value is dropped.
    */
   async function withProviderQuotaUsefulActionMarker(input: {
     run: typeof heartbeatRuns.$inferSelect;
@@ -18777,10 +19152,7 @@ export function heartbeatService(
   ) {
     try {
       const { evidence } = await buildRunLivenessInput(run, run.resultJson);
-      return hasConcreteActionEvidence({
-        ...(evidence ?? {}),
-        toolOrActionEventsCreated: 0,
-      });
+      return hasConcreteActionEvidence(evidence);
     } catch (err) {
       logger.warn(
         { err, runId: run.id },

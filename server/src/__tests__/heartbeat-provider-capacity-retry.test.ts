@@ -47,12 +47,15 @@ const CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different 
 const MINUTE_MS = 60_000;
 
 type ScriptedOutcome =
-  | { kind: "capacity"; usefulComment?: boolean; outputTokens?: number }
+  | { kind: "capacity"; usefulComment?: boolean; outputTokens?: number; toolEvent?: boolean }
   | { kind: "transient" }
   | { kind: "success" };
 
 describe("computeProviderQuotaRetrySchedule", () => {
-  const policy = { maxAttempts: 8, windowMs: 120 * MINUTE_MS, maxDailyUncountedRuns: 48 };
+  const policy = {
+    maxAttempts: 8, windowMs: 120 * MINUTE_MS, maxTotalAttempts: 24, maxRetryMs: 24 * 60 * MINUTE_MS,
+    maxDailyUncountedRuns: 48,
+  };
   const now = new Date("2026-10-08T12:00:00.000Z");
 
   it("backs off exponentially from one minute and caps each delay at thirty minutes", () => {
@@ -77,6 +80,16 @@ describe("computeProviderQuotaRetrySchedule", () => {
     const pastAttempts = computeProviderQuotaRetrySchedule({ attempt: 9, now, chainStartedAt: now, policy, random: () => 0.5 });
     expect(pastAttempts).toMatchObject({ phase: "slow", baseDelayMs: 60 * MINUTE_MS });
   });
+
+  it("stops at the total attempt ceiling or once a retry would pass the time ceiling", () => {
+    expect(computeProviderQuotaRetrySchedule({ attempt: 24, now, chainStartedAt: now, policy, random: () => 0.5 }))
+      .toMatchObject({ phase: "slow", maxAttempts: 24 });
+    expect(computeProviderQuotaRetrySchedule({ attempt: 25, now, chainStartedAt: now, policy, random: () => 0.5 }))
+      .toBeNull();
+    const nearCeiling = new Date(now.getTime() - 23.5 * 60 * MINUTE_MS);
+    expect(computeProviderQuotaRetrySchedule({ attempt: 10, now, chainStartedAt: nearCeiling, policy, random: () => 0.5 }))
+      .toBeNull();
+  });
 });
 
 describe("isProviderQuotaUsefulActionCandidate", () => {
@@ -94,6 +107,7 @@ describe("isProviderQuotaUsefulActionCandidate", () => {
     ["model output", { outputTokens: 1 }],
     ["a timed-out run", { outcome: "timed_out" }],
     ["another failure family", { errorCode: "codex_transient_upstream", resultJson: { errorFamily: "transient_upstream" } }],
+    ["a result family that contradicts the adapter errorCode", { errorCode: "adapter_failed", resultJson: { errorFamily: "provider_quota" } }],
   ])("rejects %s", (_label, override) => {
     expect(isProviderQuotaUsefulActionCandidate({ ...base, ...override })).toBe(false);
   });
@@ -123,6 +137,9 @@ describeEmbeddedPostgres("provider capacity retries", () => {
           providerQuotaBeforeUsefulAction: true,
         },
       };
+    }
+    if (outcome.toolEvent) {
+      await ctx.onEvent?.({ eventType: "tool_call", stream: "system", level: "info", message: "Ran the deploy script." });
     }
     if (outcome.usefulComment) {
       const issueId = String(ctx.context.issueId);
@@ -211,6 +228,23 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     });
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     return run;
+  }
+
+  /** A second codex_local agent and issue in the same company. */
+  async function seedAnotherAssignee(companyId: string) {
+    const agentId = randomUUID(), issueId = randomUUID();
+    const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies).where(eq(companies.id, companyId));
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Codex 2", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, permissions: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+    });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Write the summary", status: "todo", priority: "medium",
+      responsibleUserId: "responsible-user", assigneeAgentId: agentId,
+      issueNumber: 2, identifier: `${company!.issuePrefix}-2`,
+    });
+    return { agentId, issueId };
   }
 
   async function companyRuns(companyId: string) {
@@ -404,6 +438,7 @@ describeEmbeddedPostgres("provider capacity retries", () => {
   it.each([
     ["an issue comment", { usefulComment: true }],
     ["model output tokens", { outputTokens: 120 }],
+    ["a tool event with no comment or document", { toolEvent: true }],
   ] as const)("treats a capacity failure after %s as an ordinary failed run", async (_label, useful) => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     const { companyId, agentId, issueId } = await seed({ maxDailyRuns: 2 });
@@ -431,5 +466,191 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     expect(await runPendingRetry(companyId)).toMatchObject({
       status: "cancelled", errorCode: "heartbeat.daily_run_limit",
     });
+  });
+
+  it("stops a chain at its attempt ceiling, records the stop once and blocks the issue", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { companyId, agentId, issueId } = await seed({ providerQuotaRetry: { maxTotalAttempts: 2 } });
+    script = [{ kind: "capacity" }, { kind: "capacity" }, { kind: "capacity" }];
+
+    await assign(agentId, issueId);
+    expect((await runPendingRetry(companyId))?.status).toBe("failed");
+    expect((await runPendingRetry(companyId))?.status).toBe("failed");
+
+    // Two retries are the ceiling: no third retry, even without maxDailyRuns.
+    expect(await pendingRetry(companyId)).toBeNull();
+    expect(executedRunIds).toHaveLength(3);
+    const stops = await db.select({ entityId: activityLog.entityId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "heartbeat.provider_quota_exhausted")));
+    expect(stops).toEqual([{ entityId: issueId, details: expect.objectContaining({ attempts: 2, provider: "codex_local" }) }]);
+    const [issue] = await db.select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: expect.stringContaining("stayed at capacity") },
+    });
+    const notes = await db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(notes.map((note) => note.body)).toEqual([expect.stringContaining("Provider capacity retries stopped.")]);
+  });
+
+  it.each(["in_progress", "in_review"] as const)("stops a chain at its time ceiling once, even for concurrent calls (%s)", async (status) => {
+    const { companyId, agentId, issueId } = await seed();
+    const chainStartedAt = new Date(Date.now() - 23.5 * 60 * MINUTE_MS);
+    const failedRunId = randomUUID();
+    await db.update(issues).set({ status }).where(eq(issues.id, issueId));
+    await db.insert(heartbeatRuns).values({
+      id: failedRunId, companyId, agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "failed", errorCode: "provider_quota", error: CAPACITY_MESSAGE,
+      startedAt: new Date(Date.now() - MINUTE_MS), finishedAt: new Date(),
+      scheduledRetryAttempt: 12, scheduledRetryReason: "transient_failure",
+      resultJson: {
+        errorFamily: "provider_quota", providerQuotaBeforeUsefulAction: true,
+        conversationContinuation: "continue_conversation_v1",
+      },
+      contextSnapshot: {
+        issueId, taskId: issueId, wakeReason: "transient_failure_retry",
+        providerQuotaRetryStartedAt: chainStartedAt.toISOString(),
+      },
+    });
+
+    // The next hourly probe would land past 24 hours from the first failure.
+    // Two concurrent calls still record one stop.
+    const results = await Promise.all([
+      heartbeat.scheduleBoundedRetry(failedRunId, { random: () => 0.5 }),
+      heartbeat.scheduleBoundedRetry(failedRunId, { random: () => 0.5 }),
+    ]);
+    for (const result of results) expect(result).toMatchObject({ outcome: "retry_exhausted" });
+    const stops = await db.select({ entityId: activityLog.entityId }).from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "heartbeat.provider_quota_exhausted")));
+    expect(stops).toEqual([{ entityId: issueId }]);
+    const [issue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("blocked");
+    const notes = await db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(notes).toHaveLength(1);
+    expect(await pendingRetry(companyId)).toBeNull();
+  });
+
+  /** Two issues of one company fail at capacity; returns their retries, oldest chain first. */
+  async function twoWaitingRetries(secondModel?: string) {
+    const first = await seed();
+    const second = await seedAnotherAssignee(first.companyId);
+    if (secondModel) {
+      await db.update(agents).set({ adapterConfig: { model: secondModel } }).where(eq(agents.id, second.agentId));
+    }
+    script = [{ kind: "capacity" }, { kind: "capacity" }];
+    await assign(first.agentId, first.issueId);
+    await assign(second.agentId, second.issueId);
+    const retries = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, first.companyId), eq(heartbeatRuns.status, "scheduled_retry")))
+      .orderBy(asc(heartbeatRuns.createdAt));
+    expect(retries).toHaveLength(2);
+    const [probe, waiting] = retries;
+    const bothDue = new Date(Math.max(probe!.scheduledRetryAt!.getTime(), waiting!.scheduledRetryAt!.getTime()));
+    return { first, second, probe: probe!, waiting: waiting!, bothDue };
+  }
+
+  it("lets one retry probe per company and provider, and releases the others when it succeeds", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { probe, waiting, bothDue } = await twoWaitingRetries();
+
+    // Both are due, but only the oldest chain probes the provider.
+    expect((await heartbeat.promoteDueScheduledRetries(bothDue)).runIds).toEqual([probe.id]);
+    const held = await heartbeat.getRun(waiting.id);
+    expect(held?.status).toBe("scheduled_retry");
+    expect(held!.scheduledRetryAt!.getTime()).toBeGreaterThan(bothDue.getTime());
+
+    // While the probe is queued, the waiting retry stays held even past its hold.
+    const later = new Date(held!.scheduledRetryAt!.getTime() + 1_000);
+    expect((await heartbeat.promoteDueScheduledRetries(later)).runIds).toEqual([]);
+    expect((await heartbeat.getRun(waiting.id))?.status).toBe("scheduled_retry");
+
+    script = [{ kind: "success" }];
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect((await heartbeat.getRun(probe.id))?.status).toBe("succeeded");
+
+    // The probe's success releases the waiting retry without its own wait.
+    expect((await heartbeat.promoteDueScheduledRetries(bothDue)).runIds).toEqual([waiting.id]);
+  });
+
+  it("does not hold a retry behind a probe on another model of the same adapter", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { probe, waiting, bothDue } = await twoWaitingRetries("gpt-other");
+    expect((await heartbeat.promoteDueScheduledRetries(bothDue)).runIds.sort()).toEqual([probe.id, waiting.id].sort());
+  });
+
+  it("exempts only the retry an operator asked to run now, not its successors", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { probe, waiting, bothDue } = await twoWaitingRetries();
+
+    // A request copied from an earlier retry of the chain does not exempt this one.
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        ...(waiting.contextSnapshot as Record<string, unknown>),
+        retryNowRequestedAt: new Date(waiting.createdAt.getTime() - MINUTE_MS).toISOString(),
+      },
+    }).where(eq(heartbeatRuns.id, waiting.id));
+    expect((await heartbeat.promoteDueScheduledRetries(bothDue)).runIds).toEqual([probe.id]);
+
+    // The state "retry now" writes on this retry before it promotes it: due
+    // now, requested after the row was created. The sweep does not hold it,
+    // even while the probe is queued.
+    const retryNowAt = new Date(bothDue.getTime() + 1_000);
+    await db.update(heartbeatRuns).set({
+      scheduledRetryAt: retryNowAt,
+      contextSnapshot: {
+        ...(waiting.contextSnapshot as Record<string, unknown>),
+        retryNowRequestedAt: retryNowAt.toISOString(),
+      },
+    }).where(eq(heartbeatRuns.id, waiting.id));
+    expect((await heartbeat.promoteDueScheduledRetries(retryNowAt)).runIds).toEqual([waiting.id]);
+  });
+
+  it("cancels a waiting retry that would pass its ceiling and stops its issue", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { first, second, probe, waiting, bothDue } = await twoWaitingRetries();
+    // The waiting retry's chain ends 30 s after it is due; the one-minute hold passes it.
+    const chainStartedAt = new Date(bothDue.getTime() - (24 * 60 - 0.5) * MINUTE_MS);
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        ...(waiting.contextSnapshot as Record<string, unknown>),
+        providerQuotaRetryStartedAt: chainStartedAt.toISOString(),
+      },
+    }).where(eq(heartbeatRuns.id, waiting.id));
+
+    // Keep the probe's chain the oldest, so the waiting retry stays the follower.
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        ...(probe.contextSnapshot as Record<string, unknown>),
+        providerQuotaRetryStartedAt: new Date(chainStartedAt.getTime() - MINUTE_MS).toISOString(),
+      },
+    }).where(eq(heartbeatRuns.id, probe.id));
+
+    expect((await heartbeat.promoteDueScheduledRetries(bothDue)).runIds).toEqual([probe.id]);
+    expect(await heartbeat.getRun(waiting.id)).toMatchObject({ status: "cancelled" });
+    const stops = await db.select({ entityId: activityLog.entityId }).from(activityLog)
+      .where(and(eq(activityLog.companyId, first.companyId), eq(activityLog.action, "heartbeat.provider_quota_exhausted")));
+    expect(stops).toEqual([{ entityId: second.issueId }]);
+    // The cancellation starts no continuation run: that would be another probe.
+    const live = (await companyRuns(first.companyId)).filter((run) =>
+      run.contextSnapshot?.issueId === second.issueId && ["queued", "running", "scheduled_retry"].includes(run.status));
+    expect(live).toEqual([]);
+    expect(await heartbeat.getRun(waiting.id)).toMatchObject({ errorCode: "provider_quota_exhausted" });
+    const [issue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, second.issueId));
+    expect(issue?.status).toBe("blocked");
+  });
+
+  it("re-checks a held retry within the hourly cadence when the probe waits for a distant reset", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { probe, waiting, bothDue } = await twoWaitingRetries();
+    // The probe waits for a provider reset three days away.
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(bothDue.getTime() + 3 * 24 * 60 * MINUTE_MS) })
+      .where(eq(heartbeatRuns.id, probe.id));
+
+    expect((await heartbeat.promoteDueScheduledRetries(bothDue)).runIds).toEqual([]);
+    const held = await heartbeat.getRun(waiting.id);
+    expect(held?.status).toBe("scheduled_retry");
+    expect(held!.scheduledRetryAt!.getTime() - bothDue.getTime()).toBe(61 * MINUTE_MS);
   });
 });

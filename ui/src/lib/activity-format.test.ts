@@ -25,6 +25,11 @@ describe("activity formatting", () => {
       .toBe("spent the daily provider quota cap exemption for");
   });
 
+  it("names the provider quota retry ceiling stop", () => {
+    expect(formatActivityVerb("heartbeat.provider_quota_exhausted"))
+      .toBe("stopped provider capacity retries on");
+  });
+
   it("formats blocker activity using linked issue identifiers", () => {
     const details = {
       addedBlockedByIssues: [
