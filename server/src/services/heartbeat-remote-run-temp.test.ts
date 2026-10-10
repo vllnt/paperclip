@@ -58,9 +58,17 @@ describe("prepareHeartbeatRemoteRunTemp", () => {
 });
 
 describe("cleanupHeartbeatRemoteRunTemp", () => {
-  it("removes the run's directory and reports what it did", async () => {
+  it("removes the run's directory once its remote process is proven stopped, and reports what it did", async () => {
     const cleanup = vi.fn(async () => "symlink" as const);
-    await expect(cleanupHeartbeatRemoteRunTemp({ runId: RUN_ID, target: sandbox }, cleanup)).resolves.toBe("symlink");
+    await expect(cleanupHeartbeatRemoteRunTemp({ location: { runId: RUN_ID, target: sandbox }, stopProven: true }, cleanup))
+      .resolves.toBe("symlink");
     expect(cleanup).toHaveBeenCalledWith({ runId: RUN_ID, target: sandbox });
+  });
+
+  it("keeps the directory when nothing proves the remote process stopped", async () => {
+    const cleanup = vi.fn(async () => "removed" as const);
+    await expect(cleanupHeartbeatRemoteRunTemp({ location: { runId: RUN_ID, target: sandbox }, stopProven: false }, cleanup))
+      .resolves.toBe("stop_unproven");
+    expect(cleanup).not.toHaveBeenCalled();
   });
 });

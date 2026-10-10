@@ -61,15 +61,21 @@ export async function prepareHeartbeatRemoteRunTemp(
 }
 
 /**
- * Removes a remote run's temp directory; call at a terminal status, once the
- * run's remote process is proven stopped, before the lease is released.
+ * Removes a remote run's temp directory at a terminal status, before the lease
+ * is released, but only when nothing can still use it. A remote process that
+ * outlived a timeout or a dropped SSH channel may, so without proof that it
+ * stopped the directory stays.
  *
- * @returns `symlink` when it kept the directory because a link or a file
- *   replaced a directory in its path.
+ * @param input.stopProven - The adapter proved its last remote process exited,
+ *   or no adapter process was dispatched.
+ * @returns `stop_unproven` when it kept the directory for lack of that proof,
+ *   otherwise what the removal did (`symlink`: kept, a link or a file replaced
+ *   a directory in its path).
  */
 export async function cleanupHeartbeatRemoteRunTemp(
-  location: RemoteRunTempLocation,
+  input: { location: RemoteRunTempLocation; stopProven: boolean },
   cleanup = cleanupRemoteRunTempDirectory,
-): ReturnType<typeof cleanupRemoteRunTempDirectory> {
-  return await cleanup(location);
+): Promise<Awaited<ReturnType<typeof cleanupRemoteRunTempDirectory>> | "stop_unproven"> {
+  if (!input.stopProven) return "stop_unproven";
+  return await cleanup(input.location);
 }

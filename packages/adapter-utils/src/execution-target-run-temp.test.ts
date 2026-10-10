@@ -1,8 +1,9 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   cleanupRemoteRunTempDirectory,
@@ -23,20 +24,52 @@ afterEach(async () => {
   }
 });
 
-// A sandbox whose commands run on this host, with `remoteCwd` as its working directory.
-async function localSandbox(options: { env?: NodeJS.ProcessEnv } = {}): Promise<{ root: string; target: AdapterExecutionTarget }> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-run-temp-"));
-  roots.push(root);
-  const runner = {
-    execute: async (input: { command: string; args?: string[]; cwd?: string }): Promise<RunProcessResult> => {
+type CommandInput = { command: string; args?: string[]; cwd?: string };
+const execFileAsync = promisify(execFile);
+
+// Runs a target's commands on this host. `concurrent` runs them without
+// blocking, so several can overlap.
+function localRunner(options: { env?: NodeJS.ProcessEnv; concurrent?: boolean } = {}) {
+  return {
+    execute: async (input: CommandInput): Promise<RunProcessResult> => {
+      const startedAt = new Date().toISOString();
+      if (options.concurrent) {
+        const result = await execFileAsync(input.command, input.args ?? [], { cwd: input.cwd, env: options.env })
+          .then(({ stdout, stderr }) => ({ status: 0, stdout, stderr }))
+          .catch((error: { code?: number; stdout?: string; stderr?: string }) => ({
+            status: typeof error.code === "number" ? error.code : 1, stdout: error.stdout ?? "", stderr: error.stderr ?? "",
+          }));
+        return { exitCode: result.status, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
+      }
       const result = spawnSync(input.command, input.args ?? [], { cwd: input.cwd, encoding: "utf8", env: options.env });
-      return {
-        exitCode: result.status, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr,
-        pid: null, startedAt: new Date().toISOString(),
-      };
+      return { exitCode: result.status, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
     },
   };
-  return { root, target: { kind: "remote", transport: "sandbox", providerKey: "test", remoteCwd: root, runner } };
+}
+
+async function localRoot(): Promise<string> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-run-temp-"));
+  roots.push(root);
+  return root;
+}
+
+// A sandbox whose commands run on this host, with `remoteCwd` as its working directory.
+async function localSandbox(options: { env?: NodeJS.ProcessEnv; concurrent?: boolean } = {}): Promise<{ root: string; target: AdapterExecutionTarget }> {
+  const root = await localRoot();
+  return { root, target: { kind: "remote", transport: "sandbox", providerKey: "test", remoteCwd: root, runner: localRunner(options) } };
+}
+
+// An SSH target whose lease root is a directory on this host; pass
+// `localRunner()` to run its commands here instead of over SSH.
+async function localSshTarget(): Promise<{ root: string; target: AdapterExecutionTarget }> {
+  const root = await localRoot();
+  return {
+    root,
+    target: {
+      kind: "remote", transport: "ssh", remoteCwd: root,
+      spec: { host: "h", port: 22, username: "u", remoteWorkspacePath: root, remoteCwd: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false },
+    },
+  };
 }
 
 describe("remoteRunTempDirectory", () => {
@@ -184,8 +217,82 @@ describe("prepareRemoteRunTempDirectory and cleanupRemoteRunTempDirectory", () =
     expect((await stat(path.join(outside, "sealed"))).mode & 0o777).toBe(0o500);
   });
 
+  it("creates several runs' directories at once under a new root", async () => {
+    const { root, target } = await localSandbox({ concurrent: true });
+    const runIds = Array.from({ length: 8 }, (_, index) => `${index}1111111-2222-4333-8444-555555555555`);
+
+    const dirs = await Promise.all(runIds.map((runId) => prepareRemoteRunTempDirectory({ runId, target })));
+
+    expect(dirs).toEqual(runIds.map((runId) => `${root}/.paperclip-runtime/tmp/${runId}`));
+  });
+
+  // Root enters any directory.
+  it.skipIf(process.getuid?.() === 0)("fails rather than report absent when a directory in the path cannot be entered", async () => {
+    const { root, target } = await localSandbox();
+    await mkdir(path.join(root, ".paperclip-runtime", "tmp"), { recursive: true });
+    await chmod(path.join(root, ".paperclip-runtime", "tmp"), 0o000);
+
+    await expect(cleanupRemoteRunTempDirectory({ runId: RUN_ID, target })).rejects.toThrow("Could not remove");
+    await expect(prepareRemoteRunTempDirectory({ runId: RUN_ID, target })).rejects.toThrow("Could not create");
+  });
+
   it("does nothing for a local run", async () => {
     expect(await prepareRemoteRunTempDirectory({ runId: RUN_ID, target: null })).toBeNull();
     await expect(cleanupRemoteRunTempDirectory({ runId: RUN_ID, target: null })).resolves.toBe("absent");
+  });
+});
+
+// The SSH layout, run on this host: runs/<id>/tmp beside the run's workspace.
+describe("the SSH run temp directory, without an SSH server", () => {
+  it("creates it beside the workspace and removes the run directory with it when nothing else is left", async () => {
+    const { root, target } = await localSshTarget();
+    const runner = localRunner();
+
+    const dir = await prepareRemoteRunTempDirectory({ runId: RUN_ID, target }, runner);
+
+    expect(dir).toBe(`${root}/.paperclip-runtime/runs/${RUN_ID}/tmp`);
+    expect((await stat(dir ?? "")).mode & 0o777).toBe(0o700);
+    await writeFile(path.join(dir ?? "", "f"), "scratch\n");
+    await expect(cleanupRemoteRunTempDirectory({ runId: RUN_ID, target }, runner)).resolves.toBe("removed");
+    expect(existsSync(path.dirname(dir ?? ""))).toBe(false);
+    expect(await readdir(path.join(root, ".paperclip-runtime", "runs"))).toEqual([]);
+  });
+
+  it("keeps the run directory and its workspace", async () => {
+    const { root, target } = await localSshTarget();
+    const runner = localRunner();
+    const dir = await prepareRemoteRunTempDirectory({ runId: RUN_ID, target }, runner) ?? "";
+    await mkdir(path.join(path.dirname(dir), "workspace"));
+    await writeFile(path.join(path.dirname(dir), "workspace", "work.txt"), "agent work\n");
+
+    await expect(cleanupRemoteRunTempDirectory({ runId: RUN_ID, target }, runner)).resolves.toBe("removed");
+
+    expect(existsSync(dir)).toBe(false);
+    expect(await readdir(path.join(root, ".paperclip-runtime", "runs", RUN_ID))).toEqual(["workspace"]);
+  });
+
+  // A link or a file an agent put in place of a directory in the path.
+  it.each([
+    [".paperclip-runtime", "link"],
+    [".paperclip-runtime/runs", "link"],
+    [`.paperclip-runtime/runs/${RUN_ID}`, "link"],
+    [".paperclip-runtime/runs", "file"],
+  ] as const)("changes nothing through a %s replaced by a %s", async (replaced, kind) => {
+    const { root, target } = await localSshTarget();
+    const runner = localRunner();
+    const below = path.relative(path.join(root, replaced), path.join(root, ".paperclip-runtime", "runs", RUN_ID, "tmp"));
+    const outside = path.join(root, "outside");
+    const canary = path.join(outside, below, "canary");
+    await mkdir(path.dirname(canary), { recursive: true });
+    await writeFile(canary, "keep\n");
+    await mkdir(path.dirname(path.join(root, replaced)), { recursive: true });
+    if (kind === "link") await symlink(outside, path.join(root, replaced));
+    else await writeFile(path.join(root, replaced), "not a directory\n");
+
+    await expect(cleanupRemoteRunTempDirectory({ runId: RUN_ID, target }, runner)).resolves.toBe("symlink");
+    await expect(prepareRemoteRunTempDirectory({ runId: RUN_ID, target }, runner)).rejects.toThrow("link");
+
+    expect(existsSync(canary)).toBe(true);
+    expect(await readdir(path.dirname(canary))).toEqual(["canary"]);
   });
 });
