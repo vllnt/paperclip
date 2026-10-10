@@ -76,4 +76,24 @@ describe("a sync run whose host calls start to be denied (the invocation scope i
     expect(afterDenial).toBeLessThanOrEqual(3);
     expect(writesAfterDenial).toBe(0);
   }, 60_000);
+
+  it("ends the scheduled job at the first denial instead of going on to the next company", async () => {
+    const f = await fixture();
+    await seedConnection(f.h, "c2", "13");
+    const logged = vi.spyOn(f.h.ctx.logger, "error");
+    let denied = false;
+    const touched: unknown[] = [];
+    const get = f.h.ctx.state.get.bind(f.h.ctx.state);
+    vi.spyOn(f.h.ctx.state, "get").mockImplementation(async key => {
+      if (denied) { touched.push(key.scopeId); throw SCOPE_LOST(); }
+      if (key.scopeId === companyId && key.stateKey.startsWith("link:")) denied = true; // the first company's sync loses its scope
+      return get(key);
+    });
+
+    await expect(f.h.runJob("github-sync")).resolves.toBeUndefined();
+
+    expect(logged).toHaveBeenCalledWith("GitHub scheduled sync failed", expect.objectContaining({ companyId }));
+    expect(logged).toHaveBeenCalledTimes(1);
+    expect(touched).not.toContain("c2");
+  }, 60_000);
 });
