@@ -107,13 +107,19 @@ it("settles a late producer before removing shared storage after another scan fa
   let lateFinished = false;
   let settled = false;
   const removed: string[] = [];
-  const originalRm = fs.rm.bind(fs);
-  vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+  // Nothing in the manifest storage may go before the late producer settles.
+  const originalUnlink = fs.unlink.bind(fs);
+  vi.spyOn(fs, "unlink").mockImplementation(async (target) => {
+    if (String(target).includes("paperclip-workspace-manifest-")) expect(lateFinished).toBe(true);
+    return originalUnlink(target);
+  });
+  const originalRmdir = fs.rmdir.bind(fs);
+  vi.spyOn(fs, "rmdir").mockImplementation(async (target, options) => {
     if (String(target).includes("paperclip-workspace-manifest-")) {
       expect(lateFinished).toBe(true);
       removed.push(String(target));
     }
-    return originalRm(target, options);
+    return originalRmdir(target, options);
   });
   const failure = Object.assign(new Error("scan failed"), { code: "workspace_git_scan_failed" });
   setExpensiveWorkspaceGitExecutor(async (input) => {

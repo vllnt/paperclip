@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
 import { shouldExcludePath } from "./exclude-patterns.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
+import { removePaperclipTempDir } from "./paperclip-temp.js";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 
 export type SnapshotEntry =
@@ -38,7 +39,7 @@ export async function disposeDirectorySnapshot(snapshot: DirectorySnapshot | nul
     snapshot.entries.close();
     const ownedDirectory = ownedDirectorySnapshots.get(snapshot);
     ownedDirectorySnapshots.delete(snapshot);
-    if (ownedDirectory) await fs.rm(ownedDirectory, { recursive: true, force: true });
+    if (ownedDirectory) await removePaperclipTempDir(ownedDirectory);
   }
 }
 
@@ -1091,7 +1092,7 @@ export async function captureDirectorySnapshot(
     return snapshot;
   } catch (error) {
     writer?.close(false);
-    if (writer) await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    if (writer) await removePaperclipTempDir(path.dirname(writer.filePath));
     throw error;
   } finally { ignored.close(); }
 }
@@ -1114,7 +1115,7 @@ export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, optio
     return result;
   } catch (error) {
     writer.close(false);
-    await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    await removePaperclipTempDir(path.dirname(writer.filePath));
     throw error;
   }
 }
