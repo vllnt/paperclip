@@ -1988,7 +1988,7 @@ describe("SSH run directory reaper", () => {
     { read: "status", detail: "git status truncated" },
     { read: "head", detail: "git rev-parse HEAD truncated" },
     { read: "stale", detail: "git for-each-ref truncated" },
-    { read: "heads", detail: "git for-each-ref truncated" },
+    { read: "refs", detail: "git for-each-ref truncated" },
     { read: "stash", detail: "git stash list truncated" },
     { read: "trees", detail: "git worktree list truncated" },
     { read: "wtstatus", detail: "git status (extra worktree) truncated" },
@@ -2000,7 +2000,7 @@ describe("SSH run directory reaper", () => {
     const run = await runWithAgentCommit(host);
     await git(run.workspace, ["worktree", "add", "-q", "-b", "side-branch", path.join(run.runDir, "extra-tree")]);
     await writeFile(path.join(run.workspace, "only-copy"), "uncommitted work\n");
-    const cutShort = `if [ "$rname" = ${read} ]; then sed -i '$d' "$list.$rname"; fi`;
+    const cutShort = `if [ "$rname" = ${read} ]; then sed '$d' "$list.$rname" > "$list.$rname.cut" && mv "$list.$rname.cut" "$list.$rname"; fi`;
 
     const result = await reapSshRunDirectory({
       spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterRead: cutShort },
@@ -2015,7 +2015,7 @@ describe("SSH run directory reaper", () => {
     if (!host) return;
     const run = await runWithAgentCommit(host);
     await writeFile(path.join(run.workspace, "only-copy"), "uncommitted work\n");
-    const lostLine = `if [ "$rname" = status ]; then sed -i '1d' "$list.$rname"; fi`;
+    const lostLine = `if [ "$rname" = status ]; then sed '1d' "$list.$rname" > "$list.$rname.cut" && mv "$list.$rname.cut" "$list.$rname"; fi`;
 
     const result = await reapSshRunDirectory({
       spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterRead: lostLine },
@@ -2145,8 +2145,8 @@ describe("SSH run directory reaper", () => {
 
     it.each([
       { name: "a git read that fails", hook: `git() { case " $* " in *"-C workspace status --porcelain"*) return 42;; esac; command git "$@"; }`, detail: "git status" },
-      { name: "a read that loses its end", hook: `if [ "$rname" = stash ]; then sed -i '$d' "$list.$rname"; fi`, detail: "git stash list truncated", seam: "afterRead" },
-      { name: "an ancestry test that fails", hook: `git() { case " $* " in *" merge-base --is-ancestor "*) return 128;; esac; command git "$@"; }`, detail: "git merge-base", extra: true },
+      { name: "a read that loses its end", hook: `if [ "$rname" = stash ]; then sed '$d' "$list.$rname" > "$list.$rname.cut" && mv "$list.$rname.cut" "$list.$rname"; fi`, detail: "git stash list truncated", seam: "afterRead" },
+      { name: "a count of unpushed commits that fails", hook: `git() { case " $* " in *" rev-list --count "*) return 128;; esac; command git "$@"; }`, detail: "git rev-list", extra: true },
     ] as Array<{ name: string; hook: string; detail: string; seam?: "afterRead"; extra?: boolean }>)("keeps the folder as git_unreadable when it hits $name", async ({ hook, detail, seam, extra }) => {
       const host = await startHost("SSH reaper legacy unreadable test");
       if (!host) return;
@@ -2173,6 +2173,151 @@ describe("SSH run directory reaper", () => {
 
       await expect(host.reap(run.runId, null)).resolves.toMatchObject({ outcome: "kept", reason: "seed_unknown" });
     }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("refs beyond branches, and submodules", () => {
+    // A commit that only a ref outside refs/heads holds: made on a scratch branch, then the branch is deleted.
+    async function holdOnlyByRef(workspace: string, make: (workspace: string) => Promise<void>) {
+      await git(workspace, ["checkout", "-q", "-b", "scratch"]);
+      await writeFile(path.join(workspace, "only-here.txt"), "work that only a ref holds\n");
+      await git(workspace, ["add", "only-here.txt"]);
+      await git(workspace, ["commit", "-q", "-m", "local only"]);
+      const tip = await git(workspace, ["rev-parse", "HEAD"]);
+      await make(workspace);
+      await git(workspace, ["checkout", "-q", "main"]);
+      await git(workspace, ["branch", "-D", "scratch"]);
+      return tip;
+    }
+    const refKinds: Array<{ name: string; ref: string; make: (workspace: string) => Promise<void> }> = [
+      { name: "an annotated tag", ref: "ref/tags/precious", make: async (ws) => { await git(ws, ["tag", "-a", "-m", "keep this", "precious"]); } },
+      { name: "a lightweight tag", ref: "ref/tags/precious", make: async (ws) => { await git(ws, ["tag", "precious"]); } },
+      { name: "a notes ref", ref: "ref/notes/commits", make: async (ws) => { await git(ws, ["notes", "add", "-m", "a note"]); } },
+    ];
+
+    it.each(refKinds)("saves in the bundle a commit only $name holds, when the start commit is known", async ({ ref, make }) => {
+      const host = await startHost("SSH reaper tag bundle test");
+      if (!host) return;
+      const run = await host.gitRun();
+      const clone = await host.hostClone(run.workspace);
+      const tip = await holdOnlyByRef(run.workspace, make);
+      const saved = `refs/paperclip/preserved/${run.runId}/${ref}`;
+
+      const result = await host.reap(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      expect(result.outcome === "removed" && result.preserved).toContain(saved);
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${saved}:${saved}`]);
+      const savedCommit = await git(clone, ["rev-parse", saved]);
+      if (ref.startsWith("ref/notes")) {
+        expect(savedCommit).toMatch(/^[0-9a-f]{40}$/);
+      } else {
+        expect(savedCommit).toBe(tip);
+      }
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it.each(refKinds)("keeps the folder as unpushed when only $name holds a local commit and there is no seed record", async ({ make }) => {
+      const host = await startHost("SSH reaper tag legacy test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      await holdOnlyByRef(run.workspace, make);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "unpushed" });
+
+      expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("removes a folder whose tag is contained in a remote ref", async () => {
+      const host = await startHost("SSH reaper pushed tag test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      await git(run.workspace, ["tag", "-a", "-m", "release", "v1"]);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "removed" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps a folder that has a ref to something other than a commit", async () => {
+      const host = await startHost("SSH reaper blob ref test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const blob = await git(run.workspace, ["hash-object", "-w", "tracked.txt"]);
+      await git(run.workspace, ["update-ref", "refs/misc/blob", blob]);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "unpushed" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    // A repository nested as a submodule, with a commit that exists nowhere else, while the superproject stays clean and pushed.
+    async function pushedRunWithLocalSubmoduleCommit(host: NonNullable<Awaited<ReturnType<typeof startHost>>>) {
+      const sub = path.join(host.rootDir, `sub-${randomUUID()}`);
+      await mkdir(sub, { recursive: true });
+      await git(sub, ["init", "-q", "-b", "main"]);
+      await writeFile(path.join(sub, "lib.txt"), "library\n");
+      await git(sub, ["add", "lib.txt"]);
+      await git(sub, ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "library"]);
+      const run = await host.pushedRun();
+      await git(run.workspace, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "libs/sub"]);
+      await git(run.workspace, ["commit", "-q", "-m", "add submodule"]);
+      await git(run.workspace, ["push", "-q", "origin", "main"]);
+      const nested = path.join(run.workspace, "libs", "sub");
+      await writeFile(path.join(nested, "local.txt"), "only in the submodule\n");
+      await git(nested, ["add", "local.txt"]);
+      await git(nested, ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "submodule local only"]);
+      await git(nested, ["tag", "-a", "-m", "local", "local-only"]);
+      return run;
+    }
+
+    it("keeps a folder with a submodule as submodule, with a seed record", async () => {
+      const host = await startHost("SSH reaper submodule seeded test");
+      if (!host) return;
+      const run = await pushedRunWithLocalSubmoduleCommit(host);
+
+      await expect(host.reap(run.runId, run.seed)).resolves.toMatchObject({ outcome: "kept", reason: "submodule" });
+
+      await expect(stat(path.join(run.workspace, "libs", "sub", "local.txt"))).resolves.toBeTruthy();
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps a folder with a submodule as submodule, with no seed record", async () => {
+      const host = await startHost("SSH reaper submodule legacy test");
+      if (!host) return;
+      const run = await pushedRunWithLocalSubmoduleCommit(host);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "submodule" });
+
+      await expect(stat(path.join(run.workspace, "libs", "sub", "local.txt"))).resolves.toBeTruthy();
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("a reap that is cut at its time limit", () => {
+    it("leaves a folder untouched when it is cut during the checks, and removes it on the next pass", async () => {
+      const host = await startHost("SSH reaper cut during checks test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const startedAt = Date.now();
+
+      await expect(reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true, timeoutMs: 3000,
+        testHooks: { afterConfine: "sleep 30" },
+      })).rejects.toThrow();
+
+      expect(Date.now() - startedAt).toBeLessThan(15_000);
+      await expect(stat(path.join(run.workspace, "tracked.txt"))).resolves.toBeTruthy();
+      await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "removed" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+    it("leaves a folder the next pass removes without the rule when it is cut during the removal", async () => {
+      const host = await startHost("SSH reaper cut during removal test");
+      if (!host) return;
+      const run = await host.pushedRun();
+
+      await expect(reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true, timeoutMs: 3000,
+        testHooks: { beforeRemove: "sleep 30" },
+      })).rejects.toThrow();
+
+      await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+      await expect(host.reap(run.runId, null)).resolves.toMatchObject({ outcome: "removed" });
+      await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
   });
 
   it("refuses the final rmdir when the name no longer leads to the directory it emptied", async () => {

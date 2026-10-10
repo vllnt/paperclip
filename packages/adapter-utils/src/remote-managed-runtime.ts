@@ -136,6 +136,7 @@ export type SshRunDirectoryKeepReason =
   | "unpushed"
   | "stash"
   | "linked_worktree"
+  | "submodule"
   | "git_unreadable"
   | "rm_failed";
 
@@ -298,7 +299,16 @@ export async function reapSshRunDirectory(input: {
     '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then keep not_git_backed; fi',
     '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
     '  if [ ! -d "$ws/.git" ]; then keep not_git_backed; fi',
+    '  if [ -z "$seed" ]; then fail_reason=git_unreadable; fi',
     '  G rev-parse --git-dir >/dev/null 2>&1 || fail "git rev-parse"',
+    // A submodule is a repository of its own, and its commits and tags are not
+    // reached by any check below. Walking nested repositories is more surface than a
+    // throw-away copy is worth, so a folder with a submodule is kept: a .gitmodules
+    // file, a gitlink in the index, or the .git/modules directory of one that was
+    // initialized.
+    '  if [ -e "$ws/.gitmodules" ] || [ -L "$ws/.gitmodules" ] || [ -d "$ws/.git/modules" ]; then keep submodule; fi',
+    '  rd gitlinks "git ls-files" G ls-files --stage',
+    '  if grep -q "^160000 " "$list.gitlinks.body"; then keep submodule; fi',
     // The commit the run's workspace was uploaded from, as the server recorded
     // it. It is never taken from the worker's reflog, which an agent can expire.
     // Without it the directory stays. Every commit that is not reachable from
@@ -313,35 +323,32 @@ export async function reapSshRunDirectory(input: {
     // exists nowhere else, as far as a remote ref can tell: a remote ref is a hint
     // that the work was pushed, never proof. Any doubt keeps it. Nothing is
     // bundled: a folder that passes holds nothing to save.
-    '    fail_reason=git_unreadable',
     '    rd status "git status" G status --porcelain',
     '    if [ -s "$list.status.body" ]; then keep dirty; fi',
-    '    G rev-parse -q --verify HEAD >/dev/null 2>&1; head_status=$?',
-    '    if [ "$head_status" = 0 ]; then',
-    '      rd head "git rev-parse HEAD" G rev-parse -q --verify HEAD',
-    '      head=$(cat "$list.head.body"); isoid "$head" || fail "git rev-parse HEAD"',
-    '      rd remote_head "git for-each-ref" G for-each-ref "--format=%(refname)" --contains "$head" refs/remotes',
-    '      if [ ! -s "$list.remote_head.body" ]; then keep unpushed; fi',
-    '    elif [ "$head_status" = 1 ] && G symbolic-ref -q HEAD >/dev/null 2>&1; then',
-    '      head=""',
-    "    else",
-    '      fail "git rev-parse HEAD"',
-    "    fi",
-    '    rd heads "git for-each-ref" G for-each-ref "--format=%(objectname) %(refname)" refs/heads',
-    '    tipn=0',
-    '    while IFS=" " read -r obj ref; do',
-    '      [ -n "$obj$ref" ] || continue',
-    '      isoid "$obj" || fail "git for-each-ref"',
-    '      if [ -n "$head" ] && anc "$obj" "$head"; then continue; fi',
-    '      tipn=$((tipn + 1))',
-    '      rd "tip$tipn" "git for-each-ref" G for-each-ref "--format=%(refname)" --contains "$obj" refs/remotes',
-    '      if [ ! -s "$list.tip$tipn.body" ]; then keep unpushed; fi',
-    '    done < "$list.heads.body"',
     '    rd stash "git stash list" G stash list --format=%H',
     '    if [ -s "$list.stash.body" ]; then keep stash; fi',
     '    rd trees "git worktree list" G worktree list --porcelain',
     '    wt=$(grep -c "^worktree " "$list.trees.body" || true)',
     '    if [ "${wt:-0}" -gt 1 ]; then keep linked_worktree; fi',
+    // Local-only means any ref, not only branches: tags, notes and the stash
+    // count, and so does HEAD. A ref that does not lead to a commit (a tag of a
+    // tree, a ref to a blob) can hold data that exists nowhere else, so it keeps
+    // the folder. Remote refs are left out; they are the hint that work was pushed.
+    '    rd reftypes "git for-each-ref" G for-each-ref "--format=%(objecttype)|%(*objecttype)|%(refname)"',
+    '    while IFS="|" read -r otype ptype ref; do',
+    '      case "$ref" in ""|refs/remotes/*) continue ;; esac',
+    '      case "$otype" in commit) ;; tag) if [ "$ptype" != commit ]; then keep unpushed; fi ;; *) keep unpushed ;; esac',
+    '    done < "$list.reftypes.body"',
+    // The commits that some local ref (or HEAD) reaches and no remote ref does.
+    '    rd unpushed "git rev-list" G rev-list --count --all --not --remotes',
+    '    unpushed_count=$(cat "$list.unpushed.body")',
+    '    case "$unpushed_count" in ""|*[!0-9]*) fail "git rev-list" ;; esac',
+    '    if [ "$unpushed_count" != 0 ]; then keep unpushed; fi',
+    // Every check passed. The folder is marked as holding no unsynced work before
+    // anything is deleted, so a removal that is cut off at its time limit is
+    // finished by the next pass, which then needs no checks and no seed.
+    '    : > "$marker" 2>/dev/null || { echo "detail marker"; keep rm_failed; }',
+    '    had_marker=1',
     "  else",
     // Every read below fails closed: a command that exits non-zero, whose output
     // lost its end (see rd), or that prints something that is not an object id
@@ -359,15 +366,25 @@ export async function reapSshRunDirectory(input: {
     '  : > "$list"',
     '  rd stale "git for-each-ref" G for-each-ref "--format=%(refname)" "$ns"',
     '  while IFS= read -r r; do if [ -n "$r" ]; then G update-ref -d "$r" || fail "git update-ref"; fi; done < "$list.stale.body"',
-    '  add_ref() { isoid "$2" || fail "git object id"; if anc "$2" "$seed"; then return 0; fi; G update-ref "$ns/$1" "$2" || fail "git update-ref"; echo "$ns/$1" >> "$list"; }',
+    '  add_ref() { isoid "$2" || fail "git object id"; if anc "$2" "$seed"; then return 0; fi; if grep -Fxq "$ns/$1" "$list"; then fail "ref name collision"; fi; G update-ref "$ns/$1" "$2" || fail "git update-ref"; echo "$ns/$1" >> "$list"; }',
     '  [ -n "$head" ] && add_ref head "$head"',
-    '  rd heads "git for-each-ref" G for-each-ref "--format=%(objectname) %(refname)" refs/heads',
-    '  while IFS=" " read -r obj ref; do',
-    '    [ -n "$obj$ref" ] || continue',
-    '    isoid "$obj" || fail "git for-each-ref"',
-    '    if [ -n "$head" ] && anc "$obj" "$head"; then continue; fi',
-    '    add_ref "${ref#refs/heads/}" "$obj"',
-    '  done < "$list.heads.body"',
+    // Every local ref, not only branches: a commit that only a tag, a note or any
+    // other ref holds is the run's own work too. A tag is saved as the commit it
+    // points at. A branch keeps its name, any other ref is saved as ref/<name>. A
+    // ref that does not lead to a commit cannot be bundled, so it keeps the directory.
+    '  rd refs "git for-each-ref" G for-each-ref "--format=%(objecttype)|%(objectname)|%(*objecttype)|%(*objectname)|%(refname)"',
+    '  while IFS="|" read -r otype oid ptype poid ref; do',
+    '    case "$ref" in ""|refs/remotes/*|refs/stash|refs/paperclip/preserved/*) continue ;; esac',
+    '    case "$otype" in',
+    '      commit) cid=$oid ;;',
+    '      tag) if [ "$ptype" = commit ]; then cid=$poid; else fail "git ref to a non-commit"; fi ;;',
+    '      *) fail "git ref to a non-commit" ;;',
+    '    esac',
+    '    isoid "$cid" || fail "git for-each-ref"',
+    '    if [ -n "$head" ] && anc "$cid" "$head"; then continue; fi',
+    '    case "$ref" in refs/heads/*) refname="${ref#refs/heads/}" ;; *) refname="ref/${ref#refs/}" ;; esac',
+    '    add_ref "$refname" "$cid"',
+    '  done < "$list.refs.body"',
     '  index=0',
     '  rd stash "git stash list" G stash list --format=%H',
     '  while IFS= read -r obj; do if [ -n "$obj" ]; then add_ref "stash-$index" "$obj"; fi; index=$((index + 1)); done < "$list.stash.body"',
@@ -482,7 +499,7 @@ export async function reapSshRunDirectory(input: {
   if (last === "absent" || last === "symlink" || last === "unbounded") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|seed_unknown|dirty|unpushed|stash|linked_worktree|git_unreadable|rm_failed) (\d+)$/.exec(last);
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|seed_unknown|dirty|unpushed|stash|linked_worktree|submodule|git_unreadable|rm_failed) (\d+)$/.exec(last);
   if (kept) {
     const detail = lines.filter((line) => line.startsWith("detail ")).map((line) => line.slice("detail ".length)).pop();
     return {

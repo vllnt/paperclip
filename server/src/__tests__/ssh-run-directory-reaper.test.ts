@@ -15,6 +15,7 @@ import {
   environmentLeases,
   environments,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   buildSshEnvLabFixtureConfig,
@@ -220,25 +221,63 @@ describeReaper("SSH run directory reaper", () => {
     expect(await exists(run.runDir)).toBe(true);
   });
 
-  it("skips a session's last run on release and lets the sweep remove it once it is old enough", async () => {
-    const run = await startRun({ status: "failed" });
-    await db.insert(agentTaskSessions).values({
-      companyId, agentId, adapterType: "codex_local", taskKey: `task-${randomUUID()}`, lastRunId: run.runId,
-    });
+  describe("the last run of a task session", () => {
+    const openIssue = async (status = "in_progress") => {
+      const [issue] = await db.insert(issues).values({ companyId, title: `Work ${randomUUID()}`, status }).returning();
+      return issue!;
+    };
+    const sessionFor = (taskKey: string, runId: string) =>
+      db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "codex_local", taskKey, lastRunId: runId });
 
-    await runtime.releaseRunLeases(run.runId);
-    await new Promise((resolve) => setTimeout(resolve, 1_500));
-    expect(await exists(run.runDir)).toBe(true);
-    expect(await leaseMetadata(run.leaseId)).not.toHaveProperty("sshRunDirectory");
+    it("keeps the folder on release and on the sweep while the session's issue is open, and removes it once the issue is done", async () => {
+      const run = await startRun({ status: "failed" });
+      const issue = await openIssue();
+      await sessionFor(issue.id, run.runId);
 
-    const young = await reaper().sweep({ now: new Date(Date.now() + 1 * HOUR_MS), readDiskUsagePercent: async () => 10 });
-    expect(young.removed).toBe(0);
-    expect(await exists(run.runDir)).toBe(true);
+      await runtime.releaseRunLeases(run.runId);
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await leaseMetadata(run.leaseId)).not.toHaveProperty("sshRunDirectory");
 
-    const old = await reaper().sweep({ now: new Date(Date.now() + 7 * HOUR_MS), readDiskUsagePercent: async () => 10 });
-    expect(old.removed).toBe(1);
-    expect(await exists(run.runDir)).toBe(false);
-    expect((await activityFor(run.runId, "environment.ssh_run_directory_reaped"))[0]!.details).toMatchObject({ trigger: "sweep" });
+      const old = await reaper().sweep({ now: new Date(Date.now() + 48 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+      expect(old.removed).toBe(0);
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await leaseMetadata(run.leaseId)).not.toHaveProperty("sshRunDirectory");
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issue.id));
+      const closed = await reaper().sweep({ now: new Date(Date.now() + 48 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+      expect(closed.removed).toBeGreaterThanOrEqual(1);
+      expect(await exists(run.runDir)).toBe(false);
+      expect((await activityFor(run.runId, "environment.ssh_run_directory_reaped"))[0]!.details).toMatchObject({ trigger: "sweep" });
+    }, 60_000);
+
+    it("keeps a folder with no seed record the same way, so the legacy rule never reaches it", async () => {
+      const issue = await openIssue();
+      const run = await startRun({ status: "failed", recordSeed: false, pushed: true });
+      await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 25 * HOUR_MS) }).where(eq(heartbeatRuns.id, run.runId));
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 100 * HOUR_MS) }).where(eq(environmentLeases.id, run.leaseId));
+      await sessionFor(issue.id, run.runId);
+
+      await reaper().sweep({ readDiskUsagePercent: async () => 10 });
+
+      expect(await exists(run.runDir)).toBe(true);
+      expect(await leaseMetadata(run.leaseId)).not.toHaveProperty("sshRunDirectory");
+    }, 60_000);
+
+    it.each(["done", "cancelled"])("does not let a session on a %s issue, or one tied to no issue, keep a folder", async (status) => {
+      const closed = await startRun({ status: "failed" });
+      await sessionFor((await openIssue(status)).id, closed.runId);
+      const untied = await startRun({ status: "failed" });
+      await sessionFor(`task-${randomUUID()}`, untied.runId);
+
+      await runtime.releaseRunLeases(closed.runId);
+      await runtime.releaseRunLeases(untied.runId);
+
+      await vi.waitFor(async () => {
+        expect(await exists(closed.runDir)).toBe(false);
+        expect(await exists(untied.runDir)).toBe(false);
+      }, { timeout: 15_000, interval: 100 });
+    }, 60_000);
   });
 
   it("sweeps orphans: terminal, old enough, no active or pending cleanup lease, and not decided before", async () => {
@@ -764,10 +803,50 @@ describeReaper("SSH run directory reaper", () => {
       expect(summary.keptByReason.git_unreadable).toBeGreaterThanOrEqual(1);
     }, 60_000);
 
+    it("cuts a reap that hangs at the pass budget, ends the pass within it, and leaves the folder for a later pass", async () => {
+      const run = await legacyRun({ releasedAgoMs: 200 * HOUR_MS });
+      const clock = steppedClock();
+      const hung = sshRunDirectoryReaperService(db, {
+        clock: clock.now,
+        legacyPassBudgetMs: 3_000,
+        hooks: { reapRemote: (input) => reapSshRunDirectory({ ...input, testHooks: input.runId === run.runId ? { afterConfine: "sleep 40" } : undefined }) },
+      });
+      const startedAt = Date.now();
+
+      await hung.sweep({ now: clock.now(), readDiskUsagePercent: async () => 10 });
+
+      expect(Date.now() - startedAt).toBeLessThan(15_000);
+      expect(await exists(run.workspace)).toBe(true);
+      // The cut-off reap keeps its claim, so nothing records a verdict for it.
+      expect(await decisionOf(run.leaseId)).toMatchObject({ state: "reaping" });
+      clock.advance(BEYOND_STALE_WINDOW_MS);
+      await sshRunDirectoryReaperService(db, { clock: clock.now }).sweep({ now: clock.now(), readDiskUsagePercent: async () => 10 });
+      expect(await exists(run.runDir)).toBe(false);
+      expect(await decisionOf(run.leaseId)).toMatchObject({ state: "removed", unseeded: true });
+    }, 120_000);
+
+    it("spends no more than the budget on several hung folders in one pass", async () => {
+      const runs = [];
+      for (let i = 0; i < 3; i += 1) runs.push(await legacyRun({ releasedAgoMs: (210 + i) * HOUR_MS }));
+      const hung = sshRunDirectoryReaperService(db, {
+        legacyPassBudgetMs: 3_000,
+        hooks: { reapRemote: (input) => reapSshRunDirectory({ ...input, testHooks: runs.some((run) => run.runId === input.runId) ? { afterConfine: "sleep 40" } : undefined }) },
+      });
+      const startedAt = Date.now();
+
+      await hung.sweep({ readDiskUsagePercent: async () => 10 });
+
+      // One reap is cut at the budget; the others are not started.
+      expect(Date.now() - startedAt).toBeLessThan(15_000);
+      const states = await Promise.all(runs.map((run) => decisionOf(run.leaseId)));
+      expect(states.filter((state) => state?.state === "reaping")).toHaveLength(1);
+      expect(states.filter((state) => state === undefined)).toHaveLength(2);
+    }, 120_000);
+
     it("sends no more folders than the cap in one sweep, and does the rest on the next", async () => {
       // The oldest first, so these three come before any other folder the suite left behind.
       const runs = [];
-      for (let i = 0; i < 3; i += 1) runs.push(await legacyRun({ releasedAgoMs: (300 + i) * HOUR_MS }));
+      for (let i = 0; i < 3; i += 1) runs.push(await legacyRun({ releasedAgoMs: (330 + i) * HOUR_MS }));
       const capped = sshRunDirectoryReaperService(db, { legacyPassCap: 2 });
 
       await capped.sweep({ readDiskUsagePercent: async () => 10 });
@@ -780,7 +859,7 @@ describeReaper("SSH run directory reaper", () => {
     }, 120_000);
 
     it("sends none when its time budget is already spent", async () => {
-      const run = await legacyRun({ releasedAgoMs: 310 * HOUR_MS });
+      const run = await legacyRun({ releasedAgoMs: 190 * HOUR_MS });
 
       await sshRunDirectoryReaperService(db, { legacyPassBudgetMs: 0 }).sweep({ readDiskUsagePercent: async () => 10 });
 

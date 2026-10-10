@@ -21,34 +21,49 @@ status.
   `PAPERCLIP_SSH_RUN_REAPER_DISK_PRESSURE_PERCENT` disk use on the worker
   (default 80) the threshold is
   `PAPERCLIP_SSH_RUN_REAPER_PRESSURE_MAX_AGE_MINUTES` (default 15).
-- **Not on release:** the last run of an agent task session. The sweep removes
-  it once it is old enough. Resume itself does not read `runs/<runId>`: session
-  state holds the worker's identity and the provider's session id, and every run
-  uploads its own directory.
+- **Never while the run is live.** One predicate, for the release and the sweep
+  alike: a run is live while it is not terminal, while another lease of it is
+  `active`, `retained` or `pending_cleanup`, or while it is the last run of a task
+  session whose issue is still open (not `done` or `cancelled`). A session whose
+  task key is not an issue does not hold a run. A session resumes from its last
+  run, but resume itself does not read `runs/<runId>`: session state holds the
+  worker's identity and the provider's session id, and every run uploads its own
+  directory. The folder of a run held by an open issue stays for as long as the
+  issue is open.
 
 - **A run with no seed record.** A lease from before the seed record existed, or
   of a workspace that was not a git repository with a commit, has no commit to
   measure the run's own work from. The sweep removes its directory only under a
   stricter rule, and only when all of these hold; otherwise it keeps it:
-  1. The run is dead, by the checks above: terminal, no other `active`,
-     `retained` or `pending_cleanup` lease, and, on a release, not the last run of
-     a task session.
+  1. The run is not live, by the predicate above.
   2. The run finished more than `PAPERCLIP_SSH_RUN_REAPER_LEGACY_MIN_AGE_MINUTES`
      ago (default 1440, a server setting). A run with no finish time is kept as
      `finish_unknown` on the sweep; a release waits for the sweep.
   3. The worker's git shows no local-only state, by the same sentinel-checked
      reads as above: no uncommitted or untracked file (ignored files do not
-     count), HEAD contained in a remote ref (`unpushed` otherwise), every local
-     branch tip contained in HEAD or a remote ref, no stash, and no linked
-     worktree, which includes an agent worktree that points into it. A read that
-     fails keeps it as `git_unreadable`. Nothing is bundled, because a folder that
-     passes has nothing to save. A remote ref is a hint that work was pushed, not
-     proof of it.
-  4. One sweep sends at most 200 such folders to workers and spends at most 30
-     seconds on them, oldest first. The rest wait for the next sweep. The removal
-     is the one every directory gets: a direct child of the real root, no links, no
-     device crossing, the claim that serializes reapers, and a device and inode
-     recheck right before the final `rmdir`.
+     count), no stash, no linked worktree (which includes an agent worktree that
+     points into it), and every local ref in the repository reaching only commits
+     that a remote ref also reaches. "Every local ref" means branches, tags (an
+     annotated tag counts as the commit it points at), notes, the stash and HEAD;
+     remote refs are the hint, not a ref that is checked. A ref that does not lead
+     to a commit keeps the folder as `unpushed`. A folder with a submodule is kept
+     as `submodule`: a `.gitmodules` file, a gitlink in the index, or a
+     `.git/modules` directory. A read that fails keeps it as `git_unreadable`.
+     Nothing is bundled, because a folder that passes has nothing to save. A
+     remote ref is a hint that work was pushed, not proof of it.
+  4. One sweep sends at most 100 such folders to workers (the sweep's own batch)
+     and spends at most 30 seconds on them, oldest first. The rest wait for the
+     next sweep. Each reap is cut at the time the pass has left, and never runs
+     longer than 30 seconds; a folder that is due when the pass has no room is not
+     started. Every call to a worker for a folder with no seed record is bounded
+     by those 30 seconds. A reap that is cut keeps its claim, so nobody records a
+     verdict for it, and the folder is tried again once the claim goes stale (15
+     minutes). Before it deletes anything, the script marks the folder as holding no
+     unsynced work, so a removal that is cut half way is finished by the next pass
+     without the checks. The removal is the one every directory gets: a direct
+     child of the real root, no links, no device crossing, the claim that
+     serializes reapers, and a device and inode recheck right before the final
+     `rmdir`.
 
   A folder the restore marked is not subject to this: it holds no unsynced work and
   goes at once, whatever its run's age or finish time. For that reason the server
@@ -70,6 +85,7 @@ small. Bundles older than 30 days are removed.
 | --- | --- |
 | Commits on HEAD after the start commit | `head` |
 | A branch tip that HEAD does not contain | the branch name |
+| A tag, a note or any other local ref outside `refs/remotes` (a tag as the commit it points at) | `ref/<name without refs/>` |
 | Each stash entry | `stash-<n>` |
 | The detached HEAD of an extra worktree | `worktree-head-<n>` |
 | Uncommitted work: tracked and untracked files git does not ignore, as a snapshot commit | `worktree` |
@@ -101,7 +117,8 @@ The directory stays, with a reason in the activity entry and in the lease's
   record. The server always asks once the run is dead and old enough, so this is
   what a direct caller of the worker script sees.
 - For a folder with no seed record: `dirty`, `unpushed`, `stash` and
-  `linked_worktree` (the git state that rule 3 names), `git_unreadable` (a git
+  `linked_worktree` (the git state that rule 3 names), `submodule` (the folder has a
+  submodule; this holds for a run with a seed record too), `git_unreadable` (a git
   read failed or lost its end; the `detail` field names it), and `finish_unknown`
   (the run has no finish time).
 - `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
