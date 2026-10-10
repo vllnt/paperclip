@@ -239,10 +239,14 @@ instead of the run.
     collected in a shell variable and written once. A write that fails keeps the
     folder as `preserve_failed`, with the read's name as `detail`, and the
     scratch directory is removed. A name found already taken inside the fresh
-    scratch directory is tampering, and the reap stops. Files that git itself
-    writes (the temporary index, the bundle under construction) are not made by a
-    shell redirection, so noclobber does not cover them; they too are created under
-    fresh names inside the scratch directory.
+    scratch directory is tampering, and the reap stops. Two files are written by
+    git itself, not by a shell redirection, so noclobber does not cover them: the
+    temporary index and the bundle under construction. Git follows a link at the
+    name it writes (its lock-file step resolves it; checked with git 2.51 for both
+    `bundle create` and the index), so for these two the only protection is that
+    the scratch directory is new and that nothing outside the run can reach it. A
+    process of the same user that races the script could redirect them; that is the
+    accepted residual below.
   - **Invariant: the scratch directory is a direct child of `runs/<runId>/`.** It
     is never inside `workspace/` (the agent's working folder, which the agent also
     controls) and never in `/tmp` or `$TMPDIR` (a shared place, where another
