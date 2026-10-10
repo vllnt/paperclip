@@ -4,6 +4,7 @@ Date: 2026-10-10
 Status: Plan only. This pull request changes no code and claims no migration number.
 Branch: `docs/routine-stale-tick-expiry`
 Code anchors: `main` at `38819d350` (see Appendix A). Line numbers drift; names do not.
+Shared design: PR #113 (flow watchdog) defines, once, the **exemption set**, the **progress clock and clock source**, and the **atomic close step** (its section 6.1). This plan refers to them and defines only what is routine-specific: the `staleTickTimeoutMinutes` setting, the binding to the routine's current blocker, and the surfaces.
 
 ## 1. Goal and constraints
 
@@ -104,6 +105,13 @@ Visibility *between* ticks comes from the preview (section 3.6), not from a job.
 - The routine revision snapshot (`RoutineRevisionSnapshotV1`) gains the optional field
   `staleTickTimeoutMinutes`. Old snapshots do not have it. **Restoring an old revision
   sets the column to `null`**, which is faithful: the setting did not exist then.
+- **There are two builders of this snapshot, and R1 changes both.** The routine service
+  builds it (`routineRevisionSnapshotRoutine`, `routines.ts`). The pipeline service has
+  its own copy (`routineRevisionSnapshotRoutine` in `pipelines.ts`) and writes a revision
+  for a pipeline-generated routine (`appendPipelineAutomationRoutineRevision`). If only
+  one is updated, a pipeline revision would omit the timeout, and restoring it would
+  lose or wrongly keep the setting. R1 adds a test that both builders return the same
+  key set for the same routine. Removing the copy is a cleanup for later.
 
 No new table. No instance setting in slice 1 (Q2).
 
@@ -118,60 +126,53 @@ A blocking tick issue is **stale** when all of these hold:
 2. The issue is the blocker that `findLiveExecutionIssue` returned for this tick.
 3. **No run of the issue is `running`.** A running run belongs to the orphan reaper and
    the silent-run watchdog (Q6).
-4. **No progress for the timeout.** Progress is the latest of: a run of the issue
-   reaching `running` (its `started_at`), any comment on the issue, an issue status
-   change, and the issue's creation. The `issues` table keeps no status-change time, so
-   R1 reads it from the activity log (`issue.updated` entries that change `status`). A wake that is queued again, or a re-dispatch by
-   PR #104, is **not** progress. Without this rule, a loop of failed wakes would reset
-   the clock for ever.
+4. **No progress for the timeout.** Progress, the hold-lift floor and the clock source
+   are defined in PR #113, section 6.1.2. A re-dispatch (#104) is not progress.
 5. **Not held and not waiting** (the exemptions below).
-6. **Nothing holds it now.** The exemptions below are checked at the moment of the
-   tick. A hold that was lifted earlier is not remembered (the known gap in section 3.5).
+6. **No exemption applies, evaluated under the issue lock** (the set in PR #113,
+   section 6.1.1).
 
-**Exemptions.** The tick is never stale while any of these is true. In each case the
-silence is explained, and expiry would destroy a waiting state:
-
-| Exemption | Signal on `main` |
-|---|---|
-| An armed issue monitor or wait | `issues.monitor_next_check_at` is not null |
-| A board or agent recovery action is open on the issue | an `issue_recovery_actions` row with status `active` or `escalated` |
-| A held scope: the routine is paused, or its project, company or assignee agent is paused | `routines.status`, `projects.paused_at`, `companies.paused_at`, `agents.paused_at` (the scheduler already reads the project one) |
-| The issue sits in an issue-tree hold | the tree-hold check that automatic recovery already uses |
-| A pending decision | a pending issue-thread interaction, or an `in_review` stage with a pending participant |
-| The assignee is over budget | the budget hard-stop check that wake dispatch already uses |
-| A deferred wake waits for the issue's own lock | an `agent_wakeup_requests` row in `deferred_issue_execution` |
-
-This list is long on purpose. The cost of a false expiry (cancelled work) is higher than
-the cost of a late one.
+**Exemptions.** The exemption set is defined **once**, in PR #113, section 6.1.1. In
+short: an armed wait; an open recovery action; a held scope or a hold (#102); an
+issue-tree hold; a pending interaction; an `in_review` stage with a pending participant;
+a **pending linked approval**; an exhausted budget; a deferred wake. This plan adds no
+exemption of its own and does not repeat the signals. A routine that is paused is a held
+scope. A change to the set is made in #113 and reaches this plan.
 
 ### 3.4 What expiry does
 
-Expiry is one function, used by dispatch and by the manual action (section 3.6). In order:
+Expiry calls the **atomic close step** of PR #113, section 6.1.3, with these inputs:
 
-1. **Re-check under the issue's own lock** that no run became `running` and no exemption
-   appeared. If one did, abort. The tick is skipped or coalesced as before.
-2. **Cancel the issue's live runs** (`queued`, `scheduled_retry`) with the reason
-   `routine_tick_expired`, and with the flag that suppresses automatic continuation.
-   Cancelling the issue's status alone is not enough: the run cancel for a cancelled
-   issue lives in the **route layer** (`shouldCancelActiveRunForCancelledStatus`), not
-   in the issue service. The route finds only the run in `execution_run_id` or the agent's *running* run
-   (`resolveActiveIssueRun`), so it would miss a `queued` run that is bound only through
-   `contextSnapshot.issueId` (state S1). The issue service cancels only a native-question
-   run (`executeIssuePostCommitActions`). The expiry function calls the heartbeat cancel
-   directly.
-3. **Set the issue to `cancelled`** through the issue service, and add a system comment:
-   the timeout, the last progress time and the run states that were found.
-4. **End the originating routine run the way a cancelled tick issue ends it.** Call
-   `routinesSvc.syncRunStatusForIssue(issueId)`. The issue routes call it after a status
-   change, but the issue service does not, so expiry must call it. For a cancelled issue
-   it sets the run to `failed`, with the existing cancelled-issue reason and a
-   `transientFailure` payload. Then add `triggerPayload.tickExpired =
-   { source, timeoutMinutes, expiredAt }`. No new run status is added, and no custom
-   reason text. Reusing the sync also keeps a later route-driven change (a reopen, for
-   example) consistent, because the same function handles it (Q7).
-5. **Write the activity entries** (section 3.8).
-6. Return to dispatch, which looks for a blocker again, finds none, and creates the new
-   tick's issue in the normal way. The new tick is **not** recorded as `skipped`.
+| Input | Value |
+|---|---|
+| `binding` | The issue is the routine's **current blocker** (section 3.6) |
+| `expectedStatusVersion` | From the blocker that dispatch just read, or from the request of the manual call |
+| `targetStatus` | `cancelled` |
+| `reason`, `source` | `routine_tick_expired`; `timeout` or `manual` |
+
+The step closes the issue first, under the issue row lock, and compares the status
+version. It then cancels the issue's live runs after the commit. A wake that was
+deferred before the close is cancelled, not promoted. This closes the race where a wake
+arrives after the re-check and is promoted onto an issue that is then cancelled. The
+step, its order and its tests are in #113 and are not repeated here.
+
+**What is routine-specific, inside the same transaction as the close:**
+
+1. **End the originating routine run.** Call the existing run-status sync
+   (`syncRunStatusForIssue`). The issue service does not call it, only the routes do, so
+   expiry must. It must accept the transaction: R1 gives it an optional executor (the
+   `finalizeRun` helper under it already takes one). For a cancelled issue it sets the
+   run to `failed`, with the existing cancelled-issue reason and a `transientFailure`
+   payload. Expiry then adds `triggerPayload.tickExpired = { source, timeoutMinutes,
+   expiredAt, invocationRepeated }`. No new run status and no custom reason text (Q7).
+   The routine run **keeps its original `triggerPayload`**, so the expired invocation is
+   never deleted (section 3.9).
+2. **Add the system comment:** the timeout, the last progress time, the run states found
+   and the result of the check against the new tick.
+3. **Write the routine's activity entry** (section 3.8).
+
+**After the commit,** dispatch looks for a blocker again, finds none, and creates the new
+tick's issue in the normal way. The new tick is **not** recorded as `skipped`.
 
 Expiry never deletes an issue, a run or a comment.
 
@@ -203,21 +204,12 @@ Two rules make the ordering hold:
   active check in `dispatchRoutineRun` that applies to webhook and schedule only). So
   the exemption must hold on its own.
 
-**Known gap: a lifted hold is not remembered.** Agents, companies and projects have
-`paused_at`, and a routine will have one after PR #102 slice H2. None of them keeps
-the time a hold *ended*. So R1 checks holds only at the moment of the tick. A tick
-issue that waited out a hold, longer than the timeout, can expire on the first tick
-after the hold lifts.
-
-R1 accepts this gap, for these reasons:
-
-- The timeout is opt-in (default off), and the minimum is 30 minutes.
-- Only a tick with **no progress at all** can expire. The next tick recreates the same
-  work at once, so no work is lost.
-- The activity entry records the expiry and the run states, so the case is visible.
-
-The fix is to read a lift time once one exists for every hold. Q11 asks the reviewer to
-confirm that this is enough for R1.
+**Hold lifts.** A hold that ended recently is handled by the **hold-lift floor** of PR
+#113, section 6.1.2. The progress clock never starts before the latest `agent.resumed`
+of the assignee, or `company.updated`, `project.updated` or `routine.updated` entry,
+inside the timeout window. That can only delay an expiry. So a tick that waited out a
+hold does not expire on the first tick after the hold lifts. When #102 lands, its lift
+time replaces the approximation.
 
 ### 3.6 Surfaces
 
@@ -228,16 +220,32 @@ confirm that this is enough for R1.
 | `POST /companies/:companyId/routines`, `PATCH /routines/:id` | Accept `staleTickTimeoutMinutes` (`null` or 30..10080). The response returns it |
 | `GET /routines/:id`, the routine list item | Add `blockingTick`: `{ issueId, state, lastProgressAt, staleAt, exempt }`, where `exempt` names the exemption or is `null` |
 | `GET /companies/:companyId/routines/stale-ticks` | **Preview.** Every routine whose blocking tick is past its timeout or would be, with the reason it is exempt. Read only |
-| `POST /routines/:id/ticks/expire` | **Manual expire** (slice R2). Body `{ issueId, reason }`. Ignores the timeout. Refuses (409) when a run is `running` |
+| `GET /companies/:companyId/routines/stale-ticks`, `GET /routines/:id` | Each blocker also returns its `statusVersion` |
+| `POST /routines/:id/ticks/expire` | **Manual expire** (slice R2). Body `{ issueId, expectedStatusVersion, reason }`, all required. Ignores the timeout. See "The manual call is bound to the blocker" below |
+
+**The manual call is bound to the blocker.** A body with only an issue id could cancel
+unrelated work in the same company, so the server does not trust it. Under the routine
+row lock, it checks that the issue is the routine's **current blocker** by running the
+blocker query (`findLiveExecutionIssue`) with the routine, the dispatch origin and the
+**issue's own fingerprint**, and requiring that it returns exactly this issue. That one
+query carries the checks: the same company, an open status, the same origin kind and id,
+not hidden, the same fingerprint, and a live run. If the issue is not the current
+blocker (it is closed, it moved, another issue of the company, or it has no live run),
+the answer is **409 `not_current_blocker`**. A `statusVersion` that differs from
+`expectedStatusVersion` is **409 `stale_view`**. A pending exemption (section 3.3) is
+**409 `exempt`** with the exemption's name. A run in `running` is **409 `run_active`**.
+The routine must belong to the company in the path, or the answer is 404. Only a board
+user may call it (section 3.7).
 
 **CLI.** The setting goes through the existing generic path
 (`routine create` and `routine update` with `--payload-json`, `routine-api.ts`). Two new
-commands: `routine ticks:stale` (the preview) and `routine tick:expire <routineId>`.
+commands: `routine ticks:stale` (the preview, which prints the `statusVersion`) and
+`routine tick:expire <routineId> --issue <id> --status-version <n>`.
 
 **Web.** In the routine edit form, next to the concurrency policy: a field "Expire a
 stuck tick after (minutes)", empty means off, with help text that says what counts as
 stuck. On the routine list and detail pages: a "Blocked by a stuck tick" badge with
-the age, the exemption if any, and an **Expire** button. The routines page gets a
+the age, the exemption if any, and an **Expire** button that sends the `statusVersion` it showed. The routines page gets a
 "Stuck ticks" filter backed by the preview.
 
 ### 3.7 Authorization: no new permission
@@ -259,19 +267,25 @@ the age, the exemption if any, and an **Expire** button. The routines page gets 
 | `routine.tick_expired` | A tick is expired by the timeout (`source: "timeout"`) or by a board user (`source: "manual"`) | issue, with `routineId`, `routineRunId`, `timeoutMinutes`, `lastProgressAt`, `runStatuses`, `cancelledRunIds`, `nextRunId` |
 | `routine.revision_created` (existing) | The setting changes, because it is part of the snapshot | routine |
 
-The issue also gets the system comment from section 3.4. The run event of each
-cancelled run carries the reason `routine_tick_expired`.
+The `details` of `routine.tick_expired` also carry `invocationRepeated`, `startedInWindow` (the run ids that started after the check) and the check that blocked or allowed the close. The issue gets the system comment from section 3.4. The run event of each
+cancelled run carries the reason `routine_tick_expired`. A refused manual call (409) writes
+no entry.
 
 ### 3.9 Edge cases
 
 | Case | Behavior |
 |---|---|
 | A webhook tick has a different fingerprint than the blocker | `findLiveExecutionIssue` already matches by fingerprint. Only the blocker for the same fingerprint can expire |
-| A run turns `running` between the check and the cancel | The re-check in section 3.4 step 1 aborts the expiry |
+| A run turns `running` between the check and the close | The close step re-checks under the issue lock and rolls back (PR #113, section 6.1.3). After the commit, a run that started in the short window is cancelled with the others and listed in `startedInWindow` |
+| A wake arrives after the re-check | The issue is already terminal when the wake is promoted, so the wake is dropped. A person's comment with a resume intent can still reopen the issue. That is allowed and visible |
+| A pending approval, interaction or review participant | Exempt (PR #113, section 6.1.1). No expiry |
+| The database and application clocks differ by more than 5 minutes | No expiry. `clock_skew` is recorded (PR #113, section 6.1.2) |
 | Two ticks arrive together | The routine row lock serializes them. The second finds no blocker |
 | `coalesce_if_active` ticks that merged into the expired issue | Their rows keep `coalescedIntoRunId`. They are history; nothing changes |
 | The routine's project is paused | A scheduled tick is recorded as `skipped` (label `skipped_paused`) before any expiry check. A manual, API or webhook tick reaches the check, and the "held scope" exemption stops it |
-| The cancel throws | The tick falls back to skip or coalesce. The failure is logged and recorded in a `routine.tick_expiry_failed` activity entry. The next tick tries again |
+| The run cancel throws after the commit | The issue is already cancelled. The failure is logged and written as `routine.tick_expiry_failed` with the run ids. The queued run is cancelled at its claim by the staleness check, or by the next sweep. The new tick runs |
+| The close step rolls back (a check failed) | The tick is skipped or coalesced, as before. Nothing changed |
+| **The expired invocation.** The tick that created the expired issue, and the new tick, may carry different payloads | The expired routine run **keeps its payload and variables**, so nothing is deleted and a person can replay it. The new tick repeats the same invocation only when the two **dispatch fingerprints are equal**. `findLiveExecutionIssue` also accepts a blocker whose fingerprint is `default`. In that case, the invocation is not repeated, and the entry says `invocationRepeated: false`. The claim "no work is lost" therefore means: no record is deleted, and a repeated invocation is repeated automatically. Nothing is claimed beyond that |
 | The setting is lowered below the age of a blocker | The next tick expires it. That is the intent |
 | `always_enqueue` | Never blocks. The setting is stored but has no effect, and the form says so |
 
@@ -279,28 +293,33 @@ cancelled run carries the reason `routine_tick_expired`.
 
 | Slice | Content | Surfaces |
 |---|---|---|
-| **R1** | The column (migration), shared validator and snapshot field, the staleness function, dispatch-time expiry, the `blockingTick` field, activity entries | API (PATCH and read), CLI (`--payload-json`), web (the form field) |
+| **R1** | The column (migration), shared validator and snapshot field **in both builders**, the dispatch-time expiry on top of the shared stall module and atomic close step of PR #113, the run-status sync with an executor, the `blockingTick` field, activity entries | API (PATCH and read), CLI (`--payload-json`), web (the form field) |
 | **R2** | The preview route, the manual expire route, the badge and button, the "Stuck ticks" filter | API, CLI (`ticks:stale`, `tick:expire`), web |
 | **R3** | Managed and plugin routine manifests may set the timeout. An instance-wide default, only if the preview data from R1 and R2 supports one | API, CLI, web |
 
-R1 is the only slice with a migration. Parity: R1 ships the setting on all three
+R1 depends on the shared module of PR #113 (section 6.1). If #113's S1 has not landed, R1 carries that module and #113's S1 refers to it; whichever lands first creates it. R1 is the only slice with a migration. Parity: R1 ships the setting on all three
 surfaces. R2 is the named follow-up for the preview and the manual action.
 
 ## 5. Verification per slice
 
 **R1**, on embedded Postgres unless noted:
 
-- The staleness function, as a pure table test: every exemption, the clock rules, the
-  `running` exclusion, the held-now rule.
+- The staleness function, as a pure table test: the routine-specific rules (policy, the
+  blocker, the timeout). The exemptions, the clock and the atomic close step are tested
+  once, in PR #113 (section 6.1), and R1 adds one test per exemption through the routine
+  path.
 - A stale `queued` run: the tick expires it, cancels the run with no continuation wake,
   and the new tick creates one issue and one live run. **Red at `main`:** the tick is
   skipped.
 - A stale `scheduled_retry` run: same.
-- Each exemption: the tick is skipped as before (one test per row of section 3.3).
+- Each exemption of PR #113, section 6.1.1, **including a pending linked approval**: the tick is skipped as before.
+- The atomic close through dispatch: a wake deferred before the close is not promoted, and no run is attached to the expired issue.
 - An S4 issue (no run): PR #104's re-dispatch acts, and expiry does not.
 - A re-dispatch does not reset the progress clock.
 - A held agent, project or company: no expiry while it is held.
-- The re-check race: a run that becomes `running` aborts the expiry.
+- The re-check race: a run that becomes `running` rolls the close back.
+- Both revision snapshot builders return the same key set, and a pipeline revision round-trips the timeout.
+- `syncRunStatusForIssue` with an executor: the run is ended inside the close transaction, and rolls back with it.
 - A routine with `null` timeout: behavior is identical to `main` (a regression test).
 - Revision snapshot: an old snapshot restores to `null`. A new one round-trips.
 - Validation: 29, 30, 10080, 10081, a string, a negative number.
@@ -313,7 +332,7 @@ surfaces. R2 is the named follow-up for the preview and the manual action.
   `vitest run` list.
 
 **R2:** the preview matches the dispatch decision for the same fixtures (one shared
-function). Manual expire: board only, 409 on a `running` run, one activity entry. UI
+function). Manual expire: board only; **409 `not_current_blocker`** for another issue of the company, a closed issue, an issue of another routine, and an issue with another fingerprint; **409 `stale_view`**; **409 `exempt`**; **409 `run_active`**; 404 for a routine of another company; one activity entry on success. UI
 component tests for the badge and the button.
 
 **R3:** manifest validation, and the default-value behavior if a default ships.
@@ -345,7 +364,9 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q8** | Lazy check or sweeper? | Lazy in R1 (section 3.1). Add a sweeper only if the preview shows blocked routines whose ticks are rare |
 | **Q9** | Restoring an old revision | Sets the column to `null` (section 3.2) |
 | **Q10** | **For the reviewer.** Managed plugin routines | Out of R1. Their tick issues use the origin kind `plugin:<key>:operation`, which the unique index and `syncRunStatusForIssue` do not cover. R3 extends both, and then manifests may set the timeout. The wiki plugin's routines use `skip_if_active` today, so they are the likely first users, and Appendix B1 counts them |
-| **Q11** | **For the reviewer.** A lifted hold is not remembered (section 3.5, known gap). Is that acceptable for R1? | Yes for R1, for the three reasons in section 3.5. Fix it when a lift time exists for every hold. PR #102 stores one only for holds that carry a condition. Ask that plan to record the lift time of every hold, so this plan can read it |
+| **Q11** | **For the reviewer.** A lifted hold is not remembered | Closed for R1 by the hold-lift floor (PR #113, section 6.1.2). It uses `agent.resumed` and the `*.updated` entries and can only delay an expiry. #102's lift time replaces it |
+| **Q12** | **For the reviewer.** One definition of the exemptions and the atomic close | Yes: in PR #113, section 6.1. This plan refers to it. If the two plans land in either order, the first one creates the shared module |
+| **Q13** | What does a manual expire need to prove? | The issue is the routine's current blocker, the status version matches, no exemption applies, and no run is `running` (section 3.6). Anything else is a 409 |
 
 ## Appendix A. Code anchors on `main` at `38819d350`
 
@@ -371,6 +392,9 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | OpenAPI routine entries (`registerPath`; the `1587` set lists POST routes that return 201) | `server/src/routes/openapi.ts:4755-4830` (list at `4757`), `10285-10288` (revisions), `1587-1627` |
 | Generic routine CLI (`create`, `update`, `revisions`) | `cli/src/commands/client/routine-api.ts:21-40` |
 | Concurrency field in the web form | `ui/src/components/routine-sections/editable-sections.tsx:36`, `492` |
+| Pipeline-generated routine revisions: a second snapshot builder and the revision writer | `server/src/services/pipelines.ts:1164-1186`, `2678-2700` |
+| The issue lock and the promotion that the atomic close must beat | `server/src/modules/wake-queue/adapters/postgres.ts:1171`; `server/src/modules/wake-queue/application/use-cases.ts:145`, `378`, `1024` |
+| Pending linked approvals | `packages/db/src/schema/issue_approvals.ts:7-22`, `packages/db/src/schema/approvals.ts:5-19`, `server/src/services/attention.ts:1591-1617` |
 | Dispatch origin kind and id (plugin-operation routines) | `server/src/services/routines.ts:1770-1773`, `packages/shared/src/constants.ts:418` |
 | `syncRunStatusForIssue` (ends the routine run for a cancelled, blocked or done issue) | `server/src/services/routines.ts:3297-3360`, called from `server/src/routes/issues.ts:9572`, `13964` |
 | The route's run lookup on cancel | `server/src/routes/issues.ts:6869` (`resolveActiveIssueRun`) |
@@ -378,7 +402,7 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | Checkout 409 on the open-execution index | `server/src/routes/issues.ts:15187-15193` |
 | Run cancel for a cancelled issue is in the route layer | `server/src/routes/issues.ts:12946`, `13170` (`shouldCancelActiveRunForCancelledStatus`) |
 | Stale-lock sweep | `server/src/services/recovery/service.ts:6211` |
-| Orphan reaper | `server/src/services/heartbeat.ts:20051` |
+| Orphan reaper | `server/src/services/heartbeat.ts:20051-20098` |
 | Silent-run watchdog | `server/src/services/recovery/service.ts:2365` |
 | Issue monitor column | `packages/db/src/schema/issues.ts:73` |
 | Pause fields on agent and company; the project field the scheduler reads | `packages/db/src/schema/agents.ts:35-36`, `packages/db/src/schema/companies.ts:11-12`, `projects.pausedAt` (`server/src/services/routines.ts:3187`) |
@@ -387,22 +411,26 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 
 ## Appendix B. Read-only queries for Q1
 
-Run these against production before R1 starts. They read only. They print counts and
-ids, no content.
+Run these against production before R1 starts, **once per company** (replace
+`:company_id`). They read only. They print counts and ids, no content.
 
 ```sql
--- B1. Open tick issues by the state of their run and their lock. A live run wins
--- over a newer finished one, as in dispatch.
+-- B1. Open tick issues by the state of their run and their locks. A live run wins over
+-- a newer finished one, as in dispatch. A checkout lock counts as a lock.
 select
   case when i.origin_kind = 'routine_execution' then 'routine' else 'plugin operation' end as kind,
   case
-    when r.id is null and i.execution_run_id is null then 'S4 no run, no lock'
+    when r.id is null and i.execution_run_id is null and i.checkout_run_id is null
+      then 'S4 no run, no lock'
+    when r.id is null and i.execution_run_id is null and i.checkout_run_id is not null
+      then 'S4b no run, checkout lock only'
     when r.id is null then 'lock points at a missing run'
     when r.status in ('queued', 'scheduled_retry') then 'S1 ' || r.status
     when r.status = 'running' then 'S2 running'
     else 'S3 lock on a finished run (' || r.status || ')'
   end as state,
   (i.monitor_next_check_at is not null) as has_wait,
+  (i.execution_locked_at is not null) as has_execution_lock_time,
   count(*) as issues,
   min(i.created_at) as oldest
 from issues i
@@ -411,26 +439,35 @@ left join lateral (
   from heartbeat_runs hr
   where hr.company_id = i.company_id
     and (hr.id = i.execution_run_id
+         or hr.id = i.checkout_run_id
          or hr.context_snapshot ->> 'issueId' = i.id::text)
   order by (hr.status in ('queued', 'running', 'scheduled_retry')) desc, hr.created_at desc
   limit 1
 ) r on true
-where (i.origin_kind = 'routine_execution' or i.origin_kind ~ '^plugin:[^:]+:operation')
+where i.company_id = :company_id
+  and (i.origin_kind = 'routine_execution' or i.origin_kind ~ '^plugin:[^:]+:operation')
   and i.hidden_at is null
   and i.status in ('backlog', 'todo', 'in_progress', 'in_review', 'blocked')
-group by 1, 2, 3
-order by 4 desc;
+group by 1, 2, 3, 4
+order by 5 desc;
 
--- B2. Routines whose latest ticks were mostly skipped or coalesced in 24 hours.
+-- B2. Routines whose ticks were skipped or coalesced, with the share of all ticks.
+-- "Mostly" is a share of at least 0.5 over at least 6 ticks in 24 hours.
 select rr.routine_id,
+       count(*) as ticks,
        count(*) filter (where rr.status = 'skipped') as skipped,
        count(*) filter (where rr.status = 'coalesced') as coalesced,
-       count(*) filter (where rr.status = 'issue_created') as created
+       count(*) filter (where rr.status = 'issue_created') as created,
+       round((count(*) filter (where rr.status in ('skipped', 'coalesced')))::numeric
+             / nullif(count(*), 0), 2) as blocked_share
 from routine_runs rr
-where rr.created_at > now() - interval '24 hours'
+where rr.company_id = :company_id
+  and rr.created_at > now() - interval '24 hours'
 group by 1
-having count(*) filter (where rr.status in ('skipped', 'coalesced')) > 0
-order by skipped desc, coalesced desc
+having count(*) >= 6
+   and (count(*) filter (where rr.status in ('skipped', 'coalesced')))::numeric
+       / nullif(count(*), 0) >= 0.5
+order by blocked_share desc, ticks desc
 limit 50;
 ```
 
