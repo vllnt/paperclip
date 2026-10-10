@@ -10,7 +10,7 @@
  * exist, and what a wake of an older copy does while a newer one is live.
  */
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -37,6 +37,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { routineService } from "../services/routines.ts";
+import { runPeriodicHeartbeatRecovery } from "../services/periodic-heartbeat-recovery.ts";
 
 const adapterGate = vi.hoisted(() => {
   let release: () => void = () => {};
@@ -280,37 +281,92 @@ describeEmbeddedPostgres("a wake of an older routine copy while a newer copy hol
     return { companyId, agentId, holderIssueId, waitingIssueId, cancelledRunId, queuedRunId };
   }
 
-  /** The periodic recovery chain of `server/src/index.ts`, step for step (that block is not exported). */
-  function periodicRecoveryTick(heartbeat: ReturnType<typeof heartbeatService>) {
-    return heartbeat
-      .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-      .then(() => heartbeat.promoteDueScheduledRetries())
-      .then(async () => {
-        await heartbeat.resumeQueuedRuns();
-        await heartbeat.reconcileStrandedAssignedIssues();
-      })
-      .then(() => heartbeat.reconcileResolvedDependencyWakes())
-      .then(() => heartbeat.reconcileTaskWatchdogs())
-      .then(() => heartbeat.scanSilentActiveRuns())
-      .then(() => heartbeat.sweepStaleIssueLocks());
-  }
-
   it("the production state: a cancelled holder's stale lock is cleared by the periodic tick, and the waiting run starts on the next tick", async () => {
     const { holderIssueId, waitingIssueId, queuedRunId } = await seedStaleLockHolder();
     const heartbeat = heartbeatService(db);
 
     // Tick 1. On main, resumeQueuedRuns throws the duplicate key and the chain stops
     // before the sweep, so the lock stays and every later tick fails the same way.
-    await expect(periodicRecoveryTick(heartbeat)).resolves.not.toThrow();
+    await expect(runPeriodicHeartbeatRecovery(heartbeat)).resolves.not.toThrow();
     const [holderAfterTick1] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, holderIssueId));
     expect(holderAfterTick1?.executionRunId).toBeNull();
 
     // Tick 2: the slot is free, so the queued run is claimed.
-    await expect(periodicRecoveryTick(heartbeat)).resolves.not.toThrow();
+    await expect(runPeriodicHeartbeatRecovery(heartbeat)).resolves.not.toThrow();
     const [waiting] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, waitingIssueId));
     expect(waiting?.executionRunId).toBe(queuedRunId);
     const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedRunId));
     expect(run?.status).toBe("running");
+  });
+
+  /**
+   * Makes the claim of one agent's runs fail with a database error, as a lost race
+   * or a constraint would. The trigger exists only for the length of `body`.
+   */
+  async function withFailingClaimFor<T>(failingAgentId: string, body: () => Promise<T>) {
+    await db.execute(sql`create or replace function test_fail_claim() returns trigger language plpgsql as $$
+      begin raise exception 'test claim failure' using errcode = '23505'; end $$`);
+    await db.execute(sql.raw(`create trigger test_fail_claim_trg before update on heartbeat_runs
+      for each row when (new.agent_id = '${failingAgentId}' and new.status = 'running' and old.status = 'queued')
+      execute function test_fail_claim()`));
+    try {
+      return await body();
+    } finally {
+      await db.execute(sql`drop trigger if exists test_fail_claim_trg on heartbeat_runs`);
+    }
+  }
+
+  /** Two agents of one company, each with one queued run and no issue. Agent 1's run is older. */
+  async function seedTwoAgentsWithQueuedRuns() {
+    const companyId = randomUUID();
+    const agentIds = [randomUUID(), randomUUID()];
+    const runIds = [randomUUID(), randomUUID()];
+    await db.insert(companies).values({
+      id: companyId, name: "Paperclip", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user",
+    });
+    for (const [index, agentId] of agentIds.entries()) {
+      await db.insert(agents).values({
+        id: agentId, companyId, name: `Agent ${index + 1}`, role: "engineer", status: "idle",
+        adapterType: "claude_local", adapterConfig: {},
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 3 } },
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runIds[index]!, companyId, agentId, invocationSource: "automation", triggerDetail: "system",
+        status: "queued", contextSnapshot: {},
+      });
+    }
+    return { companyId, agentIds, runIds };
+  }
+
+  it("a claim error for one agent does not stop resumeQueuedRuns from starting the next agent", async () => {
+    const { agentIds, runIds } = await seedTwoAgentsWithQueuedRuns();
+    const heartbeat = heartbeatService(db);
+
+    await withFailingClaimFor(agentIds[0]!, async () => {
+      await expect(heartbeat.resumeQueuedRuns()).resolves.not.toThrow();
+    });
+
+    const [first] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runIds[0]!));
+    const [second] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runIds[1]!));
+    expect(first?.status).toBe("queued");
+    expect(second?.status).toBe("running");
+  });
+
+  it("a claim error for one agent does not skip the stale-lock sweep in the same recovery tick", async () => {
+    const stale = await seedStaleLockHolder();
+    const { agentIds, runIds } = await seedTwoAgentsWithQueuedRuns();
+    const heartbeat = heartbeatService(db);
+    // Agent 1 of the second company fails; the stale holder of the first company must still be swept.
+    await withFailingClaimFor(agentIds[0]!, async () => {
+      await expect(runPeriodicHeartbeatRecovery(heartbeat)).resolves.not.toThrow();
+    });
+
+    const [holder] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, stale.holderIssueId));
+    expect(holder?.executionRunId).toBeNull();
+    const [second] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runIds[1]!));
+    expect(second?.status).toBe("running");
   });
 
   it("the sweep alone clears a cancelled holder's lock (the existing mechanism the tick relies on)", async () => {

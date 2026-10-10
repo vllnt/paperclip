@@ -21377,7 +21377,12 @@ export function heartbeatService(
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      // One agent's claim error must not stop the agents after it.
+      try {
+        await startNextQueuedRunForAgent(agentId);
+      } catch (err) {
+        logger.error({ err, agentId }, "failed to resume queued runs for an agent");
+      }
     }
   }
 
