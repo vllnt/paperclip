@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+# The legacy evals (stand-in prompt, tests unchanged) routed through the AI Gateway instead of
+# OpenRouter, so they can be compared with promptfooconfig.yaml in this directory.
+#
+#   AI_GATEWAY_API_KEY=... npx promptfoo@0.123.1 eval -c evals/promptfoo/skill-harness/legacy-gateway.yaml --repeat 3
+
+description: "Paperclip heartbeat behavior evals (legacy stand-in prompt, AI Gateway)"
+
+prompts:
+  - file://../prompts/heartbeat-system.txt
+
+providers:
+  - id: openai:chat:anthropic/claude-sonnet-5
+    label: sonnet-5
+    config:
+      apiBaseUrl: https://ai-gateway.vercel.sh/v1
+      apiKeyEnvar: AI_GATEWAY_API_KEY
+      max_tokens: 16000
+  - id: openai:chat:anthropic/claude-haiku-4.5
+    label: haiku-4.5
+    config:
+      apiBaseUrl: https://ai-gateway.vercel.sh/v1
+      apiKeyEnvar: AI_GATEWAY_API_KEY
+      max_tokens: 16000
+
+defaultTest:
+  options:
+    transformVars: "{ ...vars, apiUrl: 'http://localhost:18080', runId: 'run-eval-001' }"
+
+tests:
+  - file://../tests/*.yaml
