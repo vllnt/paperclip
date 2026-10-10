@@ -20,6 +20,7 @@ import {
   inArray,
   isNotNull,
   isNull,
+  lte,
   not,
   notExists,
   notInArray,
@@ -155,6 +156,14 @@ import {
   type RunOutputSilenceSummary,
   type WatchdogDecisionActor,
 } from "../../modules/active-run-watchdog/index.js";
+
+/** Merges the conversation continuation marker into a run's result. */
+const conversationContinuationResult = sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+  conversationContinuation: CONVERSATION_CONTINUATION_POLICY,
+})}::jsonb`;
+
+/** The system actor of a stranded in_progress dispatch that has no source run. */
+const STRANDED_ISSUE_RECOVERY_ACTOR_ID = "stranded_issue_recovery";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -939,8 +948,8 @@ export function recoveryService(
     getOnDemandWakePolicyBlock?: (agentId: string) => Promise<string | null>;
     /**
      * Run slots the agent has free now (its concurrency limit minus its
-     * queued and running runs), or null when unknown. Stranded-issue dispatch
-     * stays within them; the rest wait for a later sweep.
+     * running runs), or null when unknown. Stranded-issue dispatch stays
+     * within them; the rest wait for a later sweep.
      */
     getAgentFreeRunSlots?: (agentId: string) => Promise<number | null>;
   },
@@ -1149,6 +1158,43 @@ export function recoveryService(
     return Boolean(run || deferredWake || nativeRecovery);
   }
 
+  /**
+   * A conversation adapter's interrupted turn resumes as a fresh turn, as the
+   * normal finalizer records it (`conversationContinuation`). Without the
+   * marker, recovery treats an orphaned run as an unreconciled provider
+   * session: it opens a reconciliation hold that execution recovery folds
+   * again for conversation runs, so the issue stays in_progress with no
+   * successor and no block. Decided from immutable run evidence only.
+   */
+  async function continuesAsConversation(run: typeof heartbeatRuns.$inferSelect) {
+    return run.runtimeMode === "legacy" && (await runUsedConversationAdapter(db, run));
+  }
+
+  /** Adds the marker to an orphaned conversation run written before the writer recorded it. */
+  async function repairOrphanedConversationContinuation(companyId: string, runId: string) {
+    const [run] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    if (
+      !run ||
+      run.status !== "interrupted" ||
+      run.errorCode !== "orphaned_running_run" ||
+      run.resultJson?.conversationContinuation === CONVERSATION_CONTINUATION_POLICY ||
+      !(await continuesAsConversation(run))
+    )
+      return;
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: conversationContinuationResult, updatedAt: new Date() })
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.id, runId),
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "orphaned_running_run"),
+      ));
+  }
+
   /** Whether any of these runs is still queued, running or waiting to retry. */
   async function isAnyRunLive(companyId: string, runIds: Array<string | null | undefined>) {
     const ids = [...new Set(runIds.filter((id): id is string => Boolean(id)))];
@@ -1165,6 +1211,46 @@ export function recoveryService(
       )
       .limit(1);
     return Boolean(live);
+  }
+
+  /**
+   * Whether a run with no issue in its context held this issue: its lock
+   * still points at that finished run, or such a run of the assignee was
+   * live when the issue was checked out (checkout stamps `startedAt`).
+   */
+  async function hasIssueLessCheckoutEvidence(
+    issue: Pick<typeof issues.$inferSelect, "companyId" | "executionRunId" | "checkoutRunId" | "startedAt">,
+    agentId: string,
+  ) {
+    const issueLess = sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is null`;
+    const lockRunIds = [issue.executionRunId, issue.checkoutRunId].filter((id): id is string => Boolean(id));
+    if (lockRunIds.length > 0) {
+      const [held] = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.id, lockRunIds),
+          issueLess,
+        ))
+        .limit(1);
+      if (held) return true;
+    }
+    if (!issue.startedAt) return false;
+    const [covering] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, issue.companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        issueLess,
+        inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"]),
+        lte(heartbeatRuns.startedAt, issue.startedAt),
+        gte(heartbeatRuns.finishedAt, issue.startedAt),
+      ))
+      .limit(1);
+    return Boolean(covering);
   }
 
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
@@ -1935,6 +2021,12 @@ export function recoveryService(
       | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON;
     source: string;
     retryOfRunId?: string | null;
+    /**
+     * A system actor id for a dispatch with no source run. The chat-control
+     * proof walk treats an unnamed system continuation as extending an older
+     * run's authority, which a fresh dispatch does not have.
+     */
+    requestedByActorId?: string;
     extraContext?: Record<string, unknown>;
     /**
      * Out-parameter: set `retryExhausted` when no successor was queued
@@ -2036,7 +2128,7 @@ export function recoveryService(
         "normal_model",
       ),
       requestedByActorType: "system",
-      requestedByActorId: null,
+      requestedByActorId: input.requestedByActorId ?? null,
       contextSnapshot: withRecoveryContext(
         {
           issueId: input.issueId,
@@ -4725,6 +4817,9 @@ export function recoveryService(
           executionRecoverySource.status,
         )
       ) {
+        // Rows the orphan writer ended before it recorded conversation
+        // continuation get the marker now, the same rule as for new rows.
+        await repairOrphanedConversationContinuation(issue.companyId, executionRecoverySource.id);
         const [source] = await db
           .select()
           .from(heartbeatRuns)
@@ -5404,6 +5499,18 @@ export function recoveryService(
           result.skipped += 1;
           return;
         }
+        // Only an issue that a run checked out counts as stranded. Work that
+        // was seeded, imported or moved to in_progress by hand never had a
+        // run, and is left alone as before.
+        if (!(await hasIssueLessCheckoutEvidence(issue, agentId))) {
+          result.skipped += 1;
+          return;
+        }
+        // A recovery action of any owner already owns the continuation.
+        if (activeRecoveryAction) {
+          result.skipped += 1;
+          return;
+        }
         if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
           result.skipped += 1;
           return;
@@ -5416,19 +5523,24 @@ export function recoveryService(
           result.dispatchDeferredForCapacity += 1;
           return;
         }
-        const queued = await enqueueStrandedIssueRecovery({
-          issueId: issue.id,
-          agentId,
-          reason: "issue_continuation_needed",
-          retryReason: "issue_continuation_needed",
-          source: "issue.unevidenced_in_progress_recovery",
-          retryOfRunId: null,
-        });
+        let queued: Awaited<ReturnType<typeof enqueueStrandedIssueRecovery>> = null;
+        try {
+          queued = await enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            source: "issue.unevidenced_in_progress_recovery",
+            retryOfRunId: null,
+            requestedByActorId: STRANDED_ISSUE_RECOVERY_ACTOR_ID,
+          });
+        } finally {
+          if (!queued) releaseAgentRunSlot(agentId);
+        }
         if (queued) {
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
-          releaseAgentRunSlot(agentId);
           result.skipped += 1;
         }
         return;
@@ -5732,7 +5844,7 @@ export function recoveryService(
         await reconcileCandidate(issue);
       } catch (err) {
         result.failed += 1;
-        logger.warn(
+        logger.error(
           { err, companyId: issue.companyId, issueId: issue.id },
           "stranded issue recovery failed for one issue; continuing with the rest",
         );
@@ -6174,15 +6286,8 @@ export function recoveryService(
         ? "run terminalized by recovery backstop: issue reached a terminal status while heartbeat_runs.status stayed live"
         : "run terminalized by recovery backstop: process and sandbox gone while heartbeat_runs.status stayed live";
 
-    // A conversation adapter's interrupted turn resumes as a fresh turn, as
-    // the normal finalizer records it. Without the marker, recovery treats the
-    // run as an unreconciled provider session: it opens a reconciliation hold
-    // that execution recovery folds again for conversation runs, so the issue
-    // stays in_progress with no successor and no block.
     const continueConversation =
-      terminalStatus === "interrupted" &&
-      run.runtimeMode === "legacy" &&
-      (await runUsedConversationAdapter(db, run));
+      terminalStatus === "interrupted" && (await continuesAsConversation(run));
     await deps.beforeOrphanedRunTerminalWrite?.(run.id);
     const now = new Date();
     const updated = await db
@@ -6196,9 +6301,7 @@ export function recoveryService(
           (terminalStatus === "interrupted" ? errorCode : null),
         ...(continueConversation
           ? {
-              resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-                conversationContinuation: CONVERSATION_CONTINUATION_POLICY,
-              })}::jsonb`,
+              resultJson: conversationContinuationResult,
             }
           : {}),
         updatedAt: now,

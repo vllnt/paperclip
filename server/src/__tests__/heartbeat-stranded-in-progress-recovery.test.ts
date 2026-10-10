@@ -191,7 +191,7 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
   }
 
   /** Holds the next adapter execution open until the test releases it. */
-  function holdNextExecution() {
+  function holdNextExecution(outcome: typeof SUCCESS = SUCCESS) {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -199,8 +199,9 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
     releases.push(release);
     mockAdapterExecute.mockImplementationOnce(async () => {
       await gate;
-      return SUCCESS;
+      return outcome;
     });
+    return release;
   }
 
   /** The database after a restart: an issue-bound assignment run still marked running, its process gone. */
@@ -259,11 +260,20 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
     expect(await issueBoundRuns(fixture.issueId)).toHaveLength(1);
   });
 
-  /** The state the sweep leaves behind once it released the finished run's locks. */
+  /** in_progress with no lock and no issue-bound run. */
   async function seedUnevidencedInProgress(label: string, options: { maxConcurrentRuns?: number } = {}) {
     const fixture = await seedAssignedTodo(label, options);
     await db.update(issues).set({ status: "in_progress", startedAt: new Date() }).where(eq(issues.id, fixture.issueId));
     return fixture;
+  }
+
+  /** A finished run with no issue in its context, live while the agent checked issues out. */
+  async function seedIssueLessRunAround(fixture: { companyId: string; agentId: string }, at: Date) {
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(), companyId: fixture.companyId, agentId: fixture.agentId, invocationSource: "on_demand",
+      triggerDetail: "manual", status: "succeeded", contextSnapshot: { triggeredBy: "board" },
+      startedAt: new Date(at.getTime() - 60_000), finishedAt: new Date(at.getTime() + 60_000),
+    });
   }
 
   it("dispatches no more stranded issues per sweep than the agent has free run slots", async () => {
@@ -275,6 +285,7 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
       priority: "medium", assigneeAgentId: first.agentId, assigneeUserId: null, responsibleUserId: "responsible-user",
       issueNumber: 2, identifier: `${prefixRow!.prefix}-2`, startedAt: new Date(),
     });
+    await seedIssueLessRunAround(first, new Date());
     holdNextExecution();
     const heartbeat = heartbeatService(db);
 
@@ -285,7 +296,12 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
     const [waiting] = [first.issueId, secondIssueId].filter((id) => !sweep.issueIds.includes(id));
     expect(await issueBoundRuns(waiting!)).toHaveLength(0);
 
-    // The slot is still taken, so the next sweep waits again instead of queueing more.
+    // The dispatched run holds the agent's only slot, so the next sweep waits again.
+    const [dispatchedIssue] = [first.issueId, secondIssueId].filter((id) => sweep.issueIds.includes(id));
+    await waitFor(async () => {
+      const [run] = await issueBoundRuns(dispatchedIssue!);
+      return run?.status === "running" ? run : null;
+    });
     const next = await heartbeat.reconcileStrandedAssignedIssues();
     expect(next.issueIds).not.toContain(waiting);
     expect(next.dispatchDeferredForCapacity).toBe(1);
@@ -331,6 +347,65 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, fixture.runId))).toHaveLength(0);
   });
 
+  it("recovers the dispatched run in turn when it fails", async () => {
+    const fixture = await seedAssignedTodo("dispatch-fails");
+    await strandThroughIssueLessRun(fixture);
+    const release = holdNextExecution({ ...SUCCESS, exitCode: 1, errorMessage: "provider crashed", summary: "" });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const [dispatched] = await issueBoundRuns(fixture.issueId);
+    expect(dispatched).toBeTruthy();
+    release();
+    const ended = await waitFor(async () => {
+      const current = await heartbeat.getRun(dispatched!.id);
+      return current && current.status !== "queued" && current.status !== "running" ? current : null;
+    });
+    expect(ended?.status).toBe("failed");
+    // Past the continuation backoff, the next sweep retries (or escalates) instead of skipping.
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 60 * 60_000) }).where(eq(heartbeatRuns.id, dispatched!.id));
+    holdNextExecution();
+
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, dispatched!.id));
+    const [issue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, fixture.issueId));
+    expect(successors.length > 0 || issue?.status === "blocked").toBe(true);
+  });
+
+  it("wakes an issue whose locks are already released when an issue-less run covered its checkout", async () => {
+    const fixture = await seedUnevidencedInProgress("covered");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    await seedIssueLessRunAround(fixture, issue!.startedAt!);
+    holdNextExecution();
+
+    const sweep = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(sweep.issueIds).toContain(fixture.issueId);
+    expect(await issueBoundRuns(fixture.issueId)).toHaveLength(1);
+  });
+
+  it("leaves in_progress work that no run ever checked out alone", async () => {
+    const fixture = await seedUnevidencedInProgress("seeded");
+
+    const sweep = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(sweep.issueIds).not.toContain(fixture.issueId);
+    expect(await issueBoundRuns(fixture.issueId)).toHaveLength(0);
+  });
+
+  it("repairs a run the orphan writer ended before it recorded conversation continuation", async () => {
+    const fixture = await seedRestartOrphanedAssignment("old-orphan");
+    // The row as an older server wrote it: orphaned, no marker, locks released.
+    await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "orphaned_running_run", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, fixture.issueId));
+    holdNextExecution();
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    const [repaired] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    expect(repaired!.resultJson).toMatchObject({ conversationContinuation: "continue_conversation_v1" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, fixture.runId))).toHaveLength(1);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId))).toEqual([]);
+  });
+
   it("keeps sweeping the other issues when one issue throws", async () => {
     const broken = await seedAssignedTodo("broken");
     const healthy = await seedAssignedTodo("healthy");
@@ -342,7 +417,7 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
       }
       return heartbeat.wakeup(agentId, options);
     });
-    const warn = vi.spyOn(logger, "warn");
+    const logged = vi.spyOn(logger, "error");
 
     const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
 
@@ -355,7 +430,7 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
       const rows = await issueBoundRuns(healthy.issueId);
       return rows.length > 0 ? rows : null;
     })).toHaveLength(1);
-    expect(warn).toHaveBeenCalledWith(
+    expect(logged).toHaveBeenCalledWith(
       expect.objectContaining({ issueId: broken.issueId, err: expect.any(Error) }),
       expect.stringContaining("stranded issue"),
     );

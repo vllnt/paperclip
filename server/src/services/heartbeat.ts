@@ -9932,16 +9932,17 @@ export function heartbeatService(
       if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
       return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
     },
-    // Stranded-issue dispatch counts queued runs too: each takes a slot as
-    // soon as one frees, so the sweep never queues more than the agent starts.
+    // The same slot count as the deferred-wake sweep: running runs against
+    // the agent's limit. Queued work waits its turn and does not starve
+    // stranded issues behind a standing queue.
     getAgentFreeRunSlots: async (agentId) => {
       const agent = await getAgent(agentId);
       if (!agent) return null;
       const [row] = await db
-        .select({ live: sql<number>`count(*)::int` })
+        .select({ running: sql<number>`count(*)::int` })
         .from(heartbeatRuns)
-        .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "running"])));
-      return Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - Number(row?.live ?? 0));
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+      return Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - Number(row?.running ?? 0));
     },
   });
   const runDispatch = createRunDispatch(db);
