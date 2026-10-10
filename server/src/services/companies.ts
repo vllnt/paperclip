@@ -74,7 +74,7 @@ import {
 import { notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { explainBlockedCompanyRemoval } from "./company-removal-conflict.js";
-import { assertNoCrossCompanyReferences } from "./company-removal-cross-company.js";
+import { assertNoCrossCompanyReferences, lockCompanyForRemoval } from "./company-removal-cross-company.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { notifyCloudOfPrimaryCompanyLifecycleChange } from "./cloud-lifecycle-sync.js";
 import {
@@ -106,12 +106,14 @@ const SYSTEM_COMPANY_ACTOR: CompanyActivityActor = {
   runId: null,
 };
 
-/** Who asked for a company delete. Both are identifiers, never credentials. */
-export interface CompanyRemovalAudit {
-  /** The user that the request authenticated as. */
+/** Who asked for a company delete, and how long it waits for locks. */
+export interface CompanyRemovalOptions {
+  /** The user that the request authenticated as. An identifier, never a credential. */
   actorUserId?: string | null;
-  /** The id of the board key record that the request used, when it used one. */
+  /** The id of the board key record that the request used, when it used one. An identifier, never a credential. */
   actorKeyId?: string | null;
+  /** The longest wait for one lock, in milliseconds. Defaults to 5 seconds. */
+  lockTimeoutMs?: number;
 }
 
 /**
@@ -606,6 +608,13 @@ export function companyService(db: Db) {
      * the database: the call fails with a 409 that names the blocking table. Either way
      * nothing is deleted.
      *
+     * The check only holds if no such row can appear after it. So the transaction first
+     * locks the company row and the rows of this company that other rows could point at
+     * (`lockCompanyForRemoval`). A write that would add such a reference waits, and fails
+     * with a foreign-key error once the delete commits. If a lock cannot be had within the
+     * limit, or Postgres ends the transaction to break a deadlock, the call fails with a 409
+     * and the code `company_delete_busy`, and trying again can work.
+     *
      * After the commit it writes one `company_deleted` log entry with the actor and the
      * number of rows removed per table. It holds no names and no content.
      *
@@ -613,9 +622,10 @@ export function companyService(db: Db) {
      * `company-removal-coverage.test.ts`: a table with a blocking key to any row
      * that this method deletes must be deleted here before that row.
      */
-    remove: async (id: string, audit: CompanyRemovalAudit = {}) => {
+    remove: async (id: string, audit: CompanyRemovalOptions = {}) => {
       try {
         const outcome = await db.transaction(async (tx) => {
+          await lockCompanyForRemoval(tx, id, audit.lockTimeoutMs);
           await assertNoCrossCompanyReferences(tx, id);
           const rowCounts: Record<string, number> = {};
           const removeOwned = async <TTable extends PgTable & { companyId: AnyPgColumn }>(table: TTable): Promise<void> => {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, type SQL } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -12,6 +12,7 @@ import {
   companySecrets,
   companySkills,
   createDb,
+  financeEvents,
   issueAttachments,
   issueDuplicatePairs,
   issues,
@@ -21,9 +22,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { isForeignKeyViolation } from "../db-errors.ts";
 import { HttpError } from "../errors.ts";
 import { companyService } from "../services/companies.ts";
-import { COMPANY_DELETE_CROSS_COMPANY_REFERENCES } from "../services/company-removal-cross-company.ts";
+import {
+  COMPANY_DELETE_CROSS_COMPANY_REFERENCES,
+  COMPANY_REMOVAL_LOCK_ORDER,
+  CROSS_COMPANY_REFERENCES,
+} from "../services/company-removal-cross-company.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -342,5 +348,212 @@ describeEmbeddedPostgres("deleting a company that other companies' rows depend o
     expect(await snapshot(deleted.companyId)).toEqual({});
     expect(await snapshot(other.companyId), "rows of the other company").toEqual(beforeOther);
     await expect(db.select().from(companies).where(eq(companies.id, deleted.companyId))).resolves.toHaveLength(0);
+  });
+
+  describe("while other requests write", () => {
+    function sleep(ms: number): Promise<void> {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    /** True once a statement whose text matches `pattern` waits for a lock held by another session. */
+    async function waitUntilBlocked(pattern: string, timeoutMs = 3000): Promise<boolean> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const rows = await db.execute(sql`
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()
+            AND query ILIKE ${pattern}
+        `);
+        if (Array.from(rows).length > 0) return true;
+        await sleep(25);
+      }
+      return false;
+    }
+
+    interface Holder {
+      ready: Promise<void>;
+      release: () => void;
+      done: Promise<void>;
+    }
+
+    /** Runs `statement` in its own transaction and keeps the transaction open until `release()`. */
+    function holdTransaction(statement: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<unknown>): Holder {
+      let release: () => void = () => undefined;
+      let markReady: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const ready = new Promise<void>((resolve) => {
+        markReady = resolve;
+      });
+      const done = db.transaction(async (tx) => {
+        await statement(tx);
+        markReady();
+        await gate;
+      });
+      return { ready: Promise.race([ready, done]), release, done };
+    }
+
+    type Outcome<T> = { value: T; error?: undefined } | { value?: undefined; error: unknown };
+
+    function outcomeOf<T>(promise: Promise<T>): Promise<Outcome<T>> {
+      return promise.then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+    }
+
+    it("is covered by locks on every parent table of the list, in one fixed order", () => {
+      const parents = [...new Set(CROSS_COMPANY_REFERENCES.map((entry) => entry.parent))].filter((table) => table !== "companies");
+
+      expect(COMPANY_REMOVAL_LOCK_ORDER[0]).toBe("companies");
+      expect(COMPANY_REMOVAL_LOCK_ORDER.slice(1)).toEqual([...parents].sort());
+      expect(new Set(COMPANY_REMOVAL_LOCK_ORDER).size).toBe(COMPANY_REMOVAL_LOCK_ORDER.length);
+    });
+
+    it("makes another company's insert that arrives after the locks wait, and fail, so nothing of its is deleted", async () => {
+      const deleted = await seedTenant("Deleted");
+      const other = await seedTenant("Other");
+      await db.insert(financeEvents).values({
+        companyId: deleted.companyId,
+        eventKind: "charge",
+        biller: "provider",
+        amountCents: 1,
+        occurredAt: new Date(),
+      });
+      const beforeOther = await snapshot(other.companyId);
+
+      const pause = holdTransaction((tx) =>
+        tx.execute(sql`SELECT 1 FROM finance_events WHERE company_id = ${deleted.companyId} FOR UPDATE`),
+      );
+      await pause.ready;
+      const removal = outcomeOf(companyService(db).remove(deleted.companyId));
+      const reachedDeletes = await waitUntilBlocked('%delete from "finance_events"%');
+      const insertion = outcomeOf(
+        db
+          .insert(issueAttachments)
+          .values({ companyId: other.companyId, issueId: other.issueId, assetId: deleted.assetId })
+          .returning({ id: issueAttachments.id }),
+      );
+      const insertWaited = await waitUntilBlocked('%insert into "issue_attachments"%');
+      pause.release();
+      await pause.done;
+      const removed = await removal;
+      const inserted = await insertion;
+      const insertedId = inserted.value?.[0]?.id;
+      const insertedRowSurvived =
+        insertedId === undefined
+          ? false
+          : (await db.select().from(issueAttachments).where(eq(issueAttachments.id, insertedId))).length > 0;
+
+      expect(reachedDeletes, "the delete paused at its first delete statement").toBe(true);
+      expect({
+        removed: removed.value?.id === deleted.companyId,
+        insertWaited,
+        insertFailedWithForeignKey: isForeignKeyViolation(inserted.error),
+        insertedRowLostByCascade: insertedId !== undefined && !insertedRowSurvived,
+      }).toEqual({ removed: true, insertWaited: true, insertFailedWithForeignKey: true, insertedRowLostByCascade: false });
+      expect(await snapshot(other.companyId), "rows of the other company").toEqual(beforeOther);
+    });
+
+    it("also holds back a new row of the deleted company, so no new row can be pointed at during the delete", async () => {
+      const deleted = await seedTenant("Deleted");
+      await db.insert(financeEvents).values({
+        companyId: deleted.companyId,
+        eventKind: "charge",
+        biller: "provider",
+        amountCents: 1,
+        occurredAt: new Date(),
+      });
+
+      const pause = holdTransaction((tx) =>
+        tx.execute(sql`SELECT 1 FROM finance_events WHERE company_id = ${deleted.companyId} FOR UPDATE`),
+      );
+      await pause.ready;
+      const removal = outcomeOf(companyService(db).remove(deleted.companyId));
+      const reachedDeletes = await waitUntilBlocked('%delete from "finance_events"%');
+      const newAssetId = randomUUID();
+      const insertion = outcomeOf(
+        db.insert(assets).values({
+          id: newAssetId,
+          companyId: deleted.companyId,
+          provider: "local_disk",
+          objectKey: `${deleted.companyId}/${newAssetId}`,
+          contentType: "text/plain",
+          byteSize: 1,
+          sha256: "b".repeat(64),
+        }),
+      );
+      const insertWaited = await waitUntilBlocked('%insert into "assets"%');
+      pause.release();
+      await pause.done;
+      const removed = await removal;
+      const inserted = await insertion;
+
+      expect(reachedDeletes, "the delete paused at its first delete statement").toBe(true);
+      expect({
+        removed: removed.value?.id === deleted.companyId,
+        insertWaited,
+        insertFailedWithForeignKey: isForeignKeyViolation(inserted.error),
+      }).toEqual({ removed: true, insertWaited: true, insertFailedWithForeignKey: true });
+    });
+
+    it("refuses when the other company's insert commits before the locks are taken, and deletes nothing", async () => {
+      const deleted = await seedTenant("Deleted");
+      const other = await seedTenant("Other");
+      const beforeDeleted = await snapshot(deleted.companyId);
+
+      const writer = holdTransaction((tx) =>
+        tx.insert(issueAttachments).values({ companyId: other.companyId, issueId: other.issueId, assetId: deleted.assetId }),
+      );
+      await writer.ready;
+      const removal = outcomeOf(companyService(db).remove(deleted.companyId));
+      const waitedForWriter = await waitUntilBlocked('%from "assets" as parent%for update%', 2000);
+      writer.release();
+      await writer.done;
+      const removed = await removal;
+      const beforeOtherAfterCommit = await snapshot(other.companyId);
+
+      expect({
+        waitedForWriter,
+        refusedWith: removed.error instanceof HttpError ? removed.error.status : removed.value ? "deleted" : "other error",
+        code: removed.error instanceof HttpError ? Reflect.get(removed.error.details ?? {}, "code") : null,
+        references: removed.error instanceof HttpError ? Reflect.get(removed.error.details ?? {}, "references") : null,
+      }).toEqual({
+        waitedForWriter: true,
+        refusedWith: 409,
+        code: COMPANY_DELETE_CROSS_COMPANY_REFERENCES,
+        references: [{ table: "issue_attachments", count: 1 }],
+      });
+      expect(await snapshot(deleted.companyId), "rows of the company that was not deleted").toEqual(beforeDeleted);
+      expect(beforeOtherAfterCommit["issue_attachments"], "the other company's attachment").toBe(1);
+    });
+
+    it("returns 409 company_delete_busy, and changes nothing, when a lock cannot be had within the limit", async () => {
+      const deleted = await seedTenant("Deleted");
+      const other = await seedTenant("Other");
+      const beforeDeleted = await snapshot(deleted.companyId);
+      const beforeOther = await snapshot(other.companyId);
+
+      const blocker = holdTransaction((tx) =>
+        tx.execute(sql`SELECT 1 FROM assets WHERE company_id = ${deleted.companyId} FOR UPDATE`),
+      );
+      await blocker.ready;
+      const attempt = outcomeOf(companyService(db).remove(deleted.companyId, { lockTimeoutMs: 300 }));
+      const first = await Promise.race([attempt, sleep(3000).then(() => "still waiting" as const)]);
+      if (first === "still waiting") blocker.release();
+      const busy = first === "still waiting" ? await attempt : first;
+      blocker.release();
+      await blocker.done;
+
+      expect(first, "the delete gave up within the limit").not.toBe("still waiting");
+      expect(busy.error).toBeInstanceOf(HttpError);
+      expect(busy.error).toMatchObject({ status: 409, details: { code: "company_delete_busy" } });
+      expect(await snapshot(deleted.companyId)).toEqual(beforeDeleted);
+      expect(await snapshot(other.companyId)).toEqual(beforeOther);
+
+      const retried = await companyService(db).remove(deleted.companyId);
+      expect(retried?.id).toBe(deleted.companyId);
+    });
   });
 });

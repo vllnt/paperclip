@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isForeignKeyViolation,
   isInvalidTextRepresentation,
+  isLockContention,
   isUniqueViolation,
   readForeignKeyViolation,
 } from "../db-errors.js";
@@ -158,5 +159,25 @@ describe("isForeignKeyViolation with a RESTRICT reference", () => {
   it("still ignores other integrity codes", () => {
     expect(isForeignKeyViolation({ code: "23502" })).toBe(false);
     expect(isForeignKeyViolation({ cause: { code: "23514" } })).toBe(false);
+  });
+});
+
+describe("isLockContention", () => {
+  it.each([
+    ["a lock timeout (55P03)", "55P03"],
+    ["a deadlock (40P01)", "40P01"],
+  ])("matches %s on the error itself and through Drizzle's cause", (_label, code) => {
+    expect(isLockContention({ code })).toBe(true);
+    expect(isLockContention(new Error("Failed query: select 1", { cause: { code } }))).toBe(true);
+  });
+
+  it("ignores other codes, non-objects and self-referential chains", () => {
+    expect(isLockContention({ code: "23503" })).toBe(false);
+    expect(isLockContention({ cause: { code: "40001" } })).toBe(false);
+    expect(isLockContention("55P03")).toBe(false);
+    expect(isLockContention(null)).toBe(false);
+    const looped: { cause?: unknown } = {};
+    looped.cause = looped;
+    expect(isLockContention(looped)).toBe(false);
   });
 });

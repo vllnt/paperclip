@@ -1,7 +1,10 @@
 import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { readForeignKeyViolation, type ForeignKeyViolationDetails } from "../db-errors.js";
+import { isLockContention, readForeignKeyViolation, type ForeignKeyViolationDetails } from "../db-errors.js";
 import { conflict, type HttpError } from "../errors.js";
+
+/** The `details.code` of the 409 that a company delete returns when it could not get its locks in time. Trying again can work. */
+export const COMPANY_DELETE_BUSY = "company_delete_busy";
 
 interface BlockingRows {
   total: number;
@@ -79,20 +82,27 @@ async function countBlockingRows(
 }
 
 /**
- * Turns the foreign-key failure of a company delete into a 409 that names the
- * blocking table and counts the blocking rows. The delete runs in one
- * transaction, so by the time this runs nothing has been deleted.
+ * Turns a failure of a company delete that is the request's fault, or only a bad moment, into a 409.
+ * A foreign-key failure becomes a 409 that names the blocking table and counts the blocking rows.
+ * A lock timeout or a deadlock becomes a 409 with the code `company_delete_busy`, and trying again
+ * can work. The delete runs in one transaction, so by the time this runs nothing has been deleted.
  *
  * @param db - A database handle outside the failed transaction.
  * @param companyId - The company whose delete failed.
  * @param error - The error thrown by the delete.
- * @returns A 409 for a foreign-key violation, or null when the error is something else.
+ * @returns A 409 for a foreign-key violation or lock contention, or null when the error is something else.
  */
 export async function explainBlockedCompanyRemoval(
   db: Db,
   companyId: string,
   error: unknown,
 ): Promise<HttpError | null> {
+  if (isLockContention(error)) {
+    return conflict(
+      "Company delete could not get the locks it needs, because other requests are writing this company's data. Nothing was deleted. Try again.",
+      { code: COMPANY_DELETE_BUSY },
+    );
+  }
   const violation = readForeignKeyViolation(error);
   if (!violation) return null;
 

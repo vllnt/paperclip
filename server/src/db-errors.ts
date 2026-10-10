@@ -2,6 +2,8 @@ const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
 const RESTRICT_VIOLATION = "23001";
 const INVALID_TEXT_REPRESENTATION = "22P02";
+const LOCK_NOT_AVAILABLE = "55P03";
+const DEADLOCK_DETECTED = "40P01";
 const MAX_CAUSE_DEPTH = 4;
 
 /**
@@ -60,6 +62,20 @@ export function isForeignKeyViolation(error: unknown): boolean {
  */
 export function isInvalidTextRepresentation(error: unknown): boolean {
   return hasPostgresCode(error, INVALID_TEXT_REPRESENTATION);
+}
+
+/**
+ * Recognizes lock contention: a statement that gave up waiting for a lock because it hit
+ * `lock_timeout` (SQLSTATE 55P03), or a transaction that Postgres chose to cancel to break a
+ * deadlock (40P01). Both leave the transaction rolled back, and the same request can work when
+ * it is tried again. Like the other helpers here, it walks the `cause` chain because Drizzle wraps
+ * the driver error.
+ *
+ * @param error - The error thrown by a query, possibly wrapped by Drizzle.
+ * @returns Whether the error is a lock timeout or a deadlock.
+ */
+export function isLockContention(error: unknown): boolean {
+  return hasPostgresCode(error, LOCK_NOT_AVAILABLE) || hasPostgresCode(error, DEADLOCK_DETECTED);
 }
 
 function hasPostgresCode(error: unknown, code: string): boolean {

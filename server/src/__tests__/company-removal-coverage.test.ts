@@ -21,6 +21,7 @@ import {
   decisionQueues,
   decisionRetention,
   decisionTriage,
+  financeEvents,
   decisionTriageEvents,
   decisions,
   heartbeatRuns,
@@ -61,7 +62,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { isLockContention } from "../db-errors.ts";
 import { companyService } from "../services/companies.ts";
+import { COMPANY_REMOVAL_LOCK_ORDER } from "../services/company-removal-cross-company.ts";
 import {
   CROSS_COMPANY_EXCLUSIONS,
   CROSS_COMPANY_REFERENCES,
@@ -809,6 +812,72 @@ describeEmbeddedPostgres("company removal coverage", () => {
     } finally {
       await db.execute(sql`DROP TABLE IF EXISTS zz_future_child`);
     }
+  });
+
+  it("holds a lock on the company's rows in every parent table of the cross-company list while it deletes", async () => {
+    const companyId = await seedCompanyWithBlockingRows();
+    await db.insert(financeEvents).values({
+      companyId,
+      eventKind: "charge",
+      biller: "provider",
+      amountCents: 1,
+      occurredAt: new Date(),
+    });
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    let release: () => void = () => undefined;
+    let markReady: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      markReady = resolve;
+    });
+    const pause = db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT 1 FROM finance_events WHERE company_id = ${companyId} FOR UPDATE`);
+      markReady();
+      await gate;
+    });
+    await Promise.race([ready, pause]);
+
+    const removal = companyService(db).remove(companyId).then(
+      (company) => ({ company }),
+      (error: unknown) => ({ error }),
+    );
+    let paused = false;
+    for (let attempt = 0; attempt < 120 && !paused; attempt += 1) {
+      const rows = await db.execute(sql`
+        SELECT 1 FROM pg_stat_activity
+        WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()
+          AND query ILIKE '%delete from "finance_events"%'
+      `);
+      paused = Array.from(rows).length > 0;
+      if (!paused) await sleep(25);
+    }
+
+    const locked: string[] = [];
+    const empty: string[] = [];
+    const unlocked: string[] = [];
+    const failed: string[] = [];
+    for (const table of COMPANY_REMOVAL_LOCK_ORDER) {
+      const owner = table === "companies" ? sql`"id"` : sql`"company_id"`;
+      try {
+        const rows = await db.execute(
+          sql`SELECT 1 FROM ${sql.identifier(table)} AS parent WHERE parent.${owner} = ${companyId} FOR UPDATE NOWAIT`,
+        );
+        (Array.from(rows).length === 0 ? empty : unlocked).push(table);
+      } catch (error) {
+        (isLockContention(error) ? locked : failed).push(table);
+      }
+    }
+    release();
+    await pause;
+    const removed = await removal;
+
+    expect(paused, "the delete paused after its locks").toBe(true);
+    expect({ unlocked, failed }, "tables whose rows of the company were not locked").toEqual({ unlocked: [], failed: [] });
+    expect(locked.length + empty.length).toBe(COMPANY_REMOVAL_LOCK_ORDER.length);
+    expect(locked.length, `tables proven locked (no rows in: ${empty.join(", ")})`).toBeGreaterThanOrEqual(14);
+    expect(removed).toMatchObject({ company: { id: companyId } });
   });
 
   it("deletes a company whose managed agent profile holds a required secret", async () => {

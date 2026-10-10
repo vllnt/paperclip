@@ -313,6 +313,59 @@ export const CROSS_COMPANY_EXCLUSIONS: readonly CrossCompanyExclusion[] = [
   { child: "environment_custom_image_templates", column: "created_by_agent_id", parent: "agents", reason: "Templates belong to an instance-level environment, not to a company. Only an audit pointer is cleared." },
 ];
 
+/**
+ * The tables whose rows of the deleted company are locked before the check, in the order they are
+ * locked. The company row comes first. Then come the parent tables of `CROSS_COMPANY_REFERENCES`
+ * in alphabetical order, so the order is the same on every delete. It is derived from the list,
+ * so a table that gets a new key is locked too.
+ *
+ * Any session that inserts a row, or changes a reference, that points at one of these rows must
+ * first take a `FOR KEY SHARE` lock on it. `FOR UPDATE` conflicts with that lock, so such a
+ * write waits for the delete. When the delete commits the row is gone and the waiting write
+ * fails with a foreign-key error. The lock on the company row also holds back any new row that
+ * belongs to the company, because every table with a `company_id` references `companies`.
+ */
+export const COMPANY_REMOVAL_LOCK_ORDER: readonly string[] = [
+  "companies",
+  ...[...new Set(CROSS_COMPANY_REFERENCES.map((reference) => reference.parent))]
+    .filter((table) => table !== "companies")
+    .sort(),
+];
+
+/** How long the delete waits for one lock before it gives up with `company_delete_busy`. */
+export const DEFAULT_COMPANY_REMOVAL_LOCK_TIMEOUT_MS = 5000;
+
+/**
+ * Locks every row of the deleted company that another company's row could point at, so that
+ * `assertNoCrossCompanyReferences` and the deletes that follow see a state that cannot change
+ * under them. Without it a row of another company that commits between the check and the
+ * delete is deleted by the cascade without being seen.
+ *
+ * It first limits the wait for each lock of this transaction to `lockTimeoutMs`. A lock that
+ * cannot be had in time fails the statement with SQLSTATE 55P03, and Postgres can cancel the
+ * transaction with 40P01 to break a deadlock. `explainBlockedCompanyRemoval` turns both into a
+ * 409 `company_delete_busy`. The limit stays in force for the rest of the transaction, so the
+ * deletes that follow cannot wait longer than that for a lock either.
+ *
+ * Run it first in the deletion transaction. It locks, so it must not be run twice in the
+ * same transaction for different companies.
+ *
+ * @param db - The transaction that will delete the company.
+ * @param companyId - The company about to be deleted.
+ * @param lockTimeoutMs - The longest wait for one lock, in milliseconds.
+ */
+export async function lockCompanyForRemoval(
+  db: Pick<Db, "execute">,
+  companyId: string,
+  lockTimeoutMs: number = DEFAULT_COMPANY_REMOVAL_LOCK_TIMEOUT_MS,
+): Promise<void> {
+  await db.execute(sql`SELECT set_config('lock_timeout', ${`${Math.max(1, Math.floor(lockTimeoutMs))}ms`}, true)`);
+  for (const table of COMPANY_REMOVAL_LOCK_ORDER) {
+    const owner = table === "companies" ? sql`"id"` : sql`"company_id"`;
+    await db.execute(sql`SELECT 1 FROM ${sql.identifier(table)} AS parent WHERE parent.${owner} = ${companyId} FOR UPDATE`);
+  }
+}
+
 function parentRowsOfCompany(reference: CrossCompanyReference, companyId: string): SQL {
   return reference.parent === "companies"
     ? sql`parent."id" = ${companyId}`
