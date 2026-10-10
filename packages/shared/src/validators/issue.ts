@@ -629,6 +629,20 @@ export type ResolveIssueRecoveryAction = z.infer<
   typeof resolveIssueRecoveryActionSchema
 >;
 
+/** Operator evidence that a stopped execution is safe to continue. */
+export const reconcileIssueExecutionSchema = z
+  .object({
+    outcome: z.enum(["done", "none", "mixed"]),
+    note: z.string().trim().min(20).max(12000),
+    expectedRunId: z.string().guid().optional(),
+    workspaceRepairNote: z.string().trim().min(20).max(12000).optional(),
+  })
+  .strict();
+
+export type ReconcileIssueExecution = z.infer<
+  typeof reconcileIssueExecutionSchema
+>;
+
 const issueRequestDepthInputSchema = z
   .number()
   .int()

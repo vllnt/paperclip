@@ -277,6 +277,7 @@ export interface IssueWakeDiagnosticWakeRequest {
   claimedAt: string | null;
   finishedAt: string | null;
   failureClass: IssueWakeDiagnosticWakeFailureClass | null;
+  executionWait?: { reason: string; message: string; recoveryActionId?: string };
 }
 
 export interface IssueWakeDiagnosticActivityRecord {

@@ -12,6 +12,8 @@ import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
+  reconcileExecutionHolds,
+  deliverReconciledExecutions,
 } from "../services/execution-recovery-resolution.js";
 import {
   storedSteeringAcknowledgement,
@@ -85,6 +87,7 @@ import {
   createIssueSchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
   runnerGoalActionRequestSchema,
   feedbackTargetTypeSchema,
@@ -1474,10 +1477,15 @@ function projectIssueWakeRequest(
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
+    payload?: Record<string, unknown> | null;
   },
   options: { includeInternalIds: boolean },
 ): IssueWakeDiagnosticWakeRequest {
   const status = projectWakeDiagnosticStatus(row.status);
+  const executionWait =
+    row.payload && typeof row.payload.executionWait === "object" && row.payload.executionWait !== null
+      ? row.payload.executionWait as { reason?: unknown; message?: unknown; recoveryActionId?: unknown }
+      : null;
   return {
     kind: "wake_request",
     agentId: options.includeInternalIds ? row.agentId : null,
@@ -1490,6 +1498,17 @@ function projectIssueWakeRequest(
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
+    ...(typeof executionWait?.reason === "string" && typeof executionWait.message === "string"
+      ? {
+          executionWait: {
+            reason: executionWait.reason,
+            message: executionWait.message,
+            ...(typeof executionWait.recoveryActionId === "string"
+              ? { recoveryActionId: executionWait.recoveryActionId }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -9085,11 +9104,89 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    const history = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.createdAt), desc(issueRecoveryActions.id));
+    const executionHolds = history
+      .filter((action) => requiresExecutionReconciliation(action.cause))
+      .map((action) => ({
+        id: action.id,
+        runId: typeof action.evidence.runId === "string" ? action.evidence.runId : null,
+        status: action.status,
+        cause: action.cause,
+        replay: (action.evidence.automaticRecovery as { replay?: string } | undefined)?.replay ?? null,
+        createdAt: action.createdAt,
+        updatedAt: action.updatedAt,
+        nextAction: action.nextAction,
+      }));
     res.json({
       active,
       actions: active ? [active] : [],
+      executionHolds,
     });
   });
+
+  router.post(
+    "/issues/:id/execution/reconcile",
+    validate(reconcileIssueExecutionSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        getIssueById(req, req.params.id as string),
+        "Issue not found",
+      );
+      if (!issue) return;
+      if (!(await assertIssueReadAllowed(req, res, issue))) return;
+      const actor = getActorInfo(req);
+      const result = await reconcileExecutionHolds({
+        db,
+        companyId: issue.companyId,
+        issueId: issue.id,
+        outcome: req.body.outcome,
+        note: req.body.note,
+        expectedRunId: req.body.expectedRunId,
+        workspaceRepairNote: req.body.workspaceRepairNote,
+        actorId: actor.actorId,
+      });
+      // Deliver only the continuation this request created; the durable sweep
+      // delivers everything else, so this request never acts on another
+      // company's pending continuations.
+      await deliverReconciledExecutions(db, heartbeat.wakeup, {
+        companyId: issue.companyId,
+        actionIds: [result.continuationActionId],
+      });
+      const [continuation] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            eq(heartbeatRuns.agentId, result.agentId),
+            sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${result.continuationActionId}`,
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+        .limit(1);
+      res.json({
+        issueId: issue.id,
+        reconciledRunIds: [...result.reconciledRunIds].reverse(),
+        recoveryActionIds: [...result.recoveryActionIds].reverse(),
+        continuation: continuation
+          ? { status: continuation.status, runId: continuation.id }
+          : { status: "pending", runId: null },
+      });
+    },
+  );
 
   router.post("/issues/:id/recovery-actions/retry-workspace-export", validate(retryWorkspaceExportSchema), async (req, res) => {
     assertBoard(req);
