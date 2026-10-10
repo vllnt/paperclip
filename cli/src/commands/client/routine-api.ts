@@ -13,6 +13,11 @@ interface CompanyOptions extends BaseClientOptions {
   projectId?: string;
 }
 
+interface JsonOptions extends CompanyOptions {
+  payloadJson?: string;
+  limit?: string;
+}
+
 interface RoutineListOptions extends CompanyOptions {
   q?: string;
   agentId?: string;
