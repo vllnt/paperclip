@@ -2320,7 +2320,8 @@ describe("SSH run directory reaper", () => {
       if (!host) return;
       const run = await host.pushedRun();
       const modeFile = path.join(host.rootDir, `mode-${randomUUID()}.txt`);
-      const record = `if [ "$rname" = status ]; then stat -c %a "$scratch" > '${modeFile}' 2>/dev/null || stat -f %Lp "$scratch" > '${modeFile}'; fi`;
+      // Choose the stat flavour first: with noclobber on, a failed `stat -c ... > f` has already created f, and the fallback write to f would be refused.
+      const record = `if [ "$rname" = status ]; then if stat -c %a / >/dev/null 2>&1; then stat -c %a "$scratch" > '${modeFile}'; else stat -f %Lp "$scratch" > '${modeFile}'; fi; fi`;
 
       await reapSshRunDirectory({
         spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true, testHooks: { afterRead: record },
