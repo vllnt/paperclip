@@ -61,7 +61,20 @@ export function isKeyboardShortcutTextInputTarget(target: EventTarget | null): b
   return !!target.closest(KEYBOARD_SHORTCUT_TEXT_INPUT_SELECTOR);
 }
 
+// Open popover, menu or select content, which Radix renders inside a popper
+// wrapper. Tooltips also use the wrapper but take no keyboard focus.
+const OPEN_POPUP_SELECTOR = [
+  "[data-radix-popper-content-wrapper] [role='dialog']:not([data-state='closed'])",
+  "[data-radix-popper-content-wrapper] [role='menu']:not([data-state='closed'])",
+  "[data-radix-popper-content-wrapper] [role='listbox']:not([data-state='closed'])",
+].join(", ");
+
+/**
+ * True while a modal dialog or a popover, menu or select is open. Those own
+ * the keyboard until they close, so page shortcuts stay quiet meanwhile.
+ */
 export function hasBlockingShortcutDialog(root: ParentNode = document): boolean {
+  if (root.querySelector(OPEN_POPUP_SELECTOR)) return true;
   return Array.from(root.querySelectorAll(OPEN_DIALOG_SELECTOR)).some(isModalDialog);
 }
 
@@ -314,4 +327,3 @@ export function shouldOpenCommandLauncher({
   if (isComposing || defaultPrevented || hasOpenDialog) return false;
   return !isKeyboardShortcutTextInputTarget(target);
 }
-
