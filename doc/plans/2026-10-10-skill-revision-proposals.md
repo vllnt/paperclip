@@ -84,7 +84,7 @@ Three consequences for the design:
   `sourceLocator` at the importer's directory (svc `:6300`). Local import is allowed from project workspace roots
   (svc `:2968-2981`), and those roots are the places where agents work. The live bytes of a `local_path` skill are then read from
   that directory (svc `:4370-4376`), so later edits need no API call at all. The #59 review found the same pattern.
-  This plan lists it as a dependency (section 8.1), not as something it fixes.
+  S1 guards the agent case for protected skills (section 4.9); the general weakness stays a dependency (section 8.1).
 - **The version id does not identify the bytes.** Only file update, file delete, create, fork, release seeding and the
   test-run auto version call `createVersion` (svc `:3095`, `:4059`, `:4625`, `:4746`, `:4815`, `:6601`). Rename
   rewrites the `name:` line of the on-disk `SKILL.md` without one (svc `:4175`), and so do install-update, reset and an
@@ -302,11 +302,14 @@ There are two bars, not four: the **decide bar** (decide, withdraw, revert) is `
 - **Human approvers** are the active members whose role is in `humanApprovers.roles`. The values are the human roles of
   `packages/shared/src/constants.ts:973-978` (`owner`, `admin`, `operator`, `viewer`). `viewer` is never accepted in the
   list. The default is the other three, which is the S1 bar of section 4.4. A membership with the company role `member`
-  exists (`server/src/services/access.ts:1019`), so the check first normalizes the membership role with
-  `normalizeHumanRole` (`server/src/services/company-member-roles.ts:11-19`), which maps `member` to `operator`. To require
-  owner or admin, a person sets `["owner", "admin"]`. The check runs at decision time, so it applies to pending proposals.
-  An instance admin always counts. An actor whose membership data is missing is refused (fail closed), because
-  `assertCompanyAccess` checks memberships only when the array is present (`server/src/routes/authz.ts:111`).
+  exists (`server/src/services/access.ts:1019`), so the check maps `member` to `operator` and **nothing else**. It does not
+  call `normalizeHumanRole` with its usual fallback: every existing caller passes `"operator"` as the fallback
+  (`server/src/routes/access.ts:1216`, `:1269`, `:1296`, `:1321`; `server/src/services/authorization.ts:709`), which turns
+  any unknown or null role into `operator`, and cloud-tenant memberships can carry other roles or none
+  (`server/src/middleware/auth.ts:584-600`). A role outside owner, admin, operator and member, and a null role, are
+  refused. To require owner or admin, a person sets `["owner", "admin"]`. The check runs at decision time, so it applies to
+  pending proposals. An instance admin always counts. An actor whose membership data is missing is refused (fail closed),
+  because `assertCompanyAccess` checks memberships only when the array is present (`server/src/routes/authz.ts:111`).
 - **Protected skills** are stored **by id**, in canonical lower-case form. A request that names a key or writes the id in another form is resolved
   to the stored id when the settings are written, because keys are derived from the slug and change on rename (svc `:4105`, `:4184`). `all: true` protects
   every existing and future skill. Renaming a protected skill keeps it protected (same id). A fork is a new,
@@ -340,8 +343,8 @@ Refused when:
    `Zs` other than the plain space; or a variation selector (U+FE00-FE0F, U+E0100-E01EF) (422). Emoji sequences that need
    a zero-width joiner are refused; that cost is accepted;
 2. the file has no frontmatter, or the lines between the frontmatter fences differ from the base in count, or in any line
-   other than a `name:` or `description:` line, or a changed `name:` or `description:` line (or the base line it replaces) is
-   not a single-line plain scalar (422 `skill_proposal_frontmatter_changed`). The **grammar applies to changed lines
+   other than a `name:` or `description:` line, or a changed position does not hold the same key (`name` or `description`) in the base and in the proposal, or a changed
+   `name:` or `description:` line (or the base line it replaces) is not a single-line plain scalar (422 `skill_proposal_frontmatter_changed`). The **grammar applies to changed lines
    only**. A single-line plain scalar is `key: value` where the value starts with a letter or digit, does not start or end
    with a quote character, and contains no `: ` and no ` #`. A quoted scalar can span lines in a real YAML reader, and a
    `: ` or ` #` inside a plain scalar changes how it parses, so those are refused rather than interpreted. Every unchanged
@@ -478,15 +481,28 @@ string nor the raw URL id:
 A person is not affected: the board edits directly, as today (in `local_trusted` the implicit board is that person, section
 4.15). A proposal is the only agent path on these routes.
 
-**By-key paths: a guard where the overwrite happens.** Import, scan-projects, catalog install and managed-source create
-carry no skill id, and install-update can reach another skill's row too: it re-imports from the skill's source and takes the
-entry whose key matches, **or the first entry** (`matching = ... ?? result.skills[0]`, svc `:4940`), so an upstream document
-that carries a different `key:` rewrites that other skill's row. All of these end in `upsertImportedSkills`, which looks
-the row up by key (svc `:6259`). S1 gives that function an optional guard that the agent-facing routes pass: when the row it
-resolves is protected and the actor is an agent, it throws 403 `skill_protected_use_proposal` before it writes anything.
-One check at the place where the overwrite happens covers every by-key path, so no blanket refusal of those routes is
-needed, and an import that creates a new key still works. It does not replace the import follow-up of section 8.1, which
-everyone else still needs. The bridge does not admit import for sandbox runs today (#13 kept it human-only).
+**By-key paths: guards where the overwrite happens.** Five routes can overwrite a skill's row by key without naming its id:
+import, scan-projects, install-update, catalog install and the shipped-team install. They end in two places:
+
+- `upsertImportedSkills`, which looks the row up by key (svc `:6259`). Its callers are bundled seeding (svc `:3018`,
+  `:3020`), fork (`:4021`), create (`:4582`), install-update (`:4944`), scan-projects (`:5297`, `:5398`, `:5455`),
+  `importPackageFiles` (`:6232`) and `importFromSource` (`:6377`). Install-update can reach *another* skill's row: it
+  re-imports from the skill's source and takes the entry whose key matches **or the first entry** (`matching = ... ??
+  result.skills[0]`, svc `:4940`), so an upstream document that carries a different `key:` rewrites that other skill.
+- `installFromCatalog` (svc `:5714-5866`), which does **not** go through `upsertImportedSkills`. It finds the existing row
+  by key (svc `:5728`) and overwrites it when the same catalog entry has a changed hash, or when `force` is set
+  (svc `:5734` onward). An agent could therefore move a protected catalog skill to newer shipped bytes.
+
+S1 gives each of the two an optional `guard` argument: a callback invoked with the existing row before anything is
+written. When the row is protected and the actor is an agent, the guard throws 403 `skill_protected_use_proposal`. The
+routes pass a guard built from `req.actor`: import, scan-projects, install-update, catalog install, and the shipped-team
+install (`server/src/services/teams-catalog.ts:880`, `:892` call `installFromCatalog` and `importFromSource` with no actor;
+its route requires `agents:create`, `server/src/routes/teams-catalog.ts:36-60`, so an agent can reach it). Internal callers
+pass none: bundled seeding, fork and create make new rows or already conflict on an existing slug. An import that creates
+a new key still works. Managed-source create and refresh are not by-key: they write rows directly under new unique keys and
+are covered by id (`skill-sources.ts:56-58`, `:65`). Company import never overwrites an existing row outside the board's
+full mode (it skips or renames, `server/src/services/company-portability.ts:259-262`). The guards do not replace the import follow-up of section 8.1, which everyone else still needs. The
+bridge does not admit import for sandbox runs today (#13 kept it human-only).
 
 **Test runs.** A test-run start cuts a head version labelled "Auto version for test run" whenever the files on disk differ
 from the head snapshot (`ensureRunSkillVersion`, svc `:6589-6604`, called by `createTestRun`, svc `:6710`). On a protected
@@ -495,13 +511,15 @@ snapshot, and it never cuts a version. Otherwise an agent could edit the file wi
 make the edit the official head with no review.
 
 **The filesystem limit.** The invariant is API-level. The live bytes of a `local_path` skill are the files on disk (svc
-`:4370-4376`), the runtime copies them from there (svc `:5868-5886`), and a skill that lives in a project workspace, or under
-the managed root, is writable by an agent with file access. Such an agent can change a protected skill's text without any
-API call, and S1 cannot stop that. What S1 does: the refusals above; `PUT /skill-proposal-settings` reports each protected
-skill's location (managed, or inside a project workspace) with a warning for the second; a disk edit under a protected skill
-makes every pending proposal stale (`skill_proposal_base_changed`), which is the visible symptom; and T20 names the limit.
-S3 can close it by serving protected skills from the head version snapshot, as the managed-git path already does (svc
-`:4361-4367`), so that disk edits are inert (Q15).
+`:4370-4376`). The runtime does not even copy them: `resolveRuntimeSkillSource` returns the live source directory itself
+when it exists (svc `:6033-6034`), and `materializeRuntimeSkillFiles` (svc `:5868-5886`, called at `:6069`) is only the
+fallback when the directory is missing. A skill that lives in a project workspace, or under the managed root, is writable
+by an agent with file access, and a disk edit is live at the next run. Such an agent can change a protected skill's text
+without any API call, and S1 cannot stop that. What S1 does: the refusals above; `PUT /skill-proposal-settings` reports each
+protected skill's location (managed, or inside a project workspace) with a warning for the second; an edit to `SKILL.md`
+makes pending proposals stale (`skill_proposal_base_changed`, because the base hash covers `SKILL.md` only), which is a
+visible symptom only when a proposal is pending and only for that file; and T20 names the limit. S3 can close it by
+serving protected skills from the head version snapshot (Q15).
 
 With `all: true`, a skill an agent creates (#59) is protected from that moment, so the create-then-edit loop becomes
 create, then propose.
@@ -680,7 +698,7 @@ options (`server/src/app.ts:666-667`), so the implementation passes `deploymentM
 | # | Threat | Control |
 | --- | --- | --- |
 | T0 | An agent acts as the board (implicit local board, a board key in a workspace) and approves its own change | **Accepted and advisory in `local_trusted`; reported.** Section 4.15: `gateEffective: false`, a banner, consent at enable, `actorSource` in the log. In `authenticated` deployments the author is never the approver and the log names the decider |
-| T1 | Agent writes a protected skill directly and skips the gate | The server invariant at the choke point, keyed on the stored id and on a per-route flag (4.9), not the policy; a guard in `upsertImportedSkills` covers the by-key paths, install-update included. Unprotected skills: the gate diagnostic |
+| T1 | Agent writes a protected skill directly and skips the gate | The server invariant at the choke point, keyed on the stored id and on a per-route flag (4.9), not the policy; guards in `upsertImportedSkills` and `installFromCatalog` cover the by-key paths, install-update and the shipped-team install included. Unprotected skills: the gate diagnostic |
 | T2 | Author approves itself | Approver is never the author; agent approval needs an explicit allow rule that selects the skill |
 | T3 | Two agents agree to pass each other's changes | Protected skills are decided by people only; `requireDifferentModelFamily` for the rest; caps; both families are logged |
 | T4 | Content swapped between review and apply | Immutable row; the id fixes the bytes; the optional `reviewedSha256`; read-back from disk and the version row |
@@ -699,7 +717,7 @@ options (`server/src/app.ts:666-667`), so the implementation passes `deploymentM
 | T17 | The gate is rewritten by an agent holding `users:manage_permissions` | Settings are person-only; the policy route is a named dependency (section 8.1) |
 | T18 | An agent changes what agents follow without editing an existing skill: creates a new skill (#59), re-points agents with skill sync, or forks a protected skill and reassigns | The invariant also covers fork (it carries the skill id). New-skill creation and agent skill assignment are **non-goals** of this plan and are governed by their own permissions |
 | T19 | The diff hides an invisible character or a homoglyph | Invisible and control characters are refused in the text (4.7). Homoglyphs are not refused; the rendered diff escapes non-ASCII characters (4.14) |
-| T20 | An agent with file access edits a protected skill's files directly, or edits them and starts a test run so the edit becomes the head | **Partly accepted in S1.** The test-run start is refused on drift (4.9); a disk edit makes pending proposals stale; settings report where each protected skill lives. The edit itself is not preventable at the API; S3 can serve protected skills from the head snapshot (Q15) |
+| T20 | An agent with file access edits a protected skill's files directly, or edits them and starts a test run so the edit becomes the head | **Partly accepted in S1.** The test-run start is refused on drift (4.9); an edit to `SKILL.md` makes pending proposals stale; settings report where each protected skill lives. The edit itself is not preventable at the API; S3 can serve protected skills from the head snapshot (Q15) |
 
 ## 6. Slices
 
@@ -708,7 +726,7 @@ company until `enabled` is set, so each slice can ship without behavior change.
 
 - **S1: propose, humans decide and apply, revert, protected skills.** Tables and migration; `skills.propose`; settings
   (without agent approval), including `humanApprovers` and `protectedSkills`; the invariant at
-  `assertCanMutateCompanySkills` and the guard in `upsertImportedSkills`; the `expectedPreviousSha256` and `versionLabel` parameters of `updateFile`; submit, list, show, decision
+  `assertCanMutateCompanySkills` the guards in `upsertImportedSkills` and `installFromCatalog` with the actor passed from the five routes that call them; the test-run drift refusal; the location report in the settings; the `expectedPreviousSha256` and `versionLabel` parameters of `updateFile`; submit, list, show, decision
   (human), withdraw, revert; caps; effective status computed on read; author wake; attention item; bridge rules;
   OpenAPI; CLI; Studio tab; launcher action; log redaction; deployment reporting (4.15).
 - **S2: agent approvers.** `skills.approve` (closed by default, `agents` subjects only); `agentApproval` settings; the
@@ -723,7 +741,7 @@ are additive. Applied changes stay as ordinary versions.
 
 - Submit refuses: disabled; no `skills.propose`; no task-bound run; an agent key with no run; non-editable skill; stale
   base version; disk bytes differing from the base; identical text; oversize (422, before any query); control, bidi,
-  zero-width and CR characters; a changed frontmatter line other than `name` and `description`; a cap hit; a second
+  zero-width and CR characters; a changed frontmatter line other than `name` and `description`; a `description:` written over a base `allowed-tools:` line; a cap hit; a second
   open proposal; the same bytes open; a bad idempotency replay.
 - Decision: wrong hash; author as approver; viewer; a role outside `humanApprovers.roles`; stale base (row becomes
   `stale`, skill unchanged); **rename then approve**; **import overwrite then approve**; **out-of-band edit then
@@ -741,13 +759,14 @@ are additive. Applied changes stay as ordinary versions.
   later; renaming a protected skill keeps it protected; **the same refused edit written with an upper-case and with a
   hyphenless skill id is refused too**; an agent's proposal on a protected skill succeeds; test inputs and test runs on a
   protected skill still work for an agent; an agent's import, scan-projects, catalog install or
-  install-update that would overwrite a protected skill by key (install-update with an upstream `key:` pointing at it
-  included) is refused and writes nothing, while one that creates a new key still works; an agent's test-run start on a
+  install-update that would overwrite a protected skill by key (install-update with an upstream `key:` pointing at it,
+  a protected catalog skill, and the shipped-team install included) is refused and writes nothing, while one that creates a new key still works; an agent's test-run start on a
   protected skill whose files drifted from the head is refused with 409 and cuts no version.
 - Frontmatter: a proposal against the repository's own folded-description `SKILL.md` (for example
   `skills/paperclip-converting-plans-to-tasks/SKILL.md`) that changes only the body is accepted; one that changes the
   folded description is refused.
-- Human approvers: a membership with role `member` counts as `operator`; a missing membership array is refused.
+- Human approvers: a membership with role `member` counts as `operator`; a missing membership array, a null role and an
+  unknown role such as the cloud-tenant `support` are refused.
 - Revert: succeeds only on an unmoved head and unchanged bytes; 409 otherwise; never edits history.
 - Deployment: `gateEffective` is false in `local_trusted`; enabling without the acknowledgement returns 409; the approved
   and applied entries carry `actorSource`.
@@ -800,8 +819,10 @@ below say what each answer means for the build. Q13 to Q15 are new, raised by th
   sandboxes behind the bridge and the review does hold.
 
 - **Q15. Serve protected skills from the head snapshot.** *New.* Recommendation: yes, in S3. It makes a disk edit under a
-  protected skill inert, which is the only way to close the filesystem limit of section 4.9. It changes how the runtime
-  reads those skills, so it needs its own look at the materialization path (svc `:5868-5886`) and is not in S1.
+  protected skill inert, which is the only way to close the filesystem limit of section 4.9. It needs two
+  changes: the runtime source resolution, which today returns the live directory when it exists (svc `:6005-6034`), and the
+  `readLoadedSkillFile` branch (svc `:4361-4367`), which is keyed on `metadata.skillSourceId` and a snapshot hash that
+  `local_path` skills do not have. It is not in S1.
 
 ### 8.1 Dependencies named, not fixed
 
@@ -860,7 +881,12 @@ These exist on `main`. This plan does not change them, and its guarantees are we
   `:66-92`; the #114 plan row `doc/plans/2026-10-10-software-factory.md:15` on the #114 branch at `d80fe041d`
 - Runner skill actions: `packages/paperclip-runner/src/protocol-actions/create-skill.ts`, `update-skill.ts`
 - Skill id handling: `server/src/routes/company-skills.ts:189`, `server/src/services/company-skill-policy.ts:57`,
-  `server/src/services/company-skills.ts:3384-3391`; `installUpdate` key fallback svc `:4940-4946`; test-run auto version svc
+  `server/src/services/company-skills.ts:3384-3391`; `installUpdate` key fallback svc `:4940-4946`; `installFromCatalog` svc `:5714-5866` (existing-row branch `:5734`);
+  `upsertImportedSkills` callers svc `:3018`, `:3020`, `:4021`, `:4582`, `:4944`, `:5297`, `:5398`, `:5455`, `:6232`, `:6377`;
+  runtime source resolution svc `:6033-6034`, materialize fallback `:6069`; `normalizeHumanRole` callers
+  `server/src/routes/access.ts:1216`, `:1269`, `:1296`, `:1321`, `server/src/services/authorization.ts:709`; cloud-tenant
+  roles `server/src/middleware/auth.ts:584-600`; shipped-team install `server/src/services/teams-catalog.ts:880`, `:892`,
+  `server/src/routes/teams-catalog.ts:36-60`; test-run auto version svc
   `:6589-6604`, `:6710`; snapshot-served skills svc `:4361-4367`; human role normalization
   `server/src/services/company-member-roles.ts:11-19`, member memberships `server/src/services/access.ts:1019`; test-input and test-run policy calls `company-skills.ts:510`, `:536`,
   `:563`, `:698`, `:802`, `:845`, `:1511`
