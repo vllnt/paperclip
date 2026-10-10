@@ -17,6 +17,7 @@ import {
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -2109,6 +2110,37 @@ function providerQuotaKeyForAgent(
 ) {
   const model = readNonEmptyString(parseObject(agent.adapterConfig).model);
   return model ? `${agent.adapterType}:${model}` : agent.adapterType;
+}
+
+/** One agent's runs in a UTC day, as `computeDailyRunUsage` reads them. */
+interface DailyRunUsage {
+  /** Started runs that are not queued or waiting to retry. */
+  total: number;
+  /** The failed ones among them that hit a provider quota before any useful action. */
+  providerQuotaBeforeUsefulAction: number;
+}
+
+const NO_DAILY_RUNS: DailyRunUsage = { total: 0, providerQuotaBeforeUsefulAction: 0 };
+
+/**
+ * The runs that count toward `maxDailyRuns`. Up to the daily allowance, a
+ * provider quota failure before any useful action is not a run the cap guards
+ * against. Failures beyond the allowance count again, so a permanent outage
+ * still meets the cap. The cap and the run stats both call this, so it is the
+ * one place that applies the allowance.
+ *
+ * @param usage - the agent's raw usage for the day.
+ * @param policy - the agent's heartbeat policy.
+ * @returns the number that the cap compares with `maxDailyRuns`.
+ */
+function countedDailyRuns(
+  usage: DailyRunUsage,
+  policy: { providerQuotaRetry: Pick<ProviderQuotaRetryPolicy, "enabled" | "maxDailyUncountedRuns"> },
+): number {
+  const forgiven = policy.providerQuotaRetry.enabled
+    ? Math.min(usage.providerQuotaBeforeUsefulAction, policy.providerQuotaRetry.maxDailyUncountedRuns)
+    : 0;
+  return usage.total - forgiven;
 }
 
 /** Reads `runtimeConfig.heartbeat.providerQuotaRetry`. */
@@ -15913,7 +15945,7 @@ export function heartbeatService(
     const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
     if (!policy.enabled) return;
     try {
-      const usage = await getHeartbeatDailyRunUsage(agent, null);
+      const usage = (await computeDailyRunUsage(agent.companyId, { agentId: agent.id })).get(agent.id) ?? NO_DAILY_RUNS;
       if (usage.providerQuotaBeforeUsefulAction <= policy.maxDailyUncountedRuns) {
         return;
       }
@@ -17765,36 +17797,61 @@ export function heartbeatService(
     return { start, end };
   }
 
-  /** Started runs in the current UTC day, as counted by maxDailyRuns. */
-  async function getHeartbeatDailyRunUsage(
-    agent: typeof agents.$inferSelect,
-    excludeRunId: string | null,
+  /**
+   * The single definition of how many runs `maxDailyRuns` counts, per agent,
+   * in one UTC day. The cap check (`getHeartbeatDailyCapBlock`), the run
+   * stats (`runStats`) and the provider quota alarm all read it, so what
+   * automation reads from the stats is exactly what the cap enforces. A run
+   * that the cap should not charge is taken out of the count here and in
+   * `countedDailyRuns`, and nowhere else.
+   *
+   * Counted: runs started in the day that are not queued or waiting to retry.
+   * `providerQuotaBeforeUsefulAction` is the part of them that failed on a
+   * provider quota before any useful action; `countedDailyRuns` decides how
+   * many of those the cap forgives.
+   *
+   * @param companyId - the company whose runs are counted.
+   * @param options.agentId - count one agent; omit to count every agent that has runs.
+   * @param options.excludeRunId - a run to leave out (the run being admitted).
+   * @param options.window - the UTC day; defaults to the current one.
+   * @returns the usage per agent ID; an agent with none is absent.
+   */
+  async function computeDailyRunUsage(
+    companyId: string,
+    options: {
+      agentId?: string;
+      excludeRunId?: string | null;
+      window?: { start: Date; end: Date };
+    } = {},
     client: Pick<Db, "select"> = db,
-  ) {
-    const { start, end } = currentUtcDayWindow();
+  ): Promise<Map<string, DailyRunUsage>> {
+    const window = options.window ?? currentUtcDayWindow();
     const conditions = [
-      eq(heartbeatRuns.companyId, agent.companyId),
-      eq(heartbeatRuns.agentId, agent.id),
-      gte(heartbeatRuns.startedAt, start),
-      lt(heartbeatRuns.startedAt, end),
+      eq(heartbeatRuns.companyId, companyId),
+      gte(heartbeatRuns.startedAt, window.start),
+      lt(heartbeatRuns.startedAt, window.end),
       notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
+      ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
     ];
-    if (excludeRunId) {
-      conditions.push(sql`${heartbeatRuns.id} <> ${excludeRunId}`);
-    }
-    const [row] = await client
+    const rows = await client
       .select({
+        agentId: heartbeatRuns.agentId,
         total: sql<number>`count(*)::integer`,
         providerQuotaBeforeUsefulAction: sql<number>`count(*) filter (where ${heartbeatRuns.status} = 'failed' and ${heartbeatRuns.resultJson} ->> 'providerQuotaBeforeUsefulAction' = 'true')::integer`,
       })
       .from(heartbeatRuns)
-      .where(and(...conditions));
-    return {
-      total: Number(row?.total ?? 0),
-      providerQuotaBeforeUsefulAction: Number(
-        row?.providerQuotaBeforeUsefulAction ?? 0,
-      ),
-    };
+      .where(and(...conditions))
+      .groupBy(heartbeatRuns.agentId);
+    return new Map(
+      rows.map((row) => [
+        row.agentId,
+        {
+          total: Number(row.total),
+          providerQuotaBeforeUsefulAction: Number(row.providerQuotaBeforeUsefulAction),
+        },
+      ]),
+    );
   }
 
   async function getHeartbeatDailyCapBlock(
@@ -17811,22 +17868,12 @@ export function heartbeatService(
     const checkCostCap = options.checkCostCap ?? true;
     const { start, end } = currentUtcDayWindow();
     if (checkRunCap && policy.maxDailyRuns !== null) {
-      const usage = await getHeartbeatDailyRunUsage(
-        agent,
-        options.excludeRunId ?? null,
+      const usage = await computeDailyRunUsage(
+        agent.companyId,
+        { agentId: agent.id, excludeRunId: options.excludeRunId, window: { start, end } },
         client,
       );
-      // Up to the daily allowance, a provider-quota failure before any useful
-      // action is not a run the cap guards against. Failures beyond the
-      // allowance count again, so a permanent outage still meets the cap.
-      const observed =
-        usage.total -
-        (policy.providerQuotaRetry.enabled
-          ? Math.min(
-              usage.providerQuotaBeforeUsefulAction,
-              policy.providerQuotaRetry.maxDailyUncountedRuns,
-            )
-          : 0);
+      const observed = countedDailyRuns(usage.get(agent.id) ?? NO_DAILY_RUNS, policy);
       if (observed >= policy.maxDailyRuns) {
         return {
           reason: "heartbeat.daily_run_limit",
@@ -31963,12 +32010,128 @@ export function heartbeatService(
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
     },
+    /**
+     * Run counts for a company over a creation-time window, the most common
+     * error codes, and each agent's runs today against its daily run cap.
+     */
+    runStats: async (
+      companyId: string,
+      input: { since: Date; until: Date; agentId?: string },
+    ): Promise<HeartbeatRunStats> => {
+      const windowFilters = [
+        eq(heartbeatRuns.companyId, companyId),
+        gte(heartbeatRuns.createdAt, input.since),
+        lt(heartbeatRuns.createdAt, input.until),
+        ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
+      ];
+      const capWindow = currentUtcDayWindow();
+      const [statusRows, errorRows, runsToday, agentRows] = await Promise.all([
+        db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters))
+          .groupBy(heartbeatRuns.agentId, heartbeatRuns.status),
+        db
+          .select({ errorCode: heartbeatRuns.errorCode, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters, isNotNull(heartbeatRuns.errorCode)))
+          .groupBy(heartbeatRuns.errorCode)
+          .orderBy(desc(sql`count(*)`), asc(heartbeatRuns.errorCode))
+          .limit(20),
+        computeDailyRunUsage(companyId, { agentId: input.agentId, window: capWindow }),
+        db
+          .select()
+          .from(agents)
+          .where(and(eq(agents.companyId, companyId), ...(input.agentId ? [eq(agents.id, input.agentId)] : []))),
+      ]);
+
+      const isRunStatus = (status: string): status is HeartbeatRunStatus =>
+        HEARTBEAT_RUN_STATUSES.some((known) => known === status);
+      const emptyCounts = () => {
+        const byStatus: Record<HeartbeatRunStatus, number> = {
+          queued: 0,
+          scheduled_retry: 0,
+          running: 0,
+          succeeded: 0,
+          interrupted: 0,
+          failed: 0,
+          cancelled: 0,
+          timed_out: 0,
+        };
+        return { runs: 0, terminal: 0, succeeded: 0, unsuccessful: 0, byStatus };
+      };
+      const addCounts = (counts: ReturnType<typeof emptyCounts>, status: string, count: number) => {
+        counts.runs += count;
+        if (!isRunStatus(status)) return;
+        counts.byStatus[status] += count;
+        if (HEARTBEAT_RUN_TERMINAL_STATUSES.some((terminal) => terminal === status)) counts.terminal += count;
+        if (status === "succeeded") counts.succeeded += count;
+        if (UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.some((unsuccessful) => unsuccessful === status)) {
+          counts.unsuccessful += count;
+        }
+      };
+
+      const totals = emptyCounts();
+      const perAgent = new Map<string, ReturnType<typeof emptyCounts>>();
+      for (const row of statusRows) {
+        const count = Number(row.count);
+        addCounts(totals, row.status, count);
+        const agentCounts = perAgent.get(row.agentId) ?? emptyCounts();
+        addCounts(agentCounts, row.status, count);
+        perAgent.set(row.agentId, agentCounts);
+      }
+
+      const agentStats = agentRows
+        .filter((agent) => agent.status !== "terminated" || perAgent.has(agent.id))
+        .map((agent) => {
+          const policy = parseHeartbeatPolicy(agent);
+          const maxDailyRuns = policy.maxDailyRuns;
+          const today = countedDailyRuns(runsToday.get(agent.id) ?? NO_DAILY_RUNS, policy);
+          return {
+            agentId: agent.id,
+            name: agent.name,
+            status: agent.status,
+            ...(perAgent.get(agent.id) ?? emptyCounts()),
+            runsToday: today,
+            maxDailyRuns,
+            remainingToday: maxDailyRuns === null ? null : Math.max(0, maxDailyRuns - today),
+            capReached: maxDailyRuns !== null && today >= maxDailyRuns,
+          };
+        })
+        .sort((a, b) => b.runs - a.runs || b.runsToday - a.runsToday || a.name.localeCompare(b.name));
+
+      return {
+        companyId,
+        window: { since: input.since.toISOString(), until: input.until.toISOString() },
+        dailyCapWindow: { start: capWindow.start.toISOString(), end: capWindow.end.toISOString() },
+        totals,
+        topErrorCodes: errorRows
+          .filter((row): row is { errorCode: string; count: number } => row.errorCode !== null)
+          .map((row) => ({ errorCode: row.errorCode, count: Number(row.count) })),
+        agents: agentStats,
+      };
+    },
+
     list: async (
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: {
+        summary?: boolean;
+        statuses?: string[];
+        errorCodes?: string[];
+        since?: Date;
+        until?: Date;
+      } = {},
     ) => {
+      const filters = [
+        eq(heartbeatRuns.companyId, companyId),
+        ...(agentId ? [eq(heartbeatRuns.agentId, agentId)] : []),
+        ...(options.statuses?.length ? [inArray(heartbeatRuns.status, options.statuses)] : []),
+        ...(options.errorCodes?.length ? [inArray(heartbeatRuns.errorCode, options.errorCodes)] : []),
+        ...(options.since ? [gte(heartbeatRuns.createdAt, options.since)] : []),
+        ...(options.until ? [lt(heartbeatRuns.createdAt, options.until)] : []),
+      ];
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
       const query = db
@@ -31991,14 +32154,7 @@ export function heartbeatService(
                 },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(
-                eq(heartbeatRuns.companyId, companyId),
-                eq(heartbeatRuns.agentId, agentId),
-              )
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(and(...filters))
         .orderBy(desc(heartbeatRuns.createdAt));
 
       const rows = limit ? await query.limit(limit) : await query;
