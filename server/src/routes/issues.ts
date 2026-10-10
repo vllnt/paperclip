@@ -15183,6 +15183,7 @@ export function issueRoutes(
           req.body.agentId,
           req.body.expectedStatuses,
           checkoutRunId,
+          { actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null },
         );
       } catch (error) {
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {

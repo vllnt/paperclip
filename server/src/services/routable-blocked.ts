@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 
@@ -46,6 +47,24 @@ function isHumanOwner(owner: IssueUnblockDescriptor["owner"]): boolean {
 export function isHumanOwnedBlock(issue: BlockStateInput): boolean {
   const descriptor = issue.unblockDescriptor;
   return issue.status === "blocked" && descriptor != null && isHumanOwner(descriptor.owner);
+}
+
+/**
+ * The SQL form of `!isHumanOwnedBlock`, for the `WHERE` of a write that must not take an issue
+ * out of a human-owned block. Putting the rule in the statement makes it atomic with the write:
+ * a descriptor that changes after the caller read the issue still stops the write.
+ * `issue-human-owned-block.test.ts` checks that it agrees with `isHumanOwnedBlock` for every
+ * status and owner.
+ *
+ * @param columns - The `status` and `unblock_descriptor` columns of the issues table.
+ * @returns A condition that is true for every row except a blocked row owned by the board or a person.
+ */
+export function notHumanOwnedBlockCondition(columns: { status: SQLWrapper; unblockDescriptor: SQLWrapper }): SQL {
+  const owner = sql`(${columns.unblockDescriptor} -> 'owner')`;
+  return sql`NOT COALESCE(
+    ${columns.status} = 'blocked' AND (${owner} = '"board"'::jsonb OR (${owner} -> 'userId') IS NOT NULL),
+    false
+  )`;
 }
 
 /**

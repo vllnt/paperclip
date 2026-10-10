@@ -5,6 +5,7 @@ import {
 } from "./activity-log.js";
 import type { NativeStatusDecision } from "./native-runtime/status-arbiter.js";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import type { IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
   agentTaskSessions,
   agentWakeupRequests,
@@ -17,6 +18,7 @@ import {
 } from "@paperclipai/db";
 
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
+import { isHumanOwnedBlock } from "./routable-blocked.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -112,6 +114,22 @@ export function currentConversationCommentCondition() {
       and conversation_issue.conversation_agent_id is not null
       and (${issueComments.createdAt}, ${issueComments.id}) < (conversation_boundary.created_at, conversation_boundary.id)
   )`;
+}
+
+/**
+ * A turn that a person did not start must not take the issue out of a block that the board or a
+ * person owns. The turn still runs, and the issue stays blocked. A turn that a message from a
+ * person started may.
+ *
+ * @param issue - The conversation issue as locked for this turn.
+ * @param startedBy - The message that woke the turn, if any.
+ * @returns Whether the issue stays blocked while the turn runs.
+ */
+function conversationTurnKeepsBlock(
+  issue: { status: string; unblockDescriptor?: IssueUnblockDescriptor | null },
+  startedBy: { authorUserId: string | null } | undefined,
+): boolean {
+  return isHumanOwnedBlock(issue) && !startedBy?.authorUserId;
 }
 
 /** Runs under the normal issue execution lock, before any provider session is read. */
@@ -259,7 +277,7 @@ export async function prepareConversationTurn(
       .update(issues)
       .set({
         conversationState: "active",
-        status: "in_progress",
+        ...(conversationTurnKeepsBlock(issue, comment) ? {} : { status: "in_progress" }),
         updatedAt: new Date(),
       })
       .where(eq(issues.id, issue.id));

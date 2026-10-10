@@ -104,9 +104,15 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
-import { assertAgentMayChangeBlock, handsBlockToHuman } from "./routable-blocked.js";
+import {
+  assertAgentMayChangeBlock,
+  handsBlockToHuman,
+  HUMAN_OWNED_BLOCK_MESSAGE,
+  isHumanOwnedBlock,
+  notHumanOwnedBlockCondition,
+} from "./routable-blocked.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -11448,12 +11454,31 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
+    /**
+     * Assigns the issue to the agent and moves it to `in_progress`.
+     *
+     * An agent that acts through the API may not take an issue out of a block that the board or a
+     * person owns, the same rule as `update`. The rule is part of the `WHERE` of the write, so a
+     * descriptor that changes after the caller read the issue still stops it. The call fails with
+     * a 403 and the issue stays blocked.
+     *
+     * The system checkout is the one exemption. A caller that passes no `actorAgentId` is not an
+     * agent acting through the API, so the rule does not apply: the board's checkout from the
+     * route, and the heartbeat's own checkout of the issue that it wakes an agent for
+     * (`heartbeat.ts`, which passes no actor and so keeps its behavior). The test group
+     * "the system checkout" in `issue-human-owned-block.test.ts` pins this.
+     *
+     * @param options.actorAgentId - The agent that the request authenticated as, for a caller that
+     *   acts through the API. Leave it unset only for the system checkout.
+     */
     checkout: async (
       id: string,
       agentId: string,
       expectedStatuses: string[],
       checkoutRunId: string | null,
+      options: { actorAgentId?: string | null } = {},
     ) => {
+      const keepHumanOwnedBlock = Boolean(options.actorAgentId);
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -11549,6 +11574,7 @@ export function issueService(db: Db) {
             inArray(issues.status, expectedStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            keepHumanOwnedBlock ? notHumanOwnedBlockCondition(issues) : undefined,
           ),
         )
         .returning()
@@ -11563,6 +11589,7 @@ export function issueService(db: Db) {
         .select({
           id: issues.id,
           status: issues.status,
+          unblockDescriptor: issues.unblockDescriptor,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
@@ -11572,6 +11599,10 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      if (keepHumanOwnedBlock && expectedStatuses.includes("blocked") && isHumanOwnedBlock(current)) {
+        throw forbidden(HUMAN_OWNED_BLOCK_MESSAGE);
+      }
 
       if (
         current.assigneeAgentId === agentId &&
@@ -11668,6 +11699,7 @@ export function issueService(db: Db) {
                   isNull(issues.assigneeAgentId),
                   eq(issues.assigneeAgentId, agentId),
                 ),
+                keepHumanOwnedBlock ? notHumanOwnedBlockCondition(issues) : undefined,
               ),
             )
             .returning()
