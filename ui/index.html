@@ -21,6 +21,18 @@
         const key = "paperclip.theme";
         const darkThemeColor = "#000000";
         const lightThemeColor = "#ffffff";
+        // Some webviews expose matchMedia but throw when it is called, and bundled
+        // libraries call it while they load, so the app never starts. Treat it as
+        // missing: the libraries and the UI already feature-detect it.
+        if (typeof window.matchMedia === "function") {
+          try {
+            window.matchMedia("all");
+          } catch {
+            try {
+              window.matchMedia = undefined;
+            } catch {}
+          }
+        }
         // Each read has its own guard: blocked storage must still follow the OS,
         // the way ThemeContext resolves an unset preference.
         let stored = null;
