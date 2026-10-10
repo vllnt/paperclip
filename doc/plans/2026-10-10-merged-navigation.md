@@ -341,6 +341,7 @@ not implementation authorization.
 | Q8 | Which upstream route owner lands first when #95, #110, #116, or the Routines tab changes the same files? | **The route owner in #110; otherwise rebase and land one composed shell** | Prevents double migration and keeps redirects stable. |
 | Q9 | What load-test scale is required before enabling each merge? | **Default scale in section 5** | A larger choice extends the performance lane; a smaller choice limits the rollout claim. |
 | Q10 | Should the three merges ship together or independently? | **Independently, A then B then C** | Each flag can roll back alone; sequencing reduces the shared sidebar conflict surface. |
+| Q11 | Should the shared agent tree share chat sessions across users, or keep one conversation per user? | **Keep the existing per-company/agent/user identity** | The tree is shared roster navigation, while transcripts and session boundaries remain private to the authenticated user under normal company visibility. |
 
 ## 7. Upstream-conflict estimate
 
