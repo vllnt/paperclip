@@ -3,9 +3,10 @@
  * this file cannot join the fixed `vitest run` list in the Dockerfile.
  */
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { companies, createDb, issueRecoveryActions, issues } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
+import type { IssueRecoveryAction } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -14,6 +15,10 @@ import {
   isUniqueRecoveryActionConflict,
   issueRecoveryActionService,
 } from "../services/issue-recovery-actions.ts";
+
+/** Rounds of racing pairs. Raise it to stress the race: RECOVERY_ACTION_RACE_ROUNDS=20. */
+const ROUNDS = Number(process.env.RECOVERY_ACTION_RACE_ROUNDS ?? 3);
+const PAIRS_PER_ROUND = 12;
 
 const SOURCE_INDEX = "issue_recovery_actions_active_source_uq";
 const FINGERPRINT_INDEX = "issue_recovery_actions_active_fingerprint_uq";
@@ -73,7 +78,7 @@ describeEmbeddedPostgres("two clients racing upsertSourceScoped", () => {
     await tempDb?.cleanup();
   });
 
-  it("fulfils both callers and keeps exactly one active action per issue", async () => {
+  it("returns the same winning action to both callers, and proves the writers overlapped", async () => {
     const dbA = createDb(tempDb!.connectionString);
     const dbB = createDb(tempDb!.connectionString);
     const companyId = randomUUID();
@@ -81,11 +86,6 @@ describeEmbeddedPostgres("two clients racing upsertSourceScoped", () => {
       id: companyId, name: "Paperclip", issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
-    const issueIds = Array.from({ length: 12 }, () => randomUUID());
-    await dbA.insert(issues).values(issueIds.map((id, index) => ({
-      id, companyId, title: `Race ${index}`, status: "in_progress" as const, priority: "medium" as const,
-      issueNumber: index + 1, identifier: `RACE-${index + 1}`,
-    })));
     const input = (sourceIssueId: string) => ({
       companyId,
       sourceIssueId,
@@ -99,15 +99,61 @@ describeEmbeddedPostgres("two clients racing upsertSourceScoped", () => {
       wakePolicy: null,
     });
 
-    const settled = await Promise.allSettled(issueIds.flatMap((id) => [
-      issueRecoveryActionService(dbA).upsertSourceScoped(input(id)),
-      issueRecoveryActionService(dbB).upsertSourceScoped(input(id)),
-    ]));
+    let pairs = 0;
+    let insertAttempts = 0;
+    for (let round = 0; round < ROUNDS; round += 1) {
+      const issueIds = Array.from({ length: PAIRS_PER_ROUND }, () => randomUUID());
+      await dbA.insert(issues).values(issueIds.map((id, index) => ({
+        id, companyId, title: `Race ${round}-${index}`, status: "in_progress" as const, priority: "medium" as const,
+        issueNumber: round * PAIRS_PER_ROUND + index + 1, identifier: `RACE-${round * PAIRS_PER_ROUND + index + 1}`,
+      })));
+      // A caller that finds no active action inserts. A caller that loses the
+      // race gets a unique violation, then re-reads and updates, so it does not
+      // insert again. Two inserts for one issue therefore mean the writers
+      // overlapped and one took the conflict path.
+      const insertsA = vi.spyOn(dbA, "insert");
+      const insertsB = vi.spyOn(dbB, "insert");
 
-    expect(settled.filter((result) => result.status === "rejected")).toEqual([]);
-    for (const id of issueIds) {
-      const rows = await dbA.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, id));
-      expect(rows.filter((row) => row.status === "active")).toHaveLength(1);
+      const settled = await Promise.allSettled(issueIds.flatMap((id) => [
+        issueRecoveryActionService(dbA).upsertSourceScoped(input(id)),
+        issueRecoveryActionService(dbB).upsertSourceScoped(input(id)),
+      ]));
+      insertAttempts += insertsA.mock.calls.length + insertsB.mock.calls.length;
+      pairs += issueIds.length;
+      insertsA.mockRestore();
+      insertsB.mockRestore();
+
+      expect(settled.filter((result) => result.status === "rejected")).toEqual([]);
+      for (const [index, id] of issueIds.entries()) {
+        const [first, second] = [settled[index * 2], settled[index * 2 + 1]]
+          .map((result) => (result as PromiseFulfilledResult<IssueRecoveryAction | undefined>).value);
+        const rows = await dbA.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, id));
+        const active = rows.filter((row) => row.status === "active");
+        expect(active).toHaveLength(1);
+        const row = active[0]!;
+
+        expect(first).toBeDefined();
+        expect(second).toBeDefined();
+        expect(first!.id).toBe(row.id);
+        expect(second!.id).toBe(row.id);
+        for (const returned of [first!, second!]) {
+          expect(returned).toMatchObject({
+            sourceIssueId: id,
+            fingerprint: `legacy-execution:${id}`,
+            status: "active",
+            ownerType: "board",
+            cause: "legacy_execution_requires_reconciliation",
+          });
+        }
+        // Two upserts happened, so the stored action counts two attempts. The
+        // caller that wrote last returns that count. The winner of an insert
+        // returns the row it created, so it may still show the first attempt.
+        expect(row.attemptCount).toBe(2);
+        expect(Math.max(first!.attemptCount, second!.attemptCount)).toBe(row.attemptCount);
+      }
     }
-  }, 240_000);
+
+    // Every pair makes one insert. An extra insert is a writer that lost.
+    expect(insertAttempts - pairs).toBeGreaterThan(0);
+  }, 600_000);
 });
