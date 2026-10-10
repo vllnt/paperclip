@@ -468,6 +468,69 @@ describePg("decisionService", () => {
     expect((await service().get(created.id))?.metadata).toMatchObject({ continuationPending: false });
   });
 
+  it("refuses to dismiss an expired decision exactly like decide does", async () => {
+    const created = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Skip?", body: "Body", continuationPolicy: "wake_origin_agent",
+      options: [{ id: "skip", label: "Skip", effects: [] }], expiresAt: nearFutureExpiry(),
+    });
+    await expireDecisionNow(created.id);
+
+    await expect(service().dismiss(created.id, decidedByUserId, boardActor(), "Late"))
+      .rejects.toMatchObject({ status: 409, message: "decision_expired" });
+    expect(await service().get(created.id)).toMatchObject({ status: "expired", chosenOptionId: null });
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "expired" }]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "decision.dismissed"))).toHaveLength(0);
+  });
+
+  it("replays a dismissed decision as dismissed when decide is called with its recorded option", async () => {
+    const created = await createCommentDecision();
+    const crashing = decisionService(db, { wakeOriginAgent: async () => { throw new Error("wake down"); } });
+    await expect(crashing.dismiss(created.id, decidedByUserId, boardActor(), "Not needed")).rejects.toThrow("wake down");
+
+    await service().decide({ id: created.id, optionId: "dismissed", decidedByUserId, userActor: boardActor() });
+
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "dismissed", dismissReason: "Not needed" }]);
+    await expect(service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() }))
+      .rejects.toMatchObject({ status: 409 });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toEqual([]);
+  });
+
+  it("re-delivers a pending dismissed continuation when the same user replays the dismissal", async () => {
+    const created = await createCommentDecision();
+    const crashing = decisionService(db, { wakeOriginAgent: async () => { throw new Error("wake down"); } });
+    await expect(crashing.dismiss(created.id, decidedByUserId, boardActor(), "Not needed")).rejects.toThrow("wake down");
+
+    await expect(service().dismiss(created.id, originResponsibleUserId, boardActor(), "Other")).rejects.toMatchObject({ status: 403 });
+    const replayed = await service().dismiss(created.id, decidedByUserId, boardActor(), "Replayed reason");
+
+    expect(replayed).toMatchObject({ status: "decided", chosenOptionId: "dismissed", metadata: expect.objectContaining({ dismissReason: "Not needed" }) });
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "dismissed", dismissReason: "Not needed" }]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "decision.dismissed"))).toHaveLength(1);
+  });
+
+  it("recovers and replays a legacy dismissal as dismissed with its stored reason", async () => {
+    process.env.PAPERCLIP_DECISIONS_RECOVERY_GRACE_MS = "0";
+    const legacy = async (title: string, executionStatus: "running" | "succeeded") => {
+      const created = await service().create({
+        companyId, actor: agentActor(), agentId, runId, title, body: "Body", continuationPolicy: "wake_origin_agent",
+        options: [{ id: "skip", label: "Skip", effects: [] }],
+      });
+      const metadata = (await service().get(created.id))!.metadata as Record<string, unknown>;
+      await db.update(decisions).set({ status: "decided", executionStatus, chosenOptionId: "skip", decidedByUserId, inputValues: {},
+        metadata: { ...metadata, decideIdempotencyKey: null, continuationPending: true, dismissed: true, dismissReason: "Old reason" },
+        updatedAt: new Date(Date.now() - 1_000) }).where(eq(decisions.id, created.id));
+      return created.id;
+    };
+    const stranded = await legacy("Stranded legacy dismissal", "running");
+
+    expect(await service().sweepExpired()).toMatchObject({ resumed: 1 });
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: stranded, outcome: "dismissed", dismissReason: "Old reason" }]);
+
+    const replayedLegacy = await legacy("Replayed legacy dismissal", "succeeded");
+    await service().decide({ id: replayedLegacy, optionId: "skip", decidedByUserId, userActor: boardActor() });
+    expect(wakes.at(-1)).toEqual({ companyId, agentId, issueId: originIssueId, decisionId: replayedLegacy, outcome: "dismissed", dismissReason: "Old reason" });
+  });
+
   it("delivers the continuation when the origin agent cancels a decision", async () => {
     const created = await createCommentDecision();
 

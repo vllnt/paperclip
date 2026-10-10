@@ -23,9 +23,19 @@ type Wake = (input: { companyId: string; agentId: string; issueId: string; decis
 export type DecisionServiceOptions = { wakeOriginAgent: Wake };
 const DAY = 86_400_000;
 
-/** True for a decision that a board user dismissed, including rows written before dismissals stopped naming an option. */
+/**
+ * True for a decision that a board user dismissed. Legacy rows, written before dismissals stopped
+ * naming an option, carry a real option id in `chosen_option_id`; `metadata.dismissed` marks them all.
+ */
 function isDismissed(metadata: unknown): boolean {
   return typeof metadata === "object" && metadata !== null && "dismissed" in metadata && metadata.dismissed === true;
+}
+
+/** The continuation outcome for a terminal decision; a dismissed one is never reported as decided. */
+function continuationOutcome(decision: { status: string; metadata: unknown }): DecisionContinuationOutcome {
+  if (decision.status === "expired") return "expired";
+  if (decision.status === "cancelled") return "cancelled";
+  return isDismissed(decision.metadata) ? "dismissed" : "decided";
 }
 
 function targetIds(options: DecisionOption[]) {
@@ -640,8 +650,21 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
 
   async function resumeDecision(decision: typeof decisions.$inferSelect, userActor: AuthorizationActor) {
     const result = decision.executionStatus === "running" ? await runEffects(decision, userActor) : await outcome(decision.id);
-    await deliverContinuation(result, "decided");
+    await deliverContinuation(result, continuationOutcome(result));
     return outcome(decision.id);
+  }
+
+  /** Expires an open decision whose deadline passed, logs it and wakes the origin agent. Callers then throw `decision_expired`. */
+  async function expireDue(current: typeof decisions.$inferSelect) {
+    const metadata = current.metadata as Record<string, unknown>;
+    const [expired] = await db.update(decisions).set({ status: "expired", updatedAt: new Date(), metadata: { ...metadata, expiredReason: "ttl",
+      ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } })
+      .where(and(eq(decisions.id, current.id), eq(decisions.status, "open"), lte(decisions.expiresAt, new Date()))).returning();
+    if (expired) {
+      await logActivity(db, { companyId: expired.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: expired.originAgentId,
+        runId: expired.originRunId, action: "decision.expired", entityType: "decision", entityId: expired.id, details: { expiredReason: "ttl" } });
+      await deliverContinuation(expired, "expired");
+    }
   }
 
   async function decide(input: { id: string; optionId: string; inputValues?: Record<string, string>; idempotencyKey?: string | null; decidedByUserId: string;
@@ -660,14 +683,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     }
     if (current.status !== "open") throw conflict("decision_already_resolved", { code: "decision_already_resolved" });
     if (current.expiresAt <= new Date()) {
-      const [expired] = await db.update(decisions).set({ status: "expired", updatedAt: new Date(), metadata: { ...metadata, expiredReason: "ttl",
-        ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } })
-        .where(and(eq(decisions.id, current.id), eq(decisions.status, "open"), lte(decisions.expiresAt, new Date()))).returning();
-      if (expired) {
-        await logActivity(db, { companyId: expired.companyId, actorType: "system", actorId: "decision-expiry-sweeper", agentId: expired.originAgentId,
-          runId: expired.originRunId, action: "decision.expired", entityType: "decision", entityId: expired.id, details: { expiredReason: "ttl" } });
-        await deliverContinuation(expired, "expired");
-      }
+      await expireDue(current);
       throw conflict("decision_expired", { code: "decision_expired" });
     }
     if (!current.options.some((option) => option.id === input.optionId)) throw unprocessable("Unknown optionId");
@@ -704,11 +720,22 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
   /**
    * Dismisses an open decision. It never records an option as chosen and never runs an effect, even
    * when an effect-free option exists, so the origin agent cannot read it as a decision. The
-   * continuation outcome is `dismissed`. `_userActor` stays in the signature for the route's call shape.
+   * continuation outcome is `dismissed`. An expired decision is refused like `decide()` refuses it.
+   * A replay by the same user re-delivers a pending continuation with the original reason.
+   * `_userActor` stays in the signature for the route's call shape.
    */
   async function dismiss(id: string, userId: string, _userActor: AuthorizationActor, reason?: string | null) {
     const current = await get(id); if (!current) throw notFound("Decision not found");
     if (!verifyDecisionSpec(spec({ id: current.id, options: current.options, targetSnapshots: current.targetSnapshots as Record<string, Snapshot> }), current.signedSpec)) throw forbidden("Decision signature verification failed");
+    if (current.status === "decided" && isDismissed(current.metadata)) {
+      if (current.decidedByUserId !== userId) throw forbidden("Decision replay belongs to a different user");
+      await deliverContinuation(current, "dismissed");
+      return outcome(id);
+    }
+    if (current.status === "open" && current.expiresAt <= new Date()) {
+      await expireDue(current);
+      throw conflict("decision_expired", { code: "decision_expired" });
+    }
     const [updated] = await db.update(decisions).set({ status: "decided", executionStatus: "succeeded", chosenOptionId: "dismissed", decidedByUserId: userId,
       decidedAt: new Date(), updatedAt: new Date(), metadata: { ...current.metadata, dismissed: true, dismissReason: reason ?? null,
         ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, id), eq(decisions.status, "open"))).returning();
@@ -747,7 +774,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       const recovered = await runEffects(decision, await recoveryActor(decision.companyId, decision.decidedByUserId));
       if (recovered.executionStatus === "running") continue;
       resumed += 1;
-      await deliverContinuation(recovered, "decided");
+      await deliverContinuation(recovered, continuationOutcome(recovered));
     }
     const pendingContinuations = await db.select().from(decisions)
       .where(and(eq(decisions.continuationPolicy, "wake_origin_agent"),
@@ -756,8 +783,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           inArray(decisions.executionStatus, ["succeeded", "partial", "failed"])))))
       .orderBy(asc(decisions.updatedAt)).limit(batchSize);
     for (const decision of pendingContinuations) {
-      await deliverContinuation(decision, decision.status === "expired" ? "expired" : decision.status === "cancelled" ? "cancelled"
-        : isDismissed(decision.metadata) ? "dismissed" : "decided");
+      await deliverContinuation(decision, continuationOutcome(decision));
     }
     const ttlRows = await db.select().from(decisions)
       .where(and(eq(decisions.status, "open"), lte(decisions.expiresAt, now)))
