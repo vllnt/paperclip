@@ -311,7 +311,9 @@ codes that the Store surfaces as a health signal.
 Forking copies an existing skill into a new, independent library entry (optionally with a
 new name, slug, and sharing scope). The fork records what it was forked from, and the
 original's `forkCount` increments. Use this to customize a catalog or community skill
-without losing the ability to see the upstream it came from.
+without losing the ability to see the upstream it came from. If the company that a skill
+was forked from is deleted, the fork keeps its content and only loses that pointer; it
+never stops the other company's delete.
 
 - API: `POST /companies/:companyId/skills/:skillId/fork`
 

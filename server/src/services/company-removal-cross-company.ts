@@ -134,7 +134,6 @@ export const CROSS_COMPANY_REFERENCES: readonly CrossCompanyReference[] = [
   { child: "chat_actions", column: "delivery_id", parent: "chat_deliveries" },
   { child: "chat_message_links", column: "delivery_id", parent: "chat_deliveries" },
   { child: "chat_message_links", column: "publication_id", parent: "chat_publications" },
-  { child: "company_skills", column: "forked_from_company_id", parent: "companies" },
   { child: "company_secret_bindings", column: "secret_id", parent: "company_secrets" },
   { child: "company_secret_proposals", column: "created_secret_id", parent: "company_secrets" },
   { child: "company_secret_proposals", column: "secret_id", parent: "company_secrets" },
@@ -311,6 +310,7 @@ export const CROSS_COMPANY_EXCLUSIONS: readonly CrossCompanyExclusion[] = [
   { child: "decision_effect_executions", column: "decision_id", parent: "decisions", reason: "This is the owner reference. A row belongs to the company of its decision, which is the deleted row." },
   { child: "environment_custom_image_setup_sessions", column: "started_by_agent_id", parent: "agents", reason: "Setup sessions belong to an instance-level environment, not to a company. Only an audit pointer is cleared." },
   { child: "environment_custom_image_templates", column: "created_by_agent_id", parent: "agents", reason: "Templates belong to an instance-level environment, not to a company. Only an audit pointer is cleared." },
+  { child: "company_skills", column: "forked_from_company_id", parent: "companies", reason: "A fork keeps its own content and only records where it came from. Clearing the pointer is the honest result, and refusing the delete would lock the source company in, because it cannot change the fork." },
 ];
 
 /**
