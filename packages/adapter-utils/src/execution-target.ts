@@ -1622,8 +1622,9 @@ export function remoteRunTempDirectory(input: RemoteRunTempLocation): string | n
 // as a real directory and prove the physical path, as the SSH run directory
 // reaper does. A link an agent planted anywhere in the path is never followed:
 // the working directory is an inode, so later commands use names relative to
-// it. `onUnsafe` and `onMissing` run when a link or a non-directory, or a
-// missing directory, is found; with `create`, missing directories are made.
+// it. `onUnsafe` runs when a link or a non-directory is found, `onMissing`
+// when a directory is missing; with `create`, missing directories are made. A
+// directory that exists but cannot be entered fails the script.
 function enterRemoteRunTempDirs(
   root: string,
   dirs: string[],
@@ -1631,14 +1632,17 @@ function enterRemoteRunTempDirs(
 ): string[] {
   const q = shellQuote;
   return [
-    `canon=$(cd -P ${q(root)} 2>/dev/null && pwd -P) || { ${options.onMissing}; }`,
-    `cd -P "$canon" || { ${options.onMissing}; }`,
+    `if [ ! -e ${q(root)} ]; then ${options.onMissing}; fi`,
+    `canon=$(cd -P ${q(root)} && pwd -P) || exit 1`,
+    'cd -P "$canon" || exit 1',
     `for dir in ${dirs.map(q).join(" ")}; do`,
     `  if [ -L "./$dir" ]; then ${options.onUnsafe}; fi`,
-    ...(options.create ? ['  if [ ! -e "./$dir" ]; then mkdir "./$dir" || exit 1; fi'] : []),
-    `  if [ ! -e "./$dir" ]; then ${options.onMissing}; fi`,
+    // Another run may create a shared parent at the same moment; the checks
+    // below decide, not mkdir's status.
+    ...(options.create ? ['  if [ ! -e "./$dir" ]; then mkdir "./$dir" 2>/dev/null; fi'] : []),
+    `  if [ ! -e "./$dir" ] && [ ! -L "./$dir" ]; then ${options.onMissing}; fi`,
     `  if [ -L "./$dir" ] || [ ! -d "./$dir" ]; then ${options.onUnsafe}; fi`,
-    `  cd -P "./$dir" || { ${options.onMissing}; }`,
+    '  cd -P "./$dir" || exit 1',
     "done",
     `if [ "$(pwd -P)" != "$canon"/${q(dirs.join("/"))} ]; then ${options.onUnsafe}; fi`,
   ];
@@ -1647,12 +1651,16 @@ function enterRemoteRunTempDirs(
 /**
  * Creates the per-run temp directory of a remote run with mode `0700`.
  *
+ * @param runner - Runs the command on the target; tests pass a local one.
  * @returns The directory, or `null` when the target is local.
  * @throws When the target's root is not one the SSH run directory reaper
  *   accepts, when a link or a file replaced a directory in its path, or when
  *   the target cannot create it.
  */
-export async function prepareRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<string | null> {
+export async function prepareRemoteRunTempDirectory(
+  input: RemoteRunTempLocation,
+  runner?: CommandManagedRuntimeRunner,
+): Promise<string | null> {
   const layout = remoteRunTempLayout(input);
   if (input.target?.kind !== "remote") return null;
   if (!layout) {
@@ -1666,7 +1674,7 @@ export async function prepareRemoteRunTempDirectory(input: RemoteRunTempLocation
     // BSD chmod reads a `--` after the mode as a file name; `.` needs no `--`.
     "chmod 700 .",
   ].join("\n");
-  const result = await adapterExecutionTargetCommandRunner(input.target).execute({
+  const result = await (runner ?? adapterExecutionTargetCommandRunner(input.target)).execute({
     command: "sh",
     args: ["-c", script],
     cwd: input.target.remoteCwd,
@@ -1692,9 +1700,14 @@ export type RemoteRunTempCleanup = "removed" | "absent" | "symlink";
  * never synced a workspace). Call only once the run's remote process is known
  * to have stopped, before releasing the run's remote environment lease.
  *
- * @throws When the removal fails or times out.
+ * @param runner - Runs the command on the target; tests pass a local one.
+ * @throws When the removal fails or times out, or a directory in the path
+ *   cannot be entered.
  */
-export async function cleanupRemoteRunTempDirectory(input: RemoteRunTempLocation): Promise<RemoteRunTempCleanup> {
+export async function cleanupRemoteRunTempDirectory(
+  input: RemoteRunTempLocation,
+  runner?: CommandManagedRuntimeRunner,
+): Promise<RemoteRunTempCleanup> {
   const layout = remoteRunTempLayout(input);
   if (!layout || input.target?.kind !== "remote") return "absent";
   const entry = `./${layout.entry}`;
@@ -1717,7 +1730,7 @@ export async function cleanupRemoteRunTempDirectory(input: RemoteRunTempLocation
       : []),
     'echo "$outcome"',
   ].join("\n");
-  const result = await adapterExecutionTargetCommandRunner(input.target).execute({
+  const result = await (runner ?? adapterExecutionTargetCommandRunner(input.target)).execute({
     command: "sh",
     args: ["-c", script],
     cwd: input.target.remoteCwd,

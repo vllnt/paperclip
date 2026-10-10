@@ -27268,24 +27268,21 @@ export function heartbeatService(
             latestRun &&
             isHeartbeatRunTerminalStatus(latestRun.status)
           ) {
-            // A remote process that outlived its channel may still use the
-            // directory, so it is removed only once the stop is proven. Without
-            // proof it stays: over SSH the run directory reaper, which checks
-            // liveness, removes it with the run directory.
-            const remoteStopProven =
-              remoteProviderStopped ||
-              (await remoteExecutionHasStopped(db, run.companyId, run.id).catch(() => false));
-            const remoteTempCleanup = remoteStopProven
-              ? await cleanupHeartbeatRemoteRunTemp(remoteRunTempLocation).catch(
-                (err) => {
-                  logger.warn(
-                    { err, runId: run.id },
-                    "failed to remove the remote run temp directory",
-                  );
-                  return null;
-                },
-              )
-              : "stop_unproven";
+            // Without proof that the remote process stopped, the directory
+            // stays for the SSH run directory reaper; a sandbox keeps it until
+            // the sandbox goes away. No dispatched adapter means no process.
+            const remoteTempCleanup = await cleanupHeartbeatRemoteRunTemp({
+              location: remoteRunTempLocation,
+              stopProven:
+                remoteProviderStopped ||
+                !(legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld),
+            }).catch((err) => {
+              logger.warn(
+                { err, runId: run.id },
+                "failed to remove the remote run temp directory",
+              );
+              return null;
+            });
             if (remoteTempCleanup === "stop_unproven" || remoteTempCleanup === "symlink") {
               logger.warn(
                 { runId: run.id, reason: remoteTempCleanup },
