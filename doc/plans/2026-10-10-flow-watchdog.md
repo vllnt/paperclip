@@ -83,19 +83,24 @@ role), a list of statuses `S`, and a duration `N` minutes.
 active run**, and has **made no progress for `N` minutes**.
 
 - *No active run* is the same test that routines use for "live": no heartbeat run in
-  `queued`, `running` or `scheduled_retry` attached to the issue, and no deferred wake.
+  `queued`, `running` or `scheduled_retry` attached to the issue, and no queued or
+  deferred wake. It is evaluated again **under the subject issue's row lock** just
+  before the action (section 6.3).
 - *No progress* is the **progress clock** of section 6.1.2, not `issues.updated_at`.
   System writes touch `updated_at`, so the clock would never run out.
-- The **exemption set** of section 6.1.1 applies, including a pending interaction, an
-  `in_review` participant and a **pending linked approval**. Rule (a) adds one: an issue
-  that an **active task watchdog** already watches.
-- **The minimum `N` is computed, not fixed.** #104's re-dispatch must always go first.
-  Its recent-progress exemption (`STRANDED_RECENT_PROGRESS_EXEMPTION_MS`) is 30 minutes
-  by default, it is set by an environment variable, and it is floored at 60 seconds.
-  So the effective minimum is **twice that value, plus two scheduler ticks** (about 61
-  minutes by default). The API returns the effective minimum, and a rule with a smaller
-  `N` is rejected at save. The check is made again at each evaluation, in case the
-  environment value changed.
+- The **exemption set** of section 6.1.1 applies.
+- **The rule never watches its own output.** A subject is never an issue with the origin
+  kind `flow_watchdog`, and never the issue of any open firing of any rule of the
+  company. Without this, a watchdog issue whose wake was skipped would match the rule
+  again and create a new issue on each cycle. A rule that wants to watch watchdog
+  issues is not allowed in S1; a later opt-in needs its own bound and test.
+- **The minimum `N` is a floor that this plan owns: 60 minutes.** It is a heuristic and
+  not a guarantee. The earlier idea of deriving it from #104's
+  `STRANDED_RECENT_PROGRESS_EXEMPTION_MS` is dropped: #104 uses that constant in one
+  branch only (the repeated productive-continuation branch), and its ordinary stranded
+  dispatch is separate. A guarantee that rests on a constant in another branch breaks
+  when that branch or constant changes. What keeps the two from acting twice is the
+  exemptions and the lock in section 9.2, not the size of `N`.
 - Like #104's pass, the watchdog pass **does not run while scheduling is suppressed**.
 
 **Subject key.** The issue id. Each stuck issue gets its own firing.
@@ -140,9 +145,10 @@ Two sub-kinds, both over a rolling window (default 60 minutes):
 - **`provider_errors`:** at least `K` runs ended with an error code from a closed list
   chosen at rule creation (for example the provider quota and rate-limit codes). The API
   lists the codes seen in the last 7 days.
-- **`failed_rate`:** the **scrap rate** of #106 is above `X` percent, with at least 5
-  runs in the window (the same floor as #106). Restart losses inside a planned drain
-  window are excluded, once #106 defines that window (section 6.6).
+- **`failed_rate`:** #106's **scrap rate** is above `X` percent, with at least 5 runs in
+  the window (#106's floor). It calls #106's measure function and re-derives nothing. A
+  setting says whether #106's `restartLoss` runs count (section 6.6). It ships after
+  #106's measure has landed.
 
 **Fires an issue or a routine only.** It never pauses dispatch (section 9.4).
 
@@ -275,14 +281,14 @@ schema, not by database checks, so a later addition needs no migration.
 | `id`, `company_id` | |
 | `name` | Unique per company among active rules |
 | `kind` | Text. The kinds are a registry in the shared code (section 3.5), not a database check |
-| `enabled` | |
+| `enabled`, `version` | `version` starts at 1 and is bumped by every edit |
 | `params` | jsonb, validated by a discriminated union per kind |
 | `action` | jsonb: `{ type: "issue", ... }` or `{ type: "routine", ... }` (section 7) |
 | `cooldown_minutes` | Default 120. Minimum time between two actions for one firing |
 | `resolve_policy` | `comment` (default), `auto_close`, `none` (section 7.3) |
 | `eval_interval_seconds` | Default 60. Minimum 30 (the scheduler tick) |
 | `next_eval_at`, `claimed_at` | The claim columns (section 6.3) |
-| `last_evaluated_at`, `last_status`, `last_error`, `last_observed` | `last_status` is `ok`, `error`, `truncated` or `skipped_held`. `last_error` is a closed code. `last_observed` holds counts only |
+| `last_evaluated_at`, `last_status`, `last_error`, `last_observed` | `last_status` is `ok`, `error`, `truncated`, `skipped_held` or `unsupported` (a kind this server does not know, section 3.5). `last_error` is a closed code. `last_observed` holds counts only |
 | `created_by_*`, `created_at`, `updated_at`, `archived_at` | |
 
 Indexes: `(company_id, enabled)`, and a partial index on `next_eval_at` for enabled,
@@ -300,10 +306,13 @@ One row per *open clog*, not per evaluation.
 | `opened_at`, `last_fired_at`, `fire_count` | |
 | `cooldown_until` | |
 | `issue_id`, `routine_run_id` | At most one is set. `issue_id` is set null if the issue is deleted |
+| `action_state` | `pending` (set in the firing transaction), `done`, `suppressed:<reason>`, `failed` |
+| `action_attempts` | A counter, at most 5 |
 | `last_wake` | `queued`, or `skipped:<reason>` |
+| `rule_version`, `action_snapshot` | The rule's version and the action as it was when the firing opened (section 7.3) |
 | `last_evidence` | jsonb, closed shape, at most 8 KiB |
 | `clear_streak` | Consecutive evaluations that did not match (section 7.3) |
-| `resolved_at`, `resolve_reason` | `condition_cleared`, `issue_closed`, `rule_disabled`, `rule_archived`, `subject_gone`, `manual` |
+| `resolved_at`, `resolve_reason` | `condition_cleared`, `issue_closed`, `rule_disabled`, `rule_archived`, `rule_edited`, `subject_gone`, `manual` |
 
 Indexes: **a unique partial index on `(rule_id, subject_key) WHERE status = 'open'`**,
 which is the dedup guarantee; `(company_id, opened_at)` for the cap and the list;
@@ -311,9 +320,25 @@ which is the dedup guarantee; `(company_id, opened_at)` for the cap and the list
 
 ### 5.3 `flow_watchdog_settings`
 
-One row per company: `company_id` (primary key), `enabled` (a kill switch), `max_actions_per_hour`
-(default 6, range 1 to 120), `window_started_at`, `window_actions` (the counter for the
-cap, section 7.4), `updated_at`.
+One row per company: `company_id` (primary key), `enabled` (the company kill switch,
+**default false**), `max_actions_per_hour` (default 6, range 1 to 120),
+`window_started_at`, `window_actions` (the counter for the cap, section 7.4),
+`cap_logged_window` (the window for which the cap entry was written, section 7.4),
+`updated_at`.
+
+**Off behavior, defined once.** The watchdog does nothing unless **all three** hold:
+
+1. **The instance experimental flag `enableFlowWatchdog` is on** (default off). It is
+   read once at the top of each pass, with the same accessor as the other experimental
+   flags (`instanceSettingsService(db).getExperimental()`). When off, the pass returns
+   at once: no claim, no evaluation, no recovery retry, no issue, no wake.
+2. **The company has a settings row with `enabled = true`.** A missing row means off.
+3. **The rule is enabled and not archived.**
+
+The claim query joins the settings row (section 6.3), so a company that is off is never
+claimed, whatever the rule says. Turning a switch off or rolling the release back stops
+all new issues, wakes and routine runs. Open firings and their issues stay as they are.
+Nothing is deleted or closed by a switch.
 
 **Why a table and not a column on `companies`.** The cap needs an atomic counter, and a
 counter on the `companies` row would make every watchdog action write that hot row. The
@@ -345,22 +370,40 @@ a waiting state. The list is long on purpose: a false close costs more than a la
 | Exemption | Signal on `main` | Used by |
 |---|---|---|
 | An armed issue monitor or wait | `issues.monitor_next_check_at` is not null | both |
-| An open recovery action of any owner | `issue_recovery_actions` with status `active` or `escalated` | both |
-| A held scope: the routine is paused, or its project, company or assignee agent is paused | `routines.status`, `projects.paused_at`, `companies.paused_at`, `agents.paused_at`; and the holds of #102 once they exist (a hold on any of these scopes) | both |
+| An open recovery action of any owner | `issue_recovery_actions` with status `active` or `escalated` (the feed lists the user and board owned ones) | both |
+| A held scope: the routine is paused, or its project, company or assignee agent is paused; an assignee agent in `error` | `routines.status`, `projects.paused_at`, `companies.paused_at`, `agents.paused_at`, `agents.status = 'error'`; and the holds of #102 once they exist | both |
 | An issue-tree hold | the tree-hold check that automatic recovery already uses | both |
-| **A pending interaction** of any kind | an `issue_thread_interactions` row that is pending | both |
-| **An `in_review` stage with a pending participant** | the issue's execution state: `status = pending` with a current participant | both |
-| **A pending linked approval** | `issue_approvals` joined to `approvals` with `approvals.status = 'pending'`, both company-scoped. Production attention logic reads the same pair when it decides that a review needs a person | both |
-| The assignee is over budget | the budget hard-stop check that wake dispatch already uses | both |
-| A deferred wake waits for the issue's own lock | `agent_wakeup_requests` in `deferred_issue_execution` | both |
+| **A pending interaction** of any kind | `issue_thread_interactions.status = 'pending'` | both |
+| **A pending linked approval** | `issue_approvals` joined to `approvals` with `approvals.status = 'pending'`, both company-scoped | both |
+| **An open decision about the issue** | `decisions.status = 'open'` and `decisions.origin_issue_id` is the issue (feed source `decision`) | both |
+| **A blocker that needs a person** | the issue is `blocked` with a human-owned `unblockDescriptor`, or it is a terminal blocker with a non-live blocker-attention state (feed source `blocker_attention`) | both |
+| **An issue owned by a person** | `issues.assignee_user_id` is set. A user-assigned `in_review` issue is the case the feed lists | both |
+| **A review that needs a person** | `in_review` with a pending human participant, or a **stalled review with no maintained path** (feed source `review`). The feed already shows the stalled review to the board, so closing it would hide it | both |
+| A failed run whose bounded retry is exhausted | the feed source `failed_run` (a person must decide) | both |
+| The assignee is over budget | the budget hard-stop check that wake dispatch already uses (feed source `budget_alert`) | both |
+| An unresolved dependency | the issue is blocked by an open issue (`listDependencyReadiness`) | both |
+| A deferred or queued wake waits for the issue | `agent_wakeup_requests` in `deferred_issue_execution` or `queued` for the issue | both |
 | An active task watchdog watches the issue | `issue_watchdogs` with status `active` | rule (a) only |
-| A conversation issue | `issues.conversation_agent_id` is set, or the origin kind is `chat_channel`. The issue service already refuses `done` and `cancelled` for these (section 6.1.3) | both |
+| **A conversation issue** | `issues.conversation_agent_id` is set, or the origin kind is `chat_channel`. The issue service already refuses `done` and `cancelled` for these (section 6.1.3) | both |
+| **A watchdog issue** | the origin kind is `flow_watchdog` (section 3.1) | rule (a) |
 
-**This list must not drift from the attention feed.** Every source that the attention
-feed treats as "waiting on a person" (a pending interaction, a pending approval, a
-review that needs a human participant, a stalled review) is an exemption. R1 adds a
-conformance test: it lists those sources from the attention code and fails if one has no
-matching exemption. A new kind of governed request is then added in one place.
+**The set is derived from the attention feed, so it cannot drift.** Two mechanisms:
+
+1. **The stall module calls the feed's own readers** for the issue-scoped sources
+   (pending approvals, pending interactions, open decisions, human-owned blockers,
+   reviews that need a person, recovery actions, exhausted retries). It does not copy
+   their predicates. A change to a reader reaches the stall module with no edit here.
+2. **A compile-time table.** The stall module holds
+   `Record<AttentionSourceKind, StallExemption | "not_issue_scoped">`.
+   `ATTENTION_SOURCE_KINDS` is an exported tuple in `packages/shared`, so a new feed
+   source makes this table fail to compile until someone decides how it is handled. The
+   mapping today: `approval` and `issue_thread_interaction` and `decision` and
+   `recovery_action` and `blocker_attention` and `review` and `failed_run` and
+   `budget_alert` and `agent_error_alert` map to the rows above; `join_request` and
+   `productivity_review` (legacy, no feed items) are `not_issue_scoped`.
+
+R1 adds a runtime test too: it seeds one issue for each issue-scoped feed source and
+asserts that `stallExemption` is not `null` for it.
 
 #### 6.1.2 The progress clock, and the clock source
 
@@ -370,17 +413,22 @@ any comment on the issue, an issue status change (read from the activity log, be
 below. A re-dispatch (#104) or a requeued wake is **not** progress. Without that rule, a
 loop of failed wakes would reset the clock for ever.
 
-**The hold-lift floor.** Nothing stores the time a hold ended, but the activity log holds
-enough to be safe. The progress clock never starts before the latest of these entries
-that falls inside the timeout window:
+**The hold-lift floor, bounded.** Nothing stores the time a hold ended, but the activity
+log records the actions that lift one. The progress clock never starts before the latest
+**hold-lift event** that falls inside the timeout window. Only these events count:
 
 - `agent.resumed` for the assignee agent (exact);
 - `company.updated`, `project.updated` or `routine.updated` for the issue's company,
-  project or routine (these cover a resume, and any other edit; reading any of them as a
-  possible lift can only **delay** a close).
+  project or routine, **only if its `details` show that the pause state changed to not
+  paused**. S1 verifies the `details` shape on `main`. If the shape cannot identify a
+  lift, these three are dropped, and only "held now" and `agent.resumed` remain. The
+  known gap is then a tick that waited out a company, project or routine hold.
 
-The lookup uses the `(entity_type, entity_id)` index and a time bound. When #102 lands,
-its lift time replaces this approximation for the holds it covers.
+An ordinary edit of a company or routine is **not** a lift event. So an object that is
+updated often cannot suppress detection: only a pause that is lifted often can, and a
+pause that is on is already an exemption. A test pins this: a routine edited every
+minute still becomes stale. The lookup uses the `(entity_type, entity_id)` index and a
+time bound. When #102 lands, its lift time replaces this approximation.
 
 **The clock source is the database clock.** The step reads `clock_timestamp()` once, at
 the start, and uses that one value for the whole decision. It never mixes in the
@@ -464,18 +512,18 @@ the tables that the exemptions read (`issue_approvals`, `issue_thread_interactio
 `issue_recovery_actions`, `issue_comments`) all have a foreign key to `issues`. Such an
 insert takes a `KEY SHARE` lock on the issue row, and `FOR UPDATE` conflicts with it.
 So an approval or interaction that is created while the close holds the lock waits,
-and one that was committed before is seen by the exemption check. S1 proves both with
+and one that was committed before is seen by the exemption check. S0 proves both with
 race tests.
 
 **The one real hazard: a writer that reads without the lock and writes after the close.**
 Such a writer decided on a row it read earlier, and its update lands after the commit.
 It could move a `cancelled` issue to another status. This hazard exists today for every
 cancel, an operator's included. It is not made worse here, and the list below is the
-audit that S1 starts with.
+audit that S0 starts with.
 
 **Writers of the compared fields.** Found by reading `main` at `d9804ac4f`. The list is
 a **lower bound**: the scan finds a status write only when `status:` appears in the
-`set` object, so a writer that passes a variable is missed. S1 begins with an exhaustive
+`set` object, so a writer that passes a variable is missed. S0 begins with an exhaustive
 audit and a test (below).
 
 | Writer | Fields it changes | Row lock |
@@ -491,7 +539,7 @@ audit and a test (below).
 | Member archive (`access.ts:696`, `708`) | status | Locked in scope by a text scan; verify |
 | Monitor claim, trigger and clear (`heartbeat.ts:11927`, `12153`, `12189`) | the monitor columns and execution state, not `status` | No lock seen. The monitor column is an exemption that is re-read under the close lock |
 
-**S1 prerequisites from this audit (each with its own test):**
+**S0 prerequisites from this audit (each with its own test):**
 
 1. **No unlocked writer may overwrite a terminal status.** Each writer in the table
    without a lock gets `status not in ('done', 'cancelled')` in its `WHERE` predicate
@@ -516,7 +564,7 @@ acting after the close, which is allowed. It is not a leak: it is a new, visible
 A queued run that carries a wake comment or a resume intent is not cancelled by the
 staleness check, for the same reason.
 
-**Tests (S1 of this plan, R1 of #105), on embedded Postgres:**
+**Tests (S0 of this plan, R1 of #105), on embedded Postgres:**
 
 - a wake deferred before the close is cancelled, not promoted, and no run is attached to
   the closed issue;
@@ -558,6 +606,8 @@ issue monitors already use:
 UPDATE flow_watchdog_rules SET claimed_at = now()
  WHERE id IN (SELECT id FROM flow_watchdog_rules
                WHERE enabled AND archived_at IS NULL AND next_eval_at <= now()
+                 AND EXISTS (SELECT 1 FROM flow_watchdog_settings s
+                              WHERE s.company_id = flow_watchdog_rules.company_id AND s.enabled)
                  AND (claimed_at IS NULL OR claimed_at < now() - interval '5 minutes')
                ORDER BY next_eval_at LIMIT :rulesPerPass FOR UPDATE SKIP LOCKED)
 RETURNING *;
@@ -580,6 +630,20 @@ the claim.
 - The firing is created inside one transaction with the unique partial index on
   `(rule_id, subject_key) WHERE status = 'open'`. If two processes did race, the second
   insert fails and its transaction (and its issue) rolls back.
+- **A crash between the firing and the action is recovered.** The firing is committed with
+  `action_state = pending`. The wake or the routine run happens after the commit and sets
+  `done`. Each pass first retries every open firing of an enabled company whose
+  `action_state` is `pending` and that is older than 2 minutes, up to 5 attempts, before
+  it evaluates rules. The retry is safe: the issue wake uses the assignment idempotency
+  key (the issue and its assignee), and the routine run uses the key
+  `flow-watchdog:<firing id>:<fire count>`, so a second attempt returns the first.
+  After 5 attempts the firing becomes `failed`, the rule's `last_status` becomes
+  `error`, and one `flow_watchdog.action_failed` entry is written. A pending firing whose
+  wake was skipped for a hold is `suppressed:<reason>`, not retried.
+- **Before the action, the pass takes the subject issue's row lock and re-checks** the
+  exemptions and "no live run, no queued wake" (section 3.1). If the issue was woken
+  meanwhile (by #104 or a person), the firing is recorded as `suppressed:woken` and the
+  pass opens no second path.
 - A global advisory lock is not needed. (The usage-record worker uses one because it
   writes aggregates. Per-rule claims are finer.)
 
@@ -595,8 +659,24 @@ the claim.
 | Title pattern | At most 200 characters, compiled at save (a test match in a savepoint) |
 
 When a bound cuts the result, `last_status` is `truncated`, the evidence says so, and the
-rule still fires on what it saw. The pattern engine of the database does not backtrack
-catastrophically, and the timeout bounds the rest.
+rule still fires on what it saw.
+
+**The title pattern is restricted and bounded.** The database regular expression engine
+supports back-references, which can take exponential time. So a pattern is validated at
+save: at most 200 characters, **no back-references**, and no group that contains a
+quantifier and is itself quantified (a nested repetition such as `(a+)+`). The test match
+at save runs on a sample with a statement timeout. At run time the pattern is applied
+only to the already bounded rows (500 at most), under the 5 second statement timeout. A
+**pass budget** of 30 seconds bounds the whole pass: when it is spent, the pass stops
+claiming rules and the rest wait for the next tick, and `last_status` of the skipped
+rules does not change. A rule whose query times out twice in a row moves to `error` and
+stops until a person edits it.
+
+**Evidence is rendered safely.** Issue text, titles and comments are written by agents
+and plugins. Evidence and templates never insert them raw. Each field is cut to 200
+characters, placed in a code span or quoted block with the markup escaped, stripped of
+`@` mentions and automatic links, and never rendered as HTML. A template may name only
+the fields of the closed context (section 7.1).
 
 ### 6.5 Query cost and indexes
 
@@ -613,15 +693,23 @@ second budget, the S1 migration adds a partial index for it (Q11).
 
 ### 6.6 Rule (d) and #106
 
-The failed-run rate is #106's **scrap rate**: the runs that ended `failed`, `timed_out` or
-`interrupted`, divided by **every terminal run** finished in the window (#106's `runs`),
-counted by `finished_at`, with at least 5 runs. Cancelled runs are in the denominator and
-not in the numerator. The function is one shared function. If
-#106 has not landed, S1 carries a private copy of the same definition and a test that
-pins it to #106's examples. Restart losses are excluded by their error codes until
-#106's drain window exists. #106's prerequisite F0 (the usage record misses
-`interrupted` runs) matters only if the rule reads the usage record. S1 reads
-`heartbeat_runs` directly, so F0 does not block it.
+Rule (d) has two readings. They have different dependencies.
+
+- **`provider_errors`** counts runs that ended with an error code from a closed list. It
+  does not depend on #106. It is in S1.
+- **`failed_rate`** uses **#106's definitions exactly as they are**, and calls #106's
+  shared measure function. It does not re-derive anything. In #106, scrap is every
+  `failed`, `timed_out` or `interrupted` terminal run, over every terminal run finished
+  in the window, counted by `finished_at`, with at least 5 runs. Restart losses are a
+  **separate report** in #106 (`restartLoss`, with its drain-window rule), not an
+  exclusion inside the scrap rate. So the rule has a setting `restartLoss: include |
+  exclude`. With `include` (the default) it reads `scrap.rate`. With `exclude` it reads
+  `scrap.rate` minus the runs that #106's `restartLoss` classifies, using #106's own
+  classification. The rule never lists restart error codes itself. **`failed_rate`
+  ships after #106's measure function has landed** (S2 or later). Until then it is
+  rejected at save with a clear message. #106's prerequisite F0 (the usage record
+  misses `interrupted` runs) does not block it if the measure reads `heartbeat_runs`
+  directly, as #106 plans.
 
 ### 6.7 Dry run
 
@@ -686,7 +774,18 @@ routine twice.
 
 **What `runRoutine` does not do, and the watchdog must.**
 
-- **It does not stop a paused routine.** `runRoutine` rejects only an archived routine.
+- **It does not stop a paused routine, and a pre-check is not enough.** `runRoutine`
+  rejects only an archived routine, and the "routine is active" check inside the
+  dispatch transaction applies to the webhook and schedule sources only
+  (`routines.ts:1789-1800`). A pause that commits after a watchdog pre-check and before
+  the dispatch would still create and wake a run. So the check must be **inside the
+  dispatch transaction, under the routine row lock**. S2 adds an input flag
+  `requireActive` that `dispatchRoutineRun` honours after it takes that lock: it refuses
+  with a conflict when the routine is not `active`, or when the routine's project is
+  paused, whatever the source. Only the watchdog sets the flag, so a person can still
+  run a paused routine by hand. The pre-check stays, to avoid a wasted call, and the
+  dry run reports both. This is an S2 prerequisite with its own race test (a pause that
+  commits between the pre-check and the dispatch makes no run).
   The "routine is active" check applies to the webhook and schedule sources, and the
   project-pause check is in the scheduler tick. So the watchdog checks the routine's
   `status`, and its project's pause, **before** the call. A paused routine is skipped,
@@ -724,6 +823,14 @@ result (the routine run id and its status) goes to the firing.
 - **If the issue is closed by someone while the condition still holds:** the firing
   resolves with `issue_closed`. A new firing may open after the cooldown, counted from
   the closure. A closed issue means "seen", so the rule does not reopen it.
+- **If a rule is edited while a firing is open.** A rule has a `version`, bumped by every
+  edit. A firing keeps the `rule_version` and the `action_snapshot` it opened with, and
+  uses that snapshot for every later action (the cooldown comment, `auto_close`, the
+  routine fire). An edit to the **kind, the filter, the subject key or the action
+  target** resolves the open firings with `rule_edited` and a comment. The next pass
+  opens a new firing if the subject still matches. An edit to the cooldown or the
+  resolve policy applies to open firings from the next action. No firing is ever
+  applied to a configuration that it did not open under.
 - **If the rule is disabled or archived:** its open firings resolve with `rule_disabled`
   or `rule_archived`, with a comment.
 - **If the subject is deleted or hidden:** `subject_gone`.
@@ -732,6 +839,12 @@ result (the routine run id and its status) goes to the firing.
 
 - **Per-rule cooldown** (`cooldown_minutes`, default 120): the minimum time between two
   actions for one firing.
+- **The cap entry has one durable winner.** When an action meets the cap, the process
+  runs `UPDATE flow_watchdog_settings SET cap_logged_window = window_started_at WHERE
+  company_id = :c AND cap_logged_window IS DISTINCT FROM window_started_at RETURNING`.
+  Only the process that gets a row back writes the `flow_watchdog.cap_reached` entry.
+  The other processes record the suppression and write nothing. A new window starts
+  with a new `window_started_at`, so the next window can log once more.
 - **Company cap** (`max_actions_per_hour`, default 6): an *action* is an issue create, a
   comment or a routine run. The counter lives in the settings row and resets with the
   window. The check and the increment are one atomic update. When the cap is reached,
@@ -803,60 +916,94 @@ The system actor is `flow-watchdog`. The entities are the rule, or the issue.
 
 | Slice | Content | Migration | Lane |
 |---|---|---|---|
-| **S1** | Three tables. The evaluator framework (claim, bounds, firing reconcile, cap). Rules (a) and (d). The issue action. The dry run. API, CLI and web for rules, firings and settings. Activity entries | **Yes** (three tables, the partial unique indexes) | Adds a step to the scheduler tick and creates issues through the wake path. It touches `index.ts` and the issue wake. It does not change `recovery/service.ts` or the reconciler. **Single, in a risky slot** |
-| **S2** | Rule (b) with the `issue_done` and `work_product` sources. Rule (c). The routine action. Agent read of open firings | No | Normal. Reads `heartbeat_runs`, `issues`, `issue_work_products` |
-| **S3** | The `plugin_event` source: one event table, written at the bus choke point | **Yes** (one table) | Touches the plugin bus. Single. Only if S2 is not enough |
-| **Later** | The lane-health kinds (section 3.5). A hold action for rule (d) (section 9.4). XmR breach as a threshold type. Moving #104's reconciler onto the shared stall module | Only if a kind adds a source table | |
+| **S0** | The audit prerequisites of section 6.1.3: a terminal-status guard in the unlocked status writers, the source test that lists the writers, and the conversation-issue exemption. The shared stall module and the atomic close step with their race tests | No | `heartbeat.ts` is touched (the pre-dispatch block writer), so a single |
+| **S1** | Three tables, the experimental flag and the kill switch. The evaluator framework (claim, bounds, firing reconcile, the recovery of pending actions, cap). Rule (a) and rule (d) `provider_errors`. The issue action. Dry run. API, CLI and web | Yes | Risky slot. It adds a scheduler step, creates issues and wakes agents |
+| **S2** | Rule (b) (sources `issue_done`, `external_object`, `work_product`), rule (c), rule (d) `failed_rate` (after #106's measure has landed), the routine action with the `requireActive` dispatch flag, agent read of open firings | No | The dispatch flag touches `routines.ts`. A single |
+| **S3** | The `plugin_event` source: one event table written at the plugin bus | Yes | Single. Only if S2 is not enough |
+| **Later** | Lane-health kinds (section 3.5). A hold action for rule (d) (section 9.4). XmR breach as a threshold. Moving #104's reconciler onto the shared stall module | Only for a new source table | |
 
-### 9.2 Order with #104 and #105
+### 9.2 Order with #104, #105 and the recovery sweeps
 
-When a clog appears, the paths act in this order:
+**Where the pass runs.** The periodic recovery chain in `server/src/index.ts` runs these
+steps one after another: the orphan reaper, `promoteDueScheduledRetries`,
+`resumeQueuedRuns` and the stranded-issue reconciliation (#104), the dependency-wake
+reconciliation, the task-watchdog reconciliation, the silent-active-run scan, and the
+stale-issue-lock sweep (`index.ts:1827-1873`). **The watchdog pass is the last step of
+that chain**, so in one process it sees the result of every sweep before it. It keeps its
+own per-rule claims. Across processes, the per-subject check under the issue lock covers
+what the order cannot.
 
-1. #104 re-dispatches an assigned open issue that has no run, to its owner, within one
-   sweep.
-2. Rule (a) fires after `N` minutes (at least 30) with no progress. It reaches only the
-   clogs that #104 cannot fix: an assignee who cannot be woken, an unassigned issue, a
-   run that is live in status but never starts.
-3. #105 (if the routine has the setting) expires a stuck routine tick. Rule (a) can also
-   see that tick and open an issue about it. The two do not cancel each other: #105
-   acts at dispatch, and the rule only reports.
-
-The shared stall module (section 6.1) makes the three agree on "no progress".
+| Step in the chain | What it does | How rule (a) avoids racing it |
+|---|---|---|
+| Orphan reaper | Ends a `running` run whose process is gone | Rule (a) needs "no live run", so it does not see a running issue. It runs after the reaper |
+| #104 stranded-issue reconciliation | Wakes the **owner** of an assigned, open issue with no live run | A queued wake or an open recovery action is an exemption. The pass re-checks both under the subject issue's row lock (section 6.3). At worst both act once: #104 wakes the owner, and the watchdog opens one issue about the same subject, which the dedup key limits to one. #104's recent-progress constant is **not** relied on (section 3.1) |
+| Dependency-wake reconciliation | Wakes issues whose blockers resolved | An unresolved dependency is an exemption. A resolved one produces a wake, which is the queued-wake exemption |
+| Task-watchdog reconciliation | Opens the task watchdog issue for a watched subtree | An active task watchdog is an exemption for rule (a) |
+| Silent-active-run scan | Reviews a `running` run with no output | Disjoint: rule (a) needs no live run |
+| Stale-issue-lock sweep | Clears a lock that points at a finished run, or a missing run | The pass runs after it in the same chain. The "no active run" test reads run **status**, not the lock columns, so a lock that is not yet cleared does not hide a stall and does not create one. Across processes, the issue-lock re-check settles it |
+| #105 stale-tick expiry | Closes a stuck routine tick at dispatch | #105 closes. Rule (a) only reports. A tick that #105 closed is a closed issue and is no longer a subject. Both use the same close step and exemption set (section 6.1) |
+| #102 holds | A held scope | A hold is an exemption. The hold-lift floor (section 6.1.2) prevents a close right after a lift |
 
 ### 9.3 Tests per slice
+
+**S0**, on embedded Postgres: the audit source test; the terminal-status guard in each
+unlocked writer (a late writer cannot move a closed issue back); the conversation-issue
+exemption; the atomic close step and the exemption conformance test (section 6.1.3 and
+6.1.1); the clock source and the bounded hold-lift floor, including a routine edited
+every minute that still becomes stale (section 6.1.2).
 
 **S1**, on embedded Postgres:
 
 - Rule (a): an issue past `N` with no progress fires once, with an issue assigned to the
-  agent and a wake. **Red at `main`:** nothing fires.
-- Each exemption of section 6.1.1: an armed wait, an open recovery action, a held agent,
-  a tree hold, a pending interaction, an `in_review` participant, a pending linked
-  approval, an exhausted budget, a deferred wake, an active task watchdog. No firing. The
-  conformance test against the attention feed.
-- The atomic close step for `auto_close` (section 6.1.3): the tests listed there.
-- The hold-lift floor: a tick whose agent was resumed inside the window is not stale.
-- A re-dispatch by #104 does not reset the clock.
+  agent and a wake. **Red at `main`:** nothing fires. `N` below the 60 minute floor is
+  rejected at save.
+- **No self-recursion.** A watchdog issue whose wake was skipped is not a subject, and
+  ten evaluations leave one issue.
+- Each exemption of section 6.1.1, one test each, and the conformance test against the
+  attention feed. No firing.
+- A re-dispatch by #104 does not reset the clock. A wake that #104 queued between the
+  evaluation and the action is seen under the issue lock: the firing is
+  `suppressed:woken`, and no second path is opened.
+- The pass runs as the last step of the recovery chain and does nothing while scheduling
+  is suppressed.
+- **Off behavior.** The experimental flag off: no claim, no issue, no wake. A company with
+  no settings row, or `enabled = false`: not claimed. Turning a switch off leaves open
+  firings and issues untouched.
+- **A crash between the firing and the action.** A firing left `pending` is retried by
+  the next pass with the same idempotency key and ends `done`. After 5 attempts it is
+  `failed` and one `action_failed` entry exists.
 - Dedup: 10 evaluations leave exactly one open firing and one issue. A second process
   claiming the same rule at the same time leaves one firing (two-client race).
 - Cooldown: a second fire inside the cooldown only updates the evidence.
-- The cap: the 7th action in the hour is suppressed, and one `cap_reached` entry exists.
+- The cap: the 7th action in the hour is suppressed, and **exactly one** `cap_reached`
+  entry exists even when several processes meet the cap at the same moment.
 - Clear: two clear evaluations resolve the firing with a comment. `auto_close` closes
-  only an untouched issue.
+  only an untouched issue, through the atomic close step.
+- **Rule edits.** An edit of the filter resolves the open firing as `rule_edited`. An
+  edit of the cooldown applies from the next action. A firing keeps its action snapshot.
 - A paused assignee: the issue exists, the wake is skipped, `last_wake` says why. A held
   company: no evaluation.
 - Restart: an overdue rule is evaluated once.
-- Bounds: a seeded dataset past 500 rows gives `truncated`.
-- Rule (d): the scrap rate matches the examples of #106. Under 5 runs, it does not fire.
+- Bounds: a seeded dataset past 500 rows gives `truncated`. A pattern with a
+  back-reference or a nested repetition is rejected at save. The pass budget stops the
+  pass and leaves the rest for the next tick. A rule that times out twice moves to
+  `error`.
+- **Evidence safety.** Issue text with an `@` mention, a link, markup and a very long
+  line is rendered cut, escaped and inert.
+- Rule (d) `provider_errors`: the count and the closed list of codes.
 - Dry run: it matches the real evaluation for the same fixtures and writes nothing.
 - Company scope: a rule and a firing of another company return 404.
 - Validation: a bad template path, a bad pattern, an interval under 30 seconds.
 - OpenAPI listing, CLI parity and the web component tests. The new database tests are
   listed in the pull request body. They cannot join the `Dockerfile` `vitest run` list.
 
-**S2:** the `issue_done` and `work_product` sources (including the never-seen baseline),
-starvation (the free-slot definition equals the scheduler's), the routine action (the
-variables check, the idempotency key, the routine's concurrency policy), the agent read
-of open firings.
+**S2:** the `issue_done`, `external_object` and `work_product` sources (including the
+never-seen baseline); starvation (the free-slot definition equals the scheduler's);
+rule (d) `failed_rate` against #106's examples, with `restartLoss` included and
+excluded; the routine action (the variables check, the idempotency key, the routine's
+concurrency policy); **the pause race: a pause that commits between the pre-check and
+the dispatch makes no run, because `requireActive` is checked under the routine lock**;
+the agent read of open firings.
 
 **S3:** the event table is written once per emit, is company-scoped, and stores no payload.
 
@@ -937,9 +1084,18 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | **Q19** | Lane-health checks from a separate planning effort | They are rule kinds that depend on this plan: two are filters on rule (a), five are new kinds after S1 (section 3.5). The filter set gets `labelIds` and "no assignee" |
 | **Q20** | The existing task watchdog | Keep it. Add "watched by an active task watchdog" as an exemption for rule (a) |
 | **Q21** | A paused or archived routine as a routine-action target | The watchdog checks the routine and its project itself, and skips (section 7.2) |
-| **Q23** | **For the reviewer.** The atomic close contract on what `main` provides: **choice A**, the issue row lock plus a compare of values (`observed`), with no `status_version`. Choice B (a real compare-and-set with a bump at every status writer) is not used | A (section 6.1.3). `status_version` is bumped only for an assignee change or a blocked re-assertion, so it cannot guard a status change. The value compare is correct under the row lock, needs no change to the writers that already lock, and S1 adds a terminal-status guard to the few that do not. The heartbeat cancel stays a separate, existing path; the terminal issue is what makes the later promotion harmless |
+| **Q23** | **For the reviewer.** The atomic close contract on what `main` provides: **choice A**, the issue row lock plus a compare of values (`observed`), with no `status_version`. Choice B (a real compare-and-set with a bump at every status writer) is not used | A (section 6.1.3). `status_version` is bumped only for an assignee change or a blocked re-assertion, so it cannot guard a status change. The value compare is correct under the row lock, needs no change to the writers that already lock, and S0 adds a terminal-status guard to the few that do not. The heartbeat cancel stays a separate, existing path; the terminal issue is what makes the later promotion harmless |
 | **Q24** | The clock source and the hold-lift floor | The database clock, a 5-minute skew guard, and a floor taken from `agent.resumed` and the `*.updated` entries of the company, project and routine (section 6.1.2). #102's lift time replaces it later |
 | **Q22** | A terminated or pending assignee at fire time | Take no action. Record `suppressed: assignee_unavailable` and put the rule in an error state that the rules page shows |
+| **Q25** | **For the reviewer.** Where is the exemption set derived from? | From the attention feed: the stall module calls the feed's readers, and a `Record<AttentionSourceKind, …>` table fails to compile when the feed gains a source (section 6.1.1) |
+| **Q26** | Rule (a) and its own output | A subject is never a `flow_watchdog` issue or the issue of an open firing. No opt-in in S1 (section 3.1) |
+| **Q27** | The floor for `N` | 60 minutes, a floor this plan owns. It is a heuristic and not a guarantee against #104. The guarantee is the exemptions and the issue lock (sections 3.1 and 9.2) |
+| **Q28** | **For the reviewer.** Rule (d) and #106 | Use #106's measure function and definitions as they are. `provider_errors` is S1. `failed_rate` ships after #106's measure has landed (section 6.6) |
+| **Q29** | The routine pause race | An S2 prerequisite: `requireActive` is honoured by `dispatchRoutineRun` under the routine lock, set only by the watchdog (section 7.2) |
+| **Q30** | Off behavior | An instance flag `enableFlowWatchdog` (default off), and a company settings row with `enabled` (a missing row means off). Both are in the claim (section 5.3) |
+| **Q31** | The hold-lift floor | Only real lift events: `agent.resumed`, and the company, project or routine update entries that show an unpause. S1 verifies the `details` shape; if it cannot be read, those three are dropped (section 6.1.2) |
+| **Q32** | A crash between the firing and the action | `action_state = pending`, retried by the next pass with an idempotency key, at most 5 attempts (section 6.3) |
+| **Q33** | The new slice S0 | The shared stall module, the atomic close and the writer audit come first, as a single, because they touch `heartbeat.ts` and are reused by #103 and #105 (section 9.1) |
 
 ## Appendix A. Code anchors on `main` at `d9804ac4f`
 
@@ -977,6 +1133,13 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | Issue create accepts a transaction as the third argument | `server/src/services/issues.ts:9804-9808` |
 | Wake gates in `enqueueWakeup` (budget, invokability, wake policy) | `server/src/services/heartbeat.ts:29038-29070` |
 | `rethrowOnError`, and the swallow when it is not set | `server/src/services/issue-assignment-wakeup.ts:229-235` |
+| Attention feed sources and their entry rules (used for the exemption set) | `server/src/services/attention.ts:1152` (approval), `1255` (interaction), `1313` (decision), `1440` (recovery action), `1502`, `1555` (blockers), `1610-1652` (review, stalled), `1740` (failed run), `1794` (budget), `1848` (agent error); `packages/shared/src/types/attention.ts:8-22` (`ATTENTION_SOURCE_KINDS`) |
+| The recovery chain in the periodic pass (reaper, #104 reconciliation, dependency wakes, task watchdogs, silent-run scan, stale-lock sweep) | `server/src/index.ts:1827-1873` |
+| Experimental flags: the type, the validator, the default, the catalog | `packages/shared/src/types/instance.ts:81`, `packages/shared/src/validators/instance.ts:60`, `server/src/services/instance-settings.ts:240`, `284`, `packages/shared/src/feature-catalog.ts:148` (`enableAgentChat` is the model for `enableFlowWatchdog`) |
+| Dispatch checks the routine is active only for webhook and schedule, inside the routine row lock | `server/src/services/routines.ts:1789-1800`, `2854-2879` |
+| Direct writers of `issues.status` without a row lock seen | `server/src/services/heartbeat.ts:30215`, `server/src/services/agent-conversations.ts:259`, `server/src/services/slack-conversation-lifecycle.ts:91` |
+| #104 (read at head `3777001734`): ordinary stranded dispatch, and the productive-continuation branch that alone uses the 30 minute constant | `server/src/services/recovery/service.ts:4537-4557`, `5407-5417`, `5652-5680` (at that head) |
+| #106 (read at head `87a95007f`): scrap, `restartLoss`, the drain window | `doc/plans/2026-10-10-company-flow-metrics.md:164-176`, `188-215` (at that head) |
 | The comment wake lives in the route; the service comment does not wake | `server/src/routes/issues.ts:17358`, `18233-18236`; `server/src/services/issues.ts:12211` |
 | Pull-request events stored in `external_objects` (`data.mergedAt`, `last_changed_at`) | `server/src/services/github-connection-events.ts:200-260`; `packages/db/src/schema/external_objects.ts` |
 | Recovery progress exemption (an environment value) | `server/src/services/recovery/service.ts:189-192` |
