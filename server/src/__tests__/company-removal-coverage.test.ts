@@ -35,6 +35,8 @@ import {
   toolConnections,
   workAssessments,
   workspaceRuntimeServices,
+  issueDuplicatePairs,
+  judgeUsageDaily,
   chatActions,
   chatConversations,
   chatDeliveries,
@@ -60,6 +62,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { companyService } from "../services/companies.ts";
+import {
+  CROSS_COMPANY_EXCLUSIONS,
+  CROSS_COMPANY_REFERENCES,
+} from "../services/company-removal-cross-company.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -77,6 +83,7 @@ interface ForeignKey {
   parent: string;
   action: string;
   columns: string[];
+  referencedColumns: string[];
   allNotNull: boolean;
 }
 
@@ -87,7 +94,7 @@ interface Violation {
   reason: string;
 }
 
-const CASCADE_COVERED_DELETES = ["chat_teams_file_transfers", "decision_queue_items"];
+const CASCADE_COVERED_DELETES = ["chat_teams_file_transfers", "decision_queue_items", "issue_duplicate_pairs"];
 
 const HEX_DIGEST = "a".repeat(64);
 
@@ -117,6 +124,7 @@ const ADDED_DELETES = [
   "decision_triage_events",
   "decisions",
   "inbox_dismissals",
+  "issue_duplicate_pairs",
   "managed_agent_profiles",
   "native_run_finalizations",
   "native_run_results",
@@ -155,10 +163,17 @@ function recordDeletes(db: Db, statements: string[]): Db {
 }
 
 function readForeignKey(row: Record<string, unknown>): ForeignKey | null {
-  const { child, parent, action, columns, all_not_null: allNotNull } = row;
+  const { child, parent, action, columns, referenced_columns: referencedColumns, all_not_null: allNotNull } = row;
   if (typeof child !== "string" || typeof parent !== "string" || typeof action !== "string") return null;
-  if (!Array.isArray(columns) || typeof allNotNull !== "boolean") return null;
-  return { child, parent, action, columns: columns.map(String), allNotNull };
+  if (!Array.isArray(columns) || !Array.isArray(referencedColumns) || typeof allNotNull !== "boolean") return null;
+  return {
+    child,
+    parent,
+    action,
+    columns: columns.map(String),
+    referencedColumns: referencedColumns.map(String),
+    allNotNull,
+  };
 }
 
 function findViolations(foreignKeys: ForeignKey[], statements: string[]): Violation[] {
@@ -619,6 +634,15 @@ describeEmbeddedPostgres("company removal coverage", () => {
       issueId,
     });
     await db.insert(inboxDismissals).values({ companyId, userId: "user-1", itemKey: "item-1" });
+    await db.insert(issueDuplicatePairs).values({
+      companyId,
+      issueId,
+      candidateIssueId: issueId,
+      lexicalScore: 0.5,
+      verdict: "lexical_only",
+      inputHash: "input-hash",
+    });
+    await db.insert(judgeUsageDaily).values({ companyId, day: "2026-10-10", calls: 1 });
     await db.insert(secretAccessEvents).values({
       companyId,
       provider: "local_encrypted",
@@ -656,6 +680,8 @@ describeEmbeddedPostgres("company removal coverage", () => {
       expect(await countCompanyRows(table, companyId), `${table} rows of the removed company`).toBe(0);
       expect(await countCompanyRows(table, otherCompanyId), `${table} rows of the other company`).toBe(1);
     }
+    expect(await countCompanyRows("judge_usage_daily", companyId), "judge_usage_daily rows of the removed company").toBe(0);
+    expect(await countCompanyRows("judge_usage_daily", otherCompanyId), "judge_usage_daily rows of the other company").toBe(1);
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
   });
 
@@ -665,6 +691,9 @@ describeEmbeddedPostgres("company removal coverage", () => {
         (SELECT array_agg(attribute.attname ORDER BY key.position)
            FROM unnest(constraint_row.conkey) WITH ORDINALITY key(attnum, position)
            JOIN pg_attribute attribute ON attribute.attrelid = constraint_row.conrelid AND attribute.attnum = key.attnum) AS columns,
+        (SELECT array_agg(attribute.attname ORDER BY key.position)
+           FROM unnest(constraint_row.confkey) WITH ORDINALITY key(attnum, position)
+           JOIN pg_attribute attribute ON attribute.attrelid = constraint_row.confrelid AND attribute.attnum = key.attnum) AS referenced_columns,
         (SELECT bool_and(attribute.attnotnull)
            FROM unnest(constraint_row.conkey) key(attnum)
            JOIN pg_attribute attribute ON attribute.attrelid = constraint_row.conrelid AND attribute.attnum = key.attnum) AS all_not_null
@@ -722,6 +751,61 @@ describeEmbeddedPostgres("company removal coverage", () => {
       const violations = findViolations(await readForeignKeys(), await recordRemovalStatements());
 
       expect(violations).toEqual([expect.objectContaining({ child: "zz_future_child", parent: "issues" })]);
+    } finally {
+      await db.execute(sql`DROP TABLE IF EXISTS zz_future_child`);
+    }
+  });
+
+  /**
+   * The keys that the cross-company check must list: cascade or set-null keys into a
+   * table that `remove()` deletes from. A composite key that pairs `company_id` with the
+   * parent's `company_id`, and a `company_id` key to `companies`, cannot reach another
+   * company's rows, so they are left out.
+   */
+  function expectedCrossCompanyKeys(foreignKeys: ForeignKey[], deletedTables: Set<string>): string[] {
+    return foreignKeys
+      .filter((key) => key.action === "c" || key.action === "n")
+      .filter((key) => deletedTables.has(key.parent) && key.child !== key.parent)
+      .filter((key) => !(key.columns.length > 1 && key.columns.includes("company_id") && key.referencedColumns.includes("company_id")))
+      .filter((key) => !(key.columns.length === 1 && key.columns[0] === "company_id" && key.parent === "companies"))
+      .map((key) => `${key.child}.${key.columns.join(",")} -> ${key.parent}`)
+      .sort();
+  }
+
+  function listedCrossCompanyKeys(): string[] {
+    return [...CROSS_COMPANY_REFERENCES, ...CROSS_COMPANY_EXCLUSIONS]
+      .map((entry) => `${entry.child}.${entry.column} -> ${entry.parent}`)
+      .sort();
+  }
+
+  it("lists every cascade or set-null foreign key into a table that remove() deletes from, and no key that is gone", async () => {
+    const statements = await recordRemovalStatements();
+    const expected = expectedCrossCompanyKeys(await readForeignKeys(), new Set(statements));
+    const listed = listedCrossCompanyKeys();
+
+    expect(expected.length).toBeGreaterThan(200);
+    expect(expected.filter((key) => !listed.includes(key)), "keys the list misses").toEqual([]);
+    expect(listed.filter((key) => !expected.includes(key)), "listed keys that no longer exist").toEqual([]);
+    expect(new Set(listed).size, "a key is listed twice").toBe(listed.length);
+    for (const exclusion of CROSS_COMPANY_EXCLUSIONS) {
+      expect(exclusion.reason.length, `${exclusion.child}.${exclusion.column} has a reason`).toBeGreaterThan(20);
+    }
+  });
+
+  it("reports a throw-away table with a cascade key into a deleted table as missing from the list", async () => {
+    await db.execute(sql`
+      CREATE TABLE zz_future_child (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id uuid NOT NULL,
+        issue_id uuid NOT NULL REFERENCES issues (id) ON DELETE CASCADE
+      )
+    `);
+    try {
+      const statements = await recordRemovalStatements();
+      const expected = expectedCrossCompanyKeys(await readForeignKeys(), new Set(statements));
+      const missing = expected.filter((key) => !listedCrossCompanyKeys().includes(key));
+
+      expect(missing).toEqual(["zz_future_child.issue_id -> issues"]);
     } finally {
       await db.execute(sql`DROP TABLE IF EXISTS zz_future_child`);
     }

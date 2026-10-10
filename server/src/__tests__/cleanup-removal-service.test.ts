@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -26,6 +26,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
 import { HttpError } from "../errors.ts";
+import { logger } from "../middleware/logger.js";
 import { companyService } from "../services/companies.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -370,5 +371,63 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(costEvents).where(eq(costEvents.companyId, other.companyId))).resolves.toHaveLength(1);
     await expect(db.select().from(financeEvents).where(eq(financeEvents.companyId, other.companyId))).resolves.toHaveLength(1);
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, other.runId))).resolves.toHaveLength(1);
+  });
+  function companyDeletedEntries(info: ReturnType<typeof vi.spyOn>): unknown[] {
+    return info.mock.calls
+      .map((call) => call[0])
+      .filter((fields) => typeof fields === "object" && fields !== null && Reflect.get(fields, "event") === "company_deleted");
+  }
+
+  it("writes one structured log entry after a company is deleted, with the actor and row counts, and no content", async () => {
+    const { companyId } = await seedFixture();
+    const info = vi.spyOn(logger, "info");
+
+    try {
+      await companyService(db).remove(companyId, { actorUserId: "user-1", actorKeyId: "key-1" });
+
+      const entries = companyDeletedEntries(info);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        event: "company_deleted",
+        companyId,
+        actorUserId: "user-1",
+        actorKeyId: "key-1",
+        rowCounts: { companies: 1, agents: 1, issues: 1, heartbeat_runs: 1 },
+      });
+      const written = JSON.stringify(info.mock.calls);
+      for (const content of ["Paperclip", "CodexCoder", "Regression fixture"]) {
+        expect(written).not.toContain(content);
+      }
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it("writes no deletion log entry when the delete is refused", async () => {
+    const { agentId, companyId, runId } = await seedFixture();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other Company",
+      issuePrefix: `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId: otherCompanyId,
+      runId,
+      agentId,
+      seq: 1,
+      eventType: "output",
+      message: "event with mismatched company scope",
+    });
+    const info = vi.spyOn(logger, "info");
+
+    try {
+      await expect(companyService(db).remove(companyId, { actorUserId: "user-1" })).rejects.toBeInstanceOf(HttpError);
+
+      expect(companyDeletedEntries(info)).toHaveLength(0);
+    } finally {
+      info.mockRestore();
+    }
   });
 });

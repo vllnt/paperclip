@@ -2099,6 +2099,8 @@ registry.registerPath({
   path: "/api/companies/{companyId}",
   tags: ["companies"],
   summary: "Delete a company",
+  description:
+    "Deletes the company and every row it owns, in one transaction. Returns 409 and deletes nothing when a row of another company would be deleted or changed (`details.code` is `company_delete_cross_company_references`, with `details.references` as a list of `{ table, count }`), or when a row still blocks the delete (`details.table` and `details.blockingRows`). The response names no ids, companies or content. A successful delete writes one `company_deleted` server log entry with the actor and the row count per table.",
   request: { params: z.object({ companyId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
