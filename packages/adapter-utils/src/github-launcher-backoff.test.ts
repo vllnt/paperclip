@@ -21,6 +21,9 @@ const BASE_STEPS = [1000, 2000, 4000, 8000];
 type Behavior = "409" | "timeout" | "refused" | "ok";
 type Brokered = { response: { status: number; ok: boolean }; result: unknown } | null;
 type Call = { url: string; startedAt: number; endedAt: number };
+type Failure = Error & { diagnostic?: string };
+/** What one brokerPost ended with: an answer, or the error it threw. */
+type Outcome = { value?: Brokered; error?: Failure };
 
 /** The launcher's brokerPost, unchanged, with a scripted `fetch`, the fake clock, and a chosen jitter. */
 type Script = Behavior[] | ((call: number, url: string) => Behavior);
@@ -62,8 +65,8 @@ async function run(script: Script, options: { jitter?: number; env?: Record<stri
   const { brokerPost, calls } = brokerPostWith(script, options.jitter ?? 0.999999);
   const begun = Date.now();
   const settled = brokerPost(options.env ?? direct, "/runtime-tools/github/credentials", "{}").then(
-    (value): { value: Brokered } => ({ value }),
-    (error: unknown): { error: Error & { diagnostic?: string } } => ({ error: error as Error & { diagnostic?: string } }),
+    (value): Outcome => ({ value }),
+    (error: unknown): Outcome => ({ error: error as Failure }),
   );
   await vi.runAllTimersAsync();
   const outcome = await settled;
@@ -253,6 +256,46 @@ describe("a real launcher process", () => {
       expect(JSON.parse(result.stdout)).toEqual({ token: null });
       expect(result.stderr).not.toMatch(/host-token|run-capability/);
     } finally { await busy.cleanup(); }
+  }, 60_000);
+
+  // The end-to-end case of the route tests above, with the real launcher and the real fetch: in a sandbox the bridge is the
+  // route that works and the broker address does not answer. The bridge does not answer the first request within the
+  // launcher's 10 s limit, and answers the second.
+  it.concurrent("keeps asking the sandbox's bridge after it timed out once, while the broker address is unreachable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-bridge-"));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({token:process.env.GH_TOKEN ?? null}));', { mode: 0o700 });
+    let bridgeRequests = 0;
+    const bridge = createServer((_req, res) => {
+      bridgeRequests++;
+      if (bridgeRequests === 1) return; // never answered: the launcher's own 10 s limit ends it
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "bridge-token" } }));
+    });
+    await new Promise<void>(resolve => bridge.listen(0, "127.0.0.1", resolve));
+    const bridgePort = (bridge.address() as { port: number }).port;
+    // A port that nothing listens on: the broker address of the sandbox does not resolve or accept connections.
+    const closed = createServer();
+    await new Promise<void>(resolve => closed.listen(0, "127.0.0.1", resolve));
+    const brokerPort = (closed.address() as { port: number }).port;
+    await new Promise<void>(resolve => closed.close(() => resolve()));
+    try {
+      const result = await exec(path.join(bin, "gh"), ["pr", "view", "1"], { env: {
+        ...hostEnv, ...githubBrokerEnvironment({ GH_TOKEN: "host-token" }, { url: `http://127.0.0.1:${brokerPort}`, token: "run-capability" }),
+        PAPERCLIP_API_BRIDGE_MODE: "1", PAPERCLIP_API_URL: `http://127.0.0.1:${bridgePort}`,
+        PATH: `${bin}:${realBin}:${process.env.PATH}`,
+      } });
+
+      expect(JSON.parse(result.stdout)).toEqual({ token: "bridge-token" });
+      expect(bridgeRequests).toBe(2);
+      expect(result.stderr).not.toContain("broker_transport_unavailable");
+      expect(result.stderr).not.toMatch(/host-token|run-capability/);
+    } finally {
+      await new Promise<void>(resolve => { bridge.closeAllConnections(); bridge.close(() => resolve()); });
+      await rm(root, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it.concurrent("says it again after the command fails, so the cause is not left to the command's own message", async () => {
