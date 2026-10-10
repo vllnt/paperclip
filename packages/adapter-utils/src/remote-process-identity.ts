@@ -300,7 +300,11 @@ export function createRemoteRunMarker(): RemoteRunMarker {
 /** The file a stop leaves in a run's record directory; a launch that finds it does not start. */
 export const REMOTE_RUN_STOPPED_MARK = "stopped";
 
-/** The note a launch leaves when its record name was taken; the run's stop reports it as `unsafe_record_dir`. */
+/**
+ * Names the note a refused launch leaves, `<launchId>.refused.<random>`: an
+ * empty directory that the run's stop reports as `unsafe_record_dir`. Any
+ * entry whose name holds it makes a later launch of the run refuse.
+ */
 export const REMOTE_RUN_REFUSED_MARK = "refused";
 
 /**
@@ -314,7 +318,8 @@ export const REMOTE_RUN_REFUSED_MARK = "refused";
  * dangling link included), write a temporary file create-exclusive and
  * publish it with the `link` utility of `trusted_tool`, on names that must be
  * free. They exit with 125 when the directory cannot be pinned, a name is
- * taken (they leave a `refused` note for the stop), no such `link` exists, or
+ * taken or a refusal note is already there (both leave a note of their own
+ * for the stop, see {@link REMOTE_RUN_REFUSED_MARK}), no such `link` exists, or
  * the record is not a regular file afterwards or, on a worker with `/proc`,
  * does not read back as the stop reads it. When the run was stopped
  * meanwhile, they delete their own record and exit 143.
@@ -355,12 +360,16 @@ export function buildRemoteRunRecordLines(input: {
     `  pin_record_dir ${input.remoteRoot} ${shellQuote(input.runId)} || { echo "[paperclip] The run's process record directory on the worker is not a real directory owned by the worker user, so the run was not started." >&2; exit 125; }`,
     // A run that was already stopped gets no record at all.
     `  if [ -e ${REMOTE_RUN_STOPPED_MARK} ] || [ -L ${REMOTE_RUN_STOPPED_MARK} ]; then exit 143; fi`,
-    // The note tells the run's stop why there is no record. mkdir never
-    // follows an existing name.
-    `  refuse_taken() { mkdir -- ${REMOTE_RUN_REFUSED_MARK} 2>/dev/null; echo "[paperclip] The run's process record name was already taken on the worker, so the run was not started." >&2; exit 125; }`,
+    // The note tells the run's stop why there is no record: an empty
+    // directory named after this launch, with a random suffix that nothing
+    // can take beforehand. mktemp never follows an existing name.
+    `  refuse_unsafe() { mktemp -d ${input.launchId}.${REMOTE_RUN_REFUSED_MARK}.XXXXXXXXXX >/dev/null 2>&1; echo "[paperclip] $1 on the worker, so the run was not started." >&2; exit 125; }`,
+    // A refusal note that is already there, left by an earlier launch or
+    // planted, in any form, makes the directory unsafe.
+    `  for paperclip_entry in *${REMOTE_RUN_REFUSED_MARK}* .*${REMOTE_RUN_REFUSED_MARK}*; do if [ -e "$paperclip_entry" ] || [ -L "$paperclip_entry" ]; then refuse_unsafe "The run's process record directory already held a refusal note"; fi; done`,
     // The launch id is visible in the remote command, so anything may already
     // be at the record's names: refuse rather than write through it.
-    `  if [ -e ${record} ] || [ -L ${record} ] || [ -e ${record}.tmp ] || [ -L ${record}.tmp ]; then refuse_taken; fi`,
+    `  if [ -e ${record} ] || [ -L ${record} ] || [ -e ${record}.tmp ] || [ -L ${record}.tmp ]; then refuse_unsafe "The run's process record name was already taken"; fi`,
     `  paperclip_link="$(trusted_tool link)" || { echo "[paperclip] The worker has no link utility in /usr/bin or /bin that only root can change, so the run was not started." >&2; exit 125; }`,
     // Readers never see a half-written record: write a tmp file, then publish
     // it with link(2), which fails on any existing name and never follows one
@@ -373,7 +382,7 @@ export function buildRemoteRunRecordLines(input: {
     `  } > ${record}.tmp ) 2>/dev/null && "$paperclip_link" ${record}.tmp ${record} 2>/dev/null && paperclip_record_written=1`,
     `  rm -f -- ${record}.tmp 2>/dev/null`,
     // Something took the name between the check and link(2).
-    `  [ -n "$paperclip_record_written" ] || { [ ! -e ${record} ] && [ ! -L ${record} ]; } || refuse_taken`,
+    `  [ -n "$paperclip_record_written" ] || { [ ! -e ${record} ] && [ ! -L ${record} ]; } || refuse_unsafe "The run's process record name was already taken"`,
     // A launch that no stop could find must not start. Where the stop can
     // work (with /proc), the record must read back exactly as the stop reads
     // it; elsewhere the stop fails closed whatever the record holds.
@@ -429,9 +438,10 @@ const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
  * Nothing is signalled without a valid record, when the record directory
  * cannot be pinned (`unsafe_record_dir`), or when `/proc`, `awk`, `grep`, `tr`
  * or `sha256sum` is missing in `/usr/bin` and `/bin`, the only tools it uses;
- * the summary names the reason. A launch refused because its record name was
- * taken leaves a `refused` note, which makes the stop `unsafe_record_dir`
- * too. It never matches
+ * the summary names the reason. A launch refused for an unsafe record
+ * directory leaves a note, which makes the stop `unsafe_record_dir` too; only
+ * a note in that exact form counts, and the stop removes nothing else (see
+ * {@link REMOTE_RUN_REFUSED_MARK}). It never matches
  * command lines. Inside the pinned directory it leaves a stop mark first,
  * create-exclusive (see {@link buildRemoteRunRecordLines}); a mark it cannot
  * leave makes the stop partial (`no_stop_mark`). It deletes the records it
@@ -465,6 +475,16 @@ export function buildRemoteProcessTreeStopLines(input: {
     ...PIN_RECORD_DIR_LINES,
     ...RECORD_FIELDS_LINES,
     "note() { [ -n \"$partial\" ] || partial=$1; }",
+    // A refused launch's note: `<launch id>.refused.<10 random>`, a real empty
+    // directory of the worker user, as mktemp made it. rmdir never follows a
+    // link and removes only an empty directory, so nothing else is touched.
+    "is_refusal_note() {",
+    `  case $1 in *[!0-9A-Za-z.]*) return 1 ;; esac`,
+    `  rn_launch=\${1%%.${REMOTE_RUN_REFUSED_MARK}.*}; rn_rand=\${1#*.${REMOTE_RUN_REFUSED_MARK}.}`,
+    `  [ "$rn_launch.${REMOTE_RUN_REFUSED_MARK}.$rn_rand" = "$1" ] && [ -n "$rn_launch" ] && [ "\${#rn_rand}" -eq 10 ] || return 1`,
+    "  case $rn_launch$rn_rand in *[!0-9A-Za-z]*) return 1 ;; esac",
+    "  [ -d \"$1\" ] && [ ! -L \"$1\" ] && [ \"$(ls -dn -- \"$1\" 2>/dev/null | awk '{print $3}')\" = \"$me\" ]",
+    "}",
     `before_signal() { ${input.testOnlyBeforeSignal ?? ":"}; }`,
     // Sets st_state, st_pgrp and st_start without a fork: the scan calls it often.
     "read_stat() {",
@@ -526,8 +546,8 @@ export function buildRemoteProcessTreeStopLines(input: {
     "}",
     // Work only inside the pinned record directory, by relative names.
     `pinned=; if pin_record_dir ${input.remoteRoot} ${shellQuote(input.runId)}; then pinned=1; else note unsafe_record_dir; fi`,
-    // A launch of the run was refused because its record name was taken.
-    `[ -z "$pinned" ] || { [ ! -e ${REMOTE_RUN_REFUSED_MARK} ] && [ ! -L ${REMOTE_RUN_REFUSED_MARK} ]; } || { note unsafe_record_dir; rmdir -- ${REMOTE_RUN_REFUSED_MARK} 2>/dev/null || rm -f -- ${REMOTE_RUN_REFUSED_MARK} 2>/dev/null; }`,
+    // A launch of the run refused because the directory was unsafe.
+    `[ -z "$pinned" ] || for f in *.${REMOTE_RUN_REFUSED_MARK}.*; do is_refusal_note "$f" && rmdir -- "$f" 2>/dev/null && note unsafe_record_dir; done`,
     // Leave the stop mark before reading any record: a launch that has not
     // written its record yet will find the mark and not start. A subshell
     // keeps a failed redirection from ending the script.

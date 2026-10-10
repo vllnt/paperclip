@@ -134,8 +134,11 @@ again before `SIGKILL`; `SIGKILL` and the final count use only what the first
 scan found. Both the launch and the stop work only inside that directory after
 checking that each part is a real directory owned by the worker user, never a
 link (`unsafe_record_dir` otherwise, and the launch does not start). A launch
-whose record name is already taken does not start either; it leaves a `refused`
-note there, so the run's stop reports `unsafe_record_dir` too. The launch writes
+whose record name is already taken, or that finds a refusal note already there,
+does not start either. It leaves a note of its own: an empty directory named
+after the launch with a random suffix. The run's stop reports
+`unsafe_record_dir` for a note in exactly that form, and leaves any other entry
+alone. The launch writes
 its record before any login profile runs and the stop sources none: both use
 only the tools in `/usr/bin` and `/bin`, and the launch publishes its record
 with a `link` from there that only root can change, or does not start. The stop

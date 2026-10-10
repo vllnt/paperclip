@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash as sha256Hash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { chmod, chown, copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -148,6 +148,27 @@ async function stop(run: Run, extra: Partial<Parameters<typeof buildRemoteProces
   const lines = buildRemoteProcessTreeStopLines({ remoteRoot: quote(run.root), runId: run.runId, termWaitSeconds: 1, ...extra });
   const { stdout } = await execFileAsync("sh", ["-c", lines.join("\n")], { timeout: 30_000 });
   return parseRemoteProcessTreeStopSummary(stdout);
+}
+
+type Plant = (at: string, victim: string) => Promise<unknown>;
+
+/** What may already sit at a `refused` name: each kind the review planted. */
+const REFUSED_FORMS: Array<[string, Plant]> = [
+  ["a regular file", (at) => writeFile(at, "planted\n")],
+  ["a directory holding a file", async (at) => {
+    await mkdir(at);
+    await writeFile(path.join(at, "inner"), "planted\n");
+  }],
+  ["a link to a directory outside", (at, victim) => symlink(victim, at)],
+  ["a link to a file outside", (at, victim) => symlink(path.join(victim, "file"), at)],
+  ["a dangling link", (at, victim) => symlink(path.join(victim, "missing", "x"), at)],
+];
+
+/** A directory outside the record directory, holding one file. */
+async function outsideVictim(): Promise<string> {
+  const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+  await writeFile(path.join(victim, "file"), "outside\n");
+  return victim;
 }
 
 async function settle() {
@@ -688,6 +709,91 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(await readFile(path.join(victim, "file"), "utf8")).toBe("outside\n");
     // The run's stop reports the refusal, not a missing record.
     expect((await stop(runOf(root, runId)))?.partial).toBe("unsafe_record_dir");
+  }, 30_000);
+
+  it.each(REFUSED_FORMS.map(([label, plant]): [string, string, Plant] => [`${label} named \`refused\``, "refused", plant]))(
+    "does not start a launch when %s is already in the record directory", async (_label, name, plant) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const run = runOf(root, randomUUID());
+    const victim = await outsideVictim();
+    await mkdir(run.dir, { recursive: true });
+    await plant(path.join(run.dir, name), victim);
+
+    const launch = await runLaunch({ root, runId: run.runId, command: "echo started" });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    expect(await recordNames(run)).toEqual([]);
+    // The stop reports the launch's own note and leaves the planted entry alone.
+    expect((await stop(run))?.partial).toBe("unsafe_record_dir");
+    await expect(lstat(path.join(run.dir, name))).resolves.toBeDefined();
+    expect(await readdir(victim)).toEqual(["file"]);
+    expect(await readFile(path.join(victim, "file"), "utf8")).toBe("outside\n");
+  }, 30_000);
+
+  it("does not start a launch after an earlier launch of the run was refused", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const run = runOf(root, randomUUID());
+    await mkdir(path.join(run.dir, "0123456789abcdef.refused.abcdefghij"), { recursive: true });
+
+    const launch = await runLaunch({ root, runId: run.runId, command: "echo started" });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    // Both notes are real refusals: the stop reports them and removes them.
+    expect((await readdir(run.dir)).filter((name) => name.includes(".refused."))).toHaveLength(2);
+    expect((await stop(run))?.partial).toBe("unsafe_record_dir");
+    expect((await readdir(run.dir)).filter((name) => name.includes(".refused."))).toEqual([]);
+  }, 30_000);
+
+  it.each([
+    ...REFUSED_FORMS.map(([label, plant]): [string, string, Plant] => [`${label} named \`refused\``, "refused", plant]),
+    ["a note-shaped directory holding a file", "0123456789abcdef.refused.abcdefghij", async (at: string) => {
+      await mkdir(at);
+      await writeFile(path.join(at, "inner"), "planted\n");
+    }] as [string, string, Plant],
+    ["a note-shaped link to an empty directory outside", "0123456789abcdef.refused.abcdefghij", async (at: string, victim: string) => {
+      await mkdir(path.join(victim, "empty"));
+      await symlink(path.join(victim, "empty"), at);
+    }] as [string, string, Plant],
+  ])("does not take %s as a refused launch, and leaves it alone", async (_label, name, plant) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const run = runOf(root, randomUUID());
+    expect((await runLaunch({ root, runId: run.runId, command: "echo started" })).code).toBe(0);
+    const victim = await outsideVictim();
+    await plant(path.join(run.dir, name), victim);
+    const outside = await readdir(victim);
+
+    const summary = await stop(run);
+
+    expect(summary).toMatchObject({ records: 1, partial: null });
+    await expect(lstat(path.join(run.dir, name))).resolves.toBeDefined();
+    expect(await readdir(victim)).toEqual(outside);
+  }, 30_000);
+
+  it("never takes or removes another run's refusal note", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const refusedRun = runOf(root, randomUUID());
+    await mkdir(refusedRun.dir, { recursive: true });
+    const refused = await runLaunch({
+      root,
+      runId: refusedRun.runId,
+      command: "echo started",
+      beforeSpawn: async (remoteScript) => {
+        const launchId = /([0-9a-f]{16})\.json/.exec(remoteScript)?.[1];
+        await mkdir(path.join(refusedRun.dir, `${launchId}.json`));
+      },
+    });
+    expect(refused.code).toBe(125);
+    const notes = (await readdir(refusedRun.dir)).filter((name) => /^[0-9a-f]{16}\.refused\.[0-9A-Za-z]{10}$/.test(name));
+    expect(notes).toHaveLength(1);
+    const other = runOf(root, randomUUID());
+    expect((await runLaunch({ root, runId: other.runId, command: "echo started" })).code).toBe(0);
+
+    expect((await stop(other))?.partial).toBeNull();
+    expect(await readdir(refusedRun.dir)).toContain(notes[0]);
+    expect((await stop(refusedRun))?.partial).toBe("unsafe_record_dir");
+    expect(await readdir(refusedRun.dir)).not.toContain(notes[0]);
   }, 30_000);
 
   it("leaves no record behind when a launch finds the run already stopped, so the stop mark can age out", async () => {
