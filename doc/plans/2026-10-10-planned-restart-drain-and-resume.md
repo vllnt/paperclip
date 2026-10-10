@@ -330,18 +330,55 @@ path that finalizes the run honours it:
      whose stop is not proven goes to the `reconciliation` class: no resume,
      because the provider may still be working and the same work could run twice.
      The caller records this outcome and does not surface the conflict as an error;
-   - re-reads the run and the issue. If the run ended `cancelled` by another writer
-     (an agent pause, a budget stop), it is `operator_stop`. If the issue lock no
-     longer points at the run, or a successor already exists, it is `superseded`.
-     Neither gets a resume, and step 4 releases as today for that ending;
-   - classifies the run (section 4.5);
-   - when it is `resumed`, schedules the resume. `scheduleBoundedRetryForRun` moves
-     the issue lock to the resume row in the same transaction that creates it
-     (`executionRunId` set to the resume, only where it still points at the
-     stopped run), so the resume's claim keeps it and the stale-lock sweep leaves it
-     (the resume is not terminal). This matches the shutdown loop's rule today
-     (release only when no retry was made);
-   - otherwise releases the issue with `suppressImmediateRecovery: true`.
+   - then makes the decision in **one atomic step** (below).
+
+   **The atomic decision step.** It reuses the atomic close pattern of the flow
+   watchdog plan (#113, section 6.1.3): one transaction, under the issue row lock,
+   with a compare-and-set, and the action inside the same transaction. It does not
+   define a second locking scheme. In order:
+
+   1. **Lock.** Open one transaction and take the issue row `FOR UPDATE` through the
+      wake-queue's `withIssueExecutionLock` (the lock that `releaseIssueExecution`
+      takes for every release today, `use-cases.ts:1024-1029` at `d47df97f0`), then
+      the stopped run's row.
+   2. **Re-validate under the lock.** Read `issues.status_version`,
+      `issues.executionRunId`, the run's status and `resultJson.plannedRestartStop`,
+      and any existing successor of the run (`retryOfRunId`). Then decide:
+      - the marker already has `decidedAt`: another decider won; roll back and do
+        nothing;
+      - the run ended `cancelled` by another writer (an agent pause, a budget stop):
+        `operator_stop`;
+      - `executionRunId` is no longer the stopped run, or a successor already
+        exists: `superseded`;
+      - otherwise the class of section 4.5, using the stop proof above.
+   3. **Act, in the same transaction:**
+      - `resumed`: insert the `planned_restart_resume` row (through
+        `scheduleBoundedRetryForRun`, which must accept the caller's transaction),
+        and move the lock to it with
+        `UPDATE issues SET executionRunId = resume WHERE id = issue AND
+        executionRunId = stoppedRun AND status_version = <read value>`. **If that
+        update matches zero rows, the transaction rolls back: no successor exists**,
+        and the decider retries the step once; the second read then classifies
+        `superseded`. Today `scheduleBoundedRetryForRun` inserts the successor and
+        returns `scheduled` even when its final lock update matches zero rows
+        (`heartbeat.ts:16912-16941` at `d47df97f0`); D1 changes it to roll back in
+        that case, for every caller, because a successor without the lock is the
+        same defect wherever it comes from;
+      - `native`: apply, under the same lock, the one effect that the gated native
+        writer recorded instead of applying (section 4.2.1);
+      - every other class: run the release drain (`runReleaseDrain`) inside the same
+        lock callback, with `suppressImmediateRecovery: true`, exactly as
+        `releaseIssueExecution` does today;
+      - set `plannedRestartStop.decidedAt` and `decision` on the run.
+   4. **Commit.** The decision, the successor or the release, and the marker commit
+      together. Post-commit effects (live events, wake dispatch) run after the
+      commit, as they do for `releaseIssueExecution` today.
+
+   **Crash safety.** A crash before the commit leaves nothing written: the marker is
+   still undecided and the lock still points at the stopped (terminal) run. After the
+   restart, the fallbacks of section 5.3 run **the same atomic step**, with the same
+   proof rule. A crash after the commit leaves a complete decision. No state exists
+   in which the marker says "decided" and the release or the successor is missing.
 
    **Undecided.** If the wait for the adapter times out (`waitForAdapterStop`
    gives up after 60 seconds and throws), the caller does not decide: no resume and
@@ -352,16 +389,16 @@ path that finalizes the run honours it:
 5. **Clear** the intent from the map after step 4. The durable marker in
    `resultJson` stays.
 
-So the resume is always the first successor, it holds the issue lock from the
-moment it exists, it exists only when the stop is proven, and the ending is the
-same whichever path wins. Section 9 tests both
+So the resume is always the first successor, it exists only together with the
+issue lock and only when the stop is proven, the decision commits with its action,
+and the ending is the same whichever path wins. Section 9 tests both
 branches.
 
 #### 4.2.1 Every path that can end a run or release its issue
 
 The intent must hold against every writer, not only the two branches of
-`cancelRunInternal`. On `main` at `d47df97f0`, `heartbeat.ts` has 21 call sites
-of `releaseIssueExecutionAndPromote` and several functions that write a terminal
+`cancelRunInternal`. On `main` at `d47df97f0`, `heartbeat.ts` has 19 call sites
+of `releaseIssueExecutionAndPromote` (Appendix B lists them) and several functions that write a terminal
 status on a live run. Gating each caller would miss the next one. So the plan
 gates two choke points that every one of them passes through, and states how the
 rest behave.
@@ -396,6 +433,10 @@ cannot write the first successor.
 | Shutdown loop (`drainRunningRunsForShutdown`, `:15494`; release `:15663`) | ends the run, schedules a retry or releases | inside a drain it is a planned-restart finalizer (below); otherwise unchanged. Retry at B, release at A |
 | Reaper (`reapOrphanedRuns`, `:20098`; release `:20570`) | ends `running` rows whose process is gone | the deadline runs in a live process, so the reaper sees only runs of an older boot; A and B still apply |
 | Other release callers (`:21228`, `:21269`, `:21300` in recovery passes; `:22128`, `:22146`, `:22160`, `:24413`, `:24905` inside `executeRunAttempt` on dispatch failure, reset or abort) | release on dispatch, reset, repair or abort outcomes | A |
+| Native runtime, terminal failure (`native-runtime/native-session-executor.ts:8975-8984`) | clears `executionRunId` and `checkoutRunId` in its own transaction when a native run fails terminally | **gated**: while the run's marker is undecided, it records the clear as the marker's `deferredEffect` and does not apply it; step 4 applies it under the lock when the class is `native` |
+| Native runtime, status decision `release_checkout` (`native-runtime/status-decision-committer.ts:1468-1485`) | clears both run ids and the lock fields | **gated** the same way |
+| Native restart recovery (`native-runtime/native-restart-recovery.ts:843-862`) | clears `executionRunId` where it still points at the run | **gated** the same way; after a restart, an undecided marker sends the run to the fallback of section 5.3, which runs the atomic step |
+| Native safe replacement (`native-runtime/native-safe-replacement.ts:390-419`) | inserts its own queued successor wake (`native-safe-replacement:<runId>`) | **gated**: while the marker is undecided it inserts nothing and records the replacement as the `deferredEffect`; step 4 inserts it under the lock when the class is `native`, so it is the only successor |
 | Writers that clear `issues.executionRunId` without promotion: issue status and assignee changes (`issues.ts`), tree holds (`issue-tree-control.ts`), membership removal (`access.ts`), watchdog, run dispatch, recovery resolution, execution-control reconciliation | clear the lock as part of an operator or domain action | not gated: the operator action wins. Step 4 re-reads the issue; if the lock no longer points at the stopped run, it classifies the run `superseded` and schedules nothing. The retry row's lock transfer is already conditional on the old holder (`:16916`) |
 | New wakes from `enqueueWakeup` (comments, assignments, timers) | a new request, not a successor of this run (no `retryOfRunId`) | not gated: during a drain they stay queued behind the lock |
 | Operator-chosen successors: resolving a recovery action (`execution-recovery-resolution.ts:263`), an authorized chat retry (`chat-channels.ts`) | an operator decision | not gated: an operator action wins, as today; step 4 then finds the successor and classifies `superseded` |
@@ -550,27 +591,32 @@ the `general` JSON: that is settings, not events, and it has no history.
 
 | Class | Test | What happens |
 |---|---|---|
-| `resumed` | legacy run, has an `issueId`, and `legacyExecutionNeedsReconciliationWithEvidence` is false (a conversation-continuation adapter, or the provider never started) | one `planned_restart_resume` retry (below) |
+| `resumed` | legacy run, has an `issueId`, has a **proven stop**, and `legacyExecutionNeedsReconciliationWithEvidence` is false. That gate is false for a conversation-continuation adapter, and for **any** adapter whose provider never started | one `planned_restart_resume` retry (below) |
 | `reconciliation` | legacy run for which that gate is true, or any run whose stop is not proven | the recovery that applies to a restart-orphaned run (below). A planned restart does **not** bypass it: the run's tool actions may already have happened, and nothing proves otherwise |
 | `operator_stop`, `superseded` | another writer ended the run or took the issue first (section 4.2.1) | nothing from this plan; the operator's action stands |
-| `native` | `runtimeMode: "native"` (not the native runner) | its own fenced same-run recovery, unchanged |
+| `native` | `runtimeMode: "native"` (not the native runner) | its own recovery, unchanged in kind: the effect its native writer recorded (a lock release or a safe replacement) is applied by the atomic step, so it cannot race the decision |
 | `no_issue` | no `issueId` (a timer heartbeat) | nothing; the next timer tick covers it |
 
-**The decided restart rule (#99 and #104).** The manager decided the conflict
-between #99 and #104 (landing order **#74 → #99 → #104**). For a run orphaned by a
-restart:
+**The restart rule, stated once.** It is the manager's decision on #99 and #104
+(landing order **#74 → #99 → #104**), plus one case this plan adds first:
 
-- a **conversation adapter** gets the bounded transient retry (2 attempts), then
-  the issue goes to `blocked` (#104);
-- **every other adapter** keeps #99's one stable board-owned hold.
+1. **Proven stop, and the reconciliation gate is false** (a conversation adapter,
+   or any adapter whose provider never started): the `planned_restart_resume`,
+   which does not spend the failure budget.
+2. **Otherwise, a conversation adapter** (no proof, or the gate is true): #104's
+   continuation recovery. At #104's head `3777001734f` this is the bounded
+   continuation retry, capped by `CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS`
+   (**3** at that head, `recovery/service.ts:546`, used at `:742-748`), then
+   `blocked`. D1 classifies `planned_restart` the way #104 classifies
+   `server_shutdown_interrupted`; it does not add a second cap. #104 is still in
+   review: D1 re-reads the constant and the classification at #104's merged head,
+   and its test asserts the cap through the constant, not a literal.
+3. **Otherwise** (an adapter that is not a conversation adapter, whose provider
+   started): #99's one stable board-owned hold.
 
-This plan follows that rule and adds one case before it: a `planned_restart` run
-with a **proven stop** whose reconciliation gate allows a retry gets the
-`planned_restart_resume`, which does not spend the failure budget. In practice
-those are conversation adapters, plus runs that never started. Every other
-`planned_restart` run, and every run whose stop is not proven, gets the decided
-rule above: a conversation adapter gets #104's bounded retry, and any other
-adapter gets #99's hold. The `reconciliation` row of the table means exactly that.
+Rule 1 is checked first, so a proven never-started run of any adapter is resumed:
+it did no work, so running it again cannot repeat an action. The
+`reconciliation` row of the table means rules 2 and 3.
 
 Chat-completion deliveries keep their own bounded retry. The status and the drain
 row count the classes, so the operator sees how much work needed a hold. The
@@ -765,7 +811,7 @@ normal retry event, in the run's own company.
 
 | Slice | Content | Depends on |
 |---|---|---|
-| **D1** | `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the deadline stop through `cancelRunInternal` with the planned-restart stop intent honoured by both finalize paths (section 4.2), and the shutdown ending inside a drain; the two choke points of section 4.2.1; `planned_restart` code, its consumers and the cause-rules bump; the run classes with the decided restart rule; the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries | #74, #99 and #104 merged |
+| **D1** | `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the deadline stop through `cancelRunInternal` with the planned-restart stop intent honoured by both finalize paths (section 4.2), and the shutdown ending inside a drain; the two choke points of section 4.2.1; `planned_restart` code, its consumers and the cause-rules bump; the run classes with the restart rule; the atomic decision step and the rollback of `scheduleBoundedRetryForRun` on a moved lock; the gates on the four native writers; the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries | #74, #99 and #104 merged |
 | **D2** | Startup classification of runs killed during a drain (section 5.2); `orphaned_running_run` cause mapping; `stop_grace_period` in `deploy/compose.yaml` (question Q9) | D1 |
 
 **Order: #74 → #99 → #104 → D1 → D2.** D1 depends on all three:
@@ -774,6 +820,10 @@ normal retry event, in the run's own company.
 - the `reconciliation` class hands runs to #99's stable hold and to #104's bounded
   retry, so both behaviours must be on `main` for D1's tests to assert them;
 - the stranded-sweep wiring of section 5.3 edits the sweep that #104 changes.
+
+**D1 and D2 are heartbeat core.** Each needs concurrency tests for operator races,
+native finalization, restart classification and the no-proof path (section 9), and
+lands in a risky window, single.
 
 D2 depends on D1. D1 is useful alone: the deploy job can drain, and the runs end
 clean and resume.
@@ -812,11 +862,24 @@ D1, embedded Postgres unless noted:
   neither releases nor resumes the interrupt until step 4; (e) an issue closed or reassigned during the deadline stop makes step
   4 classify `superseded` and schedule nothing. For each: at most one successor
   exists, and when it exists it is the `planned_restart_resume`.
-- **The decided restart rule, across PRs** (after #99 and #104 are on `main`): a
-  `planned_restart` conversation-adapter run with a proven stop gets the
-  `planned_restart_resume`, not #104's bounded retry; with no proof it gets #104's
-  bounded retry, then `blocked`; a non-conversation run gets #99's stable hold
-  whether or not the stop is proven.
+- **The restart rule, across PRs** (after #99 and #104 are on `main`), one test per
+  rule of section 4.5: (1) a conversation-adapter run with a proven stop, and a
+  process-adapter run that never started, each get the `planned_restart_resume`;
+  (2) a conversation-adapter run with no proof gets #104's continuation recovery up
+  to its constant's cap, then `blocked`; (3) a process-adapter run whose provider
+  started gets #99's stable hold, with or without a proof.
+- **Atomic step** (section 4.2): (a) an operator clears the issue lock between the
+  decider's proof check and its transaction: the lock update matches zero rows, the
+  transaction rolls back, no successor exists, and the retry classifies
+  `superseded`; (b) two deciders race: exactly one commits, the other sees
+  `decidedAt` and does nothing; (c) a crash injected after the successor insert and
+  before the commit: no successor, marker undecided, and the startup fallback
+  decides it; (d) `scheduleBoundedRetryForRun` called by any other caller with a
+  lock that moved rolls back instead of returning `scheduled`.
+- **Native writers**, one test each (section 4.2.1): a native run stopped at the
+  deadline that then fails terminally, gets a `release_checkout` decision, is seen
+  by restart recovery, or qualifies for safe replacement: nothing clears the lock
+  and no successor appears before step 4; step 4 applies the recorded effect once.
 - **No promotion into the lock.** An issue with a parked deferred wake: after the
   deadline stop, the wake is still parked and the lock is not held by a new run;
   after the restart, the resume runs first.
@@ -855,8 +918,12 @@ D1, embedded Postgres unless noted:
 - Web: the banner shows and hides (desktop and mobile widths, no console errors),
   the control starts and lifts a drain.
 - Tests that do not need embedded Postgres go on the Dockerfile `vitest run` list.
-  The embedded-Postgres suites cannot run as root in the image build; they follow
-  the shared non-root CI job proposed as #74's follow-up F1.
+  The embedded-Postgres suites cannot run there: the build stage runs `vitest` as
+  root (no `USER` before it), and embedded Postgres refuses root. No CI job runs them
+  today. D1 adds one: a job in the existing CI workflow, on a hosted runner as a
+  non-root user, that runs the D1 and D2 embedded-Postgres suites by name
+  (question Q15). Until it exists, the captain's review runs them, as for every
+  heartbeat-core change today.
 
 D2:
 
@@ -914,11 +981,6 @@ D2:
   schedule `planned_restart_resume` for a `planned_restart` predecessor with a proven
   stop (section 5.3); otherwise the sweep applies #104's decided rule. Choke point B
   and the `retryOfRunId` dedup prevent a double successor.
-- **Q14. A board pause or budget stop that races the deadline?** Recommend: the
-  first terminal write wins, as today. If the operator's write wins, the run is
-  `operator_stop`: no resume, and its release runs at step 4 with today's options,
-  so the deferred wake is promoted only once and only after the decision
-  (section 4.2.1).
 - **Q8. Drain state on `GET /api/health`?** Recommend: no. The health route is
   public. The deploy job uses the authorized `GET /api/instance/task-drain`.
 - **Q9. `stop_grace_period` in `deploy/compose.yaml`?** Recommend: set it in D2 to
@@ -942,6 +1004,16 @@ D2:
 - **Q13. A `planned_restart` start on an open `manual` drain?** Recommend: upgrade it
   (section 4.1), so a deploy that finds an operator's drain still gets a deadline
   and a clean ending. The upgrade is logged with `upgradedFrom`.
+- **Q14. A board pause or budget stop that races the deadline?** Recommend: the
+  first terminal write wins, as today. If the operator's write wins, the run is
+  `operator_stop`: no resume, and its release runs at step 4 with today's options,
+  so the deferred wake is promoted only once and only after the decision
+  (section 4.2.1).
+- **Q15. Where do the embedded-Postgres suites run in CI?** Recommend: D1 adds one
+  non-root job that runs them by name, kept small (the D1 and D2 suites, plus the
+  deferred-wake suites, which have the same gap). Alternative: keep them local and in
+  the captain's review only, which is today's practice and leaves the heartbeat-core
+  races without a CI gate.
 
 ## Appendix A. Code anchors on `main` at `38819d350`
 
@@ -994,3 +1066,25 @@ about 30 to 50 lines; names are unchanged.
 | Instance CLI group | `cli/src/commands/client/access.ts:265-283` |
 | Compose: no stop grace period | `deploy/compose.yaml:4`, `:40-45` |
 | Hot-restart path | `cli/src/commands/service.ts:204`; `index.ts:2005-2007` |
+
+## Appendix B. The 19 call sites of `releaseIssueExecutionAndPromote` (`main` at `d47df97f0`)
+
+`server/src/services/heartbeat.ts`, definition at `:28464`. Every call passes through
+choke point A (section 4.2.1).
+
+| Line | Where |
+|---|---|
+| `:15663` | shutdown loop (`drainRunningRunsForShutdown`), when no retry was made |
+| `:17161` | `finalizeAiConnectionBusyDeferral` |
+| `:17266` | `finalizeWorkspaceBusyDeferral` |
+| `:17944` | `cancelQueuedRunForHeartbeatDailyCap` |
+| `:20570` | reaper (`reapOrphanedRuns`) |
+| `:21228`, `:21269`, `:21300` | recovery passes |
+| `:22128`, `:22146`, `:22160`, `:24413`, `:24905` | `executeRunAttempt`: dispatch failure, reset, abort |
+| `:27492`, `:27924`, `:28198` | executor ending paths |
+| `:28439` | executor late path in `finally` |
+| `:31794` | `cancelRunInternal` |
+| `:31879` | `cancelActiveForAgentInternal` |
+
+The wake-queue `releaseIssueExecution` (`modules/wake-queue/application/use-cases.ts:1024`)
+has one production caller: the definition above.
