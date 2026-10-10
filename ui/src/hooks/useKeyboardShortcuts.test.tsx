@@ -11,16 +11,16 @@ import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 function TestHarness({
   onNewIssue,
   onSearch,
-  onGoToInbox,
+  onRunChord,
 }: {
   onNewIssue: () => void;
   onSearch?: () => void;
-  onGoToInbox?: () => void;
+  onRunChord?: (actionId: string) => void;
 }) {
   useKeyboardShortcuts({
     onNewIssue,
     onSearch,
-    onGoToInbox,
+    onRunChord,
   });
 
   return <div>keyboard shortcuts test</div>;
@@ -175,26 +175,87 @@ describe("useKeyboardShortcuts", () => {
 
   it("navigates to the inbox on the g \u2192 i chord", () => {
     const root = createRoot(container);
-    const onGoToInbox = vi.fn();
+    const onRunChord = vi.fn();
     const onNewIssue = vi.fn();
 
     act(() => {
-      root.render(<TestHarness onNewIssue={onNewIssue} onGoToInbox={onGoToInbox} />);
+      root.render(<TestHarness onNewIssue={onNewIssue} onRunChord={onRunChord} />);
     });
 
     // Bare "i" does nothing.
     pressKey("i");
-    expect(onGoToInbox).not.toHaveBeenCalled();
+    expect(onRunChord).not.toHaveBeenCalled();
 
     pressKey("g");
     const chordEvent = pressKey("i");
-    expect(onGoToInbox).toHaveBeenCalledTimes(1);
+    expect(onRunChord).toHaveBeenCalledTimes(1);
+    expect(onRunChord).toHaveBeenCalledWith("nav.inbox");
     expect(chordEvent.defaultPrevented).toBe(true);
 
     // Chord disarms after firing.
     pressKey("i");
-    expect(onGoToInbox).toHaveBeenCalledTimes(1);
+    expect(onRunChord).toHaveBeenCalledTimes(1);
     expect(onNewIssue).not.toHaveBeenCalled();
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("runs each catalog g chord", () => {
+    const root = createRoot(container);
+    const onRunChord = vi.fn();
+
+    act(() => {
+      root.render(<TestHarness onNewIssue={vi.fn()} onRunChord={onRunChord} />);
+    });
+
+    const expected: Array<[string, string]> = [
+      ["d", "nav.dashboard"],
+      ["t", "nav.tasks"],
+      ["a", "nav.agents"],
+      ["p", "nav.projects"],
+      ["o", "nav.goals"],
+      ["r", "nav.routines"],
+      ["v", "nav.approvals"],
+      ["e", "nav.activity"],
+      ["m", "nav.costs"],
+      ["s", "nav.settings"],
+      ["k", "nav.skills"],
+    ];
+    for (const [key, actionId] of expected) {
+      pressKey("g");
+      expect(pressKey(key).defaultPrevented).toBe(true);
+      expect(onRunChord).toHaveBeenLastCalledWith(actionId);
+    }
+    expect(onRunChord).toHaveBeenCalledTimes(expected.length);
+
+    // An unknown second key disarms without running anything.
+    pressKey("g");
+    expect(pressKey("z").defaultPrevented).toBe(false);
+    pressKey("d");
+    expect(onRunChord).toHaveBeenCalledTimes(expected.length);
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("keeps a chord armed when the host re-renders with new handlers", () => {
+    const root = createRoot(container);
+    const onRunChord = vi.fn();
+
+    act(() => {
+      root.render(<TestHarness onNewIssue={() => {}} onRunChord={onRunChord} />);
+    });
+
+    pressKey("g");
+    // The layout passes inline handlers, so any re-render gives new identities.
+    act(() => {
+      root.render(<TestHarness onNewIssue={() => {}} onRunChord={onRunChord} />);
+    });
+    expect(pressKey("d").defaultPrevented).toBe(true);
+    expect(onRunChord).toHaveBeenCalledWith("nav.dashboard");
 
     act(() => {
       root.unmount();
@@ -203,11 +264,11 @@ describe("useKeyboardShortcuts", () => {
 
   it("swallows armed chord keys instead of firing bare shortcuts", () => {
     const root = createRoot(container);
-    const onGoToInbox = vi.fn();
+    const onRunChord = vi.fn();
     const onNewIssue = vi.fn();
 
     act(() => {
-      root.render(<TestHarness onNewIssue={onNewIssue} onGoToInbox={onGoToInbox} />);
+      root.render(<TestHarness onNewIssue={onNewIssue} onRunChord={onRunChord} />);
     });
 
     // g \u2192 c is the issue-detail focus-comment chord; globally it must not
@@ -215,7 +276,7 @@ describe("useKeyboardShortcuts", () => {
     pressKey("g");
     pressKey("c");
     expect(onNewIssue).not.toHaveBeenCalled();
-    expect(onGoToInbox).not.toHaveBeenCalled();
+    expect(onRunChord).not.toHaveBeenCalledWith("nav.inbox");
 
     // Bare "c" still creates.
     pressKey("c");
