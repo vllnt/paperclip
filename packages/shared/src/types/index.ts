@@ -904,6 +904,7 @@ export type {
   AgentTaskSession,
   AgentWakeupRequest,
   DeferredWakeAgentStats,
+  DeferredWakeParkedBreakdown,
   DeferredWakeStats,
   DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
