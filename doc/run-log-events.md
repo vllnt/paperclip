@@ -287,6 +287,15 @@ waiting retry cancelled at its ceiling has `errorCode: provider_quota_exhausted`
 and reads `Provider capacity retries stopped: the chain reached its retry
 ceiling while waiting for the provider.`
 
+While the run's provider lane is in quota state, a run that must wait for the
+lane's probe stays `queued` and gets one lifecycle event, `Waiting on provider
+capacity: the provider is at capacity, so one run of it probes at a time; this
+run starts when a probe succeeds`, with `providerQuotaKey`, `nextProbeAt`,
+`probeInFlight` and `laneRetryWaiting`. Its context gets
+`providerQuotaWaitingSince`. The run chosen as the probe gets
+`providerQuotaProbe: true` and `providerQuotaKey` in its context; failed probes
+set the lane backoff.
+
 Bounded retry exhaustion writes one lifecycle receipt per run, retry reason,
 scheduled attempt, and retry limit. Repeated or concurrent recovery checks reuse
 that receipt, including receipts from earlier builds, without advancing the event

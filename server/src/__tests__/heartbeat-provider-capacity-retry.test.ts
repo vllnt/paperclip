@@ -532,15 +532,36 @@ describeEmbeddedPostgres("provider capacity retries", () => {
   });
 
   /** Two issues of one company fail at capacity; returns their retries, oldest chain first. */
+  /**
+   * Two chains whose first run failed at capacity, the second a minute after
+   * the first. The failed runs are written directly: once the lane is in quota
+   * state, a second assignment would wait on the first chain's probe instead
+   * of starting its own chain.
+   */
   async function twoWaitingRetries(secondModel?: string) {
     const first = await seed();
     const second = await seedAnotherAssignee(first.companyId);
     if (secondModel) {
       await db.update(agents).set({ adapterConfig: { model: secondModel } }).where(eq(agents.id, second.agentId));
     }
-    script = [{ kind: "capacity" }, { kind: "capacity" }];
-    await assign(first.agentId, first.issueId);
-    await assign(second.agentId, second.issueId);
+    const failedAt = Date.now() - 2 * MINUTE_MS;
+    for (const [index, chain] of [first, second].entries()) {
+      const failedRunId = randomUUID();
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, chain.issueId));
+      await db.insert(heartbeatRuns).values({
+        id: failedRunId, companyId: first.companyId, agentId: chain.agentId,
+        invocationSource: "assignment", triggerDetail: "system",
+        status: "failed", errorCode: "provider_quota", error: CAPACITY_MESSAGE,
+        startedAt: new Date(failedAt + index * MINUTE_MS), finishedAt: new Date(failedAt + index * MINUTE_MS + 1_000),
+        resultJson: {
+          errorFamily: "provider_quota", providerQuotaBeforeUsefulAction: true,
+          conversationContinuation: "continue_conversation_v1",
+        },
+        contextSnapshot: { issueId: chain.issueId, taskId: chain.issueId, wakeReason: "issue_assigned" },
+      });
+      expect(await heartbeat.scheduleBoundedRetry(failedRunId, { random: () => 0.5 }))
+        .toMatchObject({ outcome: "scheduled" });
+    }
     const retries = await db.select().from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, first.companyId), eq(heartbeatRuns.status, "scheduled_retry")))
       .orderBy(asc(heartbeatRuns.createdAt));
@@ -653,4 +674,57 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     expect(held?.status).toBe("scheduled_retry");
     expect(held!.scheduledRetryAt!.getTime() - bothDue.getTime()).toBe(61 * MINUTE_MS);
   });
+
+  it("coalesces every run of a lane in quota state behind one probe per backoff interval", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    // One company, one adapter and model, 100 fresh chains: the first fails at
+    // capacity, then 99 more issues are assigned while the lane is in quota state.
+    const { companyId, agentId, issueId } = await seed({ maxConcurrentRuns: 100 });
+    const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies).where(eq(companies.id, companyId));
+    script = [{ kind: "capacity" }];
+    await assign(agentId, issueId);
+    expect(executedRunIds).toHaveLength(1);
+
+    const freshIssueIds: string[] = [];
+    for (let index = 0; index < 99; index += 1) {
+      const freshIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: freshIssueId, companyId, title: `Fresh task ${index}`, status: "todo", priority: "medium",
+        responsibleUserId: "responsible-user", assigneeAgentId: agentId,
+        issueNumber: index + 2, identifier: `${company!.issuePrefix}-${index + 2}`,
+      });
+      freshIssueIds.push(freshIssueId);
+    }
+    script = Array.from({ length: 200 }, () => ({ kind: "capacity" as const }));
+    for (const freshIssueId of freshIssueIds) await assign(agentId, freshIssueId);
+
+    // No fresh assignment reached the provider: each waits on the lane's probe.
+    expect(executedRunIds).toHaveLength(1);
+    const waiting = (await companyRuns(companyId)).filter((run) => run.status === "queued");
+    expect(waiting).toHaveLength(99);
+    const waitingEvents = await db.select({ runId: heartbeatRunEvents.runId }).from(heartbeatRunEvents)
+      .where(and(eq(heartbeatRunEvents.companyId, companyId), like(heartbeatRunEvents.message, "Waiting on provider capacity%")));
+    expect(new Set(waitingEvents.map((event) => event.runId)).size).toBe(99);
+
+    // Within the backoff interval nothing else probes.
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(executedRunIds).toHaveLength(1);
+
+    // The probe fails: still one probe, and no waiting chain spent a retry.
+    script = [{ kind: "capacity" }, ...Array.from({ length: 200 }, () => ({ kind: "capacity" as const }))];
+    expect((await runPendingRetry(companyId))?.status).toBe("failed");
+    expect(executedRunIds).toHaveLength(2);
+    expect((await companyRuns(companyId)).filter((run) => run.status === "queued")).toHaveLength(99);
+    expect((await companyRuns(companyId)).filter((run) => run.status === "failed")).toHaveLength(2);
+    expect((await companyRuns(companyId)).filter((run) => run.status === "scheduled_retry")).toHaveLength(1);
+
+    // The next probe succeeds: the lane leaves quota state and the waiting runs go.
+    script = [];
+    expect((await runPendingRetry(companyId))?.status).toBe("succeeded");
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    const released = (await companyRuns(companyId)).filter((run) => waiting.some((held) => held.id === run.id));
+    expect(released.map((run) => run.status)).toEqual(Array.from({ length: 99 }, () => "succeeded"));
+  }, 600_000);
 });

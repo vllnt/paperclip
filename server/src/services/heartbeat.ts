@@ -2149,6 +2149,36 @@ export function computeProviderQuotaRetrySchedule(input: {
 }
 
 /**
+ * How long a provider lane in quota state waits after its latest quota failure
+ * before the next probe: the chain backoff (1, 2, 4 … minutes up to 30, then
+ * the hourly cadence past the backoff window) for probe number
+ * `failedProbes + 1`, without jitter. The per-chain ceilings do not apply: the
+ * lane keeps probing, one run at a time, until the provider answers.
+ *
+ * @returns The delay in milliseconds.
+ */
+export function computeProviderQuotaLaneProbeDelayMs(input: {
+  failedProbes: number;
+  lastFailureAt: Date;
+  stateStartedAt: Date;
+  policy: ProviderQuotaRetryPolicy;
+}) {
+  return (
+    computeProviderQuotaRetrySchedule({
+      attempt: Math.max(0, Math.floor(input.failedProbes)) + 1,
+      now: input.lastFailureAt,
+      chainStartedAt: input.stateStartedAt,
+      policy: {
+        ...input.policy,
+        maxTotalAttempts: Number.MAX_SAFE_INTEGER,
+        maxRetryMs: Number.MAX_SAFE_INTEGER,
+      },
+      random: () => 0.5,
+    })?.baseDelayMs ?? PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS
+  );
+}
+
+/**
  * The checks that need no database: a failed legacy run in the
  * provider_quota family whose model returned no output. Native runs are
  * excluded because native recovery owns their retries.
@@ -15630,6 +15660,197 @@ export function heartbeatService(
   }
 
   /**
+   * Quota state of the agent's provider lane (company, adapter and model). The
+   * lane is in quota state while its latest provider outcome (a succeeded,
+   * failed or timed-out legacy run of any agent on the lane) is a
+   * provider_quota failure. Any other outcome means the provider answered and
+   * ends the state. `nextProbeAt` follows the lane backoff over the failed
+   * probes since the state began; `probeInFlight` is a running lane run or a
+   * queued run already chosen as the probe; `laneRetryWaiting` is a scheduled
+   * retry of a lane chain, whose promotion the coalescing sweep paces.
+   */
+  async function readProviderQuotaLaneState(
+    agent: typeof agents.$inferSelect,
+    excludeRunId: string,
+    client: Db = db,
+  ) {
+    const laneKey = providerQuotaKeyForAgent(agent);
+    const laneAgentIds = (
+      await client
+        .select({ id: agents.id, adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
+        .from(agents)
+        .where(eq(agents.companyId, agent.companyId))
+    )
+      .filter((candidate) => providerQuotaKeyForAgent(candidate) === laneKey)
+      .map((candidate) => candidate.id);
+    const laneRuns = and(
+      eq(heartbeatRuns.companyId, agent.companyId),
+      inArray(heartbeatRuns.agentId, laneAgentIds),
+      eq(heartbeatRuns.runtimeMode, "legacy"),
+    );
+    const providerOutcome = and(
+      inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out"]),
+      isNotNull(heartbeatRuns.finishedAt),
+    );
+    const [latest] = await client
+      .select({ errorCode: heartbeatRuns.errorCode, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(and(laneRuns, providerOutcome))
+      .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
+      .limit(1);
+    if (!latest?.finishedAt || latest.errorCode !== "provider_quota") {
+      return { laneKey, inQuotaState: false as const };
+    }
+    const [boundary] = await client
+      .select({ finishedAt: sql<Date | null>`max(${heartbeatRuns.finishedAt})` })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        providerOutcome,
+        sql`${heartbeatRuns.errorCode} is distinct from 'provider_quota'`,
+      ));
+    const boundaryAt = boundary?.finishedAt ? new Date(boundary.finishedAt) : null;
+    const [stats] = await client
+      .select({
+        failedProbes: sql<number>`count(*) filter (where ${heartbeatRuns.contextSnapshot} ->> 'providerQuotaProbe' = 'true')::integer`,
+        stateStartedAt: sql<Date | null>`min(${heartbeatRuns.finishedAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        eq(heartbeatRuns.status, "failed"),
+        eq(heartbeatRuns.errorCode, "provider_quota"),
+        boundaryAt ? gt(heartbeatRuns.finishedAt, boundaryAt) : undefined,
+      ));
+    const lastFailureAt = new Date(latest.finishedAt);
+    const delayMs = computeProviderQuotaLaneProbeDelayMs({
+      failedProbes: Number(stats?.failedProbes ?? 0),
+      lastFailureAt,
+      stateStartedAt: stats?.stateStartedAt ? new Date(stats.stateStartedAt) : lastFailureAt,
+      policy: parseHeartbeatPolicy(agent).providerQuotaRetry,
+    });
+    const [inFlight] = await client
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        sql`${heartbeatRuns.id} <> ${excludeRunId}`,
+        or(
+          eq(heartbeatRuns.status, "running"),
+          and(
+            eq(heartbeatRuns.status, "queued"),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaProbe' = 'true'`,
+          ),
+        ),
+      ))
+      .limit(1);
+    const [laneRetry] = await client
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, agent.companyId),
+        eq(heartbeatRuns.status, "scheduled_retry"),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey' = ${laneKey}`,
+      ))
+      .limit(1);
+    return {
+      laneKey,
+      inQuotaState: true as const,
+      nextProbeAt: new Date(lastFailureAt.getTime() + delayMs),
+      probeInFlight: Boolean(inFlight),
+      laneRetryWaiting: Boolean(laneRetry),
+    };
+  }
+
+  /**
+   * Coalesces every run of a provider lane in quota state behind one probe per
+   * backoff interval: new assignments, comments and first retries alike. Only
+   * one run probes at a time. A lane chain's retry may probe when nothing else
+   * is in flight, because the coalescing sweep already promotes one retry per
+   * interval. Any other run may probe only when no lane retry is waiting and
+   * the lane backoff has passed. The probe is marked `providerQuotaProbe`
+   * under a lane advisory lock and proceeds; any other run stays queued without
+   * spending a retry and gets one "Waiting on provider capacity" run event.
+   * When a probe succeeds the lane leaves quota state and the queued runs start
+   * through the normal per-agent concurrency limit. An operator "retry now" is
+   * not held back.
+   *
+   * @returns True when the run must stay queued.
+   */
+  async function waitForProviderQuotaLane(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    if (agent.adapterType === "paperclip_runner") return false;
+    if (!parseHeartbeatPolicy(agent).providerQuotaRetry.enabled) return false;
+    if (operatorRequestedRetryNow(run)) return false;
+    if (!(await readProviderQuotaLaneState(agent, run.id)).inQuotaState) return false;
+    const now = new Date();
+    const waiting = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`provider-quota-lane:${agent.companyId}:${providerQuotaKeyForAgent(agent)}`}, 0))`,
+      );
+      const locked = await readProviderQuotaLaneState(agent, run.id, txDb);
+      if (!locked.inQuotaState) return null;
+      const laneRetry =
+        run.retryOfRunId !== null &&
+        parseObject(run.contextSnapshot).providerQuotaKey === locked.laneKey;
+      const mayProbe =
+        !locked.probeInFlight &&
+        (laneRetry ||
+          (!locked.laneRetryWaiting && now.getTime() >= locked.nextProbeAt.getTime()));
+      if (mayProbe) {
+        await txDb
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+              providerQuotaProbe: true,
+              providerQuotaKey: locked.laneKey,
+            })}::jsonb`,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")));
+        return null;
+      }
+      const [flagged] = await txDb
+        .update(heartbeatRuns)
+        .set({
+          // No provider key here: the coalescing sweep reads a keyed queued
+          // run as a probe in flight.
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+            providerQuotaWaitingSince: now.toISOString(),
+          })}::jsonb`,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.status, "queued"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaWaitingSince' is null`,
+        ))
+        .returning();
+      return { locked, newlyWaiting: flagged ?? null };
+    });
+    if (!waiting) return false;
+    if (waiting.newlyWaiting) {
+      await appendRunEvent(waiting.newlyWaiting, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          "Waiting on provider capacity: the provider is at capacity, so one run of it probes at a time; " +
+          "this run starts when a probe succeeds",
+        payload: {
+          providerQuotaKey: waiting.locked.laneKey,
+          nextProbeAt: waiting.locked.nextProbeAt.toISOString(),
+          probeInFlight: waiting.locked.probeInFlight,
+          laneRetryWaiting: waiting.locked.laneRetryWaiting,
+        },
+      });
+    }
+    return true;
+  }
+
+  /**
    * Records, once per agent and UTC day, that quota failures before useful
    * action passed the uncounted allowance and now count toward maxDailyRuns.
    * Best effort: finalization continues if the alarm cannot be written.
@@ -16121,14 +16342,18 @@ export function heartbeatService(
             }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
-        // Only a quota-lane retry carries the chain start and the provider
-        // key; any other retry drops them so a later quota failure starts a
-        // fresh chain. The key groups probes per company and provider.
+        // Only a quota-lane retry carries the chain start; any other retry
+        // drops it so a later quota failure starts a fresh chain. Every retry
+        // of a provider_quota failure carries the provider key, so the
+        // coalescing sweep paces it with the other chains of the lane.
         providerQuotaRetryStartedAt:
           providerQuotaRetry?.chainStartedAt.toISOString(),
-        providerQuotaKey: providerQuotaRetry
-          ? providerQuotaKeyForAgent(agent)
-          : undefined,
+        providerQuotaKey:
+          providerQuotaRetry ||
+          (transientRecovery?.errorFamily === "provider_quota" &&
+            parseHeartbeatPolicy(agent).providerQuotaRetry.enabled)
+            ? providerQuotaKeyForAgent(agent)
+            : undefined,
       },
       "normal_model",
     );
@@ -18088,6 +18313,7 @@ export function heartbeatService(
       await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock);
       return null;
     }
+    if (await waitForProviderQuotaLane(run, agent)) return null;
 
     const issueId = readNonEmptyString(context.issueId);
     if (issueId && activeRunExecutions.size > 0) {
