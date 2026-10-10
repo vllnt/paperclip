@@ -654,6 +654,7 @@ import {
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
+import { remoteProcessStopRunEvent } from "./ssh-run-process-stop.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
@@ -10547,6 +10548,24 @@ export function heartbeatService(
     return completedRun;
   }
 
+  /**
+   * Stops what a legacy run left in its environments, such as an SSH run's
+   * remote command and its children, and logs the count as a run event. It
+   * runs before the run's launchers are removed and its leases are released,
+   * once per lease. Never throws.
+   */
+  async function stopRemoteRunProcesses(runId: string) {
+    try {
+      const outcomes = (await environmentRuntime.stopRunProcesses?.(runId)) ?? [];
+      if (outcomes.length === 0) return;
+      const run = await getRun(runId);
+      if (!run) return;
+      for (const outcome of outcomes) await appendRunEvent(run, remoteProcessStopRunEvent(outcome));
+    } catch (err) {
+      logger.warn({ err, runId }, "failed to stop remote run processes");
+    }
+  }
+
   async function releaseEnvironmentLeasesForRun(input: {
     runId: string;
     companyId: string;
@@ -10563,6 +10582,7 @@ export function heartbeatService(
   }) {
     const leaseOwnerRun = await getRun(input.runId);
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
+    await stopRemoteRunProcesses(input.runId);
     // Recovery can finish workspace copy-back outside the executor's finally.
     // Successful copy-back does not earn warm retention for a failed turn.
     const status = leaseOwnerRun?.status ?? input.status;
@@ -28303,6 +28323,10 @@ export function heartbeatService(
           !nativeWorkspaceFinalizeScheduled &&
           !nativeOwnershipHeld
         ) {
+          // An SSH run's remote command can outlive the local ssh client. Stop
+          // it first: with its launchers gone, its `gh` would fall through to
+          // the worker's own credentials.
+          await stopRemoteRunProcesses(run.id);
           // Keep launchers during same-run recovery. At a terminal boundary all
           // operations have settled; clean before the remote lease can be stopped.
           if (
