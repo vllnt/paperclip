@@ -1,4 +1,7 @@
 import { useEffect, useRef } from "react";
+import { matchesMedia, subscribeToMedia } from "@/lib/safe-match-media";
+
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
 const CHARS = [" ", ".", "·", "▪", "▫", "○"] as const;
 const TARGET_FPS = 24;
@@ -66,7 +69,8 @@ export function AsciiArtAnimation() {
   useEffect(() => {
     if (!preRef.current) return;
     const preEl: HTMLPreElement = preRef.current;
-    const motionMedia = window.matchMedia("(prefers-reduced-motion: reduce)");
+    // A browser that cannot answer is asked for the still frame, as for reduced motion.
+    const reducedMotion = () => matchesMedia(REDUCED_MOTION_QUERY, true);
     let isVisible = document.visibilityState !== "hidden";
     let loopActive = false;
     let lastRenderAt = 0;
@@ -276,7 +280,7 @@ export function AsciiArtAnimation() {
 
     function syncLoop() {
       const canRender = cols > 0 && rows > 0;
-      if (motionMedia.matches) {
+      if (reducedMotion()) {
         if (loopActive) {
           loopActive = false;
           if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
@@ -320,7 +324,7 @@ export function AsciiArtAnimation() {
     const onMotionChange = () => {
       syncLoop();
     };
-    motionMedia.addEventListener("change", onMotionChange);
+    const unsubscribeMotion = subscribeToMedia(REDUCED_MOTION_QUERY, onMotionChange);
 
     const charSize = measureChar(preEl);
     charW = charSize.w;
@@ -333,7 +337,7 @@ export function AsciiArtAnimation() {
       if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
       observer.disconnect();
       document.removeEventListener("visibilitychange", onVisibilityChange);
-      motionMedia.removeEventListener("change", onMotionChange);
+      unsubscribeMotion();
     };
   }, []);
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "@/lib/router";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
   Agent,
@@ -140,21 +141,6 @@ export function resolveTeamInstallAdapterType(
     return TEAM_INSTALL_FALLBACK_ADAPTER_TYPE;
   }
   return selectableAdapterTypes[0] ?? null;
-}
-
-function useMediaQuery(query: string): boolean {
-  const [matches, setMatches] = useState(() =>
-    typeof window !== "undefined" ? window.matchMedia(query).matches : false,
-  );
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const mql = window.matchMedia(query);
-    const onChange = () => setMatches(mql.matches);
-    onChange();
-    mql.addEventListener("change", onChange);
-    return () => mql.removeEventListener("change", onChange);
-  }, [query]);
-  return matches;
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,7 +1259,7 @@ function TeamInstallerDialog({
   }
 
   const totalSteps = steps.length;
-  const isMobileSheet = useMediaQuery(`(max-width: ${MOBILE_MAX}px)`);
+  const isMobileSheet = useMediaQuery(`(max-width: ${MOBILE_MAX}px)`, false);
 
   const headerTitle = (
     <span className="flex items-center gap-2">
@@ -2283,7 +2269,7 @@ export function TeamCatalog() {
   );
 
   const [installOpen, setInstallOpen] = useState(false);
-  const isDesktop = useMediaQuery(`(min-width: ${DESKTOP_MIN}px)`);
+  const isDesktop = useMediaQuery(`(min-width: ${DESKTOP_MIN}px)`, false);
 
   useEffect(() => {
     setBreadcrumbs([

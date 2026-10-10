@@ -7,6 +7,7 @@ import { cn } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SidePanelFrame, SidePanelWindowControls } from "@/components/side-panel";
+import { matchesMedia } from "@/lib/safe-match-media";
 
 export function PropertiesPanel({ taskDetailLayout = false }: { taskDetailLayout?: boolean }) {
   const {
@@ -132,8 +133,7 @@ function clearStoredPaneWidth(storageKey: string) {
 }
 
 function prefersReducedMotion(): boolean {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  return matchesMedia("(prefers-reduced-motion: reduce)", false);
 }
 
 /** Fixed-position geometry while the panel is maximized (or gliding). */

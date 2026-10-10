@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { isChromelessDisplayMode } from "./pwa-display-mode";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 function matchMode(activeMode: string | null) {
   return (query: string) => ({ matches: query === `(display-mode: ${activeMode})` });
@@ -24,5 +28,23 @@ describe("isChromelessDisplayMode", () => {
 
   it("ignores normal browser launches", () => {
     expect(isChromelessDisplayMode(matchMode("browser"), false)).toBe(false);
+  });
+
+  it("treats a browser whose matchMedia throws as a normal launch instead of throwing", () => {
+    vi.stubGlobal("window", {
+      matchMedia: () => {
+        throw new Error("matchMedia failed");
+      },
+    });
+    expect(isChromelessDisplayMode(undefined, false)).toBe(false);
+  });
+
+  it("still detects an iOS home-screen launch when matchMedia throws", () => {
+    vi.stubGlobal("window", {
+      matchMedia: () => {
+        throw new Error("matchMedia failed");
+      },
+    });
+    expect(isChromelessDisplayMode(undefined, true)).toBe(true);
   });
 });

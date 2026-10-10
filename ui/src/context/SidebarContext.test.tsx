@@ -70,6 +70,37 @@ describe("SidebarContext", () => {
     localStorage.clear();
   });
 
+  it.each([
+    { width: 1280, isMobile: false },
+    { width: 390, isMobile: true },
+  ])("mounts and sizes from the window at $width px when matchMedia throws", ({ width, isMobile }) => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: () => {
+        throw new Error("matchMedia failed");
+      },
+    });
+    // React reports a crash in an effect as a window error event, not as a throw from the render call.
+    const crashes: string[] = [];
+    const recordCrash = (event: ErrorEvent): void => {
+      crashes.push(event.message);
+      event.preventDefault();
+    };
+    window.addEventListener("error", recordCrash);
+
+    try {
+      active = renderProvider();
+    } finally {
+      window.removeEventListener("error", recordCrash);
+    }
+
+    expect(crashes).toEqual([]);
+    expect(capturedValue?.isMobile).toBe(isMobile);
+    expect(capturedValue?.sidebarOpen).toBe(!isMobile);
+  });
+
   it("keeps the global navigation expanded even when legacy collapsed state exists", () => {
     active = renderProvider();
 

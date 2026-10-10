@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useOptionalToastActions } from "../context/ToastContext";
 import { CHROMELESS_DISPLAY_MODES, isChromelessDisplayMode } from "../lib/pwa-display-mode";
+import { subscribeToMedia } from "../lib/safe-match-media";
 import { copyTextToClipboard } from "../lib/clipboard";
 
 function ControlButton({
@@ -49,16 +50,9 @@ export function StandaloneBrowserControls({ mobile }: { mobile: boolean }) {
     const update = () => setChromeless(isChromelessDisplayMode());
 
     update();
-    if (typeof window.matchMedia !== "function") return;
 
-    const mediaQueries = CHROMELESS_DISPLAY_MODES.map((mode) => window.matchMedia(`(display-mode: ${mode})`));
-    if (mediaQueries.every((media) => typeof media.addEventListener === "function")) {
-      mediaQueries.forEach((media) => media.addEventListener("change", update));
-      return () => mediaQueries.forEach((media) => media.removeEventListener("change", update));
-    }
-
-    mediaQueries.forEach((media) => media.addListener(update));
-    return () => mediaQueries.forEach((media) => media.removeListener(update));
+    const unsubscribes = CHROMELESS_DISPLAY_MODES.map((mode) => subscribeToMedia(`(display-mode: ${mode})`, update));
+    return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
   }, [mobile]);
 
   const refresh = useCallback(() => {

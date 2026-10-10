@@ -3,6 +3,7 @@ import { readThreadScrollAnchor, threadScrollAnchorDelta, type ThreadScrollAncho
 import { cn } from "@/lib/utils";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import { ArrowDown } from "lucide-react";
+import { matchesMedia } from "@/lib/safe-match-media";
 import { parseCssTimeMs } from "./motion-tokens";
 import { useTaskChatScrollNavigation } from "./scroll-navigation";
 
@@ -17,8 +18,7 @@ type PillPhase = "hidden" | "in" | "out";
  * never fires animationend, so we must unmount immediately.
  */
 function motionDisabled(): boolean {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return true;
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  return matchesMedia("(prefers-reduced-motion: reduce)", true);
 }
 
 interface TaskMessageScrollerProps {

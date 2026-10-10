@@ -1,4 +1,5 @@
 import tokenStyles from "../motion-tokens.css?raw";
+import { matchesMedia } from "./safe-match-media";
 
 // Use the same stylesheet as index.css for non-browser callers and before
 // styles load. Do not maintain a second set of numeric defaults in JavaScript.
@@ -19,8 +20,7 @@ export function motionMilliseconds(name: string): number {
   return (Number.parseFloat(value) || 0) * (value.endsWith("ms") ? 1 : 1000);
 }
 export function motionSeconds(name: string): number {
-  if (typeof window !== "undefined" && typeof window.matchMedia === "function"
-    && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return 0;
+  if (matchesMedia("(prefers-reduced-motion: reduce)", false)) return 0;
   return motionMilliseconds(name) / 1000;
 }
 export function motionEase(name: string): [number, number, number, number] | "linear" {

@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { subscribeToMedia } from "../lib/safe-match-media";
 
 interface SidebarContextValue {
   // Mobile drawer + back-compat (existing behavior, unchanged).
@@ -43,15 +44,14 @@ export function SidebarProvider({ children }: { children: ReactNode }) {
   const [routeRequestsCollapsed, setRouteRequestsCollapsed] = useState(false);
   const [forceCollapsed, setForceCollapsed] = useState(false);
 
-  useEffect(() => {
-    const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`);
-    const onChange = (e: MediaQueryListEvent) => {
-      setIsMobile(e.matches);
-      setSidebarOpen(!e.matches);
-    };
-    mql.addEventListener("change", onChange);
-    return () => mql.removeEventListener("change", onChange);
-  }, []);
+  useEffect(
+    () =>
+      subscribeToMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`, (matches) => {
+        setIsMobile(matches);
+        setSidebarOpen(!matches);
+      }),
+    [],
+  );
 
   // The icon rail has been retired. Keep the old API inert so routes and
   // plugins compiled against it cannot collapse the global navigation.

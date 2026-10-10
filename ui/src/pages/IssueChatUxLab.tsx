@@ -22,6 +22,7 @@ import {
   issueChatUxTranscriptsByRunId,
 } from "../fixtures/issueChatUxFixtures";
 import { cn } from "../lib/utils";
+import { matchesMedia } from "../lib/safe-match-media";
 import { Bot, Brain, FlaskConical, Loader2, MessagesSquare, Route, Sparkles, WandSparkles } from "lucide-react";
 
 const noop = async () => {};
@@ -92,7 +93,7 @@ function RotatingReasoningDemo({ intervalMs = 2200 }: { intervalMs?: number }) {
   useEffect(() => {
     // Respect reduced motion (also makes the visual suite deterministic —
     // it captures with reducedMotion: "reduce").
-    if (typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    if (matchesMedia("(prefers-reduced-motion: reduce)", false)) {
       return;
     }
     const timer = setInterval(() => {
