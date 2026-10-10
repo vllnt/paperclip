@@ -19,7 +19,11 @@ Evidence base: `doc/plans/2026-10-10-web-app-speed-nextjs-plan.md` (same pull re
 ```
  browser ──HTTPS──> ingress ──> Express, one Node process (server/src/index.ts:929)
                                   ├─ /api/*, /api/auth/*               REST (unchanged; the only data path)
-                                  ├─ /api/companies/:id/events/ws      live events (unchanged)
+                                  ├─ upgrades: /api/companies/:id/events/ws (live events),
+                                  │   /api/runner/v1/connect/* (remote runners),
+                                  │   /api/environment-custom-image-setup-sessions/:id/terminal/ws  (all unchanged;
+                                  │   Next.js never sees an upgrade except /_next/hmr in dev)
+                                  ├─ /_next/image, /_next/mcp           404 (not used; both had advisories)
                                   ├─ /_plugins/*, /llms/*, /mcp/*, /runtime-tools/*   unchanged
                                   ├─ /_next/static/*                   express.static, immutable, br/gz siblings (#57's handler, re-pointed)
                                   └─ every other GET/HEAD ──> Next.js request handler (custom server, same process);
@@ -49,7 +53,7 @@ Rules that hold in every slice:
 
 | Part | Today | After M0 |
 |---|---|---|
-| Who builds the UI | `vite build` (`ui/vite.config.ts`) | `next build` (Turbopack). The Vite build stays in the image during the migration, behind a runtime switch, for rollback |
+| Who builds the UI | `vite build` (`ui/vite.config.ts`) | `next build` (Turbopack). The Vite build stays in the image while M0 is the newest UI slice, behind a runtime switch, for rollback |
 | Who serves HTML | Express reads `ui/dist/index.html` per request (`server/src/app.ts:984-1036`) | the Next.js handler; `app/layout.tsx` produces the `<head>` (branding, theme boot script, startup guard) |
 | Routes | React Router `<BrowserRouter>` (`ui/src/main.tsx:69`) | the same React Router tree, rendered client-only inside `app/page.tsx` and `app/[companyPrefix]/[[...rest]]/page.tsx` |
 | Static assets | `/assets/*` via `express.static`, 1 year, immutable | `/_next/static/*` via `express.static` with the same headers, served before the Next.js handler |
@@ -66,8 +70,8 @@ Why `app/page.tsx` plus `app/[companyPrefix]/[[...rest]]/page.tsx` and not one r
 
 ### 3.3 Custom server inside Express
 
-- `next({ dev, dir: "<repo>/ui", httpServer: <private emitter> })` is created after `createServer` (`server/src/index.ts:929`) and before `listen` (`:999`). `app.ts` registers a late-bound handler as the last route, for GET and HEAD only; other methods get 405, so no request can reach a Server Action decoder.
-- **Websocket upgrades.** On its first request, Next.js attaches its own `upgrade` listener to `httpServer`, or, when none is given, to the request's server (`packages/next/src/server/next.ts:491-514` at v16.3.8). For an upgrade that is not its hot-reload path, it resolves routes and ends the socket when a route matches, and the catch-all matches `/api/companies/:id/events/ws` (with `companyPrefix` = `api`). So Next.js gets a private `EventEmitter` as `httpServer`, never the real server. One dispatcher on the real server sends the live-events path to today's handler (`server/src/realtime/live-events-ws.ts:291-316`) and, in dev only, re-emits `/_next/hmr` upgrades to Next's emitter and marks them handled. The live socket must open after a page load, in production and in dev (go/no-go, section 8).
+- `next({ dev, dir: "<repo>/ui", httpServer: <private emitter> })` is created after `createServer` (`server/src/index.ts:929`) and before `listen` (`:999`). `app.ts` registers a late-bound handler as the last route. In production it takes GET and HEAD only; other methods get 405, so no request can reach a Server Action decoder. In dev it also lets `POST /__nextjs_*` through, which the error overlay uses. `/_next/image` and `/_next/mcp` get 404. `next.config.ts` sets `turbopack.root` to the repository root (one `?raw` import reaches outside `ui/`) and turns off the managed `AGENTS.md` block that `next dev` writes since 16.3 (`agentRules`), because this repository governs `AGENTS.md`.
+- **Websocket upgrades.** On its first request, Next.js attaches its own `upgrade` listener to `httpServer`, or, when none is given, to the request's server (`packages/next/src/server/next.ts:491-514` at v16.3.8). For an upgrade that is not its hot-reload path, it resolves routes and ends the socket when a route matches, and the catch-all matches `/api/companies/:id/events/ws` (with `companyPrefix` = `api`). So Next.js gets a private `EventEmitter` as `httpServer`, never the real server. The three upgrade listeners that exist today (remote runners, the setup terminal and live events, registered at `server/src/index.ts:964-968`) stay unchanged. In dev only, one more listener is added **first** (`server.prependListener("upgrade", …)`), because Node calls listeners in order and the live-events listener destroys paths it does not know (`server/src/realtime/live-events-ws.ts:291-316`). It claims `/_next/hmr`: it re-emits the upgrade to Next's emitter and marks it handled, or destroys the socket when Next has not attached its listener yet (Next attaches it on its first handled request). All three upgrade paths must open after a page load, in production and in dev, and hot reload must connect (go/no-go, section 8). In dev behind a managed hostname, that origin goes into `allowedDevOrigins`.
 - `app.prepare()` starts at boot, but `listen` does not wait for it. The API, the socket and run recovery start as fast as today; a page request waits for the `prepare` promise. This keeps the restart cost that the planned-restart work (#103) is reducing from growing.
 - Standalone output cannot be used with a custom server ("These cannot be used together", Next.js custom server docs), so the image keeps `next` in its runtime `node_modules`.
 - **Measured in the M0 spike** (section 8): resident memory idle and during 10 parallel cold loads in a 2 GB container with `--max-old-space-size=1536` (`deploy/compose.yaml:24, 34`); time from process start to the first 200 HTML response; image size; `next build` time in CI.
@@ -83,7 +87,7 @@ The Vite surface is small: 7 non-test lines use `import.meta.env` (`DEV`, `MODE`
 |---|---|
 | `serviceWorkerBuildIdPlugin` stamps `sw.js` (`ui/src/lib/vite-sw-build-id.ts`) | a route handler for `/sw.js` that stamps the Next.js build id, `Cache-Control: no-cache`; the template moves out of `ui/public/` so the two do not conflict; the worker's public-asset rule (`ui/public/sw.js:58-59`) also accepts `/_next/static/` |
 | `__PAPERCLIP_BUILD_COMMIT__` define | a `NEXT_PUBLIC_PAPERCLIP_BUILD_COMMIT` variable set at build time (the `env` key in `next.config.ts` is a legacy API) |
-| `import.meta.env.MODE` (including `"qa"`, `ui/src/pages/IssueDetail.tsx:3200`) and `DEV` | a `NEXT_PUBLIC_PAPERCLIP_MODE` variable; `DEV` maps to `process.env.NODE_ENV` |
+| `import.meta.env.MODE` and `DEV` | Turbopack supports both natively (`MODE` is the build's `NODE_ENV`); only the `"qa"` mode (`ui/src/pages/IssueDetail.tsx:3200`) needs a `NEXT_PUBLIC_PAPERCLIP_MODE` variable |
 | `import.meta.glob` (`ui/src/i18n/locales.ts:7`) | supported by Turbopack since 16.3 ("Built-in glob imports", release notes); checked in M0, else explicit imports |
 | #57's `.br` and `.gz` siblings (a Vite plugin) | a post-build step that writes them for `.next/static`; Express serves `/_next/static` with #57's handler |
 | `@` and `lexical` aliases | `tsconfig` paths and `turbopack.resolveAlias` |
@@ -103,11 +107,12 @@ M0 keeps everything inside the catch-all, so a later App Router route would rend
 
 - `app/layout.tsx` renders a client `<Providers>`: the `QueryClient`, theme, company, live updates, toasts, tooltips, dialogs, and a React Router `<Router>` bridged to the Next.js router.
   - **QueryClient:** a client component in the root layout also renders on the server, so a module-level client would be shared by every request in the process and could hand one user's session to another. The server creates a new client per request; the browser keeps one (TanStack Query's `getQueryClient()` pattern). A test renders two users' pages at the same time and checks that neither sees the other's data.
-  - **Router location:** built from `window.location` plus `history.state` (React Router's `usr` and `key`), with the navigation type from `popstate`, so `location.key`, `location.state`, the hash and POP navigations keep working. `usePathname` alone has none of these.
+  - **Router location:** the pathname and search come from `usePathname` and `useSearchParams`, which also work on the server. The hash, the state and the key come from `history.state` (React Router's `usr` and `key`) through `useSyncExternalStore`, with a server snapshot of `{ hash: "", state: null, key: "default" }`, so the first browser render matches the server HTML (M0c). The navigation type comes from `popstate`. After each `router.push`, the bridge merges a React Router style `key` into `history.state` (`replaceState`), because Next.js entries carry none and scroll memory (`ui/src/components/Layout.tsx:590-616`) is keyed by it.
   - **Navigator:** `history.pushState` between two catch-all paths; `router.push(href, { scroll: false })` whenever the current or the target route is migrated, because a native `pushState` only syncs the URL and does not render a new segment. Route state that must cross that boundary moves to the Query cache (the issue page's header seed already has one: `prefetchIssueDetailForNavigation`, `ui/src/lib/issueDetailCache.ts:185-196`). A registry of migrated route patterns in `ui/src/lib/router.tsx` decides which way.
   - React Router hooks keep working everywhere, including the plugin bridge (`ui/src/plugins/bridge.ts:29`).
 - `app/[companyPrefix]/layout.tsx` renders the board shell (`CloudAccessGate`, `Layout`: sidebar, breadcrumbs, the Cmd+K launcher) for board paths and bare children for public paths. The launcher (#86, merged; #95, open) moves with `Layout` unchanged; it is not rewritten.
 - `App.tsx` keeps its routes, but the board branch renders an `<Outlet/>` instead of `Layout`, because the shell is now the segment layout.
+- The 16 non-test files that import `react-router-dom` directly (speed plan, section 6.2) move behind `ui/src/lib/router.tsx`, and a lint rule keeps them there. Only `ui/app/**` and `ui/src/lib/router*` may import `next/navigation` or `next/link`. Storybook can then keep `@storybook/react-vite` with a mocked router.
 - **Boot data comes from the server.** `app/layout.tsx` reads session, health, experimental settings, the company list and board access through the REST API during the request and hands them to the Query cache. Each call has a short timeout (about 1 s) and fails open: on an error, a timeout or a 401, the page renders without that entry and the browser fetches it as today. Public pages skip the company calls. This removes the A1 and A2 levels of speed plan section 3.2 from the browser (-140 ms on `wan`) but adds the five in-process calls to the time to first byte (about +30-50 ms with S = 30 ms, run in parallel), so the expected gain is **about -90 to -110 ms on `wan`** [D]. It replaces the speed plan's boot script (S3), which is not built.
 - The shell stays client-rendered in M0b (`ssr: false`), so the 1,331 browser-global lines of the speed plan (section 6.3) do not have to be server-safe yet. Because the children of a client-only boundary are not in the HTML, no page gets a server-rendered first paint until M0c.
 
@@ -120,19 +125,18 @@ Without this slice, a migrated route gets its data prefetched on the server but 
 - Plugin slots in the shell render a placeholder of reserved size on the server and mount after hydration.
 - The catch-all page stays client-only; only the shell and migrated segments render on the server.
 - Expected: the shell paints from the HTML before the JavaScript; on catch-all routes, LCP is still the page content, so the gain there is the shell only.
-- The 16 non-test files that import `react-router-dom` directly (speed plan, section 6.2) move behind `ui/src/lib/router.tsx`, and a lint rule keeps them there. Only `ui/app/**` and `ui/src/lib/router*` may import `next/navigation` or `next/link`. Storybook can then keep `@storybook/react-vite` with a mocked router.
 
 ## 4. Data path, security and the version pin
 
 ### 4.1 Server components read through the REST API
 
-- A server-only module (`ui/src/lib/server-api.ts`) calls the REST API in the same process, at the address the server actually listens on (`server.address()`; the bind host can be loopback, a LAN or tailnet address, or custom, `server/src/index.ts:999`). It forwards the caller's `Cookie`, `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto`, so that `actorMiddleware` (`server/src/middleware/auth.ts:227`), the private-hostname guard (`server/src/app.ts:550-564`) and the company checks (`assertCompanyAccess`, `server/src/routes/authz.ts:75-121`) see the same request as from the browser. It sends `Accept-Encoding: identity` to skip compression on loopback.
+- A server-only module (`ui/src/lib/server-api.ts`) calls the REST API in the same process, at the address the server actually listens on (`server.address()`; the bind host can be loopback, a LAN or tailnet address, or custom, `server/src/index.ts:999`). A wildcard bind (`0.0.0.0` or `::`, as in the compose file) maps to loopback. It forwards the caller's `Cookie`, `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto`, so that `actorMiddleware` (`server/src/middleware/auth.ts:227`), the private-hostname guard (`server/src/app.ts:550-564`) and the company checks (`assertCompanyAccess`, `server/src/routes/authz.ts:75-121`) see the same request as from the browser. It sends `Accept-Encoding: identity` to skip compression on loopback.
 - The existing `ui/src/api/*` modules get an injectable transport (base URL and headers), so the server and the browser use the same endpoint functions, response types and `queryKeys`. One source of truth; web, API and CLI parity stays in the REST API.
 - Each segment creates a per-request `QueryClient`, prefetches with the same query options as the client, and passes `dehydrate(...)` to `<HydrationBoundary>`. Hydrated data is fresh for the client's `staleTime` (30 s, `ui/src/main.tsx:45`).
 - The socket-open rule (`ui/src/context/LiveUpdatesProvider.tsx:2064-2066`) must skip queries hydrated or fetched in the last few seconds, or every server-rendered page fetches its data twice. This extends #54 and lands in M0b.
 - Every call has a timeout and an error policy: fail open to the browser fetch (section 3.5), never block the HTML on an API error.
 - Rate limits: most limiters guard writes (agent creation, `server/src/routes/agents.ts:2894`), but invite reads have a per-IP limiter (`GET /api/invites/:token…`, 20 per minute, `server/src/services/invite-rate-limit.ts`). Server renders would put every visitor into the loopback bucket, so the invite page (M10) keeps fetching in the browser. M1 adds a test that a server render makes only GET requests.
-- Server load: every loopback call runs `actorMiddleware`, and every RSC prefetch renders on the server. Each slice reports loopback and RSC requests per page load and the server CPU per render (section 8). Links in long lists (board cards, list rows) use `prefetch={false}` and prefetch on hover only.
+- Server load: every loopback call runs `actorMiddleware`, and every RSC prefetch renders on the server. Each slice reports loopback and RSC requests per page load and the server CPU per render (section 8). Links in long lists (board cards, list rows) start with `prefetch={false}` and switch to `prefetch={true}` on pointer enter or focus (`prefetch={false}` alone also turns off hover prefetch, Link docs).
 
 ### 4.2 No Server Actions, and why the version still matters
 
@@ -183,7 +187,7 @@ The plugin bridge hands the host's React to plugins (`ui/src/plugins/bridge-init
 | S1, harness: warm-navigation probe, `laptop` profile, `authenticated` fixture | unchanged; it is the measuring tool, and it lands before M0 (section 7) |
 | S2, spike | replaced by the spike over M0 to M1 (section 8) |
 | S3, parallel boot calls | replaced by server boot data in `app/layout.tsx` (M0b); the boot script is not built |
-| S4, intent prefetch on hover, focus, launcher highlight | for migrated routes, `next/link` prefetch on hover (long lists use `prefetch={false}` until hover), plus `router.prefetch` from keyboard focus and the launcher highlight. `router.prefetch` is partial by default (down to `loading.tsx`); a full prefetch uses a `<Link prefetch={true}>` for the hovered or highlighted target. Same limits as the speed plan: one in flight, first level only. The issue-link data prefetch that exists today stays |
+| S4, intent prefetch on hover, focus, launcher highlight | for migrated routes, `next/link` prefetch: long lists switch a link's `prefetch` from `false` to `true` on pointer enter or focus. The launcher's rows are not links: on highlight it calls `router.prefetch(href)` (partial by default, down to `loading.tsx`) and the route's Query prefetch through the shared `ui/src/api/*` modules. Same limits as the speed plan: one in flight, first level only. The issue-link data prefetch that exists today stays. The spike measures launcher navigation this way |
 | S5, feedback in one frame, matching skeletons | `loading.tsx` per segment (a prefetched Suspense fallback) plus `useLinkStatus` for slow links |
 | S6, slow-page fixes (bounded lists, run fetched by id, inbox gate, issue-page reads) | framework-neutral client and API changes; each lands in or before its route's slice, and the server render benefits too |
 | S7, persisted Query cache | **dropped** once M0c lands: a server-rendered first paint already shows data, and no company data has to be kept in the browser. Until M0c, catch-all routes keep today's behaviour |
@@ -208,7 +212,7 @@ All of the speed plan's section 10 applies. What was learned while measuring #50
 - **One machine per comparison.** B0 and B1 in the speed plan were measured on a Mac. A slice is judged only against B1 measured on the same machine, in the same session, interleaved (B1, slice, B1, slice), at least 5 runs per cell and 2 rounds, with the median, p75 and spread. Numbers from different machines are never compared; the speed plan's numbers are a reference, not the bar.
 - **Under load above about 10, a single pass is noise.** Record the load average with every run; a comparison is invalid when the load changes more than 2x between the arms.
 - **Request counts do not depend on machine speed.** Every slice reports requests per load and per navigation; they are the most reliable numbers on a shared host.
-- **HTTP/2.** Local Chrome talks HTTP/1.1 with 6 connections to the fixture server, which makes many small chunks look worse than behind the HTTP/2 ingress. S1 adds a TLS HTTP/2 proxy built with Node's `http2` module (no new dependency) in front of the server, so migration and SSR comparisons see production-like multiplexing. It must also accept HTTP/1.1 (`allowHTTP1`) so the websocket upgrades pass. In dev behind a managed hostname, Next.js needs that origin in `allowedDevOrigins`.
+- **HTTP/2.** Local Chrome talks HTTP/1.1 with 6 connections to the fixture server, which makes many small chunks look worse than behind the HTTP/2 ingress. S1 adds a TLS HTTP/2 proxy built with Node's `http2` module (no new dependency) in front of the server, so migration and SSR comparisons see production-like multiplexing. It must also accept HTTP/1.1 (`allowHTTP1`) so the websocket upgrades pass.
 - **Service worker:** run with `serviceWorkers: "block"` when a probe intercepts requests.
 - **Announcement:** dismiss the Connectors announcement first, or it becomes the LCP (the fixture script does this).
 - **Restart the server after swapping a UI build:** the static compression handler reads its file list at startup.
@@ -227,17 +231,17 @@ The spike builds the first slices (the board and the list) on a local branch, af
 | Board warm navigation, by click, hover-then-click, Tab then Enter, and launcher Enter | usable p75 on M1 ≤ B1's usable p75, and median ≤ B1's median |
 | Board cold load, `wan` | LCP median ≤ B1 (the speed plan's ceiling estimate is 300-500 ms against B1's 1,672 ms on the Mac) |
 | No regression from M0 + M0b on the 10 harness pages | cold FCP, LCP and TTI medians within +5% or +50 ms of B1, whichever is larger; warm navigation medians within +5% or +20 ms; API calls per load ≤ B1; JS on the wire ≤ B1 + 10%; zero new console errors |
-| Every other route | the route smoke from #68 (109 routes, desktop and mobile): each loads, no failed asset, no console error |
+| Every other route | a route smoke over all routes (109 in #68's run), desktop and mobile: each loads, no failed asset, no console error. #68 ran it from its working session; slice H commits it as `tests/perf/web-app/route-smoke.mjs` |
 | Router state | scroll restored on back and forward; `location.state` survives; navigation works both ways between the catch-all and M1 |
-| Server load | loopback API calls and RSC requests per page load reported; server CPU per board render reported, with a gate set from the M0 numbers before M1 merges |
+| Server load | loopback API calls and RSC requests per page load reported; server CPU per board page load p75 ≤ 150 ms on the measuring machine, and 10 parallel board loads keep the API p95 within +20% of its idle value (the container has 2 CPUs shared with run orchestration) |
 | One SPA root across navigations (section 3.2) | 0 remounts in 20 navigations, back and forward included |
-| Live socket | opens after a page load, in production and in dev; HMR connects in dev; stays connected across 20 navigations between the catch-all and M1 |
+| Websockets | all three upgrade paths (live events, remote runners, setup terminal) open after a page load, in production and in dev; hot reload connects in dev; the live socket stays connected across 20 navigations between the catch-all and M1 |
 | Memory, 2 GB container, 1.5 GB heap | resident memory +250 MB or less at idle; no out-of-memory during 10 parallel cold loads |
 | Two users at once | two concurrent server renders by different users: neither response contains the other's data |
 | Start | process start to the first HTML 200: +2 s or less; API ready time unchanged |
 | Image and CI | image +350 MB or less uncompressed (estimate: `next` 186 MB and its Linux SWC binary 97 MB unpacked); image build +5 min or less |
 
-The spike builds M0, M0b, M0c and M1, because without M0c the board has no server-rendered first paint. If the warm-navigation check fails because the server render after each click is slow, the spike tries full prefetch on intent (a `<Link prefetch={true}>` for the hovered, focused or highlighted target) once. If it still fails, the migration stops at M0b, which already removes the boot levels, and the maintainers decide with the numbers.
+The spike builds M0, M0b, M0c and M1, because without M0c the board has no server-rendered first paint. If the warm-navigation check fails because the server render after each click is slow, the spike tries two things once: full prefetch on intent (links switch to `prefetch={true}` on hover and focus), and a server component that skips its REST prefetch on client navigations so the page renders from the Query cache filled on intent. If it still fails, the migration stops at M0b, which already removes the boot levels, and the maintainers decide with the numbers.
 
 ## 9. Slices
 
@@ -245,7 +249,7 @@ Lanes: **risky** changes the server start, the image or every page; at most one 
 
 | Slice | What | Lane | Size | Number to beat (B1, same machine) |
 |---|---|---|---|---|
-| H | Land #50 (harness), then S1 (warm-navigation probe, `laptop` profile, `authenticated` fixture, HTTP/2 proxy) | normal | S | - (produces the bar) |
+| H | Land #50 (harness), then S1 (warm-navigation probe, `laptop` profile, `authenticated` fixture, HTTP/2 proxy, route smoke script) | normal | S | - (produces the bar) |
 | M0 | Next.js 16.3.8 as a custom handler in Express (GET and HEAD only, private upgrade emitter, telemetry off); catch-all renders today's SPA client-only; Turbopack build; `/_next/static` with #57's handler; SW, budget and stale-chunk ports; runtime switch `vite`/`next` | **risky** | L | every page: no regression (section 8) |
 | M0b | Providers and board shell into layouts; per-request QueryClient on the server; React Router bridged to the Next.js router; server boot data with timeouts; direct `react-router-dom` imports behind the wrapper; socket-open refetch skips fresh data | **risky** | L | cold LCP about -90 to -110 ms on `wan` [D]; no regression elsewhere |
 | M0c | The shell renders on the server: no browser globals in `Providers`, `CloudAccessGate`, `Layout`; shell preferences in cookies; plugin slot placeholders | **risky** | M | shell paints from the HTML; no regression; zero hydration errors |
@@ -269,12 +273,12 @@ Order: H, M0, M0b, M0c, M1 (the spike decides here), then M2 to M10 (each one de
 
 | Item | Today | During the migration | After MF |
 |---|---|---|---|
-| Dockerfile build stage | `pnpm --filter @paperclipai/ui build` (Vite) | `next build` and `vite build` (the runtime switch) | `next build` |
+| Dockerfile build stage | `pnpm --filter @paperclipai/ui build` (Vite) | `next build`, plus `vite build` while the runtime switch lives (M0 only); `NEXT_TELEMETRY_DISABLED=1` | `next build` |
 | Runtime image | `ui/dist` | `ui/.next` (without `.next/cache`), `ui/public`, `next` in `node_modules` (without the optional `sharp`: no image optimisation), and `ui/dist` while the runtime switch lives (M0 only) | without `ui/dist` |
 | Image size | baseline | +350 MB uncompressed or less (gate) [D] | lower than during |
 | CI build time | `vite build` 4.2 s in a 12-minute image build [CI] | + `next build` (not measured; gate +5 min) | `next build` only |
 | Start and restart | Express listens; UI served at once | `listen` does not wait for `prepare`; pages wait for it | same |
-| Dev mode | `pnpm dev`: Vite middleware | `next dev` in process; the upgrade dispatcher passes `/_next/hmr` to Next.js; `NEXT_TELEMETRY_DISABLED=1`; the managed-runtime HMR placeholder port (`server/src/app.ts:1041-1057`) stays until its supervisor changes | same |
+| Dev mode | `pnpm dev`: Vite middleware | `next dev` in process; a dev-only upgrade listener, added first, passes `/_next/hmr` to Next.js; `allowedDevOrigins` for a managed hostname; `agentRules` off; `NEXT_TELEMETRY_DISABLED=1`; the managed-runtime HMR placeholder port (`server/src/app.ts:1041-1057`) stays until its supervisor changes | same |
 | CSP | none on the HTML | Next.js inline scripts need a nonce if a CSP is added later (Next.js supports one through `proxy.ts`) | same |
 
 ## 11. Open questions
@@ -283,14 +287,14 @@ Order: H, M0, M0b, M0c, M1 (the spike decides here), then M2 to M10 (each one de
 |---|---|---|
 | 1 | The M0 install: `next` is a new dependency, which needs an online install on a host at its disk floor | Install in a fresh worktree only after a maintainer's go and with 9,000 MiB or more free; pin 16.3.8 or the re-checked newest patch older than 7 days |
 | 2 | Keep the Vite build in the image for a `vite` runtime switch? | Only while M0 is the newest UI slice (one or two deploy windows). After M0b the Vite build has no shell and the router wrapper imports `next/navigation`, so keeping it working would mean a second entry and its own e2e run. From M0b on, rollback is a revert |
-| 10 | Should the shell render on the server (M0c), with its risk? | Yes. Without it the migration gives no server-rendered first paint, which is the main cold-load gain the maintainers expect |
 | 3 | Layout preferences that live in `localStorage` (51 non-test files use it; the issues view mode decides the board or list layout) | Move the ones that change the server-rendered layout to cookies, route by route; leave the rest client-only |
 | 4 | Drop the persisted Query cache (speed plan S7)? | Yes. Server rendering gives the first paint with data |
 | 5 | Storybook framework | Keep `@storybook/react-vite`; components import routing only from the wrapper |
 | 6 | Upgrade React Router to v8? | No. It is removed in MF; v7 gets security fixes until then |
-| 7 | Who implements | The author of this plan for S1, M0, M0b and M1; route slices M2 to M10 can go to other implementers once M1 sets the pattern, one segment directory each, so they do not overlap |
+| 7 | Who implements | The author of this plan for S1, M0, M0b, M0c and M1; route slices M2 to M10 can go to other implementers once M1 sets the pattern, one segment directory each, so they do not overlap |
 | 8 | A corrected render counter (the harness `renders.mjs` over-counts) | Not needed for the gate (INP is the render metric); commit it only if S9 needs it |
 | 9 | Phones and slow links (speed plan open question 1) | Still useful: if phones matter, M10 (public routes) and the mobile profile move earlier |
+| 10 | Should the shell render on the server (M0c), with its risk? | Yes. Without it the migration gives no server-rendered first paint, which is the main cold-load gain the maintainers expect |
 
 ## Appendix A. Sources outside the repository
 
