@@ -125,6 +125,7 @@ import {
   type IssueBlockerDiagnosticsResponse,
   type IssueSubtreeDiagnosticEdge,
   type IssueSubtreeDiagnosticNode,
+  type IssueSubtreeDiagnosticLastRun,
   type IssueSubtreeDiagnosticsResponse,
   type IssueWakeDiagnosticActivityRecord,
   type IssueWakeDiagnosticEvent,
@@ -1805,6 +1806,34 @@ type IssueSubtreeDiagnosticActivityRow = {
   createdAt: Date | string;
 };
 
+type IssueSubtreeDiagnosticLastRunRow = {
+  id: string;
+  status: string;
+  agentId: string;
+  startedAt: Date | string | null;
+  finishedAt: Date | string | null;
+  createdAt: Date | string;
+  errorCode: string | null;
+};
+
+// Run and agent ids follow the wake-request rule: only actors with
+// company-scope read see them.
+function projectIssueSubtreeLastRun(
+  row: IssueSubtreeDiagnosticLastRunRow | undefined,
+  options: { includeInternalIds: boolean },
+): IssueSubtreeDiagnosticLastRun | null {
+  if (!row) return null;
+  return {
+    id: options.includeInternalIds ? row.id : null,
+    status: row.status,
+    agentId: options.includeInternalIds ? row.agentId : null,
+    startedAt: dateToIso(row.startedAt),
+    finishedAt: dateToIso(row.finishedAt),
+    createdAt: dateToIso(row.createdAt)!,
+    errorCode: row.errorCode,
+  };
+}
+
 function groupByIssueId<T extends { issueId: string }>(rows: T[]) {
   const map = new Map<string, T[]>();
   for (const row of rows) {
@@ -1878,6 +1907,7 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
   >;
   wakeRequestsByIssueId: Map<string, IssueSubtreeDiagnosticWakeRequestRow[]>;
   activityRecordsByIssueId: Map<string, IssueSubtreeDiagnosticActivityRow[]>;
+  lastRunByIssueId: Map<string, IssueSubtreeDiagnosticLastRunRow>;
   truncatedNodes: boolean;
   truncatedDepth: boolean;
   truncatedBlockerIssueIds: Set<string>;
@@ -1971,6 +2001,9 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
           ? node.parentId
           : null,
       depth: node.depth,
+      lastRun: projectIssueSubtreeLastRun(input.lastRunByIssueId.get(node.id), {
+        includeInternalIds: input.includeInternalIds,
+      }),
       diagnosis: nodeDiagnosis,
       likelyReason: nodeDiagnosis,
       blockers: blockerResponse.blockers,
@@ -8814,6 +8847,7 @@ export function issueRoutes(
       readinessByIssueId: diagnostic.readinessByIssueId,
       wakeRequestsByIssueId: diagnostic.wakeRequestsByIssueId,
       activityRecordsByIssueId: diagnostic.activityRecordsByIssueId,
+      lastRunByIssueId: diagnostic.lastRunByIssueId,
       truncatedNodes: diagnostic.truncatedNodes,
       truncatedDepth: diagnostic.truncatedDepth,
       truncatedBlockerIssueIds: diagnostic.truncatedBlockerIssueIds,
