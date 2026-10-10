@@ -25,4 +25,16 @@ describe("createDecisionWakeOriginAgent", () => {
       payload: { issueId: "issue-1", decisionId: "decision-1", outcome: "decided" },
     });
   });
+
+  it("tells the origin agent a decision was dismissed, with the reason, and names no option", async () => {
+    const wakeup = vi.fn().mockResolvedValue({ id: "run-2" });
+
+    await createDecisionWakeOriginAgent(wakeup)({ ...input, outcome: "dismissed", dismissReason: "Not now" });
+    expect(wakeup).toHaveBeenCalledWith("agent-1", {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "decision_dismissed",
+      payload: { issueId: "issue-1", decisionId: "decision-1", outcome: "dismissed", dismissReason: "Not now" },
+    });
+  });
 });

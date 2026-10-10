@@ -452,6 +452,22 @@ describePg("decisionService", () => {
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(1);
   });
 
+  it("retries a dismissed continuation as dismissed after a crash before wake delivery", async () => {
+    const created = await createCommentDecision();
+    const crashingService = decisionService(db, { wakeOriginAgent: async () => {
+      throw new Error("simulated crash before wake delivery");
+    } });
+
+    await expect(crashingService.dismiss(created.id, decidedByUserId, boardActor(), "Not needed"))
+      .rejects.toThrow("simulated crash before wake delivery");
+    expect((await service().get(created.id))?.metadata).toMatchObject({ dismissed: true, continuationPending: true });
+
+    await service().sweepExpired();
+
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "dismissed", dismissReason: "Not needed" }]);
+    expect((await service().get(created.id))?.metadata).toMatchObject({ continuationPending: false });
+  });
+
   it("delivers the continuation when the origin agent cancels a decision", async () => {
     const created = await createCommentDecision();
 
@@ -633,7 +649,7 @@ describePg("decisionService", () => {
       { ruleKey: "routing.assign", proposed: 3, accepted: 2, rejected: 1, expired: 0,
         chosenOptions: [{ optionId: "assign", count: 2 }] },
     ]);
-    expect((await service().outcome(rejected.id)).metadata).toMatchObject({ dismissed: true, dismissReason: "Not this time" });
+    expect(await service().outcome(rejected.id)).toMatchObject({ chosenOptionId: "dismissed", metadata: { dismissed: true, dismissReason: "Not this time" } });
     expect(await db.select().from(activityLog).where(eq(activityLog.action, "decision.dismissed")))
       .toEqual([expect.objectContaining({ entityId: rejected.id, responsibleUserId: decidedByUserId })]);
   });
@@ -650,11 +666,41 @@ describePg("decisionService", () => {
     expect(await db.select().from(activityLog).where(eq(activityLog.action, "decision.dismissed"))).toHaveLength(0);
   });
 
-  it("wakes the origin agent after a direct dismissal", async () => {
+  it("wakes the origin agent with a dismissed continuation after a direct dismissal", async () => {
     const created = await createCommentDecision();
     const result = await service().dismiss(created.id, decidedByUserId, boardActor(), "No");
 
-    expect(result).toMatchObject({ status: "decided", chosenOptionId: "dismissed" });
-    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "decided" }]);
+    expect(result).toMatchObject({ status: "decided", chosenOptionId: "dismissed", executions: [] });
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "dismissed", dismissReason: "No" }]);
+    const [activity] = await db.select().from(activityLog).where(eq(activityLog.action, "decision.dismissed"));
+    expect(activity?.details).toMatchObject({ chosenOptionId: "dismissed", dismissed: true, dismissReason: "No" });
+  });
+
+  it("records no option, runs no effect and never sends a decided continuation when an effect-free option exists", async () => {
+    const created = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Comment or skip?", body: "Body", continuationPolicy: "wake_origin_agent",
+      options: [
+        { id: "skip", label: "Skip", effects: [] },
+        { id: "comment", label: "Comment", effects: [{ type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "hello" }] },
+      ],
+    });
+
+    const result = await service().dismiss(created.id, decidedByUserId, boardActor(), "Not now");
+
+    expect(result).toMatchObject({
+      status: "decided",
+      executionStatus: "succeeded",
+      chosenOptionId: "dismissed",
+      executions: [],
+      metadata: expect.objectContaining({ dismissed: true, dismissReason: "Not now" }),
+    });
+    expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "dismissed", dismissReason: "Not now" }]);
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, created.id));
+    const dismissedRows = activity.filter((row) => row.action === "decision.dismissed");
+    expect(dismissedRows).toHaveLength(1);
+    expect(dismissedRows[0]?.details).toMatchObject({ chosenOptionId: "dismissed", dismissed: true, dismissReason: "Not now" });
+    expect(activity.some((row) => row.action === "decision.decided")).toBe(false);
+    expect(JSON.stringify(activity.map((row) => row.details))).not.toContain('"skip"');
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toEqual([]);
   });
 });
