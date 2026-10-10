@@ -14,7 +14,8 @@ status.
   `timed_out`, the server removes `runs/<runId>`. The release does not wait for
   it.
 - **By a sweep.** Every 10 minutes the server looks at SSH leases released in
-  the last 14 days whose directory it has not decided about. It removes a
+  the last 14 days whose directory it has not decided about, or whose kept
+  decision is older than the keep window (below). It removes a
   directory when its run is terminal, no other lease of the run is `active`,
   `retained`, or `pending_cleanup`, and the lease finished at least
   `PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES` ago (default 60). Above
@@ -32,8 +33,10 @@ status.
   passed since the decision: `not_git_backed`, `preserve_failed`, `rm_failed`,
   and `worktree_dirty` decisions recorded before the reaper saved extra
   worktrees. A directory that is not a git repository is then deleted, because
-  nothing in it can be saved. The others go through the save step again and are
-  kept again, for another window, if it still fails. `symlink` and
+  nothing in it can be saved, unless a git repository lies below it or its
+  `workspace` is a link: that one stays kept. The others go through the save
+  step again and are kept again, for another window, if it still fails. Retries
+  stop once the lease is older than the sweep's 14-day look-back. `symlink` and
   `root_mismatch` stay kept.
 
 A directory with the `.paperclip-restored` marker holds no unsynced work and is
@@ -167,7 +170,7 @@ against `workspace/` inside the run directory, which the agent controls.
 - Activity `environment.ssh_run_directory_reaped` for each removal, with
   `bytesFreed`, `trigger` (`lease_release` or `sweep`), the preserved refs, and
   the bundle path.
-- Activity `environment.ssh_run_directory_kept`, once, with the reason.
+- Activity `environment.ssh_run_directory_kept`, once per reason, with the reason.
 - A log line per removal with `bytesFreed`, and one per sweep with the totals.
 
 The server has no metrics backend. Sum `details.bytesFreed` over the activity

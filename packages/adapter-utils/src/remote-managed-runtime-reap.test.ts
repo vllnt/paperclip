@@ -1,7 +1,7 @@
 import { execFile, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -95,6 +95,63 @@ describe("reapSshRunDirectory and extra worktrees", () => {
     expect(await readFile(path.join(tree, "notes.txt"), "utf8")).toBe("untracked, never committed\n");
   });
 
+  it("saves an extra worktree that has no commit yet", async () => {
+    const run = await finishedRun();
+    const clone = path.join(run.root, "host-clone");
+    await git(run.root, ["clone", "-q", run.workspace, clone]);
+    const tree = path.join(run.runDir, "wt-orphan");
+    await git(run.workspace, ["worktree", "add", "-q", "--orphan", "-b", "agent/orphan", tree]);
+    await writeFile(path.join(tree, "first.txt"), "first file\n");
+
+    const result = await run.reap();
+
+    const ref = `refs/paperclip/preserved/${run.runId}/worktree-dirty-0`;
+    expect(result.outcome === "removed" && result.preserved).toContain(ref);
+    await git(clone, ["fetch", "-q", sshPreservedBundlePath(run.root, run.runId), `${ref}:refs/saved`]);
+    expect(await git(clone, ["show", "refs/saved:first.txt"])).toBe("first file");
+  });
+
+  it("keeps the run directory when the temporary index cannot be written, also as root", async () => {
+    const run = await finishedRun();
+    await dirtyExtraWorktree(run);
+    await mkdir(path.join(run.runDir, ".paperclip-reap-index-0", "sub"), { recursive: true });
+
+    await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+
+    expect(existsSync(path.join(run.runDir, "wt-agent", "notes.txt"))).toBe(true);
+  });
+
+  it("keeps the run directory when git status fails in an extra worktree", async () => {
+    const run = await finishedRun();
+    const tree = await dirtyExtraWorktree(run);
+    const gitdir = (await readFile(path.join(tree, ".git"), "utf8")).replace(/^gitdir: /, "").trim();
+    await writeFile(path.join(gitdir, "index"), "not an index\n");
+
+    await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+
+    expect(existsSync(path.join(tree, "notes.txt"))).toBe(true);
+  });
+
+  it("never writes into another repository that a worktree entry points at", async () => {
+    const run = await finishedRun();
+    const tree = path.join(run.runDir, "wt-agent");
+    await git(run.workspace, ["worktree", "add", "-q", "-b", "agent/scratch", tree]);
+    const foreign = path.join(run.root, "foreign");
+    await mkdir(foreign);
+    await git(foreign, ["init", "-q", "-b", "main"]);
+    await git(foreign, ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--allow-empty", "-m", "foreign"]);
+    await writeFile(path.join(foreign, "new.txt"), "not ours\n");
+    // The agent re-points the worktree entry at the other repository, with no HEAD commit.
+    const admin = path.join(run.workspace, ".git", "worktrees", "wt-agent");
+    await writeFile(path.join(admin, "gitdir"), `${path.join(foreign, ".git")}\n`);
+    await writeFile(path.join(admin, "HEAD"), "ref: refs/heads/nonexistent\n");
+    const objectsBefore = await git(foreign, ["count-objects"]);
+
+    await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+
+    expect(await git(foreign, ["count-objects"])).toBe(objectsBefore);
+  });
+
   // Root reads the file anyway.
   it.skipIf(process.getuid?.() === 0)("keeps the run directory when the extra worktree cannot be saved", async () => {
     const run = await finishedRun();
@@ -122,6 +179,29 @@ describe("reapSshRunDirectory and a run that is not a git repository", () => {
     await expect(run.reap({ removeNotGitBacked: true })).resolves.toMatchObject({ outcome: "removed", preserved: [] });
 
     expect(existsSync(run.runDir)).toBe(false);
+  });
+
+  it("keeps a run directory with a repository below it, even after its keep window", async () => {
+    const run = await finishedRun({ git: false });
+    const nested = path.join(run.workspace, "nested");
+    await mkdir(nested);
+    await git(nested, ["init", "-q", "-b", "main"]);
+    await git(nested, ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--allow-empty", "-m", "only here"]);
+
+    await expect(run.reap({ removeNotGitBacked: true })).resolves.toMatchObject({ outcome: "kept", reason: "not_git_backed" });
+
+    expect(existsSync(path.join(nested, ".git"))).toBe(true);
+  });
+
+  it("keeps a run directory whose workspace is a link, even after its keep window", async () => {
+    const run = await finishedRun();
+    const real = path.join(run.runDir, "real-workspace");
+    await rename(run.workspace, real);
+    await symlink(real, run.workspace);
+
+    await expect(run.reap({ removeNotGitBacked: true })).resolves.toMatchObject({ outcome: "kept", reason: "not_git_backed" });
+
+    expect(existsSync(path.join(real, ".git"))).toBe(true);
   });
 
   it("still saves a git repository's state when told it may remove unsaved content", async () => {

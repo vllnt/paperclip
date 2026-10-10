@@ -134,6 +134,10 @@ describeReaper("SSH run directory reaper", () => {
     (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]?.metadata ?? {};
   const exists = (target: string) => stat(target).then(() => true, () => false);
   const reaper = () => sshRunDirectoryReaperService(db);
+  // How often a mocked remote reap ran for one run: the sweep may also pick up
+  // leases other tests left behind.
+  const callsFor = (mock: ReturnType<typeof vi.fn>, runId: string) =>
+    mock.mock.calls.filter((call) => (call[0] as { runId?: string }).runId === runId).length;
 
   it.each(TERMINAL_STATUSES)("removes the run directory of a %s run on lease release, with an activity entry and the bytes freed", async (status) => {
     const run = await startRun({ status });
@@ -209,6 +213,57 @@ describeReaper("SSH run directory reaper", () => {
     // A kept git repository is never removed without saving its state first.
     expect(reapRemote.mock.calls[1]![0]).toMatchObject({ removeNotGitBacked: false });
     expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1);
+  });
+
+  it("records a directory kept again for the same reason only once", async () => {
+    const run = await startRun({ status: "failed" });
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 2 * HOUR_MS) }).where(eq(environmentLeases.id, run.leaseId));
+    const reapRemote = vi.fn().mockResolvedValue({ outcome: "kept", reason: "preserve_failed", bytes: 1024 });
+    const hooked = () => sshRunDirectoryReaperService(db, { hooks: { reapRemote } });
+
+    await hooked().sweep({ readDiskUsagePercent: async () => 10 });
+    await hooked().sweep({ now: new Date(Date.now() + 25 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    await hooked().sweep({ now: new Date(Date.now() + 50 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+
+    expect(callsFor(reapRemote, run.runId)).toBe(3);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1);
+  });
+
+  it("tries a directory again after the keep window once its removal attempts ran out", async () => {
+    const run = await startRun({ status: "failed" });
+    await db.update(environmentLeases).set({
+      status: "released",
+      releasedAt: new Date(Date.now() - 2 * HOUR_MS),
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+        sshRunDirectory: { state: "kept", reason: "rm_failed", attempts: 5, at: new Date().toISOString(), trigger: "sweep", bytes: 0 },
+      })}::jsonb`,
+    }).where(eq(environmentLeases.id, run.leaseId));
+    const reapRemote = vi.fn().mockResolvedValue({ outcome: "removed", bytesFreed: 1024, preserved: [] });
+    const hooked = () => sshRunDirectoryReaperService(db, { hooks: { reapRemote } });
+
+    await hooked().sweep({ readDiskUsagePercent: async () => 10 });
+    expect(callsFor(reapRemote, run.runId)).toBe(0);
+    await hooked().sweep({ now: new Date(Date.now() + 25 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    expect(callsFor(reapRemote, run.runId)).toBe(1);
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "removed" } });
+  });
+
+  it.each(["symlink", "root_mismatch"] as const)("never tries a %s directory again, even after the keep window", async (reason) => {
+    const run = await startRun({ status: "failed" });
+    await db.update(environmentLeases).set({
+      status: "released",
+      releasedAt: new Date(Date.now() - 2 * HOUR_MS),
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+        sshRunDirectory: { state: "kept", reason, at: new Date(Date.now() - 48 * HOUR_MS).toISOString(), trigger: "sweep", bytes: 0 },
+      })}::jsonb`,
+    }).where(eq(environmentLeases.id, run.leaseId));
+    const reapRemote = vi.fn();
+
+    await sshRunDirectoryReaperService(db, { hooks: { reapRemote } })
+      .sweep({ now: new Date(Date.now() + 25 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+
+    expect(callsFor(reapRemote, run.runId)).toBe(0);
+    expect(await exists(run.runDir)).toBe(true);
   });
 
   it("saves the uncommitted work of an extra worktree into the bundle, then deletes the directory", async () => {

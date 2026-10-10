@@ -381,8 +381,9 @@ async function reapLease(
     if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return SKIPPED;
     if (await hasBusyLease(db, runId, lease.id)) return SKIPPED;
     if (context.trigger === "lease_release") {
-      // A task session may resume from its last run. The sweep removes it
-      // once it is old enough.
+      // A task session's last run is left to the sweep, which removes it once
+      // it is old enough. Nothing reads an earlier run's directory; this only
+      // keeps a short margin after release.
       const [session] = await db
         .select({ id: agentTaskSessions.id })
         .from(agentTaskSessions)

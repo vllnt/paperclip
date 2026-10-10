@@ -238,8 +238,11 @@ export async function reapSshRunDirectory(input: {
     '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then git_backed=0',
     '  elif [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed',
     '  elif [ ! -d "$ws/.git" ]; then git_backed=0; fi',
-    // Nothing here can be saved. After its keep window it goes like the rest.
+    // Nothing here can be saved. After its keep window it goes like the rest,
+    // unless a repository below the run directory, or a linked workspace, may
+    // hold commits that only this worker has.
     '  if [ "$git_backed" = 0 ] && [ "$unsaved_ok" != 1 ]; then keep not_git_backed; fi',
+    '  if [ "$git_backed" = 0 ] && { [ -L "$ws" ] || [ -n "$(find . -name .git -print 2>/dev/null | head -n 1)" ]; }; then keep not_git_backed; fi',
     "fi",
     'if [ "$git_backed" = 1 ]; then',
     '  G rev-parse --git-dir >/dev/null 2>&1 || keep preserve_failed',
@@ -262,6 +265,8 @@ export async function reapSshRunDirectory(input: {
     '  G stash list --format=%H > "$list.stash" 2>/dev/null || true',
     '  while IFS= read -r obj; do [ -n "$obj" ] && add_ref "stash-$index" "$obj"; index=$((index + 1)); done < "$list.stash"',
     '  G worktree list --porcelain > "$list.trees" 2>/dev/null || true',
+    // The repository every extra worktree must belong to before it is saved.
+    '  own_common=$(cd "$ws/.git" 2>/dev/null && pwd -P) || keep preserve_failed',
     '  index=0; main=1; tree=""; detached=""; prunable=""; treehead=""',
     '  while IFS= read -r line || [ -n "$line" ]; do',
     '    case "$line" in',
@@ -272,12 +277,15 @@ export async function reapSshRunDirectory(input: {
     '      "")',
     '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
     '          case "$treehead" in *[!0]*) ;; *) treehead="" ;; esac',
-    '          changes=$(GT status --porcelain 2>/dev/null)',
+    '          changes=$(GT status --porcelain 2>/dev/null) || keep preserve_failed',
     // Uncommitted work in an extra worktree: the same snapshot as for the main
     // worktree below, from a temporary index in this run directory. The
     // worktree writes its objects to the repository's shared object store, so
     // the bundle carries them.
     '          if [ -n "$changes" ]; then',
+    // A worktree entry the agent pointed at another repository is not saved there.
+    '            common=$(GT rev-parse --git-common-dir 2>/dev/null) && common=$(cd "$tree" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P) || keep preserve_failed',
+    '            [ "$common" = "$own_common" ] || keep preserve_failed',
     '            tidx="$PWD/.paperclip-reap-index-$index"; rm -f "$tidx"',
     '            if [ -n "$treehead" ]; then GIT_INDEX_FILE="$tidx" GT read-tree "$treehead" || keep preserve_failed; fi',
     '            GIT_INDEX_FILE="$tidx" GT add -A || keep preserve_failed',
