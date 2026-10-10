@@ -9417,6 +9417,24 @@ function truncateDisplayId(value: string | null | undefined, max = 128) {
   return value.length > max ? value.slice(0, max) : value;
 }
 
+const ROUTINE_EXECUTION_SLOT_INDEX = "issues_open_routine_execution_uq";
+
+/** True when taking an issue's execution slot lost to another open copy of the same routine execution. */
+function isRoutineExecutionSlotConflict(error: unknown) {
+  return isUniqueViolation(error, ROUTINE_EXECUTION_SLOT_INDEX);
+}
+
+function logRoutineExecutionSlotConflict(
+  runId: string,
+  issueId: string | null,
+  site: "claimQueuedRun" | "enqueueWakeup" = "claimQueuedRun",
+) {
+  logger.warn(
+    { runId, issueId, index: ROUTINE_EXECUTION_SLOT_INDEX },
+    `${site}: another open copy of this routine execution holds the execution slot; the run stays queued`,
+  );
+}
+
 function normalizeAgentNameKey(value: string | null | undefined) {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
@@ -18593,6 +18611,7 @@ export function heartbeatService(
         issueId,
         stage: "claim",
       });
+    let routineSlotConflict = false;
     const queuedCommentClaim =
       !nativeReviewContext && issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
@@ -18864,6 +18883,11 @@ export function heartbeatService(
             .catch((error) => {
               if (isExternalChatWaitAuthorizationContention(error))
                 return { kind: "stale" as const, run: null };
+              if (isRoutineExecutionSlotConflict(error)) {
+                routineSlotConflict = true;
+                logRoutineExecutionSlotConflict(run.id, issueId);
+                return { kind: "stale" as const, run: null };
+              }
               throw error;
             })
         : null;
@@ -18918,17 +18942,47 @@ export function heartbeatService(
               agentNameKey: normalizeAgentNameKey(agent.name),
             });
           }
-          return tx.transaction(async (claimTx) => {
-            const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
-            if (issueClaim.blocked) return null;
-            const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
-              eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
-            )).returning().then((rows) => rows[0] ?? null);
-            await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
-            return claimedRun;
-          });
+          try {
+            return await tx.transaction(async (claimTx) => {
+              const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
+              if (issueClaim.blocked) return null;
+              const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
+                eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
+              )).returning().then((rows) => rows[0] ?? null);
+              await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
+              return claimedRun;
+            });
+          } catch (error) {
+            // The claim savepoint is rolled back, so the run is still queued. Taking
+            // the slot lost a race with another open copy of the same routine
+            // execution. The next pass cancels the run if that copy is live, or claims
+            // it once a stale lock is cleared. Never surface the index as an error.
+            if (!isRoutineExecutionSlotConflict(error)) throw error;
+            routineSlotConflict = true;
+            logRoutineExecutionSlotConflict(run.id, issueId);
+            return null;
+          }
         });
-    if (!claimed) return null;
+    if (!claimed) {
+      if (routineSlotConflict) {
+        // Re-decide now that the other copy holds the slot: the staleness check
+        // cancels this run if that copy is live, and leaves it queued if the
+        // holder is a stale lock that the sweep is about to clear.
+        const staleness = await runDispatch.cancelStaleQueuedRun({
+          runId: run.id,
+          companyId: run.companyId,
+          expectedStatus: "queued",
+        });
+        if (staleness.outcome === "cancelled") {
+          applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+          logger.info(
+            { runId: run.id, issueId, errorCode: staleness.errorCode },
+            "claimQueuedRun: cancelled queued run after losing the routine execution slot",
+          );
+        }
+      }
+      return null;
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -21323,7 +21377,12 @@ export function heartbeatService(
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      // One agent's claim error must not stop the agents after it.
+      try {
+        await startNextQueuedRunForAgent(agentId);
+      } catch (err) {
+        logger.error({ err, agentId }, "failed to resume queued runs for an agent");
+      }
     }
   }
 
@@ -30051,23 +30110,36 @@ export function heartbeatService(
               if (await cancelStaleScheduledRetry(legacyRun)) {
                 activeExecutionRun = null;
               } else {
-                activeExecutionRun = legacyRun;
                 const legacyAgent = await tx
                   .select({ name: agents.name })
                   .from(agents)
                   .where(eq(agents.id, legacyRun.agentId))
                   .then((rows) => rows[0] ?? null);
-                await tx
-                  .update(issues)
-                  .set({
-                    executionRunId: legacyRun.id,
-                    executionAgentNameKey: normalizeAgentNameKey(
-                      legacyAgent?.name,
-                    ),
-                    executionLockedAt: new Date(),
-                    updatedAt: new Date(),
-                  })
-                  .where(eq(issues.id, issue.id));
+                try {
+                  // A savepoint, so a lost race on the routine execution slot rolls back
+                  // this update alone and not the whole wake.
+                  await tx.transaction(async (rebindTx) => {
+                    await rebindTx
+                      .update(issues)
+                      .set({
+                        executionRunId: legacyRun.id,
+                        executionAgentNameKey: normalizeAgentNameKey(
+                          legacyAgent?.name,
+                        ),
+                        executionLockedAt: new Date(),
+                        updatedAt: new Date(),
+                      })
+                      .where(eq(issues.id, issue.id));
+                  });
+                  activeExecutionRun = legacyRun;
+                } catch (error) {
+                  // Another open copy of the same routine execution holds the slot. This
+                  // issue cannot take it, so treat it as having no lock: the wake goes on
+                  // as a new queued run, and the claim cancels or defers it like any
+                  // other run of this copy.
+                  if (!isRoutineExecutionSlotConflict(error)) throw error;
+                  logRoutineExecutionSlotConflict(legacyRun.id, issue.id, "enqueueWakeup");
+                }
               }
             }
           }
