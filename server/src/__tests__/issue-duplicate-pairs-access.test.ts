@@ -106,6 +106,18 @@ describeEmbeddedPostgres("GET /issues/:id/duplicate-pairs hides other companies'
     expect(other.body).toEqual(missing.body);
   });
 
+  it("answers an unauthenticated caller with the same 401 whether or not the issue exists", async () => {
+    const app = appAs({ type: "none", source: "none" });
+    const existing = await request(app).get(`/api/issues/${ownIssueId}/duplicate-pairs`);
+    const otherCompany = await request(app).get(`/api/issues/${otherIdentifier}/duplicate-pairs`);
+    const missing = await request(app).get(`/api/issues/${randomUUID()}/duplicate-pairs`);
+    expect(existing.status).toBe(401);
+    expect(otherCompany.status).toBe(401);
+    expect(missing.status).toBe(401);
+    expect(existing.body).toEqual(missing.body);
+    expect(otherCompany.body).toEqual(missing.body);
+  });
+
   it("still lists the pairs of the caller's own issue", async () => {
     const board = await request(ownBoardUser()).get(`/api/issues/${ownIssueId}/duplicate-pairs`);
     expect(board.status).toBe(200);
