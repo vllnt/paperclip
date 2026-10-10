@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm"
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
+import { isUniqueViolation } from "../db-errors.js";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -109,20 +110,19 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   };
 }
 
-function isUniqueRecoveryActionConflict(error: unknown) {
-  const maybe = error as { code?: string; constraint?: string; message?: string } | null;
-  return Boolean(
-    maybe &&
-      maybe.code === "23505" &&
-      (
-        maybe.constraint === "issue_recovery_actions_active_source_uq" ||
-        maybe.constraint === "issue_recovery_actions_active_fingerprint_uq" ||
-        typeof maybe.message === "string" && (
-          maybe.message.includes("issue_recovery_actions_active_source_uq") ||
-          maybe.message.includes("issue_recovery_actions_active_fingerprint_uq")
-        )
-      ),
-  );
+const ACTIVE_RECOVERY_ACTION_UNIQUE_INDEXES = [
+  "issue_recovery_actions_active_source_uq",
+  "issue_recovery_actions_active_fingerprint_uq",
+] as const;
+
+/**
+ * True when a writer lost a race on one of the active-action unique indexes, so
+ * the caller should re-read and retry. Drizzle wraps the driver error and
+ * postgres.js nests the index name under `cause.constraint_name`; the shared
+ * helper walks that chain. Any other constraint or error code is rethrown.
+ */
+export function isUniqueRecoveryActionConflict(error: unknown): boolean {
+  return ACTIVE_RECOVERY_ACTION_UNIQUE_INDEXES.some((index) => isUniqueViolation(error, index));
 }
 
 export function issueRecoveryActionService(db: Db) {
