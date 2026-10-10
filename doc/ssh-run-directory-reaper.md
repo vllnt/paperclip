@@ -31,8 +31,8 @@ status.
 - **After the keep window.** A kept directory (see below) is tried again by the
   sweep once `PAPERCLIP_SSH_RUN_REAPER_KEEP_WINDOW_HOURS` (default 24) have
   passed since the decision: `not_git_backed`, `preserve_failed`, `rm_failed`,
-  and `worktree_dirty` decisions recorded before the reaper saved extra
-  worktrees. A directory that is not a git repository is then deleted, because
+  `external_worktree`, and `worktree_dirty` decisions recorded before the reaper
+  saved extra worktrees. A directory that is not a git repository is then deleted, because
   nothing in it can be saved, unless a git repository lies below it or its
   `workspace` is a link: that one stays kept. The others go through the save
   step again and are kept again, for another window, if it still fails. Retries
@@ -89,6 +89,14 @@ leases:list`:
   unknown. It is tried again after the keep window.
 - `rm_failed`: the removal failed. It is retried up to 5 times, then again after
   each keep window.
+- `external_worktree`: the run's repository has a worktree registered outside
+  `runs/<runId>` (an agent's `git worktree add ../<folder>`), and that folder
+  still exists. Deleting the run directory would leave the folder without its
+  repository, so the directory stays, with the folder's path in
+  `externalWorktree`. This applies to restored runs too. The reaper reads git's
+  registration files (`workspace/.git/worktrees/*/gitdir`) and runs no git in
+  the folder. After each keep window it looks again, and removes the run
+  directory once the folder is gone. It never removes the folder itself.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
 - `root_mismatch`: the root recorded on the lease is not the root the environment
   is configured with now (or the lease did not record that root), or it is too

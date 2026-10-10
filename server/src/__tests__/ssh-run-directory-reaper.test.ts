@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -264,6 +264,34 @@ describeReaper("SSH run directory reaper", () => {
 
     expect(callsFor(reapRemote, run.runId)).toBe(0);
     expect(await exists(run.runDir)).toBe(true);
+  });
+
+  it("keeps a run directory whose repository has a worktree outside it, and removes it once that worktree is gone", async () => {
+    const run = await startRun({ status: "interrupted" });
+    const outside = path.join(sshConfig.remoteWorkspacePath, ".paperclip-runtime", `wt-${run.runId.slice(0, 8)}`);
+    await git(run.workspace, ["worktree", "add", "-q", "-b", `agent/outside-${run.runId.slice(0, 8)}`, outside]);
+
+    await runtime.releaseRunLeases(run.runId);
+
+    await vi.waitFor(async () => expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1), { timeout: 15_000, interval: 100 });
+    const realOutside = await realpath(outside);
+    expect((await activityFor(run.runId, "environment.ssh_run_directory_kept"))[0]!.details)
+      .toMatchObject({ reason: "external_worktree", externalWorktree: realOutside });
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({
+      sshRunDirectory: { state: "kept", reason: "external_worktree", externalWorktree: realOutside },
+    });
+    expect(await exists(run.runDir)).toBe(true);
+
+    // While the worktree exists it stays kept, also after the keep window.
+    await reaper().sweep({ now: new Date(Date.now() + 25 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await activityFor(run.runId, "environment.ssh_run_directory_kept")).toHaveLength(1);
+
+    // Once it is gone, the next sweep past the window removes the run directory.
+    await rm(outside, { recursive: true, force: true });
+    await reaper().sweep({ now: new Date(Date.now() + 50 * HOUR_MS), readDiskUsagePercent: async () => 10 });
+    expect(await exists(run.runDir)).toBe(false);
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "removed" } });
   });
 
   it("saves the uncommitted work of an extra worktree into the bundle, then deletes the directory", async () => {

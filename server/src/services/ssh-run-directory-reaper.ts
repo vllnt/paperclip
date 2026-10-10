@@ -69,7 +69,8 @@ export function sshRunReaperKeepWindowMs(): number {
 
 // Kept decisions that the sweep reconsiders once the keep window is over.
 // `symlink` and `root_mismatch` stay kept: they say the path is not safe to use.
-const RECONSIDERED_KEEP_REASONS = ["not_git_backed", "worktree_dirty", "preserve_failed", "rm_failed"] as const;
+// `external_worktree` is checked again and stays kept while the worktree exists.
+const RECONSIDERED_KEEP_REASONS = ["not_git_backed", "worktree_dirty", "preserve_failed", "rm_failed", "external_worktree"] as const;
 
 /** Disk use, in percent, above which the sweep shortens the age threshold. */
 export function sshRunReaperDiskPressurePercent(): number {
@@ -502,16 +503,17 @@ async function recordResult(
   }
   const reason = result.outcome === "symlink" ? "symlink" : result.reason;
   const bytes = result.outcome === "kept" ? result.bytes : 0;
-  return await recordKept(db, lease, runId, agentId, reason, bytes, context, claim);
+  const extra = result.outcome === "kept" && result.externalWorktree ? { externalWorktree: result.externalWorktree } : {};
+  return await recordKept(db, lease, runId, agentId, reason, bytes, context, claim, extra);
 }
 
 async function recordKept(
   db: Db, lease: EnvironmentLease, runId: string, agentId: string, reason: string, bytes: number, context: ReapContext,
-  claim?: HeldClaim,
+  claim?: HeldClaim, extra: Record<string, unknown> = {},
 ): Promise<ReapReport> {
   const attempts = reason === "rm_failed" ? previousAttempts(lease) + 1 : undefined;
   const recorded = (!claim || await claim.hold()) && await recordDecision(db, lease.id, {
-    state: "kept", reason, at: context.now.toISOString(), trigger: context.trigger, bytes, ...(attempts ? { attempts } : {}),
+    state: "kept", reason, at: context.now.toISOString(), trigger: context.trigger, bytes, ...(attempts ? { attempts } : {}), ...extra,
   }, claim?.owner);
   if (!recorded) {
     logger.warn({ leaseId: lease.id, runId }, "dropped the outcome of a finished SSH run directory removal: its claim was taken over");
@@ -525,7 +527,7 @@ async function recordKept(
     await logActivity(db, {
       companyId: lease.companyId, actorType: "system", actorId: REAPER_ACTOR_ID, action: KEPT_ACTION,
       entityType: "heartbeat_run", entityId: runId, runId, agentId,
-      details: { leaseId: lease.id, environmentId: lease.environmentId, trigger: context.trigger, outcome: "kept", reason, bytes },
+      details: { leaseId: lease.id, environmentId: lease.environmentId, trigger: context.trigger, outcome: "kept", reason, bytes, ...extra },
     });
   }
   logger.warn({ runId, leaseId: lease.id, trigger: context.trigger, reason, bytes }, "kept a finished SSH run directory");

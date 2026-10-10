@@ -1,7 +1,7 @@
 import { execFile, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -136,7 +136,8 @@ describe("reapSshRunDirectory and extra worktrees", () => {
     const run = await finishedRun();
     const tree = path.join(run.runDir, "wt-agent");
     await git(run.workspace, ["worktree", "add", "-q", "-b", "agent/scratch", tree]);
-    const foreign = path.join(run.root, "foreign");
+    // Inside the run directory, so only the common-directory check stops it.
+    const foreign = path.join(run.runDir, "foreign");
     await mkdir(foreign);
     await git(foreign, ["init", "-q", "-b", "main"]);
     await git(foreign, ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--allow-empty", "-m", "foreign"]);
@@ -161,6 +162,44 @@ describe("reapSshRunDirectory and extra worktrees", () => {
     await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
 
     expect(existsSync(path.join(tree, "tracked.txt"))).toBe(true);
+  });
+});
+
+// An agent can add a worktree beside the run directory instead of inside it.
+// Deleting the run directory would leave that folder without its repository.
+describe("reapSshRunDirectory and a worktree outside the run directory", () => {
+  async function outsideWorktree(run: { root: string; workspace: string }) {
+    const tree = path.join(run.root, ".paperclip-runtime", "wt-agent");
+    await git(run.workspace, ["worktree", "add", "-q", "-b", "agent/outside", tree]);
+    return tree;
+  }
+
+  it("keeps the run directory and names the worktree", async () => {
+    const run = await finishedRun();
+    const tree = await outsideWorktree(run);
+
+    const result = await run.reap();
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "external_worktree", externalWorktree: await realpath(tree) });
+    expect(existsSync(path.join(run.workspace, ".git"))).toBe(true);
+  });
+
+  it("keeps it also when the run's work was restored", async () => {
+    const run = await finishedRun();
+    await outsideWorktree(run);
+    await writeFile(path.join(run.runDir, ".paperclip-restored"), "");
+
+    await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "external_worktree" });
+  });
+
+  it("removes the run directory once the outside worktree is gone", async () => {
+    const run = await finishedRun();
+    const tree = await outsideWorktree(run);
+    await rm(tree, { recursive: true, force: true });
+
+    await expect(run.reap()).resolves.toMatchObject({ outcome: "removed" });
+
+    expect(existsSync(run.runDir)).toBe(false);
   });
 });
 

@@ -130,13 +130,14 @@ export type SshRunDirectoryKeepReason =
   | "not_git_backed"
   | "worktree_dirty"
   | "preserve_failed"
-  | "rm_failed";
+  | "rm_failed"
+  | "external_worktree";
 
 export type SshRunDirectoryReapResult =
   | { outcome: "removed"; bytesFreed: number; preserved: string[] }
   | { outcome: "absent" }
   | { outcome: "symlink" }
-  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number };
+  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number; externalWorktree?: string };
 
 /** Where a reaped run's preserved git state is kept, outside every `runs/<runId>`. */
 export function sshPreservedBundlePath(remoteRoot: string, runId: string): string {
@@ -229,6 +230,20 @@ export async function reapSshRunDirectory(input: {
     // A repository config the agent planted must not run commands here.
     'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
     'GT() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$tree" "$@"; }',
+    // A worktree of the run's repository registered outside the run directory
+    // (an agent's `git worktree add ../x`) would keep its files but lose its
+    // repository when the directory goes. Keep the directory while such a
+    // worktree exists, restored or not. Read git's registration files, so no
+    // git runs in the agent's folder; a gone worktree (prunable) does not count.
+    'here=$(pwd -P)',
+    'for gd in "$ws"/.git/worktrees/*/gitdir; do',
+    '  if [ ! -f "$gd" ] || [ -L "$gd" ]; then continue; fi',
+    '  p=""; IFS= read -r p < "$gd" || [ -n "$p" ] || continue',
+    '  case "$p" in /*) ;; *) p="${gd%/gitdir}/$p" ;; esac',
+    '  [ -e "$p" ] || continue',
+    '  d=$(cd "${p%/.git}" 2>/dev/null && pwd -P) || continue',
+    '  case "$d/" in "$here/"*) ;; *) echo "external $d"; keep external_worktree ;; esac',
+    "done",
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
     'had_marker=0; git_backed=0',
     'if [ -f "$marker" ] && [ ! -L "$marker" ]; then',
@@ -354,8 +369,16 @@ export async function reapSshRunDirectory(input: {
   if (last === "absent" || last === "symlink") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed) (\d+)$/.exec(last);
-  if (kept) return { outcome: "kept", reason: kept[1] as SshRunDirectoryKeepReason, bytes: Number(kept[2]) * 1024 };
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed|external_worktree) (\d+)$/.exec(last);
+  if (kept) {
+    const external = lines.find((line) => line.startsWith("external "))?.slice("external ".length);
+    return {
+      outcome: "kept",
+      reason: kept[1] as SshRunDirectoryKeepReason,
+      bytes: Number(kept[2]) * 1024,
+      ...(kept[1] === "external_worktree" && external ? { externalWorktree: external } : {}),
+    };
+  }
   throw new Error("SSH run directory reap returned an unexpected result.");
 }
 
