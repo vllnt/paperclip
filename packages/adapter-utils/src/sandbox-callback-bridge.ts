@@ -319,9 +319,10 @@ export interface SandboxCallbackBridgeQueueClient {
   // omits it; the worker falls back to sequential `makeDir` calls, so an
   // external implementation stays compatible without a change.
   makeDirs?(remotePaths: string[]): Promise<void>;
-  // The worker passes `signal` to the reads it may give up on (the queue
-  // listing and a request read). A client that can stop a remote command in
-  // flight stops it when the signal aborts; others ignore it.
+  // The worker passes `signal` to the reads whose result it discards when it
+  // gives up on them (the queue listings and the recovery path's read). A
+  // client that can stop a remote command in flight stops it when the signal
+  // aborts; others ignore it.
   listJsonFiles(remotePath: string, options?: SandboxCallbackBridgeReadOptions): Promise<string[]>;
   fileSize?(remotePath: string, options?: SandboxCallbackBridgeReadOptions): Promise<number>;
   readTextFile(remotePath: string, maxBytes?: number, options?: SandboxCallbackBridgeReadOptions): Promise<string>;
@@ -1090,10 +1091,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
   type RequestFinalizeGuard = {
     claim: "unclaimed" | "handler" | "abandon";
     controller: AbortController;
-    // Aborts the request's reads (size, read, re-list) when the recovery path
-    // gives up on a request the handler did not claim yet. Separate from
-    // `controller`, which tells a started handler the worker aborted it.
-    readController: AbortController;
     finalized: boolean;
     backstopTimer?: ReturnType<typeof setTimeout>;
   };
@@ -1113,10 +1110,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
     const guard: RequestFinalizeGuard = {
       claim: "unclaimed",
       controller: new AbortController(),
-      readController: new AbortController(),
       finalized: false,
     };
-    const readSignal = guard.readController.signal;
     inFlightRequestGuards.set(fileName, guard);
     const reservation = createBridgeBodyReservation();
     const envelopeReadReservation = createBridgeBodyReservation();
@@ -1193,9 +1188,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // clients stat first so a high configured file limit does not reserve that
       // whole limit for a tiny request. Older clients use the conservative cap.
       const envelopeBytes = input.client.fileSize
-        ? await input.client.fileSize(requestPath, { signal: readSignal }).catch(() => maxEnvelopeBytes)
+        ? await input.client.fileSize(requestPath).catch(() => maxEnvelopeBytes)
         : maxEnvelopeBytes;
-      readSignal.throwIfAborted();
       if (envelopeBytes > maxEnvelopeBytes) {
         await finalize({
           id: fileName.replace(/\.json$/i, ""), status: 413,
@@ -1216,7 +1210,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       }
       let raw: string;
       try {
-        raw = await input.client.readTextFile(requestPath, readLimit, { signal: readSignal });
+        raw = await input.client.readTextFile(requestPath, readLimit);
       } catch (error) {
         // The gateway deletes a request file when its caller stops waiting
         // (client-side timeout cleanup). A read that fails because the file is
@@ -1224,8 +1218,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // vanished and skip quietly instead of escalating into a recovery
         // pass. A file that is still listed rethrows, so a real read fault
         // keeps its existing handling.
-        const remaining = await input.client.listJsonFiles(directories.requestsDir, { signal: readSignal })
-          .catch(() => null);
+        const remaining = await input.client.listJsonFiles(directories.requestsDir).catch(() => null);
         if (remaining !== null && !remaining.includes(fileName)) {
           return;
         }
@@ -1476,10 +1469,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
         if (guard.claim === "handler") {
           guard.controller.abort(new Error(message));
           scheduleAbortedHandlerBackstop(fileName, guard, message);
-        } else {
-          // The handler did not start: stop the request's read. The listing
-          // below answers the request (or the next poll picks it up again).
-          guard.readController.abort(new Error(message));
         }
       }
     }

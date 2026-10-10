@@ -116,19 +116,21 @@ describe("sandbox callback bridge worker aborts the reads it gives up on", () =>
     expect(memory.listSignals.at(-1)?.aborted).toBe(false);
   });
 
-  it("aborts the read of a request it gave up on before the handler started, then answers it with a 503", async () => {
-    const memory = createClient({ read: (call) => call === 1 });
+  it("aborts the recovery read that timed out, never the request's own read", async () => {
+    // The request's own read and the recovery path's read both hang.
+    const memory = createClient({ read: (call) => call <= 2 });
     memory.enqueue("slow-read");
     const handleRequest = await start(memory.client);
-    const hung = memory.readSignals[0];
-    expect(hung?.aborted).toBe(false);
 
     await vi.advanceTimersByTimeAsync(ITERATION_TIMEOUT_MS);
-    await vi.advanceTimersByTimeAsync(100);
+    expect(memory.readSignals).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(ITERATION_TIMEOUT_MS);
 
-    expect(hung?.aborted).toBe(true);
+    // Stopping the request's own read would drop its guard early; it keeps
+    // running to its own command timeout, as before.
+    expect(memory.readSignals[0]).toBeUndefined();
+    expect(memory.readSignals[1]?.aborted).toBe(true);
     expect(handleRequest).not.toHaveBeenCalled();
-    expect(memory.response("slow-read")?.status).toBe(503);
   });
 });
 
