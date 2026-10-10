@@ -292,14 +292,11 @@ path that finalizes the run honours it:
    it writes `status: "interrupted"`, `errorCode: "planned_restart"`, and the stop
    metadata with outcome `interrupted` (not `cancelled`), including the
    `runUsedConversationAdapter` result that the shutdown loop passes today, so the
-   class test of section 4.5 reads the same facts. It then **skips every release**:
-   `cancelRunInternal`'s release, the executor's release after the ending, and the
-   executor's late release in its `finally` block. Each skip reads the durable
-   `resultJson.plannedRestartStop`, not the in-memory map, because the late release
-   can run after the map entry is cleared. No path schedules a successor.
-   The issue lock stays on the stopped run for now. Nothing can take it during the
-   drain: the stale-lock sweep, the deferred-wake sweep and queue starts are all
-   suppressed.
+   class test of section 4.5 reads the same facts. **No path releases the issue or
+   schedules a successor** until step 4 decides. This is enforced at two choke
+   points, not at each caller (section 4.2.1 lists every path). The issue lock
+   stays on the stopped run for now. The sweeps that could take it (stale lock,
+   deferred wake) and queue starts are suppressed during the drain.
 4. **Decide, in one place: the deadline caller, after `cancelRunInternal`
    returns.** That function waits for the adapter to settle, and the executor
    settles after its lease release, which is where a remote ACP run's stop proof
@@ -333,6 +330,10 @@ path that finalizes the run honours it:
      whose stop is not proven goes to the `reconciliation` class: no resume,
      because the provider may still be working and the same work could run twice.
      The caller records this outcome and does not surface the conflict as an error;
+   - re-reads the run and the issue. If the run ended `cancelled` by another writer
+     (an agent pause, a budget stop), it is `operator_stop`. If the issue lock no
+     longer points at the run, or a successor already exists, it is `superseded`.
+     Neither gets a resume, and step 4 releases as today for that ending;
    - classifies the run (section 4.5);
    - when it is `resumed`, schedules the resume. `scheduleBoundedRetryForRun` moves
      the issue lock to the resume row in the same transaction that creates it
@@ -355,6 +356,51 @@ So the resume is always the first successor, it holds the issue lock from the
 moment it exists, it exists only when the stop is proven, and the ending is the
 same whichever path wins. Section 9 tests both
 branches.
+
+#### 4.2.1 Every path that can end a run or release its issue
+
+The intent must hold against every writer, not only the two branches of
+`cancelRunInternal`. On `main` at `d47df97f0`, `heartbeat.ts` has 21 call sites
+of `releaseIssueExecutionAndPromote` and several functions that write a terminal
+status on a live run. Gating each caller would miss the next one. So the plan
+gates two choke points that every one of them passes through, and states how the
+rest behave.
+
+**Choke point A: the release.** `releaseIssueExecutionAndPromote`
+(`heartbeat.ts:28464` at `d47df97f0`) is the only caller of the wake-queue
+`releaseIssueExecution` (`modules/wake-queue/application/use-cases.ts:1024`),
+which is the only code that promotes a deferred wake into the lock and the only
+code that queues an immediate recovery successor (`wake-queue adapters/postgres.ts`
+`:659-763`). While `resultJson.plannedRestartStop` is set and
+`plannedRestartStop.decidedAt` is null, it returns at once: no release, no
+promotion, no recovery successor. It reads the durable marker, not the in-memory
+map. Step 4 sets `decidedAt` and then calls it with its own options.
+
+**Choke point B: the retry successor.** `scheduleBoundedRetryForRun`
+(`heartbeat.ts:16123` at `d47df97f0`) refuses (`not_scheduled`, reason
+`planned_restart_pending`) for a run with an undecided intent, unless the caller is
+step 4 with the reason `planned_restart_resume`. So the reaper, the shutdown loop,
+the provider-capacity cancel, the stranded sweep and every other retry caller
+cannot write the first successor.
+
+**Each path, and how it is gated:**
+
+| Path (at `d47df97f0`) | What it does to a live run | Gate |
+|---|---|---|
+| `cancelRunInternal` (`:31507`), both branches | ends the run, then releases | ending honours the intent (step 3); release at A |
+| Executor ending write and its release (`:27492`, `:27924`, `:28198`) | ends the run, then releases | ending honours the intent; release at A |
+| Executor late path in `finally` (`:28435-28439`) | when a wake is pending for the issue, either releases (`releaseIssueExecutionAndPromote`) or resumes a queued-comment interrupt (`resumeQueuedCommentInterrupt`, `:10796`), which clears the lock through its own adapter (`queued-comment-postgres.ts` `clearExecutionLockAndTouchIssue`) and so **does not pass A** | the late path checks the durable marker first and does neither while the intent is undecided; step 4 resumes the interrupt after its decision, the same way it releases |
+| `cancelActiveForAgentInternal` (`:31809`; release `:31879`), used by agent pause (`cancelActiveForAgent`, `:32555`), budget pause (`cancelBudgetScopeWork`), invokability loss (`:21687`) and bulk cancel (`cancelInvocationsForAgentsInternal`) | writes `cancelled` on each active run, then releases | its terminal write is guarded by status, so the first writer wins; release at A. If it wins, the run is `cancelled` by the operator: step 4 classifies it `operator_stop` (no resume) and releases it with today's options for that ending |
+| Provider-capacity stop (the retry-ceiling stop near `:17480`) | ends through `cancelRunInternal` with `suppressImmediateRecovery` | ending honours the intent; release at A |
+| Busy-wait deferrals (`finalizeAiConnectionBusyDeferral` `:17126`, release `:17161`; `finalizeWorkspaceBusyDeferral` `:17178`, release `:17266`) and the daily-cap cancel of a queued run (`cancelQueuedRunForHeartbeatDailyCap` `:17901`, release `:17944`) | act on runs that have not started provider work; may schedule a retry | retry at B; release at A. They act on queued or deferring runs, which the deadline does not stop, so they meet the intent only if a run is stopped while deferring |
+| Shutdown loop (`drainRunningRunsForShutdown`, `:15494`; release `:15663`) | ends the run, schedules a retry or releases | inside a drain it is a planned-restart finalizer (below); otherwise unchanged. Retry at B, release at A |
+| Reaper (`reapOrphanedRuns`, `:20098`; release `:20570`) | ends `running` rows whose process is gone | the deadline runs in a live process, so the reaper sees only runs of an older boot; A and B still apply |
+| Other release callers (`:21228`, `:21269`, `:21300` in recovery passes; `:22128`, `:22146`, `:22160`, `:24413`, `:24905` inside `executeRunAttempt` on dispatch failure, reset or abort) | release on dispatch, reset, repair or abort outcomes | A |
+| Writers that clear `issues.executionRunId` without promotion: issue status and assignee changes (`issues.ts`), tree holds (`issue-tree-control.ts`), membership removal (`access.ts`), watchdog, run dispatch, recovery resolution, execution-control reconciliation | clear the lock as part of an operator or domain action | not gated: the operator action wins. Step 4 re-reads the issue; if the lock no longer points at the stopped run, it classifies the run `superseded` and schedules nothing. The retry row's lock transfer is already conditional on the old holder (`:16916`) |
+| New wakes from `enqueueWakeup` (comments, assignments, timers) | a new request, not a successor of this run (no `retryOfRunId`) | not gated: during a drain they stay queued behind the lock |
+| Operator-chosen successors: resolving a recovery action (`execution-recovery-resolution.ts:263`), an authorized chat retry (`chat-channels.ts`) | an operator decision | not gated: an operator action wins, as today; step 4 then finds the successor and classifies `superseded` |
+
+A test exercises each gated row (section 9).
 
 **Concurrency.** At most 8 runs are stopped at a time, so the deadline does not
 start dozens of terminations at once; each run's grace period still applies.
@@ -431,11 +477,16 @@ Exit codes a script can rely on:
 |---|---|---|---|
 | `0` | `wait`, `run` | Quiescent: every run finished in the grace period | Stop |
 | `10` | `wait`, `run` | The deadline passed; the remaining runs were stopped as `planned_restart` | Stop |
-| `20` | all | The request was refused or failed: not authorized, `409`, `422`, server unreachable | Its own policy; a stop now loses runs as today |
+| `20` | all | The request failed for a reason other than authentication: `409`, `422`, `5xx`, server unreachable on a `start` or `cancel` | Its own policy; a stop now loses runs as today |
 | `21` | `wait`, `run` | No poll succeeded for `--timeout` (network) | Stop is allowed; the drain expires by itself |
 | `22` | `wait`, `run` | The drain ended under the wait: cancelled, expired, or replaced by another `drainId` | Do not stop without a decision |
 | `23` | `wait`, `run` | Polls succeeded, but `--timeout` passed before `quiescent` or `ended_at_deadline` (for example a stop at the deadline that has not finished) | Stop is allowed; say so in the job log |
-| `24` | `wait`, `run` | A poll returned `401` or `403` | Fix the credential; do not stop |
+| `24` | all | Any request returned `401` or `403` | Fix the credential; do not stop |
+
+The codes are disjoint. Authentication is checked first: a `401` or `403` is
+always `24`, on any command, and never `20`. Then, for `wait` and `run`: `22`
+(the drain ended under the wait) before `21`, `23` and `20`. A deploy wrapper that
+stops only on `0`, `10`, `21` or `23` never stops after a credential failure.
 
 `start` and `cancel` exit `0` on success (including `alreadyActive`, and a cancel
 with no drain open) and `20` on failure.
@@ -500,9 +551,26 @@ the `general` JSON: that is settings, not events, and it has no history.
 | Class | Test | What happens |
 |---|---|---|
 | `resumed` | legacy run, has an `issueId`, and `legacyExecutionNeedsReconciliationWithEvidence` is false (a conversation-continuation adapter, or the provider never started) | one `planned_restart_resume` retry (below) |
-| `reconciliation` | legacy run for which that gate is true | the existing reconciliation hold, unchanged. A planned restart does **not** bypass it: the run's tool actions may already have happened, and nothing proves otherwise |
+| `reconciliation` | legacy run for which that gate is true, or any run whose stop is not proven | the recovery that applies to a restart-orphaned run (below). A planned restart does **not** bypass it: the run's tool actions may already have happened, and nothing proves otherwise |
+| `operator_stop`, `superseded` | another writer ended the run or took the issue first (section 4.2.1) | nothing from this plan; the operator's action stands |
 | `native` | `runtimeMode: "native"` (not the native runner) | its own fenced same-run recovery, unchanged |
 | `no_issue` | no `issueId` (a timer heartbeat) | nothing; the next timer tick covers it |
+
+**The decided restart rule (#99 and #104).** The manager decided the conflict
+between #99 and #104 (landing order **#74 → #99 → #104**). For a run orphaned by a
+restart:
+
+- a **conversation adapter** gets the bounded transient retry (2 attempts), then
+  the issue goes to `blocked` (#104);
+- **every other adapter** keeps #99's one stable board-owned hold.
+
+This plan follows that rule and adds one case before it: a `planned_restart` run
+with a **proven stop** whose reconciliation gate allows a retry gets the
+`planned_restart_resume`, which does not spend the failure budget. In practice
+those are conversation adapters, plus runs that never started. Every other
+`planned_restart` run, and every run whose stop is not proven, gets the decided
+rule above: a conversation adapter gets #104's bounded retry, and any other
+adapter gets #99's hold. The `reconciliation` row of the table means exactly that.
 
 Chat-completion deliveries keep their own bounded retry. The status and the drain
 row count the classes, so the operator sees how much work needed a hold. The
@@ -589,14 +657,20 @@ than the grace period), some runs end after the restart as `process_lost` or
 `orphaned_running_run`. Slice D2 classifies them. At startup, after it closes the
 old rows and before the reap (section 4.4), the new process keeps the set of boot
 IDs whose `planned_restart` row it closed with `process_stopped`. A run whose
-`controllerBootId` is in that set and that the reaper ends gets `planned_restart`
-and the class rules of section 4.5, not `process_lost` and the transient retry. A
-run of a boot with no such row is unchanged.
+`controllerBootId` is in that set and that the reaper ends gets the error code
+`planned_restart`, so the counts are honest. Its recovery follows the class rules of
+section 4.5 **and the same stop proof**: a hard kill usually leaves none, so such a
+run gets the decided restart rule (#104's bounded retry for a conversation adapter,
+#99's hold for any other). Only a run with a proof already on its row (an
+acknowledgment, or a settled never-started receipt) gets the
+`planned_restart_resume`. A run of a boot with no such row is unchanged
+(`process_lost`).
 
 ### 5.3 The stranded-issue sweep is the net, not a second path
 
-Another change fixes `reconcileStrandedAssignedIssues` so that an `in_progress`
-issue with no live run is re-dispatched once or escalated, never left invisible.
+Another change (#104) fixes `reconcileStrandedAssignedIssues` so that an
+`in_progress` issue with no live run is re-dispatched once or escalated, never left
+invisible, under the decided rule of section 4.5.
 This plan does not touch that sweep, and the resume is not a second path: both
 reach `scheduleBoundedRetryForRun`, and its `retryOfRunId` dedup keeps one
 successor per run.
@@ -691,11 +765,18 @@ normal retry event, in the run's own company.
 
 | Slice | Content | Depends on |
 |---|---|---|
-| **D1** | `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the deadline stop through `cancelRunInternal` with the planned-restart stop intent honoured by both finalize paths (section 4.2), and the shutdown ending inside a drain; `planned_restart` code, its consumers and the cause-rules bump; the run classes; the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries | none |
+| **D1** | `instance_drains` table and migration; `reason`, `graceMs`, deadline and expiry, and the timer that owns them; the start/upgrade rules; the deadline stop through `cancelRunInternal` with the planned-restart stop intent honoured by both finalize paths (section 4.2), and the shutdown ending inside a drain; the two choke points of section 4.2.1; `planned_restart` code, its consumers and the cause-rules bump; the run classes with the decided restart rule; the `planned_restart_resume` retry reason in all five accounting places, the cap and the fallback; the stranded-sweep reason wiring (section 5.3); the resume note; the `instance_drain` attention item; API and OpenAPI; CLI `instance drain` with the exit codes; web banner and control; activity entries | #74, #99 and #104 merged |
 | **D2** | Startup classification of runs killed during a drain (section 5.2); `orphaned_running_run` cause mapping; `stop_grace_period` in `deploy/compose.yaml` (question Q9) | D1 |
 
-D1 is useful alone: the deploy job can drain, and the runs end clean and resume.
-Neither slice waits for the stranded-issue change.
+**Order: #74 → #99 → #104 → D1 → D2.** D1 depends on all three:
+
+- #74's deferred-wake sweep and its holds are what choke point A must not bypass;
+- the `reconciliation` class hands runs to #99's stable hold and to #104's bounded
+  retry, so both behaviours must be on `main` for D1's tests to assert them;
+- the stranded-sweep wiring of section 5.3 edits the sweep that #104 changes.
+
+D2 depends on D1. D1 is useful alone: the deploy job can drain, and the runs end
+clean and resume.
 
 ## 9. Verification per slice
 
@@ -719,6 +800,23 @@ D1, embedded Postgres unless noted:
   `reconciliation`, and the deadline caller sees no `409`. (f) The executor's late
   release in its `finally` block does not clear the lock or promote a deferred wake
   while the intent is set.
+- **Every gated path** of section 4.2.1, one test each: with an undecided intent on
+  the run, (a) `cancelActiveForAgent` (an agent pause) races the deadline: if it
+  wins, the run is `cancelled`, the deferred wake is **not** promoted before
+  step 4, and step 4 classifies `operator_stop` and releases as today; if the
+  deadline wins, the pause cancels nothing and the resume holds the lock;
+  (b) a budget pause (`cancelBudgetScopeWork`), the same; (c) the provider-capacity
+  stop, the reaper and the stranded sweep each get `not_scheduled` from choke point
+  B; (d) a direct call to `releaseIssueExecutionAndPromote` returns without
+  releasing, and the executor's late path with a pending queued-comment interrupt
+  neither releases nor resumes the interrupt until step 4; (e) an issue closed or reassigned during the deadline stop makes step
+  4 classify `superseded` and schedule nothing. For each: at most one successor
+  exists, and when it exists it is the `planned_restart_resume`.
+- **The decided restart rule, across PRs** (after #99 and #104 are on `main`): a
+  `planned_restart` conversation-adapter run with a proven stop gets the
+  `planned_restart_resume`, not #104's bounded retry; with no proof it gets #104's
+  bounded retry, then `blocked`; a non-conversation run gets #99's stable hold
+  whether or not the stop is proven.
 - **No promotion into the lock.** An issue with a parked deferred wake: after the
   deadline stop, the wake is still parked and the lock is not held by a new run;
   after the restart, the resume runs first.
@@ -756,12 +854,26 @@ D1, embedded Postgres unless noted:
   `24`), and the 10-second request timeout.
 - Web: the banner shows and hides (desktop and mobile widths, no console errors),
   the control starts and lifts a drain.
-- The new tests are added to the Dockerfile `vitest run` list, so CI runs them.
+- Tests that do not need embedded Postgres go on the Dockerfile `vitest run` list.
+  The embedded-Postgres suites cannot run as root in the image build; they follow
+  the shared non-root CI job proposed as #74's follow-up F1.
 
-D2: a run of a boot whose `planned_restart` row was closed at startup, found by the
-reaper, gets `planned_restart` and its class; a run of a boot with no drain row gets
-`process_lost` (unchanged); `orphaned_running_run` classifies as
-`interrupted_crash`.
+D2:
+
+- **Proven stop.** A run of a boot whose `planned_restart` row was closed at
+  startup, found by the reaper, with an acknowledgment or a settled never-started
+  receipt on its row: `planned_restart`, and the `planned_restart_resume` when its
+  class allows.
+- **No proof (the important case).** The container stop kills the process during
+  the drain, before any acknowledgment or settled receipt (a stop timeout shorter
+  than the grace period): the run gets `planned_restart` as its code but **no**
+  resume. A conversation adapter gets #104's bounded retry, any other adapter gets
+  #99's hold. The test asserts that no `planned_restart_resume` row exists.
+- A run of a boot with no drain row gets `process_lost` (unchanged);
+  `orphaned_running_run` classifies as `interrupted_crash`.
+- The real two-stop sequence (the backup stop, then the restart) is an integration
+  dependency outside this repository: it gains nothing unless the deploy job drains
+  before **each** stop.
 
 ## 10. Alternatives considered
 
@@ -797,10 +909,16 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
   at most 8 runs stopped at a time.
 - **Q6. Native-runner runs?** Recommend: not stopped and not waited for; counted as
   `nativeRunnerRuns` in the status.
-- **Q7. Stranded-issue sweep.** Recommend: this plan's D1 owns the one-line wiring
-  that makes the sweep schedule `planned_restart_resume` for a `planned_restart`
-  predecessor (section 5.3). The other change needs no special case, because the
-  `retryOfRunId` dedup prevents a double successor. Neither waits for the other.
+- **Q7. Stranded-issue sweep.** Decided by the manager: #104 lands before D1
+  (order #74 → #99 → #104 → D1). D1 owns the one-line wiring that makes the sweep
+  schedule `planned_restart_resume` for a `planned_restart` predecessor with a proven
+  stop (section 5.3); otherwise the sweep applies #104's decided rule. Choke point B
+  and the `retryOfRunId` dedup prevent a double successor.
+- **Q14. A board pause or budget stop that races the deadline?** Recommend: the
+  first terminal write wins, as today. If the operator's write wins, the run is
+  `operator_stop`: no resume, and its release runs at step 4 with today's options,
+  so the deferred wake is promoted only once and only after the decision
+  (section 4.2.1).
 - **Q8. Drain state on `GET /api/health`?** Recommend: no. The health route is
   public. The deploy job uses the authorized `GET /api/instance/task-drain`.
 - **Q9. `stop_grace_period` in `deploy/compose.yaml`?** Recommend: set it in D2 to
@@ -826,6 +944,11 @@ reaper, gets `planned_restart` and its class; a run of a boot with no drain row 
   and a clean ending. The upgrade is logged with `upgradedFrom`.
 
 ## Appendix A. Code anchors on `main` at `38819d350`
+
+The captain's review verified every anchor below as true at `38819d350`. Section
+4.2.1 cites `main` at `d47df97f0` (after #28 and #86), where `heartbeat.ts` moved by
+about 30 to 50 lines; names are unchanged.
+
 
 | Fact | Where |
 |---|---|
