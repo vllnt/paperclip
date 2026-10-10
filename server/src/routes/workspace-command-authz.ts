@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { Request } from "express";
 import { forbidden } from "../errors.js";
 
@@ -13,19 +14,15 @@ function prefixPath(prefix: string, key: string) {
   return prefix.length > 0 ? `${prefix}.${key}` : key;
 }
 
+/**
+ * The commands of a `workspaceStrategy` that the host runs. An agent key may not set,
+ * change or remove any of them. Every check on a strategy reads this one list.
+ */
+export const WORKSPACE_STRATEGY_COMMAND_KEYS = ["provisionCommand", "runtimeProvisionCommand", "teardownCommand"] as const;
+
 function collectWorkspaceStrategyCommandPaths(raw: unknown, prefix: string): string[] {
   if (!isRecord(raw)) return [];
-  const paths: string[] = [];
-  if (hasOwn(raw, "provisionCommand")) {
-    paths.push(prefixPath(prefix, "provisionCommand"));
-  }
-  if (hasOwn(raw, "runtimeProvisionCommand")) {
-    paths.push(prefixPath(prefix, "runtimeProvisionCommand"));
-  }
-  if (hasOwn(raw, "teardownCommand")) {
-    paths.push(prefixPath(prefix, "teardownCommand"));
-  }
-  return paths;
+  return WORKSPACE_STRATEGY_COMMAND_KEYS.filter((key) => hasOwn(raw, key)).map((key) => prefixPath(prefix, key));
 }
 
 function collectWorkspaceRuntimeCommandPaths(raw: unknown, prefix: string): string[] {
@@ -83,6 +80,36 @@ export function collectAgentAdapterWorkspaceCommandPaths(
     adapterConfig.workspaceStrategy,
     `${prefix}.workspaceStrategy`,
   );
+}
+
+/**
+ * Lists the host commands of an agent's `workspaceStrategy` that differ between the stored
+ * `adapterConfig` and the one that a request would store. A command that is added, changed
+ * or removed counts, and so does one that disappears because the whole strategy is replaced
+ * or removed. A command that stays as it is does not, however the request words it.
+ *
+ * A merge patch replaces `workspaceStrategy` whole, so what the request sends says nothing
+ * about the commands that it takes away. This reads the result.
+ *
+ * @param stored - the `adapterConfig` as stored.
+ * @param effective - the `adapterConfig` after the request, merged.
+ * @param prefix - the path in front of the reported paths.
+ * @returns the paths of the commands that change, for example `adapterConfig.workspaceStrategy.provisionCommand`.
+ */
+export function collectChangedAgentAdapterWorkspaceCommandPaths(
+  stored: unknown,
+  effective: unknown,
+  prefix = "adapterConfig",
+): string[] {
+  const strategyOf = (adapterConfig: unknown): Record<string, unknown> => {
+    const strategy = isRecord(adapterConfig) ? adapterConfig.workspaceStrategy : undefined;
+    return isRecord(strategy) ? strategy : {};
+  };
+  const before = strategyOf(stored);
+  const after = strategyOf(effective);
+  return WORKSPACE_STRATEGY_COMMAND_KEYS.filter(
+    (key) => hasOwn(before, key) !== hasOwn(after, key) || !isDeepStrictEqual(before[key], after[key]),
+  ).map((key) => prefixPath(`${prefix}.workspaceStrategy`, key));
 }
 
 export function collectProjectExecutionWorkspaceCommandPaths(policy: unknown): string[] {

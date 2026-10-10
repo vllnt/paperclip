@@ -108,6 +108,7 @@ import { isLoginCommandSupportedAdapterType } from "../services/login-command.js
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
+  collectChangedAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import {
   agentProtectedConfigAfterPatch,
@@ -5697,6 +5698,7 @@ export function agentRoutes(
           asRecord(existing[key]) ?? {},
           delta,
           key === "adapterConfig" ? isAtomicAdapterConfigPath : undefined,
+          key,
         );
       }
       if (asRecord(configDelta.runtimeConfig)?.aiConnection === null) {
@@ -5760,7 +5762,18 @@ export function agentRoutes(
         return;
       }
       const requestedAdapterConfigKeys = asRecord(configDelta.adapterConfig) ?? adapterConfig;
-      assertNoAgentAdapterConfigMutation(req, requestedAdapterConfigKeys);
+      if (mergeConfig) {
+        // The instructions keys are plain keys, so the keys that the caller sent are what changes.
+        // A merge replaces `workspaceStrategy` whole, so the delta says nothing about the host
+        // commands that it removes: compare the result with the stored config.
+        assertNoAgentInstructionsConfigMutation(req, requestedAdapterConfigKeys, "adapterConfig");
+        assertNoAgentHostWorkspaceCommandMutation(
+          req,
+          collectChangedAgentAdapterWorkspaceCommandPaths(existing.adapterConfig, adapterConfig),
+        );
+      } else {
+        assertNoAgentAdapterConfigMutation(req, requestedAdapterConfigKeys);
+      }
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(requestedAdapterConfigKeys);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);

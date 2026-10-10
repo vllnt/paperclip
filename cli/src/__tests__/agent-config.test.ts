@@ -126,4 +126,53 @@ describe("agent config commands", () => {
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual(payload);
   });
+
+  describe("when the server refuses the merge patch", () => {
+    /** Runs the command with `process.exit` turned into an exception, and returns what was printed to stderr. */
+    async function failedRun(args: string[]): Promise<string> {
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(process, "exit").mockImplementation((code) => {
+        throw new Error(`exit ${String(code)}`);
+      });
+      await expect(run(args)).rejects.toThrow("exit 1");
+      return errors.mock.calls.map((call) => call.join(" ")).join("\n");
+    }
+
+    it("prints a 403 for a host command as one line with the message and no stack trace", async () => {
+      const message = "Agent keys cannot modify host-executed workspace commands (adapterConfig.workspaceStrategy.provisionCommand).";
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ error: message }), { status: 403 }))));
+
+      const printed = await failedRun(["agent", "config", "set", AGENT_ID, "adapterConfig.workspaceStrategy={\"type\":\"git_worktree\"}"]);
+
+      expect(printed).toContain(`API error 403: ${message}`);
+      expect(printed).not.toMatch(/\n\s+at /);
+    });
+
+    it("prints a 400 for a refused key with the path and no stack trace", async () => {
+      const body = {
+        error: "Validation error",
+        details: [{ code: "custom", path: ["adapterConfig", "env", "constructor"], message: 'Config key "constructor" is not allowed (config.env.constructor)' }],
+      };
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(body), { status: 400 }))));
+
+      const printed = await failedRun(["agent", "config", "set", AGENT_ID, "adapterConfig.model=gpt-5"]);
+
+      expect(printed).toContain("API error 400: Validation error");
+      expect(printed).toContain("adapterConfig");
+      expect(printed).toContain("constructor");
+      expect(printed).not.toMatch(/\n\s+at /);
+    });
+
+    it("refuses a forbidden key in a merge payload before sending it, and names the path", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const payload = { mergeConfig: true, adapterConfig: { jobs: [{ prototype: 1 }] } };
+
+      const printed = await failedRun(["agent", "update", AGENT_ID, "--payload-json", JSON.stringify(payload)]);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(printed).toContain("prototype");
+      expect(printed).not.toMatch(/\n\s+at /);
+    });
+  });
 });

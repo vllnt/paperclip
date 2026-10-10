@@ -3476,7 +3476,12 @@ registry.registerPath({
     "resent. An env value read back from GET as a redacted plain binding restores the stored value. The merged " +
     "configs are validated like a full update. A config that changed while the patch was applied returns 409. " +
     "`mergeConfig` cannot be combined with `replaceAdapterConfig` or an `adapterType` change, and cannot remove " +
-    "`runtimeConfig.aiConnection` (422).",
+    "`runtimeConfig.aiConnection` (422). A merge patch is refused with 400, the path of the offending value in " +
+    "`details[].path`, and nothing stored, when a key anywhere in it (arrays included) is `__proto__`, " +
+    "`constructor` or `prototype`, when it is nested deeper than 32 levels, or when it holds more than 10,000 values. " +
+    "An agent key gets 403 when the merged `adapterConfig` would add, change or remove a host-executed " +
+    "`workspaceStrategy` command (`provisionCommand`, `runtimeProvisionCommand` or `teardownCommand`), also when " +
+    "the patch replaces or removes the whole strategy; a board user with `agents:configure` may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateAgentSchema.omit({ permissions: true })),
@@ -3485,6 +3490,7 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
     422: r.unprocessable,

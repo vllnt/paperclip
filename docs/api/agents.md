@@ -95,6 +95,14 @@ config:
 - An `adapterConfig.env` value read back from `GET` as `{"type":"plain","value":"***REDACTED***"}` restores the
   stored value. Other redacted values are not restored, so don't send them back.
 - `runtimeConfig.aiConnection` can't be removed this way (`422`); change the agent's AI connection instead.
+- A key named `__proto__`, `constructor` or `prototype` anywhere in the patch, arrays included, is refused with
+  `400`, and `details[].path` names where. So is a patch nested deeper than 32 levels or holding more than 10,000
+  values. Nothing is stored and no activity is logged.
+- An agent key gets `403` when the merged `adapterConfig` would add, change or remove a host-executed
+  `workspaceStrategy` command (`provisionCommand`, `runtimeProvisionCommand` or `teardownCommand`). That includes
+  a `workspaceStrategy` that leaves a stored command out, because the strategy is replaced whole, and
+  `workspaceStrategy: null`. A strategy that keeps its commands as they are is allowed. A board user with
+  `agents:configure` may change them.
 
 ```
 PATCH /api/agents/{agentId}
