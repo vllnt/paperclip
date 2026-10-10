@@ -74,6 +74,7 @@ import {
   type Http2TelemetryEventName,
 } from "./duplex-observability.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
+import { openSshMultiplex, type SshMultiplex } from "./ssh-multiplex.js";
 import {
   ensureCommandResolvable,
   resolveCommandForLogs,
@@ -680,12 +681,16 @@ type AdapterCommandCapableExecutionTarget = AdapterSshExecutionTarget | AdapterS
 // bridge limit change never resizes this buffer as a side effect.
 const SSH_COMMAND_MAX_BUFFER_BYTES = 1024 * 1024;
 
-function adapterExecutionTargetCommandRunner(target: AdapterCommandCapableExecutionTarget): CommandManagedRuntimeRunner {
+function adapterExecutionTargetCommandRunner(
+  target: AdapterCommandCapableExecutionTarget,
+  options: { multiplex?: SshMultiplex | null } = {},
+): CommandManagedRuntimeRunner {
   if (target.transport === "ssh") {
     return createSshCommandManagedRuntimeRunner({
       spec: target.spec,
       defaultCwd: target.remoteCwd,
       maxBufferBytes: SSH_COMMAND_MAX_BUFFER_BYTES,
+      multiplex: options.multiplex,
     });
   }
   return requireSandboxRunner(target);
@@ -4371,7 +4376,6 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // input.hostApiUrl stays available as an explicit override seam.
   const hostApiUrl = input.hostApiUrl?.trim() || resolveDefaultPaperclipApiUrl();
   const shellCommand = adapterExecutionTargetShellCommand(target);
-  const runner = adapterExecutionTargetCommandRunner(target);
   const bridgeTimeoutMs =
     typeof input.timeoutSec === "number" && Number.isFinite(input.timeoutSec) && input.timeoutSec > 0
       ? Math.trunc(input.timeoutSec * 1000)
@@ -4383,6 +4387,12 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   );
 
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
+  // Over SSH every bridge step is a short command, so the steps share one
+  // master connection per environment and target instead of one login each.
+  // The agent's own session does not use it. The hold ends when the bridge
+  // stops, and on a failed start.
+  const multiplex = target.transport === "ssh" ? openSshMultiplex(target.spec, target.environmentId) : null;
+  const runner = adapterExecutionTargetCommandRunner(target, { multiplex });
 
   // The provider-scoped telemetry facade for the fixed duplex observability
   // surface. It maps the raw provider key through the allowlist one time, so no
@@ -4893,6 +4903,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       worker?.stop(),
       bridgeAsset.cleanup(),
     ]);
+    await multiplex?.release();
     throw error;
   }
 
@@ -4923,6 +4934,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         worker?.stop(),
         bridgeAsset.cleanup(),
       ]);
+      await multiplex?.release();
     },
   };
 }
