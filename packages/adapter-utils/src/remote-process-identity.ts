@@ -25,6 +25,8 @@
  * The scripts are POSIX shell and work in dash, bash and busybox ash.
  */
 
+import { createHash, randomBytes } from "node:crypto";
+
 /** A remote process as its launch recorded it. */
 export interface RemoteProcessIdentity {
   pid: number;
@@ -37,6 +39,16 @@ export interface RemoteProcessIdentity {
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
+
+// Shell function shared by the stop scripts: `valid_pid` accepts only an
+// integer id from 2 to the platform maximum.
+const VALID_PID_LINES = [
+  "pid_max=\"$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 4194304)\"",
+  "valid_pid() {",
+  "  case \"$1\" in ''|0*|*[!0-9]*) return 1 ;; esac",
+  "  [ \"$1\" -ge 2 ] 2>/dev/null && [ \"$1\" -le \"$pid_max\" ] 2>/dev/null",
+  "}",
+];
 
 /**
  * Shell lines that print the launch record of the process in `$pid` as one
@@ -113,14 +125,10 @@ export function buildRemoteProcessStopLines(input: {
     `group=${identity?.group ? 1 : 0}`,
     `expected_argv="$(printf '%s\\000' ${input.argv.map((arg) => shellQuote(arg)).join(" ")} | od -An -v -tx1)"`,
     `nonce_arg=${shellQuote(nonceArg ?? "")}`,
-    "pid_max=\"$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 4194304)\"",
     // Inspect with /proc where it exists, else with ps when a nonce can prove
     // the process, else not at all. Never both.
     "if [ -d /proc/self ]; then inspect=proc; elif [ -n \"$nonce_arg\" ]; then inspect=ps; else inspect=none; fi",
-    "valid_pid() {",
-    "  case \"$1\" in ''|0*|*[!0-9]*) return 1 ;; esac",
-    "  [ \"$1\" -ge 2 ] 2>/dev/null && [ \"$1\" -le \"$pid_max\" ] 2>/dev/null",
-    "}",
+    ...VALID_PID_LINES,
     "stat_field() {",
     "  sed -n 's/^.*) //p' \"/proc/$1/stat\" 2>/dev/null | cut -d' ' -f\"$2\"",
     "}",
@@ -163,4 +171,246 @@ export function buildRemoteProcessStopLines(input: {
     `  echo "[paperclip] Left ${input.label} process $pid unsignalled: it could not be proven to be the launched process." >&2`,
     "fi",
   ];
+}
+
+/**
+ * The environment variable that carries a launch's run marker. Every child of
+ * the launch inherits it, including children that start a session of their
+ * own, so it finds them where the process group does not. The environment is
+ * readable only by the same user; argv is readable by every user through `ps`,
+ * so the value never goes in argv, a log, a run event or a record.
+ */
+export const REMOTE_RUN_MARKER_ENV = "PAPERCLIP_RUN_MARKER";
+
+/** A per-launch secret that every process of the launch carries in its environment. */
+export interface RemoteRunMarker {
+  /** 32 hex characters (128 random bits). Deliver it on stdin, never in argv. */
+  value: string;
+  /** SHA-256 of the exact environment entry `NAME=value`; safe to store. */
+  entrySha256: string;
+}
+
+/**
+ * Creates the marker for one launch.
+ *
+ * @returns The value to deliver on stdin and the hash to record.
+ */
+export function createRemoteRunMarker(): RemoteRunMarker {
+  const value = randomBytes(16).toString("hex");
+  const entrySha256 = createHash("sha256").update(`${REMOTE_RUN_MARKER_ENV}=${value}`).digest("hex");
+  return { value, entrySha256 };
+}
+
+/**
+ * Shell lines that write the launch record of the process in `pidExpression`
+ * to `recordFile`: the identity line of {@link buildRemoteProcessRecordLines},
+ * then `{"uid":…,"marker":"<entrySha256>"}`. They write a temporary file and
+ * rename it, and a failed write never fails the launch.
+ *
+ * @param input.recordFile - A shell word naming the record file.
+ * @param input.markerSha256 - {@link RemoteRunMarker.entrySha256}.
+ * @param input.group - Whether the launch made the process lead its own session (`setsid`).
+ * @param input.pidExpression - The process; `$$` (the running shell) by default.
+ * @returns Lines for a launch script.
+ */
+export function buildRemoteRunRecordLines(input: {
+  recordFile: string;
+  markerSha256: string;
+  group: boolean;
+  pidExpression?: string;
+}): string[] {
+  return [
+    `pid=${input.pidExpression ?? "$$"}`,
+    `group=${input.group ? 1 : 0}`,
+    "{",
+    ...buildRemoteProcessRecordLines(),
+    `printf '{"uid":%s,"marker":"%s"}\\n' "$(id -u)" ${shellQuote(input.markerSha256)}`,
+    `} > ${input.recordFile}.tmp 2>/dev/null && mv -f ${input.recordFile}.tmp ${input.recordFile} 2>/dev/null`,
+  ];
+}
+
+/** What a stop of a launch's process tree did, as its script printed it. */
+export interface RemoteProcessTreeStopSummary {
+  /** Launch records found. */
+  records: number;
+  /** Processes the first scan found to be the launch's. */
+  matched: number;
+  /** Processes sent `SIGKILL` after the `SIGTERM` wait. */
+  killed: number;
+  /** Processes left unsignalled because their start time changed. */
+  skipped: number;
+  /** Processes of the launch still running at the end. */
+  survived: number;
+  /** Why the stop could not cover every process, or `null`. */
+  partial: string | null;
+}
+
+const STOP_SUMMARY_PREFIX = "paperclip-remote-stop";
+
+/**
+ * Shell lines that stop every process of the launches recorded in `recordDir`
+ * and print one summary line. A process is signalled only when all of these
+ * hold, checked again right before each signal:
+ *
+ * - its real uid is the uid recorded at launch, which is also the stopper's;
+ * - its id is an integer from 2 to the platform maximum, and it is not the
+ *   stopper or the stopper's parent;
+ * - it is in the process group of a recorded leader that is proven by its
+ *   start time, by still leading its group and by carrying the marker, or its
+ *   `/proc/<pid>/environ` holds an entry whose SHA-256 is a recorded marker
+ *   hash (one NUL-separated entry, matched whole);
+ * - its start time, read by the scan, is unchanged right before `SIGTERM` and
+ *   again right before `SIGKILL`.
+ *
+ * Nothing is signalled without a valid record, or when `/proc`, `awk`, `grep`,
+ * `tr` or `sha256sum` is missing; the summary names the reason. It never
+ * matches command lines. After a stop that found records, it deletes them.
+ *
+ * @param input.recordDir - A shell word naming the directory of launch records.
+ * @param input.termWaitSeconds - How long to wait after `SIGTERM`; 2 by default.
+ * @param input.testOnlyBeforeKill - Test seam: a shell function body run with the pid before each `SIGKILL` recheck.
+ * @returns Lines for a stop script.
+ */
+export function buildRemoteProcessTreeStopLines(input: {
+  recordDir: string;
+  termWaitSeconds?: number;
+  testOnlyBeforeKill?: string;
+}): string[] {
+  const termWaitSteps = Math.max(1, Math.round((input.termWaitSeconds ?? 2) * 20));
+  return [
+    `dir=${input.recordDir}`,
+    `name=${REMOTE_RUN_MARKER_ENV}`,
+    "self=$$",
+    "parent=$PPID",
+    "me=\"$(id -u 2>/dev/null)\"",
+    "partial=",
+    "records=0; matched=0; killed=0; skipped=0; survived=0",
+    "groups=",
+    "hashes=",
+    ...VALID_PID_LINES,
+    "note() { [ -n \"$partial\" ] || partial=$1; }",
+    `before_kill() { ${input.testOnlyBeforeKill ?? ":"}; }`,
+    // Sets st_state, st_pgrp and st_start without a fork: the scan calls it often.
+    "read_stat() {",
+    "  st_line=",
+    "  { IFS= read -r st_line < \"/proc/$1/stat\"; } 2>/dev/null || return 1",
+    "  st_rest=${st_line##*) }",
+    "  set -f; set -- $st_rest; set +f",
+    "  [ \"$#\" -ge 20 ] || return 1",
+    "  st_state=$1; st_pgrp=$3; st_start=${20}",
+    "}",
+    "marker_matches() {",
+    "  [ -n \"$hashes\" ] || return 1",
+    // Real newlines become \\001 first, so each line is exactly one entry.
+    "  mm_entries=\"$(tr '\\n\\000' '\\001\\n' 2>/dev/null < \"/proc/$1/environ\" | grep -x \"$name=[0-9a-f]\\{32\\}\")\" || return 1",
+    "  for mm_entry in $mm_entries; do",
+    "    mm_hash=\"$(printf '%s' \"$mm_entry\" | sha256sum 2>/dev/null)\" || continue",
+    "    mm_hash=${mm_hash%% *}",
+    "    for mm_want in $hashes; do [ \"$mm_hash\" = \"$mm_want\" ] && return 0; done",
+    "  done",
+    "  return 1",
+    "}",
+    // One awk pass over every process: `pid pgrp start` for live processes of uid $me.
+    "candidates() {",
+    "  { grep -H '^Uid:' /proc/[0-9]*/status; cat /proc/[0-9]*/stat; } 2>/dev/null | awk -v me=\"$me\" '",
+    "    index($0, \"/proc/\") == 1 { split($0, a, \"/\"); n = split($0, f, /[ \\t]+/); for (i = 1; i < n; i++) if (f[i] ~ /Uid:$/) { uid[a[3]] = f[i + 1]; break }; next }",
+    "    { k = 0; rest = $0; while ((j = index(rest, \") \")) > 0) { k += j + 1; rest = substr(rest, j + 2) }",
+    "      if (k == 0) next",
+    "      n = split(substr($0, k + 1), f, \" \"); if (n < 20) next",
+    "      st[$1] = f[1]; pg[$1] = f[3]; start[$1] = f[20] }",
+    "    END { for (p in st) if ((p in uid) && uid[p] == me && st[p] !~ /^[ZXx]$/) print p, pg[p], start[p] }'",
+    "}",
+    "scan() {",
+    "  candidates | while read -r sc_pid sc_pgrp sc_start; do",
+    "    valid_pid \"$sc_pid\" || continue",
+    "    [ \"$sc_pid\" = \"$self\" ] || [ \"$sc_pid\" = \"$parent\" ] && continue",
+    "    sc_hit=0",
+    "    for sc_group in $groups; do [ \"$sc_pgrp\" = \"$sc_group\" ] && sc_hit=1; done",
+    "    [ \"$sc_hit\" = 1 ] || marker_matches \"$sc_pid\" || continue",
+    "    echo \"$sc_pid $sc_start\"",
+    "  done",
+    "}",
+    "if [ ! -r /proc/self/stat ]; then note no_proc",
+    "elif [ -z \"$me\" ] || ! command -v awk >/dev/null 2>&1 || ! command -v grep >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1; then note no_tools",
+    "elif ! command -v sha256sum >/dev/null 2>&1; then note no_sha256sum",
+    "else",
+    "  for f in \"$dir\"/*.json; do",
+    "    [ -f \"$f\" ] || continue",
+    "    records=$((records + 1))",
+    "    rc_id=\"$(sed -n '1s/^{\"pid\":\\([1-9][0-9]*\\),\"start\":\"\\([0-9][0-9]*\\)\",\"group\":\\([01]\\)}$/\\1 \\2 \\3/p' \"$f\" 2>/dev/null)\"",
+    "    rc_own=\"$(sed -n '2s/^{\"uid\":\\([0-9][0-9]*\\),\"marker\":\"\\([0-9a-f]\\{64\\}\\)\"}$/\\1 \\2/p' \"$f\" 2>/dev/null)\"",
+    "    set -f; set -- $rc_id $rc_own; set +f",
+    "    if [ \"$#\" -ne 5 ] || ! valid_pid \"$1\"; then note bad_record; continue; fi",
+    "    if [ \"$4\" != \"$me\" ]; then note uid_mismatch; continue; fi",
+    "    hashes=\"$hashes $5\"",
+    "    if [ \"$3\" != 1 ]; then note no_session; continue; fi",
+    // A leader that has exited leaves its group unprovable; its children
+    // that kept the marker are still found by it.
+    "    [ -r \"/proc/$1/stat\" ] || continue",
+    "    if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ] && [ \"$st_pgrp\" = \"$1\" ] && marker_matches \"$1\"; then",
+    "      groups=\"$groups $1\"",
+    "    else",
+    "      note unverified_group",
+    "    fi",
+    "  done",
+    "  [ \"$records\" -gt 0 ] || note no_process_record",
+    "  if [ -n \"$hashes\" ]; then",
+    "    targets=\"$(scan)\"",
+    "    set -f; set -- $targets; set +f",
+    "    while [ \"$#\" -ge 2 ]; do",
+    "      matched=$((matched + 1))",
+    "      if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ]; then kill -TERM \"$1\" 2>/dev/null || :; else skipped=$((skipped + 1)); fi",
+    "      shift 2",
+    "    done",
+    "    i=0",
+    `    while [ "$i" -lt ${termWaitSteps} ]; do`,
+    "      set -f; set -- $targets; set +f",
+    "      left=0",
+    "      while [ \"$#\" -ge 2 ]; do",
+    "        if read_stat \"$1\" && [ \"$st_start\" = \"$2\" ] && [ \"$st_state\" != Z ]; then left=1; break; fi",
+    "        shift 2",
+    "      done",
+    "      [ \"$left\" = 1 ] || break",
+    "      i=$((i + 1))",
+    "      sleep 0.05",
+    "    done",
+    // Scan again: it also finds children forked during the wait.
+    "    targets=\"$(scan)\"",
+    "    set -f; set -- $targets; set +f",
+    "    while [ \"$#\" -ge 2 ]; do",
+    "      t_pid=$1; t_start=$2; shift 2",
+    "      before_kill \"$t_pid\"",
+    "      if read_stat \"$t_pid\" && [ \"$st_start\" = \"$t_start\" ]; then",
+    "        kill -KILL \"$t_pid\" 2>/dev/null && killed=$((killed + 1))",
+    "      else",
+    "        skipped=$((skipped + 1))",
+    "      fi",
+    "    done",
+    "    sleep 0.1",
+    "    targets=\"$(scan)\"",
+    "    set -f; set -- $targets; set +f",
+    "    survived=$(($# / 2))",
+    "  fi",
+    // The records only serve this stop; the lease that started the launches is being released.
+    "  [ \"$records\" -eq 0 ] || { rm -f -- \"$dir\"/*.json \"$dir\"/*.json.tmp 2>/dev/null; rmdir -- \"$dir\" 2>/dev/null; }",
+    "fi",
+    `printf '${STOP_SUMMARY_PREFIX} records=%s matched=%s killed=%s skipped=%s survived=%s partial=%s\\n' "$records" "$matched" "$killed" "$skipped" "$survived" "\${partial:--}"`,
+    "exit 0",
+  ];
+}
+
+/**
+ * Reads the summary line that {@link buildRemoteProcessTreeStopLines} printed.
+ *
+ * @param stdout - The stop script's output.
+ * @returns The summary, or `null` when the line is missing or malformed.
+ */
+export function parseRemoteProcessTreeStopSummary(stdout: string): RemoteProcessTreeStopSummary | null {
+  const line = stdout.split("\n").reverse().find((candidate) => candidate.startsWith(`${STOP_SUMMARY_PREFIX} `));
+  const match = line
+    ? /^paperclip-remote-stop records=(\d+) matched=(\d+) killed=(\d+) skipped=(\d+) survived=(\d+) partial=([a-z_]+|-)$/.exec(line)
+    : null;
+  if (!match) return null;
+  const [records, matched, killed, skipped, survived] = match.slice(1, 6).map(Number) as [number, number, number, number, number];
+  return { records, matched, killed, skipped, survived, partial: match[6] === "-" ? null : match[6]! };
 }
