@@ -108,6 +108,26 @@ export function checkoutKeepsHumanOwnedBlock(actor: IssueCheckoutActor): boolean
 }
 
 /**
+ * The system caller of the native status projection, the write that carries the decision of a
+ * native run onto its issue. It is named so that every use can be found by searching for
+ * `kind: "system"`. Unlike the heartbeat's checkout, it is held to the human-owned block rule: an
+ * `issueService.update` that names it cannot take an issue out of a block that the board or a
+ * person owns, and cannot rewrite its descriptor. The write does not match such a row, and the
+ * call resolves with the row as it is.
+ */
+export type NativeStatusProjectionActor = { kind: "system"; reason: "native_status_projection" };
+
+/**
+ * The one value of `NativeStatusProjectionActor`. The native runtime passes it where it writes an
+ * issue's status without a person or an agent asking: `status-decision-committer.ts` for the
+ * decision of a run, and `native-run-finalizer.ts` when finalization runs out of retries.
+ */
+export const NATIVE_STATUS_PROJECTION_ACTOR: NativeStatusProjectionActor = {
+  kind: "system",
+  reason: "native_status_projection",
+};
+
+/**
  * Refuses a change by an agent that would leave a human-owned block or rewrite
  * its descriptor: a new status other than `blocked`, or any descriptor that
  * differs from the stored one, including clearing it. Re-sending the same

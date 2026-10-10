@@ -89,6 +89,7 @@ import type {
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
+  IssueChanges,
   IssueRelationIssueSummary,
   IssueWatchdogSummary,
   LowTrustBoundary,
@@ -114,6 +115,7 @@ import {
   isHumanOwnedBlock,
   notHumanOwnedBlockCondition,
   type IssueCheckoutActor,
+  type NativeStatusProjectionActor,
 } from "./routable-blocked.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
@@ -10669,6 +10671,13 @@ export function issueService(db: Db) {
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        /**
+         * Names a platform caller that writes on its own account. The write is then held to the
+         * human-owned block rule in its `WHERE`: it does not match a block that the board or a
+         * person owns, and the call resolves with that row unchanged, with nothing else written. A
+         * caller that must know whether its values landed compares them with the row.
+         */
+        systemActor?: NativeStatusProjectionActor;
         companyGuard?: string;
       },
       dbOrTx: any = db,
@@ -10716,6 +10725,7 @@ export function issueService(db: Db) {
         actorRunId,
         actorRunStopId,
         actorUserId,
+        systemActor,
         companyGuard,
         ...issueData
       } = data;
@@ -11062,10 +11072,15 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(idPredicate)
+          .where(systemActor ? and(idPredicate, notHumanOwnedBlockCondition(issues)) : idPredicate)
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          if (!systemActor || !isHumanOwnedBlock(receiptExisting)) return null;
+          const [held] = await withIssueLabels(tx, [receiptExisting]);
+          const noChanges: IssueChanges = {};
+          return { ...held, changes: noChanges };
+        }
         await recordChatCompletion(tx, receiptExisting, updated);
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.

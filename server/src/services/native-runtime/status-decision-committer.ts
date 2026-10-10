@@ -39,6 +39,7 @@ import {
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
+import { NATIVE_STATUS_PROJECTION_ACTOR } from "../routable-blocked.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
@@ -1863,6 +1864,7 @@ export async function commitNativeStatusDecision(input: {
     }
 
     let updated: typeof issues.$inferSelect;
+    let projectionHeld = false;
     if (input.decision.statusAction === "preserve") {
       updated = (await tx
         .select()
@@ -1885,24 +1887,28 @@ export async function commitNativeStatusDecision(input: {
           statusVersion: input.priorStatusVersion + 1,
           lastStatusDecisionId: decisionRow.id,
           unblockDescriptor: input.decision.unblockDescriptor,
-          actorAgentId: null,
-          actorUserId: null,
+          systemActor: NATIVE_STATUS_PROJECTION_ACTOR,
         },
         tx,
         publications,
       );
       if (!projected) throw new NativeStatusRaceError();
       updated = projected;
-      materialized.unshift({
-        effectKind: "issue_status_projection",
-        targetType: "issue",
-        targetId: input.issueId,
-        payload: {
-          fromStatus: issue.status,
-          toStatus: input.decision.toStatus,
-          reasonCode,
-        },
-      });
+      // A block that the board or a person owns holds the projection: the write matched no row
+      // and the issue is as it was. The decision itself is still recorded and applied below.
+      projectionHeld = projected.lastStatusDecisionId !== decisionRow.id;
+      if (!projectionHeld) {
+        materialized.unshift({
+          effectKind: "issue_status_projection",
+          targetType: "issue",
+          targetId: input.issueId,
+          payload: {
+            fromStatus: issue.status,
+            toStatus: input.decision.toStatus,
+            reasonCode,
+          },
+        });
+      }
     }
 
     if (input.decision.statusAction === "done" && issue.status !== "done") {
@@ -2094,7 +2100,7 @@ export async function commitNativeStatusDecision(input: {
       actorType: "system",
       actorId: "native-status-committer",
       action:
-        input.decision.statusAction === "preserve"
+        input.decision.statusAction === "preserve" || projectionHeld
           ? "issue.status_decision_recorded"
           : "issue.updated",
       entityType: "issue",

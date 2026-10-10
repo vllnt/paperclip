@@ -18,7 +18,7 @@ import {
 } from "@paperclipai/db";
 
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
-import { isHumanOwnedBlock } from "./routable-blocked.js";
+import { isHumanOwnedBlock, notHumanOwnedBlockCondition } from "./routable-blocked.js";
 
 export type ConversationIdentity = {
   conversationAgentId?: string | null;
@@ -385,7 +385,11 @@ export async function settleConversationTurn(
       issue.conversationState === conversationState
     )
       return true;
-    await tx
+    const ownsTurn = and(
+      eq(issues.id, issueId),
+      sql`(${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id})`,
+    );
+    const projected = await tx
       .update(issues)
       .set({
         status,
@@ -395,12 +399,14 @@ export async function settleConversationTurn(
         cancelledAt: null,
         updatedAt: new Date(),
       })
-      .where(
-        and(
-          eq(issues.id, issueId),
-          sql`(${issues.executionRunId} is null or ${issues.executionRunId} = ${run.id})`,
-        ),
-      );
+      .where(and(ownsTurn, notHumanOwnedBlockCondition(issues)))
+      .returning({ id: issues.id });
+    // A block that the board or a person owns holds the status and keeps its descriptor. The turn
+    // still ends: only the conversation state follows it.
+    const statusHeld = projected.length === 0;
+    if (statusHeld) {
+      await tx.update(issues).set({ conversationState, updatedAt: new Date() }).where(ownsTurn);
+    }
     publication = (
       await persistActivity(tx as unknown as Db, {
         companyId: issue.companyId,
@@ -411,7 +417,7 @@ export async function settleConversationTurn(
         entityId: issue.id,
         runId: run.id,
         details: {
-          status,
+          status: statusHeld ? issue.status : status,
           conversationState,
           conversationSessionGeneration: issue.conversationSessionGeneration,
         },

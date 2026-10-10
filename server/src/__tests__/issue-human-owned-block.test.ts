@@ -19,7 +19,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { attentionService } from "../services/attention.js";
-import { prepareConversationTurn } from "../services/agent-conversations.js";
+import { prepareConversationTurn, settleConversationTurn } from "../services/agent-conversations.js";
 import { shouldAutoCheckoutIssueForWake } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -561,6 +561,113 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
       await startTurn(fixture, { authorAgentId: fixture.agent.id });
 
       expect((await readIssue(fixture.issue.id)).status).toBe("in_progress");
+    });
+
+    describe("when it settles", () => {
+      const PERSON_BLOCK: IssueUnblockDescriptor = { owner: { userId: "board-user" }, action: "Sign the form" };
+
+      /** A conversation issue whose last turn succeeded with a reply, as the reviewer's probe seeded it. */
+      async function settledTurn(input: { descriptor: IssueUnblockDescriptor | null; status?: string }) {
+        const fixture = await conversationFixture(input);
+        await db.update(issues).set({ conversationState: "active" }).where(eq(issues.id, fixture.issue.id));
+        const [run] = await db
+          .insert(heartbeatRuns)
+          .values({
+            companyId: fixture.company.id,
+            agentId: fixture.agent.id,
+            status: "succeeded",
+            contextSnapshot: { issueId: fixture.issue.id, conversationSessionGeneration: 0 },
+          })
+          .returning();
+        const [reply] = await db
+          .insert(issueComments)
+          .values({
+            companyId: fixture.company.id,
+            issueId: fixture.issue.id,
+            body: "The agent's reply",
+            createdByRunId: run!.id,
+            authorAgentId: fixture.agent.id,
+          })
+          .returning();
+        return { fixture, run: run!, reply: reply! };
+      }
+
+      it.each([
+        ["the board", BOARD_BLOCK],
+        ["a person", PERSON_BLOCK],
+      ])("leaves a block owned by %s blocked with its descriptor, and keeps the reply", async (_label, descriptor) => {
+        const { fixture, run, reply } = await settledTurn({ descriptor });
+        const before = await readIssue(fixture.issue.id);
+
+        const settled = await settleConversationTurn(db, run);
+
+        expect(settled).toBe(true);
+        const after = await readIssue(fixture.issue.id);
+        expect(after.status).toBe("blocked");
+        expect(after.unblockDescriptor).toEqual(descriptor);
+        expect(after.blockedTransitionAt).toEqual(BLOCKED_AT);
+        expect(after.statusVersion).toBe(before.statusVersion);
+        expect(after.conversationState).toBe("waiting");
+        await expect(db.select().from(issueComments).where(eq(issueComments.id, reply.id))).resolves.toHaveLength(1);
+      });
+
+      it("leaves a block owned by the board blocked when a newer message is waiting, and keeps the turn active", async () => {
+        const { fixture, run } = await settledTurn({ descriptor: BOARD_BLOCK });
+        const [wake] = await db
+          .insert(issueComments)
+          .values({
+            companyId: fixture.company.id,
+            issueId: fixture.issue.id,
+            body: "The message that started the turn",
+            authorUserId: "board-user",
+            createdAt: new Date(Date.now() - 10_000),
+          })
+          .returning();
+        await db.insert(issueComments).values({
+          companyId: fixture.company.id,
+          issueId: fixture.issue.id,
+          body: "A message that arrived during the reply",
+          authorUserId: "board-user",
+          createdAt: new Date(Date.now() + 5_000),
+        });
+        const [current] = await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: { issueId: fixture.issue.id, conversationSessionGeneration: 0, wakeCommentId: wake!.id },
+          })
+          .where(eq(heartbeatRuns.id, run.id))
+          .returning();
+
+        await settleConversationTurn(db, current!);
+
+        const after = await readIssue(fixture.issue.id);
+        expect(after.status).toBe("blocked");
+        expect(after.unblockDescriptor).toEqual(BOARD_BLOCK);
+        expect(after.conversationState).toBe("active");
+      });
+
+      it("moves a block that the agent owns itself to in review, as before", async () => {
+        const { fixture, run } = await settledTurn({ descriptor: null });
+        await db
+          .update(issues)
+          .set({ unblockDescriptor: { owner: { agentId: fixture.agent.id }, action: "Wait" } })
+          .where(eq(issues.id, fixture.issue.id));
+
+        await settleConversationTurn(db, run);
+
+        const after = await readIssue(fixture.issue.id);
+        expect(after.status).toBe("in_review");
+        expect(after.conversationState).toBe("waiting");
+        expect(Number(after.statusVersion)).toBe(1);
+      });
+
+      it("moves a conversation that is not blocked to in review, as before", async () => {
+        const { fixture, run } = await settledTurn({ descriptor: null, status: "in_progress" });
+
+        await settleConversationTurn(db, run);
+
+        expect((await readIssue(fixture.issue.id)).status).toBe("in_review");
+      });
     });
   });
 });
