@@ -120,7 +120,7 @@ No new table. No instance setting in slice 1 (Q2).
 
 A blocking tick issue is **stale** when all of these hold:
 
-1. The routine's policy is `skip_if_active` or `coalesce_if_active` (Q3), the routine
+1. For this **live-blocker** expiry, the routine's policy is `skip_if_active` or `coalesce_if_active` (Q3; `always_enqueue` is covered by section 3.10 instead), the routine
    has a timeout, and the blocker is a `routine_execution` tick issue. Managed plugin
    routines (`plugin:<key>:operation`) are left to R3 (Q10): the unique index and the
    run-status sync below do not cover them.
@@ -308,7 +308,7 @@ no entry.
 | The close step rolls back (a check failed) | The tick is skipped or coalesced, as before. Nothing changed |
 | **The expired invocation.** The tick that created the expired issue, and the new tick, may carry different payloads | The expired routine run **keeps its payload and variables**, so nothing is deleted and a person can replay it. The new tick repeats the same invocation only when the two **dispatch fingerprints are equal**. `findLiveExecutionIssue` also accepts a blocker whose fingerprint is `default`. In that case, the invocation is not repeated, and the entry says `invocationRepeated: false`. The claim "no work is lost" therefore means: no record is deleted, and a repeated invocation is repeated automatically. Nothing is claimed beyond that |
 | The setting is lowered below the age of a blocker | The next tick expires it. That is the intent |
-| `always_enqueue` | Never blocks. The setting is stored but has no effect, and the form says so |
+| `always_enqueue` | It does not block on a live run, so the live-blocker expiry of section 3.3 does not apply. **But the one-open-copy rule of section 3.10 does apply when the setting is set:** an exempt or not-yet-stale open copy makes the tick skip with a run-log reason, and a stale one is expired before the new copy is created. The form says so. With the setting `null`, nothing changes |
 
 ### 3.10 At most one open copy per fingerprint
 
@@ -328,7 +328,15 @@ function. If one exists:
 |---|---|
 | **Exempt** (PR #113, section 6.1.1) | **Skipped**, recorded as `skipped` with the reason `open_copy_exempt` and the exemption's name. The copy is not touched. No second open copy is created |
 | Not exempt, and **stale** (no progress for the timeout) | The copy is **expired** with the atomic close step (section 3.4), then the new tick creates its issue. There is then one open copy |
-| Not exempt, **not yet stale** | The tick follows the routine's policy, as it does for a live blocker today: `skip_if_active` skips it and `coalesce_if_active` merges it into the open copy |
+| Not exempt, **not yet stale** | The tick **never creates a second open copy, under any concurrency policy**. `skip_if_active` skips it. `coalesce_if_active` merges it into the open copy. `always_enqueue`, which normally never blocks, **skips** it. Every skip or merge writes a run-log reason (`open_copy_not_stale`, with the copy's id and age) |
+
+**This rule applies to all three policies.** Section 3.3 (the live-blocker check) and
+the policy values `skip_if_active` and `coalesce_if_active` still decide what happens
+when a copy has a live run. But the one-open-copy rule is about open copies, not live
+runs, so it does not look at the policy to decide whether a second copy may be created:
+it may not. It looks at the policy only to choose between skip and merge, and
+`always_enqueue` has no merge, so it skips (Q17). When the setting is `null`, no policy
+changes behavior, including `always_enqueue`.
 
 The last row is a deliberate choice, and **the reviewer should confirm it (Q14)**. The
 review decision reads "if the older copy is not exempt, expire it atomically, then
@@ -385,7 +393,8 @@ surfaces. R2 is the named follow-up for the preview and the manual action.
 - An S4 issue (no run): PR #104's re-dispatch acts, and expiry does not, until the timeout passes.
 - **One open copy per fingerprint (section 3.10),** on embedded Postgres, red at `main` where the tick adds a copy:
   - an older copy with no live run, not exempt, no progress for the timeout: it is expired, the new tick creates its issue, and one open copy remains;
-  - the same copy with progress inside the timeout: the tick is skipped or coalesced by policy, and no second copy is created;
+  - the same copy with progress inside the timeout, **one test per policy**: `skip_if_active` skips, `coalesce_if_active` merges into the copy, `always_enqueue` skips. In each, no second open copy exists afterwards and the run log carries `open_copy_not_stale`. Each of the three is red at `main` for `always_enqueue` (a second copy is created) and for the other two when the copy has no live run;
+  - an older copy that is stale, one test per policy: the copy is expired and one new copy is created, also under `always_enqueue`;
   - the older copy is exempt, once for each of: an open decision, a user-assigned review, a stalled review, an armed wait, a pending approval: the tick is `skipped` with `open_copy_exempt`, and the copy is untouched;
   - a different fingerprint keeps its own copy;
   - the setting is `null`: behavior is identical to `main`;
@@ -433,11 +442,12 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | ID | Question | Recommendation |
 |---|---|---|
 | **Q1** | **Decided, with one point to confirm (Q14).** The report said "an issue with no run blocks later ticks". On `main`, that state (S4) does not block; S1 does. Production then showed S4 piling up: three open copies of one fingerprint, with no live run on two of them. | At most one open copy per fingerprint (section 3.10). An exempt older copy makes the tick `skipped`. A stale, non-exempt one is expired atomically, then the new tick runs. PR #120 stays as the backstop. Appendix B still gives the counts before R1 starts |
-| **Q14** | **For the reviewer.** A non-exempt older copy that is not yet stale. The decision says to expire it at once | Plan: wait for the timeout, and follow the routine's policy until then (section 3.10). Reason: PR #104's re-dispatch may be about to wake it. Immediate expiry is one condition away if the reviewer prefers it |
+| **Q14** | **For the reviewer.** A non-exempt older copy that is not yet stale. The decision says to expire it at once | **Accepted by the manager (18:29), with a condition:** until the timeout, the tick skips or merges and never creates a second open copy, under any policy including `always_enqueue` (section 3.10, Q17). Plan: wait for the timeout (section 3.10). Reason: PR #104's re-dispatch may be about to wake it. Immediate expiry is one condition away if the reviewer prefers it |
 | **Q15** | Who owns the shared module and the lock helper? | `flow-stall.ts` is built first by R1 (section 4). The lock-preserving variant of `withIssueExecutionLock` is owned by PR #103's plan (D1); the first slice that needs it implements it to that spec, the others reuse it |
 | **Q16** | The queued human or resume wake | Kept after the close by the existing staleness decision (section 3.3). A human comment is progress. No new sweep |
 | **Q2** | Default: off, or a value? Instance-wide default or per routine? | Per routine only in R1, `null` (off). No instance default. Decide a default in R3 from the preview data. A guard that is off will not catch the next incident, so R2's preview and badge are the answer to that, not a hidden default |
-| **Q3** | Should `coalesce_if_active` expire too? It has the same block: ticks merge into the stuck issue | Yes. Only `always_enqueue` is excluded |
+| **Q3** | Should `coalesce_if_active` expire too? It has the same block: ticks merge into the stuck issue | Yes, for the live-blocker expiry (section 3.3). `always_enqueue` has no live-blocker expiry, but it **is** covered by the one-open-copy rule (section 3.10, Q17) |
+| **Q17** | An open copy that is not stale, under `always_enqueue` (manager decision with Q14) | The tick never creates a second open copy under any policy. `always_enqueue` skips, because it has no merge. Reviewer: confirm skip, or ask for a merge into the copy |
 | **Q4** | Who may set the timeout? | Board users only, on top of the routine manage check. An agent should not set a timer that cancels issues |
 | **Q5** | The range | 30 to 10080 minutes. 30 keeps the timeout above PR #104's re-dispatch grace period. 7 days covers weekly routines |
 | **Q6** | **For the reviewer.** A `running` run is excluded from expiry. Is that right? | Yes in R1. The reaper and the silent-run watchdog own `running`. A running run with output is not stuck, and a dead one is the reaper's. Revisit only if the data shows a `running` run that the watchdog does not catch |
