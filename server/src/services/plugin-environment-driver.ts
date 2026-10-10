@@ -24,11 +24,83 @@ import { unprocessable } from "../errors.js";
 import {
   collectSecretRefPaths,
   parseSecretRefBindingObject,
+  SecretRefRedactionLimitError,
+  haveSameSecretRefValues,
   readConfigValueAtPath,
+  redactProviderMetadata,
   writeConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+
+// A plugin worker resolves its declared secret-ref values itself, so the host
+// never sees them and cannot scrub them out of free text. Worker output that
+// reaches an API response is therefore untrusted: metadata is redacted by the
+// driver's config schema, and provider-written text is replaced by constant text.
+const WITHHELD_PROVIDER_TEXT = "The provider's text is withheld because a provider can echo a resolved secret.";
+const DIAGNOSTIC_SEVERITIES = new Set(["info", "warning", "error"]);
+
+function declaredConfigSchema(driver: PluginEnvironmentDriverDeclaration): Record<string, unknown> | null {
+  const schema = driver.configSchema;
+  return schema && typeof schema === "object" && !Array.isArray(schema) ? (schema as Record<string, unknown>) : null;
+}
+
+const MAX_PROBE_DIAGNOSTICS = 50;
+
+interface ProbeDiagnostic {
+  severity: string;
+  message: string;
+  code?: string;
+  omitted?: number;
+}
+
+function readDiagnosticSeverity(diagnostic: unknown): string {
+  if (typeof diagnostic !== "object" || diagnostic === null || !("severity" in diagnostic)) return "info";
+  const { severity } = diagnostic;
+  return typeof severity === "string" && DIAGNOSTIC_SEVERITIES.has(severity) ? severity : "info";
+}
+
+/**
+ * Maps the diagnostics of a provider probe to constant entries, at most
+ * `MAX_PROBE_DIAGNOSTICS` of them plus one marker that counts the rest. A worker
+ * response can hold millions of entries, so the list is cut before it is mapped:
+ * the cost of the probe response does not depend on how many entries arrive.
+ *
+ * @param diagnostics - The `diagnostics` value of a probe result. Anything but an array maps to none.
+ * @returns The kept entries, each with a checked severity and constant text, and a marker when entries were left out.
+ */
+function boundedProbeDiagnostics(diagnostics: unknown): ProbeDiagnostic[] {
+  if (!Array.isArray(diagnostics)) return [];
+  const kept = diagnostics.slice(0, MAX_PROBE_DIAGNOSTICS).map(
+    (diagnostic): ProbeDiagnostic => ({
+      severity: readDiagnosticSeverity(diagnostic),
+      message: WITHHELD_PROVIDER_TEXT,
+    }),
+  );
+  const omitted = diagnostics.length - kept.length;
+  if (omitted <= 0) return kept;
+  return [
+    ...kept,
+    { severity: "warning", message: WITHHELD_PROVIDER_TEXT, code: "diagnostics_truncated", omitted },
+  ];
+}
+
+function safeProbeOutput(
+  result: { diagnostics?: unknown; metadata?: Record<string, unknown> },
+  configSchema: Record<string, unknown> | null,
+) {
+  return {
+    diagnostics: boundedProbeDiagnostics(result.diagnostics),
+    metadata: redactProviderMetadata(result.metadata, configSchema),
+  };
+}
+
+function providerRejectedConfig(subject: string, result: { errors?: unknown; warnings?: unknown }) {
+  return unprocessable(`${subject} rejected its config. ${WITHHELD_PROVIDER_TEXT}`, {
+    errorCount: Array.isArray(result.errors) ? result.errors.length : 0,
+    warningCount: Array.isArray(result.warnings) ? result.warnings.length : 0,
+  });
+}
 
 /**
  * The worker methods a sandbox provider must advertise before the host reuses
@@ -336,13 +408,7 @@ export async function validatePluginSandboxProviderConfig(input: {
   });
 
   if (!result.ok) {
-    throw unprocessable(
-      result.errors?.[0] ?? `Sandbox provider "${input.provider}" rejected its config.`,
-      {
-        errors: result.errors ?? [],
-        warnings: result.warnings ?? [],
-      },
-    );
+    throw providerRejectedConfig(`Sandbox provider "${input.provider}"`, result);
   }
 
   return {
@@ -353,30 +419,49 @@ export async function validatePluginSandboxProviderConfig(input: {
   };
 }
 
+// The host owns the values at declared secret-ref positions: they are the caller's
+// secret ids. A provider may normalize any other field, but a different value at
+// one of those positions could be a resolved secret that it echoes, and the
+// normalized config is stored and returned as is. A value over the redaction
+// limits cannot be checked, so it counts as changed.
+function keepsCallerSecretRefs(
+  caller: Record<string, unknown>,
+  normalized: Record<string, unknown>,
+  schema: Record<string, unknown> | null,
+): boolean {
+  try {
+    return haveSameSecretRefValues(caller, normalized, schema);
+  } catch (error) {
+    if (error instanceof SecretRefRedactionLimitError) return false;
+    throw error;
+  }
+}
+
 export async function validatePluginEnvironmentDriverConfig(input: {
   db: Db;
   workerManager: PluginWorkerManager;
   config: PluginEnvironmentConfig;
 }): Promise<PluginEnvironmentConfig> {
-  const { plugin } = await resolvePluginEnvironmentDriver(input);
+  const { plugin, driver } = await resolvePluginEnvironmentDriver(input);
   const result = await input.workerManager.call(plugin.id, "environmentValidateConfig", {
     driverKey: input.config.driverKey,
     config: input.config.driverConfig,
   });
 
   if (!result.ok) {
+    throw providerRejectedConfig(`Plugin environment driver "${pluginDriverProviderKey(input.config)}"`, result);
+  }
+
+  const driverConfig = result.normalizedConfig ?? input.config.driverConfig;
+  if (!keepsCallerSecretRefs(input.config.driverConfig, driverConfig, declaredConfigSchema(driver))) {
     throw unprocessable(
-      result.errors?.[0] ?? `Plugin environment driver "${pluginDriverProviderKey(input.config)}" rejected its config.`,
-      {
-        errors: result.errors ?? [],
-        warnings: result.warnings ?? [],
-      },
+      `Plugin environment driver "${pluginDriverProviderKey(input.config)}" returned a config that changes a secret-ref field. The config was not saved.`,
     );
   }
 
   return {
     ...input.config,
-    driverConfig: result.normalizedConfig ?? input.config.driverConfig,
+    driverConfig,
   };
 }
 
@@ -387,7 +472,7 @@ export async function probePluginEnvironmentDriver(input: {
   environmentId: string;
   config: PluginEnvironmentConfig;
 }): Promise<EnvironmentProbeResult> {
-  const { plugin } = await resolvePluginEnvironmentDriver(input);
+  const { plugin, driver } = await resolvePluginEnvironmentDriver(input);
   const result = await input.workerManager.call(plugin.id, "environmentProbe", {
     driverKey: input.config.driverKey,
     companyId: input.companyId,
@@ -398,12 +483,11 @@ export async function probePluginEnvironmentDriver(input: {
   return {
     ok: result.ok,
     driver: "plugin",
-    summary: result.summary ?? `Plugin environment driver "${pluginDriverProviderKey(input.config)}" probe ${result.ok ? "passed" : "failed"}.`,
+    summary: `Plugin environment driver "${pluginDriverProviderKey(input.config)}" probe ${result.ok ? "passed" : "failed"}.`,
     details: {
       pluginKey: input.config.pluginKey,
       driverKey: input.config.driverKey,
-      diagnostics: result.diagnostics ?? [],
-      metadata: result.metadata ?? {},
+      ...safeProbeOutput(result, declaredConfigSchema(driver)),
     },
   };
 }
@@ -443,12 +527,11 @@ export async function probePluginSandboxProviderDriver(input: {
   return {
     ok: result.ok,
     driver: "sandbox",
-    summary: result.summary ?? `Sandbox provider "${input.provider}" probe ${result.ok ? "passed" : "failed"}.`,
+    summary: `Sandbox provider "${input.provider}" probe ${result.ok ? "passed" : "failed"}.`,
     details: {
       provider: input.provider,
       pluginKey: resolved.plugin.pluginKey,
-      diagnostics: result.diagnostics ?? [],
-      metadata: result.metadata ?? {},
+      ...safeProbeOutput(result, declaredConfigSchema(resolved.driver)),
     },
   };
 }
