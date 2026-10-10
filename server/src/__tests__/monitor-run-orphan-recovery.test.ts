@@ -238,6 +238,43 @@ describeEmbeddedPostgres("a run lost to a restart is held once and stays held", 
     expect(actions[0]).toMatchObject({ status: "resolved", outcome: "restored", resolutionNote: "source_terminal" });
   });
 
+  it("ends the hold once, and does not reopen it, when a live run takes over the issue", async () => {
+    const { companyId, agentId, issueId, runId } = await seedLostRun({
+      wakeReason: "issue_monitor_due", claudeLocal: true,
+    });
+    await periodicPass();
+    expect((await loadActions(issueId))[0]?.status).toBe("active");
+
+    const liveRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
+      status: "queued", contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    await db.update(issues).set({ executionRunId: liveRunId, checkoutRunId: liveRunId, executionLockedAt: new Date() })
+      .where(eq(issues.id, issueId));
+    for (let pass = 0; pass < PASSES; pass += 1) await periodicPass();
+
+    const actions = await loadActions(issueId);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(await activityCount(issueId, "issue.execution_recovery_settled")).toBe(0);
+    expect((await otherRuns(issueId, runId)).map((run) => run.id)).toEqual([liveRunId]);
+  });
+
+  it("ends the hold once, and does not reopen it, when the issue leaves in_progress", async () => {
+    const { issueId } = await seedLostRun({ wakeReason: "issue_monitor_due", claudeLocal: true });
+    await periodicPass();
+    expect((await loadActions(issueId))[0]?.status).toBe("active");
+
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    for (let pass = 0; pass < PASSES; pass += 1) await periodicPass();
+
+    const actions = await loadActions(issueId);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(await activityCount(issueId, "issue.execution_recovery_settled")).toBe(0);
+  });
+
   it("does not wake a paused agent, and still holds the issue once", async () => {
     const { issueId, runId } = await seedLostRun({
       wakeReason: "issue_monitor_due", agentStatus: "paused", claudeLocal: true,
