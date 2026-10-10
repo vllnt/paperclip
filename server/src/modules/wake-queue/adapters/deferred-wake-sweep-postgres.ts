@@ -1,4 +1,4 @@
-import { and, asc, eq, gte, isNull, lte, notInArray, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, notInArray, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, companies, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY } from "../domain/self-reblock-wake.js";
 import { DEFERRED_WAKE_SWEEP_BATCH_LIMIT, type OrphanedDeferredWake } from "../domain/deferred-wake-sweep.js";
@@ -105,6 +105,45 @@ export async function listOrphanedDeferredWakes(
       asc(agentWakeupRequests.id),
     )
     .limit(input.limit ?? DEFERRED_WAKE_SWEEP_BATCH_LIMIT);
+}
+
+/**
+ * Finalizes deferred wakes whose issue is done or cancelled. The orphan scan
+ * skips them so an old wake cannot revive a closed task, and a cancelled task
+ * has no next run whose release would retire them, so without this they stay
+ * parked forever. They get the existing terminal status `cancelled`, the one a
+ * release uses for a wake that lost its authority. Wakes owned by another sweep
+ * are left to it.
+ *
+ * @returns The ids of the finalized wakes.
+ */
+export async function retireClosedIssueDeferredWakes(
+  db: Db,
+  input: { now: Date; minAgeMs: number },
+): Promise<string[]> {
+  const rows = await db
+    .update(agentWakeupRequests)
+    .set({
+      status: "cancelled",
+      error: sql`'The issue is ' || ${issues.status} || '; this deferred wake will not run.'`,
+      finishedAt: input.now,
+      updatedAt: input.now,
+    })
+    .from(issues)
+    .where(
+      and(
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+        eq(issues.id, wakeIssueId),
+        eq(issues.companyId, agentWakeupRequests.companyId),
+        inArray(issues.status, [...CLOSED_ISSUE_STATUSES]),
+        lte(agentWakeupRequests.requestedAt, new Date(input.now.getTime() - input.minAgeMs)),
+        sql`${agentWakeupRequests.payload} -> 'queuedCommentInterrupt' is null`,
+        sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}::text is null`,
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+      ),
+    )
+    .returning({ id: agentWakeupRequests.id });
+  return rows.map((row) => row.id);
 }
 
 /**
