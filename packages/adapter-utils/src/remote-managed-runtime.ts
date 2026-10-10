@@ -130,13 +130,17 @@ export type SshRunDirectoryKeepReason =
   | "not_git_backed"
   | "worktree_dirty"
   | "preserve_failed"
-  | "rm_failed";
+  | "rm_failed"
+  | "external_worktree"
+  // The reaper could not read something that may hold the run's work: a worktree
+  // registration, a worktree folder, or a directory that may hold a repository.
+  | "unreadable";
 
 export type SshRunDirectoryReapResult =
   | { outcome: "removed"; bytesFreed: number; preserved: string[] }
   | { outcome: "absent" }
   | { outcome: "symlink" }
-  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number };
+  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number; externalWorktree?: string; unreadablePath?: string };
 
 /** Where a reaped run's preserved git state is kept, outside every `runs/<runId>`. */
 export function sshPreservedBundlePath(remoteRoot: string, runId: string): string {
@@ -155,22 +159,39 @@ const PRESERVED_BUNDLE_RETENTION_DAYS = 30;
  * local-only git state is safe. That state is: commits on HEAD past the commit
  * the run started from, branch tips outside HEAD, stash entries, a detached
  * head of an extra worktree, and uncommitted work (a snapshot commit of the
- * tracked and untracked files that git does not ignore). It is written to
+ * tracked and untracked files that git does not ignore, in the main worktree
+ * and in each extra worktree). It is written to
  * `refs/paperclip/preserved/<runId>/*` and bundled into
  * `<root>/.paperclip-runtime/preserved/<runId>.bundle`, with the run's start
  * commit as the bundle's prerequisite, so only new objects are stored. The
- * directory is kept, with a reason, when the work is not a git repository,
- * when an extra worktree holds uncommitted work, or when the bundle cannot be
- * written and verified. Git runs with the repository's `core.fsmonitor` and
- * hooks switched off. Bundles older than 30 days are removed.
+ * directory is kept, with a reason, when the work is not a git repository
+ * (unless `removeNotGitBacked`, after its keep window), or when the state
+ * cannot be saved, or the bundle is over 1 GiB or cannot be written and
+ * verified. Git runs with the repository's `core.fsmonitor` and hooks switched
+ * off. Bundles older than 30 days are removed.
  */
 export async function reapSshRunDirectory(input: {
   spec: SshConnectionConfig;
   remoteRoot: string;
   runId: string;
   timeoutMs?: number;
-  /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
-  testHooks?: { afterChecks?: string; afterConfine?: string };
+  /**
+   * Delete a directory that is not a git repository instead of keeping it as
+   * `not_git_backed`. Nothing in it can be saved; the caller passes this once
+   * the directory's keep window is over.
+   */
+  removeNotGitBacked?: boolean;
+  /**
+   * Test seams only: shell lines the worker runs at fixed points, to swap a
+   * path under the script; a smaller bundle cap in KiB; and a runner that runs
+   * the script on this host instead of over SSH.
+   */
+  testHooks?: {
+    afterChecks?: string;
+    afterConfine?: string;
+    maxBundleKb?: number;
+    runScript?: (script: string) => Promise<{ stdout: string }>;
+  };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -186,7 +207,7 @@ export async function reapSshRunDirectory(input: {
   const q = shellQuote;
   const hook = (line: string | undefined) => (line ? [line] : []);
   const script = [
-    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
+    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}; unsaved_ok=${input.removeNotGitBacked ? 1 : 0}`,
     // The root is resolved once. Everything below is compared with this physical path.
     'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
     'runtime="$root/.paperclip-runtime"; runs="$runtime/runs"; preserved="$runtime/preserved"',
@@ -211,14 +232,60 @@ export async function reapSshRunDirectory(input: {
     'keep() { echo "kept $1 $kb"; exit 0; }',
     // A repository config the agent planted must not run commands here.
     'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
+    'GT() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$tree" "$@"; }',
+    // A worktree of the run's repository registered outside the run directory
+    // (an agent's `git worktree add ../x`) would keep its files but lose its
+    // repository when the directory goes. Keep the directory while such a
+    // worktree exists, restored or not. Read git's registration files, so no
+    // git runs in the agent's folder. Only a worktree that is provably gone
+    // (its folder or its `.git` missing, seen from a directory this user can
+    // enter) does not count. A registration that cannot be listed, read or
+    // parsed, or a folder that cannot be entered, keeps the directory too.
+    'here=$(pwd -P)',
+    'unreadable() { printf "unreadable %s\\n" "$1"; keep unreadable; }',
+    // Succeeds when the absolute path $1 does not exist, checked from its
+    // nearest ancestor this user can enter.
+    'gone() { t=$1; while :; do up=${t%/*}; [ -n "$up" ] || up=/; if (cd "$up" 2>/dev/null); then [ ! -e "$t" ] && [ ! -L "$t" ]; return; fi; [ "$up" = / ] && return 1; t=$up; done; }',
+    // Registrations below a folder this user cannot enter would look absent.
+    'if [ -d "$ws" ] && [ ! -L "$ws" ] && ! (cd "$ws" 2>/dev/null); then unreadable "$ws"; fi',
+    'if [ -d "$ws/.git" ] && [ ! -L "$ws/.git" ] && ! (cd "$ws/.git" 2>/dev/null); then unreadable "$ws/.git"; fi',
+    'adm_root="$ws/.git/worktrees"',
+    'if [ -e "$adm_root" ] || [ -L "$adm_root" ]; then',
+    '  if [ -L "$adm_root" ] || [ ! -d "$adm_root" ] || [ ! -r "$adm_root" ] || [ ! -x "$adm_root" ]; then unreadable "$adm_root"; fi',
+    "fi",
+    'for adm in "$adm_root"/*; do',
+    '  [ -e "$adm" ] || [ -L "$adm" ] || continue',
+    '  gd="$adm/gitdir"',
+    '  if [ -L "$adm" ] || [ ! -d "$adm" ] || [ -L "$gd" ] || [ ! -f "$gd" ] || [ ! -r "$gd" ]; then unreadable "$gd"; fi',
+    '  p=""; IFS= read -r p < "$gd" || [ -n "$p" ] || unreadable "$gd"',
+    // Git writes `<worktree folder>/.git`, absolute or relative to the admin directory.
+    '  case "$p" in */.git) ;; *) unreadable "$gd" ;; esac',
+    '  case "$p" in /*) ;; *) p="$here/$adm/$p" ;; esac',
+    '  w=${p%/.git}; [ -n "$w" ] || unreadable "$gd"',
+    '  if d=$(cd "$w" 2>/dev/null && pwd -P); then',
+    '    if [ -e "$d/.git" ] || [ -L "$d/.git" ]; then',
+    '      case "$d/" in "$here/"*) ;; *) printf "external %s\\n" "$d"; keep external_worktree ;; esac',
+    "    fi",
+    '  elif ! gone "$w"; then unreadable "$gd"; fi',
+    "done",
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
-    'had_marker=0',
+    'had_marker=0; git_backed=0',
     'if [ -f "$marker" ] && [ ! -L "$marker" ]; then',
     "  had_marker=1",
     "else",
-    '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then keep not_git_backed; fi',
-    '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
-    '  if [ ! -d "$ws/.git" ]; then keep not_git_backed; fi',
+    "  git_backed=1",
+    '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then git_backed=0',
+    '  elif [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed',
+    '  elif [ ! -d "$ws/.git" ]; then git_backed=0; fi',
+    // Nothing here can be saved. After its keep window it goes like the rest,
+    // unless a repository below the run directory, or a linked workspace, may
+    // hold commits that only this worker has.
+    '  if [ "$git_backed" = 0 ] && [ "$unsaved_ok" != 1 ]; then keep not_git_backed; fi',
+    '  if [ "$git_backed" = 0 ] && [ -L "$ws" ]; then keep not_git_backed; fi',
+    // A directory find cannot read may hold a repository.
+    '  if [ "$git_backed" = 0 ]; then nested=$(find . -name .git -print 2>/dev/null) || keep unreadable; [ -z "$nested" ] || keep not_git_backed; fi',
+    "fi",
+    'if [ "$git_backed" = 1 ]; then',
     '  G rev-parse --git-dir >/dev/null 2>&1 || keep preserve_failed',
     // The run started from the oldest commit HEAD ever pointed at.
     '  head=$(G rev-parse -q --verify HEAD 2>/dev/null || true)',
@@ -239,6 +306,8 @@ export async function reapSshRunDirectory(input: {
     '  G stash list --format=%H > "$list.stash" 2>/dev/null || true',
     '  while IFS= read -r obj; do [ -n "$obj" ] && add_ref "stash-$index" "$obj"; index=$((index + 1)); done < "$list.stash"',
     '  G worktree list --porcelain > "$list.trees" 2>/dev/null || true',
+    // The repository every extra worktree must belong to before it is saved.
+    '  own_common=$(cd "$ws/.git" 2>/dev/null && pwd -P) || keep preserve_failed',
     '  index=0; main=1; tree=""; detached=""; prunable=""; treehead=""',
     '  while IFS= read -r line || [ -n "$line" ]; do',
     '    case "$line" in',
@@ -248,8 +317,24 @@ export async function reapSshRunDirectory(input: {
     '      prunable*) prunable=1 ;;',
     '      "")',
     '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
-    '          changes=$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$tree" status --porcelain 2>/dev/null)',
-    '          if [ -n "$changes" ]; then keep worktree_dirty; fi',
+    '          case "$treehead" in *[!0]*) ;; *) treehead="" ;; esac',
+    '          changes=$(GT status --porcelain 2>/dev/null) || keep preserve_failed',
+    // Uncommitted work in an extra worktree: the same snapshot as for the main
+    // worktree below, from a temporary index in this run directory. The
+    // worktree writes its objects to the repository's shared object store, so
+    // the bundle carries them.
+    '          if [ -n "$changes" ]; then',
+    // A worktree entry the agent pointed at another repository is not saved there.
+    '            common=$(GT rev-parse --git-common-dir 2>/dev/null) && common=$(cd "$tree" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P) || keep preserve_failed',
+    '            [ "$common" = "$own_common" ] || keep preserve_failed',
+    '            tidx="$PWD/.paperclip-reap-index-$index"; rm -f "$tidx"',
+    '            if [ -n "$treehead" ]; then GIT_INDEX_FILE="$tidx" GT read-tree "$treehead" || keep preserve_failed; fi',
+    '            GIT_INDEX_FILE="$tidx" GT add -A || keep preserve_failed',
+    '            tid=$(GIT_INDEX_FILE="$tidx" GT write-tree) || keep preserve_failed',
+    '            if [ -n "$treehead" ]; then dsnap=$(GT commit-tree "$tid" -p "$treehead" -m "Paperclip preserved worktree") || keep preserve_failed; else dsnap=$(GT commit-tree "$tid" -m "Paperclip preserved worktree") || keep preserve_failed; fi',
+    '            rm -f "$tidx"',
+    '            add_ref "worktree-dirty-$index" "$dsnap"',
+    '          fi',
     '          if [ -n "$detached" ] && [ -n "$treehead" ] && { [ -z "$head" ] || ! G merge-base --is-ancestor "$treehead" "$head"; }; then add_ref "worktree-head-$index" "$treehead"; fi',
     '          index=$((index + 1))',
     '        fi',
@@ -274,7 +359,7 @@ export async function reapSshRunDirectory(input: {
     // preserved directory, which is confined the same way.
     '    G bundle create ../.paperclip-reap.bundle "$@" >/dev/null 2>&1 || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
     '    size=$(du -k .paperclip-reap.bundle 2>/dev/null | cut -f1); size=${size:-0}',
-    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
+    `    if [ "$size" -gt ${input.testHooks?.maxBundleKb ?? PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
     '    mkdir -p "$preserved" 2>/dev/null || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
     '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && mv -f -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle" ) || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
     '    G bundle verify "$bundle" >/dev/null 2>&1 || { keep preserve_failed; }',
@@ -298,18 +383,30 @@ export async function reapSshRunDirectory(input: {
     '  keep rm_failed',
     "fi",
   ].join("\n");
-  const result = await runSshCommand(input.spec, script, {
-    timeoutMs: input.timeoutMs ?? 10 * 60 * 1000,
-    maxBuffer: 256 * 1024,
-  });
+  const result = input.testHooks?.runScript
+    ? await input.testHooks.runScript(script)
+    : await runSshCommand(input.spec, script, {
+      timeoutMs: input.timeoutMs ?? 10 * 60 * 1000,
+      maxBuffer: 256 * 1024,
+    });
   const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   const preserved = lines.filter((line) => line.startsWith("preserved ")).map((line) => line.slice("preserved ".length));
   const last = lines[lines.length - 1] ?? "";
   if (last === "absent" || last === "symlink") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed) (\d+)$/.exec(last);
-  if (kept) return { outcome: "kept", reason: kept[1] as SshRunDirectoryKeepReason, bytes: Number(kept[2]) * 1024 };
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed|external_worktree|unreadable) (\d+)$/.exec(last);
+  if (kept) {
+    const external = lines.find((line) => line.startsWith("external "))?.slice("external ".length);
+    const unreadable = lines.find((line) => line.startsWith("unreadable "))?.slice("unreadable ".length);
+    return {
+      outcome: "kept",
+      reason: kept[1] as SshRunDirectoryKeepReason,
+      bytes: Number(kept[2]) * 1024,
+      ...(kept[1] === "external_worktree" && external ? { externalWorktree: external } : {}),
+      ...(kept[1] === "unreadable" && unreadable ? { unreadablePath: unreadable } : {}),
+    };
+  }
   throw new Error("SSH run directory reap returned an unexpected result.");
 }
 

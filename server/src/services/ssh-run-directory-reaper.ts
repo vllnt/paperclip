@@ -39,20 +39,47 @@ const REAP_CLAIM_STALE_MS = REAP_TIMEOUT_MS + 5 * 60 * 1000;
 // longer than the timeout above still holds the claim as long as its owner lives.
 const REAP_CLAIM_RENEW_MS = 60 * 1000;
 
+// The longest any of these settings may be. A larger value (for example
+// `1e308`) would overflow into an invalid date and fail every sweep.
+const MAX_SETTING_MS = 365 * 24 * 60 * 60 * 1000;
+
 function minutesFromEnv(name: string, fallbackMinutes: number): number {
   const configured = Number(process.env[name]);
-  return (Number.isFinite(configured) && configured >= 1 ? configured : fallbackMinutes) * 60 * 1000;
+  const minutes = Number.isFinite(configured) && configured >= 1 ? configured : fallbackMinutes;
+  return Math.min(minutes * 60 * 1000, MAX_SETTING_MS);
 }
 
-/** How long a finished run's directory may stay before the sweep removes it. */
+/**
+ * How long a finished run's directory may stay before the sweep removes it.
+ * No resume or retry reads an earlier run's directory, so an hour is enough.
+ */
 export function sshRunReaperMinAgeMs(): number {
-  return minutesFromEnv("PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES", 6 * 60);
+  return minutesFromEnv("PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES", 60);
 }
 
 /** The same threshold while the worker's disk is above the pressure level. */
 export function sshRunReaperPressureMinAgeMs(): number {
   return minutesFromEnv("PAPERCLIP_SSH_RUN_REAPER_PRESSURE_MAX_AGE_MINUTES", 15);
 }
+
+/**
+ * How long a kept directory stays kept before the sweep tries it again. A
+ * directory that is not a git repository is then deleted, since nothing in it
+ * can be saved.
+ */
+export function sshRunReaperKeepWindowMs(): number {
+  const configured = Number(process.env.PAPERCLIP_SSH_RUN_REAPER_KEEP_WINDOW_HOURS);
+  const hours = Number.isFinite(configured) && configured > 0 ? configured : 24;
+  return Math.min(hours * 60 * 60 * 1000, MAX_SETTING_MS);
+}
+
+// Kept decisions that the sweep reconsiders once the keep window is over.
+// `symlink` and `root_mismatch` stay kept: they say the path is not safe to use.
+// `external_worktree` is checked again and stays kept while the worktree exists;
+// `unreadable` stays kept while the reaper cannot read what it must check.
+const RECONSIDERED_KEEP_REASONS = [
+  "not_git_backed", "worktree_dirty", "preserve_failed", "rm_failed", "external_worktree", "unreadable",
+] as const;
 
 /** Disk use, in percent, above which the sweep shortens the age threshold. */
 export function sshRunReaperDiskPressurePercent(): number {
@@ -151,6 +178,22 @@ function leasesOfDirectory(key: RunDirectoryKey) {
 
 const claimDecision = sql`${environmentLeases.metadata} -> 'sshRunDirectory'`;
 
+// A kept decision whose keep window ended before `now`.
+function keptPastWindow(now: Date) {
+  const cutoff = new Date(now.getTime() - sshRunReaperKeepWindowMs()).toISOString();
+  return sql`(${claimDecision} ->> 'state' = 'kept'
+    and ${claimDecision} ->> 'reason' in (${sql.join(RECONSIDERED_KEEP_REASONS.map((reason) => sql`${reason}`), sql`, `)})
+    and (${claimDecision} ->> 'at')::timestamptz < ${cutoff}::timestamptz)`;
+}
+
+// Whether the lease's own decision is a kept `not_git_backed` whose window ended.
+function notGitBackedPastWindow(lease: EnvironmentLease, now: Date): boolean {
+  const decision = previousDecision(lease);
+  const at = typeof decision?.at === "string" ? Date.parse(decision.at) : Number.NaN;
+  return decision?.state === "kept" && decision.reason === "not_git_backed"
+    && Number.isFinite(at) && now.getTime() - at >= sshRunReaperKeepWindowMs();
+}
+
 // When the claim's owner last showed it was alive: its latest renewal, or the
 // claim itself if it never renewed. Judging a claim by this and not by when it
 // was taken is what lets a removal outlast the stale window while its owner
@@ -192,6 +235,7 @@ async function claimRunDirectory(db: Db, lease: EnvironmentLease, key: RunDirect
       eq(environmentLeases.id, lease.id),
       sql`(${claimDecision} is null
         or ${claimDecision} ->> 'reason' = 'rm_failed'
+        or ${keptPastWindow(context.now)}
         or (${claimDecision} ->> 'state' = 'reaping' and ${claimAliveAt} < ${staleBefore}::timestamptz))`,
     )).returning({ id: environmentLeases.id });
     return taken.length > 0;
@@ -347,8 +391,9 @@ async function reapLease(
     if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return SKIPPED;
     if (await hasBusyLease(db, runId, lease.id)) return SKIPPED;
     if (context.trigger === "lease_release") {
-      // A task session may resume from its last run. The sweep removes it
-      // once it is old enough.
+      // A task session's last run is left to the sweep, which removes it once
+      // it is old enough. Nothing reads an earlier run's directory; this only
+      // keeps a short margin after release.
       const [session] = await db
         .select({ id: agentTaskSessions.id })
         .from(agentTaskSessions)
@@ -404,6 +449,7 @@ async function reapLease(
       remoteStarted = true;
       const result = await (hooks?.reapRemote ?? reapSshRunDirectory)({
         spec: parsed.config, remoteRoot, runId, timeoutMs: REAP_TIMEOUT_MS,
+        removeNotGitBacked: notGitBackedPastWindow(lease, context.now),
       });
       return await recordResult(db, lease, runId, run.agentId, remoteRoot, result, context, claim);
     } catch (error) {
@@ -466,27 +512,34 @@ async function recordResult(
   }
   const reason = result.outcome === "symlink" ? "symlink" : result.reason;
   const bytes = result.outcome === "kept" ? result.bytes : 0;
-  return await recordKept(db, lease, runId, agentId, reason, bytes, context, claim);
+  const extra = result.outcome !== "kept" ? {}
+    : result.externalWorktree ? { externalWorktree: result.externalWorktree }
+    : result.unreadablePath ? { unreadablePath: result.unreadablePath }
+    : {};
+  return await recordKept(db, lease, runId, agentId, reason, bytes, context, claim, extra);
 }
 
 async function recordKept(
   db: Db, lease: EnvironmentLease, runId: string, agentId: string, reason: string, bytes: number, context: ReapContext,
-  claim?: HeldClaim,
+  claim?: HeldClaim, extra: Record<string, unknown> = {},
 ): Promise<ReapReport> {
   const attempts = reason === "rm_failed" ? previousAttempts(lease) + 1 : undefined;
   const recorded = (!claim || await claim.hold()) && await recordDecision(db, lease.id, {
-    state: "kept", reason, at: context.now.toISOString(), trigger: context.trigger, bytes, ...(attempts ? { attempts } : {}),
+    state: "kept", reason, at: context.now.toISOString(), trigger: context.trigger, bytes, ...(attempts ? { attempts } : {}), ...extra,
   }, claim?.owner);
   if (!recorded) {
     logger.warn({ leaseId: lease.id, runId }, "dropped the outcome of a finished SSH run directory removal: its claim was taken over");
     return SKIPPED;
   }
-  // A directory that cannot be removed is retried; say so only the first time.
-  if (attempts === undefined || attempts === 1) {
+  // A directory that cannot be removed is retried, and a kept one is tried
+  // again after its keep window; say so only the first time for each reason.
+  const previous = previousDecision(lease);
+  const keptBefore = previous?.state === "kept" && previous.reason === reason;
+  if (!keptBefore && (attempts === undefined || attempts === 1)) {
     await logActivity(db, {
       companyId: lease.companyId, actorType: "system", actorId: REAPER_ACTOR_ID, action: KEPT_ACTION,
       entityType: "heartbeat_run", entityId: runId, runId, agentId,
-      details: { leaseId: lease.id, environmentId: lease.environmentId, trigger: context.trigger, outcome: "kept", reason, bytes },
+      details: { leaseId: lease.id, environmentId: lease.environmentId, trigger: context.trigger, outcome: "kept", reason, bytes, ...extra },
     });
   }
   logger.warn({ runId, leaseId: lease.id, trigger: context.trigger, reason, bytes }, "kept a finished SSH run directory");
@@ -532,9 +585,14 @@ export function sshRunDirectoryReaperService(db: Db, serviceOptions: SshRunDirec
             isNotNull(environmentLeases.heartbeatRunId),
             isNotNull(environmentLeases.environmentId),
             sql`${environmentLeases.metadata} ->> 'remoteCwd' is not null`,
-            sql`${finishedAt} > ${new Date(now.getTime() - SWEEP_LOOKBACK_MS).toISOString()}::timestamptz`,
+            // A directory kept for an outside worktree, or for something the
+            // reaper could not read, is checked again however old its lease is,
+            // so it goes once that worktree goes or the reaper can read it.
+            sql`(${finishedAt} > ${new Date(now.getTime() - SWEEP_LOOKBACK_MS).toISOString()}::timestamptz
+              or (${decision} ->> 'state' = 'kept' and ${decision} ->> 'reason' in ('external_worktree', 'unreadable')))`,
             sql`(${decision} is null
               or (${decision} ->> 'reason' = 'rm_failed' and coalesce((${decision} ->> 'attempts')::int, 0) < ${MAX_REMOVAL_ATTEMPTS})
+              or ${keptPastWindow(now)}
               or (${decision} ->> 'state' = 'reaping' and ${claimAliveAt} < ${staleClaimBefore}::timestamptz))`,
           ))
           .orderBy(asc(finishedAt))
