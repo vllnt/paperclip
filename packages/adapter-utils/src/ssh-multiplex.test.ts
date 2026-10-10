@@ -318,6 +318,42 @@ describe.skipIf(!sshSupport.supported)("SSH multiplexing for short bridge comman
     expect((await fixture.logins()) - before).toBe(1);
   }, 120_000);
 
+  it("does not retire a newer master when an older command is killed later", async () => {
+    const fixture = await startFixture();
+    if (!fixture) return;
+    const multiplex = hold(fixture.config, "env-a");
+    const runner = createSshCommandManagedRuntimeRunner({
+      spec: { ...fixture.config, remoteCwd: fixture.state.workspaceDir },
+      multiplex,
+    });
+    const run = (script: string, timeoutMs: number) => runner.execute({ command: "sh", args: ["-c", script], timeoutMs });
+    expect((await run("true", 30_000)).exitCode).toBe(0);
+    const frozen = sessionProcesses(fixture.state.pid);
+    for (const pid of frozen) process.kill(pid, "SIGSTOP");
+    cleanups.push(async () => {
+      for (const pid of frozen) {
+        try {
+          process.kill(pid, "SIGCONT");
+        } catch {
+          // gone
+        }
+      }
+    });
+    const before = await fixture.logins();
+
+    // Both start on the hung master; the first is killed and retires it, the
+    // second is killed only after a new master took over.
+    const first = run("echo first", 2_000);
+    const second = run("echo second", 5_000);
+    expect((await first).timedOut).toBe(true);
+    expect((await run("echo fresh", 30_000)).stdout.trim()).toBe("fresh");
+    expect((await second).timedOut).toBe(true);
+    expect((await run("echo again", 30_000)).stdout.trim()).toBe("again");
+
+    // One new master for both later commands.
+    expect((await fixture.logins()) - before).toBe(1);
+  }, 120_000);
+
   it("lets a command still on the master finish when the last hold is released", async () => {
     const fixture = await startFixture();
     if (!fixture) return;
@@ -325,8 +361,10 @@ describe.skipIf(!sshSupport.supported)("SSH multiplexing for short bridge comman
     const run = runnerFor(fixture.state, fixture.config, multiplex);
     expect((await run("true")).exitCode).toBe(0);
 
-    const pending = run("sleep 2; echo finished");
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const marker = path.join(fixture.state.workspaceDir, "on-the-master");
+    const pending = run(`: > ${JSON.stringify(marker)}; sleep 2; echo finished`);
+    // Release only once the command runs on the master.
+    while (!existsSync(marker)) await new Promise((resolve) => setTimeout(resolve, 20));
     await multiplex.release();
     const result = await pending;
 
@@ -425,7 +463,37 @@ describe("SSH control socket directory", () => {
       const option = channel.args.find((arg) => arg.startsWith("ControlPath="))!;
       channel.done();
 
-      expect(option.startsWith(`ControlPath=${unsafe}`)).toBe(false);
+      // It falls back to /tmp, still shared.
+      expect(option.startsWith("ControlPath=/tmp/paperclip-ssh-mux-")).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+    }
+  });
+
+  it.each([
+    ["writable by its group", 0o775, false],
+    ["a link to a folder anyone may write", 0o777, true],
+  ])("does not put the socket below a temp root %s", async (_label, mode, linked) => {
+    const target = await mkdtemp("/tmp/pg-");
+    const root = linked ? `${target}-link` : target;
+    cleanups.push(async () => {
+      if (linked) await rm(root, { force: true });
+      await rm(target, { recursive: true, force: true });
+    });
+    await chmod(target, mode);
+    if (linked) await symlink(target, root);
+    const previous = process.env.TMPDIR;
+    process.env.TMPDIR = root;
+    try {
+      const multiplex = openSshMultiplex(offline, `env-root-${mode}-${linked}`);
+      cleanups.push(() => multiplex.release());
+      const channel = await multiplex.channel(offline);
+      const option = channel.args.find((arg) => arg.startsWith("ControlPath="))!;
+      channel.done();
+
+      expect(option.startsWith(`ControlPath=${root}`)).toBe(false);
+      expect(option.startsWith("ControlPath=/tmp/paperclip-ssh-mux-")).toBe(true);
     } finally {
       if (previous === undefined) delete process.env.TMPDIR;
       else process.env.TMPDIR = previous;
