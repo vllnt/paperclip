@@ -7,9 +7,29 @@ what the upload sends, and where pnpm keeps its packages.
 ## One pnpm store per environment
 
 Every process that Paperclip starts on an SSH worker gets
-`npm_config_store_dir=<root>/.paperclip-runtime/pnpm-store`, where `<root>` is the
-environment's configured workspace path. That includes the agent's own shell
-commands, so installs the agent runs in its own worktrees use the same store.
+`npm_config_store_dir=<root>/.paperclip-runtime/pnpm-store` unless something else
+has already chosen a store. `<root>` is the environment's configured workspace
+path. The default is set in the one prelude that every remote command starts with
+(the spawn target, the managed-runtime runner, the direct shell command and
+`runSshCommand` all use it), and it reaches the agent's own shell commands, so
+installs the agent runs in its own worktrees use the same store.
+
+**Which store wins**, highest first. The default applies only when none of the
+others sets a store.
+
+| Order | Source | How it is found |
+| --- | --- | --- |
+| 1 | An environment variable the caller passes | `npm_config_store_dir`, in any letter case |
+| 2 | The project | `store-dir` in a `.npmrc`, or `storeDir` in `pnpm-workspace.yaml`, in the command's working directory or any parent |
+| 3 | The worker user | `store-dir` in `$npm_config_userconfig` or `~/.npmrc`, or in `~/.config/pnpm/rc` |
+| 4 | Paperclip | `<root>/.paperclip-runtime/pnpm-store` |
+
+For 2 and 3 the prelude only looks for the setting and, if it finds one, sets
+nothing, so pnpm reads that file itself. A commented-out line does not count. The
+working directory is the one the command runs in (the run's workspace, or the
+`cwd` a caller gives). Not looked at: pnpm's global `etc/npmrc` and settings made
+only through other environment variables. A root that is not a normalized
+absolute path gets no default.
 
 - The store is on the same filesystem as the run directories, which lets pnpm
   hard-link packages out of it. A run's `node_modules` then costs the files that
@@ -18,20 +38,18 @@ commands, so installs the agent runs in its own worktrees use the same store.
   one `du` over the whole `runs` directory, or with `df`.)
 - The store is outside every `runs/<runId>`. The run reaper removes only the run's
   own directory and never touches it.
-- A store the caller already chose (`npm_config_store_dir` in the run's
-  environment, in any letter case) is kept. The default is skipped when the root is
-  not a normalized absolute path.
-- Scope: the store belongs to the environment's root, not to a company. Runs of
-  environments that use the same root on the same worker share one store.
-  **A worker that serves more than one company needs one root per company.** Give
-  each company's environment its own workspace path, for example
-  `/srv/paperclip/<company>`. Then each company has its own `runs` directory and its
-  own store, and no package file is shared between companies. Package files are
-  content-addressed and public packages are the same for everyone, but a store also
-  holds whatever a run installed from a private registry, and the files are
-  writable (see below). Paperclip does not check that two companies use different
-  roots.
-- The store only grows. Pruning it (`pnpm store prune`) is not automatic.
+- **Scope: the store belongs to the environment's root. It does not belong to a
+  company.** An environment is a record of the instance, not of one company, so
+  every company that may use it shares its root, its `runs` directory and its
+  store. Paperclip does not keep two companies' stores apart, and it does not check
+  which companies use an environment. To keep companies apart, give each company
+  its own environment with its own workspace path (for example
+  `/srv/paperclip/<company>`) and use it for that company only. Package files
+  are content-addressed and public packages are the same for everyone, but a store
+  also holds whatever a run installed from a private registry, and its files are
+  writable (see below).
+- The store only grows. Pruning it (`pnpm store prune`) is not automatic, and a safe
+  prune needs a moment when no install runs on that root.
 
 Hard-linked files are shared between runs, and the store's files are writable by
 the SSH user (mode 600 or 664 on a typical pnpm 9 store). A run that edits a file

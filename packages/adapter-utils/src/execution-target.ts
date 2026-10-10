@@ -954,6 +954,7 @@ export async function runAdapterExecutionTargetShellCommand(
         const result = await runSshCommand(target.spec, command, {
           env,
           timeoutMs: (options.timeoutSec ?? 15) * 1000,
+          storeHints: { cwd: options.cwd },
         });
         if (result.stdout) await onLog("stdout", result.stdout);
         if (result.stderr) await onLog("stderr", result.stderr);

@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   buildSshSpawnTarget,
+  createSshCommandManagedRuntimeRunner,
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
   prepareWorkspaceForSshExecution,
@@ -28,6 +29,8 @@ import {
   SSH_RUN_RESTORED_MARKER,
   sshRunDirectory,
 } from "./remote-managed-runtime.js";
+
+import { runAdapterExecutionTargetShellCommand } from "./execution-target.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 const execFileAsync = promisify(execFile);
@@ -578,7 +581,7 @@ describe("ssh env-lab fixture", () => {
   });
 
   describe("shared pnpm store for SSH processes", () => {
-    const spec = {
+    const unitSpec = {
       host: "ssh.example.test",
       port: 22,
       username: "ssh-user",
@@ -588,58 +591,128 @@ describe("ssh env-lab fixture", () => {
       knownHosts: null,
       strictHostKeyChecking: true,
     } as const;
-    const remoteScriptFor = async (env: Record<string, string>) => {
-      const target = await buildSshSpawnTarget({ spec, command: "env", args: [], env });
+    const scriptFor = async (env: Record<string, string>, remoteWorkspacePath: string = unitSpec.remoteWorkspacePath) => {
+      const target = await buildSshSpawnTarget({ spec: { ...unitSpec, remoteWorkspacePath }, command: "env", args: [], env });
       await target.cleanup();
       return String(target.args.at(-1) ?? "");
     };
 
-    it("points pnpm at one store under the environment root, outside every run directory", async () => {
-      const script = await remoteScriptFor({});
+    it("puts the default store under the environment root, outside every run directory", async () => {
+      const script = await scriptFor({});
 
-      expect(script).toContain("npm_config_store_dir=");
       expect(script).toContain("/srv/paperclip/workspace/.paperclip-runtime/pnpm-store");
       expect(script).not.toContain("/runs/run-1/pnpm-store");
     });
 
-    it("keeps a store the caller already chose", async () => {
-      const lower = await remoteScriptFor({ npm_config_store_dir: "/opt/own-store" });
-      const upper = await remoteScriptFor({ NPM_CONFIG_STORE_DIR: "/opt/own-store" });
-
-      for (const script of [lower, upper]) {
+    it("does not look for a default when the caller already chose a store", async () => {
+      for (const key of ["npm_config_store_dir", "NPM_CONFIG_STORE_DIR"]) {
+        const script = await scriptFor({ [key]: "/opt/own-store" });
         expect(script).toContain("/opt/own-store");
         expect(script).not.toContain(".paperclip-runtime/pnpm-store");
       }
     });
 
-    it("leaves the store alone when the environment root is not a normalized absolute path", async () => {
-      for (const remoteWorkspacePath of ["relative/root", "/srv/../etc", "/srv/root/", "/"]) {
-        const target = await buildSshSpawnTarget({
-          spec: { ...spec, remoteWorkspacePath }, command: "env", args: [], env: {},
-        });
-        await target.cleanup();
-        expect(String(target.args.at(-1) ?? "")).not.toContain("npm_config_store_dir");
+    it("sets no default when the environment root is not a normalized absolute path", async () => {
+      for (const root of ["relative/root", "/srv/../etc", "/srv/root/", "/"]) {
+        expect(await scriptFor({}, root)).not.toContain("pnpm-store");
       }
     });
 
-    it("reaches a real remote process", async () => {
+    async function storeHost(label: string) {
       const rootDir = await createFixtureRootDir();
-      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH shared pnpm store env");
-      if (!started) return;
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), label);
+      if (!started) return null;
       const config = await buildSshEnvLabFixtureConfig(started);
-      const target = await buildSshSpawnTarget({
-        spec: { ...config, remoteCwd: started.workspaceDir },
-        command: "sh",
-        args: ["-c", "printf %s \"$npm_config_store_dir\""],
-        env: {},
-      });
-      try {
-        const { stdout } = await execFileAsync("ssh", target.args);
-        expect(stdout).toBe(path.posix.join(config.remoteWorkspacePath, ".paperclip-runtime", "pnpm-store"));
-      } finally {
-        await target.cleanup();
+      const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+      const defaultStore = path.posix.join(config.remoteWorkspacePath, ".paperclip-runtime", "pnpm-store");
+      const probe = "printf %s \"${npm_config_store_dir-UNSET}\"";
+      // Every way Paperclip starts a process on an SSH worker, run with the same inputs.
+      const entryPoints: Record<string, (input: { cwd: string; env: Record<string, string> }) => Promise<string>> = {
+        "spawn target": async ({ cwd, env }) => {
+          const target = await buildSshSpawnTarget({ spec: { ...spec, remoteCwd: cwd }, command: "sh", args: ["-c", probe], env });
+          try {
+            return (await execFileAsync("ssh", target.args)).stdout;
+          } finally {
+            await target.cleanup();
+          }
+        },
+        "managed-runtime runner": async ({ cwd, env }) =>
+          (await createSshCommandManagedRuntimeRunner({ spec, defaultCwd: cwd }).execute({ command: "sh", args: ["-c", probe], env })).stdout,
+        "direct shell command": async ({ cwd, env }) =>
+          (await runAdapterExecutionTargetShellCommand(
+            "run-1", { kind: "remote", transport: "ssh", remoteCwd: cwd, spec }, `cd '${cwd}' && ${probe}`, { cwd, env },
+          )).stdout,
+        "runSshCommand": async ({ cwd, env }) =>
+          (await runSshCommand(spec, `cd '${cwd}' && ${probe}`, { env, storeHints: { cwd } })).stdout,
+      };
+      return { rootDir, spec, defaultStore, entryPoints };
+    }
+
+    it.each([
+      "spawn target", "managed-runtime runner", "direct shell command", "runSshCommand",
+    ])("%s sees the default, and an explicit store anywhere wins over it", async (entryPoint) => {
+      const host = await storeHost(`SSH store precedence (${entryPoint})`);
+      if (!host) return;
+      const run = host.entryPoints[entryPoint]!;
+      const make = async (name: string, files: Record<string, string> = {}) => {
+        const dir = path.join(host.rootDir, name);
+        await mkdir(dir, { recursive: true });
+        for (const [file, content] of Object.entries(files)) await writeFile(path.join(dir, file), content);
+        return dir;
+      };
+
+      // Nothing sets a store, or the only mention is a comment: the default applies.
+      const plain = await make("plain");
+      const commented = await make("commented", { ".npmrc": "# store-dir=/tmp/not-used\nregistry=https://registry.example.test/\n" });
+      expect(await run({ cwd: plain, env: {} })).toBe(host.defaultStore);
+      expect(await run({ cwd: commented, env: {} })).toBe(host.defaultStore);
+
+      // An environment variable always wins.
+      expect(await run({ cwd: plain, env: { npm_config_store_dir: "/tmp/env-store" } })).toBe("/tmp/env-store");
+
+      // The project's own setting wins, so no default is set and pnpm reads its config.
+      const project = await make("project", { ".npmrc": "store-dir=/tmp/project-store\n" });
+      const workspaceYaml = await make("workspace-yaml", { "pnpm-workspace.yaml": "packages:\n  - 'pkg/*'\nstoreDir: /tmp/yaml-store\n" });
+      const nested = path.join(project, "packages", "app");
+      await mkdir(nested, { recursive: true });
+      expect(await run({ cwd: project, env: {} })).toBe("UNSET");
+      expect(await run({ cwd: workspaceYaml, env: {} })).toBe("UNSET");
+      expect(await run({ cwd: nested, env: {} })).toBe("UNSET");
+
+      // The worker user's own config wins too.
+      const userrc = path.join(host.rootDir, "user.npmrc");
+      await writeFile(userrc, "store-dir=/tmp/user-store\n");
+      expect(await run({ cwd: plain, env: { npm_config_userconfig: userrc } })).toBe("UNSET");
+      const emptyrc = path.join(host.rootDir, "empty.npmrc");
+      await writeFile(emptyrc, "registry=https://registry.example.test/\n");
+      expect(await run({ cwd: plain, env: { npm_config_userconfig: emptyrc } })).toBe(host.defaultStore);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS * 3);
+
+    it("lets pnpm itself resolve a project store over the default", async () => {
+      const host = await storeHost("SSH store with pnpm");
+      if (!host) return;
+      const pnpmPath = await runSshCommand(host.spec, "command -v pnpm || true");
+      if (!pnpmPath.stdout.trim()) {
+        console.warn("Skipping the pnpm precedence check: pnpm is not on the fixture host's PATH.");
+        return;
       }
-    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+      const withProject = path.join(host.rootDir, "with-project");
+      const without = path.join(host.rootDir, "without");
+      await mkdir(withProject, { recursive: true });
+      await mkdir(without, { recursive: true });
+      await writeFile(path.join(withProject, ".npmrc"), "store-dir=/tmp/project-store\n");
+      const storePath = async (cwd: string) => {
+        const target = await buildSshSpawnTarget({ spec: { ...host.spec, remoteCwd: cwd }, command: "pnpm", args: ["store", "path"], env: {} });
+        try {
+          return (await execFileAsync("ssh", target.args)).stdout.trim();
+        } finally {
+          await target.cleanup();
+        }
+      };
+
+      expect(await storePath(withProject)).toBe("/tmp/project-store/v3");
+      expect(await storePath(without)).toBe(path.posix.join(host.defaultStore, "v3"));
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
   });
 
   describe("workspace upload excludes", () => {
