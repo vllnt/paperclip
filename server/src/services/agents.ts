@@ -1,5 +1,6 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -129,6 +130,12 @@ interface UpdateAgentOptions {
    */
   verifyLockedRow?: (locked: typeof agents.$inferSelect) => Promise<void>;
   recordRevision?: RevisionMetadata;
+  /**
+   * The configs a merge patch was applied to. The update locks the agent row
+   * and fails with 409 when the stored configs changed since they were read,
+   * so a concurrent change is never overwritten with a stale merge base.
+   */
+  expectedConfig?: { adapterConfig: unknown; runtimeConfig: unknown };
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
@@ -801,7 +808,7 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
-      if (options?.verifyLockedRow) {
+      if (options?.verifyLockedRow || options?.expectedConfig) {
         const locked = await txDb
           .select()
           .from(agents)
@@ -809,7 +816,17 @@ export function agentService(db: Db) {
           .for("no key update")
           .then((rows) => rows[0] ?? null);
         if (!locked) return null;
-        await options.verifyLockedRow(locked);
+        if (options.expectedConfig) {
+          const current = await agentService(txDb).getById(id);
+          if (
+            !current
+            || !isDeepStrictEqual(current.adapterConfig, options.expectedConfig.adapterConfig)
+            || !isDeepStrictEqual(current.runtimeConfig, options.expectedConfig.runtimeConfig)
+          ) {
+            throw conflict("The agent config changed while this merge patch was applied. Read it again and retry.");
+          }
+        }
+        await options.verifyLockedRow?.(locked);
       }
       const updated = await txDb
         .update(agents)

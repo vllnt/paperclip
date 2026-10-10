@@ -3,6 +3,7 @@ import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
+import { applyConfigMergePatch, isAtomicAdapterConfigPath } from "../services/agent-config-merge-patch.js";
 import { pipeline } from "node:stream/promises";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
@@ -54,6 +55,7 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  updateAgentMergePatchSchema,
   heartbeatRunListQuerySchema,
   heartbeatRunStatsQuerySchema,
   HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS,
@@ -109,6 +111,7 @@ import { isLoginCommandSupportedAdapterType } from "../services/login-command.js
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
+  collectChangedAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import {
   agentProtectedConfigAfterPatch,
@@ -5652,7 +5655,16 @@ export function agentRoutes(
     }));
   });
 
-  router.patch("/agents/:id", validate(updateAgentSchema), async (req, res) => {
+  // A merge-mode body carries merge patches (nulls remove keys); the handler
+  // validates the merged configs with the ordinary schemas.
+  const validateAgentPatchBody = (req: Request, res: Response, next: NextFunction) =>
+    validate(readObject(req.body)?.mergeConfig === true ? updateAgentMergePatchSchema : updateAgentSchema)(
+      req,
+      res,
+      next,
+    );
+
+  router.patch("/agents/:id", validateAgentPatchBody, async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
@@ -5663,7 +5675,48 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
-    const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
+    const mergeConfig = patchData.mergeConfig === true;
+    delete patchData.mergeConfig;
+    if (
+      mergeConfig
+      && (patchData.replaceAdapterConfig === true
+        || (patchData.adapterType !== undefined && patchData.adapterType !== existing.adapterType))
+    ) {
+      res.status(422).json({
+        error: "mergeConfig cannot be combined with replaceAdapterConfig or an adapterType change",
+      });
+      return;
+    }
+    // Merge mode applies adapterConfig and runtimeConfig as JSON merge patches
+    // over the stored (unredacted) config, so callers change one key without
+    // resending secrets. The merged result then takes the ordinary replace
+    // path; only the presence-based guards and the audit summary read the delta.
+    const configDelta: Record<string, unknown> = {};
+    if (mergeConfig) {
+      for (const key of ["adapterConfig", "runtimeConfig"] as const) {
+        if (!hasOwn(patchData, key)) continue;
+        const delta = asRecord(patchData[key]) ?? {};
+        configDelta[key] = delta;
+        patchData[key] = applyConfigMergePatch(
+          asRecord(existing[key]) ?? {},
+          delta,
+          key === "adapterConfig" ? isAtomicAdapterConfigPath : undefined,
+          key,
+        );
+      }
+      if (asRecord(configDelta.runtimeConfig)?.aiConnection === null) {
+        res.status(422).json({
+          error: "runtimeConfig.aiConnection can't be removed with a merge patch; change the agent's AI connection instead",
+        });
+        return;
+      }
+      const merged: Record<string, unknown> = updateAgentSchema
+        .pick({ adapterConfig: true, runtimeConfig: true })
+        .parse(Object.fromEntries(Object.keys(configDelta).map((key) => [key, patchData[key]])));
+      for (const key of Object.keys(configDelta)) patchData[key] = merged[key];
+    }
+    const replaceAdapterConfig =
+      patchData.replaceAdapterConfig === true || (mergeConfig && hasOwn(patchData, "adapterConfig"));
     delete patchData.replaceAdapterConfig;
     // The apply-existing flag is not an agent column. The server binds the fixed
     // reference to the owner stored value with no login round trip. Remove it
@@ -5711,8 +5764,20 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
-      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
+      const requestedAdapterConfigKeys = asRecord(configDelta.adapterConfig) ?? adapterConfig;
+      if (mergeConfig) {
+        // The instructions keys are plain keys, so the keys that the caller sent are what changes.
+        // A merge replaces `workspaceStrategy` whole, so the delta says nothing about the host
+        // commands that it removes: compare the result with the stored config.
+        assertNoAgentInstructionsConfigMutation(req, requestedAdapterConfigKeys, "adapterConfig");
+        assertNoAgentHostWorkspaceCommandMutation(
+          req,
+          collectChangedAgentAdapterWorkspaceCommandPaths(existing.adapterConfig, adapterConfig),
+        );
+      } else {
+        assertNoAgentAdapterConfigMutation(req, requestedAdapterConfigKeys);
+      }
+      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(requestedAdapterConfigKeys);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
       }
@@ -5860,6 +5925,9 @@ export function agentRoutes(
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
       verifyLockedRow: lockedRowVerifier(req, existing, () => patchData, "patch_conflict"),
+      ...(mergeConfig
+        ? { expectedConfig: { adapterConfig: existing.adapterConfig, runtimeConfig: existing.runtimeConfig } }
+        : {}),
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5888,7 +5956,9 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: mergeConfig
+        ? { ...summarizeAgentUpdateDetails({ ...patchData, ...configDelta }), mergeConfig: true }
+        : summarizeAgentUpdateDetails(patchData),
     });
 
     res.json(redactAgentRowForResponse(agent));

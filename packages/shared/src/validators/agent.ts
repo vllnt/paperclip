@@ -155,11 +155,140 @@ export const updateAgentSchema = objectWithoutDefaults(
   .extend({
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
+    /**
+     * Apply `adapterConfig` and `runtimeConfig` as JSON merge patches (RFC 7396)
+     * over the stored config: only the given keys change, `null` removes a key,
+     * and `adapterConfig.env` entries are replaced per key. Secrets the patch
+     * doesn't name are kept, so they never have to be resent.
+     */
+    mergeConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),
   });
 
 export type UpdateAgent = z.infer<typeof updateAgentSchema>;
+
+/**
+ * The deepest nesting a config merge patch may have. A real agent config is a few
+ * levels deep (`env.KEY.value` is three), so 32 is far above real use, and it keeps
+ * every later walk of the merged config shallow.
+ */
+export const AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH = 32;
+
+/**
+ * The most values (objects, arrays and scalars together) one config merge patch may
+ * hold. A config with hundreds of env bindings is a few thousand, so 10,000 is far
+ * above real use and still bounds the work that one request can cause.
+ */
+export const AGENT_CONFIG_MERGE_PATCH_MAX_VALUES = 10_000;
+
+/** Keys that can reach the prototype of a plain object. A merge patch must not carry them, at any depth or inside an array. */
+export const AGENT_CONFIG_FORBIDDEN_KEYS: readonly string[] = ["__proto__", "constructor", "prototype"];
+
+/** Why a config merge patch was refused, and where in the patch. */
+export type AgentConfigMergePatchViolation =
+  | { reason: "forbidden_key"; path: Array<string | number>; key: string }
+  | { reason: "too_deep"; path: Array<string | number>; limit: number }
+  | { reason: "too_many_values"; path: Array<string | number>; limit: number };
+
+/**
+ * Looks for the first forbidden key, the first value nested deeper than
+ * `AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH`, or more than `AGENT_CONFIG_MERGE_PATCH_MAX_VALUES`
+ * values in a config merge patch. It walks with its own stack, never by recursion,
+ * so a patch that is nested 5,000 deep cannot overflow the call stack, and it counts
+ * values as it queues them, so a huge array cannot grow the stack past the limit.
+ *
+ * @param patch - the merge patch as the caller sent it, before any parsing.
+ * @returns the first violation with its path inside the patch, or null when the patch is fine.
+ * @example
+ * findAgentConfigMergePatchViolation({ jobs: [{ constructor: 1 }] })
+ * // => { reason: "forbidden_key", path: ["jobs", 0, "constructor"], key: "constructor" }
+ */
+export function findAgentConfigMergePatchViolation(patch: unknown): AgentConfigMergePatchViolation | null {
+  if (typeof patch !== "object" || patch === null) return null;
+  const stack: Array<{ value: object; path: Array<string | number>; depth: number }> = [
+    { value: patch, path: [], depth: 1 },
+  ];
+  let values = 1;
+  for (let current = stack.pop(); current !== undefined; current = stack.pop()) {
+    if (current.depth > AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH) {
+      return { reason: "too_deep", path: current.path, limit: AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH };
+    }
+    const children: Array<[string | number, unknown]> = Array.isArray(current.value)
+      ? current.value.map((item, index): [number, unknown] => [index, item])
+      : Object.entries(current.value);
+    for (const [key, child] of children) {
+      const childPath = [...current.path, key];
+      if (typeof key === "string" && AGENT_CONFIG_FORBIDDEN_KEYS.includes(key)) {
+        return { reason: "forbidden_key", path: childPath, key };
+      }
+      values += 1;
+      if (values > AGENT_CONFIG_MERGE_PATCH_MAX_VALUES) {
+        return { reason: "too_many_values", path: childPath, limit: AGENT_CONFIG_MERGE_PATCH_MAX_VALUES };
+      }
+      if (typeof child === "object" && child !== null) {
+        stack.push({ value: child, path: childPath, depth: current.depth + 1 });
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Words a violation for an error message.
+ *
+ * @param violation - what `findAgentConfigMergePatchViolation` returned.
+ * @param root - the config the patch belongs to, put in front of the path (`adapterConfig`).
+ * @returns one sentence that names the path.
+ */
+export function describeAgentConfigMergePatchViolation(
+  violation: AgentConfigMergePatchViolation,
+  root = "config",
+): string {
+  const where = violation.path.reduce<string>(
+    (text, segment) => (typeof segment === "number" ? `${text}[${segment}]` : `${text}.${segment}`),
+    root,
+  );
+  switch (violation.reason) {
+    case "forbidden_key":
+      return `Config key "${violation.key}" is not allowed (${where})`;
+    case "too_deep":
+      return `Config is nested deeper than ${violation.limit} levels (${where})`;
+    case "too_many_values":
+      return `Config holds more than ${violation.limit} values (${where})`;
+  }
+}
+
+/**
+ * A JSON merge patch object (RFC 7396): `null` values remove keys. The first step
+ * reads the raw input, because the record step would drop a top-level `__proto__`
+ * key before any check could see it.
+ */
+const configMergePatchSchema = z
+  .unknown()
+  .superRefine((patch, ctx) => {
+    const violation = findAgentConfigMergePatchViolation(patch);
+    if (!violation) return;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: describeAgentConfigMergePatchViolation(violation),
+      path: violation.path,
+    });
+  })
+  .pipe(z.record(z.string(), z.unknown()));
+
+/**
+ * `PATCH /api/agents/:id` body when `mergeConfig` is true. `adapterConfig` and
+ * `runtimeConfig` are merge patches; the server validates them with the
+ * ordinary config schemas after merging them over the stored config.
+ */
+export const updateAgentMergePatchSchema = updateAgentSchema.extend({
+  mergeConfig: z.literal(true),
+  adapterConfig: configMergePatchSchema.optional(),
+  runtimeConfig: configMergePatchSchema.optional(),
+});
+
+export type UpdateAgentMergePatch = z.infer<typeof updateAgentMergePatchSchema>;
 
 export const updateAgentInstructionsPathSchema = z.object({
   path: z.string().trim().min(1).nullable(),
