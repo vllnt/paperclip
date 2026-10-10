@@ -57,6 +57,16 @@ import {
   statusDecisions,
   workAssessments,
   workspaceRuntimeServices,
+  chatActions,
+  chatConversations,
+  chatDeliveries,
+  chatGitHubReviews,
+  chatMessageLinks,
+  chatPublications,
+  chatTeamsFileTransfers,
+  companySkillTestRuns,
+  managedAgentProfiles,
+  toolMcpGateways,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { explainBlockedCompanyRemoval } from "./company-removal-conflict.js";
@@ -569,8 +579,8 @@ export function companyService(db: Db) {
      * with a 409 that names the blocking table.
      *
      * The order below is checked against the live foreign keys by
-     * `company-removal-coverage.test.ts`: a table with a blocking key to a company,
-     * an agent or a run must be deleted here before the row it references.
+     * `company-removal-coverage.test.ts`: a table with a blocking key to any row
+     * that this method deletes must be deleted here before that row.
      */
     remove: async (id: string) => {
       try {
@@ -598,15 +608,19 @@ export function companyService(db: Db) {
           await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
           await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
           await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
+          await tx.delete(chatMessageLinks).where(eq(chatMessageLinks.companyId, id));
+          await tx.delete(chatPublications).where(eq(chatPublications.companyId, id));
           await tx.delete(issueComments).where(eq(issueComments.companyId, id));
           await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
           await tx.delete(budgetIncidents).where(eq(budgetIncidents.companyId, id));
           await tx.delete(approvals).where(eq(approvals.companyId, id));
+          await tx.delete(managedAgentProfiles).where(eq(managedAgentProfiles.companyId, id));
           await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
           await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
           await tx.delete(invites).where(eq(invites.companyId, id));
           await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
           await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
+          await tx.delete(companySkillTestRuns).where(eq(companySkillTestRuns.companyId, id));
           await tx.delete(companySkills).where(eq(companySkills.companyId, id));
           await tx.delete(routineRuns).where(eq(routineRuns.companyId, id));
           await tx.delete(routineTriggers).where(eq(routineTriggers.companyId, id));
@@ -616,7 +630,12 @@ export function companyService(db: Db) {
           await tx.delete(browserUseBrowsers).where(eq(browserUseBrowsers.companyId, id));
           await tx.delete(documents).where(eq(documents.companyId, id));
           await tx.delete(browserUseSessions).where(eq(browserUseSessions.companyId, id));
+          await tx.delete(chatActions).where(eq(chatActions.companyId, id));
+          await tx.delete(chatDeliveries).where(eq(chatDeliveries.companyId, id));
           await tx.delete(completionContracts).where(eq(completionContracts.companyId, id));
+          await tx.delete(chatConversations).where(eq(chatConversations.companyId, id));
+          await tx.delete(chatGitHubReviews).where(eq(chatGitHubReviews.companyId, id));
+          await tx.delete(chatTeamsFileTransfers).where(eq(chatTeamsFileTransfers.companyId, id));
           await tx.delete(issues).where(eq(issues.companyId, id));
           await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
           await tx.delete(assets).where(eq(assets.companyId, id));
@@ -630,6 +649,7 @@ export function companyService(db: Db) {
           await tx.delete(inboxDismissals).where(eq(inboxDismissals.companyId, id));
           await tx.delete(secretAccessEvents).where(eq(secretAccessEvents.companyId, id));
           await tx.delete(workspaceRuntimeServices).where(eq(workspaceRuntimeServices.companyId, id));
+          await tx.delete(toolMcpGateways).where(eq(toolMcpGateways.companyId, id));
           const rows = await tx
             .delete(companies)
             .where(eq(companies.id, id))

@@ -91,6 +91,25 @@ describe("readForeignKeyViolation", () => {
     ).toEqual({ constraint: FK, table: "finance_events" });
   });
 
+  it("reads a RESTRICT violation (SQLSTATE 23001) the same way", () => {
+    const restrict = "managed_agent_profiles_api_key_secret_id_company_secrets_id_fk";
+    expect(
+      readForeignKeyViolation({ cause: { code: "23001", constraint_name: restrict, table_name: "managed_agent_profiles" } }),
+    ).toEqual({ constraint: restrict, table: "managed_agent_profiles" });
+  });
+
+  it("reads the RESTRICT wording of the driver message", () => {
+    const restrict = "managed_agent_profiles_api_key_secret_id_company_secrets_id_fk";
+    expect(
+      readForeignKeyViolation({
+        cause: {
+          code: "23001",
+          message: `update or delete on table "company_secrets" violates RESTRICT setting of foreign key constraint "${restrict}" on table "managed_agent_profiles"`,
+        },
+      }),
+    ).toEqual({ constraint: restrict, table: "managed_agent_profiles" });
+  });
+
   it("reports a foreign key violation whose names are unknown", () => {
     expect(readForeignKeyViolation({ cause: { code: "23503" } })).toEqual({ constraint: null, table: null });
   });
@@ -125,5 +144,19 @@ describe.each([
     const looped: { cause?: unknown } = {};
     looped.cause = looped;
     expect(matches(looped)).toBe(false);
+  });
+});
+
+describe("isForeignKeyViolation with a RESTRICT reference", () => {
+  it("matches SQLSTATE 23001 on the error itself and through Drizzle's cause", () => {
+    expect(isForeignKeyViolation({ code: "23001" })).toBe(true);
+    expect(isForeignKeyViolation(new Error("Failed query: delete from \"company_secrets\"", { cause: { code: "23001" } }))).toBe(
+      true,
+    );
+  });
+
+  it("still ignores other integrity codes", () => {
+    expect(isForeignKeyViolation({ code: "23502" })).toBe(false);
+    expect(isForeignKeyViolation({ cause: { code: "23514" } })).toBe(false);
   });
 });

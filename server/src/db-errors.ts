@@ -1,5 +1,6 @@
 const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
+const RESTRICT_VIOLATION = "23001";
 const INVALID_TEXT_REPRESENTATION = "22P02";
 const MAX_CAUSE_DEPTH = 4;
 
@@ -35,15 +36,18 @@ export function isUniqueViolation(error: unknown, constraintName?: string): bool
 }
 
 /**
- * Recognizes a Postgres foreign-key-constraint violation (SQLSTATE 23503).
+ * Recognizes a Postgres foreign-key-constraint violation: SQLSTATE 23503, or
+ * 23001 for a reference declared `ON DELETE RESTRICT`.
  *
- * A delete that leaves an orphan reference raises this code. Drizzle wraps the
- * driver failure in its own `Failed query: ...` error, so the Postgres error
- * that carries the code is reachable only through `cause`. This helper walks
- * the `cause` chain, the same way `isUniqueViolation` does.
+ * A delete that leaves an orphan reference raises 23503. A `RESTRICT`
+ * reference raises 23001 instead, so a caller that maps only 23503 lets that
+ * refusal fall through as a bare 500. Drizzle wraps the driver failure in its
+ * own `Failed query: ...` error, so the Postgres error that carries the code
+ * is reachable only through `cause`. This helper walks the `cause` chain, the
+ * same way `isUniqueViolation` does.
  */
 export function isForeignKeyViolation(error: unknown): boolean {
-  return hasPostgresCode(error, FOREIGN_KEY_VIOLATION);
+  return hasPostgresCode(error, FOREIGN_KEY_VIOLATION) || hasPostgresCode(error, RESTRICT_VIOLATION);
 }
 
 /**
@@ -74,7 +78,7 @@ export interface ForeignKeyViolationDetails {
   table: string | null;
 }
 
-const FOREIGN_KEY_MESSAGE = /violates foreign key constraint "([^"]+)" on table "([^"]+)"/;
+const FOREIGN_KEY_MESSAGE = /violates (?:RESTRICT setting of )?foreign key constraint "([^"]+)" on table "([^"]+)"/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -86,7 +90,8 @@ function readName(value: unknown): string | null {
 
 /**
  * Reads the constraint name and the referencing table from a foreign-key
- * violation (SQLSTATE 23503), or returns null for any other error.
+ * violation (SQLSTATE 23503, or 23001 for a `RESTRICT` reference), or returns
+ * null for any other error.
  *
  * The names land on `constraint_name` and `table_name` under postgres.js and on
  * `constraint` and `table` under node-postgres. When the driver surfaces
@@ -99,7 +104,7 @@ function readName(value: unknown): string | null {
 export function readForeignKeyViolation(error: unknown): ForeignKeyViolationDetails | null {
   let current: unknown = error;
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && isRecord(current); depth += 1) {
-    if (current.code === FOREIGN_KEY_VIOLATION) {
+    if (current.code === FOREIGN_KEY_VIOLATION || current.code === RESTRICT_VIOLATION) {
       const fromMessage = typeof current.message === "string" ? FOREIGN_KEY_MESSAGE.exec(current.message) : null;
       return {
         constraint: readName(current.constraint_name) ?? readName(current.constraint) ?? fromMessage?.[1] ?? null,

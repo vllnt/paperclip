@@ -35,7 +35,24 @@ import {
   toolConnections,
   workAssessments,
   workspaceRuntimeServices,
+  chatActions,
+  chatConversations,
+  chatDeliveries,
+  chatExternalPrincipals,
+  chatGitHubReviews,
+  chatMessageLinks,
+  chatPublications,
+  chatTeamsFileTransfers,
+  companySecrets,
+  companySkillTestRuns,
+  companySkillVersions,
+  companySkills,
+  issueComments,
+  managedAgentProfiles,
+  toolMcpGateways,
+  toolProfiles,
 } from "@paperclipai/db";
+import { HttpError } from "../errors.ts";
 import type { Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
@@ -70,16 +87,26 @@ interface Violation {
   reason: string;
 }
 
-const COVERED_PARENTS = new Set(["companies", "agents", "heartbeat_runs"]);
+const CASCADE_COVERED_DELETES = ["chat_teams_file_transfers", "decision_queue_items"];
 
-const SEEDED_TABLES = [
+const HEX_DIGEST = "a".repeat(64);
+
+const ADDED_DELETES = [
   "browser_use_browsers",
   "browser_use_runs",
   "browser_use_sessions",
   "browser_use_settings",
   "budget_incidents",
   "budget_policies",
+  "chat_actions",
+  "chat_conversations",
+  "chat_deliveries",
   "chat_endpoints",
+  "chat_github_reviews",
+  "chat_message_links",
+  "chat_publications",
+  "chat_teams_file_transfers",
+  "company_skill_test_runs",
   "completion_contracts",
   "decision_archive_notification_outbox",
   "decision_bundles",
@@ -90,11 +117,13 @@ const SEEDED_TABLES = [
   "decision_triage_events",
   "decisions",
   "inbox_dismissals",
+  "managed_agent_profiles",
   "native_run_finalizations",
   "native_run_results",
   "secret_access_events",
   "status_decision_effects",
   "status_decisions",
+  "tool_mcp_gateways",
   "work_assessments",
   "workspace_runtime_services",
 ];
@@ -156,7 +185,7 @@ function findViolations(foreignKeys: ForeignKey[], statements: string[]): Violat
   const violations: Violation[] = [];
   for (const key of foreignKeys) {
     if (key.action !== "a" && key.action !== "r") continue;
-    if (!COVERED_PARENTS.has(key.parent) || key.child === key.parent) continue;
+    if (key.child === key.parent) continue;
     const parentAt = removedAt.get(key.parent);
     if (parentAt === undefined) continue;
     const childAt = removedAt.get(key.child);
@@ -444,12 +473,150 @@ describeEmbeddedPostgres("company removal coverage", () => {
       amountObserved: 2,
     });
 
-    await db.insert(chatEndpoints).values({
+    const [endpoint] = await db
+      .insert(chatEndpoints)
+      .values({
+        companyId,
+        connectionId: connection!.id,
+        provider: "slack",
+        publicId: randomUUID(),
+        assignedAgentId: agentId,
+      })
+      .returning();
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, body: "Comment" }).returning();
+    const [conversation] = await db
+      .insert(chatConversations)
+      .values({
+        companyId,
+        endpointId: endpoint!.id,
+        issueId,
+        externalConversationId: randomUUID(),
+        externalLabel: "Conversation",
+      })
+      .returning();
+    const [delivery] = await db
+      .insert(chatDeliveries)
+      .values({
+        companyId,
+        endpointId: endpoint!.id,
+        conversationId: conversation!.id,
+        providerEventId: randomUUID(),
+        deduplicationKey: randomUUID(),
+        eventKind: "message",
+        normalizedEvent: {},
+      })
+      .returning();
+    await db.insert(chatActions).values({
       companyId,
-      connectionId: connection!.id,
-      provider: "slack",
-      publicId: randomUUID(),
-      assignedAgentId: agentId,
+      endpointId: endpoint!.id,
+      conversationId: conversation!.id,
+      kind: "reply",
+      providerActionId: randomUUID(),
+    });
+    const [publication] = await db
+      .insert(chatPublications)
+      .values({
+        companyId,
+        endpointId: endpoint!.id,
+        conversationId: conversation!.id,
+        issueId,
+        commentId: comment!.id,
+        idempotencyKey: randomUUID(),
+        payload: {},
+      })
+      .returning();
+    await db.insert(chatMessageLinks).values({
+      companyId,
+      endpointId: endpoint!.id,
+      conversationId: conversation!.id,
+      publicationId: publication!.id,
+      deliveryId: delivery!.id,
+      commentId: comment!.id,
+      providerMessageId: randomUUID(),
+      direction: "outbound",
+    });
+    await db.insert(chatGitHubReviews).values({
+      companyId,
+      endpointId: endpoint!.id,
+      issueId,
+      runId,
+      repositoryId: "1",
+      repository: "owner/repository",
+      pullNumber: 1,
+      headSha: "head-sha",
+      deliveryId: randomUUID(),
+      configurationRevision: 1,
+      policySnapshot: {},
+      event: {},
+    });
+    const [principal] = await db
+      .insert(chatExternalPrincipals)
+      .values({ companyId, provider: "microsoft-teams", providerAccountId: "account", externalId: randomUUID() })
+      .returning();
+    await db.insert(chatTeamsFileTransfers).values({
+      companyId,
+      endpointId: endpoint!.id,
+      conversationId: conversation!.id,
+      publicationId: publication!.id,
+      issueId,
+      commentId: comment!.id,
+      attachmentId: randomUUID(),
+      principalId: principal!.id,
+      runtimeGeneration: 1,
+      credentialFingerprint: "fingerprint",
+      conversationGeneration: 1,
+      sourceDigest: HEX_DIGEST,
+      authorityDigest: HEX_DIGEST,
+      tenantId: randomUUID(),
+      botAppId: randomUUID(),
+      aadObjectId: randomUUID(),
+      providerConversationId: "provider-conversation",
+      providerUserId: "provider-user",
+      sha256: HEX_DIGEST,
+      byteSize: 1,
+      filename: "file.txt",
+      tokenSha256: HEX_DIGEST,
+      privateState: {},
+      expiresAt: new Date(now.getTime() + 60_000),
+    });
+
+    const [toolProfile] = await db
+      .insert(toolProfiles)
+      .values({ companyId, profileKey: "default", name: "Default" })
+      .returning();
+    await db
+      .insert(toolMcpGateways)
+      .values({ companyId, name: "Gateway", slug: "gateway", profileId: toolProfile!.id, agentId, issueId });
+
+    const [secret] = await db
+      .insert(companySecrets)
+      .values({ companyId, name: "Managed agent key", key: `managed-agent-key-${randomUUID()}` })
+      .returning();
+    await db.insert(managedAgentProfiles).values({
+      companyId,
+      profileKey: "default",
+      displayName: "Managed agent",
+      anthropicAgentId: "agent_1",
+      agentVersion: "1",
+      environmentId: "environment_1",
+      apiKeySecretId: secret!.id,
+    });
+
+    const [skill] = await db
+      .insert(companySkills)
+      .values({ companyId, key: `skill-${randomUUID()}`, slug: "skill", name: "Skill", markdown: "# Skill" })
+      .returning();
+    const [skillVersion] = await db
+      .insert(companySkillVersions)
+      .values({ companyId, companySkillId: skill!.id, revisionNumber: 1 })
+      .returning();
+    await db.insert(companySkillTestRuns).values({
+      companyId,
+      skillId: skill!.id,
+      inputSnapshot: "input",
+      skillVersionId: skillVersion!.id,
+      agentId,
+      issueId,
     });
     await db.insert(inboxDismissals).values({ companyId, userId: "user-1", itemKey: "item-1" });
     await db.insert(secretAccessEvents).values({
@@ -477,7 +644,7 @@ describeEmbeddedPostgres("company removal coverage", () => {
     const companyId = await seedCompanyWithBlockingRows();
     const otherCompanyId = await seedCompanyWithBlockingRows();
 
-    for (const table of SEEDED_TABLES) {
+    for (const table of ADDED_DELETES) {
       expect(await countCompanyRows(table, companyId), `${table} seeded for the company`).toBe(1);
       expect(await countCompanyRows(table, otherCompanyId), `${table} seeded for the other company`).toBe(1);
     }
@@ -485,17 +652,14 @@ describeEmbeddedPostgres("company removal coverage", () => {
     const removed = await companyService(db).remove(companyId);
 
     expect(removed?.id).toBe(companyId);
-    for (const table of SEEDED_TABLES) {
+    for (const table of ADDED_DELETES) {
       expect(await countCompanyRows(table, companyId), `${table} rows of the removed company`).toBe(0);
       expect(await countCompanyRows(table, otherCompanyId), `${table} rows of the other company`).toBe(1);
     }
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
   });
 
-  it("deletes every table that has a blocking foreign key to a company, an agent or a run, before the row it references", async () => {
-    const statements: string[] = [];
-    await companyService(recordDeletes(db, statements)).remove(randomUUID());
-
+  async function readForeignKeys(): Promise<ForeignKey[]> {
     const rows = await db.execute(sql`
       SELECT child_class.relname AS child, parent_class.relname AS parent, constraint_row.confdeltype AS action,
         (SELECT array_agg(attribute.attname ORDER BY key.position)
@@ -510,13 +674,137 @@ describeEmbeddedPostgres("company removal coverage", () => {
       JOIN pg_namespace namespace ON namespace.oid = child_class.relnamespace
       WHERE constraint_row.contype = 'f' AND namespace.nspname = 'public'
     `);
-    const foreignKeys = Array.from(rows).flatMap((row) => {
+    return Array.from(rows).flatMap((row) => {
       const key = readForeignKey(row);
       return key ? [key] : [];
     });
+  }
+
+  async function recordRemovalStatements(): Promise<string[]> {
+    const statements: string[] = [];
+    await companyService(recordDeletes(db, statements)).remove(randomUUID());
+    return statements;
+  }
+
+  it("deletes every table that has a blocking foreign key to a row that remove() deletes, before that row", async () => {
+    const statements = await recordRemovalStatements();
+    const foreignKeys = await readForeignKeys();
 
     expect(statements.at(-1)).toBe("companies");
     expect(foreignKeys.length).toBeGreaterThan(100);
     expect(findViolations(foreignKeys, statements)).toEqual([]);
+  });
+
+  it("reports a violation when any one of the added deletes is dropped, except where a cascade covers it", async () => {
+    const statements = await recordRemovalStatements();
+    const foreignKeys = await readForeignKeys();
+
+    for (const table of ADDED_DELETES) {
+      expect(statements, `${table} is deleted`).toContain(table);
+      const withoutTable = statements.filter((statement) => statement !== table);
+      const violations = findViolations(foreignKeys, withoutTable);
+      if (CASCADE_COVERED_DELETES.includes(table)) {
+        expect(violations, `dropping ${table}, which a cascade covers`).toEqual([]);
+      } else {
+        expect(violations, `dropping ${table}`).not.toEqual([]);
+      }
+    }
+  });
+
+  it("reports a new table with a blocking key to a parent that remove() deletes, such as issues", async () => {
+    await db.execute(sql`
+      CREATE TABLE zz_future_child (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        issue_id uuid NOT NULL REFERENCES issues (id) ON DELETE RESTRICT
+      )
+    `);
+    try {
+      const violations = findViolations(await readForeignKeys(), await recordRemovalStatements());
+
+      expect(violations).toEqual([expect.objectContaining({ child: "zz_future_child", parent: "issues" })]);
+    } finally {
+      await db.execute(sql`DROP TABLE IF EXISTS zz_future_child`);
+    }
+  });
+
+  it("deletes a company whose managed agent profile holds a required secret", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Managed profile company",
+      issuePrefix: `M${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [secret] = await db
+      .insert(companySecrets)
+      .values({ companyId, name: "Managed agent key", key: `managed-agent-key-${randomUUID()}` })
+      .returning();
+    await db.insert(managedAgentProfiles).values({
+      companyId,
+      profileKey: "default",
+      displayName: "Managed agent",
+      anthropicAgentId: "agent_1",
+      agentVersion: "1",
+      environmentId: "environment_1",
+      apiKeySecretId: secret!.id,
+    });
+
+    const removed = await companyService(db).remove(companyId);
+
+    expect(removed?.id).toBe(companyId);
+    expect(await countCompanyRows("managed_agent_profiles", companyId)).toBe(0);
+    expect(await countCompanyRows("company_secrets", companyId)).toBe(0);
+  });
+
+  it("returns 409, not 500, when a table outside the delete list holds a RESTRICT reference", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const agentId = randomUUID();
+    for (const id of [companyId, otherCompanyId]) {
+      await db.insert(companies).values({
+        id,
+        name: "Restrict company",
+        issuePrefix: `R${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+    }
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Referenced agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.execute(sql`
+      CREATE TABLE zz_restrict_blocker (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        company_id uuid NOT NULL,
+        agent_id uuid NOT NULL REFERENCES agents (id) ON DELETE RESTRICT
+      )
+    `);
+    try {
+      await db.execute(sql`INSERT INTO zz_restrict_blocker (company_id, agent_id) VALUES (${otherCompanyId}, ${agentId})`);
+
+      const failure = await companyService(db)
+        .remove(companyId)
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+
+      expect(failure).toBeInstanceOf(HttpError);
+      expect(failure).toMatchObject({
+        status: 409,
+        details: { table: "zz_restrict_blocker", blockingRows: 1 },
+      });
+      await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(1);
+      await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(1);
+    } finally {
+      await db.execute(sql`DROP TABLE IF EXISTS zz_restrict_blocker`);
+    }
   });
 });
