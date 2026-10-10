@@ -106,23 +106,29 @@ master connection instead of one login each (`packages/adapter-utils/src/ssh-mul
   is `<os.tmpdir() or /tmp>/paperclip-ssh-mux-XXXXXX/%C`, in a 0700 directory
   that only that scope uses. The longest path on Linux is about 70 bytes, under
   the 104-byte socket limit of macOS.
-- At most 10 commands share a master at a time, well under the usual
-  `MaxSessions 20`. A command over that cap connects directly. When sshd
+- At most 10 commands share a master at a time, the stock sshd default
+  `MaxSessions 10`. A command over that cap connects directly. When sshd
   refuses a channel anyway, or the master died, OpenSSH connects directly to
-  the same target.
+  the same target. A command the server kills (timeout or abort) retires its
+  master (`ssh -O stop`), so a master whose connection hangs does not hold
+  later commands; the next one connects again.
+- A target without an environment id, and any other target or credentials
+  than the hold's own, connect directly.
 - The agent's own session, workspace sync and every other SSH command stay on
   direct connections.
 - Each run's bridge holds the scope until the bridge stops: at run end, after
-  a failed start, and when a shutdown drain ends the run. The last hold ends
-  the master (`ssh -O exit`) and removes the directory. A process that exits
+  a failed start, and when a shutdown drain ends the run. The last hold stops
+  the master (`ssh -O stop`: a command still on it finishes, then it exits)
+  and removes the directory. A process that exits
   without stopping its runs still removes the directories it holds, so no
   later process can reach those masters; each master exits after 60 seconds
   idle.
 
-When the worker gives up on a queue listing or on a request whose handler did
-not start, it aborts that read, and the SSH runner stops its `ssh` process.
-Writes are never stopped this way: a stopped write could publish a cut-off
-response.
+When the worker gives up on a queue listing, or on the recovery path's read,
+it aborts that read, and the SSH runner stops its `ssh` process. A request's
+own read and every write run to their own command timeout: stopping the read
+would drop the request's guard early, and a stopped write could publish a
+cut-off response.
 
 ## The server-owned staging lease outer context
 
