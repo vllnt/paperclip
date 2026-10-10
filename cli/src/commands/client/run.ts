@@ -1,5 +1,11 @@
 import { Command } from "commander";
-import type { HeartbeatRun, HeartbeatRunEvent, Issue, WorkspaceOperation } from "@paperclipai/shared";
+import type {
+  HeartbeatRun,
+  HeartbeatRunEvent,
+  HeartbeatRunStats,
+  Issue,
+  WorkspaceOperation,
+} from "@paperclipai/shared";
 import {
   addCommonClientOptions,
   apiPath,
@@ -13,6 +19,33 @@ import {
 interface RunListOptions extends BaseClientOptions {
   agentId?: string;
   limit?: string;
+  status?: string;
+  errorCode?: string;
+  since?: string;
+  until?: string;
+}
+
+interface RunStatsOptions extends BaseClientOptions {
+  agentId?: string;
+  since?: string;
+  until?: string;
+}
+
+const DURATION_PATTERN = /^(\d+)([mhd])$/;
+const DURATION_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000 };
+
+/**
+ * Accepts an ISO 8601 time or a duration back from now (`30m`, `6h`, `2d`).
+ * @returns an ISO 8601 timestamp.
+ */
+export function resolveRunTime(value: string, now = new Date()): string {
+  const duration = DURATION_PATTERN.exec(value.trim());
+  if (duration) return new Date(now.getTime() - Number(duration[1]) * DURATION_MS[duration[2]]).toISOString();
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`Invalid time "${value}". Use an ISO 8601 time or a duration such as 30m, 6h or 2d.`);
+  }
+  return parsed.toISOString();
 }
 
 interface RunLiveOptions extends BaseClientOptions {
@@ -50,18 +83,57 @@ export function registerRunCommands(command: Command): void {
       .description("List heartbeat runs for a company")
       .option("-C, --company-id <id>", "Company ID")
       .option("--agent-id <id>", "Filter by agent ID")
+      .option("--status <list>", "Comma-separated statuses, e.g. failed,timed_out")
+      .option("--error-code <list>", "Comma-separated error codes")
+      .option("--since <time>", "Created at or after: ISO 8601 or a duration back from now (30m, 6h, 2d)")
+      .option("--until <time>", "Created before: ISO 8601 or a duration back from now")
       .option("--limit <n>", "Maximum runs to return")
       .action(async (opts: RunListOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
           const params = new URLSearchParams();
           if (opts.agentId) params.set("agentId", opts.agentId);
+          if (opts.status) params.set("status", opts.status);
+          if (opts.errorCode) params.set("errorCode", opts.errorCode);
+          if (opts.since) params.set("since", resolveRunTime(opts.since));
+          if (opts.until) params.set("until", resolveRunTime(opts.until));
           if (opts.limit) params.set("limit", opts.limit);
           const query = params.toString();
           const rows = (await ctx.api.get<HeartbeatRun[]>(
             `${apiPath`/api/companies/${ctx.companyId}/heartbeat-runs`}${query ? `?${query}` : ""}`,
           )) ?? [];
           printRuns(rows, ctx.json);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    command
+      .command("stats")
+      .description("Run counts by status, top error codes, and each agent's runs today against its daily cap")
+      .option("-C, --company-id <id>", "Company ID")
+      .option("--agent-id <id>", "Only this agent")
+      .option("--since <time>", "Window start: ISO 8601 or a duration back from now (default 24h)")
+      .option("--until <time>", "Window end: ISO 8601 or a duration back from now (default now)")
+      .action(async (opts: RunStatsOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const params = new URLSearchParams();
+          if (opts.agentId) params.set("agentId", opts.agentId);
+          if (opts.since) params.set("since", resolveRunTime(opts.since));
+          if (opts.until) params.set("until", resolveRunTime(opts.until));
+          const query = params.toString();
+          const stats = await ctx.api.get<HeartbeatRunStats>(
+            `${apiPath`/api/companies/${ctx.companyId}/heartbeat-runs/stats`}${query ? `?${query}` : ""}`,
+          );
+          if (!stats || ctx.json) {
+            printOutput(stats, { json: true });
+            return;
+          }
+          printRunStats(stats);
         } catch (err) {
           handleCommandError(err);
         }
@@ -283,6 +355,31 @@ async function fetchLog(
   if (opts.offset) params.set("offset", opts.offset);
   if (opts.limitBytes) params.set("limitBytes", opts.limitBytes);
   return api.get(`${path}?${params.toString()}`);
+}
+
+function printRunStats(stats: HeartbeatRunStats): void {
+  const { totals } = stats;
+  console.log(`Window: ${stats.window.since} → ${stats.window.until}`);
+  console.log(formatInlineRecord({
+    runs: totals.runs,
+    terminal: totals.terminal,
+    succeeded: totals.succeeded,
+    unsuccessful: totals.unsuccessful,
+  }));
+  if (stats.topErrorCodes.length > 0) {
+    console.log(`Top error codes: ${stats.topErrorCodes.map((row) => `${row.errorCode}=${row.count}`).join(", ")}`);
+  }
+  console.log(`Runs today (UTC day from ${stats.dailyCapWindow.start}):`);
+  for (const agent of stats.agents) {
+    console.log(formatInlineRecord({
+      agent: agent.name,
+      agentId: agent.agentId,
+      runs: agent.runs,
+      unsuccessful: agent.unsuccessful,
+      today: agent.maxDailyRuns === null ? `${agent.runsToday} (no cap)` : `${agent.runsToday}/${agent.maxDailyRuns}`,
+      capReached: agent.capReached,
+    }));
+  }
 }
 
 function printRuns(rows: HeartbeatRun[], json: boolean): void {
