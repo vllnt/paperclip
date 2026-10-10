@@ -2103,8 +2103,10 @@ registry.registerPath({
   path: "/api/companies/{companyId}",
   tags: ["companies"],
   summary: "Delete a company",
+  description:
+    "Deletes the company and every row it owns, in one transaction. Before it checks anything it locks the company row and the rows of the company that other rows could point at, so a concurrent write cannot add a reference after the check. A write that waits for these locks fails with a foreign-key error when the delete commits. Returns 409 and deletes nothing when a row of another company would be deleted or changed (`details.code` is `company_delete_cross_company_references`, with `details.references` as a list of `{ table, count }`), when a row still blocks the delete (`details.table` and `details.blockingRows`), or when a lock could not be had within 5 seconds or the database ended the delete to break a deadlock (`details.code` is `company_delete_busy`; trying again can work). The response names no ids, companies or content. A successful delete writes one `company_deleted` server log entry with the actor and the row count per table.",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
