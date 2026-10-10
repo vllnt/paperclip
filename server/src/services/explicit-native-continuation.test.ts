@@ -1585,8 +1585,13 @@ const support = await getEmbeddedPostgresTestSupport();
         expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
       } else expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
     });
-  it.each(["live_process", "missing_process", "lease", "coordinator", "successor", "agent_message", "old_comment", "wrong_author", "run_authored", "reassigned", "automatic", "approval", "question", "malformed_comment", "legacy_owner"])("keeps the hold for %s", async kind => {
+  it.each(["live_process", "missing_process", "lease", "coordinator", "successor", "agent_message", "old_comment", "wrong_author", "run_authored", "reassigned", "automatic", "approval", "question", "malformed_comment", "legacy_owner", "malformed_run_evidence", "uppercase_run_evidence"])("keeps the hold for %s", async kind => {
     const f = await seed();
+    // Only the text Postgres gives a uuid names a run; other evidence text names none.
+    if (kind === "malformed_run_evidence" || kind === "uppercase_run_evidence") await db.update(issueRecoveryActions).set({
+      evidence: { runId: kind === "malformed_run_evidence" ? "not-a-uuid" : f.sourceRunId.toUpperCase(),
+        automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     if (kind === "legacy_owner") await db.insert(heartbeatRuns).values({ companyId: f.companyId,
       agentId: f.agentId, status: "failed", runtimeMode: "legacy", processPid: process.pid,
       contextSnapshot: { issueId: f.issueId }, resultJson: { conversationContinuation: "continue_conversation_v1" } });

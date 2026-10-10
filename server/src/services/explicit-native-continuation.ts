@@ -18,6 +18,7 @@ import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
 
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
+import { isCanonicalUuidText } from "./uuid-text.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -157,10 +158,10 @@ export async function admitExplicitNativeContinuation(input: {
   for (const action of actions) {
     const runId = action.evidence.runId ?? action.evidence.sourceRunId;
     if (typeof runId !== "string") return blocked("source_missing", "The stopped run could not be identified. Your message is saved.");
-    // Text comparison keeps malformed historical evidence a hold, not a UUID cast error.
-    let [run] = await db.select().from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id}::text = ${runId}`,
-    ));
+    // Malformed historical evidence matches no run and stays a hold, not a UUID cast error.
+    let [run] = isCanonicalUuidText(runId) ? await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
+    )) : [];
     if (!run || run.agentId !== agentId || !terminal.includes(run.status) ||
         (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
         !run.finishedAt) return blocked("source_unavailable", "The previous execution has not finished or its owner changed. Your message is saved.");

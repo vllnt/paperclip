@@ -1,6 +1,7 @@
-import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { readProcessStartedAt } from "./hot-restart.js";
+import { isCanonicalUuidText, uuidColumnEqualsText } from "./uuid-text.js";
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
 // replay the action itself, so those adapters retain their recovery contract.
@@ -58,6 +59,15 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
   return adapterType !== null && isConversationAdapter(adapterType);
 }
 
+/** `coalesce(native_issue_id::text, context_snapshot->>'issueId') = issueId`,
+ * written so the (company, native issue) and (company, context issue) indexes
+ * serve it instead of a scan over every run of the company.
+ */
+function runOfIssuePredicate(issueId: string) {
+  const byContext = and(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`)!;
+  return isCanonicalUuidText(issueId) ? or(eq(heartbeatRuns.nativeIssueId, issueId), byContext)! : byContext;
+}
+
 /** Only immutable run evidence can retire a historical conversation hold.
  * An agent's current adapter can differ from the one that executed this run.
  * Missing evidence retains the hold; the current agent is never a fallback.
@@ -68,7 +78,7 @@ export function conversationRecoveryActionPredicate() {
     sql`exists (
       select 1 from ${heartbeatRuns}
       where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
-        and ${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'
+        and ${uuidColumnEqualsText(heartbeatRuns.id, sql`${issueRecoveryActions.evidence}->>'runId'`)}
         and coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRecoveryActions.sourceIssueId}::text
         and ${heartbeatRuns.runtimeMode} = 'legacy'
         and coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
@@ -108,7 +118,7 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
     .where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
       conversationRunPredicate(),
-      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
+      runOfIssuePredicate(issueId),
       inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
       or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
     )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
