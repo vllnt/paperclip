@@ -1,3 +1,5 @@
+import { matchesMedia } from "./safe-match-media";
+
 export const CHROMELESS_DISPLAY_MODES = ["standalone", "fullscreen", "window-controls-overlay"] as const;
 
 type DisplayMode = (typeof CHROMELESS_DISPLAY_MODES)[number];
@@ -7,20 +9,17 @@ function displayModeQuery(mode: DisplayMode) {
   return `(display-mode: ${mode})`;
 }
 
-function defaultMatchMedia(): MatchDisplayMode | undefined {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return undefined;
-  return window.matchMedia.bind(window);
-}
+/** Reads the browser's display mode; a browser that cannot answer is a normal launch. */
+const matchBrowserDisplayMode: MatchDisplayMode = (query) => ({ matches: matchesMedia(query, false) });
 
 export function isChromelessDisplayMode(
-  matchMedia: MatchDisplayMode | undefined = defaultMatchMedia(),
+  matchDisplayMode: MatchDisplayMode = matchBrowserDisplayMode,
   iosStandalone: boolean | undefined =
     typeof navigator === "undefined"
       ? undefined
       : (navigator as Navigator & { standalone?: boolean }).standalone,
 ) {
   if (iosStandalone === true) return true;
-  if (!matchMedia) return false;
 
-  return CHROMELESS_DISPLAY_MODES.some((mode) => matchMedia(displayModeQuery(mode)).matches);
+  return CHROMELESS_DISPLAY_MODES.some((mode) => matchDisplayMode(displayModeQuery(mode)).matches);
 }

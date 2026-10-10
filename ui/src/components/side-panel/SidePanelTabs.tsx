@@ -27,6 +27,7 @@ import { CSS as DndCSS } from "@dnd-kit/utilities";
 import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { matchesMedia } from "@/lib/safe-match-media";
 import { SidePanelTab } from "./SidePanelTab";
 import type { SidePanelTabItem } from "./types";
 
@@ -157,8 +158,7 @@ export function SidePanelTabs({
   useEffect(() => {
     if (!activeTabId) return;
     const element = findTabElement(activeTabId, "wrapper");
-    const reducedMotion = typeof window.matchMedia === "function"
-      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const reducedMotion = matchesMedia("(prefers-reduced-motion: reduce)", false);
     element?.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "nearest", inline: "nearest" });
     // `findTabElement` only reads the committed tab DOM for this active id.
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { GithubIcon } from "@/components/icons/github-icon";
+import { matchesMedia } from "./safe-match-media";
 import type {
   ExternalObjectLivenessState,
   ExternalObjectStatusCategory,
@@ -261,6 +262,5 @@ export function externalObjectDominantCount(
  * to react to runtime changes; non-hook callers can use the helper directly.
  */
 export function prefersReducedMotion(): boolean {
-  if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  return matchesMedia("(prefers-reduced-motion: reduce)", false);
 }

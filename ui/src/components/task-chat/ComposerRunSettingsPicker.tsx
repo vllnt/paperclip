@@ -5,6 +5,7 @@ import type { Agent, IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
 import { queryKeys } from "@/lib/queryKeys";
 import { cn } from "@/lib/utils";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import type { InlineEntityOption } from "@/components/InlineEntitySelector";
 import { Dialog, DialogClose, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -86,14 +87,7 @@ export function ComposerRunSettingsPicker({
   const [modelSearch, setModelSearch] = useState(initialModelSearch);
   const [assigneeSearch, setAssigneeSearch] = useState(initialAssigneeSearch);
   const [highlightedAssignee, setHighlightedAssignee] = useState(0);
-  const [narrow, setNarrow] = useState(() => typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(max-width: 639px)").matches);
-  useEffect(() => {
-    if (typeof window.matchMedia !== "function") return;
-    const query = window.matchMedia("(max-width: 639px)");
-    const update = () => setNarrow(query.matches);
-    query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
-  }, []);
+  const narrow = useMediaQuery("(max-width: 639px)", false);
   const mobile = mobileProp ?? narrow;
   const agentId = assigneeValue.startsWith("agent:") ? assigneeValue.slice(6) : "";
   const agent = agents.get(agentId);

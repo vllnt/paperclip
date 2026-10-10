@@ -14,6 +14,7 @@ import {
 } from "@/lib/document-annotation-debug";
 import { DocumentAnnotationLayer, type AnnotationAnchorRect, type PendingAnchor } from "./DocumentAnnotationLayer";
 import { DocumentAnnotationPanel } from "./DocumentAnnotationPanel";
+import { matchesMedia, subscribeToMedia } from "@/lib/safe-match-media";
 import { DocumentAnnotationPopover } from "./DocumentAnnotationPopover";
 import type { CompanyUserProfile } from "@/lib/company-members";
 
@@ -91,15 +92,9 @@ export function IssueDocumentAnnotations({
   const consumedInitialAnchorRef = useRef<PendingAnchor | null>(null);
 
   useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mediaQuery = window.matchMedia("(max-width: 1023px)");
-    const handler = () => setIsMobile(mediaQuery.matches);
-    handler();
-    if (typeof mediaQuery.addEventListener === "function") {
-      mediaQuery.addEventListener("change", handler);
-      return () => mediaQuery.removeEventListener("change", handler);
-    }
-    return undefined;
+    const query = "(max-width: 1023px)";
+    setIsMobile(matchesMedia(query, false));
+    return subscribeToMedia(query, setIsMobile);
   }, []);
 
   const annotationsQuery = useQuery({

@@ -30,6 +30,11 @@ interface Painted {
 
 /** Runs the real inline script from `index.html` against a minimal browser stand-in. */
 function boot(storage: Storage, os: Os): Painted {
+  return run(storage, os).painted;
+}
+
+/** As {@link boot}, and also returns the stand-in window's `matchMedia` as the script left it. */
+function run(storage: Storage, os: Os): { painted: Painted; matchMedia: unknown } {
   const classes = new Set<string>();
   const meta = { content: "" };
   const root = {
@@ -72,7 +77,10 @@ function boot(storage: Storage, os: Os): Painted {
   };
 
   new Function("window", "document", bootScript)(fakeWindow, fakeDocument);
-  return { dark: classes.has("dark"), colorScheme: root.style.colorScheme, themeColor: meta.content };
+  return {
+    painted: { dark: classes.has("dark"), colorScheme: root.style.colorScheme, themeColor: meta.content },
+    matchMedia: Reflect.get(fakeWindow, "matchMedia"),
+  };
 }
 
 /**
@@ -102,4 +110,18 @@ describe("theme boot script in index.html", () => {
       });
     }
   }
+
+  describe("matchMedia", () => {
+    it("is left in place when it works", () => {
+      expect(typeof run("unset", "dark").matchMedia).toBe("function");
+    });
+
+    it("is removed when it throws, so libraries that feature-detect it skip it instead of failing to load", () => {
+      expect(run("unset", "matchMedia-throws").matchMedia).toBeUndefined();
+    });
+
+    it("is not invented when the browser has none", () => {
+      expect(run("unset", "no-matchMedia").matchMedia).toBeUndefined();
+    });
+  });
 });
