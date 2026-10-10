@@ -316,12 +316,13 @@ async function brokerPost(env, route, body) {
   // A busy server (409: the run bridge says so when its own 10 s timeout
   // fires) and a request that timed out (this launcher's own 10 s limit) are
   // retried with a growing, jittered pause: 1, 2, 4 and 8 s at most, five
-  // tries in all. The first request may still be running on the server, so
-  // asking every second would only add work to a server that is already
-  // busy. Other transport failures keep a small budget of their own, and the
-  // body is read inside the retry so a failed read is retried too. A failure
-  // on a route that is not the last moves on to the next route at once; only
-  // the last route spends a budget. When the tries run out, the error says why.
+  // tries in all, on the same route: the first request may still be running
+  // on the server, so asking every second would only add work to a server
+  // that is already busy. Other transport failures keep a small budget of
+  // their own, and the body is read inside the retry so a failed read is
+  // retried too. A failure that is not a timeout on a route that is not the
+  // last (it cannot be reached) moves on to the next route at once; only the
+  // last route spends that budget. When the tries run out, the error says why.
   const BACKOFF_MS = [1000, 2000, 4000, 8000], TRIES = BACKOFF_MS.length + 1;
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   const startedAt = Date.now();
@@ -354,16 +355,13 @@ async function brokerPost(env, route, body) {
       return { response, result };
     } catch (error) {
       if (error && error.diagnostic) throw error;
-      const timedOut = error && (error.name === 'TimeoutError' || error.name === 'AbortError');
-      if (index < urls.length - 1) {
-        if (timedOut) slowTry('the Paperclip server did not answer within 10 s', false);
-        index += 1;
-        continue;
-      }
-      if (timedOut) {
+      // A route that is slow or busy is still the route that works (a sandbox's own bridge, whose answer the broker URL
+      // may not even reach), so it is asked again. Only a route that cannot be reached at all gives way to the next one.
+      if (error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
         await slowTry('the Paperclip server did not answer within 10 s', true);
         continue;
       }
+      if (index < urls.length - 1) { index += 1; continue; }
       transportFailures += 1;
       if (transportFailures >= 3) throw error;
       await pause(500 * transportFailures);
