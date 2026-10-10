@@ -570,8 +570,8 @@ function EnvironmentCustomImageBrowserTerminal({
       scrollback: CUSTOM_IMAGE_TERMINAL_SCROLLBACK_ROWS,
       theme: {
         // token-extraction: allowlisted — xterm.js terminal theme config; functional third-party option object, not a rendered CSS value.
-        background: "#0a0a0a",
-        foreground: "#f5f5f5",
+        background: "#000000",
+        foreground: "#ffffff",
         cursor: "#22d3ee",
         cursorAccent: "#020617",
         selectionBackground: "#2563eb55",
@@ -757,7 +757,7 @@ function EnvironmentCustomImageBrowserTerminal({
           )}
         </div>
       </div>
-      <div className="bg-neutral-950 p-2 focus-within:ring-2 focus-within:ring-ring">
+      <div className="bg-black p-2 focus-within:ring-2 focus-within:ring-ring">
         <div
           ref={terminalElementRef}
           data-testid={`custom-image-terminal-screen-${sessionId}`}
@@ -766,7 +766,7 @@ function EnvironmentCustomImageBrowserTerminal({
           tabIndex={0}
           onFocus={() => xtermRef.current?.focus()}
           onClick={() => xtermRef.current?.focus()}
-          className="h-(--sz-18rem) w-full overflow-hidden bg-neutral-950 outline-none sm:h-(--sz-22rem) [&_.xterm-cursor-bar]:!border-l-2 [&_.xterm-cursor-bar]:!border-l-cyan-300 [&_.xterm-cursor-layer_.xterm-cursor]:!bg-cyan-300 [&_.xterm-helper-textarea]:!opacity-0 [&_.xterm-screen]:focus:outline-none [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
+          className="h-(--sz-18rem) w-full overflow-hidden bg-black outline-none sm:h-(--sz-22rem) [&_.xterm-cursor-bar]:!border-l-2 [&_.xterm-cursor-bar]:!border-l-cyan-300 [&_.xterm-cursor-layer_.xterm-cursor]:!bg-cyan-300 [&_.xterm-helper-textarea]:!opacity-0 [&_.xterm-screen]:focus:outline-none [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
         />
       </div>
       {errorMessage ? (

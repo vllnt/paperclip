@@ -57,6 +57,7 @@ import {
   Zap,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ThemeModeSwitch } from "@/components/ThemeModeSwitch";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { Badge } from "@/components/ui/badge";
 import { InlineBanner } from "@/components/InlineBanner";
@@ -613,6 +614,11 @@ export function DesignGuide() {
             <ThemeToggle />
             <ThemeToggle variant="menu-action" />
             <ThemeToggle variant="compact-menu-action" />
+          </div>
+        </SubSection>
+        <SubSection title="Mode switch (System, Light, Dark)">
+          <div className="w-(--profile-popover-width) rounded-lg border border-border">
+            <ThemeModeSwitch />
           </div>
         </SubSection>
       </Section>
@@ -1648,7 +1654,7 @@ export function DesignGuide() {
       {/*  LOG VIEWER                                                   */}
       {/* ============================================================ */}
       <Section title="Log Viewer">
-        <div className="bg-neutral-950 rounded-lg p-3 font-mono text-xs max-h-80 overflow-y-auto">
+        <div className="bg-muted rounded-lg p-3 font-mono text-xs max-h-80 overflow-y-auto">
           <div className="text-foreground">[12:00:01] INFO  Agent started successfully</div>
           <div className="text-foreground">[12:00:02] INFO  Processing task PAP-001</div>
           <div className="text-yellow-400">[12:00:05] WARN  Rate limit approaching (80%)</div>
