@@ -58,6 +58,7 @@ The plan adds a new evaluator only where nothing can be reused. This table is th
 | Piece | Today | In this plan |
 |---|---|---|
 | **Stranded-issue reconciler** (#104) | A hard-coded form of rule (a). It re-dispatches an assigned issue that has no live run, to its **owner**, within one sweep. It respects the pause hold, the wake policy, free slots, open recovery actions, a queued wake and the budget | **Stays as it is.** It acts on the owner. Rule (a) acts on a **third party**, and only after the owner had its chance. The two share the same gates (sections 6.1 and 7.1) |
+| **Task watchdog** (`issue_watchdogs`, `task-watchdogs.ts`, the origin kind `task_watchdog`) | The closest precedent. A person or agent watches **one issue's subtree**. When the subtree has stopped (a stable stop fingerprint), the server opens **one deduplicated watchdog issue** assigned to a watchdog agent. It dedups by "observed" and "reviewed" fingerprints, and `issues_active_task_watchdog_uq` is a partial unique index on `issues` | **Stays as it is.** It is per issue and set by hand. The flow watchdog is company-wide rules over many subjects, events and capacity. They copy the same pattern: server-side classifier, one open issue per key, a unique partial index, an assigned agent that wakes. An issue that an **active task watchdog** already watches is an exemption for rule (a), so the two do not report the same stop twice |
 | **Routine stale-tick expiry** (#105) | Expires a routine tick that blocks later ticks. Defines a *progress clock* and a list of *exemptions* | **Shares its evaluator.** The progress clock and the exemptions become one module that #105 and rule (a) both call (section 6.1). Rule (a) reports. #105 cancels. They do not fight: #105's setting is per routine and rule (a) never cancels |
 | **Holds with lift conditions** (#102) | Evaluates conditions on a hold with a checker worker. The checker is built for hold scopes, not for general predicates | **Shares conventions, not the evaluator.** Both use a single-flight worker, the database clock, closed error codes and a generation key in the dedup key. A hold is also an **exemption** for every rule (section 6.2). The checker is not reused because a hold condition is a state machine on one target, and a rule is a query over many subjects |
 | **Flow metrics** (#106) | A read-only report: throughput, scrap by error code, runs per done issue, cost. Defines the scrap classes, the failed-run rate and limits (XmR) | **Source of truth for rule (d).** The failed-run rate is #106's *scrap rate* (section 6.6). The shared function lives in one place. XmR breach is a later threshold type |
@@ -86,8 +87,16 @@ active run**, and has **made no progress for `N` minutes**.
 - *No progress* is the **progress clock** of #105 (section 6.1), not `issues.updated_at`.
   System writes touch `updated_at`, so the clock would never run out.
 - The **exemptions** of #105 and #104 apply: an armed wait, an open recovery action, a
-  held scope, a tree hold, a pending decision, an exhausted budget.
-- `N` is at least 30 minutes, so that #104's re-dispatch always goes first.
+  held scope, a tree hold, a pending decision, an exhausted budget. Rule (a) adds one:
+  an issue that an **active task watchdog** already watches.
+- **The minimum `N` is computed, not fixed.** #104's re-dispatch must always go first.
+  Its recent-progress exemption (`STRANDED_RECENT_PROGRESS_EXEMPTION_MS`) is 30 minutes
+  by default, it is set by an environment variable, and it is floored at 60 seconds.
+  So the effective minimum is **twice that value, plus two scheduler ticks** (about 61
+  minutes by default). The API returns the effective minimum, and a rule with a smaller
+  `N` is rejected at save. The check is made again at each evaluation, in case the
+  environment value changed.
+- Like #104's pass, the watchdog pass **does not run while scheduling is suppressed**.
 
 **Subject key.** The issue id. Each stuck issue gets its own firing.
 
@@ -99,8 +108,9 @@ active run**, and has **made no progress for `N` minutes**.
 
 | Source | Slice | Answered by |
 |---|---|---|
-| `issue_done`: any issue reaching `done`, under a project or title filter | S2 | `issues.completed_at` (section 4) |
-| `work_product`: a work product of a given type reaching a status, for example a pull request reaching `merged` | S2 | `issue_work_products` (section 4) |
+| `issue_done`: any issue reaching `done`, under a project or title filter | S2 | `issues.completed_at` (section 4.1) |
+| `external_object`: a GitHub pull request reaching `merged`, for a company that connects GitHub through the core connection | S2 | `external_objects` (`data.mergedAt`, `last_changed_at`; section 4.2) |
+| `work_product`: a work product of a given type reaching a status, for a company that uses the plugin sync | S2 | `issue_work_products` (section 4.2) |
 | `plugin_event`: any event a plugin emits | S3, only if S2 is not enough | A new durable event record (section 4.3) |
 
 A rule that has never seen an event uses the rule's creation time as the baseline, so a
@@ -138,6 +148,65 @@ Two sub-kinds, both over a rolling window (default 60 minutes):
 
 **Subject key.** The empty string.
 
+### 3.5 Adding a rule kind: a registry entry, no new table
+
+The four kinds are the first entries of a **registry**. A later kind is added without a
+new table and without a migration. To add one:
+
+1. **Shared schema** (`packages/shared`): a kind constant, a `params` schema (Zod) and
+   an evidence shape. The rule's `params` is a discriminated union keyed by the kind.
+   Nothing changes in the database: `kind` is text, `params` and `last_evidence` are
+   jsonb, and `subject_key` is text.
+2. **One server evaluator** that implements this interface:
+
+   ```
+   RuleKindEvaluator<Params> {
+     kind, paramsSchema,
+     evaluate(ctx: { db, companyId, now, rowBudget, statementTimeout }, params)
+       -> { subjects: [{ key, evidence }], rowsRead, truncated }
+     explain?(...)            // extra detail for the dry run
+   }
+   ```
+
+   The framework (the claim, the bounds, the firing reconcile, the cooldown, the cap,
+   the actions, the activity entries and the dry run) is shared. It knows nothing about
+   any kind.
+3. **The surfaces read the registry.** The OpenAPI schema, the CLI JSON validation and
+   the fields of the web editor come from the kind's schema. There is no route per kind.
+4. **Tests:** a table test for the evaluator, and a conformance test that every
+   registered kind validates a sample, returns bounded evidence and writes nothing in a
+   dry run.
+
+A kind needs its own plan section only if it **reads new data** (a new source table, as
+in S3) or **needs a new permission or a hold action**. Otherwise it is a normal pull
+request. A new data source may add a source table. It never adds a rules or firings
+table.
+
+**Unknown kinds are skipped, not fatal.** A server that reads a rule whose kind it does
+not know (after a rollback, for example) skips it, sets `last_status = unsupported` and
+`last_error = unknown_kind`, shows it as "unsupported" in the API, and leaves its firings
+alone. A closed set that is enforced in the shared code, with a reader that tolerates a
+value it has not seen, keeps a rollback safe.
+
+**Lane-health checks as rule kinds.** A separate planning effort proposes
+"lane health" checks. They are rule kinds that depend on this plan. They are not a
+separate checker. A *lane* is any filter the issue filter can express: project, label,
+priority, assignee or role, title pattern. The filter set for rule (a) therefore includes
+labels (the `issue_labels` table exists) and "no assignee".
+
+| Lane check | As a rule | Reads | New kind? |
+|---|---|---|---|
+| Missing owner | Rule (a) with the filter "no assignee" | `issues` | No: a filter on (a) |
+| Stalled case | Rule (a) | `issues` | No |
+| Paused agent | `blocked_owner`: an agent that is paused or not invokable still has open assigned issues after `N` minutes | `agents.paused_at`, `issues` | Yes |
+| Missing approver | `approval_gap`: an issue waits for a review or approval stage that no eligible participant can act on | The issue's execution state (review participants), approvals | Yes |
+| Failed automation | `automation_failing`: a routine's last `K` runs failed | `routine_runs` (`status = 'failed'`) | Yes, or rule (d) scoped to one routine |
+| WIP exceeded | `limit_exceeded` with the measure `wip`: open issues in a lane per assignee or role above a limit | `issues` (the company, assignee, status index) | Yes |
+| Budget exceeded | `limit_exceeded` with the measure `budget` | The budget policy and incident tables. The kind **reads** an incident that the budget service already opens, and does not recompute the budget | Yes |
+
+None of these is in S1 to S3. Each is added after S1 as a registry entry. The data sources
+are named here as a guide and are confirmed when each kind is specified.
+
 ## 4. Event source for rule (b)
 
 **Finding.** No durable, kind-queryable record of plugin events exists today.
@@ -165,14 +234,24 @@ plan reads it.
 One caveat: reopening an issue clears `completed_at`. A done-then-reopened issue inside
 the window is not seen. That is acceptable for "no issue done for `N` minutes".
 
-### 4.2 Work products cover the pull-request case
+### 4.2 Pull requests are already stored, in two places
 
-For a pull request, the durable fact is `issue_work_products` with `type =
-'pull_request'` and `status = 'merged'`. It is company-scoped and it has an index
-`(company_id, updated_at)`. The merge time is *not* stored: `updated_at` changes on any
-update, so a later edit of a merged row looks like a new event. This is a false negative
-(a late "recent event"), not a false alarm, so it errs on the safe side. A true merge
-time needs the GitHub plugin to record it (Q3).
+Which one a company has depends on how it connects GitHub.
+
+- **The core GitHub connection** writes each pull-request event into `external_objects`:
+  `data.merged`, `data.mergedAt` (the **true merge time** from GitHub), `is_terminal`,
+  and `last_changed_at` (the time the server applied the event). The table is
+  company-scoped and indexed on `(company_id, provider_key, status_category)`. There is
+  no time index, so the query reads at most the row budget (section 6.4) of one
+  provider and type. The rule uses `data.mergedAt` when it is there, and
+  `last_changed_at` otherwise.
+- **The plugin sync** stores `issue_work_products` with `type = 'pull_request'` and
+  `status = 'merged'`. It is company-scoped and indexed on `(company_id, updated_at)`.
+  The merge time is **not** stored, and `updated_at` changes on any edit. A later edit of
+  a merged row looks like a new event. That is a false negative (a late "recent event"),
+  not a false alarm.
+
+So a "no pull request merged for `N` minutes" rule needs no new storage in either case.
 
 ### 4.3 The smallest durable record for plugin events (S3, only if needed)
 
@@ -195,7 +274,7 @@ schema, not by database checks, so a later addition needs no migration.
 |---|---|
 | `id`, `company_id` | |
 | `name` | Unique per company among active rules |
-| `kind` | `stuck_issue`, `missing_event`, `starvation`, `hard_stop` |
+| `kind` | Text. The kinds are a registry in the shared code (section 3.5), not a database check |
 | `enabled` | |
 | `params` | jsonb, validated by a discriminated union per kind |
 | `action` | jsonb: `{ type: "issue", ... }` or `{ type: "routine", ... }` (section 7) |
@@ -236,7 +315,15 @@ One row per company: `company_id` (primary key), `enabled` (a kill switch), `max
 (default 6, range 1 to 120), `window_started_at`, `window_actions` (the counter for the
 cap, section 7.4), `updated_at`.
 
-No change to a hot table. The `issues` table is not altered (Q12).
+**Why a table and not a column on `companies`.** The cap needs an atomic counter, and a
+counter on the `companies` row would make every watchdog action write that hot row. The
+comment actions are not rows, so the cap cannot be counted from `flow_watchdog_firings`.
+
+**Contract changes outside the new tables:** the shared list of issue origin kinds gains
+`flow_watchdog`; the activity actions above are added; the shared schema gains the rule,
+firing and settings types.
+
+Whether the `issues` table gets a partial unique index for the origin kind is Q12.
 
 ## 6. Evaluation
 
@@ -270,13 +357,23 @@ seconds at minimum). It claims due rules with a row-level claim, the pattern tha
 issue monitors already use:
 
 ```
-UPDATE flow_watchdog_rules SET claimed_at = now(), next_eval_at = now() + interval
+UPDATE flow_watchdog_rules SET claimed_at = now()
  WHERE id IN (SELECT id FROM flow_watchdog_rules
                WHERE enabled AND archived_at IS NULL AND next_eval_at <= now()
                  AND (claimed_at IS NULL OR claimed_at < now() - interval '5 minutes')
                ORDER BY next_eval_at LIMIT :rulesPerPass FOR UPDATE SKIP LOCKED)
 RETURNING *;
 ```
+
+After the evaluation, in the same write that records the result, the process **releases
+the claim and schedules the next one**: `claimed_at = NULL`, `next_eval_at = now() +
+eval_interval_seconds`. Without the release, a rule would run only once per 5 minutes.
+
+The batch form with `FOR UPDATE SKIP LOCKED` has precedent in
+`chat-run-publications.ts` and `execution-recovery-resolution.ts`. The issue monitors use
+a single-row conditional update with a 5-minute stale threshold and clear their claim
+when they finish. The watchdog takes that stale-claim idea and the release, and batches
+the claim.
 
 - Two processes cannot claim the same rule. A crashed process leaves a claim that
   expires after 5 minutes.
@@ -310,7 +407,7 @@ catastrophically, and the timeout bounds the rest.
 | (a) | `issues_company_status_idx` (company, status), then the project index when a project is set, then the oldest-first limit. The title pattern is applied last, on the bounded rows. The progress clock is computed for the limited set only |
 | (b) `issue_done` | `issues_company_status_idx`, then `completed_at` |
 | (b) `work_product` | `(company_id, updated_at)` on `issue_work_products` |
-| (c) | Agents by role (a company-sized set); `queued` runs through `heartbeat_runs_company_status_last_output_idx` |
+| (c) | Agents by role (a company-sized set). `maxConcurrentRuns` is not a column: it is `agents.runtime_config.heartbeat.maxConcurrentRuns`, read with `parseHeartbeatPolicy`. `queued` runs through `heartbeat_runs_company_status_last_output_idx` (company, status, last output), which does **not** cover the age of a queued run, so the age is filtered on the bounded rows |
 | (d) | A windowed count over `heartbeat_runs` by `finished_at`. #106 decides whether it adds an index. This plan reads the same measure function |
 
 S1 includes an `EXPLAIN` check per rule on a seeded dataset. If any path misses a one
@@ -318,9 +415,10 @@ second budget, the S1 migration adds a partial index for it (Q11).
 
 ### 6.6 Rule (d) and #106
 
-The failed-run rate is #106's **scrap rate**: runs that ended `failed`, `timed_out` or
-`interrupted`, over all runs finished in the window, counted by `finished_at`, with
-cancelled runs excluded and at least 5 runs. The function is one shared function. If
+The failed-run rate is #106's **scrap rate**: the runs that ended `failed`, `timed_out` or
+`interrupted`, divided by **every terminal run** finished in the window (#106's `runs`),
+counted by `finished_at`, with at least 5 runs. Cancelled runs are in the denominator and
+not in the numerator. The function is one shared function. If
 #106 has not landed, S1 carries a private copy of the same definition and a test that
 pins it to #106's examples. Restart losses are excluded by their error codes until
 #106's drain window exists. #106's prerequisite F0 (the usage record misses
@@ -346,19 +444,36 @@ available on all three surfaces.
 subject, evidence fields). They are validated at save. An unknown path is rejected. There
 is no code in a template.
 
-**Create.** In one transaction: insert the firing; create the issue through the issue
-service (as routines do), with `origin_kind = 'flow_watchdog'` and `origin_id =
-<rule id>:<subject key>`; set `firing.issue_id`. The body is the intro plus an evidence
-block.
+**The assignee.** It is checked at save with the same assignability check that issue
+creation uses (it rejects a terminated or pending agent, and it does not reject a paused
+one). It is checked again at fire time. If the agent has become unavailable, the action
+is **not** taken: the firing records `suppressed: assignee_unavailable` and the rule's
+`last_status` becomes `error`, so a person sees it on the rules page.
+
+**Create.** In one database transaction: insert the firing; create the issue with the
+issue service, **passing the transaction** (`issueSvc.create(companyId, data, tx)`; the
+routine dispatch does not, and cleans up by hand, so "as routines do" is not enough);
+set `firing.issue_id`. A failure rolls back both. The issue has these properties:
+
+- status **`todo`**. The assignment wake skips a `backlog` issue, and #104 re-dispatches
+  only `todo`, `in_progress` and `in_review`. A `backlog` issue would get neither;
+- `origin_kind = 'flow_watchdog'` (added to the shared list of issue origin kinds) and
+  `origin_id = <rule id>:<subject key>`;
+- the body: the intro plus an evidence block.
 
 **Wake.** After the commit, `queueIssueAssignmentWakeup` with the context source
-`flow_watchdog`. All the usual gates apply: the on-demand wake policy, the daily cap, the
-agent's pause and invokability, the budget. The result is stored in `last_wake`.
+`flow_watchdog`, **`requestedByActorType: "system"`** (the skip receipt for an agent that
+cannot be invoked is written only for a non-user actor) and **`rethrowOnError: true`**
+(otherwise the helper swallows the refusal and returns nothing). All the usual gates
+apply: the on-demand wake policy, the daily cap, the agent's pause and invokability, and
+the budget. `last_wake` is `queued`, or `skipped:<reason>` taken from the refusal. A
+silent non-queue (a policy skip that returns nothing) is recorded as `not_queued`. The
+dry run runs the same gate functions first, so it can say what the wake would do.
 
 **A paused or held assignee.** The issue is still created and assigned, so a person can
-see it. The wake is skipped, and `last_wake` and a comment say why. #104's re-dispatch
-picks up an assigned, open issue with no run once the agent is invokable again, so the
-watchdog needs no retry code of its own. A held **company** is not evaluated at all.
+see it. The wake is skipped and the reason is recorded. #104's re-dispatch picks up an
+assigned, open issue with no run once the agent is invokable again, so the watchdog needs
+no retry code of its own. A held **company** is not evaluated at all.
 
 ### 7.2 Routine action
 
@@ -366,12 +481,27 @@ watchdog needs no retry code of its own. A held **company** is not evaluated at 
 names to templates over the same closed context. The names are checked against the
 routine's variable list at save.
 
-**Fire.** `routines.runRoutine(routineId, { source: "api", variables, payload, idempotencyKey })`
-with the actor `flow-watchdog`. The payload carries `{ ruleId, firingId, fireCount,
-evidence }`. The idempotency key is `flow-watchdog:<firing id>:<fire count>`, so a retry
-of the same firing cannot run the routine twice. The routine's own concurrency policy,
-pause state and holds apply. The result (the routine run id and its status) goes to the
-firing.
+**Fire.** `routines.runRoutine(routineId, { source: "api", variables, payload, idempotencyKey })`.
+The payload carries `{ ruleId, firingId, fireCount, evidence }`. The idempotency key is
+`flow-watchdog:<firing id>:<fire count>`, so a retry of the same firing cannot run the
+routine twice.
+
+**What `runRoutine` does not do, and the watchdog must.**
+
+- **It does not stop a paused routine.** `runRoutine` rejects only an archived routine.
+  The "routine is active" check applies to the webhook and schedule sources, and the
+  project-pause check is in the scheduler tick. So the watchdog checks the routine's
+  `status`, and its project's pause, **before** the call. A paused routine is skipped,
+  and the firing records `suppressed: routine_paused`. A routine hold (#102) is the same
+  state.
+- **It writes no activity for a service call.** The `routine.run_triggered` entry for an
+  API run comes from the route. The watchdog's own `flow_watchdog.fired` entry is the
+  record, and it carries the routine run id.
+- **An actor name has no effect** on a service call with source `api`. The system actor
+  `flow-watchdog` is used only for the watchdog's own activity entries.
+
+The routine's own concurrency policy applies (it may skip or coalesce the run). The
+result (the routine run id and its status) goes to the firing.
 
 ### 7.3 Dedup and lifecycle
 
@@ -379,7 +509,11 @@ firing.
   issue** (or one routine run per fire).
 - **Firing again** while the firing is open: update `last_evidence` and `fire_count`. Add
   a comment with the new evidence only after `cooldown_until`, and then set the next
-  `cooldown_until`. **Never a second issue.** Whether the comment wakes the agent is Q6.
+  `cooldown_until`. **Never a second issue.** The comment is a **system comment added
+  through the issue service**, which does not wake the assignee (the wake for a comment
+  lives in the comment route, not in the service; the duplicate-detection service already
+  posts this way). A rule can opt in to a wake at each cooldown with `refireWake:
+  each_cooldown`. The default is `never` (Q6).
 - **When the condition clears** (the subject no longer matches in 2 consecutive
   evaluations, to avoid flapping): resolve the firing, with a **comment** on the issue
   ("cleared: ..."). **Recommendation:** the default is `comment`. The issue stays open
@@ -403,8 +537,9 @@ firing.
   the firing is still recorded (the evidence is updated), but the action is **suppressed**.
   One `flow_watchdog.cap_reached` entry is written per window. The entry is visible in
   the activity log and the rules page.
-- The default cap of 6 an hour keeps the worst case (144 wakes a day) near the cost of
-  the polling it replaces. A company can raise it.
+- The worst case at the default cap is 144 actions a day, which is **above** the 96
+  polls it replaces. So the cap is a safety limit and not a target. The real count is
+  the number of clogs (section 10). A company can raise or lower the cap.
 
 ## 8. Surfaces
 
@@ -439,7 +574,8 @@ production surface), so S1 ships both.
 - **Create, edit, enable, archive a rule, and change the settings:** a **board user**
   who may assign tasks (the check that routines use). A rule creates issues and wakes
   agents, so it needs the assign right. No new permission.
-- **Agents cannot create or edit rules.**
+- **Agents cannot create or edit rules.** The assign check returns early for an agent
+  actor and does not reject it, so the routes also call `assertBoard` explicitly.
 - **Read:** the board reads rules and firings. **Recommendation:** an agent may read the
   **open firings** of its company (a list with the evidence and the issue link), and
   **not** the rule parameters, so the unclog agent can see all open clogs in one call.
@@ -469,7 +605,7 @@ The system actor is `flow-watchdog`. The entities are the rule, or the issue.
 | **S1** | Three tables. The evaluator framework (claim, bounds, firing reconcile, cap). Rules (a) and (d). The issue action. The dry run. API, CLI and web for rules, firings and settings. Activity entries | **Yes** (three tables, the partial unique indexes) | Adds a step to the scheduler tick and creates issues through the wake path. It touches `index.ts` and the issue wake. It does not change `recovery/service.ts` or the reconciler. **Single, in a risky slot** |
 | **S2** | Rule (b) with the `issue_done` and `work_product` sources. Rule (c). The routine action. Agent read of open firings | No | Normal. Reads `heartbeat_runs`, `issues`, `issue_work_products` |
 | **S3** | The `plugin_event` source: one event table, written at the bus choke point | **Yes** (one table) | Touches the plugin bus. Single. Only if S2 is not enough |
-| **Later** | A hold action for rule (d) (section 9.4). XmR breach as a threshold type. Moving #104's reconciler onto the shared stall module | | |
+| **Later** | The lane-health kinds (section 3.5). A hold action for rule (d) (section 9.4). XmR breach as a threshold type. Moving #104's reconciler onto the shared stall module | Only if a kind adds a source table | |
 
 ### 9.2 Order with #104 and #105
 
@@ -529,8 +665,8 @@ and **not** built in S1 or S2.
 ## 10. Expected effect
 
 **Assumptions.** One empty poll costs one agent run. The polling agent runs every 15
-minutes (96 a day). A clog that fires the watchdog wakes the agent once, plus at most
-one run for each cooldown comment.
+minutes (96 a day). A clog that fires the watchdog wakes the agent once. A cooldown comment does not wake
+the agent by default (section 7.3).
 
 | Clogs a day | Agent runs a day with the watchdog | Runs saved | Share saved |
 |---|---|---|---|
@@ -538,8 +674,10 @@ one run for each cooldown comment.
 | 6 | 6 | 90 | 94% |
 | 12 | 12 | 84 | 88% |
 
-With the default cap of 6 an hour, the worst case is 144 wakes a day. That is above the
-polling cost, so the cap is a safety limit and not a target. The number that matters is
+With the default cap of 6 an hour, the worst case is 144 actions a day. That is above
+the polling cost (96), so the cap is a safety limit and not a target. A rule that opts in
+to `refireWake: each_cooldown` adds up to 12 wakes a day for one lasting clog at the
+default 120-minute cooldown. The number that matters is
 the real count of clogs. **Appendix B has a query** for it: the share of the past polls
 that produced an action. The estimate must be redone with that number.
 
@@ -561,7 +699,7 @@ that produced an action. The estimate must be redone with that number.
 | Use `activity_log` as the event store for rule (b) | It has no index on the action. A plugin event does not reach it. For issues, `completed_at` is simpler |
 | Fire one routine per rule, with a template issue | Too narrow: rule kinds that need dedup state and evidence would each need code in the routine |
 | Dedup by title or by #40 duplicate detection | A title match can merge issues of two rules. Semantic matching is the wrong tool for a key we control |
-| A unique index on `issues` for the watchdog origin | It changes a hot table. The firing row's unique index gives the same guarantee, inside one transaction (Q12) |
+| Rely on the firing row's index alone, with no index on `issues` | It works, but `issues` already has narrow partial unique indexes for other origin kinds (`task_watchdog`, `harness_liveness_escalation`). The same index here guards any path that creates such an issue outside the firing transaction (Q12) |
 | A global advisory lock for the pass | One process evaluates everything. Per-rule claims scale with the rules and survive a crashed process |
 | Evaluate in the unclog agent | That is the cost this plan removes |
 | Create a new issue on every fire | A persistent clog would flood the board |
@@ -574,21 +712,26 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 |---|---|---|
 | **Q1** | **For the reviewer.** Share the stall evaluator with #105 and not with #102? | Yes. Share the progress clock and the exemptions with #105, and the conventions with #102. Do not reuse #102's checker. Leave #104 alone until later. Whoever lands first creates the module |
 | **Q2** | "No update for `N` minutes": the progress clock or `issues.updated_at`? | The progress clock. System writes touch `updated_at` |
-| **Q3** | **For the reviewer.** Event source for pull-request merges | S2 reads `issue_work_products` (type `pull_request`, status `merged`). Ask the GitHub plugin to record a true merge time. A generic event table is S3, only if needed |
+| **Q3** | **For the reviewer.** Event source for pull-request merges | S2 reads `external_objects` for a company on the core GitHub connection (it has the true merge time in `data.mergedAt`) and `issue_work_products` for a company on the plugin sync (no merge time). A generic event table is S3, only if needed |
 | **Q4** | What happens when the condition clears? | `comment` and resolve the firing. The issue stays open. `auto_close` is opt-in and closes only an untouched issue |
 | **Q5** | Default company cap | 6 actions an hour, adjustable from 1 to 120 |
-| **Q6** | Does a cooldown comment wake the agent? | Yes, at most once per cooldown (default 120 minutes). Confirm in S1 whether a system comment can be added without a wake. If it can, use no-wake comments between cooldowns |
+| **Q6** | Does a cooldown comment wake the agent? | No by default. A system comment added through the issue service does not wake (the wake is in the route). A rule may opt in with `refireWake: each_cooldown` |
 | **Q7** | A paused or held assignee | Create the issue, skip the wake, record the reason. Do not re-route. A held company is not evaluated |
 | **Q8** | Agent read access | Board reads rules and firings. Agents read **open firings only**, from S2. Agents never edit rules |
 | **Q9** | Who edits rules? | Board users with the assign right. No new permission |
 | **Q10** | Active hours for rule (b) | An optional `activeHours` window per rule. Off by default. In S2 |
 | **Q11** | **For the reviewer.** Do the rule queries need new indexes? | Prove it with `EXPLAIN` in S1. Add a partial index in the S1 migration only for a path that misses the one-second budget |
-| **Q12** | Add a unique index to `issues` for the watchdog origin? | No. The firing row's unique partial index and the single transaction are enough. Avoid a hot-table change |
+| **Q12** | **For the reviewer.** A partial unique index on `issues` for the origin kind `flow_watchdog`? | Yes, in the S1 migration, with the shape of `issues_active_task_watchdog_uq` (company, origin kind, origin id, where not done or cancelled). There are two precedents, so it is not a new kind of change. The firing index stays the primary guard |
 | **Q13** | Failed-run rate definition | #106's scrap rate, at least 5 runs, restart losses excluded until the drain window exists |
 | **Q14** | Routine action variables | Validate the variable names against the routine at save |
 | **Q15** | **For the reviewer.** Lane for S1 | A risky slot: it adds a scheduler step, creates issues and wakes agents. It does not touch the reconciler |
 | **Q16** | Evaluation interval | Default 60 seconds, minimum 30 (the scheduler tick) |
 | **Q17** | Rows read per rule and per pass | 500 and 5,000, with a 5 second timeout. Tune from the S1 measurements |
+| **Q18** | **For the reviewer.** How is a new rule kind added? | As a registry entry: a shared params schema, one evaluator, form fields from the schema. No new table (section 3.5) |
+| **Q19** | Lane-health checks from a separate planning effort | They are rule kinds that depend on this plan: two are filters on rule (a), five are new kinds after S1 (section 3.5). The filter set gets `labelIds` and "no assignee" |
+| **Q20** | The existing task watchdog | Keep it. Add "watched by an active task watchdog" as an exemption for rule (a) |
+| **Q21** | A paused or archived routine as a routine-action target | The watchdog checks the routine and its project itself, and skips (section 7.2) |
+| **Q22** | A terminated or pending assignee at fire time | Take no action. Record `suppressed: assignee_unavailable` and put the rule in an error state that the rules page shows |
 
 ## Appendix A. Code anchors on `main` at `d9804ac4f`
 
@@ -599,27 +742,39 @@ Each has a recommendation. The reviewer should check the ones marked **for the r
 | Single-writer worker lock (usage records) | `server/src/services/run-usage-records.ts:33`, `390` |
 | Row-claim pattern (issue monitors) | `server/src/services/heartbeat.ts:12284-12301` |
 | Stranded-issue reconciler, active-path helper | `server/src/services/recovery/service.ts:4409`, `1080` |
-| Free slots (`maxConcurrentRuns` minus running) | `server/src/services/heartbeat.ts:17729`, `21012`, `21698` |
+| `maxConcurrentRuns` parsed from `runtime_config` (`parseHeartbeatPolicy`); the subtraction | `server/src/services/heartbeat.ts:17721-17731`; `21012`, `21698` |
 | Wake policy block, invokability | `server/src/services/heartbeat.ts:9960`, `11002` |
 | Issue assignment wake | `server/src/services/issue-assignment-wakeup.ts:144` |
-| Routine manual and API run, with variables | `server/src/services/routines.ts:2854`; `packages/shared/src/validators/routine.ts:171-175` |
+| Routine manual and API run, with variables; it rejects only an archived routine | `server/src/services/routines.ts:2854-2857`; the active check for webhook and schedule only: `1795-1800`; `Actor`: `185` |
 | Routine run route, public fire route | `server/src/routes/routines.ts:629`, `656` |
 | Routine dispatch (issue create plus wake in one lock) | `server/src/services/routines.ts:1712-2020` |
 | Origin fields on issues; a partial unique index on an origin kind | `packages/db/src/schema/issues.ts:62-67`, `149-155` |
 | Issue indexes (status, updated, project, origin, priority) | `packages/db/src/schema/issues.ts:106-142` |
 | `completed_at` set on done | `packages/db/src/schema/issues.ts:88`; `server/src/services/issues.ts:321-323` |
-| Issue dedup on create (title, idempotency key) | `server/src/services/issues.ts:9319`, `9834` |
+| Issue dedup on create: the title dedup; the child-issue idempotency replay | `server/src/services/issues.ts:9834`; `9319` |
 | Duplicate detection services | `server/src/services/duplicate-detection.ts` and its siblings |
 | Work products (type, status, `updated_at`, index) | `packages/db/src/schema/issue_work_products.ts:18-63` |
-| Activity log table and indexes; the writer | `packages/db/src/schema/activity_log.ts:23-35`; `server/src/services/activity-log.ts:136`, `217` |
+| Activity log table and indexes; the writers | `packages/db/src/schema/activity_log.ts:23-35`; `server/src/services/activity-log.ts:160` (`persistActivity`), `217` (`logActivity`) |
 | Plugin event bus (in memory) and its `emit` | `server/src/services/plugin-event-bus.ts:149`, `172`, `251-279` |
 | Plugin emit entry point | `server/src/services/plugin-host-services.ts:1600-1606` |
 | Core event names | `packages/shared/src/constants.ts:1689-1722` |
 | GitHub plugin manifest (no emit capability), sync | `packages/plugins/plugin-github/src/manifest.ts:7`; `src/sync.ts:398`, `518-563` |
 | Plugin webhook delivery insert (no company id) | `server/src/routes/plugins.ts:2768-2778` |
-| Agent role, pause fields, run columns | `packages/db/src/schema/agents.ts:22`, `35-36`; `packages/db/src/schema/heartbeat_runs.ts:68`, `96-140` |
-| Provider quota classification | `server/src/services/recovery/service.ts:248`, `386-399` |
+| Agent role, pause fields; the run `error_code` column; the status/last-output index | `packages/db/src/schema/agents.ts:22`, `35-36`; `packages/db/src/schema/heartbeat_runs.ts:68`, `136-140` |
+| Provider quota classification (the union member, the classifier) | `server/src/services/recovery/service.ts:248`, `385-399` |
 | Board and company guards | `server/src/routes/authz.ts:32`, `48`, `75` |
+| Task watchdog: table, service, origin kind, partial unique index | `packages/db/src/schema/issue_watchdogs.ts`; `server/src/services/task-watchdogs.ts`; `packages/shared/src/constants.ts:356-368`; `packages/db/src/schema/issues.ts:173` |
+| Issue origin kinds (the list gains `flow_watchdog`) | `packages/shared/src/constants.ts:356-368` |
+| Assignability check on issue create | `server/src/services/agent-assignability.ts:104-170` |
+| Issue create accepts a transaction as the third argument | `server/src/services/issues.ts:9804-9808` |
+| Wake gates in `enqueueWakeup` (budget, invokability, wake policy) | `server/src/services/heartbeat.ts:29038-29070` |
+| `rethrowOnError`, and the swallow when it is not set | `server/src/services/issue-assignment-wakeup.ts:229-235` |
+| The comment wake lives in the route; the service comment does not wake | `server/src/routes/issues.ts:17358`, `18233-18236`; `server/src/services/issues.ts:12211` |
+| Pull-request events stored in `external_objects` (`data.mergedAt`, `last_changed_at`) | `server/src/services/github-connection-events.ts:200-260`; `packages/db/src/schema/external_objects.ts` |
+| Recovery progress exemption (an environment value) | `server/src/services/recovery/service.ts:189-192` |
+| Scheduling suppression gate on the recovery pass | `server/src/index.ts:1827` |
+| Batch claim with `FOR UPDATE SKIP LOCKED` (precedent) | `server/src/services/chat-run-publications.ts:334`; `server/src/services/execution-recovery-resolution.ts:326` |
+| Labels on issues | `packages/db/src/schema/issue_labels.ts`, `labels.ts` |
 | Routine routes: board assign check, manage check | `server/src/routes/routines.ts:89`, `108` |
 | OpenAPI registration of a company resource | `server/src/routes/openapi.ts:4757-4770` |
 | Generic CLI resource helpers | `cli/src/commands/client/routine-api.ts:97`, `119` |
