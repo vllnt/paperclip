@@ -577,6 +577,128 @@ describe("ssh env-lab fixture", () => {
     await target.cleanup();
   });
 
+  describe("shared pnpm store for SSH processes", () => {
+    const spec = {
+      host: "ssh.example.test",
+      port: 22,
+      username: "ssh-user",
+      remoteCwd: "/srv/paperclip/workspace/.paperclip-runtime/runs/run-1/workspace",
+      remoteWorkspacePath: "/srv/paperclip/workspace",
+      privateKey: null,
+      knownHosts: null,
+      strictHostKeyChecking: true,
+    } as const;
+    const remoteScriptFor = async (env: Record<string, string>) => {
+      const target = await buildSshSpawnTarget({ spec, command: "env", args: [], env });
+      await target.cleanup();
+      return String(target.args.at(-1) ?? "");
+    };
+
+    it("points pnpm at one store under the environment root, outside every run directory", async () => {
+      const script = await remoteScriptFor({});
+
+      expect(script).toContain("npm_config_store_dir=");
+      expect(script).toContain("/srv/paperclip/workspace/.paperclip-runtime/pnpm-store");
+      expect(script).not.toContain("/runs/run-1/pnpm-store");
+    });
+
+    it("keeps a store the caller already chose", async () => {
+      const lower = await remoteScriptFor({ npm_config_store_dir: "/opt/own-store" });
+      const upper = await remoteScriptFor({ NPM_CONFIG_STORE_DIR: "/opt/own-store" });
+
+      for (const script of [lower, upper]) {
+        expect(script).toContain("/opt/own-store");
+        expect(script).not.toContain(".paperclip-runtime/pnpm-store");
+      }
+    });
+
+    it("leaves the store alone when the environment root is not a normalized absolute path", async () => {
+      for (const remoteWorkspacePath of ["relative/root", "/srv/../etc", "/srv/root/", "/"]) {
+        const target = await buildSshSpawnTarget({
+          spec: { ...spec, remoteWorkspacePath }, command: "env", args: [], env: {},
+        });
+        await target.cleanup();
+        expect(String(target.args.at(-1) ?? "")).not.toContain("npm_config_store_dir");
+      }
+    });
+
+    it("reaches a real remote process", async () => {
+      const rootDir = await createFixtureRootDir();
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH shared pnpm store env");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+      const target = await buildSshSpawnTarget({
+        spec: { ...config, remoteCwd: started.workspaceDir },
+        command: "sh",
+        args: ["-c", "printf %s \"$npm_config_store_dir\""],
+        env: {},
+      });
+      try {
+        const { stdout } = await execFileAsync("ssh", target.args);
+        expect(stdout).toBe(path.posix.join(config.remoteWorkspacePath, ".paperclip-runtime", "pnpm-store"));
+      } finally {
+        await target.cleanup();
+      }
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("workspace upload excludes", () => {
+    async function gitWorkspace(rootDir: string) {
+      const localRepo = path.join(rootDir, "local-workspace");
+      await mkdir(localRepo, { recursive: true });
+      await git(localRepo, ["init", "-q", "-b", "main"]);
+      await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+      await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+      await writeFile(path.join(localRepo, ".gitignore"), "node_modules/\n.next/\n.turbo/\n.pnpm-store/\n");
+      await writeFile(path.join(localRepo, "tracked.txt"), "base\n");
+      await git(localRepo, ["add", "."]);
+      await git(localRepo, ["commit", "-q", "-m", "base"]);
+      for (const dir of ["node_modules/.pnpm/dep@1/node_modules/dep", "packages/app/node_modules/nested", ".next/cache", ".turbo", ".pnpm-store/v3"]) {
+        await mkdir(path.join(localRepo, dir), { recursive: true });
+        await writeFile(path.join(localRepo, dir, "weight.bin"), Buffer.alloc(64 * 1024, 1));
+      }
+      await writeFile(path.join(localRepo, "untracked.txt"), "work in progress\n");
+      return localRepo;
+    }
+
+    it("leaves untracked dependency and cache directories on the host, and still sends the work in progress", async () => {
+      const rootDir = await createFixtureRootDir();
+      const localRepo = await gitWorkspace(rootDir);
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH upload excludes");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+
+      await prepareWorkspaceForSshExecution({
+        spec: { ...config, remoteCwd: started.workspaceDir }, localDir: localRepo, remoteDir: started.workspaceDir,
+      });
+
+      await expect(readFile(path.join(started.workspaceDir, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      await expect(readFile(path.join(started.workspaceDir, "untracked.txt"), "utf8")).resolves.toBe("work in progress\n");
+      for (const dir of ["node_modules", "packages/app/node_modules", ".next", ".turbo", ".pnpm-store"]) {
+        await expect(stat(path.join(started.workspaceDir, dir))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps sending a dependency directory name that the repository tracks", async () => {
+      const rootDir = await createFixtureRootDir();
+      const localRepo = await gitWorkspace(rootDir);
+      await mkdir(path.join(localRepo, "fixtures", ".turbo"), { recursive: true });
+      await writeFile(path.join(localRepo, "fixtures", ".turbo", "tracked.json"), "{}\n");
+      await git(localRepo, ["add", "-f", "fixtures/.turbo/tracked.json"]);
+      await git(localRepo, ["commit", "-q", "-m", "track a .turbo directory"]);
+      const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH upload excludes tracked");
+      if (!started) return;
+      const config = await buildSshEnvLabFixtureConfig(started);
+
+      await prepareWorkspaceForSshExecution({
+        spec: { ...config, remoteCwd: started.workspaceDir }, localDir: localRepo, remoteDir: started.workspaceDir,
+      });
+
+      await expect(readFile(path.join(started.workspaceDir, "fixtures", ".turbo", "tracked.json"), "utf8")).resolves.toBe("{}\n");
+      await expect(stat(path.join(started.workspaceDir, "node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
   it("rejects invalid environment variable keys when constructing SSH spawn targets", async () => {
     await expect(
       buildSshSpawnTarget({

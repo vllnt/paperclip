@@ -455,6 +455,29 @@ export async function untrackedSshSyncBackDependencyDirNames(localDir: string): 
   return tracked ? SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES.filter((name) => !tracked.has(name)) : [];
 }
 
+/**
+ * The pnpm store every process of an SSH environment shares. It sits under the
+ * environment's root, so it is on the same filesystem as the run directories
+ * and pnpm can hard-link packages from it instead of copying them into each
+ * run's `node_modules`. It is outside every `runs/<runId>`, so the run reaper
+ * never removes it. One environment has one root and one SSH user, so the store
+ * is shared by that environment's runs and by nothing else.
+ */
+export function sshSharedPnpmStoreDir(remoteWorkspacePath: string): string | null {
+  const root = remoteWorkspacePath;
+  if (!path.posix.isAbsolute(root) || root === "/" || root.endsWith("/") || path.posix.normalize(root) !== root) {
+    return null;
+  }
+  return path.posix.join(root, ".paperclip-runtime", "pnpm-store");
+}
+
+/** `env` plus the shared pnpm store, unless the caller already chose a store. */
+function withSharedPnpmStore(env: Record<string, string>, remoteWorkspacePath: string): Record<string, string> {
+  if (Object.keys(env).some((key) => key.toLowerCase() === "npm_config_store_dir")) return env;
+  const store = sshSharedPnpmStoreDir(remoteWorkspacePath);
+  return store ? { ...env, npm_config_store_dir: store } : env;
+}
+
 function tarSpawnEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -1334,7 +1357,7 @@ export async function buildSshSpawnTarget(input: {
   }
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
+  const envArgs = Object.entries(withSharedPnpmStore(input.env, input.spec.remoteWorkspacePath))
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
@@ -1695,11 +1718,18 @@ export async function prepareWorkspaceForSshExecution(input: {
       snapshot: gitSnapshot,
       onProgress: input.onProgress,
     });
+    // The history is already there, so only the working tree goes over. The
+    // dependency and cache trees the repository does not track are left behind,
+    // as sync-back leaves them: the run installs its own on the worker.
     await syncDirectoryToSsh({
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [
+        ".git",
+        ".paperclip-runtime",
+        ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.localDir)),
+      ],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
