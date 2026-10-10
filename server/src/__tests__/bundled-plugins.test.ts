@@ -166,9 +166,9 @@ describe("resolveBundledPluginInstalls", () => {
     expect(resolved).toHaveLength(1);
   });
 
-  it("includes Providers and GitHub by default and preserves the kubernetes bundle location", () => {
-    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes", "providers", "github"]);
-    const [entry, providers, github] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
+  it("includes Providers, GitHub and Convex by default and preserves the kubernetes bundle location", () => {
+    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes", "providers", "github", "convex"]);
+    const [entry, providers, github, convex] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
       catalogRoot: resolveBundledCatalogRoot({}),
       env: {},
       enforceCatalogRoot: false,
@@ -177,6 +177,8 @@ describe("resolveBundledPluginInstalls", () => {
     expect(providers.localPath).toMatch(/packages\/plugins\/plugin-providers$/);
     expect(github).toMatchObject({ key: "github", pluginKey: "vllnt.paperclip-github" });
     expect(github.localPath).toMatch(/packages\/plugins\/plugin-github$/);
+    expect(convex).toMatchObject({ key: "convex", pluginKey: "vllnt.paperclip-convex" });
+    expect(convex.localPath).toMatch(/packages\/plugins\/plugin-convex$/);
     // Preserve the existing sandbox-provider location.
     expect(entry).toEqual({
       key: "kubernetes",

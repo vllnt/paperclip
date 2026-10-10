@@ -713,6 +713,18 @@ describe("openapi routes", () => {
     ).toBeUndefined();
   });
 
+  it("documents the Convex plugin action contracts without any credential field", () => {
+    const spec = buildOpenApiSpec() as { paths: Record<string, Record<string, { description?: string }>>; components: { schemas: Record<string, unknown> } };
+    const description = spec.paths["/api/plugins/{pluginId}/actions/{key}"].post.description ?? "";
+    for (const action of ["status", "connection.connect", "deployments.list", "deployments.delete-preview", "reaper.run", "reaper.report"]) {
+      expect(description).toContain(action);
+    }
+    for (const name of ["ConvexStatus", "ConvexDeployment", "ConvexDeploymentsListParams", "ConvexDeletePreviewParams", "ConvexReaperRunParams", "ConvexReaperReport"]) {
+      expect(spec.components.schemas[name], name).toBeDefined();
+    }
+    expect(JSON.stringify(spec.components.schemas).toLowerCase()).not.toMatch(/"(token|secret|secretid|privatekey)"\s*:/);
+  });
+
   it("covers the mounted server routes exactly", () => {
     const {
       routes: actualRoutes,
