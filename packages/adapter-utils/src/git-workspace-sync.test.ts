@@ -616,13 +616,36 @@ describe("git workspace sync", () => {
     }
   });
 
-  it("creates the concurrent-history merge commit with a deterministic identity", async () => {
+  // Ambient identity (environment, global and system git config) would make
+  // these assertions machine-dependent, so each call under test runs with a
+  // controlled identity environment.
+  const IDENTITY_ENV_KEYS = [
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL",
+    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+  ] as const;
+  async function withIdentityEnv<T>(overrides: Partial<Record<(typeof IDENTITY_ENV_KEYS)[number], string>>, run: () => Promise<T>): Promise<T> {
+    const saved = new Map<string, string | undefined>(IDENTITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    for (const key of IDENTITY_ENV_KEYS) delete process.env[key];
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    Object.assign(process.env, overrides);
+    try {
+      return await run();
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  // No repo-local user.name/user.email by default: execution hosts are
+  // containers without git config, where commit-tree cannot auto-detect an
+  // identity. Setup commits pass their identity inline so only the commit
+  // under test depends on the sync-resolved identity.
+  async function createDivergedRepo() {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-merge-identity-"));
     cleanupDirs.push(rootDir);
-    // No repo-local user.name/user.email on purpose: execution hosts are
-    // containers without git config, where commit-tree cannot auto-detect an
-    // identity. Setup commits pass their identity inline so only the merge
-    // commit under test depends on the sync-supplied identity.
     const setupIdentity = ["-c", "user.name=Setup", "-c", "user.email=setup@paperclip.dev"];
     const repo = path.join(rootDir, "repo");
     await mkdir(repo, { recursive: true });
@@ -644,30 +667,76 @@ describe("git workspace sync", () => {
     await git(repo, [...setupIdentity, "commit", "-m", "sandbox change"]);
     const importedHead = await git(repo, ["rev-parse", "HEAD"]);
     await git(repo, ["checkout", "main"]);
+    return { rootDir, repo, baseHead, currentHead, importedHead, setupIdentity };
+  }
 
-    // Ambient identity env vars would override the `-c` flags and make the
-    // assertion machine-dependent, so clear them for the call under test.
-    const identityEnvKeys = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"];
-    const savedEnv = new Map(identityEnvKeys.map((key) => [key, process.env[key]]));
-    for (const key of identityEnvKeys) delete process.env[key];
-    try {
-      await integrateImportedGitHead({ localDir: repo, importedHead });
-    } finally {
-      for (const [key, value] of savedEnv) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
-    }
-
+  async function expectMergeCommit(repo: string, currentHead: string, importedHead: string) {
     const parents = (await git(repo, ["rev-list", "--parents", "-1", "HEAD"])).split(" ");
     expect(parents.slice(1)).toEqual([currentHead, importedHead]);
-    expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
-      .toBe("Paperclip|noreply@paperclip.ing|Paperclip|noreply@paperclip.ing");
     expect(await git(repo, ["log", "-1", "--format=%s"]))
       .toBe(`Paperclip remote git sync merge ${importedHead.slice(0, 12)}`);
+    expect(await git(repo, ["log", "-1", "--format=%B"])).not.toMatch(/co-authored-by/i);
     const mergedTree = await git(repo, ["ls-tree", "--name-only", "HEAD"]);
     expect(mergedTree).toContain("local.txt");
     expect(mergedTree).toContain("imported.txt");
+  }
+
+  it("falls back to the Paperclip identity for the merge commit when git has no identity", async () => {
+    const { repo, currentHead, importedHead } = await createDivergedRepo();
+
+    await withIdentityEnv({}, () => integrateImportedGitHead({ localDir: repo, importedHead }));
+
+    await expectMergeCommit(repo, currentHead, importedHead);
+    expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
+      .toBe("Paperclip|noreply@paperclip.ing|Paperclip|noreply@paperclip.ing");
+  });
+
+  it("uses the repository's configured identity for the merge commit", async () => {
+    const { repo, currentHead, importedHead } = await createDivergedRepo();
+    await git(repo, ["config", "user.name", "Repo Owner"]);
+    await git(repo, ["config", "user.email", "1+owner@users.noreply.github.com"]);
+
+    await withIdentityEnv({}, () => integrateImportedGitHead({ localDir: repo, importedHead }));
+
+    await expectMergeCommit(repo, currentHead, importedHead);
+    expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
+      .toBe("Repo Owner|1+owner@users.noreply.github.com|Repo Owner|1+owner@users.noreply.github.com");
+  });
+
+  it("uses an identity configured in the global git config", async () => {
+    const { rootDir, repo, currentHead, importedHead } = await createDivergedRepo();
+    const globalConfig = path.join(rootDir, "global.gitconfig");
+    await writeFile(globalConfig, "[user]\n\tname = Global Owner\n\temail = 2+global@users.noreply.github.com\n", "utf8");
+
+    await withIdentityEnv({ GIT_CONFIG_GLOBAL: globalConfig }, () => integrateImportedGitHead({ localDir: repo, importedHead }));
+
+    await expectMergeCommit(repo, currentHead, importedHead);
+    expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
+      .toBe("Global Owner|2+global@users.noreply.github.com|Global Owner|2+global@users.noreply.github.com");
+  });
+
+  it("respects a GIT_AUTHOR_* identity from the environment and keeps the committer consistent", async () => {
+    const { repo, currentHead, importedHead } = await createDivergedRepo();
+
+    await withIdentityEnv(
+      { GIT_AUTHOR_NAME: "Env Author", GIT_AUTHOR_EMAIL: "3+env@users.noreply.github.com" },
+      () => integrateImportedGitHead({ localDir: repo, importedHead }),
+    );
+
+    await expectMergeCommit(repo, currentHead, importedHead);
+    expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
+      .toBe("Env Author|3+env@users.noreply.github.com|Env Author|3+env@users.noreply.github.com");
+  });
+
+  it("falls back to the Paperclip identity as a pair when only part of an identity is configured", async () => {
+    const { repo, currentHead, importedHead } = await createDivergedRepo();
+    await git(repo, ["config", "user.name", "Name Only"]);
+
+    await withIdentityEnv({}, () => integrateImportedGitHead({ localDir: repo, importedHead }));
+
+    await expectMergeCommit(repo, currentHead, importedHead);
+    expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
+      .toBe("Paperclip|noreply@paperclip.ing|Paperclip|noreply@paperclip.ing");
   });
 
   it("grafts an imported head onto the current head when histories share no ancestor", async () => {
@@ -703,6 +772,21 @@ describe("git workspace sync", () => {
     const body = await git(repo, ["log", "-1", "--format=%B"]);
     expect(body).toContain(`Paperclip remote git sync graft ${importedHead.slice(0, 12)}`);
     expect(body).toContain("shares no ancestor");
+  });
+
+  it("uses the repository's configured identity for the graft commit", async () => {
+    const { repo, baseHead, currentHead, setupIdentity } = await createDivergedRepo();
+    await git(repo, ["config", "user.name", "Repo Owner"]);
+    await git(repo, ["config", "user.email", "1+owner@users.noreply.github.com"]);
+    const importedTree = await git(repo, ["rev-parse", `${baseHead}^{tree}`]);
+    const importedHead = await git(repo, [...setupIdentity, "commit-tree", importedTree, "-m", "sandbox rewrite"]);
+
+    await withIdentityEnv({}, () => integrateImportedGitHead({ localDir: repo, importedHead }));
+
+    const parents = (await git(repo, ["rev-list", "--parents", "-1", "HEAD"])).split(" ");
+    expect(parents.slice(1)).toEqual([currentHead]);
+    expect(await git(repo, ["log", "-1", "--format=%an|%ae|%cn|%ce"]))
+      .toBe("Repo Owner|1+owner@users.noreply.github.com|Repo Owner|1+owner@users.noreply.github.com");
   });
 
   it("does not graft when merge-base fails for a reason other than missing ancestry", async () => {
