@@ -439,7 +439,7 @@ describe("hasBlockingShortcutDialog", () => {
     expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { wrapper: { "data-state": "open" } }))).toBe(true);
   });
 
-  it("asks checkVisibility, with CSS checks, when the browser has it", () => {
+  it("asks checkVisibility, with opacity and visibility checks, when the browser has it", () => {
     const calls: unknown[] = [];
     function checkVisibility(visible: boolean) {
       return (options: unknown) => {
@@ -449,7 +449,22 @@ describe("hasBlockingShortcutDialog", () => {
     }
     expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { overrides: { checkVisibility: checkVisibility(false) } }))).toBe(false);
     expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { rendered: false, overrides: { checkVisibility: checkVisibility(true) } }))).toBe(true);
-    expect(calls).toEqual([{ checkVisibilityCSS: true }, { checkVisibilityCSS: true }]);
+    expect(calls).toEqual([
+      { checkOpacity: true, checkVisibilityCSS: true },
+      { checkOpacity: true, checkVisibilityCSS: true },
+    ]);
+  });
+
+  it("ignores popper content under an inert ancestor or whose content-visibility hides its items", () => {
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open" }, { wrapper: { inert: "" } }))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open", inert: "" }))).toBe(false);
+    // checkVisibility counts content-visibility only on ancestors, so content
+    // that hides its own items would still pass it.
+    expect(hasBlockingShortcutDialog(popup(
+      { role: "menu", "data-state": "open", style: "content-visibility: hidden" },
+      { overrides: { checkVisibility: () => true } },
+    ))).toBe(false);
+    expect(hasBlockingShortcutDialog(popup({ role: "menu", "data-state": "open", style: "content-visibility: visible" }))).toBe(true);
   });
 
   it("does not block when a DOM check on the content throws", () => {

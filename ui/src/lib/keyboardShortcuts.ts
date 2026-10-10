@@ -70,12 +70,18 @@ const OPEN_POPUP_SELECTOR = [
 ].join(", ");
 
 // Radix can leave popper content mounted after it hides or closes. Content
-// counts as open only while it renders and neither it nor an ancestor (such
-// as the popper wrapper) is hidden, aria-hidden or closed.
+// counts as open only while it renders, can be seen, and neither it nor an
+// ancestor (such as the popper wrapper) is hidden, aria-hidden, closed or inert.
 function isShownPopup(popup: Element): boolean {
-  if (popup.closest("[hidden], [aria-hidden='true'], [data-state='closed']")) return false;
-  if (typeof popup.checkVisibility === "function") return popup.checkVisibility({ checkVisibilityCSS: true });
-  return popup.getClientRects().length > 0;
+  if (popup.closest("[hidden], [aria-hidden='true'], [data-state='closed'], [inert]")) return false;
+  if (typeof popup.checkVisibility === "function") {
+    if (!popup.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
+  } else if (popup.getClientRects().length === 0) {
+    return false;
+  }
+  // checkVisibility counts content-visibility only on ancestors; on the
+  // content itself it hides every item.
+  return window.getComputedStyle(popup).getPropertyValue("content-visibility") !== "hidden";
 }
 
 // A DOM check that throws counts as "not open": a broken check must never

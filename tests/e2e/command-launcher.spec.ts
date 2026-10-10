@@ -217,9 +217,19 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
     });
 
     // Popper content Radix left mounted after it hid or closed, content that
-    // does not render, and a DOM check that throws: none of them is an open
-    // popup, so none may keep the launcher closed.
-    for (const variant of ["hidden menu", "aria-hidden wrapper", "closed wrapper", "display none menu", "throwing check"] as const) {
+    // does not render or cannot be seen or used, and a DOM check that throws:
+    // none of them is an open popup, so none may keep the launcher closed.
+    const staleVariants = [
+      "hidden menu",
+      "aria-hidden wrapper",
+      "closed wrapper",
+      "display none menu",
+      "throwing check",
+      "inert wrapper",
+      "content-visibility hidden menu",
+      "transparent menu",
+    ] as const;
+    for (const variant of staleVariants) {
       test(`opens over popper content that is not really open (${variant})`, async ({ page, request }) => {
         const seed = await seedCompany(request);
         const errors = trackPageErrors(page);
@@ -236,6 +246,9 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
           if (stale === "aria-hidden wrapper") wrapper.setAttribute("aria-hidden", "true");
           if (stale === "closed wrapper") wrapper.setAttribute("data-state", "closed");
           if (stale === "display none menu") menu.style.display = "none";
+          if (stale === "inert wrapper") wrapper.inert = true;
+          if (stale === "content-visibility hidden menu") menu.style.setProperty("content-visibility", "hidden");
+          if (stale === "transparent menu") menu.style.opacity = "0";
           if (stale === "throwing check") {
             Object.defineProperty(menu, "closest", {
               value: () => {
