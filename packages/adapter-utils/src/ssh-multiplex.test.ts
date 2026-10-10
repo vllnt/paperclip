@@ -118,7 +118,10 @@ describe("SSH multiplexing for short bridge commands", () => {
   }, 120_000);
 
   it(`shares a master with at most ${SSH_MULTIPLEX_MAX_CHANNELS} commands; the 21st concurrent one falls back and succeeds`, async () => {
-    const fixture = await startFixture();
+    // The 11 direct connections start at once. sshd's default `MaxStartups
+    // 10:30:100` drops some new connections above 10, which this test does not
+    // measure.
+    const fixture = await startFixture(["MaxStartups 100"]);
     if (!fixture) return;
     const run = runnerFor(fixture.state, fixture.config, hold(fixture.config, "env-a"));
     expect((await run("true")).exitCode).toBe(0);
