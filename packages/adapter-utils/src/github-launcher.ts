@@ -1,7 +1,22 @@
+import path from "node:path";
 import { ghCommandMayWrite, parseGhCommand } from "@paperclipai/shared";
 
+/** The system directories a git that holds a GitHub credential may come from, in the order they are searched. */
+const DEFAULT_TRUSTED_DIRS: readonly string[] = ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/bin"];
+
+export interface GithubLauncherOptions {
+  /** Directories (absolute) where the git that holds a credential is looked for; never the caller's PATH. Defaults to the system ones: /usr/bin, /usr/local/bin, /opt/homebrew/bin, /bin. */
+  trustedDirs?: readonly string[];
+  /** Require that this user cannot change the git it picks or the directories above it. On by default; a test turns it off to place a stand-in git. */
+  requireProtectedDirs?: boolean;
+}
+
 /** Standalone source is staged unchanged on local, SSH, and sandbox runtimes. No secrets in files. */
-export function githubLauncherSource(): string {
+export function githubLauncherSource(options: GithubLauncherOptions = {}): string {
+  const trustedDirs = options.trustedDirs ?? DEFAULT_TRUSTED_DIRS;
+  const requireProtectedDirs = options.requireProtectedDirs ?? true;
+  const relative = trustedDirs.find((dir) => !path.isAbsolute(dir));
+  if (relative !== undefined || trustedDirs.length === 0) throw new Error("The launcher's trusted directories must be absolute paths, and there must be one.");
   return String.raw`#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -21,6 +36,47 @@ const executable = findExecutable(program === SIGNER ? 'ssh-keygen' : program);
 if (!['git', 'gh', SIGNER].includes(program) || (!executable && program !== SIGNER)) {
   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
   process.exit(127);
+}
+// The git that holds a GitHub credential is never one found through the caller's PATH: whoever sets PATH (the agent) would be
+// handed the credential by a program named git. It is the first git in the trusted directories (fixed system ones) that this user
+// cannot change: the file and every directory above it belong to someone else and are not writable by this user (a symlink is
+// followed, and what it points at must hold too). Its children get those directories as their PATH and nothing else. Root can
+// change anything, so for root no check is possible and only the fixed directories count.
+const TRUSTED_DIRS = ${JSON.stringify(trustedDirs)};
+const REQUIRE_PROTECTED = ${JSON.stringify(requireProtectedDirs)};
+const TRUSTED_PATH = TRUSTED_DIRS.join(path.delimiter);
+// Why this user could change what is at file or above it (it owns it, or may write to it), or null.
+function userCanChange(file) {
+  if (!REQUIRE_PROTECTED) return null;
+  if (typeof process.getuid !== 'function') return 'this platform cannot tell who may change files';
+  const uid = process.getuid();
+  if (uid === 0) return null;
+  for (let at = file; ; at = path.dirname(at)) {
+    let stat;
+    try { stat = fs.statSync(at); } catch { return at + ' cannot be read'; }
+    if (stat.uid === uid) return at + ' belongs to this user';
+    try { fs.accessSync(at, fs.constants.W_OK); return at + ' is writable by this user'; } catch {}
+    if (at === path.dirname(at)) return null;
+  }
+}
+let trustedGitChoice;
+function trustedGit() {
+  if (trustedGitChoice) return trustedGitChoice;
+  const rejected = [];
+  for (const dir of TRUSTED_DIRS) {
+    const candidate = path.join(dir, 'git');
+    let real;
+    try {
+      real = fs.realpathSync(candidate);
+      fs.accessSync(real, fs.constants.X_OK);
+      if (!fs.statSync(real).isFile()) continue;
+    } catch { continue; }
+    const why = userCanChange(path.dirname(candidate)) || userCanChange(real);
+    if (!why) return (trustedGitChoice = { path: real });
+    rejected.push(why);
+  }
+  const where = TRUSTED_DIRS.join(', ');
+  return (trustedGitChoice = { problem: rejected.length ? 'no git that this user cannot change was found in ' + where + ' (' + rejected.join('; ') + ')' : 'no git was found in ' + where });
 }
 const argv = process.argv.slice(2);
 // The broker picks the identity (the company's GitHub App or a user) from the
@@ -411,7 +467,7 @@ const SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=ye
 function sealedEnv(env, home, gitDir) {
   const sealed = {};
   for (const [key, value] of Object.entries(env)) if (SEALED_ENV.test(key) && typeof value === 'string') sealed[key] = value;
-  return { ...sealed, PATH: originalPath.join(path.delimiter), HOME: home, GIT_DIR: gitDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+  return { ...sealed, PATH: TRUSTED_PATH, HOME: home, GIT_DIR: gitDir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
     GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_SSH_COMMAND: SSH_COMMAND };
 }
 // Every command that holds the credential runs in a git directory of the launcher's own (see privateGit), not in the checkout:
@@ -424,7 +480,7 @@ const SEALED_CONFIG = dir => ['-c', 'core.hooksPath=' + dir.hooks, '-c', 'protoc
 // the caller adds. Its setup runs without the credential (local is the checkout's environment as it was before any credential
 // came); sealed is the environment of the one command that holds it. null when it cannot be made.
 function privateGit(env, local, globalArgs, scratch, label) {
-  const git = gitBinary();
+  const git = trustedGit().path;
   if (!git || !scratch) return null;
   const { spawnSync } = require('node:child_process');
   try {
@@ -566,7 +622,7 @@ function sealedPush(env, local, globalArgs, pushArgs, authorized, scratch, listi
     return {
       args: [...SEALED_CONFIG(dir), '-c', 'push.followTags=false', '-c', 'push.recurseSubmodules=no',
         'push', ...planned.flags, '--no-verify', '--no-follow-tags', '--no-recurse-submodules', '--', url, ...planned.refspecs],
-      env: dir.sealed, gitDir: dir.gitDir, name, updates: planned.updates, upstream: options.upstream, dryRun: options.dryRun,
+      git: dir.git, env: dir.sealed, gitDir: dir.gitDir, name, updates: planned.updates, upstream: options.upstream, dryRun: options.dryRun,
     };
   } catch { return { problem: 'its private git directory cannot be made' }; }
 }
@@ -707,7 +763,7 @@ function sealedLsRemote(env, local, globalArgs, lsArgs, authorized, scratch) {
     lockPrivateGit(dir, false);
     return {
       args: [...SEALED_CONFIG(dir), 'ls-remote', ...options.flags, '--', target.url, ...options.rest.slice(1)],
-      env: dir.sealed, gitDir: dir.gitDir, finish: code => code,
+      git: dir.git, env: dir.sealed, gitDir: dir.gitDir, finish: code => code,
     };
   } catch { return { problem: 'its private git directory cannot be made' }; }
 }
@@ -767,7 +823,7 @@ function sealedFetch(env, local, globalArgs, fetchArgs, authorized, scratch) {
     return {
       // Maintenance (gc, commit graphs) would work on the checkout's objects from this directory's refs, which are not all of its refs.
       args: [...SEALED_CONFIG(dir), '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'fetch', ...options.flags, '--no-recurse-submodules', '--', target.name || target.url, ...options.rest.slice(1)],
-      env: child, gitDir: dir.gitDir, finish: code => sealedFetchFinish(local, globalArgs, plan, code),
+      git: dir.git, env: child, gitDir: dir.gitDir, finish: code => sealedFetchFinish(local, globalArgs, plan, code),
     };
   } catch { return { problem: 'its private git directory cannot be made' }; }
 }
@@ -830,6 +886,26 @@ function sealedFetchFinish(local, globalArgs, plan, code) {
     }
   } catch { complain('the result of this fetch could not be applied to the checkout'); }
   return code === 0 && failed ? 1 : code;
+}
+// The git commands that run sealed when they hold a credential, and the ones that reach the network and are not sealed, which
+// never run with one: a clone (templates, hooks, filters, submodules, upload-pack), a submodule add or update (it clones or
+// fetches each submodule with the checkout's config) and the Git LFS verbs that transfer or lock objects (a transfer agent and
+// a credential helper of its own). A pull is refused with its own explanation, where the sealed plan is made. The local verbs
+// of a submodule and of Git LFS run as they did.
+const SEALED_COMMANDS = ['push', 'fetch', 'ls-remote'];
+const LFS_LOCAL_VERBS = ['install', 'uninstall', 'track', 'untrack', 'ls-files', 'env', 'pointer', 'status', 'version', 'help', 'checkout', 'fsck', 'ext',
+  'update', 'merge-driver', 'dedup', 'completion', 'clean', 'smudge', 'filter-process', 'migrate'];
+// { command, advice } for a command that reaches the network unsealed, or null.
+function unsealedNetwork(subcommand, args) {
+  const verb = args.find(arg => !arg.startsWith('-'));
+  if (subcommand === 'clone') return { command: 'git clone', advice: 'Fetch it instead, which runs sealed: git init <dir> && cd <dir> && git fetch <url> <branch> && git checkout FETCH_HEAD' };
+  if (subcommand === 'submodule' && ['add', 'update'].includes(verb)) {
+    return { command: 'git submodule ' + verb, advice: 'Fetch the submodule\'s repository yourself, which runs sealed: git init <path> && cd <path> && git fetch <url> <commit> && git checkout FETCH_HEAD' };
+  }
+  if (subcommand === 'lfs' && verb !== undefined && !LFS_LOCAL_VERBS.includes(verb)) {
+    return { command: 'git lfs ' + verb.slice(0, 40), advice: 'Git LFS objects cannot be transferred with a GitHub credential from here yet; the local Git LFS commands still run.' };
+  }
+  return null;
 }
 // known: the refs GitHub lists for a push's destination, once read (see pushReport).
 function operation(env, known) {
@@ -1068,6 +1144,9 @@ async function main() {
     process.once('exit', () => { try { fs.rmSync(configDirectory, { recursive: true, force: true }); } catch {} });
   } catch { diagnostic('configuration_directory_unavailable'); }
   const scratch = configReady ? configDirectory : null;
+  let gitAt = 0;
+  if (program === 'git') while (gitAt < argv.length && argv[gitAt].startsWith('-')) gitAt += GIT_GLOBAL_WITH_VALUE.includes(argv[gitAt]) ? 2 : 1;
+  const gitSubcommand = program === 'git' ? argv[gitAt] : undefined;
   // authorized: the report of the command that the broker last answered with a credential; listing: the branches GitHub
   // listed when that report was checked (see remoteRefs), which the sealed push ties a lease to. readEnv: the environment of
   // the launcher's own reads of the checkout (and of what it applies to it afterwards), as it was before any credential came:
@@ -1148,6 +1227,16 @@ async function main() {
     // A command holding a GitHub token talks to GitHub directly, with verified TLS: a proxy or another trust
     // store (repository config or the run's environment) could let a TLS-intercepting proxy read the token.
     if (env.GH_TOKEN || env.GITHUB_TOKEN || env.PAPERCLIP_GIT_TOKEN) {
+      // A git command holding a token either runs sealed, from a git that the caller's PATH cannot choose, or does not run.
+      if (program === 'git') {
+        const unsealed = unsealedNetwork(gitSubcommand, argv.slice(gitAt + 1));
+        const trusted = SEALED_COMMANDS.includes(gitSubcommand) ? trustedGit() : {};
+        if (unsealed || trusted.problem) {
+          process.stderr.write('Paperclip: ' + (unsealed ? unsealed.command + ' cannot run with a GitHub credential, because it reaches the network without being sealed. ' + unsealed.advice
+            : 'git ' + gitSubcommand + ' cannot run with a GitHub credential, because ' + trusted.problem + '. Install git in a system directory that this user cannot change.') + '\n');
+          process.exit(1);
+        }
+      }
       appendGitConfig(env, 'http.sslVerify', 'true');
       appendGitConfig(env, 'http.proxy', '');
       for (const key of Object.keys(env)) {
@@ -1199,9 +1288,6 @@ async function main() {
   // A network command goes where, and sends what, the broker was told. The checkout can change meanwhile (another process,
   // or a config change made while the broker answered), so its remote, refs and commits are read again right before it
   // runs, and it does not run with the credential if they changed.
-  let gitAt = 0;
-  if (program === 'git') while (gitAt < argv.length && argv[gitAt].startsWith('-')) gitAt += GIT_GLOBAL_WITH_VALUE.includes(argv[gitAt]) ? 2 : 1;
-  const gitSubcommand = program === 'git' ? argv[gitAt] : undefined;
   if (credentialed && authorized && ['push', 'fetch', 'pull', 'ls-remote'].includes(gitSubcommand)) {
     const now = operation(readEnv, 'unknown');
     if (!['remote', 'pushUrls', 'shas', 'refs', 'currentBranch'].every(key => JSON.stringify(now[key] === undefined ? null : now[key]) === JSON.stringify(authorized[key] === undefined ? null : authorized[key]))) {
@@ -1241,17 +1327,17 @@ async function main() {
   }
   let child = null;
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child && child.kill(signal));
-  const run = (args, captureStderr, childEnv = env) => new Promise(resolve => {
+  const run = (args, captureStderr, childEnv = env, binary = executable) => new Promise(resolve => {
     let stderr = '', settled = false;
     const settle = (code) => { if (!settled) { settled = true; resolve({ code, stderr }); } };
-    child = spawn(executable, args, { env: childEnv, stdio: ['inherit', 'inherit', captureStderr ? 'pipe' : 'inherit'] });
+    child = spawn(binary, args, { env: childEnv, stdio: ['inherit', 'inherit', captureStderr ? 'pipe' : 'inherit'] });
     if (captureStderr) child.stderr.on('data', chunk => { stderr += chunk; process.stderr.write(chunk); });
     child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); settle(1); });
     // A captured stderr is complete only once the pipe closes.
     child.once(captureStderr ? 'close' : 'exit', (code) => settle(code === null ? 128 : code));
   });
   const reviewing = program === 'gh' && args[0] === 'pr' && args[1] === 'review' && args.some(arg => SELF_REVIEW_VERDICTS[arg]);
-  let result = sealedPlan ? await run(sealedPlan.args, false, sealedPlan.env) : await run(args, reviewing);
+  let result = sealedPlan ? await run(sealedPlan.args, false, sealedPlan.env, sealedPlan.git) : await run(args, reviewing);
   if (sealedPlan && gitSubcommand === 'push') sealedSync(readEnv, argv.slice(0, gitAt), sealedPlan, result.code);
   else if (sealedPlan) result = { ...result, code: sealedPlan.finish(result.code) };
   if (reviewing && result.code !== 0 && /own pull request/i.test(result.stderr)) {

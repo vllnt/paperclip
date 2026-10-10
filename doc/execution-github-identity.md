@@ -349,6 +349,35 @@ after (remotes, refs, commits, the refs that it applies after a fetch) runs
 without the credential in the environment, so a hook or helper that the checkout
 configures never sees it. The next paragraphs say how each command is sealed.
 
+**The git that holds a credential is not found through the caller's `PATH`.**
+Whoever sets `PATH` (the agent) would be handed the credential by a program named
+`git`. A sealed command runs the first `git` in `/usr/bin`, `/usr/local/bin`,
+`/opt/homebrew/bin` and `/bin` (in that order) that the user running the launcher
+cannot change: the file, once its symlinks are followed, and every directory above
+it, and the directory it was found in, are owned by someone else and not writable
+by this user. A `git` that fails that test is skipped, and when none passes the
+command is refused with the reason ("no git that this user cannot change was found
+in …"). The command's `PATH` is those four directories and nothing else, so a
+helper it starts (`ssh`, a credential helper) is a system one too; its other
+variables are the short list above, so `GIT_EXEC_PATH`, `LD_PRELOAD` and the like
+never reach it. Root can change any file, so for root no check is possible: only
+the four directories count. Commands that hold no credential still use the `git`
+that `PATH` finds, and so do the launcher's own reads of the checkout, which run
+without one.
+
+| Command, when a managed credential is supplied | What happens |
+|---|---|
+| `git push`, `git fetch`, `git ls-remote`, and the launcher's own listing of GitHub's branches | Sealed: a private git directory, the URL the broker was told, no hooks, the trusted `git` and `PATH` above |
+| `git pull` | Refused: `git fetch <remote> <branch>`, then `git merge FETCH_HEAD` or `git rebase <remote>/<branch>` |
+| `git clone` | Refused: `git init <dir> && cd <dir> && git fetch <url> <branch> && git checkout FETCH_HEAD` |
+| `git submodule add`, `git submodule update` | Refused: fetch the submodule's repository the same way |
+| `git lfs` fetch, pull, push, locks, lock, unlock, prune and every other verb that is not local | Refused |
+| `git lfs` install, track, untrack, ls-files, env, pointer, status, version, checkout, fsck, ext, update, migrate and the like; `git submodule status`, `foreach`, `init`, `sync` | Run as before (local commands get no token) |
+| `gh` | Unchanged: found through `PATH`, runs with the token (see the limits) |
+
+The same commands run as before when no credential is supplied, for example a
+clone of a public repository.
+
 **A push with a credential is sealed.** Once the broker has answered, the push
 does not run as typed. Its destination and its refs are arguments, not names that
 git looks up. The command is `git -c core.hooksPath=<empty> -c
@@ -441,8 +470,16 @@ descriptions in `FETCH_HEAD` and of a rebase's fork point. The refusal says what
 to do: `git fetch <remote> <branch>`, then `git merge FETCH_HEAD` or
 `git rebase <remote>/<branch>`.
 
-`clone`, `git submodule add|update` and `git lfs` also reach the network with a
-credential and are not sealed (see the limits).
+A **`clone`**, a **`git submodule add|update`** and the **Git LFS** verbs that
+transfer or lock objects also reach the network, and they are not sealed: a clone
+runs templates, hooks and filters and fetches submodules, a submodule command
+clones each submodule with the checkout's config, and Git LFS has a transfer agent
+and a credential helper of its own. With a credential they do not run, and the
+message says what to do instead (above). This is not a change for public
+repositories: a command that is given no credential runs as it did. A push does
+not upload Git LFS objects either, because its `pre-push` hook does not run (see
+above); a branch that adds LFS files has to have its objects uploaded another
+way.
 
 The base is the base of the same-repository open pull request whose head is the
 pushed branch, else the repository's default branch. Whoever opens a pull
@@ -692,10 +729,10 @@ a proxy or other TLS trust (URL-specific `http.<url>.proxy` or `sslVerify`,
 it; gh always gets a fresh private `GH_CONFIG_DIR`. Such a command therefore
 cannot use a proxy the network needs. The allowlist, toggles, throttle and
 guard hold on the managed path only. An agent that captures a user token (for example from the git hook of a
-command other than a push, a fetch or an `ls-remote` (`clone`, `git submodule add|update`, `git lfs` and `gh`
-still run unsealed), a program named `gh` later in `PATH`, or a gh extension, which all run with the
-token in their environment; or a process of the same user that reads the environment of the running
-command) can skip them for at most 8 hours; the hard limits are GitHub's: the App
+command other than a push, a fetch or an `ls-remote` (a `gh` command runs unsealed), a program named `gh`
+later in `PATH`, or a gh extension, which all run with the token in their environment, and the `node` that
+`#!/usr/bin/env node` finds for the launcher itself; or a process of the same user that reads the environment
+of the running command) can skip them for at most 8 hours; the hard limits are GitHub's: the App
 installation's repositories and permissions (keep Workflows write off so
 workflow files cannot change), and the repositories' rulesets. The
 `editWorkflows` check reads the checkout's objects, which an agent controls. It

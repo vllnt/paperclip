@@ -1,15 +1,17 @@
 import { execFile, execFileSync } from "node:child_process";
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync } from "node:fs";
-import { cp, mkdtemp, mkdir, readFile, symlink, writeFile, rm } from "node:fs/promises";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmod, cp, mkdtemp, mkdir, readFile, stat, symlink, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
+import { githubBrokerEnvironment, githubLauncherSource, type GithubLauncherOptions } from "./github-launcher.js";
 import { classifyGitHubCommand } from "@paperclipai/shared";
 import { runInNewContext } from "node:vm";
 const exec = promisify(execFile);
+/** The directories a launcher takes a credentialed git from when it is staged as it is. */
+const SYSTEM_DIRS = ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/bin"];
 // A test run inside a Paperclip run must not hand the launcher that run's API route.
 const hostEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("PAPERCLIP_")));
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -378,13 +380,20 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(operations.find(op => op.args[0] === "issue")).toMatchObject({ program: "gh", remote: "https://github.com/vllnt/paperclip.git" });
   }, 30_000); // many launcher runs, each spawning git
   // A managed launcher directory, a recording real `gh`, and a broker answering `answer(body, path)`.
-  async function brokered(answer: (body: any, url: string) => { status?: number; body: unknown } | null) {
+  /**
+   * Where a credentialed git comes from in a test. "fixture": the fixture's `real` directory first (a stand-in git placed there is
+   * the one that runs), then the system ones, with nobody-can-change-it not required. "system": the launcher exactly as it is
+   * staged. Or the options themselves.
+   */
+  type Trust = "fixture" | "system" | GithubLauncherOptions;
+  async function brokered(answer: (body: any, url: string) => { status?: number; body: unknown } | null, trust: Trust = "fixture") {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-brokered-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed"), realBin = path.join(root, "real"), repo = path.join(root, "repo"), log = path.join(root, "gh-calls.jsonl");
     for (const dir of [bin, realBin, repo]) await mkdir(dir, { recursive: true });
     await writeFile(path.join(bin, "package.json"), '{"type":"commonjs"}\n');
-    for (const name of ["git", "gh", "paperclip-ssh-sign"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
+    const source = githubLauncherSource(trust === "system" ? {} : trust === "fixture" ? { trustedDirs: [realBin, ...SYSTEM_DIRS], requireProtectedDirs: false } : trust);
+    for (const name of ["git", "gh", "paperclip-ssh-sign"]) await writeFile(path.join(bin, name), source, { mode: 0o700 });
     // Like the worker's wrapper, this "real" gh would write as a bot when GH_TOKEN is empty.
     await writeFile(path.join(realBin, "gh"), `#!/usr/bin/env node
 require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args: process.argv.slice(2), token: process.env.GH_TOKEN || 'bot-token' }) + '\\n');
@@ -682,7 +691,7 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     const ci = `${W}/ci.yml`;
     const refusal = { body: { status: "unavailable", reason: "refused in this test", failClosed: true, env: {} } };
     /** origin is the bare repository (main and feature/x are on it, and this checkout has both); the broker allows the first question and answers a second one with `second`. */
-    async function githubLike(second: { body: unknown } = refusal, token = "t") {
+    async function githubLike(second: { body: unknown } = refusal, token = "t", trust: Trust = "fixture") {
       let asked = 0;
       // Something the checkout's owner does while the broker is answering the first question.
       const hooks: { first: (() => void) | null } = { first: null };
@@ -690,7 +699,7 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
         if (asked++ > 0) return second;
         hooks.first?.();
         return { body: { status: "available", env: { GH_TOKEN: token, ...identity } } };
-      });
+      }, trust);
       const sys = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "file" } }).toString().trim();
       const bare = path.join(f.root, "github.git");
       await mkdir(bare);
@@ -1038,7 +1047,8 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
       const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
       const dir = path.join(r.root, "real");
       await writeFile(path.join(dir, "plan.json"), JSON.stringify({ repo: r.repo, actions, privateConfig, listing }));
-      await writeFile(path.join(dir, "git"), `#!/usr/bin/env node
+      // The interpreter by its path: a credentialed git has only the trusted directories as its PATH, and node is not in them.
+      await writeFile(path.join(dir, "git"), `#!${process.execPath}
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -1441,14 +1451,14 @@ process.exit(result.status === null ? 1 : result.status);
       const TOKEN = "fake-token-fake-token-fake-token";
       const sealedDir = /\/(push|fetch|ls|list)-[^/]+\/git$/;
       /** The broker allows every question (these tests run several commands), with a credential that is easy to recognise. */
-      const allowed = () => githubLike({ body: { status: "available", env: { GH_TOKEN: TOKEN, ...identity } } }, TOKEN);
+      const allowed = (trust: Trust = "fixture") => githubLike({ body: { status: "available", env: { GH_TOKEN: TOKEN, ...identity } } }, TOKEN, trust);
       const NETWORK = ["push", "fetch", "ls-remote"];
       /** A stand-in for the real git that logs every call (with whether it held the credential) and applies `actions` to the checkout when the first fetch, pull or ls-remote starts. */
       async function readShim(r: GithubLike, actions: string[][] = []) {
         const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
         const dir = path.join(r.root, "real");
         await writeFile(path.join(dir, "reads.json"), JSON.stringify({ repo: r.repo, actions }));
-        await writeFile(path.join(dir, "git"), `#!/usr/bin/env node
+        await writeFile(path.join(dir, "git"), `#!${process.execPath}
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -1694,6 +1704,218 @@ process.exit(result.status === null ? 1 : result.status);
         expect(result.stderr).toContain("cannot run with a GitHub credential");
         expect((await shim.calls()).filter(call => NETWORK.includes(call.sub))).toEqual([]);
       }, 60_000);
+
+      // Review r8: the git that holds the credential is chosen by the launcher, never through the caller's PATH, and the network
+      // commands that are not sealed do not run with a credential at all.
+      describe("a credentialed git is one the caller's PATH cannot choose, and what is not sealed does not run with a credential (review r8)", () => {
+        const systemGit = SYSTEM_DIRS.some(dir => existsSync(path.join(dir, "git")));
+        const isRoot = process.getuid?.() === 0;
+        const unlessRoot = isRoot ? it.skip : it;
+        const realGit = execFileSync("which", ["git"], { env: hostEnv }).toString().trim();
+        const hasToken = (call: { token: string | null }) => call.token !== null;
+        /** Runs the launcher with the agent's own directory first in PATH. */
+        const runWith = (r: GithubLike, first: string, args: string[], cwd = r.repo, extra: Record<string, string> = {}) =>
+          exec(path.join(r.bin, "git"), args, { cwd, env: { ...r.env, ...extra, PATH: `${r.bin}:${first}:${r.env.PATH}` } })
+            .then(result => ({ code: 0, ...result }), (error: any) => ({ code: error.code as number, stdout: String(error.stdout ?? ""), stderr: String(error.stderr ?? "") }));
+        /** A `git` that records, for each call, whether the credential reached it, and then runs the real one. */
+        async function wrapperFirst(r: GithubLike) {
+          const evil = path.join(r.root, "evil");
+          await mkdir(evil);
+          const seen = path.join(evil, "seen.jsonl");
+          await writeFile(path.join(evil, "git"), `#!${process.execPath}
+const { spawnSync } = require("node:child_process");
+require("node:fs").appendFileSync(${JSON.stringify(seen)}, JSON.stringify({ sub: process.argv[2], token: process.env.GH_TOKEN || process.env.PAPERCLIP_GIT_TOKEN || null }) + "\\n");
+process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), { stdio: "inherit" }).status ?? 1);
+`, { mode: 0o700 });
+          return { dir: evil, seen: async () => (await readFile(seen, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { sub: string; token: string | null }) };
+        }
+        /** A directory of the test's own, with a `git` in it that records that it ran. */
+        async function ownGit() {
+          const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-owngit-"));
+          cleanups.push(() => rm(dir, { recursive: true, force: true }).catch(() => undefined));
+          await writeFile(path.join(dir, "git"), `#!/bin/sh\necho ran > ${path.join(dir, "ran")}\nexit 1\n`, { mode: 0o755 });
+          return dir;
+        }
+
+        (systemGit ? it : it.skip)("never starts a git found through PATH with the credential: a wrapper first in PATH sees neither the listing, the fetch, the ls-remote nor the push", async () => {
+          const r = await allowed("system");
+          const wrapper = await wrapperFirst(r);
+          await r.write("app.ts", "z\n");
+          r.git("commit", "-a", "-m", "more app");
+          const tip = r.tip();
+          const pushed = await runWith(r, wrapper.dir, ["push", "origin", "feature/x"]);
+          expect(pushed.code, pushed.stderr).toBe(0);
+          expect(r.onGitHub("feature/x")).toBe(tip);
+          const theirs = await someoneElse(r);
+          const fetched = await runWith(r, wrapper.dir, ["fetch", "origin"]);
+          expect(fetched.code, fetched.stderr).toBe(0);
+          expect(r.git("rev-parse", "refs/remotes/origin/feature/x")).toBe(theirs);
+          const listed = await runWith(r, wrapper.dir, ["ls-remote", "origin"]);
+          expect(listed.code, listed.stderr).toBe(0);
+          expect(listed.stdout).toContain(`${theirs}\trefs/heads/feature/x`);
+          // The wrapper is on PATH and runs the launcher's own reads of the checkout, which hold no credential; it never gets one.
+          const seen = await wrapper.seen();
+          expect(seen.length).toBeGreaterThan(0);
+          expect(seen.filter(hasToken)).toEqual([]);
+        }, 120_000);
+
+        it("gives a credentialed git the trusted directories as its PATH and nothing of the agent's", async () => {
+          const r = await allowed();
+          await someoneElse(r);
+          const shim = await readShim(r);
+          const agent = path.join(r.root, "agent-bin");
+          await mkdir(agent);
+          expect((await runWith(r, agent, ["fetch", "origin"])).code).toBe(0);
+          expect((await runWith(r, agent, ["ls-remote", "origin"])).code).toBe(0);
+          const credentialed = (await shim.calls()).filter(hasToken);
+          expect(credentialed.map(call => call.sub).sort()).toEqual(["fetch", "ls-remote"]);
+          for (const call of credentialed) expect(call.env!.PATH, call.sub).toBe([path.join(r.root, "real"), ...SYSTEM_DIRS].join(path.delimiter));
+        }, 60_000);
+
+        it("does not reach the credential through GIT_EXEC_PATH either: a helper of the agent's is not started by the listing, the fetch, the ls-remote or the push", async () => {
+          const r = await allowed();
+          const stolen = path.join(r.root, "stolen");
+          const exec_ = path.join(r.root, "fake-exec");
+          await mkdir(exec_);
+          for (const helper of ["git-upload-pack", "git-receive-pack"]) await writeFile(path.join(exec_, helper), `#!/bin/sh\nprintenv GH_TOKEN >> ${stolen}\nexit 1\n`, { mode: 0o755 });
+          await r.write("app.ts", "z\n");
+          r.git("commit", "-a", "-m", "more app");
+          const tip = r.tip();
+          const empty = path.join(r.root, "agent-bin");
+          await mkdir(empty);
+          const env = { GIT_EXEC_PATH: exec_ };
+          const pushed = await runWith(r, empty, ["push", "origin", "feature/x"], r.repo, env);
+          expect(pushed.code, pushed.stderr).toBe(0);
+          expect(r.onGitHub("feature/x")).toBe(tip);
+          expect((await runWith(r, empty, ["fetch", "origin"], r.repo, env)).code).toBe(0);
+          expect((await runWith(r, empty, ["ls-remote", "origin"], r.repo, env)).code).toBe(0);
+          expect(await readFile(stolen, "utf8").catch(() => null)).toBeNull();
+        }, 60_000);
+
+        // The trust rules. A git that this user owns or may write to, in a directory that it owns or may write to, protects nothing.
+        for (const [label, mode] of [["a directory this user can write to", 0o700], ["a directory this user owns and cannot write to (the owner can change that)", 0o555]] as const) {
+          unlessRoot(`refuses every credentialed command when the only git is in ${label}, and never starts it`, async () => {
+            const own = await ownGit();
+            await chmod(own, mode);
+            cleanups.push(() => chmod(own, 0o700));
+            const r = await allowed({ trustedDirs: [own], requireProtectedDirs: true });
+            await r.write("app.ts", "z\n");
+            r.git("commit", "-a", "-m", "more app");
+            const before = r.onGitHub("feature/x");
+            for (const args of [["fetch", "origin"], ["ls-remote", "origin"], ["push", "origin", "feature/x"]]) {
+              const result = await r.run("git", args);
+              expect(result.code, args.join(" ")).toBe(1);
+              expect(result.stderr, args.join(" ")).toContain(`git ${args[0]} cannot run with a GitHub credential`);
+              expect(result.stderr, args.join(" ")).toContain("belongs to this user");
+            }
+            expect(r.onGitHub("feature/x")).toBe(before);
+            expect(existsSync(path.join(own, "ran"))).toBe(false);
+          }, 60_000);
+        }
+
+        it("refuses a credentialed command when no git is in the trusted directories, and says where it looked", async () => {
+          const empty = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-nogit-"));
+          cleanups.push(() => rm(empty, { recursive: true, force: true }));
+          const r = await allowed({ trustedDirs: [empty], requireProtectedDirs: true });
+          const result = await r.run("git", ["fetch", "origin"]);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain("git fetch cannot run with a GitHub credential");
+          expect(result.stderr).toContain(`no git was found in ${empty}`);
+        }, 60_000);
+
+        /** A broker that gives no credential, and a repository with one branch on a bare "GitHub". */
+        async function withoutCredential(trust: Trust = "fixture") {
+          const f = await brokered(() => ({ body: { status: "unavailable", reason: "no credential in this test", env: {} } }), trust);
+          const bare = path.join(f.root, "github.git");
+          await mkdir(bare);
+          const sys = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: { ...hostEnv, ...identity, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "file" } }).toString().trim();
+          sys(bare, "init", "--bare", "-b", "main");
+          sys(f.repo, "init", "-b", "main");
+          await writeFile(path.join(f.repo, "app.ts"), "x\n");
+          sys(f.repo, "add", ".");
+          sys(f.repo, "commit", "-m", "base");
+          sys(f.repo, "push", bare, "main");
+          return { ...f, bare, sys };
+        }
+
+        it("leaves a command that holds no credential on the git that PATH finds", async () => {
+          const empty = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-nogit-"));
+          cleanups.push(() => rm(empty, { recursive: true, force: true }));
+          const r = await withoutCredential({ trustedDirs: [empty], requireProtectedDirs: true });
+          const result = await r.run("git", ["ls-remote", r.bare]);
+          expect(result.code, result.stderr).toBe(0);
+          expect(result.stdout).toContain("refs/heads/main");
+          expect(result.stderr).not.toContain("cannot run with a GitHub credential");
+        }, 60_000);
+
+        // Clone, submodule and Git LFS reach the network and are not sealed: with a credential they do not run.
+        async function recorder() {
+          const r = await allowed();
+          const shim = await readShim(r);
+          return { r, shim };
+        }
+        it("refuses a clone that would hold the credential, says how to fetch instead, and the credential reaches no git", async () => {
+          const { r, shim } = await recorder();
+          const target = path.join(r.root, "cloned");
+          const result = await r.run("git", ["clone", r.bare, target]);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain("git clone cannot run with a GitHub credential");
+          expect(result.stderr).toContain("git init <dir> && cd <dir> && git fetch <url> <branch> && git checkout FETCH_HEAD");
+          expect(await stat(target).catch(() => null)).toBeNull();
+          expect((await shim.calls()).filter(hasToken)).toEqual([]);
+        }, 60_000);
+
+        it.each([
+          [["submodule", "update", "--init"], "git submodule update"],
+          [["submodule", "update", "--init", "--recursive"], "git submodule update"],
+          [["-c", "protocol.file.allow=always", "submodule", "update", "--init"], "git submodule update"],
+          [["submodule", "add", "REPO", "second"], "git submodule add"],
+        ])("refuses git %j that would hold the credential, and the credential reaches no git", async (args, message) => {
+          const { r, shim } = await recorder();
+          r.git("-c", "protocol.file.allow=always", "submodule", "add", r.bare, "first");
+          r.git("commit", "-m", "a submodule");
+          const result = await r.run("git", args.map(arg => (arg === "REPO" ? r.bare : arg)));
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain(`${message} cannot run with a GitHub credential`);
+          expect(existsSync(path.join(r.repo, "second"))).toBe(false);
+          expect((await shim.calls()).filter(hasToken)).toEqual([]);
+        }, 60_000);
+
+        it.each([["fetch"], ["pull"], ["push", "origin", "feature/x"], ["locks"], ["lock", "x"], ["prune"]])("refuses git lfs %s, which transfers or locks objects, and the credential reaches no git", async (...args) => {
+          const { r, shim } = await recorder();
+          const result = await r.run("git", ["lfs", ...args]);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain(`git lfs ${args[0]} cannot run with a GitHub credential`);
+          expect((await shim.calls()).filter(hasToken)).toEqual([]);
+        }, 60_000);
+
+        it.each([[["submodule", "status"]], [["submodule", "foreach", "true"]], [["lfs", "env"]], [["lfs", "track"]], [["lfs", "ls-files"]], [["lfs", "version"]], [["lfs"]]])("still runs the local command git %j", async (args) => {
+          const { r } = await recorder();
+          const result = await r.run("git", args);
+          expect(result.stderr).not.toContain("cannot run with a GitHub credential");
+        }, 60_000);
+
+        it("keeps a clone that holds no credential working", async () => {
+          const r = await withoutCredential();
+          const target = path.join(r.root, "cloned");
+          const result = await r.run("git", ["clone", r.bare, target]);
+          expect(result.code, result.stderr).toBe(0);
+          expect(existsSync(path.join(target, ".git"))).toBe(true);
+          expect(result.stderr).not.toContain("cannot run with a GitHub credential");
+        }, 60_000);
+
+        it("lets the fetch that the refusal suggests do the work of a clone", async () => {
+          const r = await allowed();
+          const tip = r.onGitHub("feature/x");
+          const target = path.join(r.root, "fetched");
+          await mkdir(target);
+          expect((await r.run("git", ["init", "-q", target], target)).code).toBe(0);
+          const fetched = await r.run("git", ["fetch", r.bare, "feature/x"], target);
+          expect(fetched.code, fetched.stderr).toBe(0);
+          r.sys(target, "checkout", "-q", "FETCH_HEAD");
+          expect(r.sys(target, "rev-parse", "HEAD")).toBe(tip);
+        }, 60_000);
+      });
     });
   });
 
