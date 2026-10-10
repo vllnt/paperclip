@@ -4,7 +4,8 @@ import { useHostNavigation, usePluginAction, type PluginWidgetProps } from "@pap
 import { PAGE_PATH, type Repository, type SyncReport, type SyncSettings } from "../contracts.js";
 import { styles } from "./styles.js";
 import { RepositoryWorkspace } from "./management-repository.js";
-export interface SyncStatus { configured: boolean; settings: SyncSettings; busy: boolean; report: SyncReport | null; pendingCount: number }
+/** `queued`: a request waits for the scheduled job (`queuedAt` is when it was made); `busy`: a sync is running now. */
+export interface SyncStatus { configured: boolean; settings: SyncSettings; busy: boolean; queued?: boolean; queuedAt?: string | null; report: SyncReport | null; pendingCount: number }
 export function GitHubTaskList({ context }: PluginWidgetProps) {
   return context.companyId ? <TaskSync key={context.companyId} companyId={context.companyId} projectId={context.projectId ?? undefined} /> : null;
 }
@@ -12,7 +13,7 @@ function TaskSync({ companyId, projectId }: { companyId: string; projectId?: str
   const nav = useHostNavigation(), status = usePluginAction("sync-status"), sync = usePluginAction("sync-now");
   const [value, setValue] = useState<SyncStatus | null>(null), [error, setError] = useState(""), [requesting, setRequesting] = useState(false);
   const [pullRequestsOpen, setPullRequestsOpen] = useState(false);
-  const details = useRef<HTMLDetailsElement>(null), refresh = useRef<(force: boolean) => Promise<void>>(async () => {});
+  const details = useRef<HTMLDetailsElement>(null), refresh = useRef<() => Promise<void>>(async () => {});
   function positionPopover() {
     const panel = details.current?.querySelector<HTMLElement>(".sync-popover");
     if (!details.current?.open || !panel) return;
@@ -29,39 +30,44 @@ function TaskSync({ companyId, projectId }: { companyId: string; projectId?: str
       let delay = 30_000;
       try {
         const data = await status({ companyId }) as SyncStatus;
-        if (!stopped && request === sequence) { setValue(data); if (data.busy) delay = 1000; }
+        if (!stopped && request === sequence) { setValue(data); delay = data.busy ? 1000 : data.queued ? 5000 : delay; }
       } catch (e) { if (!stopped && request === sequence) setError(message(e)); }
       finally { if (!stopped && request === sequence) timer = setTimeout(() => { if (document.visibilityState !== "hidden") void poll(); else timer = setTimeout(() => void poll(), 30_000); }, delay); }
     };
-    refresh.current = async force => {
+    // "Sync now" queues a request for the scheduled job; the status then says queued, then syncing, then when it last synced.
+    // Opening the page or focusing the window only reads the status: the job syncs on its own schedule.
+    refresh.current = async () => {
       if (inFlight) return;
       inFlight = true; setRequesting(true); setError("");
-      try { await sync({ companyId, ...(force ? { refresh: true } : {}) }); }
+      try { await sync({ companyId, refresh: true }); }
       catch (e) { if (!stopped) setError(message(e)); }
       finally { inFlight = false; if (!stopped) { setRequesting(false); await poll(); } }
     };
-    const focus = () => { void refresh.current(false); };
+    const focus = () => { void poll(); };
     const outside = (event: PointerEvent) => { if (details.current && !details.current.contains(event.target as Node)) details.current.open = false; };
     const escape = (event: KeyboardEvent) => { if (event.key === "Escape" && details.current?.open) { details.current.open = false; details.current.querySelector("summary")?.focus(); } };
-    void poll(); void refresh.current(false);
+    void poll();
     window.addEventListener("focus", focus); document.addEventListener("pointerdown", outside); document.addEventListener("keydown", escape); window.addEventListener("resize", positionPopover);
     return () => { stopped = true; clearTimeout(timer); window.removeEventListener("focus", focus); document.removeEventListener("pointerdown", outside); document.removeEventListener("keydown", escape); window.removeEventListener("resize", positionPopover); };
   }, [companyId]);
   if (!value?.configured && !error) return null;
   const warnings = value?.report?.warnings ?? [];
   const busy = value?.busy || requesting;
+  const queued = !!value?.queued && !busy;
   const healthy = !!value?.settings.enabled && !!value.report && !busy && !warnings.length && !value.pendingCount && !error;
-  const label = error ? "GitHub needs attention" : !value?.settings.enabled ? "GitHub sync paused" : busy ? "Syncing GitHub…" : warnings.length || value.pendingCount ? "GitHub needs attention" : value.report ? "GitHub synced" : "Waiting for GitHub sync";
+  const label = error ? "GitHub needs attention" : !value?.settings.enabled ? "GitHub sync paused" : busy ? "Syncing GitHub…" : queued ? "GitHub sync queued" : warnings.length || value.pendingCount ? "GitHub needs attention" : value.report ? "GitHub synced" : "Waiting for GitHub sync";
+  const time = (at: string | null | undefined) => at && Number.isFinite(Date.parse(at)) ? new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
   return <div className="pcg sync-control"><style>{styles}</style><details ref={details} onToggle={positionPopover}>
     <summary aria-label={label} title={label}><span className="sync-dot" data-connected={healthy} data-attention={!!(warnings.length || error || value?.pendingCount)} />GitHub</summary>
     <section className="sync-popover" aria-label="GitHub sync">
       <strong>{label}</strong>
-      {value?.report?.at && Number.isFinite(Date.parse(value.report.at)) && <p className="muted">Last synced {new Date(value.report.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</p>}
+      {queued && <p>Sync requested{time(value?.queuedAt) && ` at ${time(value?.queuedAt)}`}. It runs with the next scheduled sync.</p>}
+      {value?.report?.at && time(value.report.at) && <p className="muted">Last synced {time(value.report.at)}</p>}
       {error && <p role="alert" className="error">{error}</p>}
       {!!warnings.length && <ul className="sync-warnings">{warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul>}
       {!!value?.pendingCount && <p>{value.pendingCount} tasks waiting to publish.</p>}
       <button onClick={() => { setPullRequestsOpen(true); if (details.current) details.current.open = false; }}>Pull requests</button>
-      <div className="footer"><a {...nav.linkProps(PAGE_PATH)}>Review GitHub sync</a><button disabled={busy || value?.settings.enabled === false} onClick={() => void refresh.current(true)}>Sync now</button></div>
+      <div className="footer"><a {...nav.linkProps(PAGE_PATH)}>Review GitHub sync</a><button disabled={busy || queued || value?.settings.enabled === false} onClick={() => void refresh.current()}>{queued ? "Sync queued" : "Sync now"}</button></div>
     </section>
   </details>{pullRequestsOpen && <PullRequestBrowser key={`${companyId}:${projectId ?? "all"}`} companyId={companyId} projectId={projectId} onClose={() => setPullRequestsOpen(false)} />}</div>;
 }
