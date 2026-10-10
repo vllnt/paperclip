@@ -131,6 +131,7 @@ export type SshRunDirectoryKeepReason =
   | "worktree_dirty"
   | "preserve_failed"
   | "mount_point"
+  | "seed_unknown"
   | "rm_failed";
 
 export type SshRunDirectoryReapResult =
@@ -186,8 +187,14 @@ export async function reapSshRunDirectory(input: {
   remoteRoot: string;
   runId: string;
   timeoutMs?: number;
+  /**
+   * The commit the run's workspace was uploaded from, as the server recorded it
+   * before the upload. Without a valid one, an unrestored directory is kept
+   * (`seed_unknown`), because the worker cannot say which commits are the run's own.
+   */
+  seed?: string | null;
   /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
-  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string };
+  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string; afterRead?: string };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -201,9 +208,10 @@ export async function reapSshRunDirectory(input: {
     throw new Error("Refusing to reap an SSH run directory under a root that is too shallow to be a runtime base.");
   }
   const q = shellQuote;
+  const seed = typeof input.seed === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(input.seed) ? input.seed : "";
   const hook = (line: string | undefined) => (line ? [line] : []);
   const body = [
-    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
+    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}; seed=${q(seed)}`,
     // The root is resolved once. Everything below is compared with this physical path.
     'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
     'runtime="$root/.paperclip-runtime"; runs="$runtime/runs"; preserved="$runtime/preserved"',
@@ -232,6 +240,32 @@ export async function reapSshRunDirectory(input: {
     // Keeps the directory and names the git command that failed.
     'fail() { echo "detail $1"; keep preserve_failed; }',
     'isoid() { case "$1" in ""|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -ge 40 ]; }',
+    // Threat model: the worker's git is trusted. A git that exits 0 and prints
+    // false output is out of scope. Output that is cut short is in scope, and so is
+    // a legitimate git state that the logic could misread.
+    // rd NAME LABEL COMMAND...: runs a repository read into a file, ends the file
+    // with a line that names the read and counts the lines before it, and checks
+    // that line before anything uses the output. The data, without that line, is
+    // then in "$list.NAME.body". A read that failed, or whose output lost its end
+    // or some of its lines, keeps the directory.
+    'rd() {',
+    '  rname=$1; rlabel=$2; shift 2',
+    '  "$@" > "$list.$rname" 2>/dev/null || fail "$rlabel"',
+    '  rn=$(wc -l < "$list.$rname" | tr -d " ")',
+    '  printf "__PCREAD %s OK %s\\n" "$rname" "$rn" >> "$list.$rname" || fail "$rlabel"',
+    ...hook(input.testHooks?.afterRead),
+    '  rcheck "$rname" "$rlabel"',
+    "}",
+    'rcheck() {',
+    '  rtotal=$(wc -l < "$list.$1" | tr -d " ")',
+    '  rlast=$(tail -n 1 "$list.$1")',
+    '  [ "$rtotal" -ge 1 ] 2>/dev/null || fail "$2 truncated"',
+    '  [ "$rlast" = "__PCREAD $1 OK $((rtotal - 1))" ] || fail "$2 truncated"',
+    '  sed "\\$d" "$list.$1" > "$list.$1.body" || fail "$2"',
+    "}",
+    // Flushes a file, or a directory, to disk. A worker whose sync takes no
+    // argument flushes everything.
+    'fsync_path() { sync -- "$1" 2>/dev/null || sync; }',
     // True when bundle $1 verifies and its refs are exactly the computed ones:
     // the same number, each at the commit it has now. None missing, moved or extra.
     'matches() { G bundle verify "$1" >/dev/null 2>&1 || return 1; G bundle list-heads "$1" > "$list.published" 2>/dev/null || return 1; [ "$(grep -c . "$list.published")" = "$(grep -c . "$list")" ] || return 1; while IFS= read -r r; do want=$(G rev-parse -q --verify "$r") || return 1; grep -Fxq "$want $r" "$list.published" || return 1; done < "$list"; }',
@@ -246,41 +280,43 @@ export async function reapSshRunDirectory(input: {
     '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
     '  if [ ! -d "$ws/.git" ]; then keep not_git_backed; fi',
     '  G rev-parse --git-dir >/dev/null 2>&1 || fail "git rev-parse"',
-    // Every read below fails closed: a command that exits non-zero, or prints
-    // something that is not an object id where one is due, keeps the directory.
-    // Empty output counts as "nothing to save" only when the command exited 0.
-    // HEAD may be unborn (rev-parse exits 1 and HEAD is a symbolic ref).
-    '  head=$(G rev-parse -q --verify HEAD 2>/dev/null); head_status=$?',
+    // The commit the run's workspace was uploaded from, as the server recorded
+    // it. It is never taken from the worker's reflog, which an agent can expire.
+    // Without it the directory stays. Every commit that is not reachable from
+    // the seed is the run's own, whatever the reflog says.
+    '  if [ -z "$seed" ]; then keep seed_unknown; fi',
+    // Exit 0 is "an ancestor", exit 1 is "not", and any other status is a failed
+    // read, which keeps the directory.
+    '  anc() { G merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1; as=$?; if [ "$as" = 0 ]; then return 0; fi; if [ "$as" = 1 ]; then return 1; fi; fail "git merge-base"; }',
+    // Every read below fails closed: a command that exits non-zero, whose output
+    // lost its end (see rd), or that prints something that is not an object id
+    // where one is due, keeps the directory. HEAD may be unborn (rev-parse exits
+    // 1 and HEAD is a symbolic ref).
+    '  G rev-parse -q --verify HEAD >/dev/null 2>&1; head_status=$?',
     '  if [ "$head_status" = 0 ]; then',
-    '    isoid "$head" || fail "git rev-parse HEAD"',
+    '    rd head "git rev-parse HEAD" G rev-parse -q --verify HEAD',
+    '    head=$(cat "$list.head.body"); isoid "$head" || fail "git rev-parse HEAD"',
     '  elif [ "$head_status" = 1 ] && G symbolic-ref -q HEAD >/dev/null 2>&1; then',
     '    head=""',
     "  else",
     '    fail "git rev-parse HEAD"',
     "  fi",
-    // The run started from the oldest commit HEAD ever pointed at.
-    '  seed=""',
-    '  if [ -n "$head" ]; then',
-    '    G reflog show --format=%H HEAD > "$list.reflog" 2>/dev/null || fail "git reflog"',
-    '    seed=$(tail -n 1 "$list.reflog") || fail "git reflog"',
-    '    isoid "$seed" || fail "git reflog"',
-    "  fi",
     '  : > "$list"',
-    '  G for-each-ref --format="%(refname)" "$ns" > "$list.stale" 2>/dev/null || fail "git for-each-ref"',
-    '  while IFS= read -r r; do if [ -n "$r" ]; then G update-ref -d "$r" || fail "git update-ref"; fi; done < "$list.stale"',
-    '  add_ref() { isoid "$2" || fail "git object id"; [ "$2" = "$seed" ] && return 0; G update-ref "$ns/$1" "$2" || fail "git update-ref"; echo "$ns/$1" >> "$list"; }',
+    '  rd stale "git for-each-ref" G for-each-ref "--format=%(refname)" "$ns"',
+    '  while IFS= read -r r; do if [ -n "$r" ]; then G update-ref -d "$r" || fail "git update-ref"; fi; done < "$list.stale.body"',
+    '  add_ref() { isoid "$2" || fail "git object id"; if anc "$2" "$seed"; then return 0; fi; G update-ref "$ns/$1" "$2" || fail "git update-ref"; echo "$ns/$1" >> "$list"; }',
     '  [ -n "$head" ] && add_ref head "$head"',
-    '  G for-each-ref --format="%(refname)" refs/heads > "$list.heads" 2>/dev/null || fail "git for-each-ref"',
-    '  while IFS= read -r ref; do',
-    '    obj=$(G rev-parse -q --verify "$ref") || fail "git rev-parse"',
-    '    isoid "$obj" || fail "git rev-parse"',
-    '    if [ -n "$head" ] && G merge-base --is-ancestor "$obj" "$head"; then continue; fi',
+    '  rd heads "git for-each-ref" G for-each-ref "--format=%(objectname) %(refname)" refs/heads',
+    '  while IFS=" " read -r obj ref; do',
+    '    [ -n "$obj$ref" ] || continue',
+    '    isoid "$obj" || fail "git for-each-ref"',
+    '    if [ -n "$head" ] && anc "$obj" "$head"; then continue; fi',
     '    add_ref "${ref#refs/heads/}" "$obj"',
-    '  done < "$list.heads"',
+    '  done < "$list.heads.body"',
     '  index=0',
-    '  G stash list --format=%H > "$list.stash" 2>/dev/null || fail "git stash list"',
-    '  while IFS= read -r obj; do if [ -n "$obj" ]; then add_ref "stash-$index" "$obj"; fi; index=$((index + 1)); done < "$list.stash"',
-    '  G worktree list --porcelain > "$list.trees" 2>/dev/null || fail "git worktree list"',
+    '  rd stash "git stash list" G stash list --format=%H',
+    '  while IFS= read -r obj; do if [ -n "$obj" ]; then add_ref "stash-$index" "$obj"; fi; index=$((index + 1)); done < "$list.stash.body"',
+    '  rd trees "git worktree list" G worktree list --porcelain',
     '  index=0; main=1; tree=""; detached=""; prunable=""; treehead=""',
     '  while IFS= read -r line || [ -n "$line" ]; do',
     '    case "$line" in',
@@ -290,18 +326,21 @@ export async function reapSshRunDirectory(input: {
     '      prunable*) prunable=1 ;;',
     '      "")',
     '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
-    '          changes=$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$tree" status --porcelain 2>/dev/null) || fail "git status (extra worktree)"',
-    '          if [ -n "$changes" ]; then keep worktree_dirty; fi',
-    '          if [ -n "$detached" ] && [ -n "$treehead" ] && { [ -z "$head" ] || ! G merge-base --is-ancestor "$treehead" "$head"; }; then add_ref "worktree-head-$index" "$treehead"; fi',
+    '          rd wtstatus "git status (extra worktree)" git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$tree" status --porcelain',
+    '          if [ -s "$list.wtstatus.body" ]; then keep worktree_dirty; fi',
+    '          if [ -n "$detached" ] && [ -n "$treehead" ]; then',
+    '            wtneed=1; if [ -n "$head" ] && anc "$treehead" "$head"; then wtneed=0; fi',
+    '            if [ "$wtneed" = 1 ]; then add_ref "worktree-head-$index" "$treehead"; fi',
+    "          fi",
     '          index=$((index + 1))',
     '        fi',
     '        main=0; tree="" ;;',
     '    esac',
-    '  done < "$list.trees"',
+    '  done < "$list.trees.body"',
     // Uncommitted work: a snapshot commit of what git tracks or would track.
     // The index file is named relative to the repository, which is `-C workspace`.
-    '  status_out=$(G status --porcelain 2>/dev/null) || fail "git status"',
-    '  if [ -n "$status_out" ]; then',
+    '  rd status "git status" G status --porcelain',
+    '  if [ -s "$list.status.body" ]; then',
     '    idx=../.paperclip-reap-index; rm -f .paperclip-reap-index',
     '    if [ -n "$head" ]; then GIT_INDEX_FILE="$idx" G read-tree HEAD || fail "git read-tree"; fi',
     '    GIT_INDEX_FILE="$idx" G add -A || fail "git add"',
@@ -340,9 +379,12 @@ export async function reapSshRunDirectory(input: {
     '        echo "$tmp" ) || { rm -f .paperclip-reap.bundle; fail "bundle staging"; }',
     '      G bundle verify "$canon/.paperclip-runtime/preserved/$staged" >/dev/null 2>&1 || { ( cd "$preserved" 2>/dev/null && rm -f -- "$staged" ); fail "git bundle verify"; }',
     '      ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
-    '        sync -- "$staged" 2>/dev/null || sync',
+    // The file is flushed before the rename, and the directory after it, so a
+    // crash cannot leave the directory entry behind a deleted run directory.
+    '        fsync_path "$staged"',
     '        if [ "$pub" = 4 ]; then ln -f -- "./$id.bundle" "./$id.superseded.bundle" || exit 2; fi',
     '        mv -f -- "$staged" "./$id.bundle" || exit 2',
+    '        fsync_path .',
     '        exit 0 ) || { ( cd "$preserved" 2>/dev/null && rm -f -- "$staged" ); fail "bundle publish"; }',
     "    fi",
     '    rm -f .paperclip-reap.bundle',
@@ -383,7 +425,7 @@ export async function reapSshRunDirectory(input: {
   if (last === "absent" || last === "symlink" || last === "unbounded") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|rm_failed) (\d+)$/.exec(last);
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|seed_unknown|rm_failed) (\d+)$/.exec(last);
   if (kept) {
     const detail = lines.filter((line) => line.startsWith("detail ")).map((line) => line.slice("detail ".length)).pop();
     return {

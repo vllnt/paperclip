@@ -63,10 +63,13 @@ The directory stays, with a reason in the activity entry and in the lease's
 - `not_git_backed`: no marker and not a git repository, so nothing can be saved.
 - `worktree_dirty`: an extra worktree has uncommitted work.
 - `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
-  verify; or `.git` is a link or a file; or the start commit is unknown; or a git
+  verify; or `.git` is a link or a file; or a git
   read failed (the `detail` field names the command); or a
   bundle already at the published path is a link or not a regular file, or the
   bundle could not be replaced or still does not match this pass's refs exactly.
+- `seed_unknown`: the server has no record of the commit the run's workspace was
+  uploaded from, so the worker cannot say which commits are the run's own. Only
+  directories without the restored marker are kept for this.
 - `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
   point (a bind mount on the same device included). Nothing in it is touched.
 - `rm_failed`: the removal failed. It is retried up to 5 times. A mount below the
@@ -143,15 +146,33 @@ instead of the run.
   gives the claim back, records nothing, and logs one warning per environment.
   The directory is tried again on a later sweep, so installing `timeout` on the
   worker (GNU coreutils or busybox) is enough to resume reaping.
+- **Threat model.** The worker's `git` is trusted. A git that exits 0 and prints
+  false output is out of scope, as is the server's own user. In scope: output that
+  is lost or cut short (a killed shell, a full disk, a swallowed error), and real git
+  states that the logic could misread.
+- **The starting point comes from the server.** The commit a run's workspace was
+  uploaded from (the local HEAD, read the way the upload reads it) is written to
+  the lease (`metadata.sshWorkspaceSeed.head`) when the SSH driver realizes the
+  workspace, before the upload. The reaper passes it to the worker script. The
+  script never infers it from the worker's reflog, which `git gc`, `git reflog
+  expire` or `core.logAllRefUpdates=false` can shorten. A commit is the run's own
+  when it is reachable from a ref, HEAD or a stash and not from that commit. The
+  reflog's length changes nothing. A run with no record (a workspace that was not a
+  git repository with a commit, or a lease from before this record existed) keeps
+  its directory as `seed_unknown` when it has no restored marker. A directory that
+  the restore marked needs no seed.
 - **Git reads fail closed.** Every read of the repository before a delete (HEAD,
-  its reflog, the preserved refs, the branches, the stash, the worktree list, and
-  `git status` of the workspace and of each extra worktree) must exit 0 and, where
-  an object id is due, print one. A failed read, or one that prints something
-  else, keeps the directory as `preserve_failed`, and the failing command goes in
-  the `detail` field of the lease record and of the activity entry (for example
-  `git status`). Empty output means "nothing to save" only after an exit 0. A
-  repository whose HEAD has no commit yet still works: that is exit 1 with HEAD a
-  symbolic ref.
+  the preserved refs, the branches, the stash, the worktree list, and `git status`
+  of the workspace and of each extra worktree) must exit 0. Each one is written to
+  a file that ends with a line naming the read and counting the lines before it,
+  and the script checks that line before it uses the output. A read that failed,
+  lost its last line, or lost any other line keeps the directory as
+  `preserve_failed`. Empty output means "nothing to save" only when that line says
+  `OK 0`. An ancestry test (`git merge-base --is-ancestor`) is read by its exit
+  status: 0 is yes, 1 is no, and any other status keeps the directory. The failing
+  read goes in the `detail` field of the lease record and of the activity entry
+  (for example `git status`). A repository whose HEAD has no commit yet still
+  works: that is exit 1 with HEAD a symbolic ref.
 - **Published bundle.** `preserved/<runId>.bundle` is saved before any deletion
   starts. A pass that finds one never trusts it by name. It is a regular file
   (never a link), it verifies, and its refs are exactly the ones this pass
@@ -159,15 +180,16 @@ instead of the run.
   moved or extra. If so, the bundle is reused untouched. If not (a ref moved on or
   was deleted since the earlier pass, or the bundle is unrelated), the pass moves
   the new bundle into the preserved directory under a unique temporary name
-  (`mktemp`), verifies it, flushes it to disk (`sync` of the file, or a global
-  `sync` where the worker's `sync` takes no file), keeps the old one as
-  `<runId>.superseded.bundle` (a hard link, no copy), and renames the new one into
-  place. It then checks the same exact match again. A link or a non-regular file
-  at the path, a new bundle that does not verify, a rename that fails, or a final
-  mismatch keeps the directory (`preserve_failed`) and never deletes it. The 30-day
-  cleanup removes old bundles, superseded ones included. A crash between the
-  flush and the rename leaves only a temporary file, which the cleanup also
-  removes; crash durability of the rename itself is not tested.
+  (`mktemp`), verifies it, flushes the file to disk, keeps the old one as
+  `<runId>.superseded.bundle` (a hard link, no copy), renames the new one into
+  place, and flushes the preserved directory. (`sync` takes the path where the
+  worker's `sync` accepts one, and flushes everything where it does not.) It then
+  checks the same exact match again. A link or a non-regular file at the path, a
+  new bundle that does not verify, a rename that fails, or a final mismatch keeps
+  the directory (`preserve_failed`) and never deletes it. The 30-day cleanup
+  removes old bundles, superseded ones included. A crash between the flush and the
+  rename leaves only a temporary file, which the cleanup also removes. A real crash
+  is not tested, only the order of the two flushes.
 - **Mounts.** Before it changes anything, the script compares the device of
   `runs/<runId>` with the device of `runs`, and asks `mountpoint` where the worker
   has it, so a bind mount on the same device is caught too. A mismatch keeps the

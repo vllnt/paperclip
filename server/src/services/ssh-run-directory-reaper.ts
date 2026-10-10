@@ -312,6 +312,28 @@ function trustedRunRoot(lease: EnvironmentLease, remoteRoot: string, configuredR
     normalized(lease.metadata?.remoteWorkspacePath) === configured;
 }
 
+/**
+ * Records the commit a run's workspace is uploaded from, on the run's lease,
+ * before the upload. The reaper takes the run's starting point from this record
+ * and never from the worker, whose reflog an agent can shorten. A run with no
+ * record keeps its directory.
+ */
+export async function recordSshWorkspaceSeed(db: Db, leaseId: string, seed: string): Promise<void> {
+  await db
+    .update(environmentLeases)
+    .set({
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ sshWorkspaceSeed: { head: seed } })}::jsonb`,
+      updatedAt: new Date(),
+    })
+    .where(eq(environmentLeases.id, leaseId));
+}
+
+function recordedSeed(lease: EnvironmentLease): string | null {
+  const record: unknown = lease.metadata?.sshWorkspaceSeed;
+  const head = typeof record === "object" && record !== null && "head" in record ? record.head : null;
+  return typeof head === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head) ? head : null;
+}
+
 // Writes what was decided for a lease's directory. With an owner token it writes
 // only while that owner still holds the claim, and says whether it did: a reaper
 // whose claim was taken over must not overwrite the new owner's record.
@@ -406,7 +428,7 @@ async function reapLease(
       }
       remoteStarted = true;
       const result = await (hooks?.reapRemote ?? reapSshRunDirectory)({
-        spec: parsed.config, remoteRoot, runId, timeoutMs: REAP_TIMEOUT_MS,
+        spec: parsed.config, remoteRoot, runId, timeoutMs: REAP_TIMEOUT_MS, seed: recordedSeed(lease),
       });
       return await recordResult(db, lease, runId, run.agentId, remoteRoot, result, context, claim);
     } catch (error) {

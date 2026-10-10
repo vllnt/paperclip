@@ -25,7 +25,7 @@ import {
 } from "@paperclipai/adapter-utils/ssh";
 import { sshRunDirectory } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import { environmentRuntimeService } from "../services/environment-runtime.ts";
-import { sshRunDirectoryReaperService } from "../services/ssh-run-directory-reaper.ts";
+import { recordSshWorkspaceSeed, sshRunDirectoryReaperService } from "../services/ssh-run-directory-reaper.ts";
 import { secretService } from "../services/secrets.ts";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.ts";
 
@@ -105,7 +105,7 @@ describeReaper("SSH run directory reaper", () => {
   });
 
   // A run the way a worker leaves it: a lease on the host and runs/<id>/workspace on its disk.
-  async function startRun(options: { status?: string; git?: boolean; restored?: boolean } = {}) {
+  async function startRun(options: { status?: string; git?: boolean; restored?: boolean; recordSeed?: boolean } = {}) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "manual", status: "running" });
     const acquired = await runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: runId, persistedExecutionWorkspace: null });
@@ -120,6 +120,8 @@ describeReaper("SSH run directory reaper", () => {
       await writeFile(path.join(workspace, "tracked.txt"), "base\n");
       await git(workspace, ["add", "tracked.txt"]);
       await git(workspace, ["commit", "-q", "-m", "base"]);
+      // What realizeWorkspace records on the lease before the upload.
+      if (options.recordSeed !== false) await recordSshWorkspaceSeed(db, acquired.lease.id, await git(workspace, ["rev-parse", "HEAD"]));
     } else {
       await writeFile(path.join(workspace, "work.txt"), "only copy\n");
     }
@@ -615,6 +617,49 @@ describeReaper("SSH run directory reaper", () => {
     clock.advance(BEYOND_STALE_WINDOW_MS);
     await sshRunDirectoryReaperService(db, { clock: clock.now }).sweep({ readDiskUsagePercent: async () => 10 });
     expect(await exists(run.runDir)).toBe(false);
+  }, 60_000);
+
+  it("keeps a failed run's directory as seed_unknown when the server never recorded where the upload started", async () => {
+    const run = await startRun({ status: "failed", recordSeed: false });
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(Date.now() - 10 * HOUR_MS) }).where(eq(environmentLeases.id, run.leaseId));
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, run.leaseId));
+    await writeFile(path.join(run.workspace, "agent.txt"), "agent commit\n");
+    await git(run.workspace, ["add", "agent.txt"]);
+    await git(run.workspace, ["commit", "-q", "-m", "agent work"]);
+
+    await sshRunDirectoryReaperService(db).reapReleasedLease(environment, row as never);
+
+    expect(await exists(run.runDir)).toBe(true);
+    expect(await leaseMetadata(run.leaseId)).toMatchObject({ sshRunDirectory: { state: "kept", reason: "seed_unknown" } });
+    const [entry] = await activityFor(run.runId, "environment.ssh_run_directory_kept");
+    expect(entry?.details).toMatchObject({ reason: "seed_unknown" });
+  }, 60_000);
+
+  it("records the commit a git workspace is uploaded from when the SSH driver realizes it, and nothing for a plain directory", async () => {
+    const gitRun = await startRun({ status: "running", recordSeed: false });
+    const plainRun = await startRun({ status: "running", recordSeed: false });
+    const localRepo = await mkdtemp(path.join(os.tmpdir(), "paperclip-seed-local-"));
+    const plainDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-seed-plain-"));
+    try {
+      await git(localRepo, ["init", "-q", "-b", "main"]);
+      await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+      await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+      await writeFile(path.join(localRepo, "a.txt"), "a\n");
+      await git(localRepo, ["add", "a.txt"]);
+      await git(localRepo, ["commit", "-q", "-m", "first"]);
+      const head = await git(localRepo, ["rev-parse", "HEAD"]);
+      const leaseOf = async (leaseId: string) =>
+        (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]! as never;
+
+      await runtime.realizeWorkspace({ environment, lease: await leaseOf(gitRun.leaseId), workspace: { localPath: localRepo } });
+      await runtime.realizeWorkspace({ environment, lease: await leaseOf(plainRun.leaseId), workspace: { localPath: plainDir } });
+
+      expect(await leaseMetadata(gitRun.leaseId)).toMatchObject({ sshWorkspaceSeed: { head } });
+      expect(await leaseMetadata(plainRun.leaseId)).not.toHaveProperty("sshWorkspaceSeed");
+    } finally {
+      await rm(localRepo, { recursive: true, force: true });
+      await rm(plainDir, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it("records the git command that failed when the worker keeps a directory as preserve_failed", async () => {
