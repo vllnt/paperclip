@@ -133,6 +133,8 @@ export function CommandPalette() {
   } = useCommandActions();
   const { openNewIssue } = useDialogActions();
   const [openedAt, setOpenedAt] = useState(() => Date.now());
+  // The query for which the user moved the selection with the keyboard.
+  const [movedForQuery, setMovedForQuery] = useState<string | null>(null);
   // A selected row runs only after the close has committed: until then the
   // dialog's focus trap would pull focus back from whatever the row focuses
   // (e.g. the comment composer). The row then owns focus, so closing must not
@@ -314,7 +316,6 @@ export function CommandPalette() {
       ? actionMatches[0] ? `action:${actionMatches[0].action.id}` : undefined
       : `result:${firstResult.type}:${firstResult.id}`;
   const [selectedValue, setSelectedValue] = useState("");
-  const [movedForQuery, setMovedForQuery] = useState<string | null>(null);
   const followsBestRow = movedForQuery !== query;
   useEffect(() => {
     if (followsBestRow && bestRowValue) setSelectedValue(bestRowValue);
