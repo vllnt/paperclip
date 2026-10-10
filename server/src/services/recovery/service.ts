@@ -119,7 +119,7 @@ import {
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
-import { CONVERSATION_CONTINUATION_POLICY, runUsedConversationAdapter } from "../conversation-continuation.js";
+import { CONVERSATION_CONTINUATION_POLICY, needsConversationContinuationRepair, runUsedConversationAdapter } from "../conversation-continuation.js";
 import { queueIssueAssignmentWakeup } from "../issue-assignment-wakeup.js";
 import type { IssueExecutionState } from "@paperclipai/shared";
 import {
@@ -161,9 +161,6 @@ import {
 const conversationContinuationResult = sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
   conversationContinuation: CONVERSATION_CONTINUATION_POLICY,
 })}::jsonb`;
-
-/** Endings the settle sweep folds as conversation continuations (besides any interrupted run). */
-const CONVERSATION_FOLD_ERROR_CODES = new Set(["process_lost", "server_shutdown_interrupted", "execution_reconciliation_required"]);
 
 /** The system actor of a stranded in_progress dispatch that has no source run. */
 const STRANDED_ISSUE_RECOVERY_ACTOR_ID = "stranded_issue_recovery";
@@ -1175,27 +1172,17 @@ export function recoveryService(
 
   /**
    * Adds the marker to a conversation run that ended the way execution
-   * recovery already treats as a conversation continuation: interrupted, or
-   * `process_lost`, `server_shutdown_interrupted` or
-   * `execution_reconciliation_required` (the settle sweep's fold predicate,
-   * `conversationRecoveryActionPredicate`). Without it this sweep opens a
-   * reconciliation hold that the settle sweep folds again: hold, fold, hold,
-   * with the issue still in_progress. With it the run gets the bounded retry.
+   * recovery already treats as a conversation continuation (the settle
+   * sweep's fold predicate). Without it this sweep opens a reconciliation hold
+   * that the settle sweep folds again: hold, fold, hold, with the issue still
+   * in_progress. With it the run gets the bounded retry.
    */
   async function repairConversationContinuation(companyId: string, runId: string) {
     const [run] = await db
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
-    if (
-      !run ||
-      !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) ||
-      !(run.status === "interrupted" || CONVERSATION_FOLD_ERROR_CODES.has(run.errorCode ?? "")) ||
-      run.resultJson?.conversationContinuation === CONVERSATION_CONTINUATION_POLICY ||
-      run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" ||
-      !(await continuesAsConversation(run))
-    )
-      return;
+    if (!run || !(await needsConversationContinuationRepair(db, run))) return;
     await db
       .update(heartbeatRuns)
       .set({ resultJson: conversationContinuationResult, updatedAt: new Date() })
