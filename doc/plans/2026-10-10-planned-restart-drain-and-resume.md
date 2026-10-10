@@ -294,7 +294,9 @@ path that finalizes the run honours it:
    `runUsedConversationAdapter` result that the shutdown loop passes today, so the
    class test of section 4.5 reads the same facts. It then **skips every release**:
    `cancelRunInternal`'s release, the executor's release after the ending, and the
-   executor's late release in its `finally` block. No path schedules a successor.
+   executor's late release in its `finally` block. Each skip reads the durable
+   `resultJson.plannedRestartStop`, not the in-memory map, because the late release
+   can run after the map entry is cleared. No path schedules a successor.
    The issue lock stays on the stopped run for now. Nothing can take it during the
    drain: the stale-lock sweep, the deferred-wake sweep and queue starts are all
    suppressed.
@@ -323,10 +325,14 @@ path that finalizes the run honours it:
      (release only when no retry was made);
    - otherwise releases the issue with `suppressImmediateRecovery: true`.
 
-   If the process dies between steps 3 and 4, the lock points at a terminal run.
-   After the restart, the startup stale-lock sweep clears it and the stranded-issue
-   sweep is the net (section 5.3), as for any hard stop.
-5. **Clear** the intent from the map after step 4.
+   **Undecided.** If the wait for the adapter times out (`waitForAdapterStop`
+   gives up after 60 seconds and throws), the caller does not decide: no resume and
+   no release. The run counts as undecided in the status. The same holds when the
+   process dies between steps 3 and 4. Either way the lock points at a terminal
+   run; after the restart, the startup stale-lock sweep clears it and the
+   stranded-issue sweep is the net (section 5.3), **with the same proof rule**.
+5. **Clear** the intent from the map after step 4. The durable marker in
+   `resultJson` stays.
 
 So the resume is always the first successor, it holds the issue lock from the
 moment it exists, it exists only when the stop is proven, and the ending is the
@@ -576,7 +582,12 @@ successor per run.
 One gap: the sweep calls `scheduleRecoveryRetry`, which schedules with the default
 transient reason and so **spends the failure budget**. If a resume row is lost and
 the sweep schedules the successor of a `planned_restart` run, it must pass
-`planned_restart_resume` as the reason. That is a one-line wiring change in
+`planned_restart_resume` as the reason, **and only when the stop was proven**
+(`executionCancellation.state` is `"acknowledged"`, or the run's process is
+proven gone, as section 4.2 step 4 requires). A `planned_restart` run with no proof
+goes to the `reconciliation` class and its existing hold, never to a resume:
+its provider may still be working. The same rule applies to every fallback that
+can see a `planned_restart` run (the D2 startup classification too). That is a one-line wiring change in
 `heartbeat.ts` (where the sweep's `scheduleRecoveryRetry` is built), owned by this
 plan's D1, so the other change does not need to know about it (question Q7).
 
@@ -706,8 +717,10 @@ D1, embedded Postgres unless noted:
   by a budget hard stop, as any queued run.
 - The cap: a fourth `planned_restart` in a row on one chain falls back to the
   transient retry.
-- The stranded sweep, given a `planned_restart` run with no successor, schedules
-  `planned_restart_resume`, not `transient_failure`.
+- The stranded sweep, given a `planned_restart` run with no successor and a proven
+  stop, schedules `planned_restart_resume`, not `transient_failure`. Given one
+  with no proof (a timed-out wait), it schedules nothing and the run gets the
+  reconciliation hold.
 - The timer: deadline, alert and expiry fire once each, write their activity rows,
   and close the row on expiry. The alert appears only for instance admins and
   disappears when the drain lifts.
