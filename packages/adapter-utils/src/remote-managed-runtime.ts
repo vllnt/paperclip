@@ -130,13 +130,22 @@ export type SshRunDirectoryKeepReason =
   | "not_git_backed"
   | "worktree_dirty"
   | "preserve_failed"
+  | "mount_point"
+  | "seed_unknown"
+  | "dirty"
+  | "unpushed"
+  | "stash"
+  | "linked_worktree"
+  | "submodule"
+  | "git_unreadable"
   | "rm_failed";
 
 export type SshRunDirectoryReapResult =
   | { outcome: "removed"; bytesFreed: number; preserved: string[] }
   | { outcome: "absent" }
   | { outcome: "symlink" }
-  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number };
+  | { outcome: "unbounded" }
+  | { outcome: "kept"; reason: SshRunDirectoryKeepReason; bytes: number; detail?: string };
 
 /** Where a reaped run's preserved git state is kept, outside every `runs/<runId>`. */
 export function sshPreservedBundlePath(remoteRoot: string, runId: string): string {
@@ -145,6 +154,7 @@ export function sshPreservedBundlePath(remoteRoot: string, runId: string): strin
 
 const PRESERVED_BUNDLE_MAX_KB = 1024 * 1024;
 const PRESERVED_BUNDLE_RETENTION_DAYS = 30;
+const REAP_KILL_GRACE_SECONDS = 30;
 
 /**
  * Deletes one run's `runs/<runId>` directory on an SSH host for any finished
@@ -163,14 +173,43 @@ const PRESERVED_BUNDLE_RETENTION_DAYS = 30;
  * when an extra worktree holds uncommitted work, or when the bundle cannot be
  * written and verified. Git runs with the repository's `core.fsmonitor` and
  * hooks switched off. Bundles older than 30 days are removed.
+ *
+ * The worker script has its own time limit, `timeoutMs` rounded up to whole
+ * seconds, enforced by `timeout` on the worker (with a 30 s kill grace). A
+ * dropped connection or a stalled caller therefore cannot leave a script
+ * running past the caller's claim on the directory. A worker without
+ * `timeout` is not reaped: the result is `unbounded` and nothing is changed.
+ * A bundle already published for the run is reused only as a regular file that
+ * verifies and lists every ref this pass computed at exactly the commit it has
+ * now. Otherwise a new bundle is verified under a temporary name, the old one
+ * is kept as `<runId>.superseded.bundle`, and the new one is renamed into
+ * place; any failure, or a final mismatch, keeps the directory. The refs
+ * reported are the ones the bundle holds. A run directory that is a mount point, or on another
+ * device than `runs`, is kept as `mount_point`, and the delete stays on the
+ * run directory's own filesystem.
  */
 export async function reapSshRunDirectory(input: {
   spec: SshConnectionConfig;
   remoteRoot: string;
   runId: string;
   timeoutMs?: number;
+  /**
+   * The commit the run's workspace was uploaded from, as the server recorded it
+   * before the upload. Without a valid one, an unrestored directory is kept
+   * (`seed_unknown`), because the worker cannot say which commits are the run's own.
+   */
+  seed?: string | null;
+  /**
+   * With no seed, remove the folder anyway when it holds no work that exists
+   * nowhere else: no uncommitted or untracked file (ignored files do not count),
+   * a HEAD and every local branch tip contained in a remote ref, no stash, and no
+   * linked worktree. The caller must already have checked that the run is dead and
+   * old enough. A remote ref is a hint that work was pushed, not proof. A read
+   * that fails keeps the folder (`git_unreadable`). Nothing is bundled.
+   */
+  legacy?: boolean;
   /** Test seam only: shell lines the worker runs at fixed points, to swap a path under the script. */
-  testHooks?: { afterChecks?: string; afterConfine?: string };
+  testHooks?: { afterChecks?: string; afterConfine?: string; beforeBound?: string; afterRead?: string; beforeRemove?: string; beforeMarkerRestore?: string };
 }): Promise<SshRunDirectoryReapResult> {
   if (!RUN_ID_PATTERN.test(input.runId)) {
     throw new Error("Refusing to reap an SSH run directory for a run id that is not a UUID.");
@@ -184,9 +223,14 @@ export async function reapSshRunDirectory(input: {
     throw new Error("Refusing to reap an SSH run directory under a root that is too shallow to be a runtime base.");
   }
   const q = shellQuote;
+  const seed = typeof input.seed === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(input.seed) ? input.seed : "";
   const hook = (line: string | undefined) => (line ? [line] : []);
-  const script = [
-    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}`,
+  const body = [
+    // Noclobber for the whole script: a plain > fails on any name that already
+    // exists, a link or a hard link to another file included, instead of writing
+    // through it. A write that fails keeps the folder (see rd and the callers).
+    "set -C",
+    `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}; seed=${q(seed)}; legacy=${input.legacy && !seed ? 1 : 0}`,
     // The root is resolved once. Everything below is compared with this physical path.
     'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
     'runtime="$root/.paperclip-runtime"; runs="$runtime/runs"; preserved="$runtime/preserved"',
@@ -206,11 +250,110 @@ export async function reapSshRunDirectory(input: {
     'cd "$id" 2>/dev/null || { echo absent; exit 0; }',
     'if [ "$(pwd -P)" != "$canon/.paperclip-runtime/runs/$id" ]; then echo symlink; exit 0; fi',
     ...hook(input.testHooks?.afterConfine),
-    'ws=workspace; list=.paperclip-reap-refs; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"',
+    // Device and inode of a path, as "dev:inode". The directory entered here is
+    // recorded, and checked again from the parent right before it is removed.
+    'statid() { stat -c %d:%i "$1" 2>/dev/null || stat -f %d:%i "$1" 2>/dev/null; }',
+    'ino_here=$(statid .)',
+    'dev_here=$(stat -c %d . 2>/dev/null || stat -f %d . 2>/dev/null); dev_runs=$(stat -c %d .. 2>/dev/null || stat -f %d .. 2>/dev/null)',
+    'if [ -z "$ino_here" ]; then echo "kept mount_point 0"; exit 0; fi',
+    'if [ -z "$dev_here" ] || [ "$dev_here" != "$dev_runs" ]; then echo "kept mount_point 0"; exit 0; fi',
+    'if command -v mountpoint >/dev/null 2>&1 && mountpoint -q . 2>/dev/null; then echo "kept mount_point 0"; exit 0; fi',
+    'ws=workspace; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"; scratch=""; sdir=""; list=""; fi_=0; rdkey=""; mn=0; acc=""; nl=$(printf "\\n."); nl=${nl%.}',
     'kb=$(du -sk . 2>/dev/null | cut -f1); kb=${kb:-0}',
     'keep() { echo "kept $1 $kb"; exit 0; }',
-    // A repository config the agent planted must not run commands here.
-    'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
+    // Keeps the directory and names the git command that failed.
+    'fail() { echo "detail $1"; keep "${fail_reason:-preserve_failed}"; }',
+    // Names inside the run directory belong to the worker user, who can plant a link
+    // at any name the script knows in advance, and a plain redirection (>, >>, : >)
+    // follows a link and writes or truncates its target. So the script writes no
+    // fixed name there. Its scratch files live in a directory that mktemp -d creates
+    // fresh for this call (an unpredictable name, mode 700, which cannot already
+    // exist as a link) and that is removed on every way out. The marker, which has
+    // to keep its name, is written by put_marker.
+    'cleanup_scratch() { if [ -n "$scratch" ]; then rm -rf -- "$scratch" 2>/dev/null; fi; }',
+    'trap cleanup_scratch EXIT',
+    'trap "exit 143" HUP INT TERM',
+    'make_scratch() {',
+    '  scratch=$(mktemp -d "./.paperclip-reap.XXXXXX" 2>/dev/null) || scratch=""',
+    '  if [ -z "$scratch" ] || [ ! -d "$scratch" ] || [ -L "$scratch" ]; then scratch=""; fail "scratch directory"; fi',
+    '  sdir=${scratch#./}; list="$scratch/refs"',
+    '}',
+    // rm unlinks a link itself and never its target. The file is then created with
+    // noclobber, which opens it with O_EXCL: that fails on any existing name, a link
+    // that was planted a moment ago and a dangling one included. The subshell keeps
+    // a failed redirection from ending the script. The last test insists on a plain file.
+    'put_marker() { rm -f -- "$marker" 2>/dev/null; ( set -C; : > "$marker" ) 2>/dev/null; [ -f "$marker" ] && [ ! -L "$marker" ]; }',
+    'isoid() { case "$1" in ""|*[!0-9a-f]*) return 1 ;; esac; [ "${#1}" -ge 40 ]; }',
+    // Threat model: the worker's git is trusted. A git that exits 0 and prints
+    // false output is out of scope. Output that is cut short is in scope, and so is
+    // a legitimate git state that the logic could misread.
+    // rd NAME LABEL COMMAND...: runs a repository read, ends its output with a line
+    // that names the read and counts the lines before it, and checks that line
+    // before anything uses the output. The data, without that line, is then in
+    // "$list.NAME.body" ("$list.NAME.$rdkey.body" when a key is set, for a read that
+    // is repeated). A read that failed, or whose output lost its end or some of its
+    // lines, keeps the directory. Every file is created once, under a name used
+    // once, with noclobber: a name that already exists, a link included, is
+    // tampering, and the script keeps the folder instead of writing through it. The
+    // last file is written in one redirection, not appended to.
+    'rd() {',
+    '  [ -n "$list" ] || fail "scratch directory"',
+    '  rname=$1; rlabel=$2; shift 2',
+    '  rfile="$list.$rname${rdkey:+.$rdkey}"',
+    '  "$@" > "$rfile.out" 2>/dev/null || fail "$rlabel"',
+    '  rn=$(wc -l < "$rfile.out" | tr -d " ")',
+    '  { cat "$rfile.out"; printf "__PCREAD %s OK %s\\n" "$rname" "$rn"; } > "$rfile" || fail "$rlabel"',
+    ...hook(input.testHooks?.afterRead),
+    '  rcheck "$rfile" "$rlabel" "$rname"',
+    "}",
+    'rcheck() {',
+    '  rtotal=$(wc -l < "$1" | tr -d " ")',
+    '  rlast=$(tail -n 1 "$1")',
+    '  [ "$rtotal" -ge 1 ] 2>/dev/null || fail "$2 truncated"',
+    '  [ "$rlast" = "__PCREAD $3 OK $((rtotal - 1))" ] || fail "$2 truncated"',
+    '  sed "\\$d" "$1" > "$1.body" || fail "$2"',
+    "}",
+    // Flushes a file, or a directory, to disk. A worker whose sync takes no
+    // argument flushes everything.
+    'fsync_path() { sync -- "$1" 2>/dev/null || sync; }',
+    // True when bundle $1 verifies and its refs are exactly the computed ones:
+    // the same number, each at the commit it has now. None missing, moved or extra.
+    'matches() { mn=$((mn + 1)); G bundle verify "$1" >/dev/null 2>&1 || return 1; G bundle list-heads "$1" > "$list.published.$mn" 2>/dev/null || return 1; [ "$(grep -c . "$list.published.$mn")" = "$(grep -c . "$list")" ] || return 1; while IFS= read -r r; do want=$(G rev-parse -q --verify "$r") || return 1; grep -Fxq "$want $r" "$list.published.$mn" || return 1; done < "$list"; }',
+    // A repository config the agent planted must not run commands here. Git starts
+    // a program for core.fsmonitor and for hooks, and for a filter driver
+    // (filter.<name>.clean, .smudge and .process) when it hashes a file that has a
+    // filter attribute: git add -A, and git status on a file whose size and time
+    // do not settle the question. The first two are switched off. Every filter
+    // driver defined in the config of the repository (the repository's own, the
+    // worker user's and the system's) is replaced by one that does nothing, so the
+    // work is captured as it is on disk. neutralize_filters DIR reads the names
+    // from the config of the repository at DIR, which runs nothing, and gitx DIR
+    // ARGS... runs git there with those overrides. The names are kept in variables
+    // and put in the argument list as separate words, never parsed again.
+    'neutralize_filters() {',
+    '  fi_=0',
+    '  fnames=$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$1" config --name-only --get-regexp "^filter[.]" 2>/dev/null); frc=$?',
+    '  if [ "$frc" != 0 ] && [ "$frc" != 1 ]; then fail "git config"; fi',
+    '  oldifs=$IFS; IFS=$nl; set -f',
+    '  for fkey in $fnames; do',
+    '    case "$fkey" in filter.*.*) ;; *) continue ;; esac',
+    '    fname=${fkey#filter.}; fname=${fname%.*}',
+    '    fi_=$((fi_ + 1)); eval "FN_$fi_=\\$fname"',
+    '  done',
+    '  IFS=$oldifs; set +f',
+    '}',
+    'gitx() {',
+    '  gdir=$1; shift',
+    '  set -- -C "$gdir" "$@"',
+    '  gn=$fi_',
+    '  while [ "$gn" -gt 0 ]; do',
+    '    eval "gname=\\$FN_$gn"',
+    '    set -- -c "filter.$gname.clean=cat" -c "filter.$gname.smudge=cat" -c "filter.$gname.process=" -c "filter.$gname.required=false" "$@"',
+    '    gn=$((gn - 1))',
+    '  done',
+    '  git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -c maintenance.auto=false -c commit.gpgsign=false "$@"',
+    '}',
+    'G() { gitx "$ws" "$@"; }',
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
     'had_marker=0',
     'if [ -f "$marker" ] && [ ! -L "$marker" ]; then',
@@ -219,26 +362,97 @@ export async function reapSshRunDirectory(input: {
     '  if [ -L "$ws" ] || [ ! -d "$ws" ]; then keep not_git_backed; fi',
     '  if [ -L "$ws/.git" ] || [ -f "$ws/.git" ]; then keep preserve_failed; fi',
     '  if [ ! -d "$ws/.git" ]; then keep not_git_backed; fi',
-    '  G rev-parse --git-dir >/dev/null 2>&1 || keep preserve_failed',
-    // The run started from the oldest commit HEAD ever pointed at.
-    '  head=$(G rev-parse -q --verify HEAD 2>/dev/null || true)',
-    '  seed=$(G reflog show --format=%H HEAD 2>/dev/null | tail -n 1)',
-    '  if [ -n "$head" ] && [ -z "$seed" ]; then keep preserve_failed; fi',
-    '  : > "$list"',
-    '  stale=$(G for-each-ref --format="%(refname)" "$ns" 2>/dev/null)',
-    '  for r in $stale; do G update-ref -d "$r" || keep preserve_failed; done',
-    '  add_ref() { [ "$2" = "$seed" ] && return 0; G update-ref "$ns/$1" "$2" || keep preserve_failed; echo "$ns/$1" >> "$list"; }',
+    '  if [ -z "$seed" ]; then fail_reason=git_unreadable; fi',
+    '  make_scratch',
+    '  G rev-parse --git-dir >/dev/null 2>&1 || fail "git rev-parse"',
+    '  neutralize_filters "$ws"',
+    // A submodule is a repository of its own, and its commits and tags are not
+    // reached by any check below. Walking nested repositories is more surface than a
+    // throw-away copy is worth, so a folder with a submodule is kept: a .gitmodules
+    // file, a gitlink in the index, or the .git/modules directory of one that was
+    // initialized.
+    '  if [ -e "$ws/.gitmodules" ] || [ -L "$ws/.gitmodules" ] || [ -d "$ws/.git/modules" ]; then keep submodule; fi',
+    '  rd gitlinks "git ls-files" G ls-files --stage',
+    '  if grep -q "^160000 " "$list.gitlinks.body"; then keep submodule; fi',
+    // The commit the run's workspace was uploaded from, as the server recorded
+    // it. It is never taken from the worker's reflog, which an agent can expire.
+    // Without it the directory stays. Every commit that is not reachable from
+    // the seed is the run's own, whatever the reflog says.
+    // Exit 0 is "an ancestor", exit 1 is "not", and any other status is a failed
+    // read, which keeps the directory.
+    '  anc() { G merge-base --is-ancestor "$1" "$2" >/dev/null 2>&1; as=$?; if [ "$as" = 0 ]; then return 0; fi; if [ "$as" = 1 ]; then return 1; fi; fail "git merge-base"; }',
+    '  if [ -z "$seed" ]; then',
+    '    if [ "$legacy" != 1 ]; then keep seed_unknown; fi',
+    // A folder with no seed record, and a caller that has already checked that
+    // its run is dead and old enough. It is removed only when it holds no work that
+    // exists nowhere else, as far as a remote ref can tell: a remote ref is a hint
+    // that the work was pushed, never proof. Any doubt keeps it. Nothing is
+    // bundled: a folder that passes holds nothing to save.
+    '    rd status "git status" G status --porcelain',
+    '    if [ -s "$list.status.body" ]; then keep dirty; fi',
+    '    rd stash "git stash list" G stash list --format=%H',
+    '    if [ -s "$list.stash.body" ]; then keep stash; fi',
+    '    rd trees "git worktree list" G worktree list --porcelain',
+    '    wt=$(grep -c "^worktree " "$list.trees.body" || true)',
+    '    if [ "${wt:-0}" -gt 1 ]; then keep linked_worktree; fi',
+    // Local-only means any ref, not only branches: tags, notes and the stash
+    // count, and so does HEAD. A ref that does not lead to a commit (a tag of a
+    // tree, a ref to a blob) can hold data that exists nowhere else, so it keeps
+    // the folder. Remote refs are left out; they are the hint that work was pushed.
+    '    rd reftypes "git for-each-ref" G for-each-ref "--format=%(objecttype)|%(*objecttype)|%(refname)"',
+    '    while IFS="|" read -r otype ptype ref; do',
+    '      case "$ref" in ""|refs/remotes/*) continue ;; esac',
+    '      case "$otype" in commit) ;; tag) if [ "$ptype" != commit ]; then keep unpushed; fi ;; *) keep unpushed ;; esac',
+    '    done < "$list.reftypes.body"',
+    // The commits that some local ref (or HEAD) reaches and no remote ref does.
+    '    rd unpushed "git rev-list" G rev-list --count --all --not --remotes',
+    '    unpushed_count=$(cat "$list.unpushed.body")',
+    '    case "$unpushed_count" in ""|*[!0-9]*) fail "git rev-list" ;; esac',
+    '    if [ "$unpushed_count" != 0 ]; then keep unpushed; fi',
+    // Every check passed. The folder is marked as holding no unsynced work before
+    // anything is deleted, so a removal that is cut off at its time limit is
+    // finished by the next pass, which then needs no checks and no seed.
+    '    put_marker || { echo "detail marker"; keep rm_failed; }',
+    '    had_marker=1',
+    "  else",
+    // Every read below fails closed: a command that exits non-zero, whose output
+    // lost its end (see rd), or that prints something that is not an object id
+    // where one is due, keeps the directory. HEAD may be unborn (rev-parse exits
+    // 1 and HEAD is a symbolic ref).
+    '  G rev-parse -q --verify HEAD >/dev/null 2>&1; head_status=$?',
+    '  if [ "$head_status" = 0 ]; then',
+    '    rd head "git rev-parse HEAD" G rev-parse -q --verify HEAD',
+    '    head=$(cat "$list.head.body"); isoid "$head" || fail "git rev-parse HEAD"',
+    '  elif [ "$head_status" = 1 ] && G symbolic-ref -q HEAD >/dev/null 2>&1; then',
+    '    head=""',
+    "  else",
+    '    fail "git rev-parse HEAD"',
+    "  fi",
+    '  rd stale "git for-each-ref" G for-each-ref "--format=%(refname)" "$ns"',
+    '  while IFS= read -r r; do if [ -n "$r" ]; then G update-ref -d "$r" || fail "git update-ref"; fi; done < "$list.stale.body"',
+    '  add_ref() { isoid "$2" || fail "git object id"; if anc "$2" "$seed"; then return 0; fi; case "$nl$acc" in *"$nl$ns/$1$nl"*) fail "ref name collision" ;; esac; G update-ref "$ns/$1" "$2" || fail "git update-ref"; acc="$acc$ns/$1$nl"; }',
     '  [ -n "$head" ] && add_ref head "$head"',
-    '  G for-each-ref --format="%(refname)" refs/heads > "$list.heads" || keep preserve_failed',
-    '  while IFS= read -r ref; do',
-    '    obj=$(G rev-parse -q --verify "$ref") || keep preserve_failed',
-    '    if [ -n "$head" ] && G merge-base --is-ancestor "$obj" "$head"; then continue; fi',
-    '    add_ref "${ref#refs/heads/}" "$obj"',
-    '  done < "$list.heads"',
+    // Every local ref, not only branches: a commit that only a tag, a note or any
+    // other ref holds is the run's own work too. A tag is saved as the commit it
+    // points at. A branch keeps its name, any other ref is saved as ref/<name>. A
+    // ref that does not lead to a commit cannot be bundled, so it keeps the directory.
+    '  rd refs "git for-each-ref" G for-each-ref "--format=%(objecttype)|%(objectname)|%(*objecttype)|%(*objectname)|%(refname)"',
+    '  while IFS="|" read -r otype oid ptype poid ref; do',
+    '    case "$ref" in ""|refs/remotes/*|refs/stash|refs/paperclip/preserved/*) continue ;; esac',
+    '    case "$otype" in',
+    '      commit) cid=$oid ;;',
+    '      tag) if [ "$ptype" = commit ]; then cid=$poid; else fail "git ref to a non-commit"; fi ;;',
+    '      *) fail "git ref to a non-commit" ;;',
+    '    esac',
+    '    isoid "$cid" || fail "git for-each-ref"',
+    '    if [ -n "$head" ] && anc "$cid" "$head"; then continue; fi',
+    '    case "$ref" in refs/heads/*) refname="${ref#refs/heads/}" ;; *) refname="ref/${ref#refs/}" ;; esac',
+    '    add_ref "$refname" "$cid"',
+    '  done < "$list.refs.body"',
     '  index=0',
-    '  G stash list --format=%H > "$list.stash" 2>/dev/null || true',
-    '  while IFS= read -r obj; do [ -n "$obj" ] && add_ref "stash-$index" "$obj"; index=$((index + 1)); done < "$list.stash"',
-    '  G worktree list --porcelain > "$list.trees" 2>/dev/null || true',
+    '  rd stash "git stash list" G stash list --format=%H',
+    '  while IFS= read -r obj; do if [ -n "$obj" ]; then add_ref "stash-$index" "$obj"; fi; index=$((index + 1)); done < "$list.stash.body"',
+    '  rd trees "git worktree list" G worktree list --porcelain',
     '  index=0; main=1; tree=""; detached=""; prunable=""; treehead=""',
     '  while IFS= read -r line || [ -n "$line" ]; do',
     '    case "$line" in',
@@ -248,68 +462,122 @@ export async function reapSshRunDirectory(input: {
     '      prunable*) prunable=1 ;;',
     '      "")',
     '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
-    '          changes=$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$tree" status --porcelain 2>/dev/null)',
-    '          if [ -n "$changes" ]; then keep worktree_dirty; fi',
-    '          if [ -n "$detached" ] && [ -n "$treehead" ] && { [ -z "$head" ] || ! G merge-base --is-ancestor "$treehead" "$head"; }; then add_ref "worktree-head-$index" "$treehead"; fi',
+    '          neutralize_filters "$tree"',
+    '          rdkey=$index; rd wtstatus "git status (extra worktree)" gitx "$tree" status --porcelain; rdkey=""',
+    '          neutralize_filters "$ws"',
+    '          if [ -s "$list.wtstatus.$index.body" ]; then keep worktree_dirty; fi',
+    '          if [ -n "$detached" ] && [ -n "$treehead" ]; then',
+    '            wtneed=1; if [ -n "$head" ] && anc "$treehead" "$head"; then wtneed=0; fi',
+    '            if [ "$wtneed" = 1 ]; then add_ref "worktree-head-$index" "$treehead"; fi',
+    "          fi",
     '          index=$((index + 1))',
     '        fi',
     '        main=0; tree="" ;;',
     '    esac',
-    '  done < "$list.trees"',
+    '  done < "$list.trees.body"',
     // Uncommitted work: a snapshot commit of what git tracks or would track.
     // The index file is named relative to the repository, which is `-C workspace`.
-    '  if [ -n "$(G status --porcelain 2>/dev/null)" ]; then',
-    '    idx=../.paperclip-reap-index; rm -f .paperclip-reap-index',
-    '    if [ -n "$head" ]; then GIT_INDEX_FILE="$idx" G read-tree HEAD || keep preserve_failed; fi',
-    '    GIT_INDEX_FILE="$idx" G add -A || keep preserve_failed',
-    '    tree_id=$(GIT_INDEX_FILE="$idx" G write-tree) || keep preserve_failed',
-    '    if [ -n "$head" ]; then snap=$(G commit-tree "$tree_id" -p "$head" -m "Paperclip preserved worktree") || keep preserve_failed; else snap=$(G commit-tree "$tree_id" -m "Paperclip preserved worktree") || keep preserve_failed; fi',
-    '    rm -f .paperclip-reap-index',
+    '  rd status "git status" G status --porcelain',
+    '  if [ -s "$list.status.body" ]; then',
+    '    idx="../$sdir/index"; rm -f -- "$scratch/index"',
+    '    if [ -n "$head" ]; then GIT_INDEX_FILE="$idx" G read-tree HEAD || fail "git read-tree"; fi',
+    '    GIT_INDEX_FILE="$idx" G add -A || fail "git add"',
+    '    tree_id=$(GIT_INDEX_FILE="$idx" G write-tree) || fail "git write-tree"',
+    '    if [ -n "$head" ]; then snap=$(G commit-tree "$tree_id" -p "$head" -m "Paperclip preserved worktree") || fail "git commit-tree"; else snap=$(G commit-tree "$tree_id" -m "Paperclip preserved worktree") || fail "git commit-tree"; fi',
+    '    rm -f -- "$scratch/index"',
     '    add_ref worktree "$snap"',
     '  fi',
+    // The list of refs to save is written once, here, when it is complete.
+    '  printf "%s" "$acc" > "$list" || fail "ref list"',
     '  if [ -s "$list" ]; then',
     '    set --; while IFS= read -r r; do set -- "$@" "$r"; done < "$list"',
     '    if [ -n "$seed" ]; then set -- "$@" "^$seed"; fi',
     // Written inside the confined directory first, then moved into the
     // preserved directory, which is confined the same way.
-    '    G bundle create ../.paperclip-reap.bundle "$@" >/dev/null 2>&1 || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
-    '    size=$(du -k .paperclip-reap.bundle 2>/dev/null | cut -f1); size=${size:-0}',
-    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f .paperclip-reap.bundle; keep preserve_failed; fi`,
-    '    mkdir -p "$preserved" 2>/dev/null || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
-    '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && mv -f -- "$canon/.paperclip-runtime/runs/$id/.paperclip-reap.bundle" "./$id.bundle" ) || { rm -f .paperclip-reap.bundle; keep preserve_failed; }',
-    '    G bundle verify "$bundle" >/dev/null 2>&1 || { keep preserve_failed; }',
+    '    G bundle create "../$sdir/bundle" "$@" >/dev/null 2>&1 || { rm -f -- "$scratch/bundle"; keep preserve_failed; }',
+    '    size=$(du -k "$scratch/bundle" 2>/dev/null | cut -f1); size=${size:-0}',
+    `    if [ "$size" -gt ${PRESERVED_BUNDLE_MAX_KB} ]; then rm -f -- "$scratch/bundle"; keep preserve_failed; fi`,
+    '    mkdir -p "$preserved" 2>/dev/null || { rm -f -- "$scratch/bundle"; keep preserve_failed; }',
+    // What is at the published path: nothing (0), a regular file (4), or anything
+    // else, a link included (2).
+    '    ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
+    '      if [ -L "./$id.bundle" ]; then exit 2; fi',
+    '      if [ -e "./$id.bundle" ]; then if [ -f "./$id.bundle" ]; then exit 4; fi; exit 2; fi',
+    '      exit 0 ); pub=$?',
+    '    if [ "$pub" != 0 ] && [ "$pub" != 4 ]; then rm -f -- "$scratch/bundle"; keep preserve_failed; fi',
+    // An existing bundle is reused, untouched, only when its refs are exactly the
+    // computed ones. Otherwise the new bundle is moved into the preserved
+    // directory under a unique temporary name, verified, flushed to disk, the old
+    // bundle is kept as <id>.superseded.bundle (a hard link, so nothing is
+    // copied), and the new one is renamed into place.
+    '    if [ "$pub" = 4 ] && matches "$bundle"; then',
+    '      rm -f -- "$scratch/bundle"',
+    "    else",
+    '      staged=$( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
+    '        tmp=$(mktemp "./.$id.bundle.XXXXXX") || exit 2',
+    '        mv -f -- "$canon/.paperclip-runtime/runs/$id/$sdir/bundle" "$tmp" || { rm -f -- "$tmp"; exit 2; }',
+    '        echo "$tmp" ) || { rm -f -- "$scratch/bundle"; fail "bundle staging"; }',
+    '      G bundle verify "$canon/.paperclip-runtime/preserved/$staged" >/dev/null 2>&1 || { ( cd "$preserved" 2>/dev/null && rm -f -- "$staged" ); fail "git bundle verify"; }',
+    '      ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
+    // The file is flushed before the rename, and the directory after it, so a
+    // crash cannot leave the directory entry behind a deleted run directory.
+    '        fsync_path "$staged"',
+    '        if [ "$pub" = 4 ]; then ln -f -- "./$id.bundle" "./$id.superseded.bundle" || exit 2; fi',
+    '        mv -f -- "$staged" "./$id.bundle" || exit 2',
+    '        fsync_path .',
+    '        exit 0 ) || { ( cd "$preserved" 2>/dev/null && rm -f -- "$staged" ); fail "bundle publish"; }',
+    "    fi",
+    '    rm -f -- "$scratch/bundle"',
+    '    matches "$bundle" || fail "bundle check"',
     '    while IFS= read -r r; do echo "preserved $r"; done < "$list"',
     "  fi",
+    "  fi",
     "fi",
-    `( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && find . -maxdepth 1 -type f -name '*.bundle' -mtime +${PRESERVED_BUNDLE_RETENTION_DAYS} -exec rm -f -- {} + ) 2>/dev/null || true`,
-    // Directories without owner rwx (a Go module cache, say) would stop rm -rf.
-    // chmod -R does not follow links.
-    'chmod -R u+rwx -- . 2>/dev/null || true',
+    `( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] && find . -maxdepth 1 -type f \\( -name '*.bundle' -o -name '.*.bundle.*' \\) -mtime +${PRESERVED_BUNDLE_RETENTION_DAYS} -exec rm -f -- {} + ) 2>/dev/null || true`,
+    // Directories without owner rwx (a Go module cache, say) would stop the
+    // delete. A per-directory chmod runs before find descends into that
+    // directory. -xdev keeps both passes on the run directory's own filesystem,
+    // so a mount below it keeps its contents (the delete fails on the mount point).
+    ...hook(input.testHooks?.beforeRemove),
+    'find . -xdev -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null || true',
     // Empty the directory we are inside, then remove the marker, then the
     // directory itself from its parent, which must still be the real `runs`.
-    'if find . -mindepth 1 -maxdepth 1 ! -name .paperclip-restored -exec rm -rf -- {} + 2>/dev/null \\',
+    'if find . -mindepth 1 -depth -xdev ! -path ./.paperclip-restored -delete 2>/dev/null \\',
     '  && rm -f -- .paperclip-restored \\',
-    '  && ( cd .. 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/runs" ] && rmdir -- "$id" 2>/dev/null ); then',
+    '  && ( cd .. 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/runs" ] && [ "$(statid "$id")" = "$ino_here" ] && rmdir -- "$id" 2>/dev/null ); then',
     '  echo "removed $kb"',
     "else",
     // A failed removal keeps a restored directory removable. A directory that
     // had no marker never gets one, so the next attempt saves its state again.
-    '  if [ "$had_marker" = 1 ]; then : > .paperclip-restored 2>/dev/null || true; fi',
+    ...hook(input.testHooks?.beforeMarkerRestore),
+    '  if [ "$had_marker" = 1 ]; then put_marker || true; fi',
     '  keep rm_failed',
     "fi",
   ].join("\n");
-  const result = await runSshCommand(input.spec, script, {
-    timeoutMs: input.timeoutMs ?? 10 * 60 * 1000,
-    maxBuffer: 256 * 1024,
-  });
+  const timeoutMs = input.timeoutMs ?? 10 * 60 * 1000;
+  const script = [
+    `body=${q(body)}`,
+    ...(input.testHooks?.beforeBound ? [input.testHooks.beforeBound] : []),
+    `if command -v timeout >/dev/null 2>&1; then exec timeout -k ${REAP_KILL_GRACE_SECONDS} ${Math.ceil(timeoutMs / 1000)} sh -c "$body"; fi`,
+    "echo unbounded",
+  ].join("\n");
+  const result = await runSshCommand(input.spec, script, { timeoutMs, maxBuffer: 256 * 1024 });
   const lines = result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   const preserved = lines.filter((line) => line.startsWith("preserved ")).map((line) => line.slice("preserved ".length));
   const last = lines[lines.length - 1] ?? "";
-  if (last === "absent" || last === "symlink") return { outcome: last };
+  if (last === "absent" || last === "symlink" || last === "unbounded") return { outcome: last };
   const removed = /^removed (\d+)$/.exec(last);
   if (removed) return { outcome: "removed", bytesFreed: Number(removed[1]) * 1024, preserved };
-  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|rm_failed) (\d+)$/.exec(last);
-  if (kept) return { outcome: "kept", reason: kept[1] as SshRunDirectoryKeepReason, bytes: Number(kept[2]) * 1024 };
+  const kept = /^kept (not_git_backed|worktree_dirty|preserve_failed|mount_point|seed_unknown|dirty|unpushed|stash|linked_worktree|submodule|git_unreadable|rm_failed) (\d+)$/.exec(last);
+  if (kept) {
+    const detail = lines.filter((line) => line.startsWith("detail ")).map((line) => line.slice("detail ".length)).pop();
+    return {
+      outcome: "kept",
+      reason: kept[1] as SshRunDirectoryKeepReason,
+      bytes: Number(kept[2]) * 1024,
+      ...(detail && /^[a-z0-9 ()-]{1,60}$/i.test(detail) ? { detail } : {}),
+    };
+  }
   throw new Error("SSH run directory reap returned an unexpected result.");
 }
 
