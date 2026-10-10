@@ -216,22 +216,33 @@ for (const viewport of [{ name: "desktop", width: 1440, height: 900 }, { name: "
       expect(errors).toEqual([]);
     });
 
-    // A popper wrapper Radix left mounted after its content hid: once with the
-    // menu itself hidden, once with the wrapper aria-hidden.
-    for (const variant of ["hidden menu", "aria-hidden wrapper"] as const) {
-      test(`opens over popper content that is mounted but hidden (${variant})`, async ({ page, request }) => {
+    // Popper content Radix left mounted after it hid or closed, content that
+    // does not render, and a DOM check that throws: none of them is an open
+    // popup, so none may keep the launcher closed.
+    for (const variant of ["hidden menu", "aria-hidden wrapper", "closed wrapper", "display none menu", "throwing check"] as const) {
+      test(`opens over popper content that is not really open (${variant})`, async ({ page, request }) => {
         const seed = await seedCompany(request);
         const errors = trackPageErrors(page);
         await page.goto(`/${seed.prefix}/dashboard`);
         await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
-        await page.evaluate((hiddenOn) => {
+        await page.evaluate((stale) => {
           const wrapper = document.createElement("div");
           wrapper.setAttribute("data-radix-popper-content-wrapper", "");
           const menu = document.createElement("div");
           menu.setAttribute("role", "menu");
           menu.setAttribute("data-state", "open");
-          if (hiddenOn === "hidden menu") menu.hidden = true;
-          else wrapper.setAttribute("aria-hidden", "true");
+          menu.textContent = "Stale menu item";
+          if (stale === "hidden menu") menu.hidden = true;
+          if (stale === "aria-hidden wrapper") wrapper.setAttribute("aria-hidden", "true");
+          if (stale === "closed wrapper") wrapper.setAttribute("data-state", "closed");
+          if (stale === "display none menu") menu.style.display = "none";
+          if (stale === "throwing check") {
+            Object.defineProperty(menu, "closest", {
+              value: () => {
+                throw new Error("DOM check failed");
+              },
+            });
+          }
           wrapper.append(menu);
           document.body.append(wrapper);
         }, variant);

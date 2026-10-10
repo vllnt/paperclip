@@ -69,10 +69,25 @@ const OPEN_POPUP_SELECTOR = [
   "[data-radix-popper-content-wrapper] [role='listbox']:not([data-state='closed'])",
 ].join(", ");
 
-// Radix can leave popper content mounted after it hides; hidden or
-// aria-hidden content (or a hidden wrapper) is not open.
+// Radix can leave popper content mounted after it hides or closes. Content
+// counts as open only while it renders and neither it nor an ancestor (such
+// as the popper wrapper) is hidden, aria-hidden or closed.
 function isShownPopup(popup: Element): boolean {
-  return popup.closest("[hidden], [aria-hidden='true']") === null;
+  if (popup.closest("[hidden], [aria-hidden='true'], [data-state='closed']")) return false;
+  if (typeof popup.checkVisibility === "function") return popup.checkVisibility({ checkVisibilityCSS: true });
+  return popup.getClientRects().length > 0;
+}
+
+// A DOM check that throws counts as "not open": a broken check must never
+// trap the keyboard.
+function failOpen(check: (element: Element) => boolean): (element: Element) => boolean {
+  return (element) => {
+    try {
+      return check(element);
+    } catch {
+      return false;
+    }
+  };
 }
 
 /**
@@ -80,8 +95,8 @@ function isShownPopup(popup: Element): boolean {
  * the keyboard until they close, so page shortcuts stay quiet meanwhile.
  */
 export function hasBlockingShortcutDialog(root: ParentNode = document): boolean {
-  if (Array.from(root.querySelectorAll(OPEN_POPUP_SELECTOR)).some(isShownPopup)) return true;
-  return Array.from(root.querySelectorAll(OPEN_DIALOG_SELECTOR)).some(isModalDialog);
+  if (Array.from(root.querySelectorAll(OPEN_POPUP_SELECTOR)).some(failOpen(isShownPopup))) return true;
+  return Array.from(root.querySelectorAll(OPEN_DIALOG_SELECTOR)).some(failOpen(isModalDialog));
 }
 
 function isVisibleShortcutTarget(element: HTMLElement): boolean {
