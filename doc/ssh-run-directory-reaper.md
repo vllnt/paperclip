@@ -230,12 +230,65 @@ instead of the run.
     record is marked before its removal and when a marker is put back after a
     failed removal. If the marker cannot be created, the folder is kept as
     `rm_failed` (`detail` is `marker`) and nothing is deleted.
-  - This closes the writes the script itself makes. The worker user and the SSH
-    user are the same account, so it is a guard against corrupting another run's
-    state or a file the account can write, not a privilege boundary. A process of
-    that account that is still running and swaps the scratch directory while the
-    script works is not covered; the run is terminal and its processes are stopped
-    before the reaper starts.
+  - Noclobber (`set -C`) is on for the whole script, so a plain `>` fails on any
+    name that already exists, a symlink or a hard link included, instead of
+    writing through it. Each scratch file is created once, under a name used once:
+    a read writes its output to `<name>.out`, then writes the final file (its
+    output and the closing count line) in one redirection, and a repeated read (the
+    status of each extra worktree) gets its own name. The list of refs to save is
+    collected in a shell variable and written once. A write that fails keeps the
+    folder as `preserve_failed`, with the read's name as `detail`, and the
+    scratch directory is removed. A name found already taken inside the fresh
+    scratch directory is tampering, and the reap stops. Files that git itself
+    writes (the temporary index, the bundle under construction) are not made by a
+    shell redirection, so noclobber does not cover them; they too are created under
+    fresh names inside the scratch directory.
+  - **Invariant: the scratch directory is a direct child of `runs/<runId>/`.** It
+    is never inside `workspace/` (the agent's working folder, which the agent also
+    controls) and never in `/tmp` or `$TMPDIR` (a shared place, where another
+    user's names live and where a sandboxed agent may have a different view). A
+    test fails if it moves.
+- **Git filters and other config that starts a program.** The agent controls the
+  repository config. Git starts a program for `core.fsmonitor`, for hooks, and for
+  a filter driver (`filter.<name>.clean`, `.smudge`, `.process`) when it hashes a
+  file whose attributes name that driver. That happens on `git add -A`, which the
+  script runs to capture uncommitted work, and on `git status` for a file whose
+  size and time do not settle whether it changed. The script switches off the
+  first two (`core.fsmonitor=false`, `core.hooksPath=/dev/null`) and neutralizes
+  every filter: it lists the driver names with `git config --name-only
+  --get-regexp '^filter[.]'` (reading config runs nothing; this covers the
+  repository's config and the worker user's and the system's), then runs every git
+  command with `filter.<name>.clean=cat`, `.smudge=cat`, `.process=` and
+  `.required=false` for each one. The work is therefore captured as it is on disk,
+  not as the filter would transform it (a Git LFS repository is saved with its real
+  content, not the pointer; a bundle over 1 GiB keeps the folder). Each extra
+  worktree gets the same, from its own config. A config read that fails keeps the
+  folder (`detail` is `git config`). The other keys that start a program were
+  checked against the git commands the script runs (on git 2.51; the canary test
+  keeps checking it): `core.pager`, `pager.<cmd>`, `core.editor`, `sequence.editor`,
+  `core.askPass`, `credential.helper`, `core.sshCommand`, `core.gitProxy`,
+  `remote.<name>.vcs`, `gpg.program`, `gpg.ssh.program`, `commit.gpgsign`,
+  `tag.gpgsign`, `diff.external`, `diff.<name>.command`, `diff.<name>.textconv`,
+  `diff.tool`, `interactive.diffFilter`, `merge.<name>.driver`,
+  `core.alternateRefsCommand`, `uploadpack.packObjectsHook` and
+  `trailer.<token>.command` are not reached: they belong to the network, editing,
+  signing, diff, merge and pager commands, and the script runs none of those.
+  `gc.auto=0` and `maintenance.auto=false` stop an automatic gc or maintenance, and
+  `commit.gpgsign=false` is set although `commit-tree` does not read it.
+- **Threat model.** The reaper defends against names that are already there when
+  it starts (repository content, leftovers of earlier runs, anything a finished
+  run planted) and against a sandboxed agent, one with less access than the SSH
+  user, so that the reaper does not do for it what it cannot do itself (the
+  scratch location and the git filters above). It does not defend against a
+  concurrent process that has the same user's full rights and is running while the
+  reaper works: such a process can plant a link inside the scratch directory, or
+  swap the directory for another one, but it could do the same damage directly,
+  and the reaper gives it nothing extra, since the reaper logs in as the same SSH
+  user on the same host and does not use `sudo` or `su`. That race is an accepted,
+  documented residual. Nothing guarantees that no such process exists: the server
+  records the run as finished (terminal status, a released lease, the minimum age,
+  and no open issue holding it), and an SSH command has no terminal, so a
+  background job started with `nohup`, or a dev server, can outlive the run.
 - **Git reads fail closed.** Every read of the repository before a delete (HEAD,
   the preserved refs, the branches, the stash, the worktree list, and `git status`
   of the workspace and of each extra worktree) must exit 0. Each one is written to

@@ -226,6 +226,10 @@ export async function reapSshRunDirectory(input: {
   const seed = typeof input.seed === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(input.seed) ? input.seed : "";
   const hook = (line: string | undefined) => (line ? [line] : []);
   const body = [
+    // Noclobber for the whole script: a plain > fails on any name that already
+    // exists, a link or a hard link to another file included, instead of writing
+    // through it. A write that fails keeps the folder (see rd and the callers).
+    "set -C",
     `root=${q(root)}; id=${q(input.runId)}; ns=${q(`refs/paperclip/preserved/${input.runId}`)}; seed=${q(seed)}; legacy=${input.legacy && !seed ? 1 : 0}`,
     // The root is resolved once. Everything below is compared with this physical path.
     'canon=$(cd "$root" 2>/dev/null && pwd -P) || { echo absent; exit 0; }',
@@ -254,7 +258,7 @@ export async function reapSshRunDirectory(input: {
     'if [ -z "$ino_here" ]; then echo "kept mount_point 0"; exit 0; fi',
     'if [ -z "$dev_here" ] || [ "$dev_here" != "$dev_runs" ]; then echo "kept mount_point 0"; exit 0; fi',
     'if command -v mountpoint >/dev/null 2>&1 && mountpoint -q . 2>/dev/null; then echo "kept mount_point 0"; exit 0; fi',
-    'ws=workspace; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"; scratch=""; sdir=""; list=""',
+    'ws=workspace; marker=.paperclip-restored; bundle="$canon/.paperclip-runtime/preserved/$id.bundle"; scratch=""; sdir=""; list=""; fi_=0; rdkey=""; mn=0; acc=""; nl=$(printf "\\n."); nl=${nl%.}',
     'kb=$(du -sk . 2>/dev/null | cut -f1); kb=${kb:-0}',
     'keep() { echo "kept $1 $kb"; exit 0; }',
     // Keeps the directory and names the git command that failed.
@@ -283,35 +287,73 @@ export async function reapSshRunDirectory(input: {
     // Threat model: the worker's git is trusted. A git that exits 0 and prints
     // false output is out of scope. Output that is cut short is in scope, and so is
     // a legitimate git state that the logic could misread.
-    // rd NAME LABEL COMMAND...: runs a repository read into a file, ends the file
-    // with a line that names the read and counts the lines before it, and checks
-    // that line before anything uses the output. The data, without that line, is
-    // then in "$list.NAME.body". A read that failed, or whose output lost its end
-    // or some of its lines, keeps the directory.
+    // rd NAME LABEL COMMAND...: runs a repository read, ends its output with a line
+    // that names the read and counts the lines before it, and checks that line
+    // before anything uses the output. The data, without that line, is then in
+    // "$list.NAME.body" ("$list.NAME.$rdkey.body" when a key is set, for a read that
+    // is repeated). A read that failed, or whose output lost its end or some of its
+    // lines, keeps the directory. Every file is created once, under a name used
+    // once, with noclobber: a name that already exists, a link included, is
+    // tampering, and the script keeps the folder instead of writing through it. The
+    // last file is written in one redirection, not appended to.
     'rd() {',
     '  [ -n "$list" ] || fail "scratch directory"',
     '  rname=$1; rlabel=$2; shift 2',
-    '  "$@" > "$list.$rname" 2>/dev/null || fail "$rlabel"',
-    '  rn=$(wc -l < "$list.$rname" | tr -d " ")',
-    '  printf "__PCREAD %s OK %s\\n" "$rname" "$rn" >> "$list.$rname" || fail "$rlabel"',
+    '  rfile="$list.$rname${rdkey:+.$rdkey}"',
+    '  "$@" > "$rfile.out" 2>/dev/null || fail "$rlabel"',
+    '  rn=$(wc -l < "$rfile.out" | tr -d " ")',
+    '  { cat "$rfile.out"; printf "__PCREAD %s OK %s\\n" "$rname" "$rn"; } > "$rfile" || fail "$rlabel"',
     ...hook(input.testHooks?.afterRead),
-    '  rcheck "$rname" "$rlabel"',
+    '  rcheck "$rfile" "$rlabel" "$rname"',
     "}",
     'rcheck() {',
-    '  rtotal=$(wc -l < "$list.$1" | tr -d " ")',
-    '  rlast=$(tail -n 1 "$list.$1")',
+    '  rtotal=$(wc -l < "$1" | tr -d " ")',
+    '  rlast=$(tail -n 1 "$1")',
     '  [ "$rtotal" -ge 1 ] 2>/dev/null || fail "$2 truncated"',
-    '  [ "$rlast" = "__PCREAD $1 OK $((rtotal - 1))" ] || fail "$2 truncated"',
-    '  sed "\\$d" "$list.$1" > "$list.$1.body" || fail "$2"',
+    '  [ "$rlast" = "__PCREAD $3 OK $((rtotal - 1))" ] || fail "$2 truncated"',
+    '  sed "\\$d" "$1" > "$1.body" || fail "$2"',
     "}",
     // Flushes a file, or a directory, to disk. A worker whose sync takes no
     // argument flushes everything.
     'fsync_path() { sync -- "$1" 2>/dev/null || sync; }',
     // True when bundle $1 verifies and its refs are exactly the computed ones:
     // the same number, each at the commit it has now. None missing, moved or extra.
-    'matches() { G bundle verify "$1" >/dev/null 2>&1 || return 1; G bundle list-heads "$1" > "$list.published" 2>/dev/null || return 1; [ "$(grep -c . "$list.published")" = "$(grep -c . "$list")" ] || return 1; while IFS= read -r r; do want=$(G rev-parse -q --verify "$r") || return 1; grep -Fxq "$want $r" "$list.published" || return 1; done < "$list"; }',
-    // A repository config the agent planted must not run commands here.
-    'G() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -C "$ws" "$@"; }',
+    'matches() { mn=$((mn + 1)); G bundle verify "$1" >/dev/null 2>&1 || return 1; G bundle list-heads "$1" > "$list.published.$mn" 2>/dev/null || return 1; [ "$(grep -c . "$list.published.$mn")" = "$(grep -c . "$list")" ] || return 1; while IFS= read -r r; do want=$(G rev-parse -q --verify "$r") || return 1; grep -Fxq "$want $r" "$list.published.$mn" || return 1; done < "$list"; }',
+    // A repository config the agent planted must not run commands here. Git starts
+    // a program for core.fsmonitor and for hooks, and for a filter driver
+    // (filter.<name>.clean, .smudge and .process) when it hashes a file that has a
+    // filter attribute: git add -A, and git status on a file whose size and time
+    // do not settle the question. The first two are switched off. Every filter
+    // driver defined in the config of the repository (the repository's own, the
+    // worker user's and the system's) is replaced by one that does nothing, so the
+    // work is captured as it is on disk. neutralize_filters DIR reads the names
+    // from the config of the repository at DIR, which runs nothing, and gitx DIR
+    // ARGS... runs git there with those overrides. The names are kept in variables
+    // and put in the argument list as separate words, never parsed again.
+    'neutralize_filters() {',
+    '  fi_=0',
+    '  fnames=$(git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$1" config --name-only --get-regexp "^filter[.]" 2>/dev/null); frc=$?',
+    '  if [ "$frc" != 0 ] && [ "$frc" != 1 ]; then fail "git config"; fi',
+    '  oldifs=$IFS; IFS=$nl; set -f',
+    '  for fkey in $fnames; do',
+    '    case "$fkey" in filter.*.*) ;; *) continue ;; esac',
+    '    fname=${fkey#filter.}; fname=${fname%.*}',
+    '    fi_=$((fi_ + 1)); eval "FN_$fi_=\\$fname"',
+    '  done',
+    '  IFS=$oldifs; set +f',
+    '}',
+    'gitx() {',
+    '  gdir=$1; shift',
+    '  set -- -C "$gdir" "$@"',
+    '  gn=$fi_',
+    '  while [ "$gn" -gt 0 ]; do',
+    '    eval "gname=\\$FN_$gn"',
+    '    set -- -c "filter.$gname.clean=cat" -c "filter.$gname.smudge=cat" -c "filter.$gname.process=" -c "filter.$gname.required=false" "$@"',
+    '    gn=$((gn - 1))',
+    '  done',
+    '  git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 -c maintenance.auto=false -c commit.gpgsign=false "$@"',
+    '}',
+    'G() { gitx "$ws" "$@"; }',
     'export GIT_TERMINAL_PROMPT=0 GIT_AUTHOR_NAME=Paperclip GIT_AUTHOR_EMAIL=reaper@paperclip.invalid GIT_COMMITTER_NAME=Paperclip GIT_COMMITTER_EMAIL=reaper@paperclip.invalid',
     'had_marker=0',
     'if [ -f "$marker" ] && [ ! -L "$marker" ]; then',
@@ -323,6 +365,7 @@ export async function reapSshRunDirectory(input: {
     '  if [ -z "$seed" ]; then fail_reason=git_unreadable; fi',
     '  make_scratch',
     '  G rev-parse --git-dir >/dev/null 2>&1 || fail "git rev-parse"',
+    '  neutralize_filters "$ws"',
     // A submodule is a repository of its own, and its commits and tags are not
     // reached by any check below. Walking nested repositories is more surface than a
     // throw-away copy is worth, so a folder with a submodule is kept: a .gitmodules
@@ -385,10 +428,9 @@ export async function reapSshRunDirectory(input: {
     "  else",
     '    fail "git rev-parse HEAD"',
     "  fi",
-    '  : > "$list"',
     '  rd stale "git for-each-ref" G for-each-ref "--format=%(refname)" "$ns"',
     '  while IFS= read -r r; do if [ -n "$r" ]; then G update-ref -d "$r" || fail "git update-ref"; fi; done < "$list.stale.body"',
-    '  add_ref() { isoid "$2" || fail "git object id"; if anc "$2" "$seed"; then return 0; fi; if grep -Fxq "$ns/$1" "$list"; then fail "ref name collision"; fi; G update-ref "$ns/$1" "$2" || fail "git update-ref"; echo "$ns/$1" >> "$list"; }',
+    '  add_ref() { isoid "$2" || fail "git object id"; if anc "$2" "$seed"; then return 0; fi; case "$nl$acc" in *"$nl$ns/$1$nl"*) fail "ref name collision" ;; esac; G update-ref "$ns/$1" "$2" || fail "git update-ref"; acc="$acc$ns/$1$nl"; }',
     '  [ -n "$head" ] && add_ref head "$head"',
     // Every local ref, not only branches: a commit that only a tag, a note or any
     // other ref holds is the run's own work too. A tag is saved as the commit it
@@ -420,8 +462,10 @@ export async function reapSshRunDirectory(input: {
     '      prunable*) prunable=1 ;;',
     '      "")',
     '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
-    '          rd wtstatus "git status (extra worktree)" git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$tree" status --porcelain',
-    '          if [ -s "$list.wtstatus.body" ]; then keep worktree_dirty; fi',
+    '          neutralize_filters "$tree"',
+    '          rdkey=$index; rd wtstatus "git status (extra worktree)" gitx "$tree" status --porcelain; rdkey=""',
+    '          neutralize_filters "$ws"',
+    '          if [ -s "$list.wtstatus.$index.body" ]; then keep worktree_dirty; fi',
     '          if [ -n "$detached" ] && [ -n "$treehead" ]; then',
     '            wtneed=1; if [ -n "$head" ] && anc "$treehead" "$head"; then wtneed=0; fi',
     '            if [ "$wtneed" = 1 ]; then add_ref "worktree-head-$index" "$treehead"; fi',
@@ -443,6 +487,8 @@ export async function reapSshRunDirectory(input: {
     '    rm -f -- "$scratch/index"',
     '    add_ref worktree "$snap"',
     '  fi',
+    // The list of refs to save is written once, here, when it is complete.
+    '  printf "%s" "$acc" > "$list" || fail "ref list"',
     '  if [ -s "$list" ]; then',
     '    set --; while IFS= read -r r; do set -- "$@" "$r"; done < "$list"',
     '    if [ -n "$seed" ]; then set -- "$@" "^$seed"; fi',
