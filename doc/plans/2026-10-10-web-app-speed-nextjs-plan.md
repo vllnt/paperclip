@@ -3,7 +3,7 @@
 Date: 2026-10-10
 Status: Plan only. No code ships with this pull request. Implementation starts after the plan is approved.
 Branch: `docs/web-app-speed-nextjs-plan`
-Builds on: #50 (web-perf plan and the harness `tests/perf/web-app/`), #53, #54, #57, #68, #87 (open), #84 (merged), and the keyboard work in #86 and #95 (open).
+Builds on: #50 (web-perf plan and the harness `tests/perf/web-app/`), #53, #54, #57, #68, #87 (open), #84 (merged), and the keyboard work in #86 (merged as `d47df97f0`, after B0) and #95 (open).
 
 ## 0. The answer in short
 
@@ -15,7 +15,7 @@ Builds on: #50 (web-perf plan and the harness `tests/perf/web-app/`), #53, #54, 
    |---|---|---|---|
    | Cold load, board LCP | 2,736 ms [M50] | 1,672 ms [M50] | about 1,530 ms first visit (about 1,360 ms with S10); 0.5-0.7 s repeat visit on the same build [D] |
    | Cold load, issue with 400 comments, TTI (quiet window) | 6,808 ms [M50] | 4,751 ms [M50] | 2,500 ms or less (target) |
-   | Network wait after a click or Enter, first visit | 70-210 ms [D] | 125-275 ms [D] | 0 ms when the hover or highlight came 120-190 ms before; 70-140 ms otherwise [D] |
+   | Network wait after a click or Enter, first visit | 70-210 ms [D] | 125-275 ms [D] | 0 ms when the hover or highlight came 120-163 ms before; 70-140 ms otherwise [D] |
    | Network wait on a revisit | 0 ms within 5 min, then a full fetch [D] | same | 0 ms [D] |
 
    The measured B1 column is #57 plus #68 only (#50 section 10.2). Every warm navigation also pays the client render of the new page, about 80-240 ms at 2x CPU [D]. No option removes that cost; slices S6 and S9 reduce it.
@@ -63,7 +63,7 @@ Builds on: #50 (web-perf plan and the harness `tests/perf/web-app/`), #53, #54, 
 ## 2. The two baselines
 
 - **B0** is `main` at `38819d350`.
-- **B1** is B0 plus #53 (issue polling), #54 (no refetch of instance-level queries when the socket opens), #57 (precompressed br/gz assets), #68 (lazy route chunks and an initial-JS budget), and #87 (live-run placeholder size). All five are open and have the same author as #50. #84 is already in B0.
+- **B1** is B0 plus #53 (issue polling), #54 (no refetch of instance-level queries when the socket opens), #57 (precompressed br/gz assets), #68 (lazy route chunks and an initial-JS budget), and #87 (live-run placeholder size). All five are open and are part of the #50 web-perf series. #84 is already in B0.
 
 Every option below is compared with **B1**, not B0, so that no framework gets credit for work that the open PRs already do.
 
@@ -253,7 +253,7 @@ Levels after the page starts to render (warm navigation), from the waterfall rea
 | Every page, cold | The page chunk loads after the gate, then the data (B1 adds one level) | section 3.2 | S4 (loaders start data with the chunk) |
 | Every page, cold | The shell fetches the user's 500 issues and 200 runs for the inbox badge on every page; the socket open refetches all page data | `ui/src/hooks/useInboxBadge.ts:180-257`; `ui/src/context/LiveUpdatesProvider.tsx:2064-2066` | S6 (count-only badge source is #50 item 10); S4 (skip the open refetch for queries fetched in the last few seconds) |
 | Every page, warm | No prefetch except issue links; keyboard paths never prefetch; no feedback while the chunk loads | sections 3.3, 5.2 | S4, S5 |
-| Issue detail | Usable at 4.75 s on `wan` (B1): many polls (1 s live runs on B0), unbounded activity and runs lists, 12 run-log reads, up to 150 comments auto-loaded page by page, a 117 + 68 KB chunk, a `documents/plan` probe that returns 404 on every open | [M50]; autoload limit `ui/src/pages/IssueDetail.tsx:440`; 1 s poll `:1473`; plan probe `ui/src/hooks/useIssuePlanDocument.ts:14-26`, used at `IssueDetail.tsx:3707`; unbounded `forIssue` and `runsForIssue` in `server/src/services/activity.ts:378-389, 391-447` | #53 (B1), S6 |
+| Issue detail | TTI (quiet window) 4.75 s on `wan` (B1, measured without #53): many polls (1 s live runs on B0), unbounded activity and runs lists, 12 run-log reads, up to 150 comments auto-loaded page by page, a 117 + 68 KB chunk, a `documents/plan` probe that returns 404 on every open | [M50]; autoload limit `ui/src/pages/IssueDetail.tsx:440`; 1 s poll `:1473`; plan probe `ui/src/hooks/useIssuePlanDocument.ts:14-26`, used at `IssueDetail.tsx:3707`; unbounded `forIssue` and `runsForIssue` in `server/src/services/activity.ts:378-389, 391-447` | #53 (B1), S6 |
 | Tasks board | 8 issue-list requests (7 × 200 rows plus the list query); a status change or a new issue refetches all columns (#84 narrowed the other changes); the drag is not optimistic and refetches all 7 columns; a gap of about 1 s between first paint and LCP on `wan` that round trips do not explain | `ui/src/pages/Issues.tsx:274` (the list query is enabled in board mode too), `:290-296` (drag); `ui/src/components/NewIssueDialog.tsx:672`; [M50] | #84 (merged), S6, S9; the gap is traced in S1 |
 | Inbox | Waits for all 7 queries; 3 × 500 issues plus 200 runs; the badge fetches the same 500 rows under another key | `ui/src/pages/Inbox.tsx:2388-2395`; `ui/src/hooks/useInboxBadge.ts:225-243` | S6 |
 | Dashboard | A 500-row issue list with no limit; the live-run panel mounts only after the summary, and its cards fetch issue detail one level later; layout shift on mobile | `ui/src/pages/Dashboard.tsx:189-193`; #87 | #87 (B1), S6 |
@@ -261,7 +261,7 @@ Levels after the page starts to render (warm navigation), from the waterfall rea
 | Run transcript | 8 levels deep: the run is never fetched by its id | `ui/src/pages/AgentDetail.tsx:3306-3313` | S6 |
 | Project detail | Issue list with no limit, mounted only after the project loads | `ui/src/pages/ProjectDetail.tsx:221-225, 861-863` | S4 (start both at once), S6 |
 | Settings pages | No loading state; gates render nothing while they load | section 4.1 | S5 |
-| Filter popover (board, list) | One 460 ms task at 4x CPU: mounts about 393 components | section 5.3 | S9 |
+| Filter popover (board, list) | The worst INP on the board and the list (136 ms and 108 ms at 4x CPU, [M50]); opening it mounts every filter option at once | section 5.3; `ui/src/components/IssueFiltersPopover.tsx` | S9 |
 
 ## 6. Options, compared with evidence
 
@@ -283,12 +283,12 @@ What it adds on top of B1 (slices in section 9):
 
 1. **Boot without serial identity calls (S3).** A small boot script that runs before the entry chunk starts the five boot GETs at once (session, health, experimental settings, company list, board access) and hands their promises to the Query cache. Preload hints alone do not work here: the app's fetch wrapper adds `Content-Type`, `X-Paperclip-Tab-Visible` and `X-Paperclip-Route` (`ui/src/api/client.ts:37-55`), a `<link rel=preload>` cannot send headers, and Chromium does not reuse a preload whose request headers differ, so every call would run twice. The company list is stored under the account key only after the session answers, as `ui/src/api/companies-query.ts:60-95` requires. The company id is then resolved from the URL prefix with that list in the same tick, and page queries start at the first render. Removes A1 and A2 from the serial path: **-140 ms on `wan`, -160 ms on `slow`, -360 ms on `mobile`** [D, 2 × (RTT + S)]. No user data goes into the HTML. The script is inline today; if a CSP is added later it needs a hash.
 2. **Route intent registry (S4).** One small module maps each top route to its chunk import and its query options. The router wrapper (`ui/src/lib/router.tsx`) calls it on hover (after a dwell of about 50 ms), on keyboard focus, on touch start, and at navigation time. The launcher calls it when a row has been highlighted for about 50 ms (a debounce for fast arrowing). At navigation time the data starts together with the chunk (a client-side loader), so the chunk no longer delays the data. The wrapper owns most links, but 16 non-test files import `react-router-dom` directly (for example `IssueLinkQuicklook`, `CommentThread`, `CompanySettings`, `plugins/bridge.ts`); S4 moves them to the wrapper or lists them, and adds a lint rule.
-   - With a lead of at least the dwell plus max(chunk, data), 120-190 ms for the top routes: network wait after the input **0 ms** for one-level pages [D].
+   - With a lead of at least the dwell plus max(chunk, data), 120-163 ms for the top routes: network wait after the input **0 ms** for one-level pages [D]. A two-level page (agent overview until S6 flattens it) still waits for its second level after the click, because the prefetch fetches the first level only.
    - Without intent (chords, fast clicks): wait = max(chunk, data) instead of chunk + data: **board 93 ms (was 134), issue 113 (was 183), agent overview 140 (was 204)** [D].
    - Limits, so that prefetch does not load the server: prefetch only queries that are stale; only the first level of a page; at most one route prefetch in flight, aborted when the pointer leaves or the highlight moves. S1 records API calls per minute during a hover sweep over the board and the sidebar.
    - #50 found that *idle* prefetch of many chunks cost 2 s of TTI, and that a boot preload of the open route cost 250 ms of FCP. Intent prefetch of one route is a different thing, but it must pass its own A/B (#50 section 10.5 lists it as not measured).
 3. **Immediate feedback and matching skeletons (S5).** The layout stays mounted. Each route gets a skeleton that has the final layout's shape. A navigation that is not ready within about 100 ms shows the skeleton instead of an empty or unchanged page area. React Router has a `useTransitions` prop (unstable from 7.10.0, stable from 7.15.0; it works on `BrowserRouter`); `useTransitions={false}` stops wrapping router updates in a transition. A per-route Suspense boundary is the other way. The spike compares both.
-4. **Query cache that survives a reload (S7).** Longer `gcTime` for top-route data, and an opt-in persisted cache. It is keyed by **user id and company id**, and it renders only after the boot session call confirms the same user (that call runs in parallel with the JavaScript, so it costs no extra level). It is cleared on any 401, on a change of user, on sign-out and on loss of company access. It is stamped with a data-schema version, not the build id, so that it survives deploys. A repeat load renders the last data and refreshes it in the background: **board LCP about 0.5-0.7 s on `wan` on the same build** (warm HTTP cache: one round trip plus 386 ms of evaluation, plus render) **and about 0.7-0.9 s after a deploy** (B1's cold FCP of 620-664 ms plus render) [D].
+4. **Query cache that survives a reload (S7).** Longer `gcTime` for top-route data, and an opt-in persisted cache. It is keyed by **user id and company id**, and it renders only after the boot session call confirms the same user (that call runs in parallel with the JavaScript, so it costs no extra level). It is cleared on any 401, on a change of user, on sign-out and on loss of company access. It is stamped with a data-schema version, not the build id, so that it survives deploys. The version is a constant in `packages/shared`, next to the API types, compiled into the UI bundle; a CI test hashes the response types of the persisted query roots and fails when they change without a version bump. On a mismatch the cache is dropped, never rendered. A repeat load renders the last data and refreshes it in the background: **board LCP about 0.5-0.7 s on `wan` on the same build** (warm HTTP cache: one round trip plus 386 ms of evaluation, plus render) **and about 0.7-0.9 s after a deploy** (B1's cold FCP of 620-664 ms plus render) [D].
 5. **Named slow-page fixes (S6)** and **render work (S9)**, which every option needs.
 
 Expected after B (`wan`): see section 6.5. Cost: 9 slices, mostly small or medium, each one revertible on its own. Risk: low to medium. The persisted cache keeps company data in the browser; that needs a decision (open question 3). What breaks: nothing structural. Plugins, the socket, optimistic updates, tests and deploy stay as they are.
@@ -306,7 +306,7 @@ Status as of 2026-10-10:
 Two steps:
 
 1. **C1, SPA mode (`ssr: false`) with `clientLoader`:** loaders, pending UI with `useNavigation`, and framework conventions. It works on v7; v8 is the better base because v7 gets security fixes only. It needs a move of 242 routes from `App.tsx` into route modules. `<Link prefetch="intent">` prefetches route modules and server loader data on hover and focus, but it does not run `clientLoader`, so C1 still needs B's Query prefetch for data. It adds no speed over B by itself.
-2. **C2, server rendering:** the HTML has the page content, so the first pixels come before the JavaScript. Cold load LCP **about 0.3-0.5 s on `wan`, 0.4-0.7 s on `slow`, about 1 s on `mobile`** [D, ceiling]. The page is not usable until the JavaScript has loaded and hydrated: usable time stays close to B's (section 6.5). Warm navigation with server loaders: close to 0 ms network wait with `<Link prefetch="intent">` and enough lead (one server loader call per prefetch), and 100-250 ms without intent [D].
+2. **C2, server rendering:** the HTML has the page content, so the first pixels come before the JavaScript. Cold load LCP **about 0.3-0.5 s on `wan`, 0.4-0.7 s on `slow`, about 1 s on `mobile`** [D, ceiling]. The page is not usable until the JavaScript has loaded and hydrated: usable time stays close to B's (section 6.5). Warm navigation with server loaders: close to 0 ms network wait with `<Link prefetch="intent">` and enough lead (one server loader call per prefetch), and 100-250 ms without intent [D]. The intent prefetch uses `<link rel="prefetch">`; whether the click reuses it depends on the loader's cache headers (a `no-store` response is not reused) and on the browser. To verify in a C2 spike.
 
 Cost: C1 about 4 to 6 pull requests (route modules, loaders, and the v8 upgrade if it is done here); C2 about 5 to 8 more (server entry in Express, a server-safety audit of 1,331 non-test lines in `ui/src` that match `\b(window|document|localStorage|sessionStorage)\.|matchMedia\(`, hydration of the Query cache, plugin placeholders). Risk: medium (C1), high (C2). What breaks: route definitions move; every module that reads browser globals at import or render time must be made safe for the server; hydration mismatches appear as console errors.
 
@@ -340,7 +340,7 @@ Cold load, LCP. First visit / repeat visit on the same build.
 How the B column is derived:
 
 - **First visit** = measured B1 minus the serial wait that S3 and S4 remove. On the fixture (`local_trusted`) B1 waits A1 + max(A2, chunk) + A3; B waits max(chunk, A3). On `wan` that saves 140 ms on every route (the issue page waits A1 + chunk + data, because its queries do not need the company; the saving is the same). In `authenticated` mode B1 also waits for the chunk after A2, so the saving there is 140 ms + min(chunk, A3): 181-210 ms.
-- **S10** (initial JS below 1,000 KB gzip) cuts about 435 KB gzip, which is about 352 KB brotli and 1,460 KB raw: about -170 ms on `wan`, -540 ms on `slow`, -1.95 s on `mobile`, transfer plus evaluation [D].
+- **S10** (initial JS below 1,000 KB gzip) cuts about 435 KB gzip from the first load (this assumes the measured route does not need the trimmed code; code moved into a route's own chunk still loads for that route), which is about 352 KB brotli and 1,460 KB raw: about -170 ms on `wan`, -540 ms on `slow`, -1.95 s on `mobile`, transfer plus evaluation [D].
 - **Repeat visit on the same build** = one round trip for the HTML + 386 ms of evaluation at 2x (the JavaScript comes from the HTTP cache) + 80-240 ms of render from the persisted cache (S7). **After a deploy** the JavaScript is new, so it is B1's cold FCP (620-664 ms) plus render: 0.7-0.9 s, and only if the cache is stamped with a data-schema version (section 6.2).
 - **`slow`** uses the same steps with 80 ms levels (saving 160 ms).
 - **`mobile`** is not measured. The B1 value is 2 round trips (300 ms) + 5,649 ms of JS transfer + 772 ms of evaluation at 4x + 1,272 ms of levels and payload (A1 + max(A2, chunk) + A3, with 732 ms for the board's 150 KB of lists), before render. B waits max(chunk, A3) = 912 ms instead of 1,272 ms.
@@ -358,10 +358,10 @@ Warm navigation, network wait after the input, first visit (render of 80-240 ms 
 
 | Route | B1 | B, lead of dwell + max(chunk, data) or more | B, no intent | C2 or A, with intent prefetch | C2 or A, no intent |
 |---|---|---|---|---|---|
-| Board | 134 ms | 0 ms (lead 143 ms) | 93 ms | about 0 ms, one server render per prefetch | 100-250 ms |
+| Board | 134 ms | 0 ms (lead 143 ms) | 93 ms | about 0 ms, one server render per prefetch (reuse to verify) | 100-250 ms |
 | Issue detail | 183 ms (113 if hovered) | 0 ms (lead 163 ms) | 113 ms | same | 100-250 ms |
 | Inbox | 161 ms | 0 ms (lead 157 ms) | 107 ms | same | 100-250 ms + 37 ms payload |
-| Agent detail, overview | 204 ms | 0 ms (lead 190 ms) | 140 ms (70 after S6 flattens it) | same | 100-250 ms |
+| Agent detail, overview | 204 ms | 70 ms until S6 (first level only); 0 ms after S6 flattens it (lead 120 ms) | 140 ms (70 after S6) | same | 100-250 ms |
 | Run transcript | 274 ms | 0 ms after S6 (lead 120 ms) | 70 ms after S6 fetches the run by id | same | 100-250 ms |
 | Any revisit | 0 ms within 5 min, else as first visit | 0 ms | 0 ms | 0 ms if cached on purpose | 100-250 ms |
 
@@ -374,7 +374,7 @@ INP: the same in every option. Only S9 changes it.
 | Constraint | Today | B | C2 (server rendering) | A (Next.js) |
 |---|---|---|---|---|
 | **Deploy** | One Express process serves UI, API, socket and plugin bundles. Read-only root file system, 2 GB memory limit, 1.5 GB heap, 2 CPUs (`deploy/compose.yaml`) | No change | A request handler inside Express: still one process; server render CPU now comes from the same 2 CPUs that run the orchestration | Either a custom server inside Express (one process; standalone output cannot be used with a custom server) or `next start` as a second process with a proxy for `/api`, `/_plugins` and the socket. Runtime writes need a writable mount on a read-only file system (to verify) |
-| **Auth and company scope** | Cookie session (better-auth); `actorMiddleware` (`server/src/middleware/auth.ts:227`); `assertCompanyAccess` (`server/src/routes/authz.ts:75-121`), called 269 times in 51 other route files; non-GET Origin guard (`server/src/middleware/board-mutation-guard.ts`) | No change | Server code must enforce the same company boundaries | Same as C2, for every server component and server function |
+| **Auth and company scope** | Cookie session (better-auth); `actorMiddleware` (`server/src/middleware/auth.ts:227`); `assertCompanyAccess` (`server/src/routes/authz.ts:75-121`), called 269 times in 52 other route files; non-GET Origin guard (`server/src/middleware/board-mutation-guard.ts`) | No change | Server code must enforce the same company boundaries | Same as C2, for every server component and server function |
 | **Data path** | Browser calls the REST API | Same REST API | **Recommendation for C2 and A: server code calls the same REST API in process, with the user's cookie.** This keeps one authorization path and the web, API and CLI parity rule. Calling services directly would copy the authorization checks and drift. The in-process call costs about 1-3 ms instead of a 40 ms round trip, which is the real win of server rendering | Same recommendation. Every Server Function is a public endpoint that must do its own access checks (React Router v8.4.0 docs say the same) |
 | **Websocket and optimistic updates** | One socket per company page; events invalidate or patch Query keys; optimistic updates through `onMutate` and `setQueryData` | No change | Unchanged after hydration | Live surfaces must stay client components with Query. A server component would need a full server re-render (`router.refresh()`) per event |
 | **Plugin UI slots** | 20 slot types. Bundles are fetched at run time, rewritten to Blob-URL modules, and share the host React through a global bridge; host hooks use browser state, router hooks, `window` and `EventSource` (`ui/src/plugins/slots.tsx:259-455`, `ui/src/plugins/bridge-init.ts:71-90`) | No change | Render a placeholder of reserved size on the server; mount the plugin after hydration | Same as C2, plus a shim that maps the bridge's React Router hooks to Next.js navigation, or the plugin SDK contract breaks |
@@ -399,7 +399,7 @@ INP: the same in every option. Only S9 changes it.
 | INP, any scripted interaction | 4x CPU | 36-136 ms (B0, Mac, [M50]) | < 200 ms | S9 |
 | Initial JS | build | 1,435 KB gzip | < 1,000 KB gzip; budget lowered in the same PR | S10 (trim `app-core`) |
 | Top-route chunk | build | up to 117 + 68 KB gzip (issue) | < 60 KB gzip each; issue < 100 KB | S6, S10 |
-| Layout shift | `desktop`, `mobile` | board 0.10 (B0, [M50]); phone-size dashboard, first visit: 0.001-0.253 with #87, 0.001-0.384 on `main`, by number of live runs; 0.000-0.003 on later visits (#87 body) | < 0.05 | #87, S5 |
+| Layout shift | `desktop`, `mobile` | board 0.10 (B0, [M50]); phone-size dashboard, first visit: 0.001-0.253 with #87, 0.001-0.384 on `main`, by number of live runs; 0.000-0.002 on later visits (#87 body) | < 0.05 | #87, S5 |
 
 Why these numbers: 1.0 s and 1.5 s are where people stop noticing a wait for a page that they asked for; 200 ms is the edge of "instant" for a click; 100 ms for typing keeps keys from feeling late. `laptop` is the main target for warm navigation because the 2x CPU of `wan` adds render cost that most users' machines do not have; the `wan` numbers are still reported.
 
@@ -449,7 +449,7 @@ Each slice is one pull request from `main`, with before and after tables from th
 | S3 | Boot: an early boot script starts the five boot calls in parallel; company id from the URL prefix with the boot list | S | cold -140 ms `wan`, -160 `slow`, -360 `mobile` [D] | harness cold, `authenticated` | revert |
 | S4 | Route intent registry and loaders for tier 1 and 2 routes; router wrapper and launcher hooks; the 16 direct `react-router-dom` importers moved behind the wrapper, plus a lint rule; prefetch limits (stale only, first level, one in flight, abort on leave); skip the socket-open refetch of data fetched in the last few seconds | M | first-visit wait 0 ms with intent; max(chunk, data) without | new warm-navigation probe | setting off, or revert |
 | S5 | Loading states: skeletons with the final layout per route; feedback within one frame; no blank gates; runs tab and settings states; space reserved for board columns (#50 item E) | M | no empty or unchanged page area; CLS < 0.05 | screenshots, CLS, probe | revert |
-| S6 | Slow pages: issue page (run-log reads on demand, first comment page only, unbounded lists bounded, chunk split), run fetched by id, inbox waits for its main list only, dashboard and project lists bounded, agent overview flattened | M × 3 | issue usable < 2.5 s on `wan`; transcript 8 → 6 levels | harness | revert per PR |
+| S6 | Slow pages: issue page (run-log reads on demand, first comment page only, unbounded lists bounded, chunk split), run fetched by id, inbox waits for its main list only, dashboard and project lists bounded, agent overview flattened | M × 3 | issue TTI (quiet window) < 2.5 s on `wan`, plus S1's usable time reported; transcript 8 → 6 levels | harness | revert per PR |
 | S7 | Query cache: longer `gcTime` for top routes; persisted cache keyed by user and company, shown only after the session confirms the user, schema-stamped, opt-in first | M | repeat LCP about 0.5-0.7 s on `wan` on the same build, 0.7-0.9 s after a deploy [D]; revisits always from cache | harness repeat visit, plus a test that a second user never sees the first user's data | setting off |
 | S8 | HTTP and service worker: navigation preload or no fetch handler for navigations; cacheable promo image; font caching | S | removes the worker start from navigations [not measured] | harness | revert |
 | S9 | Render work: memoization (#50 item F), lazy filter options, launcher typing | M | INP < 100 ms `desktop`; open filter well under 200 ms at 4x | `interact.mjs` | revert |
@@ -507,14 +507,14 @@ The numbers that decide:
 | 4 | Boot data: an early boot script, preload hints, or data in the HTML? | An early boot script. Preload hints only if the boot GETs drop the custom headers and S2 shows that Chromium reuses them. No user data in `index.html` in either case |
 | 5 | On a slow navigation, keep the old page until the new one is ready, or show the skeleton at once? | Show the skeleton when the target is not ready within about 100 ms; measure both in S2 |
 | 6 | Should the launcher prefetch the highlighted row? | Yes, once a row has been highlighted for 50 ms (a debounce for fast arrowing), at most one prefetch in flight, top result included |
-| 7 | Upgrade to React Router v8 now? v7 gets security fixes only. | A separate small PR after B1. B does not need it; C does |
+| 7 | Upgrade to React Router v8 now? v7 gets security fixes only. | A separate small PR after B1. B does not need it; C prefers it (C1 also works on v7) |
 | 8 | Collect real-user timings? | Not now. It would be a Telemetry or Observability change (AGENTS.md section 5, rule 7) with its own review. Revisit if the fixture and production disagree |
-| 9 | Who implements? | The author of #50 and B1 for S1 and S3-S10, with the launcher hook in S4 coordinated with the author of #86 and #95 |
+| 9 | Who implements? | The owner of the #50 web-perf series for S1 and S3-S10, with the launcher hook in S4 coordinated with the launcher series (#86, #95) |
 
 ## 12. Coordination
 
-- #50, #53, #54, #57, #68 and #87 have one author. This plan does not change them. It depends on them landing (S0).
-- #86 and #95 (launcher, action registry, launcher replacing the search page) have their own author. S4 adds one call from the launcher's highlighted row to the route intent registry, after those PRs merge.
+- #50, #53, #54, #57, #68 and #87 form the web-perf series of #50. This plan does not change them. It depends on them landing (S0).
+- #86 (launcher and action registry, merged as `d47df97f0`) and #95 (launcher replacing the search page, open) are the launcher series, reviewed on their own. S4 adds one call from the launcher's highlighted row to the route intent registry, after #95 merges.
 - `DESIGN.md` and the token gates apply to the skeletons in S5.
 - The harness stays opt-in (AGENTS.md section 7). No browser suite becomes part of the default `pnpm test`.
 
