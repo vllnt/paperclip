@@ -19,14 +19,15 @@ async function act(callback: () => void | Promise<void>) {
 }
 
 const navigateMock = vi.fn();
-const routinesListMock = vi.fn<(companyId: string) => Promise<RoutineListItem[]>>();
+const routinesListMock = vi.fn<(companyId: string, filters?: Record<string, unknown>) => Promise<RoutineListItem[]>>();
+const setSearchParamsMock = vi.fn();
 const foldersListMock = vi.fn<(companyId: string, kind: string) => Promise<FolderListResult>>();
 const issuesListMock = vi.fn<(companyId: string, filters?: Record<string, unknown>) => Promise<Issue[]>>();
 const markdownEditorRenderMock = vi.fn((props: { mentions?: Array<{ id: string; name: string }> }) => props);
 const issuesListRenderMock = vi.fn(({ issues }: { issues: Issue[] }) => (
   <div data-testid="issues-list">{issues.map((issue) => issue.title).join(", ")}</div>
 ));
-const inlineEntitySelectorRenderMock = vi.fn((props: { options?: Array<{ id: string }> }) => props);
+const inlineEntitySelectorRenderMock = vi.fn((props: { options?: Array<{ id: string }>; value?: string }) => props);
 
 vi.mock("@/lib/router", () => ({
   Navigate: ({ to }: { to: string }) => <a data-redirect href={to}>Redirect</a>,
@@ -37,11 +38,13 @@ vi.mock("@/lib/router", () => ({
   ),
   useNavigate: () => navigateMock,
   useLocation: () => ({ pathname: "/routines", search: currentSearch ? `?${currentSearch}` : "", hash: "" }),
-  useSearchParams: () => [new URLSearchParams(currentSearch), vi.fn()],
+  useSearchParams: () => [new URLSearchParams(currentSearch), setSearchParamsMock],
 }));
 
+let currentCompanyId = "company-1";
+
 vi.mock("../context/CompanyContext", () => ({
-  useCompany: () => ({ selectedCompanyId: "company-1" }),
+  useCompany: () => ({ selectedCompanyId: currentCompanyId }),
 }));
 
 vi.mock("../context/BreadcrumbContext", () => ({
@@ -54,7 +57,7 @@ vi.mock("../context/ToastContext", () => ({
 
 vi.mock("../api/routines", () => ({
   routinesApi: {
-    list: (companyId: string) => routinesListMock(companyId),
+    list: (companyId: string, filters?: Record<string, unknown>) => routinesListMock(companyId, filters),
     create: vi.fn(),
     update: vi.fn(),
     run: vi.fn(),
@@ -262,7 +265,7 @@ vi.mock("../components/MarkdownEditor", () => ({
 }));
 
 vi.mock("../components/InlineEntitySelector", () => ({
-  InlineEntitySelector: (props: { options?: Array<{ id: string }> }) => {
+  InlineEntitySelector: (props: { options?: Array<{ id: string }>; value?: string }) => {
     inlineEntitySelectorRenderMock(props);
     return <button type="button">selector</button>;
   },
@@ -384,8 +387,11 @@ describe("Routines page", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     currentSearch = "";
+    currentCompanyId = "company-1";
+    window.history.replaceState(null, "", "/routines");
     navigateMock.mockReset();
     routinesListMock.mockReset();
+    setSearchParamsMock.mockReset();
     foldersListMock.mockReset();
     foldersListMock.mockResolvedValue({
       kind: "routine",
@@ -838,6 +844,197 @@ describe("Routines page", () => {
 
     await act(async () => {
       secondRoot.unmount();
+    });
+  });
+
+  async function renderRoutines(element: ReactNode, waitForText?: string) {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(<QueryClientProvider client={queryClient}>{element}</QueryClientProvider>);
+      await flush();
+    });
+    for (let attempts = 0; attempts < 5 && waitForText && !container.textContent?.includes(waitForText); attempts += 1) {
+      await act(async () => {
+        await flush();
+      });
+    }
+    return root;
+  }
+
+  it("sends the URL filters to the routine list API and offers to clear them when nothing matches", async () => {
+    currentSearch = "q=weekly&status=paused&trigger=manual&agent=33333333-3333-4333-8333-333333333333";
+    routinesListMock.mockResolvedValue([]);
+    issuesListMock.mockResolvedValue([]);
+
+    window.history.replaceState(null, "", `/routines?${currentSearch}&folder=unfiled`);
+    const root = await renderRoutines(<Routines />, "No routines match");
+
+    expect(routinesListMock).toHaveBeenCalledWith("company-1", {
+      q: "weekly",
+      status: "paused",
+      trigger: "manual",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+    });
+    expect(container.textContent).toContain("No routines match these filters");
+    const clear = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Clear filters"));
+    expect(clear).toBeTruthy();
+    await act(async () => {
+      clear!.click();
+    });
+    // The write starts from the browser URL, so it keeps parameters that are not filters.
+    const update = setSearchParamsMock.mock.calls.at(-1)?.[0] as () => URLSearchParams;
+    const cleared = update();
+    expect(["q", "status", "trigger", "agent"].map((key) => cleared.get(key))).toEqual([null, null, null, null]);
+    expect(cleared.get("folder")).toBe("unfiled");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("shows archived routines when the status filter asks for them", async () => {
+    currentSearch = "status=archived";
+    routinesListMock.mockResolvedValue([createRoutine({ id: "routine-2", title: "Archived cleanup", status: "archived" })]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(<Routines />, "Archived cleanup");
+
+    expect(routinesListMock).toHaveBeenCalledWith("company-1", { status: "archived" });
+    expect(container.textContent).toContain("Archived cleanup");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("writes the search box to the q URL parameter after a short pause", async () => {
+    routinesListMock.mockResolvedValue([createRoutine({ id: "routine-1", title: "Morning sync" })]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(<Routines />, "Morning sync");
+
+    expect(routinesListMock).toHaveBeenCalledWith("company-1", {});
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="Search routines"]');
+    expect(input).toBeTruthy();
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, "  morning  ");
+      input!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 400));
+    });
+    const update = setSearchParamsMock.mock.calls.at(-1)?.[0] as () => URLSearchParams;
+    expect(update().get("q")).toBe("morning");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("embedded for one agent: fixes the agent filter, drops the page heading and the agent chip, and hides excluded routines", async () => {
+    routinesListMock.mockResolvedValue([
+      createRoutine({ id: "routine-1", title: "Morning sync", assigneeAgentId: "agent-1" }),
+      createRoutine({ id: "routine-3", title: "Managed coach routine", assigneeAgentId: "agent-1" }),
+    ]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(
+      <Routines embedded fixedAssigneeAgentId="agent-1" excludeRoutineIds={["routine-3"]} />,
+      "Morning sync",
+    );
+
+    expect(routinesListMock).toHaveBeenCalledWith("company-1", { assigneeAgentId: "agent-1" });
+    const text = container.textContent ?? "";
+    expect(text).toContain("Morning sync");
+    expect(text).not.toContain("Managed coach routine");
+    expect(text).not.toContain("Recurring work definitions");
+    expect(container.querySelector('[aria-label="Filter by agent"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Filter by status"]')).toBeTruthy();
+    expect([...container.querySelectorAll("button")].some((button) => button.textContent?.includes("New routine"))).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("embedded for one agent: New routine opens the composer with that agent already chosen", async () => {
+    routinesListMock.mockResolvedValue([]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(<Routines embedded fixedAssigneeAgentId="agent-2" />, "No routines are assigned");
+
+    expect(container.textContent).toContain("No routines are assigned to this agent yet");
+    const newRoutine = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("New routine"));
+    expect(newRoutine).toBeTruthy();
+    await act(async () => {
+      newRoutine!.click();
+      await flush();
+    });
+    const agentSelector = inlineEntitySelectorRenderMock.mock.calls.map(([props]) => props).filter((props) => {
+      const ids = (props.options ?? []).map((option) => option.id);
+      return ids.includes("agent-1") && ids.includes("agent-2");
+    }).at(-1);
+    expect(agentSelector?.value).toBe("agent-2");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("keeps the last list while a filter loads, but never shows it under another company", async () => {
+    issuesListMock.mockResolvedValue([]);
+    routinesListMock.mockImplementation(async (companyId) =>
+      companyId === "company-1" ? [createRoutine({ id: "routine-1", title: "Company one routine" })] : new Promise(() => {}),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const root = createRoot(container);
+    const renderPage = async () => {
+      await act(async () => {
+        root.render(<QueryClientProvider client={queryClient}><Routines /></QueryClientProvider>);
+        await flush();
+      });
+    };
+    await renderPage();
+    for (let attempts = 0; attempts < 5 && !container.textContent?.includes("Company one routine"); attempts += 1) {
+      await act(async () => {
+        await flush();
+      });
+    }
+    expect(container.textContent).toContain("Company one routine");
+
+    // A new filter in the same company keeps the rows while it loads.
+    routinesListMock.mockImplementation(() => new Promise(() => {}));
+    currentSearch = "status=paused";
+    await renderPage();
+    expect(container.textContent).toContain("Company one routine");
+
+    // Another company never shows them.
+    currentCompanyId = "company-2";
+    currentSearch = "";
+    await renderPage();
+    expect(container.textContent).not.toContain("Company one routine");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("embedded with the built-in routine excluded: says no other routines rather than none", async () => {
+    routinesListMock.mockResolvedValue([createRoutine({ id: "routine-3", title: "Managed coach routine", assigneeAgentId: "agent-1" })]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(
+      <Routines embedded fixedAssigneeAgentId="agent-1" excludeRoutineIds={["routine-3"]} />,
+      "No other routines",
+    );
+
+    expect(container.textContent).toContain("No other routines are assigned to this agent");
+    expect(container.textContent).not.toContain("Managed coach routine");
+
+    await act(async () => {
+      root.unmount();
     });
   });
 
