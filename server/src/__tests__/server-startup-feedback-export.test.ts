@@ -203,6 +203,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     feedbackExportBackendToken: "telemetry-token",
     heartbeatSchedulerEnabled: false,
     heartbeatSchedulerIntervalMs: 30000,
+    runUsageRecordIntervalMs: 60000,
     companyDeletionEnabled: false,
     ...overrides,
   };
@@ -353,6 +354,12 @@ vi.mock("../services/index.js", () => ({
       failed: 0,
     })),
   })),
+}));
+
+vi.mock("../services/run-usage-records.js", () => ({
+  runUsageRecordService: () => ({
+    runScheduledPass: vi.fn(async () => ({ skipped: false, scanned: 0, written: 0, truncated: false, sweep: false })),
+  }),
 }));
 
 vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }) }));
@@ -549,6 +556,7 @@ describe("startServer feedback export wiring", () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
+      runUsageRecordIntervalMs: 60000,
     }));
     const retiredDetector = vi.fn(async () => ({ created: 1, updated: 1, failed: 0 }));
     const runtime = Object.assign(heartbeatServiceMock, { reconcileProductivityReviews: retiredDetector });
@@ -603,6 +611,7 @@ describe("startServer feedback export wiring", () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
+      runUsageRecordIntervalMs: 60000,
     }));
     resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
       suppressed: true,
@@ -643,6 +652,7 @@ describe("startServer feedback export wiring", () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: false,
       heartbeatSchedulerIntervalMs: 30000,
+      runUsageRecordIntervalMs: 60000,
     }));
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
@@ -677,6 +687,7 @@ describe("startServer feedback export wiring", () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
+      runUsageRecordIntervalMs: 60000,
     }));
     heartbeatServiceMock.reconcileHotRestartAdoption.mockRejectedValueOnce(new Error("partial adoption"));
     heartbeatServiceMock.reapOrphanedRuns
@@ -693,6 +704,7 @@ describe("startServer feedback export wiring", () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
+      runUsageRecordIntervalMs: 60000,
     }));
     heartbeatServiceMock.recoverNativeRunsAfterRestart.mockRejectedValueOnce(
       new Error("native recovery unavailable"),

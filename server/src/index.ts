@@ -1,4 +1,5 @@
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
+import { runUsageRecordService } from "./services/run-usage-records.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 import { sshRunDirectoryReaperService } from "./services/ssh-run-directory-reaper.js";
 /// <reference path="./types/express.d.ts" />
@@ -1180,6 +1181,22 @@ async function startServerWithDatabaseTeardown(
   const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();
+  const runUsageRecords = runUsageRecordService(db);
+  let runUsageDerivationInFlight = false;
+  const deriveRunUsageRecords = () => {
+    if (heartbeatSchedulerStopped || runUsageDerivationInFlight) return;
+    runUsageDerivationInFlight = true;
+    trackHeartbeatSchedulerWork(runUsageRecords.runScheduledPass()
+      .then((result) => {
+        if (result.written > 0) {
+          logger.info({ scanned: result.scanned, written: result.written, sweep: result.sweep }, "run usage records derived");
+        }
+      })
+      .catch((err) => logger.error({ err }, "run usage record derivation failed"))
+      .finally(() => { runUsageDerivationInFlight = false; }));
+  };
+  const runUsageRecordInterval = setInterval(deriveRunUsageRecords, config.runUsageRecordIntervalMs);
+  runUsageRecordInterval.unref?.();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
@@ -1960,6 +1977,7 @@ async function startServerWithDatabaseTeardown(
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
     clearInterval(executionControlInterval);
+    clearInterval(runUsageRecordInterval);
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;
