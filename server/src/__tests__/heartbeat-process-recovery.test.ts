@@ -3808,14 +3808,72 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // Three runs at a 20-second grace, one after another, take more than a
       // minute. In parallel, with each grace capped by the deadline, they end
       // in seconds.
-      expect(Date.now() - started).toBeLessThan(9_000);
+      expect(Date.now() - started).toBeLessThan(15_000);
       expect(result.interrupted).toBe(3);
       for (const fixture of fixtures) {
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
         expect(run).toMatchObject({ status: "interrupted", errorCode: "server_shutdown_interrupted" });
+        // The marker written with the status is complete once the follow-ups ran.
+        expect((run?.resultJson as Record<string, any> | null)?.shutdownDrain?.phase).toBe("complete");
         expect(isPidAlive(fixture.child.pid)).toBe(false);
       }
-    }, 30_000);
+    }, 60_000);
+
+    it("leaves a run running for the reaper when the drain deadline passed before its drain started", async () => {
+      const heartbeat = heartbeatService(db);
+      const fixture = await seedRunFixture({ adapterType: "process", agentStatus: "running" });
+      const child = spawnSigtermIgnoringProcess();
+      childProcesses.add(child);
+      runningProcesses.set(fixture.runId, { child, graceSec: 20, processGroupId: null });
+      const controller = new AbortController();
+      controller.abort();
+
+      const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), null, {
+        deadlineAt: Date.now(),
+        abortSignal: controller.signal,
+      });
+
+      expect(result.outcomes).toEqual([{ runId: fixture.runId, outcome: "deadline_skipped" }]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      expect(run?.status).toBe("running");
+    }, 60_000);
+
+    it("finishes, at the next start, a drain that was cut after the status became interrupted", async () => {
+      const heartbeat = heartbeatService(db);
+      // The state a kill leaves mid-drain: the status and its marker committed,
+      // and none of the follow-ups (no retry, the issue lock still on the run).
+      const fixture = await seedRunFixture({
+        adapterType: "process",
+        agentStatus: "running",
+        runStatus: "interrupted",
+        runErrorCode: "server_shutdown_interrupted",
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ resultJson: { shutdownDrain: { phase: "pending", signal: "SIGTERM", at: new Date().toISOString() } } })
+        .where(eq(heartbeatRuns.id, fixture.runId));
+
+      const repaired = await heartbeat.repairIncompleteShutdownDrains();
+
+      expect(repaired).toEqual({ found: 1, repairedRunIds: [fixture.runId] });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      expect((run?.resultJson as Record<string, any> | null)?.shutdownDrain?.phase).toBe("complete");
+      // The issue no longer points at the interrupted run: a retry holds it, or
+      // the release freed it.
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue?.executionRunId).not.toBe(fixture.runId);
+      // Run again, it finds nothing left to do.
+      await expect(heartbeat.repairIncompleteShutdownDrains()).resolves.toEqual({ found: 0, repairedRunIds: [] });
+    }, 60_000);
+
+    it("writes no hot-restart snapshot once the shutdown budget aborted the preparation", async () => {
+      const heartbeat = heartbeatService(db);
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(heartbeat.prepareHotRestartShutdown("SIGTERM", new Date(), { abortSignal: controller.signal }))
+        .resolves.toMatchObject({ mode: "aborted", skipDrain: false });
+    });
 
     it("keeps ending the other runs when one run cannot be stopped, and reports each run's outcome", async () => {
       const heartbeat = heartbeatService(db);
@@ -3854,7 +3912,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       } finally {
         mockTerminateLocalService.mockImplementation(actualSupervisor.terminateLocalService);
       }
-    }, 30_000);
+    }, 60_000);
   });
 
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {

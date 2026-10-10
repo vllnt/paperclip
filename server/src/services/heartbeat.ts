@@ -9332,6 +9332,12 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
+/**
+ * `resultJson` key written with a run's `interrupted` status by the shutdown
+ * drain: `pending` until its follow-up writes finish, then `complete`.
+ */
+const SHUTDOWN_DRAIN_MARKER_KEY = "shutdownDrain";
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -14903,8 +14909,16 @@ export function heartbeatService(
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
+    opts: { abortSignal?: AbortSignal } = {},
   ) {
     shutdownInProgress = true;
+    // Aborted by the shutdown budget: write nothing, and let the drain run.
+    const aborted = () => ({
+      mode: "aborted" as const,
+      skipDrain: false as const,
+      activeRunIds: [] as string[],
+    });
+    if (opts.abortSignal?.aborted) return aborted();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
@@ -14957,6 +14971,9 @@ export function heartbeatService(
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+    // The last point to give up: from the first snapshot write on, the
+    // preparation finishes, and the shutdown waits for it before the drain.
+    if (opts.abortSignal?.aborted) return aborted();
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -15509,7 +15526,7 @@ export function heartbeatService(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
-    opts: { deadlineAt?: number } = {},
+    opts: { deadlineAt?: number; abortSignal?: AbortSignal } = {},
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
@@ -15641,6 +15658,9 @@ export function heartbeatService(
       }
       // A run whose process may still be alive is left for the reaper.
       if (stopFailure) return stopFailure;
+      // After the drain deadline nothing new is written: the run stays
+      // `running`, its process is gone, and the next start reaps it.
+      if (opts.abortSignal?.aborted) return { runId: run.id, outcome: "deadline_skipped" };
 
       const persistedCancellationResult =
         run.runtimeMode === "native"
@@ -15657,65 +15677,34 @@ export function heartbeatService(
           error: message,
           errorCode: "server_shutdown_interrupted",
           signal,
-          resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-            conversationContinuationEligible: await runUsedConversationAdapter(db, run),
-            resultJson: persistedCancellationResult,
-            errorCode: "server_shutdown_interrupted",
-            errorMessage: message,
-          }),
+          resultJson: {
+            ...mergeRunStopMetadataForAgent(agent, "interrupted", {
+              conversationContinuationEligible: await runUsedConversationAdapter(db, run),
+              resultJson: persistedCancellationResult,
+              errorCode: "server_shutdown_interrupted",
+              errorMessage: message,
+            }),
+            // Written with the status: until the follow-ups below mark it
+            // complete, the next start finishes them (repairIncompleteShutdownDrains).
+            [SHUTDOWN_DRAIN_MARKER_KEY]: { phase: "pending", signal, at: now.toISOString() },
+          },
         },
       );
       if (!interruptedStatus.updated || !interruptedStatus.run) return { runId: run.id, outcome: "not_running" };
-      let interrupted = interruptedStatus.run;
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: now,
-        error: null,
-      });
-      interrupted =
-        (await classifyAndPersistRunLiveness(
-          interrupted,
-          parseObject(interrupted.resultJson),
-        )) ?? interrupted;
-
-      await releaseEnvironmentLeasesForRun({
-        runId: interrupted.id,
-        companyId: interrupted.companyId,
-        agentId: interrupted.agentId,
-        status: interrupted.status,
-        failureReason: interrupted.error ?? undefined,
-      });
-
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
-        retryRunIds.push(retry.id);
-      }
-
-      await appendRunEvent(interrupted, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
-          signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
-
-      await finalizeAgentStatus(run.agentId, "interrupted", message, {
-        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-      });
-      interruptedRunIds.push(interrupted.id);
+      const retry = await completeShutdownDrainFollowups(interruptedStatus.run, agent, signal, now);
+      if (retry) retryRunIds.push(retry.id);
+      interruptedRunIds.push(interruptedStatus.run.id);
       return { runId: run.id, outcome: "interrupted" };
     };
 
     outcomes.push(...await drainRunsInParallel({
       rows: activeRuns,
       runIdOf: (row) => row.run.id,
-      drainOne,
+      drainOne: async (row) => {
+        // After the drain deadline no new per-run drain starts.
+        if (opts.abortSignal?.aborted) return { runId: row.run.id, outcome: "deadline_skipped" };
+        return drainOne(row);
+      },
       signal,
       log: logger,
     }));
@@ -15739,6 +15728,103 @@ export function heartbeatService(
       restartSuspendedRunIds,
       outcomes,
     };
+  }
+
+  /**
+   * Everything a graceful shutdown does for a run after its status became
+   * `interrupted`: the wakeup, the liveness class, the leases, the retry or the
+   * issue release, the run event and the agent status. Each step is idempotent,
+   * so a later start can run them again for a run whose drain was cut (see
+   * `repairIncompleteShutdownDrains`). The last write marks the drain complete.
+   */
+  async function completeShutdownDrainFollowups(
+    interruptedRun: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    signal: "SIGINT" | "SIGTERM",
+    now: Date,
+  ) {
+    const message = `Interrupted by graceful server shutdown (${signal})`;
+    let interrupted = interruptedRun;
+    await setWakeupStatus(interrupted.wakeupRequestId, "cancelled", {
+        finishedAt: now,
+        error: null,
+      });
+    interrupted =
+      (await classifyAndPersistRunLiveness(
+        interrupted,
+        parseObject(interrupted.resultJson),
+      )) ?? interrupted;
+
+    await releaseEnvironmentLeasesForRun({
+      runId: interrupted.id,
+      companyId: interrupted.companyId,
+      agentId: interrupted.agentId,
+      status: interrupted.status,
+      failureReason: interrupted.error ?? undefined,
+    });
+
+    const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+    if (!retry) {
+      await releaseIssueExecutionAndPromote(interrupted);
+    }
+
+    await appendRunEvent(interrupted, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        signal,
+        ...(interrupted.processPid ? { processPid: interrupted.processPid } : {}),
+        ...(interrupted.processGroupId ? { processGroupId: interrupted.processGroupId } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(interrupted.agentId, "interrupted", message, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(interrupted),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), ${`{${SHUTDOWN_DRAIN_MARKER_KEY},phase}`}::text[], '"complete"'::jsonb, true)`,
+      })
+      .where(eq(heartbeatRuns.id, interrupted.id));
+    return retry;
+  }
+
+  /**
+   * At startup: finishes the shutdown drain of every run whose status became
+   * `interrupted` but whose follow-ups never completed (the process was killed
+   * mid-drain). Without this, such a run has no retry and may keep its issue
+   * lock, and neither the orphan reap (it selects `running`) nor the stale-lock
+   * sweep recreates them.
+   */
+  async function repairIncompleteShutdownDrains(now = new Date()) {
+    const rows = await db
+      .select({ run: heartbeatRuns, agent: agents })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "server_shutdown_interrupted"),
+        sql`${heartbeatRuns.resultJson} -> ${SHUTDOWN_DRAIN_MARKER_KEY} ->> 'phase' = 'pending'`,
+      ));
+    const repairedRunIds: string[] = [];
+    for (const { run, agent } of rows) {
+      const marker = parseObject(parseObject(run.resultJson)[SHUTDOWN_DRAIN_MARKER_KEY]);
+      const signal = marker.signal === "SIGINT" ? "SIGINT" : "SIGTERM";
+      try {
+        await completeShutdownDrainFollowups(run, agent, signal, now);
+        repairedRunIds.push(run.id);
+      } catch (err) {
+        logger.error({ err, runId: run.id }, "failed to finish an interrupted shutdown drain");
+      }
+    }
+    if (rows.length > 0) {
+      logger.warn({ found: rows.length, repairedRunIds }, "finished shutdown drains that a restart cut");
+    }
+    return { found: rows.length, repairedRunIds };
   }
 
   /**
@@ -32441,6 +32527,7 @@ export function heartbeatService(
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
+    repairIncompleteShutdownDrains,
     drainActiveRunExecutions,
     startTaskDrain,
     stopTaskDrain,

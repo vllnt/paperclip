@@ -322,19 +322,37 @@ snapshot and any required drain complete while the database is still available;
 the coordinated shutdown path stops embedded PostgreSQL afterward.
 
 **Shutdown budget.** On `SIGTERM` or `SIGINT` the server finishes inside one
-budget, so it exits 0 before the stop timeout instead of being killed. Set
+budget, so it exits before the stop timeout instead of being killed. Set
 `PAPERCLIP_STOP_TIMEOUT_MS` to the stop timeout of whatever stops the process (for
-example the `--time` of `docker stop`); the default is 60000. The budget is that
-timeout minus 10 seconds (half of it when the timeout is under 20 seconds). In
-order: the HTTP listener stops accepting connections at once, and requests in
-flight get up to 5 seconds; the scheduler quiesces (at most 10 seconds); running
-runs are ended in parallel, each run's grace cut so that it ends with 30 % of the
-budget (at most 15 seconds) still left; then the finalizers, the run-log flush and
-the teardown share the rest. Each step logs `shutdown step started` and `shutdown
-step finished` with its duration and its outcome (`done`, `timed_out` or
-`failed`), and each run logs `shutdown run outcome`. A run whose process cannot be
-stopped is reported as `terminate_failed` and left `running` for the reaper. If a
-step hangs, a hard deadline at the end of the budget logs the step and exits 0.
+example `stop_grace_period`, or the `--time` of `docker stop`); the deploy compose
+files set both to 60 seconds. The default is 60000, and the server logs a warning at
+boot when the variable is unset or invalid. The budget is that timeout minus 10
+seconds (half of it when the timeout is under 20 seconds). In order:
+
+1. New work is refused at once: `POST` to an agent's `wakeup` or `heartbeat/invoke`,
+   a routine's `run` and a public routine trigger answer `503` with
+   `Retry-After: 30`, and run admission is held, so a wake created by any other
+   request (a comment, for example) waits in the queue for the next process. Every
+   other request is still served: the runs being drained keep their callbacks.
+2. The scheduler quiesces (at most 10 seconds). If it outlives that, it is aborted;
+   a hot-restart preparation that has started writing finishes first, so the drain
+   never runs alongside it.
+3. Running runs are ended in parallel, each run's grace cut so that it ends with 30 %
+   of the budget (at most 15 seconds) still left. At that deadline no new per-run
+   drain starts: a run not yet reached stays `running`, and the next start reaps it.
+   A run's status and a `shutdownDrain` marker are written together; the follow-up
+   writes (wakeup, leases, retry or issue release, event, agent status) finish the
+   marker. If the process dies in between, the next start finishes them.
+4. The finalizers and the per-run drains still in flight finish (at most 5
+   seconds), then the run-log flush.
+5. The HTTP listener closes (in-flight requests get 5 seconds), then the teardown.
+
+Each step logs `shutdown step started` and `shutdown step finished` with its
+duration and its outcome (`done`, `timed_out` or `failed`), and each run logs
+`shutdown run outcome`. A run whose process cannot be stopped is reported as
+`terminate_failed` and left `running` for the reaper. A complete shutdown exits 0. If
+a step hangs, a hard deadline at the end of the budget logs the step and exits
+**70**. A programmatic shutdown that keeps the process alive arms no hard deadline.
 
 The request command records the preflight set of running heartbeat IDs and writes
 an instance-scoped marker plus a PID-targeted legacy home-root handoff marker.
