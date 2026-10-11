@@ -161,12 +161,13 @@ async function appFixture(options: { revoked?: () => boolean; config?: Record<st
   const { admin, server } = actors("anthm");
   const h = createTestHarness({ manifest });
   const signing = signingKeyPem();
-  /** The company's plugin config; a test may change it between two calls, as an instance admin does. */
-  const config: Record<string, unknown> = {
+  /** More fields of the company's plugin config; a test may change them between two calls, as an instance admin does. */
+  const config: Record<string, unknown> = { ...options.config };
+  vi.spyOn(h.ctx.config, "get").mockImplementation(async company => company === "anthm" ? {
     appId: APP, privateKey: secretRef("a-key"), userClientId: "Iv23liAbcdef12", userClientSecret: secretRef("client-secret"),
-    userRefreshToken: secretRef("refresh"), signingKey: secretRef("signing"), personalToken: secretRef("pat"), ...options.config,
-  };
-  vi.spyOn(h.ctx.config, "get").mockImplementation(async company => company === "anthm" ? { ...config } : {});
+    userRefreshToken: secretRef("refresh"), signingKey: secretRef("signing"), personalToken: secretRef("pat"),
+    ...config,
+  } : {});
   const github = {
     refresh: "unset", issued: 0, revoked: false,
     installation: { id: 101, repository_selection: "selected", permissions: { ...permissions } as Record<string, string> },
@@ -1528,22 +1529,60 @@ describe("security review round 5 (attack regressions)", () => {
 
 describe("agentMergeablePaths: an instance admin releases some protected paths for agent merges", () => {
   const head = "a".repeat(40), base = "c".repeat(40);
-  // The fixture's fake GitHub answers for two repositories: an ordinary one, and the control repository of the code's own list.
-  const ORDINARY = "anthm-fr/songtrivia", CONTROL = CONTROL_REPOSITORIES[0]!;
-  const optIn = (extra: Record<string, unknown> = {}, repository = "anthm-fr/songtrivia") => [{ repository, allow: [".github/**"], exclude: [".github/workflows/release.yml"], ...extra }];
+  // Synthetic repositories for these tests (the fixture is extended below to answer for them). The control repository is the
+  // code's own list's first entry, which the fixture answers as it is.
+  const OWNER = "example-org", ORDINARY = `${OWNER}/app`, OTHER = `${OWNER}/other`, CONTROL = CONTROL_REPOSITORIES[0]!;
+  const optIn = (extra: Record<string, unknown> = {}, repository = ORDINARY) => [{ repository, allow: [".github/**"], exclude: [".github/workflows/release.yml"], ...extra }];
   const merge = (f: Awaited<ReturnType<typeof appFixture>>, repository = ORDINARY, extra: Record<string, unknown> = {}) =>
     f.write(repository, { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head, ...extra });
   const tiersFile = (paths: string[]) => `version: 1\nprotectedPaths:\n${paths.map(path => `  - ${path}`).join("\n")}\n`;
+  /** The synthetic repositories as the plugin's catalog lists them: the fixture's one installation, owner example-org. */
+  const synthetic = [ORDINARY, OTHER].map((fullName, index) => ({ id: 900 + index, name: fullName.split("/")[1]!, fullName, url: `https://github.com/${fullName}`, installationId: 101, owner: OWNER, ownerId: 1, private: true, permissions }));
+  /** Extends the fixture's fake GitHub, catalog and installation so that they answer for the synthetic repositories as for their own. */
+  function addSyntheticRepositories(f: Awaited<ReturnType<typeof appFixture>>) {
+    const catalog = vi.mocked(f.client.catalog), listed = catalog.getMockImplementation()!;
+    catalog.mockImplementation(async (...args) => { const result = await listed(...args); return { ...result, repositories: [...result.repositories, ...synthetic] }; });
+    const own = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      const mine = new RegExp(`^/repos/(${OWNER}/[a-z-]+)/(.+)$`).exec(path);
+      if (!mine) return (own as any)(path, ...rest);
+      const [, repository, tail] = mine as unknown as [string, string, string];
+      const answer = (data: unknown, next = false) => ({ data: data as any, next });
+      if (tail === "pulls/7") { f.github.prReads += 1; return answer({ ...f.github.pr, changed_files: f.github.changedFiles ?? f.github.prFiles.length }); }
+      const files = /^pulls\/7\/files\?per_page=100&page=(\d+)$/.exec(tail);
+      if (files) { const page = Number(files[1]); return answer(f.github.prFiles.slice((page - 1) * 100, page * 100), f.github.prFiles.length > page * 100); }
+      const content = /^contents\/(.+)\?ref=([0-9a-f]{40})$/.exec(tail);
+      if (content) {
+        const entry = f.github.contents[`${repository}/${content[1]}@${content[2]}`];
+        if (entry === undefined) throw new GitHubError(404);
+        if (typeof entry === "number") throw new GitHubError(entry);
+        return answer({ type: "file", encoding: "base64", content: Buffer.from(entry).toString("base64") });
+      }
+      if (tail === "pulls/7/merge") return answer({ merged: true, sha: head, message: "Pull Request successfully merged" });
+      if (tail.startsWith("rules/branches/main?per_page=100")) return answer(f.github.rules);
+      if (tail === "branches/main") return answer({ name: "main", protection: f.github.protection });
+      if (tail.startsWith(`commits/${head}/check-runs`)) return answer({ check_runs: f.github.checkRuns });
+      if (tail.startsWith(`commits/${head}/status`)) return answer({ statuses: f.github.statuses });
+      throw new Error(`Unexpected GitHub request ${path}`);
+    });
+  }
   async function fixture(agentMergeablePaths?: unknown) {
     const f = await appFixture(agentMergeablePaths === undefined ? {} : { config: { agentMergeablePaths } });
+    addSyntheticRepositories(f);
     await f.authorize();
+    // The user's installation, the write allowlist and the installation fence of the stored policy now also name the synthetic repositories.
+    const stored = await f.policy(), names = synthetic.map(repo => repo.fullName);
+    f.github.installationRepos.push(...names);
+    await f.setPolicy({ ...stored, allowedRepositories: [...stored.allowedRepositories, ...names], installationRepositories: [...stored.installationRepositories, ...names] });
     return f;
   }
+  /** The company's id, as the fixture's own actions answer it. */
+  const companyOf = async (f: Awaited<ReturnType<typeof appFixture>>) => String((await f.action("write-identity.get")).companyId);
   const refused = (files: string[], by = "a human must merge it: agent-owner in the GitHub web UI") =>
     ({ unavailable: expect.stringMatching(new RegExp(`protected paths \\(${files.map(file => file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(", ")}\\); agents cannot merge it, ${by.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)) });
 
   it("refuses a workflow change exactly as before when no repository is opted in (no config, an empty list)", async () => {
-    for (const config of [undefined, [], [{ repository: "anthm-fr/linkzic", allow: [".github/**"] }]]) {
+    for (const config of [undefined, [], [{ repository: OTHER, allow: [".github/**"] }]]) {
       const f = await fixture(config);
       f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }];
       const decision = await merge(f);
@@ -1573,9 +1612,21 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
     const f = await fixture(optIn());
     f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
     expect(await merge(f, ORDINARY, { privileged: ["adminMerge"] })).toMatchObject({ credential: { login: "agent-owner" }, evidence: { protectedPaths: { releasedBy: "config:agentMergeablePaths" } } });
-    const tool = await f.h.executeTool<any>("github_merge_pull_request", { repository: "Anthm-FR/songtrivia", number: 7, sha: head, method: "squash", confirm: "Anthm-FR/songtrivia#7" },
-      { companyId: "anthm", agentId: "agent-1", projectId: "p1", runId: "run-1" });
-    expect(tool.error ?? "").not.toMatch(/protected paths/);
+    // The tool counts as an admin merge too: it passes the guard and then merges, as the App user, with GitHub's own answer.
+    const run = { companyId: await companyOf(f), agentId: "agent-1", projectId: "p1", runId: "run-1" };
+    const input = { repository: ORDINARY, number: 7, sha: head, method: "squash", confirm: `${ORDINARY}#7` };
+    const tool = await f.h.executeTool<any>("github_merge_pull_request", input, run);
+    expect(tool.error).toBeUndefined();
+    expect(f.request.mock.calls.some(([path, , , method]) => method === "PUT" && String(path) === `/repos/${ORDINARY}/pulls/7/merge`)).toBe(true);
+  });
+
+  it("keeps the plugin's merge tool refused without the opt-in, before any merge is sent", async () => {
+    const f = await fixture();
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    const run = { companyId: await companyOf(f), agentId: "agent-1", projectId: "p1", runId: "run-1" };
+    const tool = await f.h.executeTool<any>("github_merge_pull_request", { repository: ORDINARY, number: 7, sha: head, method: "squash", confirm: `${ORDINARY}#7` }, run);
+    expect(tool.error).toMatch(/protected paths \(\.github\/workflows\/ci\.yml\)/);
+    expect(f.request.mock.calls.some(([, , , method]) => method === "PUT")).toBe(false);
   });
 
   it("keeps the refusal for the whole pull request when one touched file is not released, and lists only that file", async () => {
@@ -1621,14 +1672,14 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
       expect(await merge(f), JSON.stringify(allow)).toMatchObject(refused([".github/workflows/ci.yml"]));
     }
     // Other entries of the same config keep working: only the invalid one is dropped.
-    const f = await fixture([...optIn({ allow: ["CODEOWNERS"] }, ORDINARY), ...optIn({}, "anthm-fr/linkzic")]);
+    const f = await fixture([...optIn({ allow: ["CODEOWNERS"] }, ORDINARY), ...optIn({}, OTHER)]);
     f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
     expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
   });
 
   it("fails closed on a config that is not a list, on unknown keys, on a repeated repository and on a bad exclusion", async () => {
     for (const config of ["yes", { repository: ORDINARY, allow: [".github/**"] }, [{ repository: ORDINARY, allow: [".github/**"], extra: true }],
-      [...optIn(), ...optIn({ exclude: [] })], optIn({ exclude: ["../escape"] }), optIn({ exclude: "no" }), [null], [{ repository: "anthm-fr/*", allow: [".github/**"] }]]) {
+      [...optIn(), ...optIn({ exclude: [] })], optIn({ exclude: ["../escape"] }), optIn({ exclude: "no" }), [null], [{ repository: `${OWNER}/*`, allow: [".github/**"] }]]) {
       const f = await fixture(config);
       f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
       expect(await merge(f), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
@@ -1671,7 +1722,7 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
   });
 
   it("matches the repository exactly and without regard to case, and nothing else", async () => {
-    for (const [repository, merges] of [["Anthm-FR/SongTrivia", true], ["ANTHM-FR/SONGTRIVIA", true], ["anthm-fr/songtriv", false], ["anthm-fr/songtrivia-2", false], ["anthm-fr", false]] as const) {
+    for (const [repository, merges] of [["Example-Org/App", true], ["EXAMPLE-ORG/APP", true], ["example-org/ap", false], ["example-org/app-2", false], ["example-org", false]] as const) {
       const f = await fixture(optIn({ repository }));
       f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
       const decision = await merge(f);
@@ -1699,7 +1750,7 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
     f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
     expect(await merge(f, ORDINARY, { autoMerge: true })).toMatchObject({ unavailable: expect.stringMatching(/auto-merge or the merge queue: a human must merge/) });
     expect(await merge(f, ORDINARY, { retarget: true })).toMatchObject({ unavailable: expect.stringMatching(/base branch: a human must/) });
-    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    await f.setPolicy({ ...await f.policy(), enabled: false });
     expect(await merge(f)).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
   });
 
