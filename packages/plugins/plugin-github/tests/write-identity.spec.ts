@@ -154,16 +154,18 @@ function signingKeyPem() {
   return generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString();
 }
 
-async function appFixture(options: { revoked?: () => boolean } = {}) {
+async function appFixture(options: { revoked?: () => boolean; config?: Record<string, unknown> } = {}) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-10-08T08:00:00Z"));
   const { admin, server } = actors("anthm");
   const h = createTestHarness({ manifest });
   const signing = signingKeyPem();
-  vi.spyOn(h.ctx.config, "get").mockImplementation(async company => company === "anthm" ? {
+  /** The company's plugin config; a test may change it between two calls, as an instance admin does. */
+  const config: Record<string, unknown> = {
     appId: APP, privateKey: secretRef("a-key"), userClientId: "Iv23liAbcdef12", userClientSecret: secretRef("client-secret"),
-    userRefreshToken: secretRef("refresh"), signingKey: secretRef("signing"), personalToken: secretRef("pat"),
-  } : {});
+    userRefreshToken: secretRef("refresh"), signingKey: secretRef("signing"), personalToken: secretRef("pat"), ...options.config,
+  };
+  vi.spyOn(h.ctx.config, "get").mockImplementation(async company => company === "anthm" ? { ...config } : {});
   const github = {
     refresh: "unset", issued: 0, revoked: false,
     installation: { id: 101, repository_selection: "selected", permissions: { ...permissions } as Record<string, string> },
@@ -259,7 +261,7 @@ async function appFixture(options: { revoked?: () => boolean } = {}) {
     return result;
   }
   const policy = async () => (await h.performAction<any>("write-identity.get", { companyId: "anthm" }, admin)).policy;
-  return { h, client, github, scoped, oauth, request, resolve, storeOwn, decide, sign, setPolicy, action, write, read, authorize, policy, signing, current: () => current };
+  return { h, client, github, scoped, oauth, request, resolve, storeOwn, decide, sign, setPolicy, action, write, read, authorize, policy, signing, config, current: () => current };
 }
 
 describe("GitHub write identity: App user (anthm)", () => {
@@ -1515,5 +1517,217 @@ describe("security review round 5 (attack regressions)", () => {
       f.github.prFiles = [{ filename }];
       expect(await merge(f), filename).toMatchObject({ unavailable: expect.stringContaining(`protected paths (${filename})`) });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An instance admin's per-repository opt-in (`agentMergeablePaths` in the plugin config): agents may merge pull requests that
+// touch `.github/**`, except for the CODEOWNERS paths, control repositories, tiers paths and the admin's own exclusions.
+// ---------------------------------------------------------------------------
+
+describe("agentMergeablePaths: an instance admin releases some protected paths for agent merges", () => {
+  const head = "a".repeat(40), base = "c".repeat(40);
+  const ORDINARY = "anthm-fr/songtrivia", CONTROL = "anthm-fr/anthm-fr";
+  const optIn = (extra: Record<string, unknown> = {}, repository = "anthm-fr/songtrivia") => [{ repository, allow: [".github/**"], exclude: [".github/workflows/release.yml"], ...extra }];
+  const merge = (f: Awaited<ReturnType<typeof appFixture>>, repository = ORDINARY, extra: Record<string, unknown> = {}) =>
+    f.write(repository, { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head, ...extra });
+  const tiersFile = (paths: string[]) => `version: 1\nprotectedPaths:\n${paths.map(path => `  - ${path}`).join("\n")}\n`;
+  async function fixture(agentMergeablePaths?: unknown) {
+    const f = await appFixture(agentMergeablePaths === undefined ? {} : { config: { agentMergeablePaths } });
+    await f.authorize();
+    return f;
+  }
+  const refused = (files: string[], by = "a human must merge it: agent-owner in the GitHub web UI") =>
+    ({ unavailable: expect.stringMatching(new RegExp(`protected paths \\(${files.map(file => file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(", ")}\\); agents cannot merge it, ${by.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)) });
+
+  it("refuses a workflow change exactly as before when no repository is opted in (no config, an empty list)", async () => {
+    for (const config of [undefined, [], [{ repository: "anthm-fr/linkzic", allow: [".github/**"] }]]) {
+      const f = await fixture(config);
+      f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }];
+      const decision = await merge(f);
+      expect(decision, JSON.stringify(config)).toMatchObject({ ...refused([".github/workflows/ci.yml"]), evidence: { protectedFiles: [".github/workflows/ci.yml"] } });
+      expect(decision).not.toHaveProperty("credential");
+    }
+  });
+
+  it("lets an opted-in repository merge a workflow change, and records which files the config released", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }, { filename: ".github/actions/setup/action.yml" }];
+    const decision = await merge(f);
+    expect(decision).toMatchObject({
+      credential: { login: "agent-owner" },
+      evidence: { protectedPaths: { pullRequest: 7, headSha: head, baseSha: base, files: 3,
+        releasedProtectedFiles: [".github/actions/setup/action.yml", ".github/workflows/ci.yml"], releasedBy: "config:agentMergeablePaths" } },
+    });
+    // A pull request that touches nothing protected records no release.
+    f.github.prFiles = [{ filename: "src/ok.ts" }];
+    const plain = await merge(f);
+    expect(plain).toHaveProperty("credential");
+    expect(plain.evidence.protectedPaths).not.toHaveProperty("releasedProtectedFiles");
+    expect(plain.evidence.protectedPaths).not.toHaveProperty("releasedBy");
+  });
+
+  it("applies to admin merges and to the plugin's own merge tool, which share the guard", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, ORDINARY, { privileged: ["adminMerge"] })).toMatchObject({ credential: { login: "agent-owner" }, evidence: { protectedPaths: { releasedBy: "config:agentMergeablePaths" } } });
+    const tool = await f.h.executeTool<any>("github_merge_pull_request", { repository: "Anthm-FR/songtrivia", number: 7, sha: head, method: "squash", confirm: "Anthm-FR/songtrivia#7" },
+      { companyId: "anthm", agentId: "agent-1", projectId: "p1", runId: "run-1" });
+    expect(tool.error ?? "").not.toMatch(/protected paths/);
+  });
+
+  it("keeps the refusal for the whole pull request when one touched file is not released, and lists only that file", async () => {
+    const f = await fixture(optIn());
+    for (const [label, files, expected] of [
+      ["an excluded file alone", [".github/workflows/release.yml"], [".github/workflows/release.yml"]],
+      ["an excluded file next to allowed ones", [".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/dependabot.yml"], [".github/workflows/release.yml"]],
+      ["an excluded file next to an ordinary change", ["src/ok.ts", ".github/workflows/release.yml"], [".github/workflows/release.yml"]],
+      ["the exclusion in another case", [".GitHub/Workflows/Release.yml"], [".GitHub/Workflows/Release.yml"]],
+    ] as const) {
+      f.github.prFiles = files.map(filename => ({ filename }));
+      const decision = await merge(f);
+      expect(decision, label).toMatchObject({ ...refused([...expected]), evidence: { protectedFiles: [...expected] } });
+      expect(decision, label).not.toHaveProperty("credential");
+    }
+  });
+
+  it("releases only what `allow` covers: a narrower glob leaves the rest of .github refused", async () => {
+    const f = await fixture(optIn({ allow: [".github/workflows/**"], exclude: [] }));
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f)).toHaveProperty("credential");
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }, { filename: ".github/dependabot.yml" }, { filename: ".github/scripts/deploy.sh" }];
+    expect(await merge(f)).toMatchObject({ ...refused([".github/dependabot.yml", ".github/scripts/deploy.sh"]) });
+  });
+
+  it("never releases a CODEOWNERS path, alone or mixed with released files, whatever `allow` says", async () => {
+    const f = await fixture(optIn({ exclude: [] }));
+    for (const filename of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS", "sub/dir/CODEOWNERS", ".github/codeowners"]) {
+      f.github.prFiles = [{ filename }];
+      expect(await merge(f), filename).toMatchObject(refused([filename]));
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }, { filename }];
+      expect(await merge(f), `${filename} with a workflow`).toMatchObject({ ...refused([filename]), evidence: { protectedFiles: [filename] } });
+    }
+    // A rename out of CODEOWNERS counts both names.
+    f.github.prFiles = [{ filename: ".github/workflows/owners.yml", previous_filename: ".github/CODEOWNERS", status: "renamed" }];
+    expect(await merge(f)).toMatchObject(refused([".github/CODEOWNERS"]));
+  });
+
+  it("drops an entry that names CODEOWNERS or reaches outside .github, so nothing is released and the refusal is the old one", async () => {
+    for (const allow of [["CODEOWNERS"], [".github/CODEOWNERS"], ["docs/CODEOWNERS"], [".github/**", "CODEOWNERS"], ["**"], ["scripts/**"], ["/.github/**"], [".github/../scripts/**"], [".github/**/CODEOWNERS"], []]) {
+      const f = await fixture(optIn({ allow }));
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f), JSON.stringify(allow)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    }
+    // Other entries of the same config keep working: only the invalid one is dropped.
+    const f = await fixture([...optIn({ allow: ["CODEOWNERS"] }, ORDINARY), ...optIn({}, "anthm-fr/linkzic")]);
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+  });
+
+  it("fails closed on a config that is not a list, on unknown keys, on a repeated repository and on a bad exclusion", async () => {
+    for (const config of ["yes", { repository: ORDINARY, allow: [".github/**"] }, [{ repository: ORDINARY, allow: [".github/**"], extra: true }],
+      [...optIn(), ...optIn({ exclude: [] })], optIn({ exclude: ["../escape"] }), optIn({ exclude: "no" }), [null], [{ repository: "anthm-fr/*", allow: [".github/**"] }]]) {
+      const f = await fixture(config);
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    }
+  });
+
+  it("never lets a control repository opt in, even when it is listed, and keeps its other protected paths", async () => {
+    const f = await fixture(optIn({}, CONTROL));
+    for (const filename of [".github/workflows/ci.yml", "paperclip/gates.yaml", "scripts/build.sh"]) {
+      f.github.prFiles = [{ filename }];
+      expect(await merge(f, CONTROL), filename).toMatchObject(refused([filename]));
+    }
+  });
+
+  it("never lets a repository with a tiers file on its base branch opt in, and its tiers paths win", async () => {
+    const f = await fixture(optIn());
+    f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`] = tiersFile([".github/workflows/deploy.yml"]);
+    for (const filename of [".github/workflows/ci.yml", ".github/workflows/deploy.yml"]) {
+      f.github.prFiles = [{ filename }];
+      expect(await merge(f), filename).toMatchObject(refused([filename]));
+    }
+    // Without the tiers file the same repository is released again.
+    delete f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`];
+    f.github.prFiles = [{ filename: ".github/workflows/deploy.yml" }];
+    expect(await merge(f)).toHaveProperty("credential");
+    // An unreadable tiers file refuses, as before.
+    f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`] = 500;
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringMatching(/cannot read paperclip\/tiers\.yaml on the base branch/) });
+  });
+
+  it("refuses a rename between an excluded name and an allowed one, in both directions", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml", previous_filename: ".github/workflows/release.yml", status: "renamed" }];
+    expect(await merge(f)).toMatchObject({ ...refused([".github/workflows/release.yml"]), evidence: { protectedFiles: [".github/workflows/release.yml"] } });
+    f.github.prFiles = [{ filename: ".github/workflows/release.yml", previous_filename: ".github/workflows/ci.yml", status: "renamed" }];
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/release.yml"]));
+    // A rename between two allowed names merges.
+    f.github.prFiles = [{ filename: ".github/workflows/build.yml", previous_filename: ".github/workflows/ci.yml", status: "renamed" }];
+    expect(await merge(f)).toHaveProperty("credential");
+  });
+
+  it("matches the repository exactly and without regard to case, and nothing else", async () => {
+    for (const [repository, merges] of [["Anthm-FR/SongTrivia", true], ["ANTHM-FR/SONGTRIVIA", true], ["anthm-fr/songtriv", false], ["anthm-fr/songtrivia-2", false], ["anthm-fr", false]] as const) {
+      const f = await fixture(optIn({ repository }));
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      const decision = await merge(f);
+      expect(decision.credential !== undefined, repository).toBe(merges);
+    }
+  });
+
+  it("still refuses when the head moved, when it is not the expected head, and when no head SHA is given", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, ORDINARY, { expectedHeadSha: "b".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("not the expected") });
+    expect(await merge(f, ORDINARY, { expectedHeadSha: null })).toMatchObject({ unavailable: expect.stringContaining("--match-head-commit") });
+    const original = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      const result = await (original as any)(path, ...rest);
+      if (/\/pulls\/7$/.test(path) && f.github.prReads === 1) f.github.pr = { ...f.github.pr, head: { sha: "b".repeat(40) } };
+      return result;
+    });
+    f.github.prReads = 0;
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringContaining("changed while Paperclip checked it") });
+  });
+
+  it("still refuses auto-merge, the merge queue and a base change, and every other write-identity gate", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, ORDINARY, { autoMerge: true })).toMatchObject({ unavailable: expect.stringMatching(/auto-merge or the merge queue: a human must merge/) });
+    expect(await merge(f, ORDINARY, { retarget: true })).toMatchObject({ unavailable: expect.stringMatching(/base branch: a human must/) });
+    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+  });
+
+  it("reads the config on every merge, so a change by the instance admin applies at once, in both directions", async () => {
+    const f = await fixture();
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    f.config.agentMergeablePaths = optIn();
+    expect(await merge(f)).toHaveProperty("credential");
+    f.config.agentMergeablePaths = optIn({ exclude: [".github/workflows/ci.yml"] });
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    delete f.config.agentMergeablePaths;
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+  });
+
+  it("takes the opt-in from the plugin config only, never from the pull request's head or any file of the repository", async () => {
+    const f = await fixture();
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }, { filename: "paperclip/tiers.yaml" }];
+    f.github.contents[`${ORDINARY}/.github/agent-mergeable-paths.json`] = JSON.stringify(optIn());
+    f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${head}`] = "agentMergeablePaths: all\n";
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringContaining("protected paths (.github/workflows/ci.yml)") });
+    const reads = f.request.mock.calls.map(([path]) => String(path)).filter(path => path.includes("/contents/"));
+    expect(reads.every(path => path.includes("paperclip/tiers.yaml?ref=" + base))).toBe(true);
+  });
+
+  it("lists at most 100 released files in the evidence and says how many there are", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = Array.from({ length: 150 }, (_, n) => ({ filename: `.github/workflows/w${String(n).padStart(3, "0")}.yml` }));
+    const decision = await merge(f);
+    expect(decision.evidence.protectedPaths.releasedProtectedFiles).toHaveLength(100);
+    expect(decision.evidence.protectedPaths).toMatchObject({ releasedProtectedFilesCount: 150, releasedBy: "config:agentMergeablePaths" });
   });
 });
