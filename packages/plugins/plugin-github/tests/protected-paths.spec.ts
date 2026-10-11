@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CODEOWNERS_PATHS, CONTROL_PROTECTED_PATHS, MINIMUM_PROTECTED_PATHS, isCodeownersPath, isControlRepository, matchesProtectedPath, parseAgentMergeablePaths, parseJsonWithoutDuplicateKeys, parseProtectedPaths, protectedFiles, protectedPatterns, releasedByOptIn, splitReleased, type AgentMergeableRule } from "../src/protected-paths.js";
+import { CODEOWNERS_PATHS, CONTROL_PROTECTED_PATHS, CONTROL_REPOSITORIES, MINIMUM_PROTECTED_PATHS, isCodeownersPath, isControlRepository, matchesProtectedPath, parseAgentMergeablePaths, parseJsonWithoutDuplicateKeys, parseProtectedPaths, protectedFiles, protectedPatterns, releasedByOptIn, splitReleased, type AgentMergeableRule } from "../src/protected-paths.js";
 
 describe("protected paths (P4b, round 4)", () => {
   it("reads protectedPaths from a tiers file and nothing else", () => {
@@ -62,7 +62,7 @@ describe("the opt-in that releases some protected paths for agent merges", () =>
   });
 
   it("knows a control repository by the code's list or by a tiers file, in any case", () => {
-    expect(isControlRepository("Anthm-FR/Anthm-FR", null)).toBe(true);
+    expect(isControlRepository(CONTROL_REPOSITORIES[0]!.toUpperCase(), null)).toBe(true);
     expect(isControlRepository("owner/repo", [])).toBe(true);
     expect(isControlRepository("owner/repo", ["a/**"])).toBe(true);
     expect(isControlRepository("owner/repo", null)).toBe(false);
@@ -117,7 +117,7 @@ describe("the opt-in that releases some protected paths for agent merges", () =>
     const touched = [".github/CODEOWNERS", ".github/dependabot.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml"];
     expect(splitReleased(touched, r, "owner/repo", null)).toEqual({ released: [".github/dependabot.yml", ".github/workflows/ci.yml"], kept: [".github/CODEOWNERS", ".github/workflows/release.yml"] });
     expect(splitReleased(touched, null, "owner/repo", null)).toEqual({ released: [], kept: touched });
-    expect(splitReleased(touched, r, "anthm-fr/anthm-fr", null)).toEqual({ released: [], kept: touched });
+    expect(splitReleased(touched, r, CONTROL_REPOSITORIES[0]!, null)).toEqual({ released: [], kept: touched });
     expect(splitReleased(touched, r, "owner/repo", ["paperclip/**"])).toEqual({ released: [], kept: touched });
     expect(splitReleased([], r, "owner/repo", null)).toEqual({ released: [], kept: [] });
   });

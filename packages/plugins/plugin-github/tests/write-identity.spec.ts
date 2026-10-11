@@ -10,6 +10,7 @@ import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
 import { GitHubClient, GitHubError, assertReadOnlyInstallationToken } from "../src/github.js";
 import { WriteThrottle } from "../src/write-identity.js";
+import { CONTROL_REPOSITORIES } from "../src/protected-paths.js";
 import { parseSshSigningKey } from "../src/ssh-signature.js";
 import { RepositoryManager } from "../src/management-repository.js";
 
@@ -1527,7 +1528,8 @@ describe("security review round 5 (attack regressions)", () => {
 
 describe("agentMergeablePaths: an instance admin releases some protected paths for agent merges", () => {
   const head = "a".repeat(40), base = "c".repeat(40);
-  const ORDINARY = "anthm-fr/songtrivia", CONTROL = "anthm-fr/anthm-fr";
+  // The fixture's fake GitHub answers for two repositories: an ordinary one, and the control repository of the code's own list.
+  const ORDINARY = "anthm-fr/songtrivia", CONTROL = CONTROL_REPOSITORIES[0]!;
   const optIn = (extra: Record<string, unknown> = {}, repository = "anthm-fr/songtrivia") => [{ repository, allow: [".github/**"], exclude: [".github/workflows/release.yml"], ...extra }];
   const merge = (f: Awaited<ReturnType<typeof appFixture>>, repository = ORDINARY, extra: Record<string, unknown> = {}) =>
     f.write(repository, { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head, ...extra });
