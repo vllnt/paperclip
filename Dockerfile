@@ -152,6 +152,10 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
+# The GitHub plugin's merge guard and the instance admin's per-repository opt-in (agentMergeablePaths): the guard and path rules,
+# the config schema as the host validates it when it is saved, and the save route's admin check. No database. After the plugin SDK build.
+RUN pnpm exec vitest run packages/plugins/plugin-github/tests/protected-paths.spec.ts packages/plugins/plugin-github/tests/write-identity.spec.ts server/src/__tests__/plugin-github-merge-opt-in-config.test.ts
+RUN pnpm exec vitest run server/src/__tests__/plugin-routes-authz.test.ts -t agentMergeablePaths
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
 # Build the remaining bundled local plugins here. The production root filesystem
