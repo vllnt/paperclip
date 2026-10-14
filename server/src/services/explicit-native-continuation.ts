@@ -22,6 +22,7 @@ import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js
 
 type Run = typeof heartbeatRuns.$inferSelect;
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
+const COMMENT_LOOKUP_BATCH = 500;
 
 function processStopped(pid: number): boolean {
   try { process.kill(pid, 0); return false; }
@@ -35,15 +36,25 @@ export async function undeliveredLegacyUserCommentIds(
   db: Db, companyId: string, issueId: string, agentId: string, commentIds: string[],
 ): Promise<string[]> {
   if (!commentIds.length) return [];
-  const comments = await db.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-    inArray(issueComments.id, commentIds), eq(issueComments.authorType, "user"),
-    isNull(issueComments.createdByRunId), isNull(issueComments.deletedAt),
-    sql`nullif(trim(${issueComments.body}), '') is not null`,
-    sql`nullif(trim(${issueComments.authorUserId}), '') is not null`,
-  ));
-  const valid = new Set(comments.map(comment => comment.id));
-  const previous = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+  // A long issue can save thousands of comments. Look them up in fixed-size
+  // batches, and read consumed ids from the issue's runs (bounded by run count)
+  // instead of matching every saved id against every run in SQL.
+  const valid = new Set<string>();
+  for (let offset = 0; offset < commentIds.length; offset += COMMENT_LOOKUP_BATCH) {
+    const comments = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+      inArray(issueComments.id, commentIds.slice(offset, offset + COMMENT_LOOKUP_BATCH)),
+      eq(issueComments.authorType, "user"),
+      isNull(issueComments.createdByRunId), isNull(issueComments.deletedAt),
+      sql`nullif(trim(${issueComments.body}), '') is not null`,
+      sql`nullif(trim(${issueComments.authorUserId}), '') is not null`,
+    ));
+    for (const comment of comments) valid.add(comment.id);
+  }
+  const previous = await db.select({
+    wakeCommentId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'wakeCommentId'`,
+    wakeCommentIds: sql<unknown>`${heartbeatRuns.contextSnapshot}->'wakeCommentIds'`,
+  }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
     // A queued turn cancelled before dispatch has not consumed input, whatever
@@ -51,15 +62,12 @@ export async function undeliveredLegacyUserCommentIds(
     // native identity/process metadata is not proof that its prompt was sent.
     // Admission separately verifies process termination before a new turn.
     sql`not (${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null)`,
-    or(...commentIds.map(id => or(
-      sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${id}`,
-      sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> ${JSON.stringify([id])}::jsonb`,
-    ))),
+    sql`(${heartbeatRuns.contextSnapshot} ? 'wakeCommentId' or ${heartbeatRuns.contextSnapshot} ? 'wakeCommentIds')`,
   ));
-  for (const { context } of previous) {
-    if (typeof context?.wakeCommentId === "string") valid.delete(context.wakeCommentId);
-    if (Array.isArray(context?.wakeCommentIds)) {
-      for (const id of context.wakeCommentIds) if (typeof id === "string") valid.delete(id);
+  for (const { wakeCommentId, wakeCommentIds } of previous) {
+    if (typeof wakeCommentId === "string") valid.delete(wakeCommentId);
+    if (Array.isArray(wakeCommentIds)) {
+      for (const id of wakeCommentIds) if (typeof id === "string") valid.delete(id);
     }
   }
   return commentIds.filter(id => valid.has(id));
