@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 
 /** Both run finalization and provider publication can arrive first. Re-read
  * durable evidence under the task lock; never infer completion from prose. */
@@ -44,9 +45,12 @@ export async function settleSlackConversation(db: Db, companyId: string, issueId
       ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ].filter((id): id is string => typeof id === "string" && /^[a-f0-9-]{36}$/i.test(id)))];
     if (!commentIds.length) return false;
-    const [wake] = await tx.select().from(issueComments)
-      .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)))
-      .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+    // Newest of the wake's comments; each batch is ordered, so compare their heads.
+    const newest = await selectInCommentBatches(commentIds, batch => tx.select().from(issueComments)
+      .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch)))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1));
+    const wake = newest.reduce<(typeof newest)[number] | undefined>((best, row) =>
+      !best || row.createdAt > best.createdAt || (row.createdAt.getTime() === best.createdAt.getTime() && row.id > best.id) ? row : best, undefined);
     if (!wake) return false;
     const [evidence] = await tx.execute<{ ready: boolean }>(sql`select
       exists (select 1 from chat_publications p join issue_comments response
