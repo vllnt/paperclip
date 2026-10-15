@@ -41,6 +41,7 @@ import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -8112,32 +8113,34 @@ export async function buildPaperclipWakePayload(input: {
   const commentRows =
     commentIds.length === 0
       ? []
-      : await input.db
-          .select({
-            id: issueComments.id,
-            issueId: issueComments.issueId,
-            body: issueComments.body,
-            authorType: issueComments.authorType,
-            authorAgentId: issueComments.authorAgentId,
-            authorUserId: issueComments.authorUserId,
-            presentation: issueComments.presentation,
-            metadata: issueComments.metadata,
-            deletedAt: issueComments.deletedAt,
-            deletedByType: issueComments.deletedByType,
-            deletedByAgentId: issueComments.deletedByAgentId,
-            deletedByUserId: issueComments.deletedByUserId,
-            deletedByRunId: issueComments.deletedByRunId,
-            sourceTrust: issueComments.sourceTrust,
-            createdAt: issueComments.createdAt,
-          })
-          .from(issueComments)
-          .where(
-            and(
-              eq(issueComments.companyId, input.companyId),
-              issueId ? eq(issueComments.issueId, issueId) : undefined,
-              inArray(issueComments.id, commentIds),
+      : await selectInCommentBatches(commentIds, (batch) =>
+          input.db
+            .select({
+              id: issueComments.id,
+              issueId: issueComments.issueId,
+              body: issueComments.body,
+              authorType: issueComments.authorType,
+              authorAgentId: issueComments.authorAgentId,
+              authorUserId: issueComments.authorUserId,
+              presentation: issueComments.presentation,
+              metadata: issueComments.metadata,
+              deletedAt: issueComments.deletedAt,
+              deletedByType: issueComments.deletedByType,
+              deletedByAgentId: issueComments.deletedByAgentId,
+              deletedByUserId: issueComments.deletedByUserId,
+              deletedByRunId: issueComments.deletedByRunId,
+              sourceTrust: issueComments.sourceTrust,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, input.companyId),
+                issueId ? eq(issueComments.issueId, issueId) : undefined,
+                inArray(issueComments.id, batch),
+              ),
             ),
-          );
+        );
 
   const commentsById = new Map(
     commentRows.map((comment) => [comment.id, comment]),
@@ -11389,19 +11392,22 @@ export function heartbeatService(
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
-        .select({
-          id: issueComments.id,
-          authorUserId: issueComments.authorUserId,
-        })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, input.companyId),
-            eq(issueComments.issueId, input.issueContext.id),
-            inArray(issueComments.id, messageIds),
+      const issueContextId = input.issueContext.id;
+      const messages = await selectInCommentBatches(messageIds, (batch) =>
+        db
+          .select({
+            id: issueComments.id,
+            authorUserId: issueComments.authorUserId,
+          })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, input.companyId),
+              eq(issueComments.issueId, issueContextId),
+              inArray(issueComments.id, batch),
+            ),
           ),
-        );
+      );
       for (const id of [...messageIds].reverse()) {
         const author = messages.find(
           (message) => message.id === id,
@@ -18758,21 +18764,24 @@ export function heartbeatService(
                   ? { kind: "claimed" as const, run: claimedRun }
                   : { kind: "stale" as const, run: null };
               }
-              const commentRows = await tx
-                .select({
-                  id: issueComments.id,
-                  deletedAt: issueComments.deletedAt,
-                })
-                .from(issueComments)
-                .where(
-                  and(
-                    eq(issueComments.companyId, run.companyId),
-                    eq(issueComments.issueId, issueId),
-                    inArray(issueComments.id, authoritativeIds),
+              const commentRows = await selectInCommentBatches(authoritativeIds, (batch) =>
+                tx
+                  .select({
+                    id: issueComments.id,
+                    deletedAt: issueComments.deletedAt,
+                  })
+                  .from(issueComments)
+                  .where(
+                    and(
+                      eq(issueComments.companyId, run.companyId),
+                      eq(issueComments.issueId, issueId),
+                      inArray(issueComments.id, batch),
+                    ),
                   ),
-                );
+              );
+              const commentsById = new Map(commentRows.map((row) => [row.id, row]));
               const liveIds = authoritativeIds.filter((commentId) => {
-                const comment = commentRows.find((row) => row.id === commentId);
+                const comment = commentsById.get(commentId);
                 return Boolean(comment && !comment.deletedAt);
               });
               if (liveIds.length === 0) {

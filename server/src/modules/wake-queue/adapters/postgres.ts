@@ -3,6 +3,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { selectInCommentBatches } from "../../../services/comment-id-batches.js";
 import { ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON } from "../../../services/issue-dependency-wakeups.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -282,13 +283,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds }) {
-      const rows = await tx
+      const rows = await selectInCommentBatches(queuedCommentIds, (batch) => tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
-        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queuedCommentIds), currentConversationCommentCondition()));
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch), currentConversationCommentCondition())));
+      const rowsById = new Map(rows.map((row) => [row.id, row]));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveNonSelfCommentIds = queuedCommentIds.filter((commentId) => {
-        const row = rows.find((candidate) => candidate.id === commentId);
+        const row = rowsById.get(commentId);
         return Boolean(row && !row.deletedAt && (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });
       const containedSelfAuthoredComment = rows.some(
@@ -438,10 +440,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async getCommentSelfAuthorship({ companyId, issueId, finishingRunId, commentIds }) {
-      const rows = await tx
+      const rows = await selectInCommentBatches(commentIds, (batch) => tx
         .select({ createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
-        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch))));
       return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
     },
 
@@ -457,12 +459,12 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .then((rows) => rows[0]);
       if (parent?.status !== "done" || parent.assigneeAgentId !== run.agentId) return false;
 
-      const comments = await tx.select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId,
+      const comments = await selectInCommentBatches(uniqueCommentIds, (batch) => tx.select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId,
         authorAgentId: issueComments.authorAgentId })
         .from(issueComments).where(and(
           eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-          inArray(issueComments.id, uniqueCommentIds), isNull(issueComments.deletedAt), currentConversationCommentCondition(),
-        ));
+          inArray(issueComments.id, batch), isNull(issueComments.deletedAt), currentConversationCommentCondition(),
+        )));
       if (comments.length !== uniqueCommentIds.length || comments.some((comment) =>
         comment.createdByRunId !== run.id || (comment.authorAgentId !== null && comment.authorAgentId !== run.agentId)
       )) return false;
