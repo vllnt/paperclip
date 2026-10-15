@@ -11754,6 +11754,7 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    manualUserWake?: boolean;
   }) {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
@@ -11815,6 +11816,7 @@ export function heartbeatService(
             { issueId: recoveryIssue.id, sourceIssueId: input.claimed.id },
             "status_only",
           ),
+          ...(input.manualUserWake ? { manualUserWake: true } : {}),
           requestedByActorType: input.actorType,
           requestedByActorId: input.actorId,
           contextSnapshot: withRecoveryContext(
@@ -11891,6 +11893,7 @@ export function heartbeatService(
         },
         "status_only",
       ),
+      ...(input.manualUserWake ? { manualUserWake: true } : {}),
       requestedByActorType: input.actorType,
       requestedByActorId: input.actorId,
       contextSnapshot: withRecoveryContext(
@@ -11937,6 +11940,8 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    /** Trusted provenance of a user's check-now: the recovery wake stays exempt from the automation window. */
+    manualUserWake?: boolean;
   }) {
     await db
       .update(issues)
@@ -11983,6 +11988,7 @@ export function heartbeatService(
       agentId: input.agentId,
       runId: input.runId,
       activitySource: input.activitySource,
+      manualUserWake: input.manualUserWake,
     });
 
     return { outcome: "skipped" as const, reason: input.clearReason };
@@ -12074,6 +12080,7 @@ export function heartbeatService(
         agentId: input.agentId,
         runId: input.runId,
         activitySource: input.activitySource,
+        manualUserWake: input.manualUserWake,
       });
     }
 

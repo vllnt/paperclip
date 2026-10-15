@@ -723,4 +723,49 @@ describe("automation wake window on the real queue", () => {
     expect(runs).toHaveLength(1);
     expect(await deferredReceipts(agentId, issueIds[0]!)).toHaveLength(0);
   }, 60_000);
+  // A limit-hit check-now is still the person's request: the policy recovery it enqueues keeps the
+  // trusted manual provenance, so the window neither coalesces nor parks it.
+  it.each([
+    {
+      name: "max attempts with wake_owner",
+      wakeReason: "issue_monitor_recovery",
+      monitor: { maxAttempts: 1, recoveryPolicy: "wake_owner" },
+      attemptCount: 1,
+    },
+    {
+      name: "timeout with create_recovery_issue",
+      wakeReason: "issue_monitor_recovery_issue",
+      monitor: { timeoutAt: new Date(Date.now() - 10_000).toISOString(), recoveryPolicy: "create_recovery_issue" },
+      attemptCount: 0,
+    },
+  ])("starts the recovery run for a user's check-now that hits the limit: $name", async ({ wakeReason, monitor, attemptCount }) => {
+    for (const windowSeconds of [300, 0]) {
+      const { companyId, agentId, issueIds } = await seed(windowSeconds, 2);
+      await insertRecentAutomationRun(companyId, agentId, issueIds[1]!);
+      const nextCheckAt = new Date(Date.now() + 60_000);
+      await db.update(issues).set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: { nextCheckAt: nextCheckAt.toISOString(), ...monitor },
+        },
+        monitorNextCheckAt: nextCheckAt,
+        monitorAttemptCount: attemptCount,
+        monitorScheduledBy: "assignee",
+      }).where(eq(issues.id, issueIds[0]!));
+
+      await heartbeat.triggerIssueMonitor(issueIds[0]!, { actorType: "user", actorId: "window-user" });
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      const recoveryRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .filter((run) => run.contextSnapshot?.wakeReason === wakeReason);
+      expect(recoveryRuns).toHaveLength(1);
+      const parked = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      expect(parked).toHaveLength(0);
+    }
+  }, 120_000);
 });
