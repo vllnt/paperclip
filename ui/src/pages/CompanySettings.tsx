@@ -1,4 +1,4 @@
-import { ChangeEvent, useEffect, useState } from "react";
+import { ChangeEvent, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -95,6 +95,33 @@ export function CompanySettings() {
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
+  // Each field edit patches the latest draft (not the last server snapshot) and
+  // saves run one at a time, so a quick second edit cannot erase the first.
+  const retryDraft = useRef(retryPolicy);
+  const retryServerPolicy = useRef(retryPolicy);
+  retryServerPolicy.current = retryPolicy;
+  const retrySaves = useRef({ pending: 0, tail: Promise.resolve() });
+  useEffect(() => {
+    if (retrySaves.current.pending === 0) retryDraft.current = retryPolicy;
+  }, [retryPolicy]);
+  const saveRetryPolicy = (patch: TransientRetryPolicy) => {
+    const policy = { ...retryDraft.current, ...patch };
+    retryDraft.current = policy;
+    const saves = retrySaves.current;
+    saves.pending += 1;
+    saves.tail = saves.tail
+      .then(() => retryPolicyMutation.mutateAsync(policy))
+      .then(
+        () => undefined,
+        () => {
+          // Drop the failed edit so the next one starts from the saved policy.
+          retryDraft.current = retryServerPolicy.current;
+        },
+      )
+      .finally(() => {
+        saves.pending -= 1;
+      });
+  };
 
   const governanceMutation = useMutation({
     mutationFn: (next: InteractionResolverGovernance) =>
@@ -385,7 +412,7 @@ export function CompanySettings() {
             onBlur={(e) => {
               const next = e.currentTarget.valueAsNumber;
               if (Number.isInteger(next) && next >= 0 && next <= 100 && next !== (retryPolicy.perIssuePerHour ?? 0)) {
-                retryPolicyMutation.mutate({ ...retryPolicy, perIssuePerHour: next });
+                saveRetryPolicy({ perIssuePerHour: next });
               }
             }}
           />
@@ -395,9 +422,7 @@ export function CompanySettings() {
             type="checkbox"
             checked={retryPolicy.suppressWhenBlocked ?? false}
             data-testid="company-settings-transient-retry-suppress-blocked"
-            onChange={(e) =>
-              retryPolicyMutation.mutate({ ...retryPolicy, suppressWhenBlocked: e.currentTarget.checked })
-            }
+            onChange={(e) => saveRetryPolicy({ suppressWhenBlocked: e.currentTarget.checked })}
           />
           Skip transient retries while the issue is blocked
         </label>

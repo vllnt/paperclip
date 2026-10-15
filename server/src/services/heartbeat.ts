@@ -16173,7 +16173,7 @@ export function heartbeatService(
    * Defers (never drops) a transient retry so that at most `limit` retries are
    * scheduled per (issue, agent) in any rolling hour.
    */
-  async function resolveTransientRetryRateLimitedDueAt(input: {
+  async function resolveTransientRetryRateLimitedDueAt(reader: Pick<typeof db, "select">, input: {
     companyId: string;
     agentId: string;
     issueId: string;
@@ -16183,7 +16183,7 @@ export function heartbeatService(
   }): Promise<Date> {
     const { limit } = input;
     const windowStart = new Date(input.dueAt.getTime() - 60 * 60 * 1000);
-    const slots = await db
+    const slots = await reader
       .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
       .from(heartbeatRuns)
       .where(
@@ -16392,25 +16392,9 @@ export function heartbeatService(
     const retryPolicy = isTransientRetryWake
       ? await resolveTransientRetryPolicyForRun({ companyId: run.companyId, agent, issueId, wakeReason })
       : null;
-    const rateLimitedDueAt =
-      issueId && retryPolicy && retryPolicy.perIssuePerHour > 0
-        ? await resolveTransientRetryRateLimitedDueAt({
-            companyId: run.companyId,
-            agentId: run.agentId,
-            issueId,
-            retryReason,
-            limit: retryPolicy.perIssuePerHour,
-            dueAt: notBeforeSchedule.dueAt,
-          })
-        : notBeforeSchedule.dueAt;
-    const schedule =
-      rateLimitedDueAt.getTime() > notBeforeSchedule.dueAt.getTime()
-        ? {
-            ...notBeforeSchedule,
-            dueAt: rateLimitedDueAt,
-            delayMs: Math.max(0, rateLimitedDueAt.getTime() - now.getTime()),
-          }
-        : notBeforeSchedule;
+    // The per-issue hourly slot is reserved inside the transaction, after the
+    // issue row lock, so concurrent predecessors cannot claim the same slot.
+    let schedule = notBeforeSchedule;
 
     const requiresIssueGate =
       isTransientWorkspaceGitScanCode(run.errorCode) ||
@@ -16854,6 +16838,25 @@ export function heartbeatService(
               issueId,
               details: { issueId, currentStatus: "blocked" },
             };
+          }
+        }
+
+        if (issueId && retryPolicy && retryPolicy.perIssuePerHour > 0) {
+          const rateLimitedDueAt = await resolveTransientRetryRateLimitedDueAt(tx, {
+            companyId: run.companyId,
+            agentId: run.agentId,
+            issueId,
+            retryReason,
+            limit: retryPolicy.perIssuePerHour,
+            dueAt: notBeforeSchedule.dueAt,
+          });
+          if (rateLimitedDueAt.getTime() > notBeforeSchedule.dueAt.getTime()) {
+            schedule = {
+              ...notBeforeSchedule,
+              dueAt: rateLimitedDueAt,
+              delayMs: Math.max(0, rateLimitedDueAt.getTime() - now.getTime()),
+            };
+            retryContextSnapshot.scheduledRetryAt = rateLimitedDueAt.toISOString();
           }
         }
 

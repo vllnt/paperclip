@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -225,5 +225,42 @@ describeEmbeddedPostgres("transient retry policy layers", () => {
       .set({ runtimeConfig: { heartbeat: { wakeOnDemand: true }, transientRetryPolicy: { perIssuePerHour: "lots" } } })
       .where(eq(agents.id, agentId));
     expect(await scheduledDelayMs(runId)).toBe(BASE_DELAY_MS);
+  });
+
+  it("reserves distinct hour slots for concurrent predecessors of one issue", async () => {
+    const { runId, issueId } = await seed({ company: { perIssuePerHour: 1 } });
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "transient_failure"));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const secondId = randomUUID();
+    await db.insert(heartbeatRuns).values({ ...source, id: secondId });
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>(r => { acquired = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    const hold = db.transaction(async tx => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      acquired();
+      await gate;
+    });
+    await ready;
+    const work = Promise.all([schedule(runId), schedule(secondId)]);
+    let blocked = 0;
+    try {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const rows = await db.execute<{ n: number }>(sql`select count(*)::integer as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and query like 'select id from issues%' and pid <> pg_backend_pid()`);
+        blocked = rows[0]?.n ?? 0;
+        if (blocked >= 2) break;
+        await new Promise(r => setTimeout(r, 25));
+      }
+    } finally {
+      release();
+      await hold;
+    }
+    const results = await work;
+    expect(blocked, "both real transactions reached the issue row lock after preflight").toBe(2);
+    expect(results.map(r => r.outcome)).toEqual(["scheduled", "scheduled"]);
+    const due = results.map(r => r.outcome === "scheduled" ? r.run!.scheduledRetryAt!.getTime() : NaN).sort((a,b) => a-b);
+    expect(due[1] - due[0], "limit one permits at most one reservation per rolling hour").toBeGreaterThanOrEqual(HOUR_MS);
   });
 });
