@@ -142,6 +142,7 @@ import {
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -11065,6 +11066,27 @@ export function issueService(db: Db) {
         if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
+          // A recovery hold names the previous owner's run; the new owner
+          // cannot reconcile it, so supersede it with the ownership change.
+          const supersededAt = new Date();
+          const supersededNote = "Recovery closed because the task's owner changed. No work was replayed.";
+          await tx.update(issueRecoveryActions).set({
+            status: "resolved",
+            outcome: "cancelled",
+            resolvedAt: supersededAt,
+            updatedAt: supersededAt,
+            nextAction: supersededNote,
+            resolutionNote: supersededNote,
+            wakePolicy: null,
+            monitorPolicy: null,
+            evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
+              then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"owner_changed"'::jsonb)
+              else ${issueRecoveryActions.evidence} end`,
+          }).where(and(
+            eq(issueRecoveryActions.companyId, updated.companyId),
+            eq(issueRecoveryActions.sourceIssueId, updated.id),
+            executionBlockerPredicate(),
+          ));
         }
         if (existing.status !== updated.status) {
           if (
