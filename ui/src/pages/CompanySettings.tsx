@@ -92,8 +92,8 @@ export function CompanySettings() {
   const runContextMutation = useMutation({
     mutationFn: (next: RunContextPolicy | null) =>
       companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
-    onSuccess: () => {
-      setRunContextDraft(undefined);
+    onSuccess: (_company, saved) => {
+      setRunContextDraft((current) => (current === saved ? undefined : current));
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
