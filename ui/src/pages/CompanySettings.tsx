@@ -102,7 +102,8 @@ export function CompanySettings() {
     onMutate: ({ companyId }) => setCompanyEntry(setHiringErrors, companyId, null),
     onError: (error, { companyId }) =>
       setCompanyEntry(setHiringErrors, companyId, errorMessage(error, "Failed to save")),
-    onSuccess: () => {
+    onSuccess: (_company, { companyId }) => {
+      setCompanyEntry(setHiringErrors, companyId, null);
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
@@ -144,6 +145,7 @@ export function CompanySettings() {
       try {
         const updated = await retryPolicyMutation.mutateAsync({ companyId, policy });
         saves.base = updated.transientRetryPolicy ?? policy;
+        setCompanyEntry(setRetryErrors, companyId, null);
       } catch (error) {
         // Only the failed edit is dropped; edits queued after it still apply.
         // Show the error and snap the input back to the saved value.

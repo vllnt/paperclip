@@ -234,4 +234,35 @@ describe("CompanySettings transient retry policy", () => {
     });
     await act(async () => root.unmount());
   });
+
+  it("clears the save error once a later save succeeds", async () => {
+    const settlers: Array<{ ok: () => void; fail: () => void }> = [];
+    mockCompaniesApi.update.mockImplementation(
+      (_id: string, data: unknown) =>
+        new Promise((resolve, reject) => {
+          settlers.push({
+            ok: () => resolve({ ...SELECTED_COMPANY, ...(data as object) }),
+            fail: () => reject(new Error("Rate save failed")),
+          });
+        }),
+    );
+    const { root, render } = renderSettings();
+    await act(async () => render());
+
+    await enterRate("5");
+    await enterRate("6");
+    await act(async () => {
+      settlers[0].fail();
+    });
+    expect(container.textContent).toContain("Rate save failed");
+
+    await act(async () => {
+      settlers[1].ok();
+    });
+    expect(container.textContent).not.toContain("Rate save failed");
+    expect(mockCompaniesApi.update).toHaveBeenLastCalledWith("company-1", {
+      transientRetryPolicy: { perIssuePerHour: 6 },
+    });
+    await act(async () => root.unmount());
+  });
 });
