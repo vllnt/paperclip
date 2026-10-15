@@ -12001,6 +12001,8 @@ export function heartbeatService(
       runId: string | null;
       clearOnClientError: boolean;
       activitySource: "manual" | "scheduled";
+      /** An authenticated user's check-now: exempt from the automation window like any human wake. */
+      manualUserWake?: boolean;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -12138,6 +12140,7 @@ export function heartbeatService(
           triggerDetail: input.triggerDetail,
           reason: wakeReason,
           idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
+          ...(input.manualUserWake ? { manualUserWake: true } : {}),
           payload: {
             issueId: claimed.id,
             nextCheckAt: scheduledAtIso,
@@ -12336,6 +12339,7 @@ export function heartbeatService(
       runId: input?.runId ?? null,
       clearOnClientError: false,
       activitySource: "manual",
+      manualUserWake: actorType === "user",
     });
   }
 

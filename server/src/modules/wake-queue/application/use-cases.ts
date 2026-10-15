@@ -819,6 +819,7 @@ async function runReleaseRecoveryTail(
 
   // A system recovery run is an automation wake like any other: it passes the agent's
   // window, and a held one stays parked for the deferred-wake sweep instead of starting now.
+  let admittedAt: Date | undefined;
   if (AUTOMATION_WAKE_REASON_SET.has(recoveryReason)) {
     const admission = await transaction.admitAutomationWake({
       companyId: issue.companyId,
@@ -840,6 +841,7 @@ async function runReleaseRecoveryTail(
       });
       return { outcome: { kind: "released" }, postCommitEffects };
     }
+    admittedAt = admission.admittedAt;
   }
 
   const queuedRun = await transaction.queueImmediateRecoveryRun({
@@ -851,6 +853,7 @@ async function runReleaseRecoveryTail(
     contextSnapshot: recoveryContextSnapshot,
     responsibleUserId: recoveryResponsibleUserId,
     sessionBefore,
+    ...(admittedAt ? { admittedAt } : {}),
     now: input.now,
   });
   postCommitEffects.push({ kind: "run_queued", run: queuedRun });

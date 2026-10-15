@@ -689,4 +689,38 @@ describe("automation wake window on the real queue", () => {
     expect(await recoveries()).toHaveLength(1);
     expect(await deferredReceipts(agentId, issueIds[0]!)).toHaveLength(0);
   }, 60_000);
+
+  // The recovery run opens the agent's next window. A wait on the issue lock must not age it:
+  // its creation time is the admission time, not the start of the release transaction.
+  it("stamps the immediate recovery run with its admission time after an issue-lock wait", async () => {
+    const { companyId, agentId, issueIds } = await seed(300, 1);
+    const manual = await queueManualRun(companyId, agentId, issueIds[0]!);
+    const lock = await holdIssueLock(issueIds[0]!);
+    const pending = heartbeat.cancelRun(manual.id);
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const releasedAt = Date.now();
+    await lock.release();
+    await pending;
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const recovery = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .find((run) => run.contextSnapshot?.wakeReason === "issue_continuation_needed");
+    expect(recovery).toBeDefined();
+    expect(recovery!.createdAt.getTime()).toBeGreaterThanOrEqual(releasedAt - 100);
+  }, 60_000);
+
+  // A person pressing "check now" is not an automation wake: the window must not coalesce it.
+  it("starts a monitor run for an authenticated user's check-now inside the window", async () => {
+    const { companyId, agentId, issueIds } = await seed(300, 2);
+    await insertRecentAutomationRun(companyId, agentId, issueIds[1]!);
+    await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60_000) })
+      .where(eq(issues.id, issueIds[0]!));
+
+    await heartbeat.triggerIssueMonitor(issueIds[0]!, { actorType: "user", actorId: "window-user" });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const runs = (await monitorRuns(agentId)).filter((run) => run.contextSnapshot?.issueId === issueIds[0]);
+    expect(runs).toHaveLength(1);
+    expect(await deferredReceipts(agentId, issueIds[0]!)).toHaveLength(0);
+  }, 60_000);
 });

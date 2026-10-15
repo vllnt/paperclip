@@ -794,6 +794,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       contextSnapshot,
       responsibleUserId,
       sessionBefore,
+      admittedAt,
       now,
     }) {
       const wakeupRequest = await tx
@@ -826,6 +827,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
+          ...(admittedAt ? { createdAt: admittedAt } : {}),
           updatedAt: now,
         })
         .returning()

@@ -290,6 +290,8 @@ export interface WakeQueueTransaction {
     contextSnapshot: Record<string, unknown>;
     responsibleUserId: string;
     sessionBefore: string | null;
+    /** The window admission time, stamped as the run's creation time so it opens the agent's next window. */
+    admittedAt?: Date;
     now: Date;
   }): Promise<RunSummary>;
 }
