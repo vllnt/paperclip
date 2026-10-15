@@ -12332,6 +12332,40 @@ export function heartbeatService(
 
   async function tickDueIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const parkedMonitors = await db
+      .select(issueMonitorDispatchColumns)
+      .from(issues)
+      .where(
+        and(
+          sql`${issues.monitorNextCheckAt} is not null`,
+          lte(issues.monitorNextCheckAt, now),
+          inArray(issues.status, ["blocked", "done", "cancelled"]),
+        ),
+      )
+      .limit(50);
+    for (const parked of parkedMonitors) {
+      await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorClearedPatch({
+            issue: parked,
+            policy: normalizeIssueExecutionPolicy(parked.executionPolicy ?? null),
+            clearReason:
+              parked.status === "done" || parked.status === "cancelled"
+                ? parked.status
+                : "invalid_status",
+            clearedAt: now,
+          }),
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issues.id, parked.id),
+            inArray(issues.status, ["blocked", "done", "cancelled"]),
+          ),
+        );
+    }
+
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)

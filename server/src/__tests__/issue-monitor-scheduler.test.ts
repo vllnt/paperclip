@@ -149,7 +149,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused";
-    issueStatus?: "in_progress" | "in_review";
+    issueStatus?: "in_progress" | "in_review" | "blocked" | "done" | "cancelled";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
   }) {
@@ -281,6 +281,22 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
   });
+
+  it.each(["blocked", "done", "cancelled"] as const)(
+    "skips the wake and clears a due monitor on a %s issue",
+    async (issueStatus) => {
+      const { issueId, agentId } = await seedFixture({ issueStatus });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+      expect(result.enqueued).toBe(0);
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
+    },
+  );
 
   it.each(["unknown", "exhausted"] as const)("does not replay a quota monitor with %s execution evidence", async (kind) => {
     const sourceRunId = randomUUID();
