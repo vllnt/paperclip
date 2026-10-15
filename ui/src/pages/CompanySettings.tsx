@@ -92,8 +92,8 @@ export function CompanySettings() {
   const runContextMutation = useMutation({
     mutationFn: (next: RunContextPolicy | null) =>
       companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
-    onSuccess: (_company, saved) => {
-      setRunContextDraft((current) => (current === saved ? undefined : current));
+    onSuccess: () => {
+      setRunContextDraft(undefined);
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
@@ -375,12 +375,15 @@ export function CompanySettings() {
           How much issue history a run sees. Blank fields keep the built-in behavior. Agents, routines
           and wake types can override these.
         </div>
-        <RunContextPolicyEditor
-          key={JSON.stringify(selectedCompany.runContextPolicy ?? null)}
-          value={runContextDraft === undefined ? selectedCompany.runContextPolicy : runContextDraft}
-          onChange={setRunContextDraft}
-          testId="company-settings-run-context"
-        />
+        {/* Locked while saving: an edit made mid-save would be dropped when the saved draft clears. */}
+        <fieldset disabled={runContextMutation.isPending} className="m-0 min-w-0 border-0 p-0">
+          <RunContextPolicyEditor
+            key={JSON.stringify(selectedCompany.runContextPolicy ?? null)}
+            value={runContextDraft === undefined ? selectedCompany.runContextPolicy : runContextDraft}
+            onChange={setRunContextDraft}
+            testId="company-settings-run-context"
+          />
+        </fieldset>
         {runContextDraft !== undefined && (
           <Button
             size="sm"
