@@ -11063,7 +11063,8 @@ export function issueService(db: Db) {
               eq(chatConversations.state, "waiting"), sql`exists (select 1 from chat_endpoints e
                 where e.id = ${chatConversations.endpointId} and e.company_id = ${chatConversations.companyId} and e.provider = 'slack')`));
         }
-        if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
+        // Compare against the row read under the lock, not the pre-lock snapshot.
+        if (updated.assigneeAgentId !== receiptExisting.assigneeAgentId || updated.assigneeUserId !== receiptExisting.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
           // A recovery hold names the previous owner's run; the new owner
@@ -11086,6 +11087,8 @@ export function issueService(db: Db) {
             eq(issueRecoveryActions.companyId, updated.companyId),
             eq(issueRecoveryActions.sourceIssueId, updated.id),
             executionBlockerPredicate(),
+            // An unsafe workspace stays held until repair, whoever owns the task.
+            sql`coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'`,
           ));
         }
         if (existing.status !== updated.status) {
