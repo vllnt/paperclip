@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   type InteractionResolverGovernance,
+  type TransientRetryPolicy,
   type IssueThreadInteractionKind,
 } from "@paperclipai/shared";
 import { useCompany } from "../context/CompanyContext";
@@ -81,6 +82,15 @@ export function CompanySettings() {
       companiesApi.update(selectedCompanyId!, {
         requireBoardApprovalForNewAgents: requireApproval
       }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    }
+  });
+
+  const retryPolicy: TransientRetryPolicy = selectedCompany?.transientRetryPolicy ?? {};
+  const retryPolicyMutation = useMutation({
+    mutationFn: (policy: TransientRetryPolicy) =>
+      companiesApi.update(selectedCompanyId!, { transientRetryPolicy: policy }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
@@ -352,6 +362,45 @@ export function CompanySettings() {
             toggleTestId="company-settings-team-approval-toggle"
           />
         </div>
+      </div>
+
+      {/* Run retries */}
+      <div className="max-w-2xl space-y-4" data-testid="company-settings-retry-section">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Run retries
+        </div>
+        <Field
+          label="Transient retries per issue per hour"
+          hint="0 means unlimited. Extra retries for the same issue and agent are deferred until the hour window allows them. Agents, routines and wake types can override this."
+        >
+          <input
+            key={retryPolicy.perIssuePerHour ?? 0}
+            className="w-24 rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+            type="number"
+            min={0}
+            max={100}
+            step={1}
+            defaultValue={retryPolicy.perIssuePerHour ?? 0}
+            data-testid="company-settings-transient-retry-input"
+            onBlur={(e) => {
+              const next = e.currentTarget.valueAsNumber;
+              if (Number.isInteger(next) && next >= 0 && next <= 100 && next !== (retryPolicy.perIssuePerHour ?? 0)) {
+                retryPolicyMutation.mutate({ ...retryPolicy, perIssuePerHour: next });
+              }
+            }}
+          />
+        </Field>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={retryPolicy.suppressWhenBlocked ?? false}
+            data-testid="company-settings-transient-retry-suppress-blocked"
+            onChange={(e) =>
+              retryPolicyMutation.mutate({ ...retryPolicy, suppressWhenBlocked: e.currentTarget.checked })
+            }
+          />
+          Skip transient retries while the issue is blocked
+        </label>
       </div>
 
       {/* Interaction governance */}

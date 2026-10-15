@@ -1,4 +1,4 @@
-import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
+import { resolveCompanyEnvironmentDefault, resolveTransientRetryPolicy, type ResolvedTransientRetryPolicy } from "@paperclipai/shared";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
@@ -16126,6 +16126,83 @@ export function heartbeatService(
     return true;
   }
 
+  /**
+   * Resolves the transient-retry tunables for a run: company < agent < routine,
+   * with wake-type overrides on top. With nothing configured this returns the
+   * pre-setting behavior (no rate limit, no blocked-issue suppression).
+   */
+  async function resolveTransientRetryPolicyForRun(input: {
+    companyId: string;
+    agent: typeof agents.$inferSelect;
+    issueId: string | null;
+    wakeReason: string | null;
+  }): Promise<ResolvedTransientRetryPolicy> {
+    const company = await db
+      .select({ policy: companies.transientRetryPolicy })
+      .from(companies)
+      .where(eq(companies.id, input.companyId))
+      .then((rows) => rows[0] ?? null);
+    const routinePolicy = input.issueId
+      ? await db
+          .select({ policy: routines.transientRetryPolicy })
+          .from(issues)
+          .innerJoin(
+            routines,
+            and(eq(routines.companyId, issues.companyId), sql`${routines.id}::text = ${issues.originId}`),
+          )
+          .where(
+            and(
+              eq(issues.id, input.issueId),
+              eq(issues.companyId, input.companyId),
+              eq(issues.originKind, "routine_execution"),
+            ),
+          )
+          .then((rows) => rows[0]?.policy ?? null)
+      : null;
+    return resolveTransientRetryPolicy(
+      {
+        company: company?.policy,
+        agent: parseObject(input.agent.runtimeConfig).transientRetryPolicy,
+        routine: routinePolicy,
+      },
+      input.wakeReason,
+    );
+  }
+
+  /**
+   * Defers (never drops) a transient retry so that at most `limit` retries are
+   * scheduled per (issue, agent) in any rolling hour.
+   */
+  async function resolveTransientRetryRateLimitedDueAt(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    retryReason: string;
+    limit: number;
+    dueAt: Date;
+  }): Promise<Date> {
+    const { limit } = input;
+    const windowStart = new Date(input.dueAt.getTime() - 60 * 60 * 1000);
+    const slots = await db
+      .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          eq(heartbeatRuns.scheduledRetryReason, input.retryReason),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+          gt(heartbeatRuns.scheduledRetryAt, windowStart),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.scheduledRetryAt))
+      .limit(limit);
+    const oldestSlot = slots[limit - 1]?.scheduledRetryAt;
+    if (!oldestSlot) return input.dueAt;
+    const nextSlot = new Date(oldestSlot.getTime() + 60 * 60 * 1000);
+    return nextSlot.getTime() > input.dueAt.getTime() ? nextSlot : input.dueAt;
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -16297,7 +16374,7 @@ export function heartbeatService(
       }
     }
 
-    const schedule =
+    const notBeforeSchedule =
       transientRetryNotBefore &&
       transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
@@ -16309,6 +16386,31 @@ export function heartbeatService(
             ),
           }
         : baseSchedule;
+    const isTransientRetryWake =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      wakeReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    const retryPolicy = isTransientRetryWake
+      ? await resolveTransientRetryPolicyForRun({ companyId: run.companyId, agent, issueId, wakeReason })
+      : null;
+    const rateLimitedDueAt =
+      issueId && retryPolicy && retryPolicy.perIssuePerHour > 0
+        ? await resolveTransientRetryRateLimitedDueAt({
+            companyId: run.companyId,
+            agentId: run.agentId,
+            issueId,
+            retryReason,
+            limit: retryPolicy.perIssuePerHour,
+            dueAt: notBeforeSchedule.dueAt,
+          })
+        : notBeforeSchedule.dueAt;
+    const schedule =
+      rateLimitedDueAt.getTime() > notBeforeSchedule.dueAt.getTime()
+        ? {
+            ...notBeforeSchedule,
+            dueAt: rateLimitedDueAt,
+            delayMs: Math.max(0, rateLimitedDueAt.getTime() - now.getTime()),
+          }
+        : notBeforeSchedule;
 
     const requiresIssueGate =
       isTransientWorkspaceGitScanCode(run.errorCode) ||
@@ -16461,6 +16563,7 @@ export function heartbeatService(
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
+            | "issue_blocked"
             | "issue_execution_lock_changed";
           issueId: string | null;
           details: Record<string, unknown>;
@@ -16734,6 +16837,22 @@ export function heartbeatService(
               outcome: "not_scheduled", issueId, errorCode: "issue_execution_lock_changed",
               reason: "Subscription retry suppressed because the task execution lock changed",
               details: { issueId, expectedExecutionRunId: run.id, currentExecutionRunId: lockedIssue?.executionRunId ?? null },
+            };
+          }
+        }
+
+        if (issueId && retryPolicy?.suppressWhenBlocked) {
+          const [blockedCheck] = await tx
+            .select({ status: issues.status })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+          if (blockedCheck?.status === "blocked") {
+            return {
+              outcome: "not_scheduled",
+              reason: "Transient retry suppressed because the issue is blocked",
+              errorCode: "issue_blocked",
+              issueId,
+              details: { issueId, currentStatus: "blocked" },
             };
           }
         }

@@ -1448,11 +1448,23 @@ export function registerCompanyCommands(program: Command): void {
       .command("update")
       .description("Update a company")
       .argument("<companyId>", "Company ID")
-      .requiredOption("--payload-json <json>", "UpdateCompany JSON payload")
-      .action(async (companyId: string, opts: CompanyJsonOptions) => {
+      .option("--payload-json <json>", "UpdateCompany JSON payload")
+      .option(
+        "--transient-retry-policy-json <json>",
+        'Company transient-retry policy, e.g. {"perIssuePerHour":2,"suppressWhenBlocked":true,"wakeTypes":{"transient_failure_retry":{"perIssuePerHour":1}}}. perIssuePerHour 0 = unlimited (default).',
+      )
+      .action(async (companyId: string, opts: CompanyJsonOptions & { transientRetryPolicyJson?: string }) => {
         try {
           const ctx = resolveCommandContext(opts);
-          printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, parseJson(opts.payloadJson ?? "{}")), { json: ctx.json });
+          const base = parseJson(opts.payloadJson ?? "{}");
+          const payload =
+            opts.transientRetryPolicyJson === undefined
+              ? base
+              : {
+                  ...(typeof base === "object" && base !== null ? base : {}),
+                  transientRetryPolicy: parseJson(opts.transientRetryPolicyJson),
+                };
+          printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, payload), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

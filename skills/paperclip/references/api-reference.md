@@ -708,7 +708,21 @@ POST /api/companies/{companyId}/logo     — upload logo (multipart, field: "fil
 
 **CEO-allowed fields:** `name`, `description`, `logoAssetId` (UUID or null).
 
-**Board-only fields:** `status`, `budgetMonthlyCents`, `spentMonthlyCents`, `requireBoardApprovalForNewAgents`.
+**Board-only fields:** `status`, `budgetMonthlyCents`, `spentMonthlyCents`, `requireBoardApprovalForNewAgents`, `transientRetryPolicy`.
+
+### Transient retry policy (layered)
+
+`transientRetryPolicy` tunes bounded retries after transient failures. It is accepted on `PATCH /api/companies/{companyId}`, on routine create/update (`transientRetryPolicy`), and on an agent at `runtimeConfig.transientRetryPolicy`. Shape (all fields optional):
+
+```json
+{ "perIssuePerHour": 2, "suppressWhenBlocked": true, "wakeTypes": { "transient_failure_retry": { "perIssuePerHour": 1 } } }
+```
+
+- `perIssuePerHour` (0-100): max transient retries scheduled per issue and agent per rolling hour; extra retries are deferred, never dropped. `0` = unlimited.
+- `suppressWhenBlocked`: skip the retry (`issue_blocked`) when the issue is `blocked`.
+- Precedence, least to most specific: company < agent < routine < wake-type (`wakeTypes` entries of any layer beat every plain layer value). Unset fields fall through; defaults are `0` / `false`, i.e. the behavior before this setting existed.
+- CLI: `paperclipai company update <id> --transient-retry-policy-json '<json>'`; routines and agents via their `--payload-json`.
+
 
 **Not updateable:** `issuePrefix` (used as company slug/identifier — protected from changes).
 

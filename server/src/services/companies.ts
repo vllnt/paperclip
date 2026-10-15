@@ -212,6 +212,7 @@ export function companyService(db: Db) {
     requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
     interactionResolverGovernance: companies.interactionResolverGovernance,
     duplicateDetectionMode: companies.duplicateDetectionMode,
+    transientRetryPolicy: companies.transientRetryPolicy,
     feedbackDataSharingEnabled: companies.feedbackDataSharingEnabled,
     feedbackDataSharingConsentAt: companies.feedbackDataSharingConsentAt,
     feedbackDataSharingConsentByUserId: companies.feedbackDataSharingConsentByUserId,
