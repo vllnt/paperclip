@@ -16,6 +16,7 @@ import {
 } from "./issue.js";
 import { envConfigSchema } from "./secret.js";
 import { isValidRoutineDateString } from "../routine-variables.js";
+import { transientRetryPolicySchema } from "../transient-retry-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
 
 const routineVariableValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
@@ -78,6 +79,7 @@ export const createRoutineSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  transientRetryPolicy: transientRetryPolicySchema.optional(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;

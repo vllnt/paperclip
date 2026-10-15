@@ -449,6 +449,21 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routine.activityGateScope).toBe("company");
   });
 
+  it("defaults the transient retry policy to empty and persists a policy-only update without a new revision", async () => {
+    const { routine, svc } = await seedFixture();
+    expect(routine.transientRetryPolicy).toEqual({});
+
+    const policy = { perIssuePerHour: 2, wakeTypes: { transient_failure_retry: { suppressWhenBlocked: true } } };
+    const updated = await svc.update(
+      routine.id,
+      { transientRetryPolicy: policy, baseRevisionId: routine.latestRevisionId },
+      {},
+    );
+    expect(updated?.transientRetryPolicy).toEqual(policy);
+    expect(updated?.latestRevisionId).toBe(routine.latestRevisionId);
+    expect((await svc.get(routine.id))?.transientRetryPolicy).toEqual(policy);
+  });
+
   it("fires an activity gate for a routine that has never dispatched", async () => {
     const { routine, svc } = await seedFixture();
 

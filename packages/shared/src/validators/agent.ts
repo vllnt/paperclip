@@ -1,6 +1,7 @@
 import { agentAppearanceSchema } from "../agent-appearance.js";
 import { aiConnectionBindingSchema } from "../ai-connections.js";
 import { z } from "zod";
+import { transientRetryPolicySchema } from "../transient-retry-policy.js";
 import {
   AGENT_ICON_NAMES,
   AGENT_ROLES,
@@ -71,6 +72,7 @@ export const createAgentInstructionsBundleSchema = z.object({
 
 export const agentRuntimeConfigSchema = z.object({
   aiConnection: aiConnectionBindingSchema.optional(),
+  transientRetryPolicy: transientRetryPolicySchema.optional(),
   debug: z.object({
     providerTrace: z.literal("raw").optional(),
   }).strict().optional(),

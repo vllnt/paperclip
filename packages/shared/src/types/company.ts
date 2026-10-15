@@ -1,3 +1,4 @@
+import type { TransientRetryPolicy } from "../transient-retry-policy.js";
 import type { DuplicateDetectionMode } from "../duplicate-detection.js";
 import type {
   CompanyStatus,
@@ -30,6 +31,7 @@ export interface Company {
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
   duplicateDetectionMode: DuplicateDetectionMode;
+  transientRetryPolicy: TransientRetryPolicy;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

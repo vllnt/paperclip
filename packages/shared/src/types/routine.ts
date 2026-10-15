@@ -1,3 +1,4 @@
+import type { TransientRetryPolicy } from "../transient-retry-policy.js";
 import type {
   IssueOriginKind,
   IssuePriority,
@@ -85,6 +86,7 @@ export interface Routine {
   catchUpPolicy: string;
   activityGatePolicy: string;
   activityGateScope: string;
+  transientRetryPolicy?: TransientRetryPolicy;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];
