@@ -12343,27 +12343,41 @@ export function heartbeatService(
         ),
       )
       .limit(50);
-    for (const parked of parkedMonitors) {
-      await db
-        .update(issues)
-        .set({
-          ...buildIssueMonitorClearedPatch({
-            issue: parked,
-            policy: normalizeIssueExecutionPolicy(parked.executionPolicy ?? null),
-            clearReason:
-              parked.status === "done" || parked.status === "cancelled"
-                ? parked.status
-                : "invalid_status",
-            clearedAt: now,
-          }),
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, parked.id),
-            inArray(issues.status, ["blocked", "done", "cancelled"]),
-          ),
-        );
+    for (const candidate of parkedMonitors) {
+      // Lock and re-read so the cleanup never overwrites a concurrent edit with a stale snapshot.
+      await db.transaction(async (tx) => {
+        const [parked] = await tx
+          .select(issueMonitorDispatchColumns)
+          .from(issues)
+          .where(
+            and(
+              eq(issues.id, candidate.id),
+              sql`${issues.monitorNextCheckAt} is not null`,
+              inArray(issues.status, ["blocked", "done", "cancelled"]),
+            ),
+          )
+          .for("update");
+        if (!parked) return;
+        const { monitor: _monitor, ...policyWithoutMonitor } = (parked.executionPolicy ?? {}) as Record<string, unknown>;
+        const clearedPatch = buildIssueMonitorClearedPatch({
+          issue: parked,
+          policy: normalizeIssueExecutionPolicy(parked.executionPolicy ?? null),
+          clearReason:
+            parked.status === "done" || parked.status === "cancelled"
+              ? parked.status
+              : "invalid_status",
+          clearedAt: now,
+        });
+        await tx
+          .update(issues)
+          .set({
+            ...clearedPatch,
+            // Keep every non-monitor policy field; the normalized policy would drop some.
+            executionPolicy: parked.executionPolicy ? policyWithoutMonitor : null,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, parked.id));
+      });
     }
 
     const dueMonitors = await db
