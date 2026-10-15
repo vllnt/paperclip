@@ -2830,3 +2830,4 @@ export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
 export * from "./duplicate-detection.js";
+export * from "./automation-wake.js";

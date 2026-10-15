@@ -34,6 +34,7 @@ const ARCHIVING_COMPANY = {
   attachmentMaxBytes: null,
   requireBoardApprovalForNewAgents: false,
   interactionResolverGovernance: {},
+  automationWakeSettings: {},
 };
 
 const SIBLING_COMPANY = {

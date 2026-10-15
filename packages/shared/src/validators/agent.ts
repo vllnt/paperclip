@@ -1,3 +1,4 @@
+import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { agentAppearanceSchema } from "../agent-appearance.js";
 import { aiConnectionBindingSchema } from "../ai-connections.js";
 import { z } from "zod";
@@ -69,8 +70,11 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
+const agentHeartbeatConfigSchema = automationWakeSettingsSchema.catchall(z.unknown());
+
 export const agentRuntimeConfigSchema = z.object({
   aiConnection: aiConnectionBindingSchema.optional(),
+  heartbeat: agentHeartbeatConfigSchema.optional(),
   debug: z.object({
     providerTrace: z.literal("raw").optional(),
   }).strict().optional(),

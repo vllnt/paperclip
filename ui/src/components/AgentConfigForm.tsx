@@ -108,6 +108,11 @@ import {
   paperclipRunnerTransitionConfig,
   type CreateConfigValues,
 } from "@paperclipai/adapter-utils";
+import {
+  AUTOMATION_WAKE_SETTINGS_HELP,
+  AutomationWakeSettingsFields,
+  readAutomationWakeSettings,
+} from "./AutomationWakeSettingsFields";
 import { Badge } from "@/components/ui/badge";
 
 /* ---- Props ---- */
@@ -2083,6 +2088,27 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   onCommit={(v) => mark("heartbeat", "cooldownSec", v)}
                   immediate
                   className={inputClass}
+                />
+              </Field>
+              <Field label="Automation wake window" hint={AUTOMATION_WAKE_SETTINGS_HELP}>
+                <AutomationWakeSettingsFields
+                  idPrefix="agent"
+                  value={{
+                    minSecondsBetweenAutomationWakes: eff(
+                      "heartbeat",
+                      "minSecondsBetweenAutomationWakes",
+                      readAutomationWakeSettings(heartbeat).minSecondsBetweenAutomationWakes,
+                    ),
+                    byWakeReason: eff(
+                      "heartbeat",
+                      "byWakeReason",
+                      readAutomationWakeSettings(heartbeat).byWakeReason,
+                    ),
+                  }}
+                  onChange={(next) => {
+                    mark("heartbeat", "minSecondsBetweenAutomationWakes", next.minSecondsBetweenAutomationWakes);
+                    mark("heartbeat", "byWakeReason", next.byWakeReason);
+                  }}
                 />
               </Field>
               <Field label="Max concurrent runs" hint={help.maxConcurrentRuns}>

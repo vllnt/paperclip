@@ -42,6 +42,7 @@ export type {
   PromoteScheduledRetryOutcome,
   CancelStaleQueuedRunOutcome,
 } from "./application/types.js";
+export type { RetryAdmissionPolicy } from "./application/ports.js";
 export { RunDispatchApplicationError } from "./application/types.js";
 
 export type RunDispatchDeps = {
