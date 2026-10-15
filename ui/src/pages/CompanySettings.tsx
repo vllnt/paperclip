@@ -77,11 +77,31 @@ export function CompanySettings() {
     }
   });
 
+  // Save failures are remembered per company so one company's error never
+  // shows on another. `resets` remounts the retry input back to the saved value.
+  const [hiringErrors, setHiringErrors] = useState<Record<string, string>>({});
+  const [retryErrors, setRetryErrors] = useState<Record<string, string>>({});
+  const [retryResets, setRetryResets] = useState<Record<string, number>>({});
+  const errorMessage = (error: unknown, fallback: string) =>
+    error instanceof Error ? error.message : fallback;
+  const setCompanyEntry = <T,>(
+    setter: (update: (prev: Record<string, T>) => Record<string, T>) => void,
+    companyId: string,
+    value: T | null,
+  ) =>
+    setter((prev) => {
+      const { [companyId]: _dropped, ...rest } = prev;
+      return value === null ? rest : { ...rest, [companyId]: value };
+    });
+
   const settingsMutation = useMutation({
-    mutationFn: (requireApproval: boolean) =>
-      companiesApi.update(selectedCompanyId!, {
+    mutationFn: ({ companyId, requireApproval }: { companyId: string; requireApproval: boolean }) =>
+      companiesApi.update(companyId, {
         requireBoardApprovalForNewAgents: requireApproval
       }),
+    onMutate: ({ companyId }) => setCompanyEntry(setHiringErrors, companyId, null),
+    onError: (error, { companyId }) =>
+      setCompanyEntry(setHiringErrors, companyId, errorMessage(error, "Failed to save")),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
@@ -118,13 +138,17 @@ export function CompanySettings() {
     }
     const saves = state;
     saves.queued.push(patch);
+    setCompanyEntry(setRetryErrors, companyId, null);
     saves.tail = saves.tail.then(async () => {
       const policy = Object.assign({}, saves.base, ...saves.queued);
       try {
         const updated = await retryPolicyMutation.mutateAsync({ companyId, policy });
         saves.base = updated.transientRetryPolicy ?? policy;
-      } catch {
+      } catch (error) {
         // Only the failed edit is dropped; edits queued after it still apply.
+        // Show the error and snap the input back to the saved value.
+        setCompanyEntry(setRetryErrors, companyId, errorMessage(error, "Failed to save retry policy"));
+        setRetryResets((prev) => ({ ...prev, [companyId]: (prev[companyId] ?? 0) + 1 }));
       } finally {
         saves.queued.splice(saves.queued.indexOf(patch), 1);
       }
@@ -393,9 +417,16 @@ export function CompanySettings() {
             label="Require board approval for new hires"
             hint="New agent hires stay pending until approved by board."
             checked={!!selectedCompany.requireBoardApprovalForNewAgents}
-            onChange={(v) => settingsMutation.mutate(v)}
+            onChange={(requireApproval) =>
+              settingsMutation.mutate({ companyId: selectedCompany.id, requireApproval })
+            }
             toggleTestId="company-settings-team-approval-toggle"
           />
+          {hiringErrors[selectedCompany.id] && (
+            <span className="text-xs text-destructive" role="alert">
+              {hiringErrors[selectedCompany.id]}
+            </span>
+          )}
         </div>
       </div>
 
@@ -409,7 +440,7 @@ export function CompanySettings() {
           hint="0 means unlimited. Extra retries for the same issue and agent are deferred until the hour window allows them. Agents, routines and wake types can override this."
         >
           <input
-            key={`${selectedCompany.id}:${retryPolicy.perIssuePerHour ?? 0}`}
+            key={`${selectedCompany.id}:${retryPolicy.perIssuePerHour ?? 0}:${retryResets[selectedCompany.id] ?? 0}`}
             className="w-24 rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
             type="number"
             min={0}
@@ -434,6 +465,11 @@ export function CompanySettings() {
           />
           Skip transient retries while the issue is blocked
         </label>
+        {retryErrors[selectedCompany.id] && (
+          <span className="text-xs text-destructive" role="alert" data-testid="company-settings-transient-retry-error">
+            {retryErrors[selectedCompany.id]}
+          </span>
+        )}
       </div>
 
       {/* Interaction governance */}
