@@ -7,6 +7,7 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { selectInCommentBatches, COMMENT_LOOKUP_BATCH } from "./comment-id-batches.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
+import { issueService } from "./issues.js";
 import { withQueuedCommentIdsInWakePayload } from "./issue-queued-comment-queue.js";
 
 const COMMENT_COUNT = 20000;
@@ -77,6 +78,28 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(blocker?.savedMessageCount).toBe(pending.length - consumed.length);
     expect(elapsed, "elapsed ms").toBeLessThan(BOUND_MS);
   }, 120000);
+
+  it.each(["active", "resolved"] as const)("clears a %s execution blocker when the task is reassigned", async (status) => {
+    const companyId = randomUUID(), agentId = randomUUID(), nextAgentId = randomUUID(), issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Reassign", defaultResponsibleUserId: "board", issuePrefix: `R${companyId.slice(0, 6)}` });
+    await db.insert(agents).values([agentId, nextAgentId].map((id) => ({ id, companyId, name: `Agent ${id.slice(0, 4)}`, role: "engineer",
+      adapterType: "paperclip_runner", status: "idle", runtimeConfig: {} })));
+    await db.insert(issues).values({ id: issueId, companyId, title: "Reassign", status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "failed", runtimeMode: "legacy",
+      startedAt: new Date(), contextSnapshot: { issueId } });
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+      status, ownerType: "board", cause: "legacy_execution_requires_reconciliation", fingerprint: runId, returnOwnerAgentId: agentId,
+      evidence: status === "active" ? { runId } : { runId, automaticRecovery: { replay: "blocked" } },
+      nextAction: "Inspect the stopped run before continuing." }).returning();
+    expect((await getExecutionBlocker(db, companyId, issueId))?.recoveryActionId).toBe(action!.id);
+
+    await issueService(db).update(issueId, { assigneeAgentId: nextAgentId });
+
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(after).toMatchObject({ status: "resolved", outcome: "cancelled" });
+  }, 30000);
 
   it("selects every row across batches and never exceeds the batch size", async () => {
     const { companyId, issueId, ids } = await seedLongIssue();
