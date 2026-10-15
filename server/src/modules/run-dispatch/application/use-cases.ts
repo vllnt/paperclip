@@ -1,4 +1,4 @@
-import type { RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
+import type { RetryAdmissionPolicy, RunDispatchWriter, ScheduledRetryReader } from "./ports.js";
 import type { PostCommitEffect, PromoteScheduledRetryOutcome } from "./types.js";
 
 export function createEvaluateScheduledRetryGate(deps: { reader: ScheduledRetryReader }) {
@@ -15,15 +15,19 @@ export function createPromoteScheduledRetry(deps: { writer: RunDispatchWriter })
     runId: string;
     companyId: string;
     now?: Date;
+    admission?: RetryAdmissionPolicy;
   }): Promise<PromoteScheduledRetryOutcome> =>
     deps.writer.promoteOrCancelDueRetry({
       runId: input.runId,
       companyId: input.companyId,
       now: input.now ?? new Date(),
+      admission: input.admission,
     });
 }
 
 const MAX_DUE_RETRIES_PER_SWEEP = 50;
+/** Bounds how many retries a sweep may skip past before it stops looking. */
+const MAX_SKIPPED_RETRIES_PER_SWEEP = 500;
 
 export function createPromoteDueScheduledRetries(deps: {
   reader: ScheduledRetryReader;
@@ -32,22 +36,38 @@ export function createPromoteDueScheduledRetries(deps: {
   return async function promoteDueScheduledRetries(input: {
     now?: Date;
     cutoff: Date | null;
-    /** True keeps a due retry scheduled for the next sweep (for example, while an agent window is open). */
-    isHeld?: (run: { runId: string; companyId: string }) => Promise<boolean>;
+    admission?: RetryAdmissionPolicy;
   }) {
     const now = input.now ?? new Date();
-    const dueRuns = (
-      await deps.reader.listDueRetries({ now, cutoff: input.cutoff, limit: MAX_DUE_RETRIES_PER_SWEEP })
-    ).slice(0, MAX_DUE_RETRIES_PER_SWEEP);
     const runIds: string[] = [];
     const postCommitEffects: PostCommitEffect[] = [];
+    // Retries that stay scheduled (held or lost to a race) would otherwise refill every
+    // page, so later pages skip them and an eligible retry behind them is still reached.
+    const skippedRunIds: string[] = [];
 
-    for (const dueRun of dueRuns) {
-      if (await input.isHeld?.(dueRun)) continue;
-      const result = await deps.promoteScheduledRetry({ ...dueRun, now });
-      if (result.outcome !== "promoted") continue;
-      runIds.push(dueRun.runId);
-      postCommitEffects.push(...result.postCommitEffects);
+    while (skippedRunIds.length < MAX_SKIPPED_RETRIES_PER_SWEEP) {
+      const dueRuns = (
+        await deps.reader.listDueRetries({
+          now,
+          cutoff: input.cutoff,
+          limit: MAX_DUE_RETRIES_PER_SWEEP,
+          excludeRunIds: skippedRunIds,
+        })
+      ).slice(0, MAX_DUE_RETRIES_PER_SWEEP);
+      const skippedBefore = skippedRunIds.length;
+
+      for (const dueRun of dueRuns) {
+        const result = await deps.promoteScheduledRetry({ ...dueRun, now, admission: input.admission });
+        if (result.outcome === "held" || result.outcome === "not_promoted") {
+          skippedRunIds.push(dueRun.runId);
+        }
+        if (result.outcome !== "promoted") continue;
+        runIds.push(dueRun.runId);
+        postCommitEffects.push(...result.postCommitEffects);
+      }
+
+      // Without a skipped retry the page behaves exactly like a single bounded sweep.
+      if (dueRuns.length < MAX_DUE_RETRIES_PER_SWEEP || skippedRunIds.length === skippedBefore) break;
     }
 
     return { promoted: runIds.length, runIds, postCommitEffects };

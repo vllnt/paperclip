@@ -27,6 +27,8 @@ describe("automation wake window on the real queue", () => {
 
   afterEach(async () => {
     await db.update(issues).set({ status: "done" });
+    // Held retries stay scheduled; do not let them fill a later test's sweep.
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.status, "scheduled_retry"));
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
   }, 30_000);
 
@@ -179,6 +181,117 @@ describe("automation wake window on the real queue", () => {
     const released = await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 301_000));
     expect(released.runIds).toContain(scheduledRunId);
   });
+
+  async function insertScheduledRetry(
+    companyId: string,
+    agentId: string,
+    issueId: string,
+    options: { dueAt?: Date; createdAt?: Date } = {},
+  ) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "provider_quota_recovery",
+      status: "queued",
+      payload: { issueId, retryReason: "provider_quota_recovery" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      wakeupRequestId,
+      scheduledRetryAt: options.dueAt ?? new Date(Date.now() - 1000),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "provider_quota_recovery",
+      responsibleUserId: "window-user",
+      createdAt: options.createdAt ?? new Date(Date.now() - 600_000),
+      contextSnapshot: { issueId, wakeReason: "provider_quota_recovery", retryReason: "provider_quota_recovery" },
+    });
+    await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    return runId;
+  }
+
+  it("treats promotion as the admission time for an aged retry", async () => {
+    const { companyId, agentId, issueIds } = await seed(300, 3);
+    const first = await insertScheduledRetry(companyId, agentId, issueIds[0]!);
+    const second = await insertScheduledRetry(companyId, agentId, issueIds[1]!);
+
+    const promotion = await heartbeat.promoteDueScheduledRetries();
+    expect(promotion.runIds).toHaveLength(1);
+    expect([first, second]).toContain(promotion.runIds[0]);
+
+    // The promoted retry opened a window, so an immediate fresh wake is coalesced.
+    await monitorWake(agentId, issueIds[2]!);
+    expect(await monitorRuns(agentId)).toHaveLength(0);
+  });
+
+  it("rechecks the window under the promotion lock when a fresh wake commits first", async () => {
+    const { companyId, agentId, issueIds } = await seed(300, 2);
+    const retryId = await insertScheduledRetry(companyId, agentId, issueIds[0]!);
+    let unlock: () => void = () => {};
+    let signal: () => void = () => {};
+    const locked = new Promise<void>((resolve) => {
+      signal = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    // Hold the retry's issue lock so the promotion blocks before its admission check.
+    const blocker = db.transaction(async (transaction) => {
+      await transaction.select({ id: issues.id }).from(issues).where(eq(issues.id, issueIds[0]!)).for("update");
+      signal();
+      await released;
+    });
+    await locked;
+    const pending = heartbeat.promoteDueScheduledRetries();
+    try {
+      const deadline = Date.now() + 5000;
+      let waiting = 0;
+      while (Date.now() < deadline && waiting === 0) {
+        const result = await db.execute(sql`select count(*)::int as count from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+          and query like '%from "issues"%' and query like '%for update%'`);
+        waiting = Number(result[0]?.count ?? 0);
+        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(waiting).toBeGreaterThan(0);
+      await monitorWake(agentId, issueIds[1]!);
+    } finally {
+      unlock();
+      await blocker;
+    }
+    const promoted = await pending;
+
+    expect(await monitorRuns(agentId)).toHaveLength(1);
+    expect(promoted.runIds).not.toContain(retryId);
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(retry?.status).toBe("scheduled_retry");
+  });
+
+  it("does not let held retries starve an eligible retry of another agent", async () => {
+    const held = await seed(300, 1);
+    await insertRecentAutomationRun(held.companyId, held.agentId, held.issueIds[0]!);
+    for (let index = 0; index < 52; index += 1) {
+      await insertScheduledRetry(held.companyId, held.agentId, held.issueIds[0]!, {
+        dueAt: new Date(Date.now() - 60_000 + index),
+      });
+    }
+    const other = await seed(0, 1);
+    const eligible = await insertScheduledRetry(other.companyId, other.agentId, other.issueIds[0]!, {
+      dueAt: new Date(Date.now() - 1000),
+    });
+
+    const promotion = await heartbeat.promoteDueScheduledRetries();
+    expect(promotion.runIds).toEqual([eligible]);
+  }, 90_000);
 
   it("promotes a due scheduled retry immediately when no window is configured", async () => {
     const { companyId, agentId, issueIds } = await seed(0, 2);

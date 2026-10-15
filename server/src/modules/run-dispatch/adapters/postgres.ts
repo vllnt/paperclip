@@ -1,7 +1,7 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, lte, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -488,6 +488,7 @@ export function createPostgresRunDispatchAdapter(
           eq(heartbeatRuns.status, "scheduled_retry"),
           lte(heartbeatRuns.scheduledRetryAt, input.now),
           input.cutoff ? gte(heartbeatRuns.createdAt, input.cutoff) : undefined,
+          input.excludeRunIds?.length ? not(inArray(heartbeatRuns.id, input.excludeRunIds)) : undefined,
         ),
       )
       .orderBy(
@@ -633,13 +634,18 @@ export function createPostgresRunDispatchAdapter(
   async function promoteDueRetryInTx(
     tx: Db,
     input: PromoteOrCancelDueRetryInput,
+    stampAdmission = false,
   ): Promise<
     | { applied: true; run: HeartbeatRun; postCommitEffects: PostCommitEffect[] }
     | { applied: false }
   > {
     const [row] = await tx
       .update(heartbeatRuns)
-      .set({ status: "queued", updatedAt: input.now })
+      .set({
+        status: "queued",
+        updatedAt: input.now,
+        ...(stampAdmission ? { createdAt: input.now } : {}),
+      })
       .where(
         and(
           eq(heartbeatRuns.id, input.runId),
@@ -827,11 +833,23 @@ export function createPostgresRunDispatchAdapter(
           : { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
       }
 
-      const promoted = await promoteDueRetryInTx(tx as unknown as Db, {
-        runId: input.runId,
-        companyId: input.companyId,
+      const admission = await input.admission?.({
+        tx,
+        run: {
+          id: run.id,
+          companyId: run.companyId,
+          agentId: run.agentId,
+          contextSnapshot: parseObject(run.contextSnapshot),
+        },
         now,
       });
+      if (admission?.hold) return { outcome: { outcome: "held" as const }, telemetryRun: null };
+
+      const promoted = await promoteDueRetryInTx(
+        tx as unknown as Db,
+        { runId: input.runId, companyId: input.companyId, now },
+        admission?.stampAdmission,
+      );
       return promoted.applied
         ? {
             outcome: {

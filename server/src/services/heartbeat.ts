@@ -564,6 +564,7 @@ import {
 import {
   createRunDispatch,
   type PostCommitEffect,
+  type RetryAdmissionPolicy,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
@@ -17559,40 +17560,36 @@ export function heartbeatService(
   }
 
   /**
-   * A scheduled retry is an automation wake too: while the agent's window is
-   * open it stays scheduled and is reconsidered by the next sweep.
+   * A scheduled retry is an automation wake too. Inside the promotion transaction, under
+   * the same per-agent lock as fresh wakes, it is held while the agent's window is open;
+   * otherwise its admission time opens a new window.
    */
-  async function isScheduledRetryHeldByAutomationWindow(
-    runRef: { runId: string; companyId: string },
-    now: Date,
-  ): Promise<boolean> {
-    const [run] = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.id, runRef.runId), eq(heartbeatRuns.companyId, runRef.companyId)));
-    if (!run) return false;
-    const reason = readNonEmptyString(parseObject(run.contextSnapshot).wakeReason);
-    if (!reason) return false;
-    const [agent] = await db.select().from(agents).where(eq(agents.id, run.agentId));
-    if (!agent) return false;
-    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+  const admitScheduledRetryThroughAutomationWindow: RetryAdmissionPolicy = async ({ tx, run, now }) => {
+    const proceed = { hold: false, stampAdmission: false };
+    const txDb = tx as Db;
+    const reason = readNonEmptyString(run.contextSnapshot.wakeReason);
+    if (!reason) return proceed;
+    const [agent] = await txDb.select().from(agents).where(eq(agents.id, run.agentId));
+    if (!agent) return proceed;
+    const issueId = readNonEmptyString(run.contextSnapshot.issueId);
     const issue = issueId
-      ? await db
+      ? await txDb
           .select({ originKind: issues.originKind, originId: issues.originId })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
-    const windowSec = await resolveAutomationWakeWindowSec(db, { agent, reason, issue });
-    if (windowSec <= 0) return false;
-    const last = await findLastAutomationRun(db, {
+    const windowSec = await resolveAutomationWakeWindowSec(txDb, { agent, reason, issue });
+    if (windowSec <= 0) return proceed;
+    await lockAutomationWakeWindow(txDb, run.companyId, run.agentId);
+    const last = await findLastAutomationRun(txDb, {
       companyId: run.companyId,
       agentId: run.agentId,
       since: new Date(now.getTime() - windowSec * 1000),
       excludeRunId: run.id,
     });
-    return last !== null;
-  }
+    return last ? { hold: true, stampAdmission: false } : { hold: false, stampAdmission: true };
+  };
 
   async function promoteDueScheduledRetries(now = new Date()) {
     await coalesceProviderQuotaRetries(now).catch((err) => {
@@ -17602,7 +17599,7 @@ export function heartbeatService(
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,
-      isHeld: (run) => isScheduledRetryHeldByAutomationWindow(run, now),
+      admission: admitScheduledRetryThroughAutomationWindow,
     });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
     return { promoted: result.promoted, runIds: result.runIds };

@@ -162,6 +162,9 @@ export function RoutineDetail() {
   const navigate = useNavigate();
   const { pushToast } = useToastActions();
   const hydratedRoutineIdRef = useRef<string | null>(null);
+  // Wake settings the draft started from. A refetch can change the stored value under a dirty
+  // draft, so edits are detected, and conflicts checked, against this base and not the latest.
+  const editBaseWakeSettingsRef = useRef<RoutineEditDraft["automationWakeSettings"]>({});
   const titleInputRef = useRef<HTMLTextAreaElement | null>(null);
   const descriptionEditorRef = useRef<MarkdownEditorRef>(null);
   const assigneeSelectorRef = useRef<HTMLButtonElement | null>(null);
@@ -318,7 +321,7 @@ export function RoutineDetail() {
     }
     if (
       JSON.stringify(editDraft.automationWakeSettings) !==
-      JSON.stringify(routineDefaults.automationWakeSettings)
+      JSON.stringify(editBaseWakeSettingsRef.current)
     ) {
       result.push({ key: "automationWakeSettings", label: "the automation wake window" });
     }
@@ -361,6 +364,7 @@ export function RoutineDetail() {
     const changedRoutine = hydratedRoutineIdRef.current !== routine.id;
     if (changedRoutine || !isEditDirty) {
       setEditDraft(routineDefaults);
+      editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
       hydratedRoutineIdRef.current = routine.id;
     }
   }, [routine, routineDefaults, isEditDirty, setBreadcrumbs]);
@@ -394,15 +398,26 @@ export function RoutineDetail() {
 
   const saveRoutine = useMutation({
     mutationFn: () => {
-      const payload = buildRoutineMutationPayload(editDraft);
+      const { automationWakeSettings, ...payload } = buildRoutineMutationPayload(editDraft);
       const baseRevisionId = routine?.latestRevisionId ?? null;
+      // Wake settings are not versioned, so send them only when edited, together with
+      // the value the edit started from, and a concurrent change surfaces as a conflict.
+      const baseAutomationWakeSettings = editBaseWakeSettingsRef.current;
+      const wakeSettingsEdited =
+        JSON.stringify(automationWakeSettings) !== JSON.stringify(baseAutomationWakeSettings);
       return routinesApi.update(routineId!, {
         ...payload,
+        ...(wakeSettingsEdited ? { automationWakeSettings, baseAutomationWakeSettings } : {}),
         ...(baseRevisionId ? { baseRevisionId } : {}),
       });
     },
-    onSuccess: async () => {
+    onSuccess: async (saved) => {
       setSaveConflict(false);
+      // The saved routine is the new base, and the draft adopts it so unedited wake
+      // settings do not stay dirty against a value saved or refetched in the meantime.
+      const savedWakeSettings = readAutomationWakeSettings(saved.automationWakeSettings);
+      editBaseWakeSettingsRef.current = savedWakeSettings;
+      setEditDraft((current) => ({ ...current, automationWakeSettings: savedWakeSettings }));
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(routineId!) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.list(selectedCompanyId!) }),
@@ -679,6 +694,7 @@ export function RoutineDetail() {
         env: (response.routine.env ?? null) as RoutineEnvConfig | null,
         automationWakeSettings: readAutomationWakeSettings(response.routine.automationWakeSettings),
       });
+      editBaseWakeSettingsRef.current = readAutomationWakeSettings(response.routine.automationWakeSettings);
       hydratedRoutineIdRef.current = response.routine.id;
     },
     [queryClient, routineId],
