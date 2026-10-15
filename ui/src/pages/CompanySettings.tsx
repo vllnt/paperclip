@@ -409,7 +409,7 @@ export function CompanySettings() {
           hint="0 means unlimited. Extra retries for the same issue and agent are deferred until the hour window allows them. Agents, routines and wake types can override this."
         >
           <input
-            key={retryPolicy.perIssuePerHour ?? 0}
+            key={`${selectedCompany.id}:${retryPolicy.perIssuePerHour ?? 0}`}
             className="w-24 rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
             type="number"
             min={0}
