@@ -121,6 +121,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
     admitAutomationWake: vi.fn(async () => ({ hold: false as const })),
+    parkHeldAutomationWake: vi.fn(async () => undefined),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
     finalizePromotedWake: vi.fn(async (input) => runSummary(input.wakeId)),
     hasExistingExecutionPath: vi.fn(async () => false),

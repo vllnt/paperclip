@@ -17539,6 +17539,13 @@ export function heartbeatService(
     );
   }
 
+  async function tryLockAutomationWakeWindow(tx: Db, companyId: string, agentId: string): Promise<boolean> {
+    const rows = await tx.execute<{ acquired: boolean }>(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0)) as acquired`,
+    );
+    return Boolean(rows[0]?.acquired);
+  }
+
   async function findLastAutomationRun(
     dbOrTx: Db,
     input: { companyId: string; agentId: string; since: Date; excludeRunId?: string },
@@ -17575,6 +17582,8 @@ export function heartbeatService(
       issueId: string | null;
       now: Date;
       excludeRunId?: string;
+      /** Hold, rather than wait, when another transaction owns the window lock. */
+      nonblocking?: boolean;
     },
   ): Promise<{ hold: true; holdUntil: Date } | { hold: false; admittedAt?: Date }> {
     const proceed = { hold: false as const };
@@ -17590,7 +17599,13 @@ export function heartbeatService(
       : null;
     const windowSec = await resolveAutomationWakeWindowSec(txDb, { agent, reason: input.reason, issue });
     if (windowSec <= 0) return proceed;
-    await lockAutomationWakeWindow(txDb, input.companyId, input.agentId);
+    if (input.nonblocking) {
+      if (!(await tryLockAutomationWakeWindow(txDb, input.companyId, input.agentId))) {
+        return { hold: true as const, holdUntil: input.now };
+      }
+    } else {
+      await lockAutomationWakeWindow(txDb, input.companyId, input.agentId);
+    }
     // The caller's clock predates any wait for the issue and window locks; admit on a fresh one.
     const admittedAt = new Date(Math.max(input.now.getTime(), Date.now()));
     const last = await findLastAutomationRun(txDb, {

@@ -388,6 +388,7 @@ async function runReleaseDrain(
         reason: automationReason,
         issueId: issue.id,
         now: input.now,
+        nonblocking: true,
       });
       if (admission.hold) {
         excludedWakeIds.push(workingCandidate.id);
@@ -814,6 +815,31 @@ async function runReleaseRecoveryTail(
         wakeReason: recoveryReason,
       },
     );
+  }
+
+  // A system recovery run is an automation wake like any other: it passes the agent's
+  // window, and a held one stays parked for the deferred-wake sweep instead of starting now.
+  if (AUTOMATION_WAKE_REASON_SET.has(recoveryReason)) {
+    const admission = await transaction.admitAutomationWake({
+      companyId: issue.companyId,
+      agentId: recoveryAgent.id,
+      reason: recoveryReason,
+      issueId: issue.id,
+      now: input.now,
+      nonblocking: true,
+    });
+    if (admission.hold) {
+      await transaction.parkHeldAutomationWake({
+        companyId: issue.companyId,
+        agentId: recoveryAgent.id,
+        issueId: issue.id,
+        reason: recoveryReason,
+        contextSnapshot: recoveryContextSnapshot,
+        notBefore: admission.holdUntil,
+        now: input.now,
+      });
+      return { outcome: { kind: "released" }, postCommitEffects };
+    }
   }
 
   const queuedRun = await transaction.queueImmediateRecoveryRun({

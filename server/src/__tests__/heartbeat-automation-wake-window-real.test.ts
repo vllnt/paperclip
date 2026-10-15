@@ -547,4 +547,146 @@ describe("automation wake window on the real queue", () => {
     expect(await runsForIssue(agentId, issueIds[0]!)).toHaveLength(1);
     expect(await deferredReceipts(agentId, issueIds[0]!)).toHaveLength(0);
   }, 60_000);
+
+  async function insertAgent(companyId: string, name: string, windowSeconds: number) {
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name,
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"], cwd: "/tmp" },
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1, minSecondsBetweenAutomationWakes: windowSeconds },
+      },
+      permissions: {},
+    });
+    return agentId;
+  }
+
+  async function insertIssue(companyId: string, assigneeAgentId: string, title: string) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title,
+      status: "in_progress",
+      assigneeAgentId,
+      responsibleUserId: "window-user",
+    });
+    return issueId;
+  }
+
+  async function parkUnmarkedWake(companyId: string, agentId: string, issueId: string) {
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_monitor_due",
+      status: "deferred_issue_execution",
+      payload: { issueId, _paperclipWakeContext: { issueId, wakeReason: "issue_monitor_due" } },
+    });
+  }
+
+  // A queued manual run that its issue points at; cancelling it enters the real release drain.
+  async function queueManualRun(companyId: string, agentId: string, issueId: string) {
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "queued",
+      responsibleUserId: "window-user",
+      contextSnapshot: { issueId, wakeReason: "manual_test" },
+    }).returning();
+    await db.update(issues).set({ executionRunId: run!.id, executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+    return run!;
+  }
+
+  // Holds the agent's window lock in a separate transaction until the returned function is called.
+  async function holdWindowLock(companyId: string, agentId: string) {
+    let unlock!: () => void;
+    const hold = new Promise<void>((resolve) => { unlock = resolve; });
+    let locked!: () => void;
+    const acquired = new Promise<void>((resolve) => { locked = resolve; });
+    const finished = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0))`,
+      );
+      locked();
+      await hold;
+    });
+    await acquired;
+    return async () => {
+      unlock();
+      await finished;
+    };
+  }
+
+  it("releases opposite-order queues of several agents without deadlock, keeping held receipts", async () => {
+    const { companyId, agentId: agentA } = await seed(300, 0);
+    const agentB = await insertAgent(companyId, "Window agent B", 300);
+    const finisher1 = await insertAgent(companyId, "Finisher 1", 0);
+    const finisher2 = await insertAgent(companyId, "Finisher 2", 0);
+    const issue1 = await insertIssue(companyId, finisher1, "Queue [A, B]");
+    const issue2 = await insertIssue(companyId, finisher2, "Queue [B, A]");
+    for (const agentId of [agentA, agentB]) await insertRecentAutomationRun(companyId, agentId, issue1);
+    const manual1 = await queueManualRun(companyId, finisher1, issue1);
+    const manual2 = await queueManualRun(companyId, finisher2, issue2);
+    await parkUnmarkedWake(companyId, agentA, issue1);
+    await parkUnmarkedWake(companyId, agentB, issue1);
+    await parkUnmarkedWake(companyId, agentB, issue2);
+    await parkUnmarkedWake(companyId, agentA, issue2);
+
+    // Both windows are busy when the releases start; unlocking A before B reproduces the
+    // interleaving in which each drain holds one window and waits for the other.
+    const unlockA = await holdWindowLock(companyId, agentA);
+    const unlockB = await holdWindowLock(companyId, agentB);
+    const releases = Promise.allSettled([
+      heartbeat.cancelRun(manual1.id, undefined, { suppressImmediateRecovery: true }),
+      heartbeat.cancelRun(manual2.id, undefined, { suppressImmediateRecovery: true }),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await unlockA();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await unlockB();
+    const results = await releases;
+
+    expect(results.map((result) => (result.status === "rejected" ? String(result.reason) : result.status))).toEqual(["fulfilled", "fulfilled"]);
+    const pointers = await db.select({ id: issues.id, executionRunId: issues.executionRunId }).from(issues)
+      .where(sql`${issues.id} in (${issue1}, ${issue2})`);
+    expect(pointers.map((row) => row.executionRunId)).toEqual([null, null]);
+    for (const agentId of [agentA, agentB]) {
+      expect(await deferredReceipts(agentId, issue1)).toHaveLength(1);
+      expect(await deferredReceipts(agentId, issue2)).toHaveLength(1);
+    }
+  }, 90_000);
+
+  // A cancelled run's system recovery is an automation wake: inside the window it is not started,
+  // its receipt waits, and the sweep delivers it once the window has ended.
+  it("holds the immediate recovery of a cancelled run inside the window, then delivers it", async () => {
+    const { companyId, agentId, issueIds } = await seed(300, 2);
+    await insertRecentAutomationRun(companyId, agentId, issueIds[1]!);
+    const manual = await queueManualRun(companyId, agentId, issueIds[0]!);
+
+    await heartbeat.cancelRun(manual.id);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const recoveries = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .filter((run) => run.contextSnapshot?.wakeReason === "issue_continuation_needed");
+    expect(await recoveries()).toHaveLength(0);
+    const [receipt] = await deferredReceipts(agentId, issueIds[0]!);
+    expect(receipt).toBeDefined();
+
+    await db.update(heartbeatRuns).set({ createdAt: new Date(Date.now() - 301_000) })
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "succeeded")));
+    await heartbeat.sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    expect(await recoveries()).toHaveLength(1);
+    expect(await deferredReceipts(agentId, issueIds[0]!)).toHaveLength(0);
+  }, 60_000);
 });

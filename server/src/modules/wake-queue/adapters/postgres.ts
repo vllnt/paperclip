@@ -44,6 +44,7 @@ import {
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
 import {
   AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  buildAutomationWakeCoalescedState,
   readAutomationWakeCoalescedUntil,
 } from "../domain/automation-wake-coalesce.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
@@ -504,6 +505,55 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
 
     admitAutomationWake(input) {
       return deps.admitAutomationWake({ ...input, tx });
+    },
+
+    async parkHeldAutomationWake({ companyId, agentId, issueId, reason, contextSnapshot, notBefore, now }) {
+      const [existing] = await tx
+        .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is not null`,
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.requestedAt))
+        .limit(1);
+      const state = buildAutomationWakeCoalescedState({
+        notBefore,
+        existing: existing ? parseObject(existing.payload) : null,
+        reason,
+      });
+      if (existing) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY}]::text[], ${JSON.stringify(state)}::jsonb)`,
+            coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, existing.id));
+        return;
+      }
+      await tx.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "automation_wake_coalesced",
+        payload: {
+          issueId,
+          [DEFERRED_WAKE_CONTEXT_KEY]: contextSnapshot,
+          [AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY]: state,
+        },
+        status: DEFERRED_WAKE_STATUS,
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        updatedAt: now,
+      });
     },
 
     async claimDeferredWakeForPromotion({ companyId, wakeId, now }) {
