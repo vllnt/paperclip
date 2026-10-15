@@ -147,6 +147,7 @@ export type AgentBadgeColor = "gray" | "blue" | "amber" | "red";
 export const agentStatusColor: Record<string, AgentBadgeColor> = {
   idle: "gray",
   active: "gray",
+  waiting: "gray",
   running: "blue",
   paused: "amber",
   error: "red",
@@ -244,6 +245,8 @@ export const issueStatusColorDefault: BrandChipColor = "gray";
 export const agentStatusVar: Record<string, string> = {
   idle: "--status-agent-idle",
   active: "--status-agent-idle",
+  // Derived display status: no live run, at least one active wait.
+  waiting: "--status-agent-idle",
   running: "--status-agent-running",
   paused: "--status-agent-paused",
   error: "--status-agent-error",

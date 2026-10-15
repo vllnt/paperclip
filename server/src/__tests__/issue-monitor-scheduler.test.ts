@@ -26,6 +26,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
+import { scheduleIssueWaitMonitor } from "../services/issue-waits.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -148,7 +150,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   });
 
   async function seedFixture(input?: {
-    agentStatus?: "active" | "paused";
+    agentStatus?: "active" | "paused" | "terminated";
+    wakeOnDemand?: boolean;
     issueStatus?: "in_progress" | "in_review";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
@@ -190,7 +193,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       runtimeConfig: {
         heartbeat: {
           enabled: false,
-          wakeOnDemand: true,
+          wakeOnDemand: input?.wakeOnDemand ?? true,
         },
       },
       permissions: {},
@@ -423,8 +426,146 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
+  it("keeps a paused agent's due monitor and fires it once after the agent resumes", async () => {
+    const { issueId, agentId } = await seedFixture({ agentStatus: "paused" });
+    const heartbeat = heartbeatService(db);
+
+    const whilePaused = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(whilePaused.skipped ?? 0).toBe(0);
+    const pausedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(pausedIssue.status).toBe("in_progress");
+    expect(pausedIssue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:30:00.000Z");
+    expect(parseIssueExecutionState(pausedIssue.executionState)?.monitor).toMatchObject({ status: "scheduled" });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual([]);
+
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+    const afterResume = await heartbeat.tickTimers(new Date("2026-04-11T12:40:00.000Z"));
+    expect(afterResume.enqueued).toBe(1);
+    await heartbeat.tickTimers(new Date("2026-04-11T12:41:00.000Z"));
+
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.map((wake) => wake.reason)).toEqual(["issue_monitor_due"]);
+    const resumedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(resumedIssue.monitorNextCheckAt).toBeNull();
+    expect(resumedIssue.monitorAttemptCount).toBe(1);
+  });
+
+  it("keeps the monitor and retries when the wake queue drops the wake", async () => {
+    const { issueId, agentId } = await seedFixture({ wakeOnDemand: false });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("in_progress");
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    expect(issue.monitorAttemptCount).toBe(1);
+    expect(issue.monitorLastTriggeredAt).toBeNull();
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor?.nextCheckAt).toBe("2026-04-11T12:36:00.000Z");
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      nextCheckAt: "2026-04-11T12:36:00.000Z",
+    });
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(activity.map((row) => row.action)).toContain("issue.monitor_wake_skipped");
+    expect(activity.map((row) => row.action)).not.toContain("issue.monitor_triggered");
+
+    // Wake on demand comes back: the next due check wakes the agent once.
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+    }).where(eq(agents.id, agentId));
+    await heartbeat.tickTimers(new Date("2026-04-11T12:37:00.000Z"));
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((wake) => wake.status !== "skipped").map((wake) => wake.reason)).toEqual(["issue_monitor_due"]);
+    const fired = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(fired.monitorNextCheckAt).toBeNull();
+    expect(fired.monitorAttemptCount).toBe(2);
+  });
+
+  it.each(["pending_approval"] as const)(
+    "keeps the wait and backs off when the agent is %s and the wake is refused with a 409",
+    async (agentStatus) => {
+      const { issueId, agentId } = await seedFixture();
+      await db.update(agents).set({ status: agentStatus }).where(eq(agents.id, agentId));
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+      const first = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(first.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+      expect(first.monitorAttemptCount).toBe(1);
+      expect(parseIssueExecutionState(first.executionState)?.monitor).toMatchObject({ status: "scheduled", attemptCount: 1 });
+
+      // The second refusal backs off further (10 minutes) and counts again.
+      await heartbeat.tickTimers(new Date("2026-04-11T12:37:00.000Z"));
+      const second = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(second.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:47:00.000Z");
+      expect(second.monitorAttemptCount).toBe(2);
+      const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((row) => row.action);
+      expect(actions).toContain("issue.monitor_wake_skipped");
+      expect(actions).not.toContain("issue.monitor_skipped");
+    },
+  );
+
+  it("stops retrying a dropped wake after the attempt cap and hands the issue to owner recovery", async () => {
+    const { issueId } = await seedFixture({ wakeOnDemand: false, monitorAttemptCount: 49 });
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "max_attempts_exhausted",
+    });
+  });
+
+  it("does not treat a wake queued behind a live run as dropped", async () => {
+    const { issueId, agentId, companyId } = await seedFixture();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, invocationSource: "assignment", status: "running",
+      startedAt: new Date(), contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionRunId: runId, executionLockedAt: new Date() }).where(eq(issues.id, issueId));
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(issue.monitorAttemptCount).toBe(1);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, issueId));
+  });
+
+  it("bounds a chain of waits: the monitor attempt count carries over and the cap refuses another wait", async () => {
+    const { issueId } = await seedFixture({ monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" }, monitorAttemptCount: 49 });
+    const heartbeat = heartbeatService(db);
+    const waitIssue = () => db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const wait = async (at: Date) => scheduleIssueWaitMonitor(db, issueService(db), {
+      issue: await waitIssue(),
+      nextCheckAt: at,
+      notes: "Waiting: CI",
+      serviceName: "Issue wait",
+      externalRef: null,
+      activity: { actorType: "system", actorId: "test", agentId: null, runId: null, source: "test" },
+    });
+
+    // 49 wakes are used, so one more wait is allowed and it carries the cap.
+    await db.update(issues).set({ monitorNextCheckAt: null, executionPolicy: null }).where(eq(issues.id, issueId));
+    await wait(new Date("2026-04-11T12:30:00.000Z"));
+    expect(normalizeIssueExecutionPolicy((await waitIssue()).executionPolicy ?? null)?.monitor?.maxAttempts).toBe(50);
+    await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect((await waitIssue()).monitorAttemptCount).toBe(50);
+
+    // The 51st wake is refused: the agent cannot chain waits without end.
+    await expect(wait(new Date("2026-04-11T12:40:00.000Z"))).rejects.toMatchObject({
+      status: 422,
+      message: "Monitor bounds are already exhausted",
+    });
+    expect((await waitIssue()).monitorNextCheckAt).toBeNull();
+  });
+
   it("clears due monitors that cannot be dispatched and records a skip", async () => {
-    const { issueId } = await seedFixture({ agentStatus: "paused" });
+    const { issueId } = await seedFixture({ agentStatus: "terminated" });
     const heartbeat = heartbeatService(db);
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
 

@@ -13,6 +13,7 @@ import {
   createIssueWorkProductSchema,
   DUPLICATE_PAIR_LABELS,
   type FeedbackTrace,
+  issueWaitRequestSchema,
   findSimilarIssuesSchema,
   type FindSimilarIssuesResult,
   type HeartbeatRun,
@@ -1393,6 +1394,28 @@ export function registerIssueCommands(program: Command): void {
 
   addCommonClientOptions(
     issue
+      .command("wait")
+      .description(
+        "End your turn with a wait: Paperclip re-checks this issue after the delay and wakes you. " +
+          "Use it instead of leaving a background process (CI watch, sleep loop, port wait) running.",
+      )
+      .argument("<issueId>", "Issue ID (must be assigned to you)")
+      .requiredOption("--in <duration>", "Delay before the re-check: 1m to 24h, e.g. 10m, 90s, 1h30m")
+      .requiredOption("--reason <text>", 'What you are waiting for, e.g. "CI on PR #4320 head abc123"')
+      .action(async (issueId: string, opts: IssueWaitOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = issueWaitRequestSchema.parse({ in: opts.in, reason: opts.reason });
+          const result = await ctx.api.post(apiPath`/api/issues/${issueId}/wait`, payload);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
       .command("release")
       .description("Release issue execution locks; clear the assignee only for unfinished issues")
       .argument("<issueId>", "Issue ID")
@@ -1406,6 +1429,11 @@ export function registerIssueCommands(program: Command): void {
         }
       }),
   );
+}
+
+interface IssueWaitOptions extends BaseClientOptions {
+  in: string;
+  reason: string;
 }
 
 function parseCsv(value: string | undefined): string[] {

@@ -62,6 +62,32 @@ describe("issue subresource commands", () => {
     ]);
   });
 
+  it("waits on an issue with a bounded delay and a reason", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "wait", ISSUE_ID, "--in", "10m", "--reason", "CI on PR #4320 head abc123"]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect([init.method, url]).toEqual(["POST", `http://localhost:3100/api/issues/${ISSUE_ID}/wait`]);
+    expect(JSON.parse(String(init.body))).toEqual({ in: "10m", reason: "CI on PR #4320 head abc123" });
+  });
+
+  it("refuses an out-of-bounds wait before calling the API", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit ${code}`);
+    }) as never);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run(["issue", "wait", ISSUE_ID, "--in", "48h", "--reason", "CI"])).rejects.toThrow();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    exit.mockRestore();
+  });
+
   it("binds explicit uploaded attachments when adding a comment", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);

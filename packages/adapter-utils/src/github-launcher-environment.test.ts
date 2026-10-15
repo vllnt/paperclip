@@ -11,6 +11,8 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   prepareGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  REMOTE_PREFLIGHT_UNAVAILABLE_CODE,
+  RemotePreflightUnavailableError,
   runAdapterExecutionTargetProcess,
 } from "./execution-target.js";
 
@@ -305,5 +307,22 @@ describe("managed GitHub launcher environment", () => {
       runId: "run-failure", target: fixture.target, cwd: fixture.root, env: {},
     })).rejects.toThrow("Could not resolve remote PATH for managed GitHub launchers");
     expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { failure: { exitCode: 255, timedOut: false, stdout: "" }, transient: true },
+    { failure: { exitCode: 0, timedOut: true, stdout: "" }, transient: true },
+    { failure: { exitCode: 1, timedOut: false, stdout: "" }, transient: false },
+    { failure: { exitCode: 0, timedOut: false, stdout: "login banner only" }, transient: false },
+  ])("marks only a connection failure or timeout as a transient preflight failure: %j", async ({ failure, transient }) => {
+    const fixture = await sandbox("nvm/bin");
+    fixture.runner.execute.mockResolvedValueOnce({ ...failure, signal: null, stderr: "",
+      pid: null, startedAt: new Date().toISOString() });
+    const error = await prepareGitHubOperationLaunchers({
+      runId: "run-transient", target: fixture.target, cwd: fixture.root, env: {},
+    }).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(Error);
+    expect(error instanceof RemotePreflightUnavailableError).toBe(transient);
+    expect((error as { code?: string }).code).toBe(transient ? REMOTE_PREFLIGHT_UNAVAILABLE_CODE : undefined);
   });
 });
