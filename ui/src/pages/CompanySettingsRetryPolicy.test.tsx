@@ -33,13 +33,20 @@ vi.mock("../api/assets", () => ({ assetsApi: { uploadCompanyLogo: vi.fn() } }));
 vi.mock("../context/BreadcrumbContext", () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: vi.fn() }),
 }));
+const OTHER_COMPANY = { ...SELECTED_COMPANY, id: "company-2", name: "Beta", issuePrefix: "BET" };
+const companyState = vi.hoisted(() => ({ selectedId: "company-1" }));
+
 vi.mock("../context/CompanyContext", () => ({
-  useCompany: () => ({
-    companies: [SELECTED_COMPANY],
-    selectedCompany: SELECTED_COMPANY,
-    selectedCompanyId: SELECTED_COMPANY.id,
-    setSelectedCompanyId: vi.fn(),
-  }),
+  useCompany: () => {
+    const companies = [SELECTED_COMPANY, OTHER_COMPANY];
+    const selectedCompany = companies.find((company) => company.id === companyState.selectedId)!;
+    return {
+      companies,
+      selectedCompany,
+      selectedCompanyId: selectedCompany.id,
+      setSelectedCompanyId: vi.fn(),
+    };
+  },
 }));
 vi.mock("../components/InteractionGovernancePanel", () => ({
   InteractionGovernancePanel: () => null,
@@ -58,6 +65,7 @@ describe("CompanySettings transient retry policy", () => {
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
+    companyState.selectedId = "company-1";
   });
 
   afterEach(() => {
@@ -121,6 +129,108 @@ describe("CompanySettings transient retry policy", () => {
 
     await act(async () => {
       releases[1]();
+    });
+    await act(async () => root.unmount());
+  });
+
+  function renderSettings() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.health, { status: "ok", cloud: null });
+    const root = createRoot(container);
+    const render = () =>
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <TooltipProvider>
+            <MemoryRouter>
+              <CompanySettings />
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
+    return { root, render };
+  }
+
+  const rateInput = () =>
+    container.querySelector<HTMLInputElement>('[data-testid="company-settings-transient-retry-input"]')!;
+  const suppressBox = () =>
+    container.querySelector<HTMLInputElement>('[data-testid="company-settings-transient-retry-suppress-blocked"]')!;
+  async function enterRate(value: string) {
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(rateInput(), value);
+      rateInput().dispatchEvent(new Event("input", { bubbles: true }));
+      rateInput().dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    });
+  }
+
+  it("sends a queued save to the company it was edited on after switching companies", async () => {
+    const releases: Array<() => void> = [];
+    mockCompaniesApi.update.mockImplementation(
+      (id: string, data: unknown) =>
+        new Promise((resolve) => {
+          releases.push(() => resolve({ ...SELECTED_COMPANY, id, ...(data as object) }));
+        }),
+    );
+    const { root, render } = renderSettings();
+    await act(async () => render());
+
+    await enterRate("5");
+    await act(async () => {
+      suppressBox().click();
+    });
+    companyState.selectedId = "company-2";
+    await act(async () => render());
+    await act(async () => {
+      releases[0]();
+    });
+
+    expect(mockCompaniesApi.update).toHaveBeenCalledTimes(2);
+    expect(mockCompaniesApi.update).toHaveBeenLastCalledWith("company-1", {
+      transientRetryPolicy: { perIssuePerHour: 5, suppressWhenBlocked: true },
+    });
+
+    await act(async () => {
+      releases[1]();
+    });
+    await act(async () => root.unmount());
+  });
+
+  it("keeps newer queued edits when an earlier save fails", async () => {
+    const settlers: Array<{ ok: () => void; fail: () => void }> = [];
+    mockCompaniesApi.update.mockImplementation(
+      (_id: string, data: unknown) =>
+        new Promise((resolve, reject) => {
+          settlers.push({
+            ok: () => resolve({ ...SELECTED_COMPANY, ...(data as object) }),
+            fail: () => reject(new Error("offline")),
+          });
+        }),
+    );
+    const { root, render } = renderSettings();
+    await act(async () => render());
+
+    await enterRate("5");
+    await act(async () => {
+      suppressBox().click();
+    });
+    await act(async () => {
+      settlers[0].fail();
+    });
+    expect(mockCompaniesApi.update).toHaveBeenCalledTimes(2);
+    expect(mockCompaniesApi.update).toHaveBeenLastCalledWith("company-1", {
+      transientRetryPolicy: { suppressWhenBlocked: true },
+    });
+
+    await enterRate("6");
+    await act(async () => {
+      settlers[1].ok();
+    });
+    expect(mockCompaniesApi.update).toHaveBeenCalledTimes(3);
+    expect(mockCompaniesApi.update).toHaveBeenLastCalledWith("company-1", {
+      transientRetryPolicy: { suppressWhenBlocked: true, perIssuePerHour: 6 },
+    });
+
+    await act(async () => {
+      settlers[2].ok();
     });
     await act(async () => root.unmount());
   });

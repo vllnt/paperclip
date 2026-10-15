@@ -89,38 +89,46 @@ export function CompanySettings() {
 
   const retryPolicy: TransientRetryPolicy = selectedCompany?.transientRetryPolicy ?? {};
   const retryPolicyMutation = useMutation({
-    mutationFn: (policy: TransientRetryPolicy) =>
-      companiesApi.update(selectedCompanyId!, { transientRetryPolicy: policy }),
+    mutationFn: ({ companyId, policy }: { companyId: string; policy: TransientRetryPolicy }) =>
+      companiesApi.update(companyId, { transientRetryPolicy: policy }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
-  // Each field edit patches the latest draft (not the last server snapshot) and
-  // saves run one at a time, so a quick second edit cannot erase the first.
-  const retryDraft = useRef(retryPolicy);
-  const retryServerPolicy = useRef(retryPolicy);
-  retryServerPolicy.current = retryPolicy;
-  const retrySaves = useRef({ pending: 0, tail: Promise.resolve() });
+  // Each field edit is queued per company and saves run one at a time. A save
+  // sends the company's last known policy plus every edit still queued for it,
+  // so a quick second edit cannot erase the first, a failed edit drops only
+  // itself, and switching companies cannot redirect a queued save.
+  const retrySaves = useRef(
+    new Map<string, { base: TransientRetryPolicy; queued: TransientRetryPolicy[]; tail: Promise<void> }>(),
+  );
   useEffect(() => {
-    if (retrySaves.current.pending === 0) retryDraft.current = retryPolicy;
-  }, [retryPolicy]);
+    for (const company of companies) {
+      const saves = retrySaves.current.get(company.id);
+      if (saves && saves.queued.length === 0) saves.base = company.transientRetryPolicy ?? {};
+    }
+  }, [companies]);
   const saveRetryPolicy = (patch: TransientRetryPolicy) => {
-    const policy = { ...retryDraft.current, ...patch };
-    retryDraft.current = policy;
-    const saves = retrySaves.current;
-    saves.pending += 1;
-    saves.tail = saves.tail
-      .then(() => retryPolicyMutation.mutateAsync(policy))
-      .then(
-        () => undefined,
-        () => {
-          // Drop the failed edit so the next one starts from the saved policy.
-          retryDraft.current = retryServerPolicy.current;
-        },
-      )
-      .finally(() => {
-        saves.pending -= 1;
-      });
+    const companyId = selectedCompanyId;
+    if (!companyId) return;
+    let state = retrySaves.current.get(companyId);
+    if (!state) {
+      state = { base: retryPolicy, queued: [], tail: Promise.resolve() };
+      retrySaves.current.set(companyId, state);
+    }
+    const saves = state;
+    saves.queued.push(patch);
+    saves.tail = saves.tail.then(async () => {
+      const policy = Object.assign({}, saves.base, ...saves.queued);
+      try {
+        const updated = await retryPolicyMutation.mutateAsync({ companyId, policy });
+        saves.base = updated.transientRetryPolicy ?? policy;
+      } catch {
+        // Only the failed edit is dropped; edits queued after it still apply.
+      } finally {
+        saves.queued.splice(saves.queued.indexOf(patch), 1);
+      }
+    });
   };
 
   const governanceMutation = useMutation({
