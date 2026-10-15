@@ -58,6 +58,7 @@ function makeCompany(id: string): Company {
     requireBoardApprovalForNewAgents: false,
     interactionResolverGovernance: {},
     duplicateDetectionMode: "off",
+    runContextPolicy: null,
     feedbackDataSharingEnabled: false,
     feedbackDataSharingConsentAt: null,
     feedbackDataSharingConsentByUserId: null,

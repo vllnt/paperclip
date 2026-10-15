@@ -181,6 +181,7 @@ export function RoutineDetail() {
     activityGateScope: "company",
     variables: [],
     env: null,
+    runContextPolicy: null,
   });
 
   const section: RoutineSectionKey = isRoutineSection(sectionParam) ? sectionParam : "overview";
@@ -275,6 +276,7 @@ export function RoutineDetail() {
             activityGateScope: routine.activityGateScope,
             variables: routine.variables,
             env: routine.env ?? null,
+            runContextPolicy: routine.runContextPolicy ?? null,
           }
         : null,
     [routine],
@@ -312,6 +314,9 @@ export function RoutineDetail() {
     }
     if (JSON.stringify(editDraft.env ?? null) !== JSON.stringify(routineDefaults.env ?? null)) {
       result.push({ key: "env", label: "the secrets" });
+    }
+    if (JSON.stringify(editDraft.runContextPolicy ?? null) !== JSON.stringify(routineDefaults.runContextPolicy ?? null)) {
+      result.push({ key: "runContextPolicy", label: "the run context" });
     }
     return result;
   }, [editDraft, routineDefaults]);
@@ -668,6 +673,7 @@ export function RoutineDetail() {
         activityGateScope: response.routine.activityGateScope,
         variables: response.routine.variables as RoutineVariable[],
         env: (response.routine.env ?? null) as RoutineEnvConfig | null,
+        runContextPolicy: response.routine.runContextPolicy ?? null,
       });
       hydratedRoutineIdRef.current = response.routine.id;
     },

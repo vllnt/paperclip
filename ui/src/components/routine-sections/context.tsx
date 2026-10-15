@@ -4,6 +4,7 @@ import type {
   CompanySecret,
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
+  RunContextPolicy,
   RoutineVariable,
 } from "@paperclipai/shared";
 import type { MarkdownEditorRef, MentionOption } from "../MarkdownEditor";
@@ -45,7 +46,7 @@ export const SECTION_FIELD_KEYS: Record<string, string[]> = {
   overview: ["title", "description", "projectId", "assigneeAgentId", "priority"],
   variables: ["variables"],
   secrets: ["env"],
-  delivery: ["concurrencyPolicy", "catchUpPolicy", "activityGatePolicy", "activityGateScope"],
+  delivery: ["concurrencyPolicy", "catchUpPolicy", "activityGatePolicy", "activityGateScope", "runContextPolicy"],
 };
 
 export type RoutineEditDraft = {
@@ -60,6 +61,7 @@ export type RoutineEditDraft = {
   activityGateScope: string;
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
+  runContextPolicy: RunContextPolicy | null;
 };
 
 export type NewTriggerDraft = {

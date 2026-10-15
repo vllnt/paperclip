@@ -1,3 +1,4 @@
+import { runContextPolicySchema } from "../run-context.js";
 import { z } from "zod";
 import {
   ISSUE_PRIORITIES,
@@ -78,6 +79,7 @@ export const createRoutineSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  runContextPolicy: runContextPolicySchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;

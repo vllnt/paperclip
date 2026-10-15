@@ -18,7 +18,7 @@ import { projects } from "./projects.js";
 import { goals } from "./goals.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { folders } from "./folders.js";
-import type { RoutineEnvConfig, RoutineRevisionSnapshotV1, RoutineVariable, RoutineWebhookDelivery } from "@paperclipai/shared";
+import type { RoutineEnvConfig, RunContextPolicy, RoutineRevisionSnapshotV1, RoutineVariable, RoutineWebhookDelivery } from "@paperclipai/shared";
 
 export const routines = pgTable(
   "routines",
@@ -42,6 +42,7 @@ export const routines = pgTable(
     originId: text("origin_id"),
     variables: jsonb("variables").$type<RoutineVariable[]>().notNull().default([]),
     env: jsonb("env").$type<RoutineEnvConfig>(),
+    runContextPolicy: jsonb("run_context_policy").$type<RunContextPolicy>(),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),

@@ -1,6 +1,7 @@
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { AiConnectionField, aiProviderForAdapter } from "./ai-connections/AiConnectionField";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import { RunContextPolicyEditor } from "./RunContextPolicyEditor";
+import { aiConnectionBindingSchema, runContextPolicySchema } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { bindingProblem, personalAiDefault } from "./ai-connections/model";
 import { testAgentSetup } from "@/lib/test-agent-setup";
@@ -597,6 +598,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const config = !isCreate ? ((props.agent.adapterConfig ?? {}) as Record<string, unknown>) : {};
   const runtimeConfig = !isCreate ? ((props.agent.runtimeConfig ?? {}) as Record<string, unknown>) : {};
   const heartbeat = !isCreate ? ((runtimeConfig.heartbeat ?? {}) as Record<string, unknown>) : {};
+  const pendingRuntimeConfig = (overlay.runtime.runtimeConfig as Record<string, unknown> | undefined) ?? runtimeConfig;
   const debug = !isCreate ? ((runtimeConfig.debug ?? {}) as Record<string, unknown>) : {};
 
   const adapterType = isCreate
@@ -1695,6 +1697,24 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     }));
                   }
                 }}
+              />
+            </Field>
+          )}
+
+          {!isCreate && (
+            <Field
+              label="Run context"
+              hint="Per-agent override of how much issue history a run sees. Blank fields inherit the company setting."
+            >
+              <RunContextPolicyEditor
+                value={runContextPolicySchema.safeParse(pendingRuntimeConfig.runContext).data ?? null}
+                onChange={(next) => {
+                  const rest = Object.fromEntries(
+                    Object.entries(pendingRuntimeConfig).filter(([key]) => key !== "runContext"),
+                  );
+                  mark("runtime", "runtimeConfig", next ? { ...rest, runContext: next } : rest);
+                }}
+                testId="agent-run-context"
               />
             </Field>
           )}

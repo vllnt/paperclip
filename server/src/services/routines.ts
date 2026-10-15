@@ -2240,6 +2240,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            runContextPolicy: input.runContextPolicy ?? null,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2337,6 +2338,11 @@ export function routineService(
           throw conflict("Routine was updated by someone else", {
             currentRevisionId: locked.latestRevisionId,
           });
+        }
+
+        if (patch.runContextPolicy !== undefined) {
+          await txDb.update(routines).set({ runContextPolicy: patch.runContextPolicy }).where(eq(routines.id, id));
+          locked.runContextPolicy = patch.runContextPolicy;
         }
 
         const candidate: RoutineRow = {

@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   type InteractionResolverGovernance,
+  type RunContextPolicy,
   type IssueThreadInteractionKind,
 } from "@paperclipai/shared";
 import { useCompany } from "../context/CompanyContext";
@@ -28,6 +29,7 @@ import {
   Field,
   ToggleField,
 } from "../components/agent-config-primitives";
+import { RunContextPolicyEditor } from "../components/RunContextPolicyEditor";
 import { InstanceGeneralSettings } from "./InstanceGeneralSettings";
 
 export function CompanySettings() {
@@ -81,6 +83,14 @@ export function CompanySettings() {
       companiesApi.update(selectedCompanyId!, {
         requireBoardApprovalForNewAgents: requireApproval
       }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    }
+  });
+
+  const runContextMutation = useMutation({
+    mutationFn: (next: RunContextPolicy | null) =>
+      companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
@@ -352,6 +362,28 @@ export function CompanySettings() {
             toggleTestId="company-settings-team-approval-toggle"
           />
         </div>
+      </div>
+
+      {/* Run context */}
+      <div className="max-w-2xl space-y-4" data-testid="company-settings-run-context-section">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Run context
+        </div>
+        <div className="text-xs text-muted-foreground">
+          How much issue history a run sees. Blank fields keep the built-in behavior. Agents, routines
+          and wake types can override these.
+        </div>
+        <RunContextPolicyEditor
+          key={JSON.stringify(selectedCompany.runContextPolicy ?? null)}
+          value={selectedCompany.runContextPolicy}
+          onChange={(next) => runContextMutation.mutate(next)}
+          testId="company-settings-run-context"
+        />
+        {runContextMutation.isError && (
+          <span className="text-xs text-destructive">
+            {runContextMutation.error instanceof Error ? runContextMutation.error.message : "Failed to save"}
+          </span>
+        )}
       </div>
 
       {/* Interaction governance */}
