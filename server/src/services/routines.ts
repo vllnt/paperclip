@@ -1,5 +1,6 @@
 import { verifyAppWebhook } from "./app-webhook.js";
 import crypto from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -2342,7 +2343,18 @@ export function routineService(
 
         // Automation-wake settings are operational tuning, not routine content: they
         // apply immediately and are not versioned in routine revisions.
-        if (patch.automationWakeSettings !== undefined) {
+        if (
+          patch.automationWakeSettings !== undefined &&
+          !isDeepStrictEqual(patch.automationWakeSettings, locked.automationWakeSettings)
+        ) {
+          if (
+            patch.baseAutomationWakeSettings !== undefined &&
+            !isDeepStrictEqual(patch.baseAutomationWakeSettings, locked.automationWakeSettings)
+          ) {
+            throw conflict("Routine automation wake settings were updated by someone else", {
+              currentAutomationWakeSettings: locked.automationWakeSettings,
+            });
+          }
           await txDb
             .update(routines)
             .set({ automationWakeSettings: patch.automationWakeSettings })

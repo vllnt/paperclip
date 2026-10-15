@@ -371,10 +371,17 @@ export function RoutineDetail() {
 
   const saveRoutine = useMutation({
     mutationFn: () => {
-      const payload = buildRoutineMutationPayload(editDraft);
+      const { automationWakeSettings, ...payload } = buildRoutineMutationPayload(editDraft);
       const baseRevisionId = routine?.latestRevisionId ?? null;
+      // Wake settings are not versioned, so send them only when edited, together with
+      // the value the edit started from, and a concurrent change surfaces as a conflict.
+      const baseAutomationWakeSettings = routineDefaults?.automationWakeSettings;
+      const wakeSettingsEdited =
+        baseAutomationWakeSettings !== undefined &&
+        JSON.stringify(automationWakeSettings) !== JSON.stringify(baseAutomationWakeSettings);
       return routinesApi.update(routineId!, {
         ...payload,
+        ...(wakeSettingsEdited ? { automationWakeSettings, baseAutomationWakeSettings } : {}),
         ...(baseRevisionId ? { baseRevisionId } : {}),
       });
     },

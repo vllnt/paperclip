@@ -29,7 +29,12 @@ export function createPromoteDueScheduledRetries(deps: {
   reader: ScheduledRetryReader;
   promoteScheduledRetry: ReturnType<typeof createPromoteScheduledRetry>;
 }) {
-  return async function promoteDueScheduledRetries(input: { now?: Date; cutoff: Date | null }) {
+  return async function promoteDueScheduledRetries(input: {
+    now?: Date;
+    cutoff: Date | null;
+    /** True keeps a due retry scheduled for the next sweep (for example, while an agent window is open). */
+    isHeld?: (run: { runId: string; companyId: string }) => Promise<boolean>;
+  }) {
     const now = input.now ?? new Date();
     const dueRuns = (
       await deps.reader.listDueRetries({ now, cutoff: input.cutoff, limit: MAX_DUE_RETRIES_PER_SWEEP })
@@ -38,6 +43,7 @@ export function createPromoteDueScheduledRetries(deps: {
     const postCommitEffects: PostCommitEffect[] = [];
 
     for (const dueRun of dueRuns) {
+      if (await input.isHeld?.(dueRun)) continue;
       const result = await deps.promoteScheduledRetry({ ...dueRun, now });
       if (result.outcome !== "promoted") continue;
       runIds.push(dueRun.runId);

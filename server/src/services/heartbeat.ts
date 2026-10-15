@@ -17502,6 +17502,98 @@ export function heartbeatService(
     }
   }
 
+  async function resolveAutomationWakeWindowSec(
+    dbOrTx: Db,
+    input: {
+      agent: { companyId: string; runtimeConfig: unknown };
+      reason: string;
+      issue: { originKind: string | null; originId: string | null } | null;
+    },
+  ): Promise<number> {
+    if (!AUTOMATION_WAKE_REASON_SET.has(input.reason)) return 0;
+    const { agent, issue } = input;
+    return resolveMinSecondsBetweenAutomationWakes({
+      reason: input.reason,
+      agent: parseHeartbeatPolicy(agent as typeof agents.$inferSelect).automationWakeSettings,
+      company: await dbOrTx
+        .select({ settings: companies.automationWakeSettings })
+        .from(companies)
+        .where(eq(companies.id, agent.companyId))
+        .then((rows) => rows[0]?.settings ?? null),
+      routine:
+        issue?.originKind === "routine_execution" && issue.originId
+          ? await dbOrTx
+              .select({ settings: routines.automationWakeSettings })
+              .from(routines)
+              .where(and(eq(routines.id, issue.originId), eq(routines.companyId, agent.companyId)))
+              .then((rows) => rows[0]?.settings ?? null)
+          : null,
+    });
+  }
+
+  async function lockAutomationWakeWindow(tx: Db, companyId: string, agentId: string) {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0))`,
+    );
+  }
+
+  async function findLastAutomationRun(
+    dbOrTx: Db,
+    input: { companyId: string; agentId: string; since: Date; excludeRunId?: string },
+  ) {
+    const [row] = await dbOrTx
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          gte(heartbeatRuns.createdAt, input.since),
+          inArray(sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`, [...AUTOMATION_WAKE_REASON_SET]),
+          input.excludeRunId ? ne(heartbeatRuns.id, input.excludeRunId) : undefined,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * A scheduled retry is an automation wake too: while the agent's window is
+   * open it stays scheduled and is reconsidered by the next sweep.
+   */
+  async function isScheduledRetryHeldByAutomationWindow(
+    runRef: { runId: string; companyId: string },
+    now: Date,
+  ): Promise<boolean> {
+    const [run] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runRef.runId), eq(heartbeatRuns.companyId, runRef.companyId)));
+    if (!run) return false;
+    const reason = readNonEmptyString(parseObject(run.contextSnapshot).wakeReason);
+    if (!reason) return false;
+    const [agent] = await db.select().from(agents).where(eq(agents.id, run.agentId));
+    if (!agent) return false;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    const issue = issueId
+      ? await db
+          .select({ originKind: issues.originKind, originId: issues.originId })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const windowSec = await resolveAutomationWakeWindowSec(db, { agent, reason, issue });
+    if (windowSec <= 0) return false;
+    const last = await findLastAutomationRun(db, {
+      companyId: run.companyId,
+      agentId: run.agentId,
+      since: new Date(now.getTime() - windowSec * 1000),
+      excludeRunId: run.id,
+    });
+    return last !== null;
+  }
+
   async function promoteDueScheduledRetries(now = new Date()) {
     await coalesceProviderQuotaRetries(now).catch((err) => {
       logger.warn({ err }, "failed to coalesce provider quota retries");
@@ -17510,6 +17602,7 @@ export function heartbeatService(
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,
+      isHeld: (run) => isScheduledRetryHeldByAutomationWindow(run, now),
     });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
     return { promoted: result.promoted, runIds: result.runIds };
@@ -30306,43 +30399,25 @@ export function heartbeatService(
           const automationWakeReason = reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason);
           const automationWakeWindowSec =
             automationWakeReason &&
-            AUTOMATION_WAKE_REASON_SET.has(automationWakeReason) &&
             !reconciledSourceRunId &&
             !opts.manualUserWake
-              ? resolveMinSecondsBetweenAutomationWakes({
+              ? await resolveAutomationWakeWindowSec(tx as unknown as Db, {
+                  agent,
                   reason: automationWakeReason,
-                  agent: policy.automationWakeSettings,
-                  company: await tx
-                    .select({ settings: companies.automationWakeSettings })
-                    .from(companies)
-                    .where(eq(companies.id, agent.companyId))
-                    .then((rows) => rows[0]?.settings ?? null),
-                  routine:
-                    issue.originKind === "routine_execution" && issue.originId
-                      ? await tx
-                          .select({ settings: routines.automationWakeSettings })
-                          .from(routines)
-                          .where(and(eq(routines.id, issue.originId), eq(routines.companyId, agent.companyId)))
-                          .then((rows) => rows[0]?.settings ?? null)
-                      : null,
+                  issue,
                 })
               : 0;
           if (automationWakeReason && automationWakeWindowSec > 0) {
             const windowMs = automationWakeWindowSec * 1000;
             const gateNow = new Date();
-            const [lastAutomationRun] = await tx
-              .select({ createdAt: heartbeatRuns.createdAt })
-              .from(heartbeatRuns)
-              .where(
-                and(
-                  eq(heartbeatRuns.companyId, agent.companyId),
-                  eq(heartbeatRuns.agentId, agentId),
-                  gte(heartbeatRuns.createdAt, new Date(gateNow.getTime() - windowMs)),
-                  inArray(sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`, [...AUTOMATION_WAKE_REASON_SET]),
-                ),
-              )
-              .orderBy(desc(heartbeatRuns.createdAt))
-              .limit(1);
+            // Wakes for different issues of one agent share the window; the lock
+            // makes the check and the run insert below atomic per agent.
+            await lockAutomationWakeWindow(tx as unknown as Db, agent.companyId, agentId);
+            const lastAutomationRun = await findLastAutomationRun(tx as unknown as Db, {
+              companyId: agent.companyId,
+              agentId,
+              since: new Date(gateNow.getTime() - windowMs),
+            });
             if (lastAutomationRun) {
               // A redelivered receipt already exists; it simply waits longer.
               if (executionWaitRequestId) return { kind: "deferred" as const };
