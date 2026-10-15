@@ -33,13 +33,14 @@ export interface ScheduledRetryReader {
 /**
  * Caller policy evaluated inside the promotion transaction, after the retry's locks
  * are held and just before it would be promoted. `tx` is the adapter's transaction handle.
- * `hold` keeps the retry scheduled; `stampAdmission` records `now` as its admission time.
+ * A hold moves the retry's due time to `holdUntil`, so it leaves the due list until it can be
+ * admitted. Admission records `admittedAt` (read after the caller's locks) as its admission time.
  */
 export type RetryAdmissionPolicy = (input: {
   tx: unknown;
   run: { id: string; companyId: string; agentId: string; contextSnapshot: Record<string, unknown> };
   now: Date;
-}) => Promise<{ hold: boolean; stampAdmission: boolean }>;
+}) => Promise<{ hold: true; holdUntil: Date } | { hold: false; admittedAt?: Date }>;
 
 export type PromoteOrCancelDueRetryInput = {
   runId: string;

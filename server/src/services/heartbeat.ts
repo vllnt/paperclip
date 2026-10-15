@@ -17565,7 +17565,7 @@ export function heartbeatService(
    * otherwise its admission time opens a new window.
    */
   const admitScheduledRetryThroughAutomationWindow: RetryAdmissionPolicy = async ({ tx, run, now }) => {
-    const proceed = { hold: false, stampAdmission: false };
+    const proceed = { hold: false as const };
     const txDb = tx as Db;
     const reason = readNonEmptyString(run.contextSnapshot.wakeReason);
     if (!reason) return proceed;
@@ -17582,13 +17582,17 @@ export function heartbeatService(
     const windowSec = await resolveAutomationWakeWindowSec(txDb, { agent, reason, issue });
     if (windowSec <= 0) return proceed;
     await lockAutomationWakeWindow(txDb, run.companyId, run.agentId);
+    // The sweep's clock predates any wait for the issue and window locks; admit on a fresh one.
+    const admittedAt = new Date(Math.max(now.getTime(), Date.now()));
     const last = await findLastAutomationRun(txDb, {
       companyId: run.companyId,
       agentId: run.agentId,
-      since: new Date(now.getTime() - windowSec * 1000),
+      since: new Date(admittedAt.getTime() - windowSec * 1000),
       excludeRunId: run.id,
     });
-    return last ? { hold: true, stampAdmission: false } : { hold: false, stampAdmission: true };
+    return last
+      ? { hold: true as const, holdUntil: new Date(last.createdAt.getTime() + windowSec * 1000 + 1) }
+      : { hold: false as const, admittedAt };
   };
 
   async function promoteDueScheduledRetries(now = new Date()) {

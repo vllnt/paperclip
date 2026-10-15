@@ -353,6 +353,9 @@ export function RoutineDetail() {
         }
         return next as RoutineEditDraft;
       });
+      if (keys.includes("automationWakeSettings")) {
+        editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
+      }
     },
     [routineDefaults],
   );
@@ -645,7 +648,10 @@ export function RoutineDetail() {
 
   const reloadLatest = useCallback(() => {
     setSaveConflict(false);
-    if (routineDefaults) setEditDraft(routineDefaults);
+    if (routineDefaults) {
+      setEditDraft(routineDefaults);
+      editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
+    }
     queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(routineId!) });
   }, [queryClient, routineDefaults, routineId]);
 

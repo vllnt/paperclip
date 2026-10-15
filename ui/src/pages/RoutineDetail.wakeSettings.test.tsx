@@ -64,6 +64,16 @@ function createBackend(initialWake: WakeSettings) {
     if (url === `/api/routines/${ROUTINE_ID}` && method === "PATCH") {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       state.patches.push(body);
+      // Mirrors the server: a wake-settings edit based on a stale value is a conflict.
+      if (
+        body.baseAutomationWakeSettings !== undefined &&
+        JSON.stringify(body.baseAutomationWakeSettings) !== JSON.stringify(state.wake)
+      ) {
+        return new Response(JSON.stringify({ error: "Routine automation wake settings were updated by someone else" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       if (typeof body.title === "string") state.title = body.title;
       if (body.automationWakeSettings) state.wake = body.automationWakeSettings as WakeSettings;
       state.revision += 1;
@@ -217,5 +227,51 @@ describe.each(VARIANTS)("RoutineDetail wake settings save ($name)", ({ load }) =
       automationWakeSettings: { minSecondsBetweenAutomationWakes: 120 },
       baseAutomationWakeSettings: { minSecondsBetweenAutomationWakes: 300 },
     });
+  });
+
+  async function clickButton(label: string, scope: ParentNode = document) {
+    const button = Array.from(scope.querySelectorAll("button")).find((candidate) => candidate.textContent?.trim() === label);
+    expect(button).toBeDefined();
+    await act(async () => button!.click());
+    await settle();
+  }
+
+  // Someone else changed the window while this edit was open and the editor refetched.
+  async function openStaleWindowEdit(backend: ReturnType<typeof createBackend>) {
+    await render(backend, "delivery");
+    await editWindow("300");
+    backend.state.wake = { minSecondsBetweenAutomationWakes: 600 };
+    await refetchRoutine();
+  }
+
+  it("rebases on the latest settings after a conflict and Reload latest", async () => {
+    const backend = createBackend({});
+    await openStaleWindowEdit(backend);
+    await save();
+    expect(backend.state.patches).toHaveLength(1);
+    expect(backend.state.wake).toEqual({ minSecondsBetweenAutomationWakes: 600 });
+
+    await clickButton("Reload latest");
+    expect(container.querySelector<HTMLInputElement>("#routine-automation-wake-window")?.value).toBe("600");
+    await editWindow("120");
+    await save();
+
+    expect(backend.state.patches).toHaveLength(2);
+    expect(backend.state.patches[1]).toMatchObject({
+      automationWakeSettings: { minSecondsBetweenAutomationWakes: 120 },
+      baseAutomationWakeSettings: { minSecondsBetweenAutomationWakes: 600 },
+    });
+    expect(backend.state.wake).toEqual({ minSecondsBetweenAutomationWakes: 120 });
+  });
+
+  it("does not report phantom wake-settings edits after Discard", async () => {
+    const backend = createBackend({});
+    await openStaleWindowEdit(backend);
+    await clickButton("Discard");
+    await clickButton("Discard changes");
+
+    const labels = Array.from(document.querySelectorAll("button")).map((button) => button.textContent?.trim());
+    expect(labels.some((label) => label?.startsWith("Save changes"))).toBe(false);
+    expect(container.querySelector<HTMLInputElement>("#routine-automation-wake-window")?.value).toBe("600");
   });
 });

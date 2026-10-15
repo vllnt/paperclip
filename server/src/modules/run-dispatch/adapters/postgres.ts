@@ -634,7 +634,7 @@ export function createPostgresRunDispatchAdapter(
   async function promoteDueRetryInTx(
     tx: Db,
     input: PromoteOrCancelDueRetryInput,
-    stampAdmission = false,
+    admittedAt?: Date,
   ): Promise<
     | { applied: true; run: HeartbeatRun; postCommitEffects: PostCommitEffect[] }
     | { applied: false }
@@ -644,7 +644,7 @@ export function createPostgresRunDispatchAdapter(
       .set({
         status: "queued",
         updatedAt: input.now,
-        ...(stampAdmission ? { createdAt: input.now } : {}),
+        ...(admittedAt ? { createdAt: admittedAt } : {}),
       })
       .where(
         and(
@@ -843,12 +843,18 @@ export function createPostgresRunDispatchAdapter(
         },
         now,
       });
-      if (admission?.hold) return { outcome: { outcome: "held" as const }, telemetryRun: null };
+      if (admission?.hold) {
+        await tx
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: admission.holdUntil, updatedAt: now })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "scheduled_retry")));
+        return { outcome: { outcome: "held" as const }, telemetryRun: null };
+      }
 
       const promoted = await promoteDueRetryInTx(
         tx as unknown as Db,
         { runId: input.runId, companyId: input.companyId, now },
-        admission?.stampAdmission,
+        admission && !admission.hold ? admission.admittedAt : undefined,
       );
       return promoted.applied
         ? {

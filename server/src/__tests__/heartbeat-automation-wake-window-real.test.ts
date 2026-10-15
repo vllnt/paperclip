@@ -233,9 +233,8 @@ describe("automation wake window on the real queue", () => {
     expect(await monitorRuns(agentId)).toHaveLength(0);
   });
 
-  it("rechecks the window under the promotion lock when a fresh wake commits first", async () => {
-    const { companyId, agentId, issueIds } = await seed(300, 2);
-    const retryId = await insertScheduledRetry(companyId, agentId, issueIds[0]!);
+  // Holds an issue's row lock so a promotion on that issue blocks before its admission check.
+  async function holdIssueLock(issueId: string) {
     let unlock: () => void = () => {};
     let signal: () => void = () => {};
     const locked = new Promise<void>((resolve) => {
@@ -244,29 +243,42 @@ describe("automation wake window on the real queue", () => {
     const released = new Promise<void>((resolve) => {
       unlock = resolve;
     });
-    // Hold the retry's issue lock so the promotion blocks before its admission check.
     const blocker = db.transaction(async (transaction) => {
-      await transaction.select({ id: issues.id }).from(issues).where(eq(issues.id, issueIds[0]!)).for("update");
+      await transaction.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
       signal();
       await released;
     });
     await locked;
+    return {
+      async waitForWaiter() {
+        const deadline = Date.now() + 5000;
+        let waiting = 0;
+        while (Date.now() < deadline && waiting === 0) {
+          const result = await db.execute(sql`select count(*)::int as count from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+            and query like '%from "issues"%' and query like '%for update%'`);
+          waiting = Number(result[0]?.count ?? 0);
+          if (!waiting) await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(waiting).toBeGreaterThan(0);
+      },
+      async release() {
+        unlock();
+        await blocker;
+      },
+    };
+  }
+
+  it("rechecks the window under the promotion lock when a fresh wake commits first", async () => {
+    const { companyId, agentId, issueIds } = await seed(300, 2);
+    const retryId = await insertScheduledRetry(companyId, agentId, issueIds[0]!);
+    const lock = await holdIssueLock(issueIds[0]!);
     const pending = heartbeat.promoteDueScheduledRetries();
     try {
-      const deadline = Date.now() + 5000;
-      let waiting = 0;
-      while (Date.now() < deadline && waiting === 0) {
-        const result = await db.execute(sql`select count(*)::int as count from pg_stat_activity
-          where datname = current_database() and wait_event_type = 'Lock'
-          and query like '%from "issues"%' and query like '%for update%'`);
-        waiting = Number(result[0]?.count ?? 0);
-        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      expect(waiting).toBeGreaterThan(0);
+      await lock.waitForWaiter();
       await monitorWake(agentId, issueIds[1]!);
     } finally {
-      unlock();
-      await blocker;
+      await lock.release();
     }
     const promoted = await pending;
 
@@ -276,22 +288,74 @@ describe("automation wake window on the real queue", () => {
     expect(retry?.status).toBe("scheduled_retry");
   });
 
-  it("does not let held retries starve an eligible retry of another agent", async () => {
+  it("stamps admission after waiting for locks, not at the start of the sweep", async () => {
+    const { companyId, agentId, issueIds } = await seed(1, 2);
+    const retryId = await insertScheduledRetry(companyId, agentId, issueIds[0]!);
+    const lock = await holdIssueLock(issueIds[0]!);
+    const pending = heartbeat.promoteDueScheduledRetries();
+    try {
+      await lock.waitForWaiter();
+      // Longer than the 1-second window: a sweep-start stamp would already be expired.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    } finally {
+      await lock.release();
+    }
+    expect((await pending).runIds).toEqual([retryId]);
+
+    await monitorWake(agentId, issueIds[1]!);
+    expect(await monitorRuns(agentId)).toHaveLength(0);
+  }, 30_000);
+
+  it("reschedules held retries so more than a sweep's skip cap cannot starve another agent", async () => {
     const held = await seed(300, 1);
     await insertRecentAutomationRun(held.companyId, held.agentId, held.issueIds[0]!);
-    for (let index = 0; index < 52; index += 1) {
-      await insertScheduledRetry(held.companyId, held.agentId, held.issueIds[0]!, {
-        dueAt: new Date(Date.now() - 60_000 + index),
-      });
-    }
+    const heldCount = 520;
+    const heldIds: string[] = [];
+    await db.insert(heartbeatRuns).values(
+      Array.from({ length: heldCount }, (_, index) => {
+        const id = randomUUID();
+        heldIds.push(id);
+        return {
+          id,
+          companyId: held.companyId,
+          agentId: held.agentId,
+          invocationSource: "automation" as const,
+          triggerDetail: "system",
+          status: "scheduled_retry" as const,
+          scheduledRetryAt: new Date(Date.now() - 60_000 + index),
+          scheduledRetryAttempt: 1,
+          scheduledRetryReason: "provider_quota_recovery",
+          responsibleUserId: "window-user",
+          createdAt: new Date(Date.now() - 600_000),
+          contextSnapshot: {
+            issueId: held.issueIds[0],
+            wakeReason: "provider_quota_recovery",
+            retryReason: "provider_quota_recovery",
+          },
+        };
+      }),
+    );
     const other = await seed(0, 1);
-    const eligible = await insertScheduledRetry(other.companyId, other.agentId, other.issueIds[0]!, {
+    const first = await insertScheduledRetry(other.companyId, other.agentId, other.issueIds[0]!, {
       dueAt: new Date(Date.now() - 1000),
     });
 
-    const promotion = await heartbeat.promoteDueScheduledRetries();
-    expect(promotion.runIds).toEqual([eligible]);
-  }, 90_000);
+    expect((await heartbeat.promoteDueScheduledRetries()).runIds).toEqual([first]);
+
+    // Held rows moved to the end of the window, so they are no longer due and later
+    // sweeps reach the other agent's next retry without rescanning them.
+    const rescheduled = await db
+      .select({ at: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, held.agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(rescheduled).toHaveLength(heldCount);
+    expect(rescheduled.every((row) => row.at && row.at.getTime() > Date.now())).toBe(true);
+
+    const second = await insertScheduledRetry(other.companyId, other.agentId, other.issueIds[0]!, {
+      dueAt: new Date(Date.now() - 500),
+    });
+    expect((await heartbeat.promoteDueScheduledRetries()).runIds).toEqual([second]);
+  }, 120_000);
 
   it("promotes a due scheduled retry immediately when no window is configured", async () => {
     const { companyId, agentId, issueIds } = await seed(0, 2);

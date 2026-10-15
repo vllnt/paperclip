@@ -41,33 +41,26 @@ export function createPromoteDueScheduledRetries(deps: {
     const now = input.now ?? new Date();
     const runIds: string[] = [];
     const postCommitEffects: PostCommitEffect[] = [];
-    // Retries that stay scheduled (held or lost to a race) would otherwise refill every
-    // page, so later pages skip them and an eligible retry behind them is still reached.
+    // Retries that stay due after a lost race would otherwise refill every page, so later
+    // pages skip them. A held retry is rescheduled past `now` and drops out of the due list.
     const skippedRunIds: string[] = [];
 
-    while (skippedRunIds.length < MAX_SKIPPED_RETRIES_PER_SWEEP) {
+    // Pages continue past held retries until the sweep has promoted its bounded share.
+    while (skippedRunIds.length < MAX_SKIPPED_RETRIES_PER_SWEEP && runIds.length < MAX_DUE_RETRIES_PER_SWEEP) {
+      const limit = MAX_DUE_RETRIES_PER_SWEEP - runIds.length;
       const dueRuns = (
-        await deps.reader.listDueRetries({
-          now,
-          cutoff: input.cutoff,
-          limit: MAX_DUE_RETRIES_PER_SWEEP,
-          excludeRunIds: skippedRunIds,
-        })
-      ).slice(0, MAX_DUE_RETRIES_PER_SWEEP);
-      const skippedBefore = skippedRunIds.length;
+        await deps.reader.listDueRetries({ now, cutoff: input.cutoff, limit, excludeRunIds: skippedRunIds })
+      ).slice(0, limit);
 
       for (const dueRun of dueRuns) {
         const result = await deps.promoteScheduledRetry({ ...dueRun, now, admission: input.admission });
-        if (result.outcome === "held" || result.outcome === "not_promoted") {
-          skippedRunIds.push(dueRun.runId);
-        }
+        if (result.outcome === "not_promoted") skippedRunIds.push(dueRun.runId);
         if (result.outcome !== "promoted") continue;
         runIds.push(dueRun.runId);
         postCommitEffects.push(...result.postCommitEffects);
       }
 
-      // Without a skipped retry the page behaves exactly like a single bounded sweep.
-      if (dueRuns.length < MAX_DUE_RETRIES_PER_SWEEP || skippedRunIds.length === skippedBefore) break;
+      if (dueRuns.length < limit) break;
     }
 
     return { promoted: runIds.length, runIds, postCommitEffects };
