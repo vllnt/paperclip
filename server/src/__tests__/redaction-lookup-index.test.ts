@@ -130,6 +130,25 @@ describeEmbeddedPostgres("secret-redaction lookup and typed issue joins", () => 
     expect(after.ms).toBeLessThan(before.ms);
   }, 60_000);
 
+  describe("bound task keys", () => {
+    // Bound parameters reach PostgreSQL untyped; a non-UUID key must match nothing, not raise 22P02.
+    it.each(["__heartbeat__", "custom:opaque-task", "not-a-uuid", ""])(
+      "returns no match for the bound non-UUID key %j",
+      async (key) => {
+        const rows = await db.select({ id: issues.id }).from(issues).where(issueIdEqualsText(sql`${key}`));
+        expect(rows).toEqual([]);
+      },
+    );
+
+    it("still matches a bound canonical UUID key and rejects uppercase or padded forms", async () => {
+      const matches = (key: string) =>
+        db.select({ id: issues.id }).from(issues).where(issueIdEqualsText(sql`${key}`));
+      expect(await matches(issueIds[0]!)).toEqual([{ id: issueIds[0] }]);
+      expect(await matches(issueIds[0]!.toUpperCase())).toEqual([]);
+      expect(await matches(` ${issueIds[0]}`)).toEqual([]);
+    });
+  });
+
   describe("typed issue join", () => {
     const join = (typed: boolean) => sql`
       SELECT agent_wakeup_requests.id FROM agent_wakeup_requests
