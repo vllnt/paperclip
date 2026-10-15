@@ -45,6 +45,12 @@ export type {
 } from "./application/ports.js";
 export type { AdmitWakeBehindIssueExecutionInput, AdmitWakeBehindIssueExecutionResult, ReleaseIssueExecutionInput } from "./application/use-cases.js";
 export {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  AUTOMATION_WAKE_REASON_SET,
+  buildAutomationWakeCoalescedState,
+  resolveMinSecondsBetweenAutomationWakes,
+} from "./domain/automation-wake-coalesce.js";
+export {
   buildSelfReblockWakeParkedState,
   decideSelfReblockWakeLimit,
   deriveSelfReblockWakeMarker,

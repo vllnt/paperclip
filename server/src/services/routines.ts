@@ -2240,6 +2240,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            automationWakeSettings: input.automationWakeSettings ?? {},
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2337,6 +2338,16 @@ export function routineService(
           throw conflict("Routine was updated by someone else", {
             currentRevisionId: locked.latestRevisionId,
           });
+        }
+
+        // Automation-wake settings are operational tuning, not routine content: they
+        // apply immediately and are not versioned in routine revisions.
+        if (patch.automationWakeSettings !== undefined) {
+          await txDb
+            .update(routines)
+            .set({ automationWakeSettings: patch.automationWakeSettings })
+            .where(eq(routines.id, id));
+          locked.automationWakeSettings = patch.automationWakeSettings;
         }
 
         const candidate: RoutineRow = {

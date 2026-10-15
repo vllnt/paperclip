@@ -32,6 +32,7 @@ const SELECTED_COMPANY = {
   attachmentMaxBytes: null,
   requireBoardApprovalForNewAgents: false,
   interactionResolverGovernance: {},
+  automationWakeSettings: {},
 };
 
 vi.mock("../api/companies", () => ({ companiesApi: mockCompaniesApi }));

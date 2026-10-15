@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { readAutomationWakeSettings } from "../components/AutomationWakeSettingsFields";
 import { Navigate, useNavigate, useParams } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Repeat, Sparkles } from "lucide-react";
@@ -181,6 +182,7 @@ export function RoutineDetail() {
     activityGateScope: "company",
     variables: [],
     env: null,
+    automationWakeSettings: {},
   });
 
   const section: RoutineSectionKey = isRoutineSection(sectionParam) ? sectionParam : "overview";
@@ -275,6 +277,7 @@ export function RoutineDetail() {
             activityGateScope: routine.activityGateScope,
             variables: routine.variables,
             env: routine.env ?? null,
+            automationWakeSettings: readAutomationWakeSettings(routine.automationWakeSettings),
           }
         : null,
     [routine],
@@ -312,6 +315,12 @@ export function RoutineDetail() {
     }
     if (JSON.stringify(editDraft.env ?? null) !== JSON.stringify(routineDefaults.env ?? null)) {
       result.push({ key: "env", label: "the secrets" });
+    }
+    if (
+      JSON.stringify(editDraft.automationWakeSettings) !==
+      JSON.stringify(routineDefaults.automationWakeSettings)
+    ) {
+      result.push({ key: "automationWakeSettings", label: "the automation wake window" });
     }
     return result;
   }, [editDraft, routineDefaults]);
@@ -668,6 +677,7 @@ export function RoutineDetail() {
         activityGateScope: response.routine.activityGateScope,
         variables: response.routine.variables as RoutineVariable[],
         env: (response.routine.env ?? null) as RoutineEnvConfig | null,
+        automationWakeSettings: readAutomationWakeSettings(response.routine.automationWakeSettings),
       });
       hydratedRoutineIdRef.current = response.routine.id;
     },

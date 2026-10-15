@@ -376,6 +376,21 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
   });
 
+  it("defaults automation wake settings to empty and persists a settings-only update", async () => {
+    const { routine, svc } = await seedFixture();
+    expect(routine.automationWakeSettings).toEqual({});
+
+    const settings = { minSecondsBetweenAutomationWakes: 120, byWakeReason: { issue_monitor_due: 30 } };
+    const updated = await svc.update(routine.id, { automationWakeSettings: settings }, {});
+    expect(updated?.automationWakeSettings).toEqual(settings);
+
+    const stored = await svc.get(routine.id);
+    expect(stored?.automationWakeSettings).toEqual(settings);
+
+    const cleared = await svc.update(routine.id, { automationWakeSettings: {} }, {});
+    expect(cleared?.automationWakeSettings).toEqual({});
+  });
+
   it("filters listed routines by project", async () => {
     const { companyId, agentId, projectId, routine, svc } = await seedFixture();
     const otherProjectId = randomUUID();

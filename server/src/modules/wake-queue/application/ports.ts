@@ -88,6 +88,8 @@ export type DeferredWakeCandidate = {
   selfReblockWake?: SelfReblockWakeMarker | null;
   /** Set while the self-reblock limit holds the wake back; the drain skips it until then. */
   selfReblockParkedUntil?: Date | null;
+  /** Set while a per-agent automation-wake window holds the wake back; the drain skips it until then. */
+  automationCoalescedUntil?: Date | null;
 };
 
 export type PromoteDeferredWakeInput = {

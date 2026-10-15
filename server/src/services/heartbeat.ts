@@ -577,11 +577,15 @@ import {
   isResolvedInteractionContinuationWakeContext,
 } from "../modules/run-dispatch/index.js";
 import {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  AUTOMATION_WAKE_REASON_SET,
+  buildAutomationWakeCoalescedState,
   buildSelfReblockWakeParkedState,
   createWakeQueue,
   DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
   DEFERRED_WAKE_SWEEP_RECHECK_MS,
   decideSelfReblockWakeLimit,
+  resolveMinSecondsBetweenAutomationWakes,
   deriveSelfReblockWakeMarker,
   isSelfReblockWakeOwner,
   readSelfReblockWakeMarker,
@@ -616,7 +620,10 @@ import {
   DIRECT_NON_INVOKABLE_STATUSES,
   type AgentOrgRow,
 } from "./agent-invokability.js";
-import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
+import {
+  isHeartbeatWakeOnDemandEnabled,
+  readAgentAutomationWakeSettings,
+} from "./heartbeat-policy.js";
 import {
   isLowTrustQuarantined,
   redactQuarantinedBodyForHigherTrust,
@@ -17735,6 +17742,7 @@ export function heartbeatService(
       maxConcurrentRuns: normalizeMaxConcurrentRuns(
         heartbeat.maxConcurrentRuns,
       ),
+      automationWakeSettings: readAgentAutomationWakeSettings(heartbeat),
       skipTimerWhenNoActionableWork: asBoolean(
         heartbeat.skipTimerWhenNoActionableWork ??
           heartbeat.requireActionableTimerWork ??
@@ -28523,6 +28531,7 @@ export function heartbeatService(
       // Loop-guard provenance is derived below from server facts only.
       delete payload[SELF_REBLOCK_WAKE_PAYLOAD_KEY];
       delete payload[SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY];
+      delete payload[AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -29471,6 +29480,8 @@ export function heartbeatService(
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
+              originKind: issues.originKind,
+              originId: issues.originId,
             })
             .from(issues)
             .where(
@@ -30283,6 +30294,108 @@ export function heartbeatService(
                 },
               });
               return { kind: "skipped" as const };
+            }
+          }
+
+          // Automation window: a recovery, retry or monitor wake that lands within
+          // the resolved `minSecondsBetweenAutomationWakes` (company < agent <
+          // routine < wake type) of the agent's last such run is parked, and later
+          // ones merge into the same receipt. The deferred-wake sweep delivers it
+          // once the window ends; nothing is dropped. Assignment and human-driven
+          // wakes never pass through here. Unset everywhere means off.
+          const automationWakeReason = reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason);
+          const automationWakeWindowSec =
+            automationWakeReason &&
+            AUTOMATION_WAKE_REASON_SET.has(automationWakeReason) &&
+            !reconciledSourceRunId &&
+            !opts.manualUserWake
+              ? resolveMinSecondsBetweenAutomationWakes({
+                  reason: automationWakeReason,
+                  agent: policy.automationWakeSettings,
+                  company: await tx
+                    .select({ settings: companies.automationWakeSettings })
+                    .from(companies)
+                    .where(eq(companies.id, agent.companyId))
+                    .then((rows) => rows[0]?.settings ?? null),
+                  routine:
+                    issue.originKind === "routine_execution" && issue.originId
+                      ? await tx
+                          .select({ settings: routines.automationWakeSettings })
+                          .from(routines)
+                          .where(and(eq(routines.id, issue.originId), eq(routines.companyId, agent.companyId)))
+                          .then((rows) => rows[0]?.settings ?? null)
+                      : null,
+                })
+              : 0;
+          if (automationWakeReason && automationWakeWindowSec > 0) {
+            const windowMs = automationWakeWindowSec * 1000;
+            const gateNow = new Date();
+            const [lastAutomationRun] = await tx
+              .select({ createdAt: heartbeatRuns.createdAt })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, agent.companyId),
+                  eq(heartbeatRuns.agentId, agentId),
+                  gte(heartbeatRuns.createdAt, new Date(gateNow.getTime() - windowMs)),
+                  inArray(sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`, [...AUTOMATION_WAKE_REASON_SET]),
+                ),
+              )
+              .orderBy(desc(heartbeatRuns.createdAt))
+              .limit(1);
+            if (lastAutomationRun) {
+              // A redelivered receipt already exists; it simply waits longer.
+              if (executionWaitRequestId) return { kind: "deferred" as const };
+              const notBefore = new Date(lastAutomationRun.createdAt.getTime() + windowMs);
+              const [coalesced] = await tx
+                .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.companyId, agent.companyId),
+                    eq(agentWakeupRequests.agentId, agentId),
+                    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                    sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is not null`,
+                  ),
+                )
+                .orderBy(asc(agentWakeupRequests.requestedAt))
+                .limit(1);
+              const coalescedState = buildAutomationWakeCoalescedState({
+                notBefore,
+                existing: coalesced ? parseObject(coalesced.payload) : null,
+                reason: automationWakeReason,
+              });
+              if (coalesced) {
+                await tx
+                  .update(agentWakeupRequests)
+                  .set({
+                    payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY}]::text[], ${JSON.stringify(coalescedState)}::jsonb)`,
+                    coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                    updatedAt: gateNow,
+                  })
+                  .where(eq(agentWakeupRequests.id, coalesced.id));
+              } else {
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason: "automation_wake_coalesced",
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId: issue.id,
+                    [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+                    [AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY]: coalescedState,
+                  },
+                  status: "deferred_issue_execution",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                });
+              }
+              return { kind: "deferred" as const };
             }
           }
 

@@ -179,6 +179,14 @@ async function runReleaseDrain(
     }
     processedWakeIds.add(candidate.id);
 
+    // An automation wake coalesced by the agent's window keeps its place until
+    // the window ends, whoever releases; the deferred-wake sweep delivers it.
+    const coalescedUntil = candidate.automationCoalescedUntil ?? null;
+    if (coalescedUntil && coalescedUntil.getTime() > input.now.getTime()) {
+      excludedWakeIds.push(candidate.id);
+      continue;
+    }
+
     // Promotion re-applies admission's self-reblock policy. A wake parked
     // before the owner's run released must not restart the owner on its own
     // re-block, and a non-owner's own re-block wakes stay within the limit.

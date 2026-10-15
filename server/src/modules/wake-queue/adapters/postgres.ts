@@ -42,6 +42,10 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
+import {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  readAutomationWakeCoalescedUntil,
+} from "../domain/automation-wake-coalesce.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
@@ -178,6 +182,7 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     wakeReason,
     selfReblockWake: readSelfReblockWakeMarker(payload, row.agentId),
     selfReblockParkedUntil: readSelfReblockWakeParkedUntil(payload),
+    automationCoalescedUntil: readAutomationWakeCoalescedUntil(payload),
   };
 }
 
@@ -1032,6 +1037,8 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             // A wake parked by the self-reblock limit keeps its own provenance;
             // other wakes queue beside it instead of inheriting its actor.
             sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} is null`,
+            // Likewise an automation-coalesced receipt waits out its window alone.
+            sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is null`,
             ...(durableActor
               ? [
                   durableActor.type === null

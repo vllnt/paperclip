@@ -60,6 +60,10 @@ In agent runtime settings, configure heartbeat policy:
 - `wakeOnAssignment`: wake when assigned work
 - `wakeOnOnDemand`: allow ping-style on-demand wakeups
 - `wakeOnAutomation`: allow system automation wakeups
+- `minSecondsBetweenAutomationWakes` and `byWakeReason`: minimum seconds between recovery, retry and monitor runs for an agent (unset or 0 = off, the default; nothing changes until set). Wakes inside the window are merged into one deferred wake and delivered after it; none are dropped. Assignment and human-driven wakes are never affected.
+  - Layers, least to most specific: company, agent, routine, wake type. The most specific layer that sets a value wins. `byWakeReason` (keyed by `issue_monitor_due`, `issue_continuation_needed`, `issue_assignment_recovery`, `issue_graph_liveness_backstop`, `issue_monitor_recovery`, `issue_monitor_recovery_issue`, `provider_quota_recovery`, `ai_connection_busy_retry`) is the wake-type layer and beats the level-wide value of every level; a routine applies to issues it created.
+  - Where: company `automationWakeSettings` (Company settings > Automation wakes), agent `runtimeConfig.heartbeat` (agent config > Heartbeat), routine `automationWakeSettings` (routine > Delivery; applied immediately, not versioned in routine revisions). The same shape everywhere: `{ "minSecondsBetweenAutomationWakes": 300, "byWakeReason": { "issue_monitor_due": 60 } }`.
+  - CLI (JSON payload, so the contract is the API schema): `paperclipai company update <companyId> --payload-json '{"automationWakeSettings":{"minSecondsBetweenAutomationWakes":300}}'`, `paperclipai agent update <agentId> --payload-json '{"runtimeConfig":{"heartbeat":{"minSecondsBetweenAutomationWakes":300}}}'`, `paperclipai routine update <routineId> --payload-json '{"automationWakeSettings":{"byWakeReason":{"issue_monitor_due":60}}}'`.
 
 ## 3.3 Working directory and execution limits
 
