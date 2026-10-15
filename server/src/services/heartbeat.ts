@@ -1,4 +1,5 @@
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
+import { issueIdEqualsText } from "./issue-id-match.js";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
@@ -10921,7 +10922,7 @@ export function heartbeatService(
     const waits = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`),
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
@@ -13111,7 +13112,7 @@ export function heartbeatService(
     lastError: string | null;
   }) {
     return db.transaction(async (tx) => {
-      const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
+      const [issue] = await tx.select().from(issues).where(and(issueIdEqualsText(sql`${input.taskKey}`), eq(issues.companyId, input.companyId))).for("update");
       if (isConversation(issue)) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
         if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
@@ -13195,7 +13196,7 @@ export function heartbeatService(
 
     return db.transaction(async (tx) => {
       if (opts?.taskKey && opts.expectedRunId) {
-        const [issue] = await tx.select().from(issues).where(sql`${issues.id}::text = ${opts.taskKey}`).for("update");
+        const [issue] = await tx.select().from(issues).where(issueIdEqualsText(sql`${opts.taskKey}`)).for("update");
         if (isConversation(issue)) {
           const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, opts.expectedRunId));
           if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return 0;
@@ -17141,7 +17142,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, heartbeatRuns.companyId),
-          sql`${issues.id}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+          issueIdEqualsText(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`),
         ),
       )
       .where(
@@ -21252,7 +21253,7 @@ export function heartbeatService(
     const strandedQueues = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`),
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -21296,7 +21297,7 @@ export function heartbeatService(
       .select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`))
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
@@ -21400,7 +21401,7 @@ export function heartbeatService(
       .innerJoin(
         issues,
         and(
-          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          issueIdEqualsText(sql`${agentTaskSessions.taskKey}`),
           eq(issues.companyId, agentTaskSessions.companyId),
           eq(issues.assigneeAgentId, agentTaskSessions.agentId),
         ),
@@ -21455,7 +21456,7 @@ export function heartbeatService(
       .innerJoin(
         issues,
         and(
-          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          issueIdEqualsText(sql`${agentTaskSessions.taskKey}`),
           eq(issues.companyId, agentTaskSessions.companyId),
           eq(issues.assigneeAgentId, agentTaskSessions.agentId),
         ),
@@ -31426,7 +31427,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, companyId),
-          sql`${issues.id}::text = ${runIssueId}`,
+          issueIdEqualsText(sql`${runIssueId}`),
         ),
       )
       .where(
@@ -31462,7 +31463,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, companyId),
-          sql`${issues.id}::text = ${wakeIssueId}`,
+          issueIdEqualsText(sql`${wakeIssueId}`),
         ),
       )
       .where(

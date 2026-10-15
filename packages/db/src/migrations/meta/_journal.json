@@ -2080,6 +2080,13 @@
       "when": 1791590969281,
       "tag": "0298_modern_junta",
       "breakpoints": true
+    },
+    {
+      "idx": 299,
+      "version": "7",
+      "when": 1792086411029,
+      "tag": "0299_redaction_lookup_index",
+      "breakpoints": true
     }
   ]
 }
