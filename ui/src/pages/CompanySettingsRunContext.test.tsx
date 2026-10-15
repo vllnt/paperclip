@@ -6,6 +6,7 @@ import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Company } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -19,9 +20,10 @@ import { CompanySettings } from "./CompanySettings";
 // adapted (relative URLs, and holding or failing the save response).
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-// Vitest runs with the ui package as cwd.
-const FIXTURE_DIR = path.resolve(process.cwd(), "../server");
-const TSX_CLI = path.resolve(process.cwd(), "../cli/node_modules/tsx/dist/cli.mjs");
+// Resolved from this module so the test runs from the repo root or from ui/.
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const FIXTURE_DIR = path.resolve(MODULE_DIR, "../../../server");
+const TSX_CLI = path.resolve(MODULE_DIR, "../../../cli/node_modules/tsx/dist/cli.mjs");
 const SAVE_TEST_ID = "company-settings-run-context-save";
 const MAX_COMMENTS_TEST_ID = "company-settings-run-context-base-maxComments";
 const SETTER = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
@@ -69,6 +71,8 @@ describe("CompanySettings run context against the real company API", () => {
   let queryClient: QueryClient;
   let releaseSave: (() => void) | null;
   let failNextSave: boolean;
+  let listMode: "pass" | "hold" | "fail";
+  let releaseList: (() => void) | null;
   let holdNextSave: boolean;
   let saveStarted: Promise<void>;
   let markSaveStarted: () => void;
@@ -88,10 +92,24 @@ describe("CompanySettings run context against the real company API", () => {
     releaseSave = null;
     failNextSave = false;
     holdNextSave = false;
+    listMode = "pass";
+    releaseList = null;
     saveStarted = new Promise((resolve) => { markSaveStarted = resolve; });
     globalThis.fetch = async (input, init) => {
       const url = typeof input === "string" && input.startsWith("/") ? origin + input : input;
-      if (init?.method !== "PATCH") return nativeFetch(url, init);
+      if (init?.method !== "PATCH") {
+        const isList = new URL(String(url)).pathname === "/api/companies" && listMode !== "pass";
+        if (!isList) return nativeFetch(url, init);
+        if (listMode === "fail") {
+          return new Response(JSON.stringify({ error: "List failed" }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        const held = await nativeFetch(url, init);
+        await new Promise<void>((resolve) => { releaseList = resolve; });
+        return held;
+      }
       if (failNextSave) {
         failNextSave = false;
         return new Response(JSON.stringify({ error: "Save failed" }), {
@@ -135,6 +153,7 @@ describe("CompanySettings run context against the real company API", () => {
 
   afterEach(async () => {
     releaseSave?.();
+    releaseList?.();
     await act(async () => root.unmount());
     queryClient.clear();
     container.remove();
@@ -230,5 +249,35 @@ describe("CompanySettings run context against the real company API", () => {
     await clickSave();
     await waitFor(() => saveButton() === null);
     expect(await persistedPolicy()).toEqual({ maxComments: 30 });
+  });
+
+  it("keeps a focused edit typed while the post-save list refresh is still pending", async () => {
+    await typeWithoutBlur("30");
+    await blurInput();
+    listMode = "hold";
+    await clickSave();
+    await waitFor(() => saveButton() === null && releaseList !== null);
+
+    await typeWithoutBlur("40");
+    await act(async () => releaseList?.());
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)); });
+
+    expect(maxComments()?.value).toBe("40");
+    await blurInput();
+    expect(saveButton()).not.toBeNull();
+    expect(await persistedPolicy()).toEqual({ maxComments: 30 });
+  });
+
+  it("shows the saved policy when the post-save list refresh fails", async () => {
+    await typeWithoutBlur("30");
+    await blurInput();
+    listMode = "fail";
+    await clickSave();
+    await waitFor(() => saveButton() === null);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)); });
+
+    expect(await persistedPolicy()).toEqual({ maxComments: 30 });
+    expect(maxComments()?.value).toBe("30");
+    expect(saveButton()).toBeNull();
   });
 });

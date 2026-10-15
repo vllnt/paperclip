@@ -14,6 +14,7 @@ import { resolveCompanyArchiveDeparture } from "../lib/company-selection";
 import { cloudPortfolioManageUrl } from "../lib/cloudLinks";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { companiesApi } from "../api/companies";
+import type { CompanyListResult } from "../api/companies-query";
 import { assetsApi } from "../api/assets";
 import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
@@ -92,9 +93,19 @@ export function CompanySettings() {
   const runContextMutation = useMutation({
     mutationFn: (next: RunContextPolicy | null) =>
       companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
-    onSuccess: () => {
+    onSuccess: (saved) => {
+      // Adopt the saved company before the draft clears and the editor unlocks,
+      // so a slow or failed list refresh cannot show (or restore) the old policy.
+      queryClient.setQueriesData<CompanyListResult>(
+        { queryKey: ["companies", "list"] },
+        (current) =>
+          current && {
+            ...current,
+            companies: current.companies.map((company) => (company.id === saved.id ? saved : company)),
+          },
+      );
       setRunContextDraft(undefined);
-      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
 
