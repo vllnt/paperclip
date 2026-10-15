@@ -571,6 +571,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     activityGateScope: routine.activityGateScope as RoutineRevisionSnapshotV1["routine"]["activityGateScope"],
     variables: routine.variables ?? [],
     env: routine.env ?? null,
+    ...(routine.runContextPolicy ? { runContextPolicy: routine.runContextPolicy } : {}),
     responsibleUserId: routine.responsibleUserId ?? null,
   };
 }
@@ -2340,11 +2341,6 @@ export function routineService(
           });
         }
 
-        if (patch.runContextPolicy !== undefined) {
-          await txDb.update(routines).set({ runContextPolicy: patch.runContextPolicy }).where(eq(routines.id, id));
-          locked.runContextPolicy = patch.runContextPolicy;
-        }
-
         const candidate: RoutineRow = {
           ...locked,
           projectId: nextProjectId,
@@ -2362,6 +2358,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           variables: nextVariables,
           env: nextEnv,
+          runContextPolicy: patch.runContextPolicy === undefined ? locked.runContextPolicy : patch.runContextPolicy,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2427,6 +2424,7 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             variables: candidate.variables,
             env: candidate.env,
+            runContextPolicy: candidate.runContextPolicy,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2769,6 +2767,7 @@ export function routineService(
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
+            runContextPolicy: routineSnapshot.runContextPolicy ?? null,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,

@@ -8109,7 +8109,7 @@ export async function buildPaperclipWakePayload(input: {
     return null;
 
   const runContext =
-    commentIds.length === 0
+    commentIds.length === 0 && !annotationCommentId
       ? RUN_CONTEXT_DEFAULTS
       : await loadRunContextSettings({
           db: input.db,

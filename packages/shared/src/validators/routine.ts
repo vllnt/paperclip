@@ -106,6 +106,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).default("always"),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).default("company"),
   variables: z.array(routineVariableSchema),
+  runContextPolicy: runContextPolicySchema.optional(),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
 }).strict();

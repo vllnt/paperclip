@@ -52,6 +52,7 @@ export function CompanySettings() {
   const [description, setDescription] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [logoUploadError, setLogoUploadError] = useState<string | null>(null);
+  const [runContextDraft, setRunContextDraft] = useState<RunContextPolicy | null | undefined>(undefined);
   const [governance, setGovernance] = useState<InteractionResolverGovernance>({});
 
   // Sync local state from selected company
@@ -92,6 +93,7 @@ export function CompanySettings() {
     mutationFn: (next: RunContextPolicy | null) =>
       companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
     onSuccess: () => {
+      setRunContextDraft(undefined);
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
@@ -375,10 +377,20 @@ export function CompanySettings() {
         </div>
         <RunContextPolicyEditor
           key={JSON.stringify(selectedCompany.runContextPolicy ?? null)}
-          value={selectedCompany.runContextPolicy}
-          onChange={(next) => runContextMutation.mutate(next)}
+          value={runContextDraft === undefined ? selectedCompany.runContextPolicy : runContextDraft}
+          onChange={setRunContextDraft}
           testId="company-settings-run-context"
         />
+        {runContextDraft !== undefined && (
+          <Button
+            size="sm"
+            onClick={() => runContextMutation.mutate(runContextDraft)}
+            disabled={runContextMutation.isPending}
+            data-testid="company-settings-run-context-save"
+          >
+            {runContextMutation.isPending ? "Saving..." : "Save run context"}
+          </Button>
+        )}
         {runContextMutation.isError && (
           <span className="text-xs text-destructive">
             {runContextMutation.error instanceof Error ? runContextMutation.error.message : "Failed to save"}

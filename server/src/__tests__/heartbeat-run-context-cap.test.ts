@@ -7,12 +7,16 @@ import {
   updateCompanySchema,
   updateRoutineSchema,
   createAgentSchema,
+  createRoutineSchema,
   type RunContextPolicy,
 } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { companyService } from "../services/companies.js";
+import { documentService } from "../services/documents.js";
+import { documentAnnotationService } from "../services/document-annotations.js";
+import { routineService } from "../services/routines.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -126,5 +130,78 @@ describe("resolveRunContextSettings", () => {
 
     await db.update(routines).set({ runContextPolicy: { maxComments: 15, byWakeReason: { issue_commented: { maxComments: 2 } } } }).where(eq(routines.id, routineId));
     expect((await wake(s, "issue_commented"))?.comments.map((c) => c.id)).toEqual(s.ids.slice(-2));
+  });
+  it("caps annotation-only wakes with the configured limit", async () => {
+    const s = await seed({ comments: 1 });
+    await companyService(db).update(s.companyId, { runContextPolicy: { maxCommentChars: 100 } });
+    const { document } = await documentService(db).upsertIssueDocument({
+      issueId: s.issueId, key: "plan", title: "Plan", format: "markdown", body: "Alpha selected text omega",
+    });
+    const thread = await documentAnnotationService(db).createThread(s.issueId, "plan", {
+      baseRevisionId: document.latestRevisionId ?? "",
+      baseRevisionNumber: document.latestRevisionNumber,
+      selector: {
+        quote: { exact: "selected text", prefix: "Alpha ", suffix: " omega" },
+        position: { normalizedStart: 6, normalizedEnd: 19, markdownStart: 6, markdownEnd: 19 },
+      },
+      body: "a".repeat(300),
+    }, { actorType: "user", actorId: "board", userId: "board" });
+    const contextSnapshot = {
+      issueId: s.issueId, annotationCommentId: thread.comments[0]?.id, wakeReason: "document_annotation_commented",
+    };
+    const capped = await buildPaperclipWakePayload({ db, companyId: s.companyId, agentId: s.agentId, contextSnapshot });
+    expect(capped?.annotationDeltas[0]?.body).toHaveLength(100);
+
+  });
+});
+
+(support.supported ? describe : describe.skip)("routine run-context policy revisions", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("run-context-routine-");
+    db = createDb(database.connectionString);
+  }, 30000);
+  afterAll(async () => { await database?.cleanup(); });
+
+  it("snapshots, conflict-checks and restores policy-only edits", async () => {
+    const companyId = randomUUID(), agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Rev", defaultResponsibleUserId: "board", issuePrefix: `R${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "idle", adapterType: "process" });
+    const svc = routineService(db);
+    const routine = await svc.create(companyId, createRoutineSchema.parse({
+      title: "Routine", description: "Body", assigneeAgentId: agentId, status: "paused", runContextPolicy: { maxComments: 5 },
+    }), { userId: "board" });
+    const firstRevisionId = routine.latestRevisionId ?? "";
+
+    const revisions = await svc.listRevisions(routine.id);
+    expect(revisions.find((r) => r.id === firstRevisionId)?.snapshot.routine.runContextPolicy).toEqual({ maxComments: 5 });
+
+    const changed = await svc.update(routine.id, { baseRevisionId: firstRevisionId, runContextPolicy: { maxComments: 10 } }, { userId: "editor-a" });
+    expect(changed?.latestRevisionId).not.toBe(firstRevisionId);
+    expect(changed?.runContextPolicy).toEqual({ maxComments: 10 });
+    expect(changed?.updatedByUserId).toBe("editor-a");
+
+    await expect(
+      svc.update(routine.id, { baseRevisionId: firstRevisionId, runContextPolicy: { maxComments: 15 } }, { userId: "editor-b" }),
+    ).rejects.toThrow(/updated by someone else/);
+    expect((await svc.get(routine.id))?.runContextPolicy).toEqual({ maxComments: 10 });
+
+    const restored = await svc.restoreRevision(routine.id, firstRevisionId, { userId: "board" });
+    expect(restored.routine.runContextPolicy).toEqual({ maxComments: 5 });
+  });
+
+  it("does not add a revision for an unchanged or unset policy", async () => {
+    const companyId = randomUUID(), agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Rev2", defaultResponsibleUserId: "board", issuePrefix: `R${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "idle", adapterType: "process" });
+    const svc = routineService(db);
+    const routine = await svc.create(companyId, createRoutineSchema.parse({
+      title: "Routine", description: "Body", assigneeAgentId: agentId, status: "paused",
+    }), { userId: "board" });
+    const same = await svc.update(routine.id, { title: "Routine" }, { userId: "board" });
+    expect(same?.latestRevisionId).toBe(routine.latestRevisionId);
+    const cleared = await svc.update(routine.id, { runContextPolicy: null }, { userId: "board" });
+    expect(cleared?.latestRevisionId).toBe(routine.latestRevisionId);
   });
 });
