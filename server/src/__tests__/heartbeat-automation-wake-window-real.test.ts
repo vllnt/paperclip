@@ -306,6 +306,44 @@ describe("automation wake window on the real queue", () => {
     expect(await monitorRuns(agentId)).toHaveLength(0);
   }, 30_000);
 
+  it("stamps a fresh wake's admission after waiting for the window lock", async () => {
+    const { companyId, agentId, issueIds } = await seed(1, 2);
+    let release!: () => void;
+    let ready!: () => void;
+    const locked = new Promise<void>((resolve) => (ready = resolve));
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const blocker = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0))`,
+      );
+      ready();
+      await released;
+    });
+    await locked;
+    const pending = monitorWake(agentId, issueIds[0]!);
+    try {
+      const deadline = Date.now() + 5000;
+      let waiting = 0;
+      while (!waiting && Date.now() < deadline) {
+        const rows = await db.execute(sql`select count(*)::int as count from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+          and query like '%pg_advisory_xact_lock%'`);
+        waiting = Number(rows[0]?.count ?? 0);
+        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(waiting).toBeGreaterThan(0);
+      // Longer than the 1-second window: a transaction-start stamp would already be expired.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    } finally {
+      release();
+      await blocker;
+    }
+    await pending;
+
+    await monitorWake(agentId, issueIds[1]!);
+    expect(await monitorRuns(agentId)).toHaveLength(1);
+  }, 30_000);
+
   it("reschedules held retries so more than a sweep's skip cap cannot starve another agent", async () => {
     const held = await seed(300, 1);
     await insertRecentAutomationRun(held.companyId, held.agentId, held.issueIds[0]!);

@@ -30397,6 +30397,7 @@ export function heartbeatService(
           // ones merge into the same receipt. The deferred-wake sweep delivers it
           // once the window ends; nothing is dropped. Assignment and human-driven
           // wakes never pass through here. Unset everywhere means off.
+          let automationAdmittedAt: Date | undefined;
           const automationWakeReason = reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason);
           const automationWakeWindowSec =
             automationWakeReason &&
@@ -30410,10 +30411,13 @@ export function heartbeatService(
               : 0;
           if (automationWakeReason && automationWakeWindowSec > 0) {
             const windowMs = automationWakeWindowSec * 1000;
-            const gateNow = new Date();
             // Wakes for different issues of one agent share the window; the lock
             // makes the check and the run insert below atomic per agent.
             await lockAutomationWakeWindow(tx as unknown as Db, agent.companyId, agentId);
+            // Read the clock after the lock wait: the transaction-start default would
+            // age a run by that wait and let the next wake into a window it still owns.
+            const gateNow = new Date();
+            automationAdmittedAt = gateNow;
             const lastAutomationRun = await findLastAutomationRun(tx as unknown as Db, {
               companyId: agent.companyId,
               agentId,
@@ -30902,6 +30906,7 @@ export function heartbeatService(
           const newRun = await tx
             .insert(heartbeatRuns)
             .values({
+                            ...(automationAdmittedAt ? { createdAt: automationAdmittedAt } : {}),
               ...(explicitContinuation ? { id: explicitContinuationRunId } : {}),
               companyId: agent.companyId,
               agentId,

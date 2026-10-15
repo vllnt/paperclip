@@ -269,6 +269,7 @@ function makeContext(
     companyId: COMPANY_ID,
     editDraft,
     setEditDraft: () => {},
+    discardEdits: () => {},
     routineDefaults: defaults,
     dirtyFields,
     isEditDirty: dirty,

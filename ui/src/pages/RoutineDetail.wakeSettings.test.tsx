@@ -274,4 +274,20 @@ describe.each(VARIANTS)("RoutineDetail wake settings save ($name)", ({ load }) =
     expect(labels.some((label) => label?.startsWith("Save changes"))).toBe(false);
     expect(container.querySelector<HTMLInputElement>("#routine-automation-wake-window")?.value).toBe("600");
   });
+
+  it("does not report phantom wake-settings edits after Discard on the History tab", async () => {
+    const backend = createBackend({});
+    await openStaleWindowEdit(backend);
+    const historyLink = Array.from(document.querySelectorAll("a, button")).find(
+      (candidate) => candidate.textContent?.trim() === "History",
+    );
+    expect(historyLink).toBeDefined();
+    await act(async () => (historyLink as HTMLElement).click());
+    await settle();
+    await clickButton("Discard changes");
+
+    const labels = Array.from(document.querySelectorAll("button")).map((button) => button.textContent?.trim());
+    expect(labels).not.toContain("Discard changes");
+    expect(labels.some((label) => label?.startsWith("Save changes"))).toBe(false);
+  });
 });

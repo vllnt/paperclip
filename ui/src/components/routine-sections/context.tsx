@@ -101,6 +101,8 @@ export type RoutineDetailContextValue = {
   // edit state
   editDraft: RoutineEditDraft;
   setEditDraft: React.Dispatch<React.SetStateAction<RoutineEditDraft>>;
+  /** Resets the draft and its captured wake-settings base to the saved routine. */
+  discardEdits: () => void;
   routineDefaults: RoutineEditDraft;
   dirtyFields: RoutineHistoryDirtyFieldDescriptor[];
   isEditDirty: boolean;

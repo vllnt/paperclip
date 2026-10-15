@@ -624,14 +624,18 @@ export function RoutineDetail() {
   const currentAssignee = editDraft.assigneeAgentId ? agentById.get(editDraft.assigneeAgentId) ?? null : null;
   const currentProject = editDraft.projectId ? projectById.get(editDraft.projectId) ?? null : null;
 
+  // The draft and the captured wake-settings base reset together, or edits stay phantom.
+  const discardEdits = useCallback(() => {
+    if (!routineDefaults) return;
+    setEditDraft(routineDefaults);
+    editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
+  }, [routineDefaults]);
+
   const reloadLatest = useCallback(() => {
     setSaveConflict(false);
-    if (routineDefaults) {
-      setEditDraft(routineDefaults);
-      editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
-    }
+    discardEdits();
     queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(routineId!) });
-  }, [queryClient, routineDefaults, routineId]);
+  }, [discardEdits, queryClient, routineId]);
 
   const onHistoryRestoreSecretMaterials = useCallback((response: RestoreRoutineRevisionResponse) => {
     if (response.secretMaterials.length > 0) {
@@ -735,6 +739,7 @@ export function RoutineDetail() {
     companyId: routine.companyId,
     editDraft,
     setEditDraft: setEditDraftTracked,
+    discardEdits,
     routineDefaults,
     dirtyFields,
     isEditDirty,
