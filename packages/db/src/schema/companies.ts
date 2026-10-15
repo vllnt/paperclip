@@ -1,4 +1,4 @@
-import type { DuplicateDetectionMode, InteractionResolverGovernance } from "@paperclipai/shared";
+import type { DuplicateDetectionMode, InteractionResolverGovernance, RunContextPolicy } from "@paperclipai/shared";
 import { pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
@@ -26,6 +26,7 @@ export const companies = pgTable(
       .$type<DuplicateDetectionMode>()
       .notNull()
       .default("off"),
+    runContextPolicy: jsonb("run_context_policy").$type<RunContextPolicy>(),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")
       .notNull()
       .default(false),

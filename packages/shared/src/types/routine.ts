@@ -1,3 +1,4 @@
+import type { RunContextPolicy } from "../run-context.js";
 import type {
   IssueOriginKind,
   IssuePriority,
@@ -89,6 +90,7 @@ export interface Routine {
   originId?: string | null;
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
+  runContextPolicy?: RunContextPolicy | null;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
   createdByAgentId: string | null;
@@ -134,6 +136,7 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   originId?: string | null;
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
+  runContextPolicy?: RunContextPolicy;
   responsibleUserId: string | null;
 }
 

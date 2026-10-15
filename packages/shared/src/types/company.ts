@@ -1,4 +1,5 @@
 import type { DuplicateDetectionMode } from "../duplicate-detection.js";
+import type { RunContextPolicy } from "../run-context.js";
 import type {
   CompanyStatus,
   IssueThreadInteractionKind,
@@ -30,6 +31,7 @@ export interface Company {
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
   duplicateDetectionMode: DuplicateDetectionMode;
+  runContextPolicy: RunContextPolicy | null;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

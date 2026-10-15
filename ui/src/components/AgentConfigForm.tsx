@@ -1,6 +1,7 @@
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { AiConnectionField, aiProviderForAdapter } from "./ai-connections/AiConnectionField";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import { RunContextPolicyEditor } from "./RunContextPolicyEditor";
+import { aiConnectionBindingSchema, runContextPolicySchema } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { bindingProblem, personalAiDefault } from "./ai-connections/model";
 import { testAgentSetup } from "@/lib/test-agent-setup";
@@ -1695,6 +1696,21 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     }));
                   }
                 }}
+              />
+            </Field>
+          )}
+
+          {!isCreate && (
+            <Field
+              label="Run context"
+              hint="Per-agent override of how much issue history a run sees. Blank fields inherit the company setting."
+            >
+              <RunContextPolicyEditor
+                value={runContextPolicySchema.safeParse(
+                  "runContext" in overlay.runtime ? overlay.runtime.runContext : runtimeConfig.runContext,
+                ).data ?? null}
+                onChange={(next) => mark("runtime", "runContext", next)}
+                testId="agent-run-context"
               />
             </Field>
           )}
