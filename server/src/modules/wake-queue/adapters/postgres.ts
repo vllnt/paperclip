@@ -66,6 +66,8 @@ import {
 } from "../domain/values.js";
 import { requireTransactionScopeTx, TransactionScope } from "../application/ports.js";
 import type {
+  AutomationWakeAdmission,
+  AutomationWakeAdmissionInput,
   DeferredWakeCandidate,
   InvokableAgentSnapshot,
   IssueLockWriter,
@@ -190,6 +192,7 @@ export type WakeQueuePostgresAdapterDeps = {
   resolveResponsibleUserId: WakeQueueHost["resolveResponsibleUserId"];
   getRoutineEnv: WakeQueueHost["getRoutineEnv"];
   resolveSessionBeforeForWakeup: WakeQueueHost["resolveSessionBeforeForWakeup"];
+  admitAutomationWake: (input: AutomationWakeAdmissionInput & { tx: Db }) => Promise<AutomationWakeAdmission>;
 };
 
 function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
@@ -499,6 +502,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return updated ? toIssueSnapshot(updated as unknown as IssueRow) : null;
     },
 
+    admitAutomationWake(input) {
+      return deps.admitAutomationWake({ ...input, tx });
+    },
+
     async claimDeferredWakeForPromotion({ companyId, wakeId, now }) {
       const claimed = await tx
         .update(agentWakeupRequests)
@@ -531,6 +538,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: input.triggerDetail,
           status: "queued",
           wakeupRequestId: input.wakeId,
+          ...(input.admittedAt ? { createdAt: input.admittedAt } : {}),
           retryOfRunId: input.authorizedFailedChatRetry
             ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
             : null,

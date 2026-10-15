@@ -10126,6 +10126,7 @@ export function heartbeatService(
       if (!agent) return null;
       return resolveSessionBeforeForWakeup(agent, input.taskKey);
     },
+    admitAutomationWake: ({ tx, ...input }) => admitThroughAutomationWindow(tx as Db, input),
     // These four helpers stay in this file today; the wake-queue module
     // receives them here so it never imports this file, the service it is
     // extracted from.
@@ -17560,40 +17561,58 @@ export function heartbeatService(
   }
 
   /**
-   * A scheduled retry is an automation wake too. Inside the promotion transaction, under
-   * the same per-agent lock as fresh wakes, it is held while the agent's window is open;
+   * Admits an automation wake that is about to start a run outside the fresh-wake path: a
+   * scheduled retry or a deferred wake promoted on release. Inside the caller's transaction,
+   * under the same per-agent lock as fresh wakes, it is held while the agent's window is open;
    * otherwise its admission time opens a new window.
    */
-  const admitScheduledRetryThroughAutomationWindow: RetryAdmissionPolicy = async ({ tx, run, now }) => {
+  async function admitThroughAutomationWindow(
+    txDb: Db,
+    input: {
+      companyId: string;
+      agentId: string;
+      reason: string | null;
+      issueId: string | null;
+      now: Date;
+      excludeRunId?: string;
+    },
+  ): Promise<{ hold: true; holdUntil: Date } | { hold: false; admittedAt?: Date }> {
     const proceed = { hold: false as const };
-    const txDb = tx as Db;
-    const reason = readNonEmptyString(run.contextSnapshot.wakeReason);
-    if (!reason) return proceed;
-    const [agent] = await txDb.select().from(agents).where(eq(agents.id, run.agentId));
+    if (!input.reason) return proceed;
+    const [agent] = await txDb.select().from(agents).where(eq(agents.id, input.agentId));
     if (!agent) return proceed;
-    const issueId = readNonEmptyString(run.contextSnapshot.issueId);
-    const issue = issueId
+    const issue = input.issueId
       ? await txDb
           .select({ originKind: issues.originKind, originId: issues.originId })
           .from(issues)
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
-    const windowSec = await resolveAutomationWakeWindowSec(txDb, { agent, reason, issue });
+    const windowSec = await resolveAutomationWakeWindowSec(txDb, { agent, reason: input.reason, issue });
     if (windowSec <= 0) return proceed;
-    await lockAutomationWakeWindow(txDb, run.companyId, run.agentId);
-    // The sweep's clock predates any wait for the issue and window locks; admit on a fresh one.
-    const admittedAt = new Date(Math.max(now.getTime(), Date.now()));
+    await lockAutomationWakeWindow(txDb, input.companyId, input.agentId);
+    // The caller's clock predates any wait for the issue and window locks; admit on a fresh one.
+    const admittedAt = new Date(Math.max(input.now.getTime(), Date.now()));
     const last = await findLastAutomationRun(txDb, {
-      companyId: run.companyId,
-      agentId: run.agentId,
+      companyId: input.companyId,
+      agentId: input.agentId,
       since: new Date(admittedAt.getTime() - windowSec * 1000),
-      excludeRunId: run.id,
+      excludeRunId: input.excludeRunId,
     });
     return last
       ? { hold: true as const, holdUntil: new Date(last.createdAt.getTime() + windowSec * 1000 + 1) }
       : { hold: false as const, admittedAt };
-  };
+  }
+
+  const admitScheduledRetryThroughAutomationWindow: RetryAdmissionPolicy = ({ tx, run, now }) =>
+    admitThroughAutomationWindow(tx as Db, {
+      companyId: run.companyId,
+      agentId: run.agentId,
+      reason: readNonEmptyString(run.contextSnapshot.wakeReason),
+      issueId: readNonEmptyString(run.contextSnapshot.issueId),
+      now,
+      excludeRunId: run.id,
+    });
 
   async function promoteDueScheduledRetries(now = new Date()) {
     await coalesceProviderQuotaRetries(now).catch((err) => {

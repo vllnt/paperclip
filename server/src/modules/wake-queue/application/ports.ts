@@ -92,6 +92,18 @@ export type DeferredWakeCandidate = {
   automationCoalescedUntil?: Date | null;
 };
 
+/** Admission of an automation wake through the agent's serialized window; a hold keeps the wake deferred. */
+export type AutomationWakeAdmissionInput = {
+  companyId: string;
+  agentId: string;
+  reason: string | null;
+  issueId: string | null;
+  now: Date;
+};
+export type AutomationWakeAdmission =
+  | { hold: true; holdUntil: Date }
+  | { hold: false; admittedAt?: Date };
+
 export type PromoteDeferredWakeInput = {
   companyId: string;
   wakeId: string;
@@ -105,6 +117,8 @@ export type PromoteDeferredWakeInput = {
   payload: Record<string, unknown>;
   responsibleUserId: string;
   sessionBefore: string | null;
+  /** The window admission time, stamped as the run's creation time so it opens the agent's next window. */
+  admittedAt?: Date;
   /** Only a proven failed-chat retry may retain its original retry lineage. */
   authorizedFailedChatRetry?: boolean;
   now: Date;
@@ -126,6 +140,11 @@ export interface WakeQueueTransaction {
     finishingRunAgentId: string;
     queuedCommentIds: string[];
   }): Promise<{ liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean }>;
+  /**
+   * Runs the agent's automation-window admission inside this transaction, under the
+   * per-agent window lock, before a deferred wake may start a run.
+   */
+  admitAutomationWake(input: AutomationWakeAdmissionInput): Promise<AutomationWakeAdmission>;
   /** Cancels the wake with `status = 'deferred_issue_execution'` as an atomic compare-and-set guard. */
   cancelDeferredWake(input: {
     companyId: string;

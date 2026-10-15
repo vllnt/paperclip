@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -430,4 +433,118 @@ describe("automation wake window on the real queue", () => {
     const result = await heartbeat.promoteDueScheduledRetries(new Date(now.getTime() + 1000));
     expect(result.runIds).toContain(scheduledRunId);
   });
+
+  // Starts a manual run on `issueId` whose real child process stays alive for `runMs`, so a
+  // wake for that issue parks behind it and its release drains the queue.
+  async function startManualRun(companyId: string, agentId: string, issueId: string, runMs: number) {
+    const marker = join(tmpdir(), `window-child-${randomUUID()}`);
+    const command = (script: string) => ({ command: process.execPath, args: ["-e", script], cwd: tmpdir() });
+    await db.update(agents).set({
+      adapterConfig: command(
+        `require("fs").writeFileSync(${JSON.stringify(marker)}, "x"); setTimeout(() => process.exit(0), ${runMs})`,
+      ),
+    }).where(eq(agents.id, agentId));
+    const manual = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "manual_test",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "manual_test" },
+      requestedByActorType: "user",
+      requestedByActorId: "window-user",
+    });
+    expect(manual).not.toBeNull();
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && !existsSync(marker)) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(existsSync(marker)).toBe(true);
+    unlinkSync(marker);
+    // The running child keeps its command; later runs finish promptly.
+    await db.update(agents).set({ adapterConfig: command("process.exit(0)") }).where(eq(agents.id, agentId));
+    return manual!;
+  }
+
+  async function runsForIssue(agentId: string, issueId: string) {
+    return (await monitorRuns(agentId)).filter((run) => run.contextSnapshot?.issueId === issueId);
+  }
+
+  async function deferredReceipts(agentId: string, issueId: string) {
+    return db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+      ));
+  }
+
+  // Parks a monitor wake for issue 0 behind its running manual run. Coalesced: the window was
+  // open when it arrived and its own deadline has since passed. Unmarked: a receipt carrying no
+  // window deadline at all, as an automation wake deferred behind active execution does.
+  async function parkMonitorWake(
+    kind: "coalesced" | "unmarked",
+    fixture: { companyId: string; agentId: string; issueIds: string[] },
+  ) {
+    const { companyId, agentId, issueIds } = fixture;
+    if (kind === "unmarked") {
+      const [receipt] = await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_monitor_due",
+        status: "deferred_issue_execution",
+        payload: {
+          issueId: issueIds[0],
+          _paperclipWakeContext: { issueId: issueIds[0], wakeReason: "issue_monitor_due" },
+        },
+      }).returning();
+      return receipt!;
+    }
+    await insertRecentAutomationRun(companyId, agentId, issueIds[1]!);
+    await db.update(heartbeatRuns).set({ createdAt: new Date(Date.now() - 299_000) })
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "succeeded")));
+    expect(await monitorWake(agentId, issueIds[0]!)).toBeNull();
+    const [receipt] = await deferredReceipts(agentId, issueIds[0]!);
+    expect(receipt).toBeDefined();
+    // Let the receipt's own deadline pass; the renewal that follows outlives it.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    return receipt!;
+  }
+
+  // The parked wake stays behind the manual run while another issue's wake renews the window;
+  // the release must then not start it inside the renewed window.
+  it.each(["coalesced", "unmarked"] as const)("holds a %s receipt on release while another issue's wake owns the window", async (kind) => {
+    const fixture = await seed(300, 2);
+    const { companyId, agentId, issueIds } = fixture;
+    const manual = await startManualRun(companyId, agentId, issueIds[0]!, 4000);
+    const parked = await parkMonitorWake(kind, fixture);
+    expect(await monitorWake(agentId, issueIds[1]!)).not.toBeNull();
+
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, manual.id));
+    expect(finished?.status).toBe("succeeded");
+    expect(await runsForIssue(agentId, issueIds[0]!)).toHaveLength(0);
+    expect((await deferredReceipts(agentId, issueIds[0]!)).map((row) => row.id)).toEqual([parked.id]);
+  }, 60_000);
+
+  it("delivers a receipt held on release once the window ends", async () => {
+    const fixture = await seed(300, 2);
+    const { companyId, agentId, issueIds } = fixture;
+    await startManualRun(companyId, agentId, issueIds[0]!, 2000);
+    await parkMonitorWake("coalesced", fixture);
+    expect(await monitorWake(agentId, issueIds[1]!)).not.toBeNull();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(await runsForIssue(agentId, issueIds[0]!)).toHaveLength(0);
+
+    // Age the renewing run past the window, then let the sweep redeliver the held receipt.
+    await db.update(heartbeatRuns).set({ createdAt: new Date(Date.now() - 301_000) })
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "succeeded")));
+    await heartbeat.sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    expect(await runsForIssue(agentId, issueIds[0]!)).toHaveLength(1);
+    expect(await deferredReceipts(agentId, issueIds[0]!)).toHaveLength(0);
+  }, 60_000);
 });

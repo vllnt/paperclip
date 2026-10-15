@@ -1,4 +1,5 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
+import { AUTOMATION_WAKE_REASON_SET } from "../domain/automation-wake-coalesce.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -370,7 +371,32 @@ async function runReleaseDrain(
     // Unreachable: decideWakeOutcome only returns "promote" when agentFound and invokable are both true.
     if (!deferredAgent) throw new Error("wake-queue: promoted a deferred wake with no invokable agent");
 
-    const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input);
+    // A deferred automation wake starts a run like a fresh one, so it passes the same
+    // per-agent window under the same lock. Another wake may have renewed the window
+    // since this receipt was parked, whatever its own deadline said; a held receipt
+    // stays deferred and the sweep redelivers it through ordinary admission.
+    const automationReason = workingCandidate.wakeReason ?? workingCandidate.reason;
+    let admittedAt: Date | undefined;
+    if (
+      automationReason &&
+      AUTOMATION_WAKE_REASON_SET.has(automationReason) &&
+      workingCandidate.requestedByActorType !== "user"
+    ) {
+      const admission = await ports.transaction.admitAutomationWake({
+        companyId: run.companyId,
+        agentId: workingCandidate.agentId,
+        reason: automationReason,
+        issueId: issue.id,
+        now: input.now,
+      });
+      if (admission.hold) {
+        excludedWakeIds.push(workingCandidate.id);
+        continue;
+      }
+      admittedAt = admission.admittedAt;
+    }
+
+    const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input, admittedAt);
     if (!promoted) continue;
     return promoted;
   }
@@ -392,6 +418,7 @@ async function promoteDeferredWake(
   pauseHold: PauseHoldFacts,
   postCommitEffects: PostCommitEffect[],
   input: ReleaseIssueExecutionInput,
+  admittedAt: Date | undefined,
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
   let shouldReopen = false;
@@ -543,6 +570,7 @@ async function promoteDeferredWake(
     payload: promotedPayload,
     responsibleUserId,
     sessionBefore,
+    ...(admittedAt ? { admittedAt } : {}),
     authorizedFailedChatRetry: workingCandidate.authorizedFailedChatRetry,
     now: input.now,
   });
