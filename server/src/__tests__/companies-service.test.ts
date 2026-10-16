@@ -79,6 +79,16 @@ describeEmbeddedPostgres("companyService", () => {
     await tempDb?.cleanup();
   });
 
+  it("defaults automation wake settings to empty and updates them", async () => {
+    const svc = companyService(db);
+    const created = await svc.create({ name: "Wake Settings Co" });
+    expect(created.automationWakeSettings).toEqual({});
+
+    const settings = { minSecondsBetweenAutomationWakes: 600, byWakeReason: { issue_monitor_due: 60 } };
+    const updated = await svc.update(created.id, { automationWakeSettings: settings });
+    expect(updated?.automationWakeSettings).toEqual(settings);
+  });
+
   it("retries generated issue prefixes when Drizzle wraps the unique constraint error", async () => {
     await db.insert(companies).values({
       name: "Aron Existing",

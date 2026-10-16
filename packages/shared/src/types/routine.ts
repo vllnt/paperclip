@@ -1,3 +1,4 @@
+import type { AutomationWakeSettings } from "../automation-wake.js";
 import type {
   IssueOriginKind,
   IssuePriority,
@@ -89,6 +90,7 @@ export interface Routine {
   originId?: string | null;
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
+  automationWakeSettings?: AutomationWakeSettings;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
   createdByAgentId: string | null;

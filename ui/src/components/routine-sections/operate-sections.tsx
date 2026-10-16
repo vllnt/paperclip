@@ -106,8 +106,7 @@ export function HistorySection() {
     routine,
     isEditDirty,
     dirtyFields,
-    routineDefaults,
-    setEditDraft,
+    discardEdits,
     saveRoutine,
     agentById,
     projectById,
@@ -121,7 +120,7 @@ export function HistorySection() {
       routine={routine}
       isEditDirty={isEditDirty}
       dirtyFields={dirtyFields}
-      onDiscardEdits={() => setEditDraft(routineDefaults)}
+      onDiscardEdits={discardEdits}
       onSaveEdits={() => {
         if (!saveRoutine.isPending && routine.title.trim()) {
           saveRoutine.mutate();

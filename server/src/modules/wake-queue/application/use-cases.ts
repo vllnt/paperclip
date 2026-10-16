@@ -1,4 +1,5 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
+import { AUTOMATION_WAKE_REASON_SET } from "../domain/automation-wake-coalesce.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -178,6 +179,14 @@ async function runReleaseDrain(
       );
     }
     processedWakeIds.add(candidate.id);
+
+    // An automation wake coalesced by the agent's window keeps its place until
+    // the window ends, whoever releases; the deferred-wake sweep delivers it.
+    const coalescedUntil = candidate.automationCoalescedUntil ?? null;
+    if (coalescedUntil && coalescedUntil.getTime() > input.now.getTime()) {
+      excludedWakeIds.push(candidate.id);
+      continue;
+    }
 
     // Promotion re-applies admission's self-reblock policy. A wake parked
     // before the owner's run released must not restart the owner on its own
@@ -362,7 +371,33 @@ async function runReleaseDrain(
     // Unreachable: decideWakeOutcome only returns "promote" when agentFound and invokable are both true.
     if (!deferredAgent) throw new Error("wake-queue: promoted a deferred wake with no invokable agent");
 
-    const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input);
+    // A deferred automation wake starts a run like a fresh one, so it passes the same
+    // per-agent window under the same lock. Another wake may have renewed the window
+    // since this receipt was parked, whatever its own deadline said; a held receipt
+    // stays deferred and the sweep redelivers it through ordinary admission.
+    const automationReason = workingCandidate.wakeReason ?? workingCandidate.reason;
+    let admittedAt: Date | undefined;
+    if (
+      automationReason &&
+      AUTOMATION_WAKE_REASON_SET.has(automationReason) &&
+      workingCandidate.requestedByActorType !== "user"
+    ) {
+      const admission = await ports.transaction.admitAutomationWake({
+        companyId: run.companyId,
+        agentId: workingCandidate.agentId,
+        reason: automationReason,
+        issueId: issue.id,
+        now: input.now,
+        nonblocking: true,
+      });
+      if (admission.hold) {
+        excludedWakeIds.push(workingCandidate.id);
+        continue;
+      }
+      admittedAt = admission.admittedAt;
+    }
+
+    const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input, admittedAt);
     if (!promoted) continue;
     return promoted;
   }
@@ -384,6 +419,7 @@ async function promoteDeferredWake(
   pauseHold: PauseHoldFacts,
   postCommitEffects: PostCommitEffect[],
   input: ReleaseIssueExecutionInput,
+  admittedAt: Date | undefined,
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
   let shouldReopen = false;
@@ -535,6 +571,7 @@ async function promoteDeferredWake(
     payload: promotedPayload,
     responsibleUserId,
     sessionBefore,
+    ...(admittedAt ? { admittedAt } : {}),
     authorizedFailedChatRetry: workingCandidate.authorizedFailedChatRetry,
     now: input.now,
   });
@@ -780,6 +817,33 @@ async function runReleaseRecoveryTail(
     );
   }
 
+  // A system recovery run is an automation wake like any other: it passes the agent's
+  // window, and a held one stays parked for the deferred-wake sweep instead of starting now.
+  let admittedAt: Date | undefined;
+  if (AUTOMATION_WAKE_REASON_SET.has(recoveryReason)) {
+    const admission = await transaction.admitAutomationWake({
+      companyId: issue.companyId,
+      agentId: recoveryAgent.id,
+      reason: recoveryReason,
+      issueId: issue.id,
+      now: input.now,
+      nonblocking: true,
+    });
+    if (admission.hold) {
+      await transaction.parkHeldAutomationWake({
+        companyId: issue.companyId,
+        agentId: recoveryAgent.id,
+        issueId: issue.id,
+        reason: recoveryReason,
+        contextSnapshot: recoveryContextSnapshot,
+        notBefore: admission.holdUntil,
+        now: input.now,
+      });
+      return { outcome: { kind: "released" }, postCommitEffects };
+    }
+    admittedAt = admission.admittedAt;
+  }
+
   const queuedRun = await transaction.queueImmediateRecoveryRun({
     companyId: issue.companyId,
     issue,
@@ -789,6 +853,7 @@ async function runReleaseRecoveryTail(
     contextSnapshot: recoveryContextSnapshot,
     responsibleUserId: recoveryResponsibleUserId,
     sessionBefore,
+    ...(admittedAt ? { admittedAt } : {}),
     now: input.now,
   });
   postCommitEffects.push({ kind: "run_queued", run: queuedRun });
