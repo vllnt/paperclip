@@ -9064,6 +9064,68 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+// ─── Convex plugin action contracts ───────────────────────────────────────────
+// The bundled Convex plugin (vllnt.paperclip-convex) serves these board actions
+// through the URL-keyed action route below. Agents use the plugin's tools
+// (GET /api/plugins/tools) instead; the grants and guards apply to both.
+const convexEnvironment = z.enum(["production", "staging", "preview", "dev", "custom"]);
+const convexDeploymentSchema = z.object({
+  name: z.string(),
+  environment: convexEnvironment.describe("Computed by the server from the re-fetched Convex record; unknown means production"),
+  environmentReason: z.string().optional(),
+  deploymentType: z.string().nullable(),
+  reference: z.string().nullable(),
+  previewIdentifier: z.string().nullable(),
+  isDefault: z.boolean().nullable(),
+  createTime: z.number().nullable().describe("Milliseconds since epoch"),
+  lastDeployTime: z.number().nullable(),
+  expiresAt: z.number().nullable(),
+  region: z.string().nullable(),
+  deploymentClass: z.string().nullable(),
+  creator: z.string().nullable(),
+  project: z.string().nullable(),
+});
+registry.register("ConvexDeployment", convexDeploymentSchema);
+registry.register("ConvexStatus", z.object({
+  connection: z.enum(["connected", "disconnected", "not-configured", "not-connected"]),
+  configError: z.string().optional(),
+  teamId: z.string().nullable(),
+  projects: z.array(z.object({ convexProjectId: z.string(), name: z.string(), repository: z.string().nullable(), paperclipProjectId: z.string().nullable(), reserved: z.boolean() })),
+  credentials: z.object({ teamToken: z.boolean(), github: z.boolean() }).describe("Whether a credential is configured; values are never returned"),
+  grants: z.number(),
+}));
+registry.register("ConvexDeploymentsListParams", z.object({
+  convexProjectId: z.string().optional(),
+  deploymentType: z.enum(["preview", "dev", "prod", "custom"]).optional(),
+}));
+registry.register("ConvexDeploymentsList", z.object({ deployments: z.array(convexDeploymentSchema), truncated: z.boolean() }));
+registry.register("ConvexDeletePreviewParams", z.object({
+  name: z.string(),
+  dryRun: z.boolean().optional().describe("Run every guard and delete nothing"),
+}));
+registry.register("ConvexReaperRunParams", z.object({
+  dryRun: z.boolean().optional().describe("Absent or true only plans. false runs for real and needs reaper.enabled and an instance administrator"),
+}));
+registry.register("ConvexReaperReport", z.object({
+  at: z.string(),
+  trigger: z.enum(["schedule", "manual", "retry", "api"]),
+  dryRun: z.boolean(),
+  projects: z.array(z.object({
+    convexProjectId: z.string(), name: z.string(), previews: z.number(), kept: z.number(),
+    delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    setExpiry: z.array(z.object({ name: z.string(), from: z.number().nullable(), to: z.number() })),
+    deleted: z.array(z.string()), expirySet: z.array(z.string()),
+    failed: z.array(z.object({ name: z.string(), error: z.string() })),
+    skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    error: z.string().optional(),
+  })),
+  quota: z.object({ count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional() }).nullable(),
+  errors: z.array(z.string()),
+}));
+export const CONVEX_PLUGIN_ACTIONS = [
+  "status", "connection.connect", "connection.disconnect", "deployments.list", "deployments.delete-preview", "reaper.run", "reaper.report",
+] as const;
+
 registry.registerPath({
   method: "post",
   path: "/api/plugins/{pluginId}/data/{key}",
@@ -9086,6 +9148,11 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/actions/{key}",
   tags: ["plugins"],
   summary: "Invoke a plugin action (URL-keyed bridge)",
+  description:
+    "Board-authorised actions of a plugin. The bundled Convex plugin (pluginId vllnt.paperclip-convex) serves: " +
+    `${CONVEX_PLUGIN_ACTIONS.join(", ")}. Their params and results are the ConvexStatus, ConvexDeploymentsListParams, ConvexDeploymentsList, ` +
+    "ConvexDeletePreviewParams, ConvexReaperRunParams and ConvexReaperReport components. Mutating Convex actions need an instance administrator " +
+    "and run the same server-side guards as the agent tools; no action returns a credential.",
   request: {
     params: z.object({ pluginId: z.string(), key: z.string() }),
     body: jsonBody(
