@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { activityLog, heartbeatRuns, routineRuns } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
@@ -89,12 +89,13 @@ export function resolveRoutineNoopSkip(input: {
  */
 export async function lastRunLeftNothingChanged(
   db: Db,
-  input: { companyId: string; routineId: string; dispatchFingerprint: string },
+  input: { companyId: string; routineId: string; assigneeAgentId: string; dispatchFingerprint: string },
 ): Promise<boolean> {
   const last = await db
     .select({
       status: routineRuns.status,
       fingerprint: routineRuns.dispatchFingerprint,
+      triggeredAt: routineRuns.triggeredAt,
       issueId: routineRuns.linkedIssueId,
     })
     .from(routineRuns)
@@ -110,6 +111,23 @@ export async function lastRunLeftNothingChanged(
     .then((rows) => rows[0] ?? null);
   if (!last?.issueId || last.fingerprint !== input.dispatchFingerprint) return false;
   if (last.status !== "issue_created" && last.status !== "completed") return false;
+
+  // The fingerprint does not cover the agent's prompt, config or instructions, so any
+  // change to the assignee since the last run means the same inputs may now do new work.
+  const agentChanged = await db
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, input.companyId),
+        eq(activityLog.entityType, "agent"),
+        eq(activityLog.entityId, input.assigneeAgentId),
+        gt(activityLog.createdAt, last.triggeredAt),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (agentChanged) return false;
 
   const issueId = last.issueId;
   const issue = await db.query.issues.findFirst({
@@ -149,7 +167,7 @@ export async function lastRunLeftNothingChanged(
             ),
           ),
           and(
-            sql`${activityLog.runId} is null or ${activityLog.runId} <> all(${sql`array[${sql.join(runIds.map((id) => sql`${id}::uuid`), sql`, `)}]`})`,
+            or(isNull(activityLog.runId), notInArray(activityLog.runId, runIds)),
             sql`${activityLog.action} not in (${sql.join(RUNLESS_BOOKKEEPING_ISSUE_ACTIONS.map((action) => sql`${action}`), sql`, `)})`,
           ),
         ),

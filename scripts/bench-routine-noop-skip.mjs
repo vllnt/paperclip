@@ -33,7 +33,7 @@ if (!(noopRate >= 0 && noopRate <= 1)) {
 const report = JSON.parse(readFileSync(path, "utf8"));
 const total = report.loops.TOTAL;
 const routinesOnly = Object.entries(report.loops)
-  .filter(([name]) => name.startsWith("routine") || name.startsWith("ops:"))
+  .filter(([name]) => name.startsWith("routine:"))
   .map(([, loop], index) => ({ id: `routine-${index + 1}`, runs: loop.runs, usd: loop.cost_usd }));
 
 const sum = (rows, key) => rows.reduce((acc, row) => acc + row[key], 0);

@@ -323,4 +323,56 @@ describeEmbeddedPostgres("routine run skip when unchanged", () => {
     expect(updated?.routineNoopSkipSettings).toEqual({ skipUnchanged: true });
     expect(updated?.latestRevisionNumber).toBe(routine.latestRevisionNumber);
   });
+  it("skips repeat API runs even though the API route audits each run", async () => {
+    const { companyId, agentId, routine, svc, wakeups } = await seed({ routine: { skipUnchanged: true } });
+    const first = await svc.runRoutine(routine.id, { source: "api" });
+    // The row POST /routines/:id/run writes after svc.runRoutine returns.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board",
+      action: "routine.run_triggered",
+      entityType: "routine_run",
+      entityId: first.id,
+      details: { routineId: routine.id, source: first.source, status: first.status },
+    });
+    await finishIssue({ companyId, agentId, issueId: first.linkedIssueId! });
+    expect((await svc.runRoutine(routine.id, { source: "api" })).status).toBe("skipped");
+    expect(wakeups).toHaveLength(1);
+  });
+
+  it("runs again after the assigned agent changed, even with project scope", async () => {
+    const { companyId, agentId, routine, svc } = await seed({ routine: { skipUnchanged: true } });
+    await db.update(routines).set({ activityGateScope: "project" }).where(eq(routines.id, routine.id));
+    const first = await svc.runRoutine(routine.id, { source: "api" });
+    await finishIssue({ companyId, agentId, issueId: first.linkedIssueId! });
+    expect((await svc.runRoutine(routine.id, { source: "api" })).status).toBe("skipped");
+
+    // The agent PATCH route's audit row carries no projectId.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board",
+      action: "agent.updated",
+      entityType: "agent",
+      entityId: agentId,
+      details: { changedTopLevelKeys: ["adapterConfig"] },
+    });
+    expect((await svc.runRoutine(routine.id, { source: "api" })).status).toBe("issue_created");
+  });
+
+  it("ignores runless read markers on the finished issue", async () => {
+    const { companyId, agentId, routine, svc } = await seed({ routine: { skipUnchanged: true } });
+    const first = await svc.runRoutine(routine.id, { source: "api" });
+    await finishIssue({ companyId, agentId, issueId: first.linkedIssueId! });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "someone",
+      action: "issue.read_marked",
+      entityType: "issue",
+      entityId: first.linkedIssueId!,
+    });
+    expect((await svc.runRoutine(routine.id, { source: "api" })).status).toBe("skipped");
+  });
 });

@@ -1376,6 +1376,10 @@ export function routineService(
               or (${activityLog.entityType} = 'routine' and ${activityLog.entityId} = ${routine.id})
             )
           )`,
+          sql`not (
+            ${activityLog.action} = 'routine.run_triggered'
+            and (${activityLog.details} ->> 'routineId') = ${routine.id}
+          )`,
           sql`not exists (
             select 1
             from ${heartbeatRuns} own_run
@@ -1734,6 +1738,7 @@ export function routineService(
     const unchanged = await lastRunLeftNothingChanged(db, {
       companyId: routine.companyId,
       routineId: routine.id,
+      assigneeAgentId,
       dispatchFingerprint,
     });
     if (!unchanged) return false;
