@@ -33,6 +33,7 @@ const SELECTED_COMPANY = {
   requireBoardApprovalForNewAgents: false,
   interactionResolverGovernance: {},
   automationWakeSettings: {},
+  routineNoopSkipSettings: {},
 };
 
 vi.mock("../api/companies", () => ({ companiesApi: mockCompaniesApi }));

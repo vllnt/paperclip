@@ -89,6 +89,16 @@ describeEmbeddedPostgres("companyService", () => {
     expect(updated?.automationWakeSettings).toEqual(settings);
   });
 
+  it("defaults routine no-op skip settings to empty and updates them", async () => {
+    const svc = companyService(db);
+    const created = await svc.create({ name: "Noop Skip Co" });
+    expect(created.routineNoopSkipSettings).toEqual({});
+
+    const settings = { skipUnchanged: true, bySource: { api: false } };
+    const updated = await svc.update(created.id, { routineNoopSkipSettings: settings });
+    expect(updated?.routineNoopSkipSettings).toEqual(settings);
+  });
+
   it("retries generated issue prefixes when Drizzle wraps the unique constraint error", async () => {
     await db.insert(companies).values({
       name: "Aron Existing",

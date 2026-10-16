@@ -1,4 +1,5 @@
 import { automationWakeSettingsSchema } from "../automation-wake.js";
+import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import { agentAppearanceSchema } from "../agent-appearance.js";
 import { aiConnectionBindingSchema } from "../ai-connections.js";
 import { z } from "zod";
@@ -70,7 +71,9 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
-const agentHeartbeatConfigSchema = automationWakeSettingsSchema.catchall(z.unknown());
+const agentHeartbeatConfigSchema = automationWakeSettingsSchema
+  .extend({ routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional() })
+  .catchall(z.unknown());
 
 export const agentRuntimeConfigSchema = z.object({
   aiConnection: aiConnectionBindingSchema.optional(),

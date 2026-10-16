@@ -35,6 +35,7 @@ const ARCHIVING_COMPANY = {
   requireBoardApprovalForNewAgents: false,
   interactionResolverGovernance: {},
   automationWakeSettings: {},
+  routineNoopSkipSettings: {},
 };
 
 const SIBLING_COMPANY = {
