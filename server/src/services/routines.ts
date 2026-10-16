@@ -1291,7 +1291,11 @@ export function routineService(
     return { eligible: true };
   }
 
-  async function evaluateActivityGate(routine: typeof routines.$inferSelect, now: Date) {
+  async function evaluateActivityGate(
+    routine: typeof routines.$inferSelect,
+    now: Date,
+    options: { ignoreOwnDispatchAudits?: boolean } = {},
+  ) {
     const lastDispatchedRun = await db
       .select({ triggeredAt: routineRuns.triggeredAt })
       .from(routineRuns)
@@ -1376,10 +1380,12 @@ export function routineService(
               or (${activityLog.entityType} = 'routine' and ${activityLog.entityId} = ${routine.id})
             )
           )`,
-          sql`not (
-            ${activityLog.action} = 'routine.run_triggered'
-            and (${activityLog.details} ->> 'routineId') = ${routine.id}
-          )`,
+          options.ignoreOwnDispatchAudits
+            ? sql`not (
+              ${activityLog.action} = 'routine.run_triggered'
+              and (${activityLog.details} ->> 'routineId') = ${routine.id}
+            )`
+            : undefined,
           sql`not exists (
             select 1
             from ${heartbeatRuns} own_run
@@ -1742,7 +1748,7 @@ export function routineService(
       dispatchFingerprint,
     });
     if (!unchanged) return false;
-    return !(await evaluateActivityGate(routine, new Date())).fire;
+    return !(await evaluateActivityGate(routine, new Date(), { ignoreOwnDispatchAudits: true })).fire;
   }
 
   async function dispatchRoutineRun(input: {

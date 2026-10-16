@@ -341,6 +341,43 @@ describeEmbeddedPostgres("routine run skip when unchanged", () => {
     expect(wakeups).toHaveLength(1);
   });
 
+  it.each(["manual", "api"] as const)(
+    "keeps the scheduler gate unchanged with settings unset: a failed %s dispatch is retried",
+    async (source) => {
+      const { companyId, routine, svc, wakeups } = await seed();
+      await svc.update(routine.id, { activityGatePolicy: "require_external_activity" }, {});
+      const failed = await db
+        .insert(routineRuns)
+        .values({
+          companyId,
+          routineId: routine.id,
+          source,
+          status: "failed",
+          failureReason: "wakeup rejected",
+          triggeredAt: new Date(Date.now() - 60_000),
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+      // The row the board/API route writes after a dispatch, even a failed one.
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "user",
+        actorId: "board",
+        action: "routine.run_triggered",
+        entityType: "routine_run",
+        entityId: failed.id,
+        details: { routineId: routine.id, source, status: "failed" },
+      });
+      const { trigger } = await svc.createTrigger(routine.id, { kind: "schedule", cronExpression: "0 9 * * *", timezone: "UTC" }, {});
+      const due = new Date(Date.now() + 1_000);
+      await db.update(routineTriggers).set({ nextRunAt: due }).where(eq(routineTriggers.id, trigger.id));
+
+      expect(await svc.tickScheduledTriggers(due)).toEqual({ triggered: 1 });
+      expect(wakeups).toHaveLength(1);
+      expect(await db.select().from(issues)).toHaveLength(1);
+    },
+  );
+
   it("runs again after the assigned agent changed, even with project scope", async () => {
     const { companyId, agentId, routine, svc } = await seed({ routine: { skipUnchanged: true } });
     await db.update(routines).set({ activityGateScope: "project" }).where(eq(routines.id, routine.id));
