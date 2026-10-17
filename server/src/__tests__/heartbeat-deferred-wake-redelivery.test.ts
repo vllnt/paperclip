@@ -31,6 +31,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { logger } from "../middleware/logger.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -239,6 +240,9 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       /** Comment ids a comment-driven wake carries, oldest first. */
       commentIds?: string[];
       actor?: { type: "agent" | "user" | "system"; id: string };
+      /** The recovery gate that parked the wake, as admission records it in the payload. */
+      executionWait?: { reason: string; message?: string; recoveryActionId?: string };
+      idempotencyKey?: string;
     },
   ) {
     const at = new Date(Date.now() - input.ageMs);
@@ -255,9 +259,11 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
         triggerDetail: "system",
         reason: "issue_execution_deferred",
         status: "deferred_issue_execution",
+        ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
         payload: {
           issueId,
           ...(latestCommentId ? { commentId: latestCommentId } : {}),
+          ...(input.executionWait ? { executionWait: input.executionWait } : {}),
           _paperclipWakeContext: {
             issueId,
             taskId: issueId,
@@ -491,7 +497,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     expect(fresh[0]).toMatchObject({ agentId, status: "succeeded" });
   });
 
-  it("does not wake a held issue: pause hold, execution blocker, or paused agent", async () => {
+  it("does not wake a held issue: pause hold, execution blocker, operator Stop, or paused agent", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent(companyId, { name: "HeldAgent", maxConcurrentRuns: 3 });
     const pausedAgentId = await seedAgent(companyId, { name: "PausedAgent", maxConcurrentRuns: 3, status: "paused" });
@@ -525,11 +531,19 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     const pausedIssueId = await seedIssue(companyId, { assigneeAgentId: pausedAgentId, title: "Paused assignee" });
     const pausedWakeId = await seedDeferredWake(companyId, pausedAgentId, pausedIssueId, { ageMs: 20 * MINUTE_MS });
 
+    const operatorStopIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Operator Stop" });
+    const operatorStopRunId = await seedRun(companyId, agentId, operatorStopIssueId, {
+      status: "cancelled",
+      errorCode: "cancelled",
+      resultJson: { executionCancellation: { state: "acknowledged" } },
+    });
+    const operatorStopWakeId = await seedDeferredWake(companyId, agentId, operatorStopIssueId, { ageMs: 20 * MINUTE_MS });
+
     await heartbeat.resumeQueuedRuns();
     await heartbeat.resumeQueuedRuns();
     await heartbeat.drainActiveRunExecutions();
 
-    for (const wakeId of [heldWakeId, blockedWakeId, pausedWakeId]) {
+    for (const wakeId of [heldWakeId, blockedWakeId, pausedWakeId, operatorStopWakeId]) {
       const wake = await wakeRow(wakeId);
       expect(wake.status).toBe("deferred_issue_execution");
       expect(wake.runId).toBeNull();
@@ -537,6 +551,243 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     expect(await runsForIssue(heldRootId)).toHaveLength(0);
     expect((await runsForIssue(blockedIssueId)).filter((run) => run.id !== stoppedRunId)).toHaveLength(0);
     expect(await runsForIssue(pausedIssueId)).toHaveLength(0);
+    expect((await runsForIssue(operatorStopIssueId)).filter((run) => run.id !== operatorStopRunId)).toHaveLength(0);
+
+    // The endpoint says what held each wake. The paused agent's wake is excluded
+    // by the query, so only the three issue holds are counted, once each.
+    const { sweep } = await heartbeat.getDeferredWakeStats(companyId);
+    expect(sweep).toMatchObject({
+      examined: 3,
+      promoted: 0,
+      skippedHeld: 3,
+      skippedPauseHold: 1,
+      skippedExecutionBlocker: 1,
+      skippedOperatorStop: 1,
+      skippedBudget: 0,
+      failed: 0,
+      executionBlockerCauses: { legacy_execution_requires_reconciliation: 1 },
+    });
+  });
+
+  describe("wakes parked behind an execution-recovery hold", () => {
+    /**
+     * ANT-3892 as production holds it: a todo task, its assignee with a free
+     * slot, no lock and no live run. Its latest run was cancelled before it ever
+     * started (`execution_reconciliation_required`), the run before it was
+     * orphaned, and the recovery action recorded for that run is resolved with a
+     * no-replay verdict, which still holds the task. Six user comments were
+     * saved behind the hold, each parked with a recovery wait.
+     */
+    async function seedRecoveryHeldTask(companyId: string) {
+      const agentId = await seedAgent(companyId, { name: "Anthm DX", maxConcurrentRuns: 2 });
+      const busyIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Other work" });
+      const busyRunId = await seedRun(companyId, agentId, busyIssueId, { status: "running" });
+      const issueId = await seedIssue(companyId, {
+        assigneeAgentId: agentId,
+        title: "Recovery-held task",
+        priority: "critical",
+      });
+      await seedRun(companyId, agentId, issueId, { status: "interrupted", errorCode: "orphaned_running_run" });
+      const neverStartedRunId = await seedRun(companyId, agentId, issueId, {
+        status: "cancelled",
+        errorCode: "execution_reconciliation_required",
+        resultJson: {
+          stopReason: "execution_reconciliation_required",
+          timeoutSource: "stale_queued_run_gate",
+          executionWait: { issueId, recoveryActionId: null },
+        },
+      });
+      const [action] = await db
+        .insert(issueRecoveryActions)
+        .values({
+          companyId,
+          sourceIssueId: issueId,
+          kind: "active_run_watchdog",
+          status: "resolved",
+          outcome: "blocked",
+          resolvedAt: new Date(),
+          ownerType: "board",
+          cause: "legacy_execution_requires_reconciliation",
+          fingerprint: neverStartedRunId,
+          evidence: {
+            runId: neverStartedRunId,
+            attempt: 1,
+            automaticRecovery: {
+              runId: neverStartedRunId,
+              policy: "preserve_without_replay_v1",
+              replay: "blocked",
+              actionOutcome: "unknown",
+            },
+          },
+          nextAction:
+            "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+        })
+        .returning();
+      const wakeIds: string[] = [];
+      for (let index = 0; index < 6; index += 1) {
+        const [comment] = await db
+          .insert(issueComments)
+          .values({ companyId, issueId, authorUserId: "board-user", body: `Please continue (${index + 1}).` })
+          .returning();
+        wakeIds.push(
+          await seedDeferredWake(companyId, agentId, issueId, {
+            ageMs: (7 - index) * 30 * MINUTE_MS,
+            reason: "issue_commented",
+            commentIds: [comment!.id],
+            actor: { type: "user", id: "board-user" },
+            executionWait: {
+              reason: "execution_recovery",
+              message: "Waiting for execution recovery. Your message is saved.",
+              recoveryActionId: action!.id,
+            },
+          }),
+        );
+      }
+      return { agentId, issueId, actionId: action!.id, wakeIds, busyRunId, neverStartedRunId };
+    }
+
+    const finishBusyRun = (runId: string) =>
+      db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+
+    it("holds a task whose no-replay recovery action awaits an operator, examines only its oldest wake, and says why", async () => {
+      const info = vi.spyOn(logger, "info");
+      const companyId = await seedCompany();
+      const { issueId, actionId, wakeIds, busyRunId, neverStartedRunId } = await seedRecoveryHeldTask(companyId);
+      const before = await Promise.all(wakeIds.map((wakeId) => wakeRow(wakeId)));
+
+      // The periodic pass, with the default recheck window.
+      const first = await heartbeat.sweepDeferredWakes();
+      expect(first).toMatchObject({
+        scanned: 1,
+        promoted: 0,
+        skippedHeld: 1,
+        skippedExecutionBlocker: 1,
+        skippedPauseHold: 0,
+        skippedOperatorStop: 0,
+        skippedBudget: 0,
+        failed: 0,
+        executionBlockerCauses: { legacy_execution_requires_reconciliation: 1 },
+      });
+      // The next tick finds the head waiting out its window. A younger comment
+      // must not step forward in its place and be examined out of order.
+      const second = await heartbeat.sweepDeferredWakes();
+      expect(second.scanned).toBe(0);
+
+      const after = await Promise.all(wakeIds.map((wakeId) => wakeRow(wakeId)));
+      expect(after.every((wake) => wake.status === "deferred_issue_execution" && wake.runId === null)).toBe(true);
+      expect(after[0]!.updatedAt.getTime()).toBeGreaterThan(before[0]!.updatedAt.getTime());
+      for (const index of [1, 2, 3, 4, 5]) {
+        expect(after[index]!.updatedAt.getTime()).toBe(before[index]!.updatedAt.getTime());
+      }
+      // Nothing started, and the hold itself is untouched.
+      expect((await runsForIssue(issueId)).map((run) => run.id)).toContain(neverStartedRunId);
+      expect(await runsForSeededWake(issueId, "issue_commented")).toHaveLength(0);
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(action).toMatchObject({ status: "resolved", outcome: "blocked" });
+
+      // A reader sees why, from a different service instance than the scheduler's,
+      // as a route builds its own.
+      const stats = await heartbeatService(db).getDeferredWakeStats(companyId);
+      expect(stats.parked).toEqual({
+        closedIssue: 0,
+        awaitingRecovery: { execution_recovery: 6 },
+        behindIssueLock: 0,
+        otherRecovery: 0,
+        heldAgent: 0,
+        orphaned: 0,
+      });
+      expect(stats.sweep).toMatchObject({
+        examined: 1,
+        promoted: 0,
+        skippedHeld: 1,
+        skippedExecutionBlocker: 1,
+        executionBlockerCauses: { legacy_execution_requires_reconciliation: 1 },
+      });
+      expect(stats.sweep.lastExaminedAt).toBeInstanceOf(Date);
+      expect(stats.deferredTotal).toBe(6);
+
+      // One line for the pass that read a wake, none for the pass that read none.
+      const passLines = info.mock.calls.filter(
+        ([fields, message]) =>
+          message === "deferred wake sweep pass" && (fields as { trigger?: string } | undefined)?.trigger === "periodic",
+      );
+      expect(passLines).toHaveLength(1);
+      expect(passLines[0]![0]).toMatchObject({ trigger: "periodic", scanned: 1, skippedExecutionBlocker: 1 });
+      info.mockRestore();
+      await finishBusyRun(busyRunId);
+    });
+
+    it("delivers the oldest saved comment once an operator has cleared the hold", async () => {
+      const companyId = await seedCompany();
+      const { issueId, actionId, wakeIds, busyRunId, neverStartedRunId } = await seedRecoveryHeldTask(companyId);
+
+      const held = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      expect(held).toMatchObject({ promoted: 0, skippedExecutionBlocker: 1 });
+      expect(await runsForSeededWake(issueId, "issue_commented")).toHaveLength(0);
+
+      // The board verifies the unverified outcome and restores the task.
+      await db
+        .update(issueRecoveryActions)
+        .set({
+          outcome: "restored",
+          evidence: { runId: neverStartedRunId, automaticRecovery: { replay: "allowed" } },
+        })
+        .where(eq(issueRecoveryActions.id, actionId));
+
+      const released = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.drainActiveRunExecutions();
+      expect(released).toMatchObject({ promoted: 1, skippedHeld: 0, failed: 0 });
+      expect((await wakeRow(wakeIds[0]!)).status).not.toBe("deferred_issue_execution");
+      const started = await runsForSeededWake(issueId, "issue_commented");
+      expect(started).toHaveLength(1);
+      expect(started[0]).toMatchObject({ agentId: expect.any(String), status: "succeeded" });
+      await finishBusyRun(busyRunId);
+    });
+  });
+
+  it("explains why each parked wake is parked, from durable state", async () => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
+    const otherAgentId = await seedAgent(otherCompanyId, { name: "Elsewhere", maxConcurrentRuns: 3 });
+
+    const closedIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, status: "done" });
+    await seedDeferredWake(companyId, agentId, closedIssueId, { ageMs: 40 * MINUTE_MS });
+
+    for (const reason of ["execution_recovery", "execution_recovery", "remote_cleanup"]) {
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+      await seedDeferredWake(companyId, agentId, issueId, { ageMs: 40 * MINUTE_MS, executionWait: { reason } });
+    }
+
+    const lockedIssueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+    const holderRunId = await seedRun(companyId, agentId, lockedIssueId, { status: "running" });
+    await db.update(issues).set({ executionRunId: holderRunId, executionLockedAt: new Date() }).where(eq(issues.id, lockedIssueId));
+    await seedDeferredWake(companyId, agentId, lockedIssueId, { ageMs: 40 * MINUTE_MS });
+
+    const chatIssueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+    await seedDeferredWake(companyId, agentId, chatIssueId, { ageMs: 40 * MINUTE_MS, idempotencyKey: `chat-inbound:${randomUUID()}` });
+
+    const pausedAgentId = await seedAgent(companyId, { name: "Paused", status: "paused" });
+    const pausedAgentIssueId = await seedIssue(companyId, { assigneeAgentId: pausedAgentId });
+    await seedDeferredWake(companyId, pausedAgentId, pausedAgentIssueId, { ageMs: 40 * MINUTE_MS });
+
+    const orphanedIssueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+    await seedDeferredWake(companyId, agentId, orphanedIssueId, { ageMs: 40 * MINUTE_MS });
+    const otherIssueId = await seedIssue(otherCompanyId, { assigneeAgentId: otherAgentId });
+    await seedDeferredWake(otherCompanyId, otherAgentId, otherIssueId, { ageMs: 40 * MINUTE_MS });
+
+    const { parked, deferredTotal } = await heartbeat.getDeferredWakeStats(companyId);
+
+    expect(parked).toEqual({
+      closedIssue: 1,
+      awaitingRecovery: { execution_recovery: 2, remote_cleanup: 1 },
+      behindIssueLock: 1,
+      otherRecovery: 1,
+      heldAgent: 1,
+      orphaned: 1,
+    });
+    expect(deferredTotal).toBe(8);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, holderRunId));
   });
 
   it("starts exactly one run per wake when recovery passes and completion triggers race", async () => {
@@ -974,6 +1225,70 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
 
       releaseRuns();
       await heartbeat.drainActiveRunExecutions();
+    });
+  });
+
+  describe("an older wake the sweep cannot deliver", () => {
+    it("does not strand the assignee's newer wake behind a paused agent's older wake", async () => {
+      const companyId = await seedCompany();
+      const pausedId = await seedAgent(companyId, { name: "FormerPaused", status: "paused" });
+      const currentId = await seedAgent(companyId, { name: "Current" });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: currentId, title: "Reassigned" });
+      await seedDeferredWake(companyId, pausedId, issueId, { ageMs: 30 * MINUTE_MS });
+      const newerWakeId = await seedDeferredWake(companyId, currentId, issueId, { ageMs: 20 * MINUTE_MS });
+
+      await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.drainActiveRunExecutions();
+
+      expect((await wakeRow(newerWakeId)).status).not.toBe("deferred_issue_execution");
+      expect((await runsForSeededWake(issueId)).filter((run) => run.agentId === currentId)).toHaveLength(1);
+    });
+
+    it("does not strand the assignee's newer wake behind an older wake whose agent cannot be invoked", async () => {
+      const companyId = await seedCompany();
+      const managerId = await seedAgent(companyId, { name: "TerminatedManager", status: "terminated" });
+      const reportId = await seedAgent(companyId, { name: "ReportOfTerminated" });
+      await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, reportId));
+      const currentId = await seedAgent(companyId, { name: "Current" });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: currentId, title: "Chain-blocked older wake" });
+      await seedDeferredWake(companyId, reportId, issueId, { ageMs: 30 * MINUTE_MS });
+      const newerWakeId = await seedDeferredWake(companyId, currentId, issueId, { ageMs: 20 * MINUTE_MS });
+
+      // One pass: the older wake is skipped as not invokable and the issue is
+      // served through the newer wake in the same pass.
+      const pass = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(pass).toMatchObject({ skippedNotInvokable: 1, promoted: 1, skippedCapacity: 0 });
+      expect((await wakeRow(newerWakeId)).status).not.toBe("deferred_issue_execution");
+      expect((await runsForSeededWake(issueId)).filter((run) => run.agentId === currentId)).toHaveLength(1);
+    });
+
+    it("delivers the assignee's newer wake after an active former assignee's older comment wake", async () => {
+      const companyId = await seedCompany();
+      const formerId = await seedAgent(companyId, { name: "FormerActive" });
+      const currentId = await seedAgent(companyId, { name: "Current" });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: currentId, title: "Reassigned active" });
+      const [comment] = await db
+        .insert(issueComments)
+        .values({ companyId, issueId, authorUserId: "user-1", body: "Old message for the former owner." })
+        .returning();
+      await seedDeferredWake(companyId, formerId, issueId, {
+        ageMs: 30 * MINUTE_MS,
+        reason: "issue_commented",
+        commentIds: [comment!.id],
+        actor: { type: "user", id: "user-1" },
+      });
+      const newerWakeId = await seedDeferredWake(companyId, currentId, issueId, { ageMs: 20 * MINUTE_MS });
+
+      for (let pass = 0; pass < 4; pass += 1) {
+        await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 0 });
+        await heartbeat.drainActiveRunExecutions();
+      }
+
+      expect((await wakeRow(newerWakeId)).status).not.toBe("deferred_issue_execution");
+      expect((await runsForSeededWake(issueId)).filter((run) => run.agentId === currentId)).toHaveLength(1);
     });
   });
 
