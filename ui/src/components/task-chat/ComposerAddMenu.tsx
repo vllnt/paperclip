@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { IssueWorkMode } from "@paperclipai/shared";
 import { Check, ClipboardList, MessageCircleQuestion, Paperclip, Plus, Target, X, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { workModeMetaFor } from "@/lib/work-mode-meta";
 import { Dialog, DialogClose, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import {
@@ -31,14 +32,7 @@ export function ComposerAddMenu({
 }: ComposerAddMenuProps) {
   const [open, setOpen] = useState(false);
   const goalFocusRef = useRef(false);
-  const [narrow, setNarrow] = useState(() => typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(MOBILE_SHELL_QUERY).matches);
-  useEffect(() => {
-    if (typeof window.matchMedia !== "function") return;
-    const query = window.matchMedia(MOBILE_SHELL_QUERY);
-    const update = () => setNarrow(query.matches);
-    query.addEventListener("change", update);
-    return () => query.removeEventListener("change", update);
-  }, []);
+  const narrow = useMediaQuery(MOBILE_SHELL_QUERY, false);
   const mobile = mobileProp ?? narrow;
   if (!onModeChange && !onAttachFile && !onGoal) return null;
   const actions: Array<{ id: string; label: string; detail?: string; Icon: LucideIcon; select: () => void; disabled?: boolean; selected?: boolean }> = [
