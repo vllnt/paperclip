@@ -35,9 +35,10 @@ jobs:
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Read-only: a missing login or mirror falls back to the pinned public reference.
+          # Login is optional (the mirror is public); a missing mirror fails the job.
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin || true
-          echo "image=$(scripts/ci/resolve-base-image.sh)" >> "$GITHUB_OUTPUT"
+          image=$(scripts/ci/resolve-base-image.sh)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
       - name: Build all application source without publishing
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:

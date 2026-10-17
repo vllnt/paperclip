@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Print the base image reference the production build should use.
+# Print the GHCR base image reference the production build must use.
 #
 # The Dockerfile pins its base image by digest from a public registry that
-# rate-limits anonymous pulls. This script copies that exact digest to GHCR
-# once (authenticated), then prints the GHCR reference, which carries the same
-# digest. If the copy is unavailable it prints the original pinned reference,
-# so the build still works, just through the public registry.
+# rate-limits anonymous pulls. CI never pulls that registry: it builds from a
+# GHCR copy that carries the same digest. This script verifies the copy exists
+# and prints its reference; if it is missing it fails, it never falls back to
+# the public registry and never creates the copy.
 #
-# Env: MIRROR_PUSH=true to create the GHCR copy when missing (needs a prior
-#      `docker login ghcr.io` with packages:write). Default: read-only.
-#      MIRROR_REPO overrides the destination repository.
+# The copy is a one-time maintainer step, repeated whenever the pinned digest
+# changes (see "Mirror the base image" in .github/BASE-IMAGE.md).
+#
+# Env: MIRROR_REPO overrides the destination repository.
+#      DOCKERFILE overrides the Dockerfile to read.
 set -euo pipefail
 
 dockerfile="${DOCKERFILE:-Dockerfile}"
@@ -24,28 +26,20 @@ if [[ -z "$source_ref" || "$digest" != sha256:* ]]; then
 fi
 mirror_ref="${mirror_repo}@${digest}"
 
-retry() {
-  local n=1 delay=5
-  until "$@"; do
-    if ((n >= attempts)); then return 1; fi
-    echo "resolve-base-image: attempt $n failed, retrying in ${delay}s" >&2
-    sleep "$delay"
-    n=$((n + 1))
-    delay=$((delay * 2))
-  done
-}
+for ((n = 1; n <= attempts; n++)); do
+  if docker buildx imagetools inspect "$mirror_ref" >/dev/null 2>&1; then
+    echo "$mirror_ref"
+    exit 0
+  fi
+  if ((n < attempts)); then
+    echo "resolve-base-image: attempt $n failed, retrying in $((5 * n))s" >&2
+    sleep $((5 * n))
+  fi
+done
 
-if docker buildx imagetools inspect "$mirror_ref" >/dev/null 2>&1; then
-  echo "$mirror_ref"
-  exit 0
-fi
-
-if [[ "${MIRROR_PUSH:-false}" == "true" ]] &&
-  retry docker buildx imagetools create --tag "${mirror_repo}:${digest#sha256:}" "$source_ref" >&2 &&
-  docker buildx imagetools inspect "$mirror_ref" >/dev/null 2>&1; then
-  echo "$mirror_ref"
-  exit 0
-fi
-
-echo "resolve-base-image: mirror unavailable, using pinned public reference" >&2
-echo "$source_ref"
+cat >&2 <<MSG
+resolve-base-image: ${mirror_ref} is not readable.
+CI does not fall back to the public registry. A maintainer must mirror this
+digest to GHCR and make the package public (see .github/BASE-IMAGE.md).
+MSG
+exit 1

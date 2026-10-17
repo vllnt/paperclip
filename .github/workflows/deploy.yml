@@ -37,9 +37,9 @@ jobs:
         run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Resolve authenticated base image
         id: base
-        env:
-          MIRROR_PUSH: "true"
-        run: echo "image=$(scripts/ci/resolve-base-image.sh)" >> "$GITHUB_OUTPUT"
+        run: |
+          image=$(scripts/ci/resolve-base-image.sh)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
       - name: Build all application source and publish
         id: image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
