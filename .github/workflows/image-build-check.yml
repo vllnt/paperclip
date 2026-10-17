@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 75
     permissions:
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -29,6 +30,15 @@ jobs:
         with:
           # moby/buildkit:buildx-stable-1 from a mirror, never anonymous Docker Hub (see Dockerfile header).
           driver-opts: image=mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - name: Resolve authenticated base image
+        id: base
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Login is optional (the mirror is public); a missing mirror fails the job.
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin || true
+          image=$(scripts/ci/resolve-base-image.sh)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
       - name: Build all application source without publishing
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
@@ -40,5 +50,6 @@ jobs:
             PAPERCLIP_BUILD_COMMIT=${{ github.event.pull_request.head.sha }}
             PAPERCLIP_BUILD_VERSION=2026.1001.0-vllnt
             INSTALL_LOCAL_CLIS=false
+            BASE_IMAGE=${{ steps.base.outputs.image }}
           # Read the production cache only; pull requests never write to it.
           cache-from: type=gha,scope=paperclip-production,timeout=1m
