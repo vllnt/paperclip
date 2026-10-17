@@ -1,4 +1,5 @@
 import type { AutomationWakeSettings } from "../automation-wake.js";
+import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
 import type { DuplicateDetectionMode } from "../duplicate-detection.js";
 import type {
   CompanyStatus,
@@ -32,6 +33,7 @@ export interface Company {
   interactionResolverGovernance: InteractionResolverGovernance;
   duplicateDetectionMode: DuplicateDetectionMode;
   automationWakeSettings: AutomationWakeSettings;
+  routineNoopSkipSettings: RoutineNoopSkipSettings;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

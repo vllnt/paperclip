@@ -4,6 +4,7 @@ import {
   ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES,
 } from "../constants.js";
 import { automationWakeSettingsSchema } from "../automation-wake.js";
+import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import { DUPLICATE_DETECTION_MODES } from "../duplicate-detection.js";
 import { objectWithoutDefaults } from "./partial.js";
 
@@ -42,6 +43,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       interactionResolverGovernance: interactionResolverGovernanceSchema.optional(),
       duplicateDetectionMode: z.enum(DUPLICATE_DETECTION_MODES).optional(),
       automationWakeSettings: automationWakeSettingsSchema.optional(),
+      routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
       feedbackDataSharingEnabled: z.boolean().optional(),
       feedbackDataSharingConsentAt: z.coerce.date().nullable().optional(),
       feedbackDataSharingConsentByUserId: z.string().min(1).nullable().optional(),
