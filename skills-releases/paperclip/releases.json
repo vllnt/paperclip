@@ -12,5 +12,12 @@
     "releasedAt": "2026-07-21",
     "notes": "Adopted by PAP-14624 G3 confirmation card 9c304fc2. This frozen historical release predates three later master edits to SKILL.md, references/api-reference.md, and references/company-skills.md; the live default keeps the newer guidance.",
     "dir": "v7-roster"
+  },
+  {
+    "id": "v8-lean",
+    "releaseName": "V8 — Lean",
+    "releasedAt": "2026-10-09",
+    "notes": "Opt-in lean rewrite of the live default (2026-10-09). SKILL.md keeps the heartbeat checklist, dispositions, comment style and gotchas; interactions, approvals, monitors, delegation, chat turns, secrets and inbox moved to one-level references. Adds a done-when per step, PASS/FAIL/UNVERIFIED verdicts and a reply contract; drops emphasis words; fixes the missing issue-update helper, repo-rooted reference paths, the supersedeOnUserComment default and the scoped-wake checkout. See doc/plans/2026-10-09-lean-default-skills.md.",
+    "dir": "v8-lean"
   }
 ]

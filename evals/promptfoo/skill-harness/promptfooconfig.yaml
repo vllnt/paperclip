@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+# Paperclip skill evals: the same tests as ../promptfooconfig.yaml, but the model gets the real
+# skill (SKILL.md in the system message, references readable through read_file) instead of the
+# stand-in prompt, and never sees expectedBehavior.
+#
+# Run from the repository root:
+#   AI_GATEWAY_API_KEY=... PAPERCLIP_EVAL_SKILL_DIR=skills/paperclip \
+#     npx promptfoo@0.123.1 eval -c evals/promptfoo/skill-harness/promptfooconfig.yaml --repeat 3
+# Point PAPERCLIP_EVAL_SKILL_DIR at skills-releases/paperclip/<release> to evaluate a release.
+
+description: "Paperclip skill evals (skill injected, references readable)"
+
+prompts:
+  - file://skill-prompt.cjs
+
+providers:
+  - id: file://skill-agent-provider.cjs
+    label: sonnet-5
+    config:
+      model: anthropic/claude-sonnet-5
+  - id: file://skill-agent-provider.cjs
+    label: haiku-4.5
+    config:
+      model: anthropic/claude-haiku-4.5
+
+defaultTest:
+  options:
+    transformVars: "{ ...vars, apiUrl: 'http://localhost:18080', runId: 'run-eval-001' }"
+  assert:
+    - type: javascript
+      value: "!context.vars.mustRead || (context.providerResponse?.metadata?.filesRead ?? []).includes(context.vars.mustRead)"
+      metric: opened_required_reference
+
+tests: file://load-tests.cjs

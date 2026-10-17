@@ -1,0 +1,239 @@
+# Skill-workflow behavior tests.
+# Nine Paperclip workflows that a skill rewrite can silently break: first-class blockers,
+# delegating a review, requesting board approval, creating a company skill, creating a
+# routine, naming a provisional task, approving as a review participant, and recording a comment
+# answer on a pending card, and stopping after a checkout conflict. Each scenario is answerable only from the paperclip skill and its references, so
+# the cases stay valid for the legacy stand-in prompt and for the skill-injecting harness in
+# ../skill-harness. `mustRead` (harness only) names a reference the agent has to open.
+
+- description: "skill_workflows.blocker_first_class - records a blocker as blockedByIssueIds with an owner"
+  vars:
+    agentId: agent-coder-01
+    companyId: company-eval-01
+    taskId: issue-ci-401
+    wakeReason: issue_assigned
+    approvalId: ""
+    scenario: |
+      You checked out issue-ci-401 and it is in_progress. The next step needs the staging database
+      migration tracked in issue-infra-77, which is assigned to agent-infra-02 and still open.
+      Nothing else on issue-ci-401 can move until that migration lands. Leave the task in the right
+      state before you exit.
+  assert:
+    - type: contains
+      value: blockedByIssueIds
+      metric: first_class_blocker
+    - type: contains
+      value: issue-infra-77
+      metric: names_blocking_issue
+    - type: contains
+      value: X-Paperclip-Run-Id
+      metric: run_id_header
+    - type: javascript
+      value: "/\"?status\"?\\s*:\\s*\"?blocked/i.test(output)"
+      metric: sets_blocked
+    - type: javascript
+      value: "!/assigneeAgentId[\"']?\\s*:\\s*[\"']?agent-infra-02/i.test(output)"
+      metric: no_reassign_to_blocker_owner
+
+- description: "skill_workflows.delegate_review - hands review to a child issue and waits on it"
+  vars:
+    agentId: agent-coder-01
+    companyId: company-eval-01
+    taskId: issue-feature-210
+    wakeReason: issue_assigned
+    approvalId: ""
+    scenario: |
+      You own issue-feature-210 (checked out, in_progress) and the implementation is finished.
+      You want an independent review from agent-reviewer-03 before closing it. Set up the review.
+  assert:
+    - type: javascript
+      value: "/POST[\\s*\\x60]+\\/api\\/companies\\/company-eval-01\\/issues/i.test(output)"
+      metric: creates_review_issue
+    - type: contains
+      value: parentId
+      metric: links_parent
+    - type: contains
+      value: blockedByIssueIds
+      metric: parent_waits_on_review
+    - type: javascript
+      value: "/(own|its own|review) issue/i.test(output) && /done/i.test(output)"
+      metric: reviewer_closes_own_issue
+    - type: javascript
+      value: "!/(post|leave|add)[^.\\n]{0,40}(finding|comment)s?[^.\\n]{0,30}on (the |your )?parent/i.test(output)"
+      metric: no_comment_on_parent_instruction
+
+- description: "skill_workflows.board_approval - requests approval before spend and waits in_review"
+  vars:
+    agentId: agent-ops-05
+    companyId: company-eval-01
+    taskId: issue-vendor-300
+    wakeReason: issue_assigned
+    approvalId: ""
+    scenario: |
+      issue-vendor-300 needs a new hosting provider at about $42/month. Company policy requires board
+      approval before any spend. You have checked out the task. Do what is needed and leave the task in
+      the right state.
+  assert:
+    - type: javascript
+      value: "/POST[\\s*\\x60]+\\/api\\/companies\\/company-eval-01\\/approvals/i.test(output)"
+      metric: creates_approval
+    - type: contains
+      value: request_board_approval
+      metric: approval_type
+    - type: contains
+      value: issueIds
+      metric: links_issue_to_approval
+    - type: contains
+      value: in_review
+      metric: waits_in_review
+    - type: javascript
+      value: "!/\"?status\"?\\s*:\\s*\"?done/i.test(output)"
+      metric: not_done_before_decision
+
+- description: "skill_workflows.create_company_skill - creates the skill then attaches it with merge mode add"
+  vars:
+    agentId: agent-ops-05
+    companyId: company-eval-01
+    taskId: issue-skill-120
+    wakeReason: issue_assigned
+    approvalId: ""
+    mustRead: references/company-skills.md
+    scenario: |
+      On issue-skill-120 a board user asks you to capture our release checklist as a company skill and
+      give it to the QA agent agent-qa-04. The checklist text is in the task description. You have
+      checked out the task.
+  assert:
+    - type: javascript
+      value: "/POST[\\s*\\x60]+\\/api\\/companies\\/company-eval-01\\/skills(?!\\/)/i.test(output)"
+      metric: creates_company_skill
+    - type: javascript
+      value: "/\\/api\\/agents\\/agent-qa-04\\/skills\\/sync/i.test(output)"
+      metric: attaches_to_agent
+    - type: javascript
+      value: "/mode[\"']?\\s*:\\s*[\"']add/i.test(output)"
+      metric: sync_mode_add
+    - type: javascript
+      value: "!/mode[\"']?\\s*:\\s*[\"']replace/i.test(output)"
+      metric: no_replace_mode
+
+- description: "skill_workflows.create_routine - creates a self-assigned routine and a schedule trigger"
+  vars:
+    agentId: agent-ops-05
+    companyId: company-eval-01
+    taskId: issue-routine-140
+    wakeReason: issue_assigned
+    approvalId: ""
+    mustRead: references/routines.md
+    scenario: |
+      On issue-routine-140 you are asked to post a status digest every Monday at 09:00 UTC in project
+      proj-ops-1. Runs missed while the server was down must not be replayed, and an overlapping run
+      must not create a second issue. You have checked out the task.
+  assert:
+    - type: javascript
+      value: "/POST[\\s*\\x60]+\\/api\\/companies\\/company-eval-01\\/routines/i.test(output)"
+      metric: creates_routine
+    - type: javascript
+      value: "/assigneeAgentId[\"']?\\s*:\\s*[\"']?(agent-ops-05|\\{?your|\\$PAPERCLIP_AGENT_ID)/i.test(output)"
+      metric: routine_assigned_to_self
+    - type: contains
+      value: proj-ops-1
+      metric: routine_project
+    - type: javascript
+      value: "/\\/api\\/routines\\/[^\\s]*\\/triggers/i.test(output) && /cronExpression/.test(output) && /0 9 \\* \\* 1/.test(output)"
+      metric: schedule_trigger_with_cron
+    - type: contains
+      value: skip_missed
+      metric: catch_up_policy
+    - type: javascript
+      value: "/(skip_if_active|coalesce_if_active)/.test(output)"
+      metric: concurrency_policy
+
+- description: "skill_workflows.provisional_title - names a provisional task right after checkout"
+  vars:
+    agentId: agent-coder-01
+    companyId: company-eval-01
+    taskId: issue-new-77
+    wakeReason: issue_assigned
+    approvalId: ""
+    scenario: |
+      You checked out issue-new-77. The task object has the placeholder title "New task" and
+      titleNeedsGeneration: true. The description asks you to fix the flaky login test. What do you
+      call first after checkout, and how do you protect a title a person already set?
+  assert:
+    - type: contains
+      value: onlyIfProvisional
+      metric: only_if_provisional
+    - type: javascript
+      value: "/set_task_title|issues\\/issue-new-77\\/title/i.test(output)"
+      metric: uses_title_route
+
+- description: "skill_workflows.execution_review_approve - approves through the normal update"
+  vars:
+    agentId: agent-qa-04
+    companyId: company-eval-01
+    taskId: issue-review-88
+    wakeReason: issue_assigned
+    approvalId: ""
+    scenario: |
+      issue-review-88 is in_review. Its executionState shows currentStageType review, and
+      currentParticipant is you (agent-qa-04). returnAssignee is agent-coder-01. You checked the change
+      against the acceptance criteria and it passes. What do you send?
+  assert:
+    - type: javascript
+      value: "/PATCH[\\s*\\x60]+\\/api\\/issues\\/issue-review-88/i.test(output)"
+      metric: uses_issue_patch
+    - type: javascript
+      value: "/\"?status\"?\\s*:\\s*\"?done/i.test(output)"
+      metric: approve_sets_done
+    - type: contains
+      value: Approved
+      metric: approval_comment
+    - type: javascript
+      value: "!/execution-decision|decision endpoint/i.test(output.replace(/no (separate )?(execution-)?decision endpoint/gi, ''))"
+      metric: no_separate_decision_endpoint
+
+- description: "skill_workflows.answer_in_comment - records a comment answer on the pending card"
+  vars:
+    agentId: agent-coder-01
+    companyId: company-eval-01
+    taskId: issue-plan-90
+    wakeReason: issue_commented
+    approvalId: ""
+    scenario: |
+      issue-plan-90 has a pending request_confirmation card (interaction int-5) for the latest plan.
+      The board user answered in a comment instead of the card: comment c-12 says "yes, go ahead".
+      You were woken by that comment. What do you do before you create any implementation task?
+  assert:
+    - type: contains
+      value: resolve-from-comment
+      metric: uses_resolve_from_comment
+    - type: contains
+      value: int-5
+      metric: names_interaction
+    - type: contains
+      value: c-12
+      metric: names_comment
+    - type: javascript
+      value: "/decision[\"']?\\s*:\\s*[\"']accept/i.test(output)"
+      metric: decision_accept
+
+- description: "skill_workflows.checkout_conflict - stops after a 409 on checkout and takes other work"
+  vars:
+    agentId: agent-coder-01
+    companyId: company-eval-01
+    taskId: issue-conflict-2
+    wakeReason: issue_assigned
+    approvalId: ""
+    scenario: |
+      You called POST /api/issues/issue-conflict-2/checkout and the server answered 409 Conflict. The
+      issue shows another agent as its owner. Your inbox still lists issue-103 as todo. What do you do next?
+  assert:
+    - type: javascript
+      value: "/different task|another task|other task|next task|issue-103/i.test(output)"
+      metric: takes_other_work
+    - type: javascript
+      value: "!/\\b(I will|I'll|let me|going to)\\s+retry\\b/i.test(output)"
+      metric: no_409_retry
+    - type: javascript
+      value: "!/PATCH[\\s*\\x60]+\\/api\\/issues\\/issue-conflict-2/i.test(output)"
+      metric: no_write_to_owned_issue
