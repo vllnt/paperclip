@@ -1,6 +1,6 @@
 services:
   paperclip:
-    image: ghcr.io/vllnt/paperclip@sha256:3bbea84e26e2133bc07e15037f96e43ea9d6d1e1037d31f6b792edde602e3103
+    image: ghcr.io/vllnt/paperclip@sha256:8e4c3cb9fc2f3235f1ff712267468d9172c70cf2762a859be9217b5933bb1d48
     restart: unless-stopped
     user: "1000:1000"
     read_only: true
