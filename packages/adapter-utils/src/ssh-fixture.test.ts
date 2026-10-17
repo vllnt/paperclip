@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1711,7 +1711,10 @@ describe("SSH run directory reaper", () => {
     const config = await buildSshEnvLabFixtureConfig(started);
     const spec = { ...config, remoteCwd: started.workspaceDir } as const;
     const root = started.workspaceDir;
-    const reap = (runId: string) => reapSshRunDirectory({ spec, remoteRoot: root, runId });
+    // What the server records before an upload: the commit the workspace starts from.
+    const seeds = new Map<string, string>();
+    const reap = (runId: string, seed: string | null | undefined = seeds.get(runId)) =>
+      reapSshRunDirectory({ spec, remoteRoot: root, runId, seed });
     const preservedBundle = (runId: string) => path.join(root, ".paperclip-runtime", "preserved", `${runId}.bundle`);
     // A run's workspace the way an SSH run leaves it: a git repository in runs/<id>/workspace.
     async function gitRun(options: { restored?: boolean } = {}) {
@@ -1727,7 +1730,9 @@ describe("SSH run directory reaper", () => {
       await git(workspace, ["commit", "-q", "-m", "base"]);
       await writeFile(path.join(runDir, "ballast.bin"), Buffer.alloc(300 * 1024, 1));
       if (options.restored) await writeFile(path.join(runDir, SSH_RUN_RESTORED_MARKER), "");
-      return { runId, runDir, workspace };
+      const seed = await git(workspace, ["rev-parse", "HEAD"]);
+      seeds.set(runId, seed);
+      return { runId, runDir, workspace, seed };
     }
     // A clone of the project as the host already has it, to prove a preserved ref is usable.
     async function hostClone(workspace: string) {
@@ -1735,7 +1740,19 @@ describe("SSH run directory reaper", () => {
       await git(rootDir, ["clone", "-q", workspace, clone]);
       return clone;
     }
-    return { rootDir, root, spec, reap, preservedBundle, gitRun, hostClone };
+    // A run whose branch is pushed: the origin is a bare repository, so refs/remotes/origin/main exists.
+    async function pushedRun() {
+      const run = await gitRun();
+      const origin = path.join(rootDir, `origin-${randomUUID()}.git`);
+      await git(rootDir, ["init", "-q", "--bare", origin]);
+      await git(run.workspace, ["remote", "add", "origin", origin]);
+      await git(run.workspace, ["push", "-q", "origin", "main"]);
+      return { ...run, origin };
+    }
+    // A run folder with no seed record, as one from before the record existed.
+    const reapLegacy = (runId: string, testHooks?: Parameters<typeof reapSshRunDirectory>[0]["testHooks"]) =>
+      reapSshRunDirectory({ spec, remoteRoot: root, runId, seed: null, legacy: true, testHooks });
+    return { rootDir, root, spec, reap, reapLegacy, preservedBundle, gitRun, pushedRun, hostClone };
   }
 
   it("removes a restored run directory and reports the bytes it freed", async () => {
@@ -1879,6 +1896,980 @@ describe("SSH run directory reaper", () => {
     await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
 
     expect(await git(run.workspace, ["rev-parse", "agent/work"])).toMatch(/^[0-9a-f]{40}$/);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  async function runWithAgentCommit(host: NonNullable<Awaited<ReturnType<typeof startHost>>>) {
+    const run = await host.gitRun();
+    await writeFile(path.join(run.workspace, "agent.txt"), "agent commit\n");
+    await git(run.workspace, ["add", "agent.txt"]);
+    await git(run.workspace, ["commit", "-q", "-m", "agent work"]);
+    const ns = `refs/paperclip/preserved/${run.runId}`;
+    return { ...run, ns, headRef: `${ns}/head`, bundlePath: host.preservedBundle(run.runId) };
+  }
+
+  it("reuses a published bundle that holds exactly the computed refs, without rewriting it", async () => {
+    const host = await startHost("SSH reaper existing bundle test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["update-ref", run.headRef, "HEAD"]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef]);
+    const published = await readFile(run.bundlePath);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
+    expect((await readFile(run.bundlePath)).equals(published)).toBe(true);
+    await expect(stat(path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("rebuilds the bundle when it holds a ref this pass did not compute, so the final bundle holds exactly the computed refs", async () => {
+    const host = await startHost("SSH reaper extra ref test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const clone = await host.hostClone(run.workspace);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["update-ref", run.headRef, "HEAD"]);
+    await git(run.workspace, ["update-ref", `${run.ns}/deleted-since`, "HEAD"]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef, `${run.ns}/deleted-since`]);
+    const earlier = await readFile(run.bundlePath);
+    await git(run.workspace, ["update-ref", "-d", `${run.ns}/deleted-since`]);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
+    const heads = (await git(clone, ["bundle", "list-heads", run.bundlePath])).split("\n").map((line) => line.split(" ")[1]);
+    expect(heads).toEqual([run.headRef]);
+    const superseded = path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`);
+    expect((await readFile(superseded)).equals(earlier)).toBe(true);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  const readFailures = [
+    { name: "git status", detail: "git status", match: '*"-C workspace status --porcelain"*' },
+    { name: "the HEAD lookup", detail: "git rev-parse HEAD", match: '*" rev-parse -q --verify HEAD"*' },
+    { name: "the preserved ref listing", detail: "git for-each-ref", match: '*" for-each-ref "*"refs/paperclip/preserved/"*' },
+    { name: "the stash listing", detail: "git stash list", match: '*" stash list "*' },
+    { name: "the worktree listing", detail: "git worktree list", match: '*" worktree list "*' },
+    { name: "the status of an extra worktree", detail: "git status (extra worktree)", match: '*"extra-tree status --porcelain"*' },
+  ];
+
+  it.each(readFailures)("keeps the directory and its only copy when $name fails", async ({ detail, match }) => {
+    const host = await startHost("SSH reaper git read failure test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    await git(run.workspace, ["worktree", "add", "-q", "-b", "side-branch", path.join(run.runDir, "extra-tree")]);
+    await writeFile(path.join(run.workspace, "only-copy"), "uncommitted work\n");
+    const failingGit = `git() { case " $* " in ${match}) return 42;; esac; command git "$@"; }`;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterConfine: failingGit },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail });
+    await expect(readFile(path.join(run.workspace, "only-copy"), "utf8")).resolves.toBe("uncommitted work\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the directory when merge-base fails for a reason other than \"not an ancestor\"", async () => {
+    const host = await startHost("SSH reaper merge-base failure test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const failing = `git() { case " $* " in *" merge-base --is-ancestor "*) return 128;; esac; command git "$@"; }`;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterConfine: failing },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail: "git merge-base" });
+    expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  const truncatedReads = [
+    { read: "status", detail: "git status truncated" },
+    { read: "head", detail: "git rev-parse HEAD truncated" },
+    { read: "stale", detail: "git for-each-ref truncated" },
+    { read: "refs", detail: "git for-each-ref truncated" },
+    { read: "stash", detail: "git stash list truncated" },
+    { read: "trees", detail: "git worktree list truncated" },
+    { read: "wtstatus", detail: "git status (extra worktree) truncated" },
+  ];
+
+  it.each(truncatedReads)("keeps the directory and its only copy when the $read read loses its end", async ({ read, detail }) => {
+    const host = await startHost("SSH reaper truncated read test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    await git(run.workspace, ["worktree", "add", "-q", "-b", "side-branch", path.join(run.runDir, "extra-tree")]);
+    await writeFile(path.join(run.workspace, "only-copy"), "uncommitted work\n");
+    const cutShort = `if [ "$rname" = ${read} ]; then sed '$d' "$rfile" > "$rfile.cut" && mv "$rfile.cut" "$rfile"; fi`;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterRead: cutShort },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail });
+    await expect(readFile(path.join(run.workspace, "only-copy"), "utf8")).resolves.toBe("uncommitted work\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the directory when a read loses a line but keeps its end", async () => {
+    const host = await startHost("SSH reaper short read test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    await writeFile(path.join(run.workspace, "only-copy"), "uncommitted work\n");
+    const lostLine = `if [ "$rname" = status ]; then sed '1d' "$rfile" > "$rfile.cut" && mv "$rfile.cut" "$rfile"; fi`;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterRead: lostLine },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail: "git status truncated" });
+    await expect(readFile(path.join(run.workspace, "only-copy"), "utf8")).resolves.toBe("uncommitted work\n");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("still bundles a local-only commit after the worker's reflog was expired, because the seed comes from the server", async () => {
+    const host = await startHost("SSH reaper expired reflog test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const clone = await host.hostClone(run.workspace);
+    const tip = await git(run.workspace, ["rev-parse", "HEAD"]);
+    await git(run.workspace, ["reflog", "expire", "--expire=now", "--all"]);
+    await git(run.workspace, ["config", "core.logAllRefUpdates", "false"]);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
+    await git(clone, ["fetch", "-q", run.bundlePath, `${run.headRef}:${run.headRef}`]);
+    expect(await git(clone, ["rev-parse", run.headRef])).toBe(tip);
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it.each([
+    { name: "no record", seed: null },
+    { name: "a record that is not an object id", seed: "main" },
+  ])("keeps an unrestored directory as seed_unknown when the server has $name", async ({ seed }) => {
+    const host = await startHost("SSH reaper unknown seed test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+
+    await expect(host.reap(run.runId, seed)).resolves.toMatchObject({ outcome: "kept", reason: "seed_unknown" });
+
+    expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  describe("a run folder with no seed record, when the caller allows the legacy rule", () => {
+    it("removes a clean folder whose work is pushed, without writing a bundle", async () => {
+      const host = await startHost("SSH reaper legacy clean test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      await git(run.workspace, ["branch", "merged-already"]);
+      await writeFile(path.join(run.workspace, ".gitignore"), "build-output/\n");
+      await git(run.workspace, ["add", ".gitignore"]);
+      await git(run.workspace, ["commit", "-q", "-m", "ignore build output"]);
+      await git(run.workspace, ["push", "-q", "origin", "main"]);
+      await mkdir(path.join(run.workspace, "build-output"));
+      await writeFile(path.join(run.workspace, "build-output", "x.bin"), "ignored files do not count\n");
+
+      const result = await host.reapLegacy(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed", preserved: [] });
+      await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(host.preservedBundle(run.runId))).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    const keepCases: Array<{ name: string; reason: string; setup: (run: { workspace: string }, host: { rootDir: string }) => Promise<void> }> = [
+      {
+        name: "an untracked file",
+        reason: "dirty",
+        setup: async (run) => { await writeFile(path.join(run.workspace, "only-copy.txt"), "work\n"); },
+      },
+      {
+        name: "an uncommitted edit",
+        reason: "dirty",
+        setup: async (run) => { await writeFile(path.join(run.workspace, "tracked.txt"), "edited\n"); },
+      },
+      {
+        name: "a HEAD that no remote ref contains",
+        reason: "unpushed",
+        setup: async (run) => {
+          await writeFile(path.join(run.workspace, "new.txt"), "new\n");
+          await git(run.workspace, ["add", "new.txt"]);
+          await git(run.workspace, ["commit", "-q", "-m", "local only"]);
+        },
+      },
+      {
+        name: "a local branch tip that neither HEAD nor a remote ref contains",
+        reason: "unpushed",
+        setup: async (run) => {
+          await git(run.workspace, ["checkout", "-q", "-b", "side"]);
+          await writeFile(path.join(run.workspace, "side.txt"), "side\n");
+          await git(run.workspace, ["add", "side.txt"]);
+          await git(run.workspace, ["commit", "-q", "-m", "side work"]);
+          await git(run.workspace, ["checkout", "-q", "main"]);
+        },
+      },
+      {
+        name: "a stash",
+        reason: "stash",
+        setup: async (run) => {
+          await writeFile(path.join(run.workspace, "tracked.txt"), "stashed\n");
+          await git(run.workspace, ["stash", "push", "-q", "-m", "parked"]);
+        },
+      },
+      {
+        name: "a worktree linked into it",
+        reason: "linked_worktree",
+        setup: async (run, host) => {
+          await git(run.workspace, ["worktree", "add", "-q", "--detach", path.join(host.rootDir, `agent-tree-${randomUUID()}`)]);
+        },
+      },
+    ];
+
+    it.each(keepCases)("keeps the folder, with its reason, when it holds $name", async ({ reason, setup }) => {
+      const host = await startHost("SSH reaper legacy keep test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      await setup(run, host);
+
+      const result = await host.reapLegacy(run.runId);
+
+      expect(result).toMatchObject({ outcome: "kept", reason });
+      expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps a folder whose repository has no remote ref at all", async () => {
+      const host = await startHost("SSH reaper legacy no remote test");
+      if (!host) return;
+      const run = await host.gitRun();
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "unpushed" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it.each([
+      { name: "a git read that fails", hook: `git() { case " $* " in *"-C workspace status --porcelain"*) return 42;; esac; command git "$@"; }`, detail: "git status" },
+      { name: "a read that loses its end", hook: `if [ "$rname" = stash ]; then sed '$d' "$rfile" > "$rfile.cut" && mv "$rfile.cut" "$rfile"; fi`, detail: "git stash list truncated", seam: "afterRead" },
+      { name: "a count of unpushed commits that fails", hook: `git() { case " $* " in *" rev-list --count "*) return 128;; esac; command git "$@"; }`, detail: "git rev-list", extra: true },
+    ] as Array<{ name: string; hook: string; detail: string; seam?: "afterRead"; extra?: boolean }>)("keeps the folder as git_unreadable when it hits $name", async ({ hook, detail, seam, extra }) => {
+      const host = await startHost("SSH reaper legacy unreadable test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      if (extra) {
+        await git(run.workspace, ["checkout", "-q", "-b", "side"]);
+        await writeFile(path.join(run.workspace, "side.txt"), "side\n");
+        await git(run.workspace, ["add", "side.txt"]);
+        await git(run.workspace, ["commit", "-q", "-m", "side"]);
+        await git(run.workspace, ["checkout", "-q", "main"]);
+        await git(run.workspace, ["push", "-q", "origin", "side"]);
+      }
+
+      const result = await host.reapLegacy(run.runId, seam === "afterRead" ? { afterRead: hook } : { afterConfine: hook });
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "git_unreadable", detail });
+      expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps seed_unknown when the caller does not allow the rule", async () => {
+      const host = await startHost("SSH reaper legacy not allowed test");
+      if (!host) return;
+      const run = await host.pushedRun();
+
+      await expect(host.reap(run.runId, null)).resolves.toMatchObject({ outcome: "kept", reason: "seed_unknown" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("a link planted at a name the script writes", () => {
+    const CANARY = "outside file that must not change\n";
+    // A file and a directory outside the run directory, and one path that does not exist, each the target of a planted link.
+    async function outside(host: { rootDir: string }) {
+      const file = path.join(host.rootDir, `canary-${randomUUID()}.txt`);
+      await writeFile(file, CANARY);
+      const dir = path.join(host.rootDir, `canary-dir-${randomUUID()}`);
+      await mkdir(dir);
+      await writeFile(path.join(dir, "keep.txt"), CANARY);
+      const dangling = path.join(host.rootDir, `never-created-${randomUUID()}`);
+      return { file, dir, dangling };
+    }
+    // Every name the script has used for scratch files in the run directory, before this change.
+    const OLD_SCRATCH_NAMES = [
+      ".paperclip-reap-refs", ".paperclip-reap-refs.head", ".paperclip-reap-refs.head.body", ".paperclip-reap-refs.stale",
+      ".paperclip-reap-refs.refs", ".paperclip-reap-refs.stash", ".paperclip-reap-refs.trees", ".paperclip-reap-refs.status",
+      ".paperclip-reap-refs.status.body", ".paperclip-reap-refs.gitlinks", ".paperclip-reap-refs.published",
+      ".paperclip-reap-index", ".paperclip-reap.bundle",
+    ];
+
+    it("does not write through a link planted at any old scratch name, and still saves the work", async () => {
+      const host = await startHost("SSH reaper scratch link test");
+      if (!host) return;
+      const run = await host.gitRun();
+      const clone = await host.hostClone(run.workspace);
+      await writeFile(path.join(run.workspace, "agent.txt"), "agent commit\n");
+      await git(run.workspace, ["add", "agent.txt"]);
+      await git(run.workspace, ["commit", "-q", "-m", "agent work"]);
+      const tip = await git(run.workspace, ["rev-parse", "HEAD"]);
+      await writeFile(path.join(run.workspace, "uncommitted.txt"), "work in progress\n");
+      const targets = await outside(host);
+      const planted: string[] = [];
+      for (const [i, name] of OLD_SCRATCH_NAMES.entries()) {
+        const kind = i % 3 === 0 ? targets.file : i % 3 === 1 ? targets.dangling : targets.dir;
+        await symlink(kind, path.join(run.runDir, name));
+        planted.push(name);
+      }
+
+      const result = await host.reap(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+      await expect(readFile(path.join(targets.dir, "keep.txt"), "utf8")).resolves.toBe(CANARY);
+      expect(await readdir(targets.dir)).toEqual(["keep.txt"]);
+      await expect(stat(targets.dangling)).rejects.toMatchObject({ code: "ENOENT" });
+      const saved = `refs/paperclip/preserved/${run.runId}/head`;
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${saved}:${saved}`]);
+      expect(await git(clone, ["rev-parse", saved])).toBe(tip);
+      expect(planted.length).toBe(OLD_SCRATCH_NAMES.length);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("does not write through a link planted at an old scratch name on the legacy path either", async () => {
+      const host = await startHost("SSH reaper scratch link legacy test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const targets = await outside(host);
+      await symlink(targets.file, path.join(run.runDir, ".paperclip-reap-refs.head"));
+      await symlink(targets.file, path.join(run.runDir, ".paperclip-reap-refs.status"));
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "removed" });
+
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it.each([
+      { kind: "a file", pick: (t: Awaited<ReturnType<typeof outside>>) => t.file },
+      { kind: "a path that does not exist", pick: (t: Awaited<ReturnType<typeof outside>>) => t.dangling },
+      { kind: "a directory", pick: (t: Awaited<ReturnType<typeof outside>>) => t.dir },
+    ])("does not follow a marker that is a link to $kind, and removes the clean legacy folder", async ({ pick }) => {
+      const host = await startHost("SSH reaper marker link test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const targets = await outside(host);
+      await symlink(pick(targets), path.join(run.runDir, SSH_RUN_RESTORED_MARKER));
+
+      const result = await host.reapLegacy(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+      expect(await readdir(targets.dir)).toEqual(["keep.txt"]);
+      await expect(readFile(path.join(targets.dir, "keep.txt"), "utf8")).resolves.toBe(CANARY);
+      await expect(stat(targets.dangling)).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps the folder, and writes nothing outside it, when the marker cannot be created", async () => {
+      const host = await startHost("SSH reaper marker fail closed test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const targets = await outside(host);
+      // A directory at the marker name: it cannot be unlinked with rm -f and cannot be created as a file.
+      const blocker = `mkdir -p '${SSH_RUN_RESTORED_MARKER}' && : > '${SSH_RUN_RESTORED_MARKER}/inner'`;
+      await symlink(targets.file, path.join(run.runDir, ".paperclip-reap-refs.head"));
+
+      const result = await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true,
+        testHooks: { afterRead: `if [ "$rname" = unpushed ]; then ${blocker}; fi` },
+      });
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "rm_failed", detail: "marker" });
+      await expect(stat(path.join(run.workspace, "tracked.txt"))).resolves.toBeTruthy();
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("does not follow a link planted at the marker name when it puts the marker back after a failed removal", async () => {
+      const host = await startHost("SSH reaper marker restore link test");
+      if (!host) return;
+      const run = await host.gitRun({ restored: true });
+      const targets = await outside(host);
+      const swap = `mv '${run.runDir}' '${run.runDir}.moved' && mkdir '${run.runDir}'`;
+      const witness = path.join(host.rootDir, `planted-${randomUUID()}`);
+      const plant = `ln -s '${targets.file}' '${SSH_RUN_RESTORED_MARKER}' && : > '${witness}'`;
+
+      const result = await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed,
+        testHooks: { beforeRemove: swap, beforeMarkerRestore: plant },
+      });
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "rm_failed" });
+      // The link really was planted, at the moment the marker is put back.
+      await expect(stat(witness)).resolves.toBeTruthy();
+      await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+      const restored = path.join(`${run.runDir}.moved`, SSH_RUN_RESTORED_MARKER);
+      expect((await stat(restored)).isFile()).toBe(true);
+      await expect(readlink(restored)).rejects.toMatchObject({ code: "EINVAL" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("leaves no scratch directory behind, whether the folder is removed or kept", async () => {
+      const host = await startHost("SSH reaper scratch cleanup test");
+      if (!host) return;
+      const removed = await host.pushedRun();
+      const kept = await host.pushedRun();
+      await writeFile(path.join(kept.workspace, "only-copy.txt"), "work\n");
+
+      await expect(host.reapLegacy(removed.runId)).resolves.toMatchObject({ outcome: "removed" });
+      await expect(host.reapLegacy(kept.runId)).resolves.toMatchObject({ outcome: "kept", reason: "dirty" });
+
+      expect((await readdir(kept.runDir)).filter((name) => name.startsWith(".paperclip-reap"))).toEqual([]);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("creates its scratch directory with owner-only access", async () => {
+      const host = await startHost("SSH reaper scratch mode test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const modeFile = path.join(host.rootDir, `mode-${randomUUID()}.txt`);
+      // Choose the stat flavour first: with noclobber on, a failed `stat -c ... > f` has already created f, and the fallback write to f would be refused.
+      const record = `if [ "$rname" = status ]; then if stat -c %a / >/dev/null 2>&1; then stat -c %a "$scratch" > '${modeFile}'; else stat -f %Lp "$scratch" > '${modeFile}'; fi; fi`;
+
+      await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true, testHooks: { afterRead: record },
+      });
+
+      expect((await readFile(modeFile, "utf8")).trim()).toBe("700");
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("a name planted in the scratch directory while the script runs", () => {
+    const CANARY = "outside file that must not change\n";
+    async function outsideFile(host: { rootDir: string }) {
+      const file = path.join(host.rootDir, `canary-${randomUUID()}.txt`);
+      await writeFile(file, CANARY);
+      return { file, dangling: path.join(host.rootDir, `never-created-${randomUUID()}`) };
+    }
+    // What a process of the worker user could do to a name the script is about to write.
+    const kinds: Array<{ kind: string; plant: (t: { file: string; dangling: string }, name: string) => string }> = [
+      { kind: "a symlink to a file", plant: (t, name) => `ln -s '${t.file}' "$scratch/${name}"` },
+      { kind: "a hard link to a file", plant: (t, name) => `ln '${t.file}' "$scratch/${name}"` },
+      { kind: "a symlink to a path that does not exist", plant: (t, name) => `ln -s '${t.dangling}' "$scratch/${name}"` },
+    ];
+    // The file a read writes last, the file it writes first, and the list of refs to save.
+    const spots = [
+      { name: "refs.stale", after: "gitlinks", detail: "git for-each-ref" },
+      { name: "refs.stale.out", after: "gitlinks", detail: "git for-each-ref" },
+      { name: "refs", after: "status", detail: "ref list" },
+    ];
+
+    for (const spot of spots) {
+      it.each(kinds)(`keeps the folder and writes nothing outside it when $kind is planted at ${spot.name}`, async ({ plant }) => {
+        const host = await startHost("SSH reaper planted scratch name test");
+        if (!host) return;
+        const run = await runWithAgentCommit(host);
+        const targets = await outsideFile(host);
+        const hook = `if [ "$rname" = ${spot.after} ]; then ${plant(targets, spot.name)}; fi`;
+
+        const result = await reapSshRunDirectory({
+          spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterRead: hook },
+        });
+
+        await expect(readFile(targets.file, "utf8")).resolves.toBe(CANARY);
+        await expect(stat(targets.dangling)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail: spot.detail });
+        expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+        expect((await readdir(run.runDir)).filter((name) => name.startsWith(".paperclip-reap"))).toEqual([]);
+      }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+    }
+
+    it("keeps the scratch directory directly under the run directory, never in the workspace or in TMPDIR", async () => {
+      const host = await startHost("SSH reaper scratch location test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const otherTmp = path.join(host.rootDir, `tmpdir-${randomUUID()}`);
+      await mkdir(otherTmp);
+      const recorded = path.join(host.rootDir, `scratch-path-${randomUUID()}.txt`);
+      const record = `if [ "$rname" = status ]; then ( cd "$scratch" && pwd -P ) > '${recorded}'; fi`;
+      const physicalRunDir = await realpath(run.runDir);
+      const physicalWorkspace = await realpath(run.workspace);
+
+      await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true,
+        testHooks: { afterRead: record, beforeBound: `export TMPDIR='${otherTmp}'` },
+      });
+
+      const scratch = (await readFile(recorded, "utf8")).trim();
+      expect(path.dirname(scratch)).toBe(physicalRunDir);
+      expect(path.basename(scratch)).toMatch(/^\.paperclip-reap\.[A-Za-z0-9]{6}$/);
+      expect(scratch.startsWith(`${physicalWorkspace}${path.sep}`)).toBe(false);
+      expect(await readdir(otherTmp)).toEqual([]);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("a filter defined in the repository's config", () => {
+    // A clean filter that creates a file outside the folder when git runs it, on every file.
+    async function plantFilter(host: { rootDir: string }, workspace: string) {
+      const canary = path.join(host.rootDir, `filter-canary-${randomUUID()}`);
+      await git(workspace, ["config", "filter.evil.clean", `touch '${canary}'; cat`]);
+      await git(workspace, ["config", "filter.evil.smudge", `touch '${canary}'; cat`]);
+      await git(workspace, ["config", "filter.evil.required", "true"]);
+      await writeFile(path.join(workspace, ".git", "info", "attributes"), "* filter=evil\n");
+      return canary;
+    }
+    // Every git call that the test makes must come before plantFilter, because git would run the filter.
+
+    it("is not run when the work is captured, and the work is still saved", async () => {
+      const host = await startHost("SSH reaper filter seeded test");
+      if (!host) return;
+      const run = await runWithAgentCommit(host);
+      const clone = await host.hostClone(run.workspace);
+      const canary = await plantFilter(host, run.workspace);
+      await writeFile(path.join(run.workspace, "tracked.txt"), "BASE\n");
+      await writeFile(path.join(run.workspace, "only-copy.txt"), "work in progress\n");
+
+      const result = await host.reap(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      await expect(stat(canary)).rejects.toMatchObject({ code: "ENOENT" });
+      const saved = `refs/paperclip/preserved/${run.runId}/worktree`;
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${saved}:${saved}`]);
+      expect(await git(clone, ["show", `${saved}:only-copy.txt`])).toBe("work in progress");
+      expect(await git(clone, ["show", `${saved}:tracked.txt`])).toBe("BASE");
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("is not run by the status check of a folder with no seed record", async () => {
+      const host = await startHost("SSH reaper filter legacy test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const canary = await plantFilter(host, run.workspace);
+      await writeFile(path.join(run.workspace, "tracked.txt"), "BASE\n");
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "dirty" });
+
+      await expect(stat(canary)).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("is not run by the status check of an extra worktree", async () => {
+      const host = await startHost("SSH reaper filter worktree test");
+      if (!host) return;
+      const run = await host.gitRun();
+      const extra = path.join(run.runDir, "extra-tree");
+      await git(run.workspace, ["worktree", "add", "-q", "--detach", extra]);
+      const canary = await plantFilter(host, run.workspace);
+      await writeFile(path.join(extra, "tracked.txt"), "BASE\n");
+
+      const result = await host.reap(run.runId);
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "worktree_dirty" });
+      await expect(stat(canary)).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("is not run when its name has dots in it", async () => {
+      const host = await startHost("SSH reaper filter odd name test");
+      if (!host) return;
+      const run = await runWithAgentCommit(host);
+      const canary = path.join(host.rootDir, `filter-canary-${randomUUID()}`);
+      await git(run.workspace, ["config", "filter.my.evil.driver.clean", `touch '${canary}'; cat`]);
+      await writeFile(path.join(run.workspace, ".git", "info", "attributes"), "* filter=my.evil.driver\n");
+      await writeFile(path.join(run.workspace, "only-copy.txt"), "work in progress\n");
+
+      await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "removed" });
+
+      await expect(stat(canary)).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps the folder when the config cannot be read", async () => {
+      const host = await startHost("SSH reaper filter config failure test");
+      if (!host) return;
+      const run = await runWithAgentCommit(host);
+      await writeFile(path.join(run.workspace, "only-copy.txt"), "work in progress\n");
+      const failing = `git() { case " $* " in *" config --name-only --get-regexp "*) return 128;; esac; command git "$@"; }`;
+
+      const result = await reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterConfine: failing },
+      });
+
+      expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail: "git config" });
+      await expect(readFile(path.join(run.workspace, "only-copy.txt"), "utf8")).resolves.toBe("work in progress\n");
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("other config keys that start a program", () => {
+    // Each key is set to a command that creates its own file outside the folder. Setting them last keeps the test's own git calls from running them.
+    const KEYS = [
+      "diff.external", "diff.evil.textconv", "diff.evil.command", "diff.tool", "core.sshCommand", "core.pager", "pager.status",
+      "core.editor", "sequence.editor", "core.askPass", "credential.helper", "gpg.program", "gpg.ssh.program",
+      "core.alternateRefsCommand", "merge.evil.driver", "uploadpack.packObjectsHook", "trailer.x.command", "core.gitProxy",
+      "interactive.diffFilter", "remote.origin.vcs",
+    ];
+
+    it("starts none of them while the work is captured and saved", async () => {
+      const host = await startHost("SSH reaper config keys test");
+      if (!host) return;
+      const run = await runWithAgentCommit(host);
+      await git(run.workspace, ["remote", "add", "origin", path.join(host.rootDir, "nowhere.git")]);
+      await git(run.workspace, ["tag", "-a", "-m", "release", "v1"]);
+      await git(run.workspace, ["stash", "list"]);
+      const clone = await host.hostClone(run.workspace);
+      const canaries = path.join(host.rootDir, `canaries-${randomUUID()}`);
+      await mkdir(canaries);
+      const hooks = path.join(host.rootDir, `hooks-${randomUUID()}`);
+      await mkdir(hooks);
+      for (const hook of ["pre-commit", "post-index-change", "reference-transaction", "pre-auto-gc", "post-commit", "post-checkout"]) {
+        await writeFile(path.join(hooks, hook), `#!/bin/sh\ntouch '${canaries}/hook-${hook}'\n`, { mode: 0o755 });
+      }
+      for (const key of KEYS) await git(run.workspace, ["config", key, `touch '${canaries}/${key}'`]);
+      await git(run.workspace, ["config", "core.fsmonitor", `touch '${canaries}/fsmonitor'`]);
+      await git(run.workspace, ["config", "core.hooksPath", hooks]);
+      await git(run.workspace, ["config", "commit.gpgsign", "true"]);
+      await git(run.workspace, ["config", "tag.gpgsign", "true"]);
+      await git(run.workspace, ["config", "gc.auto", "1"]);
+      await writeFile(path.join(run.workspace, ".git", "info", "attributes"), "* diff=evil\n");
+      await writeFile(path.join(run.workspace, "tracked.txt"), "BASE\n");
+      await writeFile(path.join(run.workspace, "only-copy.txt"), "work in progress\n");
+
+      const result = await host.reap(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      expect(await readdir(canaries)).toEqual([]);
+      const saved = `refs/paperclip/preserved/${run.runId}/worktree`;
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${saved}:${saved}`]);
+      expect(await git(clone, ["show", `${saved}:only-copy.txt`])).toBe("work in progress");
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("refs beyond branches, and submodules", () => {
+    // A commit that only a ref outside refs/heads holds: made on a scratch branch, then the branch is deleted.
+    async function holdOnlyByRef(workspace: string, make: (workspace: string) => Promise<void>) {
+      await git(workspace, ["checkout", "-q", "-b", "scratch"]);
+      await writeFile(path.join(workspace, "only-here.txt"), "work that only a ref holds\n");
+      await git(workspace, ["add", "only-here.txt"]);
+      await git(workspace, ["commit", "-q", "-m", "local only"]);
+      const tip = await git(workspace, ["rev-parse", "HEAD"]);
+      await make(workspace);
+      await git(workspace, ["checkout", "-q", "main"]);
+      await git(workspace, ["branch", "-D", "scratch"]);
+      return tip;
+    }
+    const refKinds: Array<{ name: string; ref: string; make: (workspace: string) => Promise<void> }> = [
+      { name: "an annotated tag", ref: "ref/tags/precious", make: async (ws) => { await git(ws, ["tag", "-a", "-m", "keep this", "precious"]); } },
+      { name: "a lightweight tag", ref: "ref/tags/precious", make: async (ws) => { await git(ws, ["tag", "precious"]); } },
+      { name: "a notes ref", ref: "ref/notes/commits", make: async (ws) => { await git(ws, ["notes", "add", "-m", "a note"]); } },
+    ];
+
+    it.each(refKinds)("saves in the bundle a commit only $name holds, when the start commit is known", async ({ ref, make }) => {
+      const host = await startHost("SSH reaper tag bundle test");
+      if (!host) return;
+      const run = await host.gitRun();
+      const clone = await host.hostClone(run.workspace);
+      const tip = await holdOnlyByRef(run.workspace, make);
+      const saved = `refs/paperclip/preserved/${run.runId}/${ref}`;
+
+      const result = await host.reap(run.runId);
+
+      expect(result).toMatchObject({ outcome: "removed" });
+      expect(result.outcome === "removed" && result.preserved).toContain(saved);
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${saved}:${saved}`]);
+      const savedCommit = await git(clone, ["rev-parse", saved]);
+      if (ref.startsWith("ref/notes")) {
+        expect(savedCommit).toMatch(/^[0-9a-f]{40}$/);
+      } else {
+        expect(savedCommit).toBe(tip);
+      }
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it.each(refKinds)("keeps the folder as unpushed when only $name holds a local commit and there is no seed record", async ({ make }) => {
+      const host = await startHost("SSH reaper tag legacy test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      await holdOnlyByRef(run.workspace, make);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "unpushed" });
+
+      expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("removes a folder whose tag is contained in a remote ref", async () => {
+      const host = await startHost("SSH reaper pushed tag test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      await git(run.workspace, ["tag", "-a", "-m", "release", "v1"]);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "removed" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps a folder that has a ref to something other than a commit", async () => {
+      const host = await startHost("SSH reaper blob ref test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const blob = await git(run.workspace, ["hash-object", "-w", "tracked.txt"]);
+      await git(run.workspace, ["update-ref", "refs/misc/blob", blob]);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "unpushed" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    // A repository nested as a submodule, with a commit that exists nowhere else, while the superproject stays clean and pushed.
+    async function pushedRunWithLocalSubmoduleCommit(host: NonNullable<Awaited<ReturnType<typeof startHost>>>) {
+      const sub = path.join(host.rootDir, `sub-${randomUUID()}`);
+      await mkdir(sub, { recursive: true });
+      await git(sub, ["init", "-q", "-b", "main"]);
+      await writeFile(path.join(sub, "lib.txt"), "library\n");
+      await git(sub, ["add", "lib.txt"]);
+      await git(sub, ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "library"]);
+      const run = await host.pushedRun();
+      await git(run.workspace, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "libs/sub"]);
+      await git(run.workspace, ["commit", "-q", "-m", "add submodule"]);
+      await git(run.workspace, ["push", "-q", "origin", "main"]);
+      const nested = path.join(run.workspace, "libs", "sub");
+      await writeFile(path.join(nested, "local.txt"), "only in the submodule\n");
+      await git(nested, ["add", "local.txt"]);
+      await git(nested, ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "submodule local only"]);
+      await git(nested, ["tag", "-a", "-m", "local", "local-only"]);
+      return run;
+    }
+
+    it("keeps a folder with a submodule as submodule, with a seed record", async () => {
+      const host = await startHost("SSH reaper submodule seeded test");
+      if (!host) return;
+      const run = await pushedRunWithLocalSubmoduleCommit(host);
+
+      await expect(host.reap(run.runId, run.seed)).resolves.toMatchObject({ outcome: "kept", reason: "submodule" });
+
+      await expect(stat(path.join(run.workspace, "libs", "sub", "local.txt"))).resolves.toBeTruthy();
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+    it("keeps a folder with a submodule as submodule, with no seed record", async () => {
+      const host = await startHost("SSH reaper submodule legacy test");
+      if (!host) return;
+      const run = await pushedRunWithLocalSubmoduleCommit(host);
+
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "submodule" });
+
+      await expect(stat(path.join(run.workspace, "libs", "sub", "local.txt"))).resolves.toBeTruthy();
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+  });
+
+  describe("a reap that is cut at its time limit", () => {
+    it("leaves a folder untouched when it is cut during the checks, and removes it on the next pass", async () => {
+      const host = await startHost("SSH reaper cut during checks test");
+      if (!host) return;
+      const run = await host.pushedRun();
+      const startedAt = Date.now();
+
+      await expect(reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true, timeoutMs: 3000,
+        testHooks: { afterConfine: "sleep 30" },
+      })).rejects.toThrow();
+
+      expect(Date.now() - startedAt).toBeLessThan(15_000);
+      await expect(stat(path.join(run.workspace, "tracked.txt"))).resolves.toBeTruthy();
+      await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(host.reapLegacy(run.runId)).resolves.toMatchObject({ outcome: "removed" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
+    it("leaves a folder the next pass removes without the rule when it is cut during the removal", async () => {
+      const host = await startHost("SSH reaper cut during removal test");
+      if (!host) return;
+      const run = await host.pushedRun();
+
+      await expect(reapSshRunDirectory({
+        spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: null, legacy: true, timeoutMs: 3000,
+        testHooks: { beforeRemove: "sleep 30" },
+      })).rejects.toThrow();
+
+      await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+      await expect(host.reap(run.runId, null)).resolves.toMatchObject({ outcome: "removed" });
+      await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+  });
+
+  it("refuses the final rmdir when the name no longer leads to the directory it emptied", async () => {
+    const host = await startHost("SSH reaper inode recheck test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+    const runsDir = path.dirname(run.runDir);
+    const swap = `mv '${run.runDir}' '${run.runDir}.moved' && mkdir '${run.runDir}'`;
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { beforeRemove: swap },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "rm_failed" });
+    await expect(stat(run.runDir)).resolves.toBeTruthy();
+    expect((await readdir(runsDir)).sort()).toEqual([path.basename(run.runDir), `${path.basename(run.runDir)}.moved`].sort());
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("does not need a seed for a directory the restore already marked", async () => {
+    const host = await startHost("SSH reaper restored without seed test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+
+    await expect(host.reap(run.runId, null)).resolves.toMatchObject({ outcome: "removed" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("saves uncommitted work when the worker's HEAD has no commit, for a seed the server knows", async () => {
+    const host = await startHost("SSH reaper unborn HEAD test");
+    if (!host) return;
+    const run = await host.gitRun();
+    await git(run.workspace, ["checkout", "-q", "--orphan", "fresh"]);
+    await writeFile(path.join(run.workspace, "first.txt"), "first file on a new branch\n");
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [`refs/paperclip/preserved/${run.runId}/worktree`] });
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(host.preservedBundle(run.runId))).resolves.toBeTruthy();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("flushes the staged bundle before the rename and the preserved directory after it", async () => {
+    const host = await startHost("SSH reaper fsync order test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const log = path.join(host.rootDir, "sync.log");
+    const logging = `sync() { printf '%s\\n' "$*" >> '${log}'; command sync "$@"; }`;
+
+    await expect(reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed, testHooks: { afterConfine: logging },
+    })).resolves.toMatchObject({ outcome: "removed" });
+
+    const calls = (await readFile(log, "utf8")).trim().split("\n");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatch(new RegExp(`^-- \\./\\.${run.runId}\\.bundle\\.[A-Za-z0-9]+$`));
+    expect(calls[1]).toBe("-- .");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("removes old bundles, superseded bundles and leftover temporary bundles after the retention period", async () => {
+    const host = await startHost("SSH reaper retention test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+    const preservedDir = path.dirname(host.preservedBundle(run.runId));
+    await mkdir(preservedDir, { recursive: true });
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    const names = [`${randomUUID()}.bundle`, `${randomUUID()}.superseded.bundle`, `.${randomUUID()}.bundle.aB3dE9`];
+    for (const name of names) {
+      await writeFile(path.join(preservedDir, name), "old");
+      await utimes(path.join(preservedDir, name), old, old);
+    }
+    const recent = `${randomUUID()}.bundle`;
+    await writeFile(path.join(preservedDir, recent), "recent");
+
+    await host.reap(run.runId);
+
+    expect(await readdir(preservedDir)).toEqual([recent]);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("rebuilds the bundle when a computed ref moved on since an earlier pass, and keeps the superseded one", async () => {
+    const host = await startHost("SSH reaper stale tip test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const clone = await host.hostClone(run.workspace);
+    const tipA = await git(run.workspace, ["rev-parse", "HEAD"]);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["update-ref", run.headRef, tipA]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef]);
+    const earlier = await readFile(run.bundlePath);
+    await writeFile(path.join(run.workspace, "later.txt"), "later work\n");
+    await git(run.workspace, ["add", "later.txt"]);
+    await git(run.workspace, ["commit", "-q", "-m", "later work"]);
+    const tipB = await git(run.workspace, ["rev-parse", "HEAD"]);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
+    await git(clone, ["fetch", "-q", run.bundlePath, `${run.headRef}:${run.headRef}`]);
+    expect(await git(clone, ["rev-parse", run.headRef])).toBe(tipB);
+    const superseded = path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`);
+    expect((await readFile(superseded)).equals(earlier)).toBe(true);
+    await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the directory when the published bundle is a symlink, and does not trust what it points to", async () => {
+    const host = await startHost("SSH reaper symlinked bundle test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const elsewhere = path.join(host.rootDir, "unrelated.bundle");
+    await git(run.workspace, ["bundle", "create", elsewhere, "main"]);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await symlink(elsewhere, run.bundlePath);
+
+    const result = await host.reap(run.runId);
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+    expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+    await expect(readlink(run.bundlePath)).resolves.toBe(elsewhere);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("replaces a published bundle that does not hold the refs this pass computed, and keeps the old one", async () => {
+    const host = await startHost("SSH reaper unrelated bundle test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const clone = await host.hostClone(run.workspace);
+    const tip = await git(run.workspace, ["rev-parse", "HEAD"]);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["bundle", "create", run.bundlePath, "main"]);
+    const unrelated = await readFile(run.bundlePath);
+
+    await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "removed", preserved: [run.headRef] });
+
+    await git(clone, ["fetch", "-q", run.bundlePath, `${run.headRef}:${run.headRef}`]);
+    expect(await git(clone, ["rev-parse", run.headRef])).toBe(tip);
+    const superseded = path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`);
+    expect((await readFile(superseded)).equals(unrelated)).toBe(true);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the directory and the old bundle when the rebuilt bundle cannot be published", async () => {
+    const host = await startHost("SSH reaper unpublishable bundle test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    const preservedDir = path.dirname(run.bundlePath);
+    await mkdir(preservedDir, { recursive: true });
+    await git(run.workspace, ["bundle", "create", run.bundlePath, "main"]);
+    const old = await readFile(run.bundlePath);
+    await chmod(preservedDir, 0o555);
+
+    try {
+      await expect(host.reap(run.runId)).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+    } finally {
+      await chmod(preservedDir, 0o755);
+    }
+
+    expect((await readFile(run.bundlePath)).equals(old)).toBe(true);
+    expect(await git(run.workspace, ["rev-parse", "HEAD"])).toMatch(/^[0-9a-f]{40}$/);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("does not reap on a worker without timeout, because the script would be unbounded", async () => {
+    const host = await startHost("SSH reaper no timeout test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, testHooks: { beforeBound: "PATH=/nonexistent" },
+    });
+
+    expect(result).toEqual({ outcome: "unbounded" });
+    await expect(stat(path.join(run.runDir, "ballast.bin"))).resolves.toBeTruthy();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps a run directory that is on another device than runs, and deletes nothing in it", async () => {
+    const host = await startHost("SSH reaper mount point test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+    const otherDevice = "stat() { for a; do last=$a; done; if [ \"$last\" = . ]; then echo 11; else echo 22; fi; }";
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, testHooks: { afterConfine: otherDevice },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "mount_point" });
+    await expect(stat(path.join(run.runDir, "ballast.bin"))).resolves.toBeTruthy();
+    await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).resolves.toBeTruthy();
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("stops the worker script at its time limit, so it cannot outlive the claim that started it", async () => {
+    const host = await startHost("SSH reaper time limit test");
+    if (!host) return;
+    const run = await host.gitRun({ restored: true });
+    const lateWrite = path.join(host.rootDir, "late-write");
+
+    await expect(reapSshRunDirectory({
+      spec: host.spec,
+      remoteRoot: host.root,
+      runId: run.runId,
+      timeoutMs: 2000,
+      testHooks: { afterConfine: `sleep 5 && : > '${lateWrite}'` },
+    })).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+
+    await expect(stat(lateWrite)).rejects.toMatchObject({ code: "ENOENT" });
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("does not run commands from a repository config the agent planted", async () => {
