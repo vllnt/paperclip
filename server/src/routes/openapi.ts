@@ -10244,11 +10244,45 @@ registerCurrentRoute({
   summary: "Get wake diagnostics for an issue",
 });
 
+const issueSubtreeDiagnosticLastRunSchema = z
+  .object({
+    id: z.string().nullable().describe("Null for actors without company-scope read"),
+    status: z.string(),
+    agentId: z.string().nullable().describe("Null for actors without company-scope read"),
+    startedAt: z.string().nullable(),
+    finishedAt: z.string().nullable(),
+    createdAt: z.string(),
+    errorCode: z.string().nullable(),
+  })
+  .describe("Latest heartbeat run whose context issue is this node");
+
 registerCurrentRoute({
   method: "get",
   path: "/api/issues/{id}/diagnostics/subtree",
   tags: ["issues"],
   summary: "Get bounded subtree wake and blocker diagnostics for an issue",
+  responses: {
+    200: r.ok(
+      z
+        .object({
+          nodes: z.array(
+            z
+              .object({
+                issue: z.object({ id: z.string(), identifier: z.string().nullable(), title: z.string() }).passthrough(),
+                parentId: z.string().nullable(),
+                depth: z.number().int(),
+                lastRun: issueSubtreeDiagnosticLastRunSchema.nullable(),
+              })
+              .passthrough(),
+          ),
+        })
+        .passthrough(),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registerCurrentRoute({

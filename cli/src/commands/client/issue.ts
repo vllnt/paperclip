@@ -47,6 +47,7 @@ import {
   normalizeFeedbackTraceExportFormat,
   serializeFeedbackTraces,
 } from "./feedback.js";
+import { formatIssueTree, type IssueTreeResponse } from "./issue-tree.js";
 
 interface IssueBaseOptions extends BaseClientOptions {
   status?: string;
@@ -157,6 +158,10 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+}
+
+interface IssueTreeOptions extends BaseClientOptions {
+  companyId?: string;
 }
 
 interface InteractionAcceptOptions extends BaseClientOptions {
@@ -621,6 +626,39 @@ export function registerIssueCommands(program: Command): void {
           handleCommandError(err);
         }
       }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("tree")
+      .description("Show an issue and its sub-issues as a tree with status, assignee, and last run")
+      .argument("<issueId>", "Root issue ID")
+      .option("-C, --company-id <id>", "Company ID (only used to show agent names)")
+      .action(async (issueId: string, opts: IssueTreeOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const tree = await ctx.api.get<IssueTreeResponse>(apiPath`/api/issues/${issueId}/diagnostics/subtree`);
+          if (ctx.json) {
+            printOutput(tree, { json: true });
+            return;
+          }
+          const agentNames = new Map<string, string>();
+          if (ctx.companyId) {
+            try {
+              const agentRows = (await ctx.api.get<Array<{ id: string; name: string }>>(
+                apiPath`/api/companies/${ctx.companyId}/agents`,
+              )) ?? [];
+              for (const row of agentRows) agentNames.set(row.id, row.name);
+            } catch {
+              // Names are a convenience; fall back to agent ids when the list is not readable.
+            }
+          }
+          for (const line of formatIssueTree(tree ?? { nodes: [] }, agentNames)) console.log(line);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
   );
 
   addCommonClientOptions(
