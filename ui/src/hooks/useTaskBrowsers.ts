@@ -2,12 +2,22 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TaskBrowser } from "@paperclipai/shared";
 import { browserUseApi } from "@/api/browser-use";
-export function useTaskBrowsers(issueId?: string) {
+import { taskBrowsersRefetchInterval } from "@/lib/live-run-polling";
+
+/**
+ * Lists the browser sessions of an issue.
+ *
+ * @param issueId - The issue whose sessions to list.
+ * @param runExpected - True while a run is live or expected. Defaults to true,
+ * which keeps the fast cadence for callers that cannot tell. Callers that share
+ * this query must pass the same value, because the shortest interval wins.
+ */
+export function useTaskBrowsers(issueId?: string, runExpected = true) {
   return useQuery({
     queryKey: ["task-browsers", issueId],
     queryFn: () => browserUseApi.list(issueId!),
     enabled: Boolean(issueId),
-    refetchInterval: 3000,
+    refetchInterval: taskBrowsersRefetchInterval(runExpected),
     retry: false,
   });
 }
