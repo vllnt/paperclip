@@ -92,6 +92,16 @@ The vite dev server serves an unbundled module graph. This is fast to reload on 
 
 The preview server binds `0.0.0.0` and accepts any Host, so a tailnet or LAN address (e.g. `http://<host>.ts.net:3101/`) works out of the box. The `/api` proxy sets `x-forwarded-host` and `x-forwarded-proto`, which the server's board mutation guard uses to trust the browser's Origin — mutations from `:3101` succeed against the API on `:3100` without further configuration. An HTTPS tunnel in front of the preview server (ngrok, tailscale funnel) is also supported: the tunnel's `x-forwarded-proto` header is preserved when set.
 
+### Lazy routes and the initial JS budget
+
+`ui/src/App.tsx` loads every page with `lazy(() => import("./pages/X").then((m) => ({ default: m.X })))`. Each page is its own chunk, fetched when its route first renders, under a `Suspense` boundary in each layout (`RouteSuspense`), so the sidebar and header stay on screen while the page loads. Add new pages the same way. Only the shell, the route gates and small redirects stay in the entry bundle.
+
+`vite build` fails when the entry chunk plus the chunks it imports statically (the JavaScript needed before the first route renders) grow past the limits in `ui/bundle-budget.json` (raw and gzip bytes). If it fails, find which new import pulled the code into the entry bundle (an eager `import` of a page or of a heavy library) and load it with `lazy()` or a dynamic `import()`. If the growth is intended, raise the limit in the same pull request and say why. `PAPERCLIP_UI_BUNDLE_BUDGET=off` skips the check while you investigate.
+
+The first visit to a lazy page in a session waits for its chunk, so the page area stays empty for about one round trip (most page chunks are 5 to 25 KB brotli; issue detail is about 90 KB). Do not hide this by importing chunks early: importing a chunk also runs its code. Measured in a real browser, starting the open page's chunk at boot made first paint about 250 ms later, and prefetching chunks while idle made TTI about 2 s worse, so both were removed.
+
+A tab left open across a deploy asks for chunk names that no longer exist. `installStaleChunkReload` (`ui/src/lib/stale-chunk-reload.ts`) reloads the page once, at most every 30 seconds, when Vite reports that a chunk failed to load. It does not reload while the browser is offline or for a failed background prefetch.
+
 ## Storybook
 
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.
