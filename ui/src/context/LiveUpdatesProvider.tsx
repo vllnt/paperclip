@@ -12,6 +12,7 @@ import {
   useQuery,
   useQueryClient,
   type InfiniteData,
+  type InvalidateQueryFilters,
   type QueryClient,
 } from "@tanstack/react-query";
 import {
@@ -63,6 +64,15 @@ const RECONNECT_SUPPRESS_MS = 2000;
 const RUN_TOAST_MAX_AGE_MS = 5 * 60_000;
 const MAX_OBSERVED_RUN_OUTCOMES = 2000;
 const DISCONNECTED_POLL_INTERVAL_MS = 15_000;
+const LIVE_EVENT_INDEPENDENT_QUERY_ROOTS: ReadonlySet<unknown> = new Set([
+  queryKeys.health[0],
+  queryKeys.auth.session[0],
+  queryKeys.instance.settings[0],
+  queryKeys.adapters.all[0],
+  queryKeys.sidebarPreferences.companyOrder("")[0],
+  queryKeys.stagingCommit[0],
+  queryKeys.cloud.stacks[0],
+]);
 const SOCKET_CONNECTING = 0;
 const SOCKET_OPEN = 1;
 const TERMINAL_RUN_STATUSES = new Set([
@@ -1895,7 +1905,33 @@ function closeSocketQuietly(
   }
 }
 
+/**
+ * Chooses which active queries the first socket connection refetches. The pass
+ * exists because live events are not replayed: data read just before the
+ * subscription can miss an event. Queries that no live event can change (the
+ * session, health, adapters, instance settings and similar) cannot miss one,
+ * so refetching them only repeats a request the page made moments earlier.
+ * Every other query is refetched, so a new query defaults to the safe side.
+ *
+ * @param query - The cached query being considered.
+ * @returns False for queries that live events never change.
+ */
+function shouldReconcileActiveQuery(query: { queryKey: readonly unknown[] }): boolean {
+  const [root, second] = query.queryKey;
+  if (root === queryKeys.access.currentBoardAccess[0]) {
+    return second !== queryKeys.access.currentBoardAccess[1];
+  }
+  return !LIVE_EVENT_INDEPENDENT_QUERY_ROOTS.has(root);
+}
+
+const RECONCILE_ACTIVE_QUERIES: InvalidateQueryFilters = {
+  type: "active",
+  predicate: shouldReconcileActiveQuery,
+};
+
 export const __liveUpdatesTestUtils = {
+  RECONCILE_ACTIVE_QUERIES,
+  shouldReconcileActiveQuery,
   applyRunLifecycleToCompanyLiveRuns,
   buildAgentStatusToast,
   buildRunStatusToast,
@@ -1995,7 +2031,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
     if (wasHidden.current) {
       wasHidden.current = false;
       // Reconcile events missed while hidden, including completed runs/issues.
-      void queryClient.invalidateQueries({ type: "active" }, { cancelRefetch: false });
+      void queryClient.invalidateQueries(RECONCILE_ACTIVE_QUERIES, { cancelRefetch: false });
     }
 
     let closed = false;
@@ -2022,7 +2058,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
       if (closed || pollTimer !== null) return;
       // Visible queries still need fresh state when realtime is unavailable.
       pollTimer = window.setInterval(() => {
-        void queryClient.invalidateQueries({ type: "active" }, { cancelRefetch: false });
+        void queryClient.invalidateQueries(RECONCILE_ACTIVE_QUERIES, { cancelRefetch: false });
       }, DISCONNECTED_POLL_INTERVAL_MS);
     };
 
@@ -2063,7 +2099,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
         }
         // The initial page queries can finish before the first subscription,
         // too. Reconcile that gap as well as reconnects: events are not replayed.
-        void queryClient.invalidateQueries({ type: "active" }, { cancelRefetch: false });
+        void queryClient.invalidateQueries(RECONCILE_ACTIVE_QUERIES, { cancelRefetch: false });
         reconnectAttempt = 0;
       };
 
