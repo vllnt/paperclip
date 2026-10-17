@@ -2,6 +2,7 @@
 
 import { act } from "react";
 import type { ReactNode } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueFiltersPopover } from "./IssueFiltersPopover";
@@ -144,6 +145,92 @@ describe("IssueFiltersPopover", () => {
     expect(container.querySelector('[data-testid="popover-content"]')?.querySelectorAll(".overflow-y-auto").length).toBe(0);
 
     act(() => root.unmount());
+  });
+
+  describe("deferred option lists", () => {
+    const projects = Array.from({ length: 40 }, (_, index) => ({ id: `project-${index + 1}`, name: `Project ${index + 1}` }));
+    const labels = Array.from({ length: 40 }, (_, index) => ({ id: `label-${index + 1}`, name: `Label ${index + 1}`, color: "#336699" }));
+    const agents = Array.from({ length: 40 }, (_, index) => ({ id: `agent-${index + 1}`, name: `Agent ${index + 1}` }));
+    const workspaces = Array.from({ length: 40 }, (_, index) => ({ id: `workspace-${index + 1}`, name: `Workspace ${index + 1}` }));
+    const renderPopover = (root: ReturnType<typeof createRoot>, presentation: "streamlined" | "legacy") =>
+      root.render(
+        <IssueFiltersPopover
+          presentation={presentation}
+          state={defaultIssueFilterState}
+          onChange={vi.fn()}
+          activeFilterCount={0}
+          agents={agents}
+          projects={projects}
+          labels={labels}
+          workspaces={workspaces}
+          enableExternalObjectFilters={false}
+        />,
+      );
+    const rows = (key: string) => container.querySelectorAll(`[data-filter-options="${key}"] label`).length;
+
+    it.each(["streamlined", "legacy"] as const)("paints the sections first and fills the long lists in a later pass (%s)", async (presentation) => {
+      const root = createRoot(container);
+      flushSync(() => renderPopover(root, presentation));
+
+      // First paint: the sections and their fixed rows are there, the long lists are empty.
+      expect(container.querySelector('[data-filter-options="projects"]')).not.toBeNull();
+      expect(container.querySelector('[data-filter-options="labels"]')).not.toBeNull();
+      expect(container.querySelector('[data-filter-options="workspaces"]')).not.toBeNull();
+      expect(rows("projects")).toBe(0);
+      expect(rows("labels")).toBe(0);
+      expect(rows("workspaces")).toBe(0);
+      expect(rows("responsible")).toBe(1);
+      expect(container.textContent).toContain("No responsible");
+      expect(container.textContent).toContain("Status");
+
+      await act(async () => {});
+
+      // Deferred pass: every option is there, with the same markup as before.
+      expect(rows("projects")).toBe(40);
+      expect(rows("labels")).toBe(40);
+      expect(rows("workspaces")).toBe(40);
+      expect(rows("responsible")).toBe(1 + 40);
+      expect(container.querySelector('[data-filter-options="projects"]')?.textContent).toContain("Project 40");
+      expect(container.querySelector('[data-filter-options="labels"] span[style]')).not.toBeNull();
+
+      act(() => root.unmount());
+    });
+
+    it("narrows and restores a long list through its search once the list has filled", async () => {
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(
+          <IssueFiltersPopover
+            presentation="streamlined"
+            state={defaultIssueFilterState}
+            onChange={vi.fn()}
+            activeFilterCount={0}
+            projects={projects}
+            enableExternalObjectFilters={false}
+          />,
+        );
+      });
+      expect(rows("projects")).toBe(40);
+
+      const input = container.querySelector<HTMLInputElement>('input[aria-label="Search projects"]');
+      expect(input).not.toBeNull();
+      await act(async () => {
+        const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        valueSetter?.call(input, "Project 40");
+        input?.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(rows("projects")).toBe(1);
+      expect(container.querySelector('[data-filter-options="projects"]')?.textContent).toContain("Project 40");
+
+      await act(async () => {
+        const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        valueSetter?.call(input, "");
+        input?.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(rows("projects")).toBe(40);
+
+      await act(async () => root.unmount());
+    });
   });
 
   it("restores per-section scrolling and hides added option searches in legacy presentation", () => {

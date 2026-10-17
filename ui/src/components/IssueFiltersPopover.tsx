@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useDeferredValue, useMemo, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -80,6 +80,26 @@ const INBOX_APPROVAL_STATUS_OPTIONS: ReadonlyArray<[InboxApprovalFilter, string]
 ];
 
 const SEARCHABLE_FILTER_THRESHOLD = 6;
+
+const NO_OPTIONS: readonly never[] = [];
+
+/**
+ * Renders a checkbox list one low-priority pass after the rest of the popover.
+ * Opening the popover mounts every row, and each row is a Radix checkbox of about
+ * a dozen components, so a long list holds up the first paint of the popover.
+ * The rows first render empty and then fill in with the same output; typing in a
+ * section search also updates the rows in the deferred pass.
+ */
+function DeferredOptions<T>({
+  options,
+  renderOption,
+}: {
+  options: readonly T[];
+  renderOption: (option: T) => ReactNode;
+}) {
+  const deferredOptions = useDeferredValue(options, NO_OPTIONS);
+  return <>{deferredOptions.map((option) => renderOption(option))}</>;
+}
 
 function FilterOptionSearch({
   value,
@@ -381,15 +401,18 @@ export function IssueFiltersPopover({
                       <span className="text-sm">Me</span>
                     </label>
                   ) : null}
-                  {(streamlined ? visibleAgents : agents ?? []).map((agent) => (
-                    <label key={agent.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
-                      <Checkbox
-                        checked={state.assignees.includes(agent.id)}
-                        onCheckedChange={() => onChange({ assignees: toggleIssueFilterValue(state.assignees, agent.id) })}
-                      />
-                      <span className="text-sm">{agent.name}</span>
-                    </label>
-                  ))}
+                  <DeferredOptions
+                    options={streamlined ? visibleAgents : agents ?? []}
+                    renderOption={(agent) => (
+                      <label key={agent.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
+                        <Checkbox
+                          checked={state.assignees.includes(agent.id)}
+                          onCheckedChange={() => onChange({ assignees: toggleIssueFilterValue(state.assignees, agent.id) })}
+                        />
+                        <span className="text-sm">{agent.name}</span>
+                      </label>
+                    )}
+                  />
                 </div>
               </div>
 
@@ -454,15 +477,18 @@ export function IssueFiltersPopover({
                     <FilterOptionSearch value={projectSearch} onChange={setProjectSearch} label="Projects" />
                   ) : null}
                   <div data-filter-options="projects" className={streamlined ? "space-y-0.5" : "max-h-32 space-y-0.5 overflow-y-auto"}>
-                    {(streamlined ? visibleProjects : projects).map((project) => (
-                      <label key={project.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
-                        <Checkbox
-                          checked={state.projects.includes(project.id)}
-                          onCheckedChange={() => onChange({ projects: toggleIssueFilterValue(state.projects, project.id) })}
-                        />
-                        <span className="text-sm">{project.name}</span>
-                      </label>
-                    ))}
+                    <DeferredOptions
+                      options={streamlined ? visibleProjects : projects}
+                      renderOption={(project) => (
+                        <label key={project.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
+                          <Checkbox
+                            checked={state.projects.includes(project.id)}
+                            onCheckedChange={() => onChange({ projects: toggleIssueFilterValue(state.projects, project.id) })}
+                          />
+                          <span className="text-sm">{project.name}</span>
+                        </label>
+                      )}
+                    />
                   </div>
                 </div>
               ) : null}
@@ -476,16 +502,19 @@ export function IssueFiltersPopover({
                     <FilterOptionSearch value={labelSearch} onChange={setLabelSearch} label="Labels" />
                   ) : null}
                   <div data-filter-options="labels" className={streamlined ? "space-y-0.5" : "max-h-32 space-y-0.5 overflow-y-auto"}>
-                    {(streamlined ? visibleLabels : labels).map((label) => (
-                      <label key={label.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
-                        <Checkbox
-                          checked={state.labels.includes(label.id)}
-                          onCheckedChange={() => onChange({ labels: toggleIssueFilterValue(state.labels, label.id) })}
-                        />
-                        <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: label.color }} />
-                        <span className="text-sm">{label.name}</span>
-                      </label>
-                    ))}
+                    <DeferredOptions
+                      options={streamlined ? visibleLabels : labels}
+                      renderOption={(label) => (
+                        <label key={label.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
+                          <Checkbox
+                            checked={state.labels.includes(label.id)}
+                            onCheckedChange={() => onChange({ labels: toggleIssueFilterValue(state.labels, label.id) })}
+                          />
+                          <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: label.color }} />
+                          <span className="text-sm">{label.name}</span>
+                        </label>
+                      )}
+                    />
                   </div>
                 </div>
               ) : null}
@@ -497,16 +526,19 @@ export function IssueFiltersPopover({
                     <FilterOptionSearch value={workspaceSearch} onChange={setWorkspaceSearch} label="Workspaces" />
                   ) : null}
                   <div data-filter-options="workspaces" className={streamlined ? "space-y-0.5" : "max-h-32 space-y-0.5 overflow-y-auto"}>
-                    {(streamlined ? visibleWorkspaces : workspaces).map((workspace) => (
-                      <label key={workspace.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
-                        <Checkbox
-                          checked={state.workspaces.includes(workspace.id)}
-                          onCheckedChange={() => onChange({ workspaces: toggleIssueFilterValue(state.workspaces, workspace.id) })}
-                        />
-                        <HardDrive className="h-3.5 w-3.5 text-muted-foreground" />
-                        <span className="text-sm">{workspace.name}</span>
-                      </label>
-                    ))}
+                    <DeferredOptions
+                      options={streamlined ? visibleWorkspaces : workspaces}
+                      renderOption={(workspace) => (
+                        <label key={workspace.id} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
+                          <Checkbox
+                            checked={state.workspaces.includes(workspace.id)}
+                            onCheckedChange={() => onChange({ workspaces: toggleIssueFilterValue(state.workspaces, workspace.id) })}
+                          />
+                          <HardDrive className="h-3.5 w-3.5 text-muted-foreground" />
+                          <span className="text-sm">{workspace.name}</span>
+                        </label>
+                      )}
+                    />
                   </div>
                 </div>
               ) : null}
