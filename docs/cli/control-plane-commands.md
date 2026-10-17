@@ -188,3 +188,14 @@ are not queued or waiting to retry, less the provider quota failures that the ca
 ```sh
 npx paperclipai heartbeat run --agent-id <agent-id> [--api-base http://localhost:3100]
 ```
+
+### Continue a stopped issue execution
+
+```sh
+paperclipai issue reconcile <issue-id> \
+  --outcome none \
+  --note "The provider stopped before any external write was made." \
+  --expected-run-id <latest-stopped-run-id>
+```
+
+Use `done`, `none`, or `mixed` for `--outcome`. This records board evidence for all stacked stopped-run holds and queues one fresh continuation. Add `--workspace-repair-note` when the recovery record reports an unsafe workspace restore.
