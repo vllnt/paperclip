@@ -29,7 +29,18 @@ npx paperclipai issue checkout <issue-id> --agent-id <agent-id>
 
 # Release task
 npx paperclipai issue release <issue-id>
+
+# Per-issue adapter overrides: run this issue's assignee with a different model or effort
+npx paperclipai issue update <issue-id> --adapter-overrides-json '{"adapterConfig":{"model":"gpt-5","effort":"high"}}'
+npx paperclipai issue update <issue-id> --adapter-overrides-file overrides.json
+npx paperclipai issue update <issue-id> --adapter-overrides-json null     # clear them
+npx paperclipai issue create -C <company-id> --title "..." --adapter-overrides-json '{"useProjectWorkspace":true}'
 ```
+
+`--adapter-overrides-json` and `--adapter-overrides-file` take the issue's `assigneeAdapterOverrides`
+object: `adapterConfig` (keys that override the agent's adapter config for runs on this issue) and
+`useProjectWorkspace` (boolean). Unknown keys are rejected before the request is sent. Use only one of the
+two options.
 
 ## Company Commands
 
