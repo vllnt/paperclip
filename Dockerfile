@@ -8,7 +8,12 @@
 # way in the workflows' setup-buildx-action steps. To bump a pin, read the new
 # digest with `docker buildx imagetools inspect docker.io/<image>:<tag>`,
 # confirm the mirror returns the same digest, and replace the @sha256 part.
-FROM public.ecr.aws/docker/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
+#
+# CI does not pull this anonymously: scripts/ci/resolve-base-image.sh copies the
+# pinned digest to ghcr.io/vllnt/paperclip-node-base (same bytes, same digest)
+# and passes that reference as BASE_IMAGE. Local builds use the default below.
+ARG BASE_IMAGE=public.ecr.aws/docker/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66
+FROM ${BASE_IMAGE} AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
