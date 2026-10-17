@@ -87,6 +87,30 @@ interface IssueUpdateOptions extends BaseClientOptions {
   billingCode?: string;
   comment?: string;
   hiddenAt?: string;
+  unblockOwner?: string;
+  unblockAction?: string;
+}
+
+type UnblockOwner = "board" | { agentId: string } | { userId: string };
+
+/**
+ * Parses `--unblock-owner`: `board`, `agent:<id>` or `user:<id>`.
+ * @returns the descriptor owner the API expects.
+ */
+export function parseUnblockOwner(value: string): UnblockOwner {
+  const trimmed = value.trim();
+  if (trimmed === "board") return "board";
+  const match = /^(agent|user):(.+)$/.exec(trimmed);
+  if (!match) throw new Error(`Invalid --unblock-owner "${value}". Use board, agent:<agent-id> or user:<user-id>.`);
+  return match[1] === "agent" ? { agentId: match[2] } : { userId: match[2] };
+}
+
+function unblockDescriptorFromOptions(opts: IssueUpdateOptions) {
+  if (opts.unblockOwner === undefined && opts.unblockAction === undefined) return undefined;
+  if (!opts.unblockOwner || !opts.unblockAction) {
+    throw new Error("--unblock-owner and --unblock-action go together.");
+  }
+  return { owner: parseUnblockOwner(opts.unblockOwner), action: opts.unblockAction };
 }
 
 interface IssueCommentOptions extends BaseClientOptions {
@@ -410,10 +434,16 @@ export function registerIssueCommands(program: Command): void {
       .option("--billing-code <code>", "Billing code")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
+      .option(
+        "--unblock-owner <owner>",
+        "Who must act on a blocked issue: board, agent:<id> or user:<id> (agents may name only board or themselves)",
+      )
+      .option("--unblock-action <text>", "The exact action that unblocks the issue (with --unblock-owner)")
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = updateIssueSchema.parse({
+            unblockDescriptor: unblockDescriptorFromOptions(opts),
             title: opts.title,
             description: opts.description,
             status: opts.status,
