@@ -1,5 +1,5 @@
 {
-  "id": "d3505f8d-4c19-4a83-9f8f-b39589d813c4",
+  "id": "33201b1d-34df-42fd-8665-b2a223027676",
   "prevId": "8df2f822-b1ee-46f9-ac00-fbc399cacc63",
   "version": "7",
   "dialect": "postgresql",
@@ -10759,13 +10759,6 @@
         },
         "automation_wake_settings": {
           "name": "automation_wake_settings",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'{}'::jsonb"
-        },
-        "routine_noop_skip_settings": {
-          "name": "routine_noop_skip_settings",
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,
@@ -25067,6 +25060,50 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_company_ctx_issue_redaction_idx": {
+          "name": "heartbeat_runs_company_ctx_issue_redaction_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "(\"context_snapshot\" ->> 'issueId')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"heartbeat_runs\".\"context_snapshot\" ? 'paperclipSecretRedactions'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_company_ctx_pcissue_redaction_idx": {
+          "name": "heartbeat_runs_company_ctx_pcissue_redaction_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "(\"context_snapshot\" -> 'paperclipIssue' ->> 'id')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"heartbeat_runs\".\"context_snapshot\" ? 'paperclipSecretRedactions'",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -40553,13 +40590,6 @@
         },
         "automation_wake_settings": {
           "name": "automation_wake_settings",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'{}'::jsonb"
-        },
-        "routine_noop_skip_settings": {
-          "name": "routine_noop_skip_settings",
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,
