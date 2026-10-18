@@ -27,6 +27,7 @@ export const ROUTINE_SECTION_KEYS = [
   "delivery",
   "runs",
   "activity",
+  "event-groups",
   "history",
 ] as const;
 

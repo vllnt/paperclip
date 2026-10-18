@@ -330,6 +330,7 @@ const SECTION_TITLES: Record<RoutineSectionKey, string> = {
   delivery: "Delivery",
   runs: "Runs",
   activity: "Activity",
+  "event-groups": "Event groups",
   history: "History",
 };
 
