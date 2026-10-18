@@ -1782,7 +1782,7 @@ describe("LiveUpdatesProvider reconcile after a gap", () => {
     ["session", queryKeys.auth.session, false],
     ["general settings", queryKeys.instance.generalSettings, false],
     ["experimental settings", queryKeys.instance.experimentalSettings, false],
-    ["adapters", queryKeys.adapters.all, false],
+    ["adapters", queryKeys.adapters.all, true],
     ["sidebar order", queryKeys.sidebarPreferences.companyOrder("user-1"), false],
     ["board access", queryKeys.access.currentBoardAccess, false],
     ["staging commit", queryKeys.stagingCommit, false],
@@ -1794,7 +1794,7 @@ describe("LiveUpdatesProvider reconcile after a gap", () => {
     ["plugin contributions", queryKeys.plugins.uiContributions, true],
     ["resource memberships", queryKeys.resourceMemberships.mine("company-1"), true],
     ["sidebar badges", queryKeys.sidebarBadges("company-1"), true],
-    ["other access data", ["access", "invite", "token"], true],
+    ["other access data", queryKeys.access.invite("token"), true],
     ["a key nobody listed", ["a-new-feature", "x"], true],
   ])("%s: reconciled = %s", (_name, queryKey, reconciled) => {
     expect(__liveUpdatesTestUtils.shouldReconcileActiveQuery({ queryKey })).toBe(reconciled);

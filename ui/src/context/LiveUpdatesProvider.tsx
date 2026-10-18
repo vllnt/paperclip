@@ -64,11 +64,16 @@ const RECONNECT_SUPPRESS_MS = 2000;
 const RUN_TOAST_MAX_AGE_MS = 5 * 60_000;
 const MAX_OBSERVED_RUN_OUTCOMES = 2000;
 const DISCONNECTED_POLL_INTERVAL_MS = 15_000;
+// Query roots that no live event changes. `shouldReconcileActiveQuery` skips
+// them when reconciling a gap in the event stream. A root is listed only when
+// nothing the socket delivers can change its data; `adapters` stays out
+// because a deploy changes the adapter list and also drops the socket. The
+// `[0]` of a sample key stands in for the whole root (the helpers need an
+// argument, which is never read).
 const LIVE_EVENT_INDEPENDENT_QUERY_ROOTS: ReadonlySet<unknown> = new Set([
   queryKeys.health[0],
   queryKeys.auth.session[0],
   queryKeys.instance.settings[0],
-  queryKeys.adapters.all[0],
   queryKeys.sidebarPreferences.companyOrder("")[0],
   queryKeys.stagingCommit[0],
   queryKeys.cloud.stacks[0],
@@ -1906,18 +1911,23 @@ function closeSocketQuietly(
 }
 
 /**
- * Chooses which active queries the first socket connection refetches. The pass
- * exists because live events are not replayed: data read just before the
- * subscription can miss an event. Queries that no live event can change (the
- * session, health, adapters, instance settings and similar) cannot miss one,
+ * Chooses which active queries a reconcile pass refetches. Three places use it:
+ * every socket open (the first connection and each reconnect), the return from
+ * a hidden tab and the 15 s poll while the socket is down. The pass exists
+ * because live events are not replayed: data read just before a subscription,
+ * or while it was down, can miss an event. Queries that no live event can
+ * change (the session, health, instance settings and similar) cannot miss one,
  * so refetching them only repeats a request the page made moments earlier.
- * Every other query is refetched, so a new query defaults to the safe side.
+ * A query under a root that is not listed is refetched, so a new root defaults
+ * to the safe side; a new key under a listed root is skipped with it.
  *
  * @param query - The cached query being considered.
  * @returns False for queries that live events never change.
  */
 function shouldReconcileActiveQuery(query: { queryKey: readonly unknown[] }): boolean {
   const [root, second] = query.queryKey;
+  // The `access` root also holds invite and member lists, which are not shown
+  // to be event-independent; only the board-access key is skipped.
   if (root === queryKeys.access.currentBoardAccess[0]) {
     return second !== queryKeys.access.currentBoardAccess[1];
   }
