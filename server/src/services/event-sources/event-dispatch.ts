@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issues, routineEventGroups, routineRuns, routines, routineTriggers } from "@paperclipai/db";
 import {
@@ -105,8 +105,6 @@ export interface EventDispatchDeps {
 /** What the gate worker hands back to commit a run it parked: the same row is finalized. */
 export interface EventGatedCommit {
   runId: string;
-  /** Whether the parked dispatch consumed a storm slot, so the commit folds into the storm group. */
-  stormFold: boolean;
   gateResult: RoutineGateResult | null;
   decision: GateDecision;
 }
@@ -119,9 +117,46 @@ export interface EventDispatchInput {
   deliveryId: string | null;
   /** Atomically takes one of the source's new-issues-per-hour slots; false means the budget is spent. */
   consumeStormSlot: () => Promise<boolean>;
+  /** Gives back the slot taken by this dispatch, when the group it was for never opened. */
+  releaseStormSlot?: () => Promise<void>;
   now?: Date;
   /** Set only when the gate worker commits a parked run. */
   gated?: EventGatedCommit;
+}
+
+/**
+ * A comment the event path already posted to an issue. It is written to the run
+ * right after the comment commits, so a sender retry after a failed wake wakes
+ * for this comment instead of posting it again.
+ */
+interface PostedComment {
+  commentId: string;
+  issueId: string;
+  kind: "comment" | "recovery" | "append";
+  wake: boolean;
+  storm: boolean;
+  fingerprint: string;
+}
+
+function readPostedComment(payload: unknown): PostedComment | null {
+  const posted = (payload as { postedComment?: Partial<PostedComment> } | null)?.postedComment;
+  if (
+    !posted ||
+    typeof posted.commentId !== "string" ||
+    typeof posted.issueId !== "string" ||
+    typeof posted.fingerprint !== "string" ||
+    (posted.kind !== "comment" && posted.kind !== "recovery" && posted.kind !== "append")
+  ) {
+    return null;
+  }
+  return {
+    commentId: posted.commentId,
+    issueId: posted.issueId,
+    kind: posted.kind,
+    wake: posted.wake !== false,
+    storm: posted.storm === true,
+    fingerprint: posted.fingerprint,
+  };
 }
 
 interface OpenGroup {
@@ -243,23 +278,45 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
   }
 
   async function dispatch(input: EventDispatchInput): Promise<EventRoutineOutcome> {
+    // Set once this dispatch holds one of the source's new-issue slots.
+    const slot = { taken: false };
+    let outcome: EventRoutineOutcome;
     try {
-      return await dispatchUnsafe(input);
+      outcome = await dispatchUnsafe(input, slot);
     } catch (err) {
       logger.warn({ err, routineId: input.routine.id, deliveryId: input.deliveryId }, "event dispatch failed");
-      return failedOutcome(err);
+      outcome = failedOutcome(err);
     }
+    // The slot pays for a new group. A dispatch that failed opened none, and its retry takes a slot of its own.
+    if (slot.taken && (outcome.status === "failed_transient" || outcome.status === "failed_permanent")) {
+      await Promise.resolve(input.releaseStormSlot?.()).catch((err) =>
+        logger.warn({ err, routineId: input.routine.id }, "failed to release event storm slot"),
+      );
+    }
+    return outcome;
+  }
+
+  async function releaseSlotFor(input: EventDispatchInput, slot: { taken: boolean }) {
+    if (!slot.taken) return;
+    await Promise.resolve(input.releaseStormSlot?.()).catch((err) =>
+      logger.warn({ err, routineId: input.routine.id }, "failed to release event storm slot"),
+    );
   }
 
   /**
    * Commits a run the gate worker parked. Unlike `dispatch`, a transient failure is thrown so the
-   * worker retries the claim; a permanent one ends the parked row as `failed` and is returned, so
-   * the caller can fire the source's fallback.
+   * worker retries the claim (the row stays `gating`); a permanent one ends the parked row as
+   * `failed` and is returned, so the caller can fire the source's fallback.
    */
   async function commitGated(input: EventDispatchInput & { gated: EventGatedCommit }): Promise<EventRoutineOutcome> {
+    const slot = { taken: false };
     try {
-      return await dispatchUnsafe(input);
+      const outcome = await dispatchUnsafe(input, slot);
+      if (outcome.status === "failed_transient" || outcome.status === "failed_permanent") await releaseSlotFor(input, slot);
+      return outcome;
     } catch (err) {
+      // The slot pays for a group that opened; this attempt opened none, and the retry takes its own.
+      await releaseSlotFor(input, slot);
       if (classifyEventDispatchError(err) !== "permanent") throw err;
       const outcome = failedOutcome(err, { runId: input.gated.runId });
       await db.transaction(async (tx) => {
@@ -291,26 +348,36 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
     }
   }
 
-  async function dispatchUnsafe(input: EventDispatchInput): Promise<EventRoutineOutcome> {
+  /** The latest failed attempt of this delivery on this routine that had already posted its comment. */
+  async function findPostedComment(executor: Db, deliveryId: string, routineId: string): Promise<PostedComment | null> {
+    const rows = await executor
+      .select({ triggerPayload: routineRuns.triggerPayload })
+      .from(routineRuns)
+      .where(
+        and(
+          eq(routineRuns.eventDeliveryId, deliveryId),
+          eq(routineRuns.routineId, routineId),
+          eq(routineRuns.status, "failed"),
+          sql`${routineRuns.triggerPayload} -> 'postedComment' is not null`,
+        ),
+      )
+      .orderBy(desc(routineRuns.createdAt))
+      .limit(1);
+    return readPostedComment(rows[0]?.triggerPayload);
+  }
+
+  async function dispatchUnsafe(input: EventDispatchInput, slot: { taken: boolean }): Promise<EventRoutineOutcome> {
     const { routine, trigger, event } = input;
     const gated = input.gated ?? null;
     const gateApplies = !gated && deps.gateApplies?.(routine) === true;
     let parkedRunId: string | null = null;
+    // Set when a committing run hit a transient failure: its row stays `gating` and the worker retries the claim.
+    let retryError: unknown = null;
     const now = input.now ?? new Date();
     const prepared = await deps.prepareRoutine(routine);
     const grouping = parseGrouping(trigger.eventGrouping);
     const primaryFingerprint = eventGroupFingerprint(renderEventGroupKey(grouping.groupKey, event));
     const appendTargetId = typeof grouping.issueMode === "object" ? grouping.issueMode.appendToIssueId : null;
-
-    // The storm budget is taken before the transaction: the counter is its own
-    // short statement, so the event_sources row is never locked while an issue
-    // is being created. It is only needed when this event would open a new group.
-    let stormFold = gated?.stormFold ?? false;
-    if (!gated && event.state !== "recovery") {
-      const appendTarget = appendTargetId ? await loadAppendTarget(db, routine, appendTargetId) : null;
-      const existing = await findOpenGroup(db, routine, primaryFingerprint, appendTarget?.id ?? null);
-      if (!existing && !appendTarget) stormFold = !(await input.consumeStormSlot());
-    }
 
     const outcome = await db.transaction(async (tx): Promise<EventRoutineOutcome> => {
       const txDb = tx as unknown as Db;
@@ -380,6 +447,99 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         }
       }
 
+      // Resolved on first use: a silent repeat opens no run and needs none.
+      let responsibleUserId: string | null | undefined;
+      const resolveResponsible = async () => {
+        if (responsibleUserId === undefined) responsibleUserId = await deps.resolveResponsibleUserId(txDb, routine);
+        return responsibleUserId;
+      };
+      const startRun = async (
+        fingerprint: string,
+        extraPayload: Record<string, unknown> = {},
+        parkAs?: GateEventDispatchInput,
+      ) => {
+        const runResponsibleUserId = await resolveResponsible();
+        const values = {
+          companyId: routine.companyId,
+          routineId: routine.id,
+          triggerId: trigger.id,
+          source: "event" as const,
+          triggeredAt: now,
+          eventDeliveryId: input.deliveryId,
+          triggerPayload: { event, groupFingerprint: fingerprint, ...extraPayload },
+          dispatchFingerprint: fingerprint,
+          routineRevisionId: routine.latestRevisionId,
+          responsibleUserId: runResponsibleUserId,
+        };
+        // The parked row being committed is finalized in place, keeping the time the event arrived.
+        if (gatingRow) {
+          return (await deps.finalizeRun(gatingRow.id, { ...values, triggeredAt: gatingRow.triggeredAt }, txDb)) ?? gatingRow;
+        }
+        const [run] = await txDb
+          .insert(routineRuns)
+          .values(parkAs ? { ...values, status: "gating", gateDispatchInput: parkAs } : { ...values, status: "received" })
+          .returning();
+        return run!;
+      };
+      const completeRun = async (
+        run: RoutineRunRow,
+        status: "grouped" | "recovered",
+        issueId: string,
+      ) => {
+        await deps.finalizeRun(run.id, { status, linkedIssueId: issueId, completedAt: now, ...gateRecord }, txDb);
+        await deps.updateRoutineTouchedState(
+          { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status, issueId },
+          txDb,
+        );
+      };
+      const failRun = async (run: RoutineRunRow, err: unknown, extra: Partial<EventRoutineOutcome>) => {
+        const failure = failedOutcome(err, { ...extra, runId: run.id });
+        await deps.finalizeRun(
+          run.id,
+          { status: "failed", failureReason: failure.error ?? "Event dispatch failed", completedAt: new Date(), ...gateRecord },
+          txDb,
+        );
+        await deps.updateRoutineTouchedState(
+          { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "failed" },
+          txDb,
+        );
+        return failure;
+      };
+      /** A committing run keeps its `gating` row on a transient failure: the worker retries the claim later. */
+      const failOrRetry = async (run: RoutineRunRow, err: unknown, extra: Partial<EventRoutineOutcome>) => {
+        if (gatingRow && classifyEventDispatchError(err) === "transient") {
+          retryError = err;
+          return failedOutcome(err, { ...extra, runId: run.id });
+        }
+        return failRun(run, err, extra);
+      };
+      /** Remembers a committed comment on the run, so a retry after a failed wake does not post it again. */
+      const recordPostedComment = async (run: RoutineRunRow, posted: PostedComment) => {
+        await txDb
+          .update(routineRuns)
+          .set({ triggerPayload: { ...(run.triggerPayload ?? {}), postedComment: posted } })
+          .where(eq(routineRuns.id, run.id));
+      };
+
+      // A retry of a delivery whose comment landed but whose wake failed: only the wake is left to do.
+      const posted = gatingRow
+        ? readPostedComment(gatingRow.triggerPayload)
+        : input.deliveryId
+          ? await findPostedComment(txDb, input.deliveryId, routine.id)
+          : null;
+      if (posted) {
+        const run = await startRun(posted.fingerprint, { postedComment: posted, resumedWake: true });
+        try {
+          const current = await currentIssue(txDb, posted.issueId);
+          if (posted.wake && current && isOpenIssue(current)) await wakeForComment(posted.issueId, posted.commentId, current);
+          const status = posted.kind === "recovery" ? "recovered" : "grouped";
+          await completeRun(run, status, posted.issueId);
+          return { status: posted.storm ? "storm_folded" : status, runId: run.id, issueId: posted.issueId };
+        } catch (err) {
+          return failOrRetry(run, err, {});
+        }
+      }
+
       let note: string | null = null;
       let appendTarget: Awaited<ReturnType<typeof loadAppendTarget>> = null;
       if (appendTargetId) {
@@ -387,16 +547,39 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         if (!appendTarget) note = "append_target_unavailable";
       }
 
+      if (gatingRow && gated && gated.decision.action !== "wake") {
+        // The gate said skip (exit 1): nothing is posted, nothing wakes, and no storm slot is spent.
+        await deps.finalizeRun(
+          gatingRow.id,
+          { status: "skipped", failureReason: ROUTINE_GATE_SKIP_REASON, completedAt: now, ...gateRecord },
+          txDb,
+        );
+        await deps.updateRoutineTouchedState(
+          { routineId: routine.id, triggerId: trigger.id, triggeredAt: gatingRow.triggeredAt, status: "skipped_gate" },
+          txDb,
+        );
+        return { status: "gate_skipped", runId: gatingRow.id, ...(note ? { note } : {}) } satisfies EventRoutineOutcome;
+      }
+
       let effectiveGrouping = grouping;
       let fingerprint = primaryFingerprint;
       let storm = false;
       let open = await findOpenGroup(txDb, routine, fingerprint, appendTarget?.id ?? null);
-      if (!open && stormFold && event.state !== "recovery" && !appendTarget) {
-        // Folded into this routine's own storm group, never another agent's.
-        storm = true;
-        fingerprint = eventGroupFingerprint(eventStormGroupKey(event.source));
-        effectiveGrouping = { ...grouping, rewakeOnSeverityIncrease: false, issueMode: "group" };
-        open = await findOpenGroup(txDb, routine, fingerprint, null);
+      // A run about to be parked spends no slot: the gate may skip it, and the slot is taken when it commits.
+      if (!open && event.state !== "recovery" && !gateApplies) {
+        // Only now is a new group about to open, so only now is a slot spent: concurrent repeats of one alert
+        // find the group the first of them opened and cost nothing. The counter is its own short statement on
+        // the root connection, so the event_sources row is never locked while an issue is created. Append
+        // mode is not exempt: every new group there is a comment and a wake on a standing issue.
+        slot.taken = await input.consumeStormSlot();
+        if (!slot.taken) {
+          // Folded into this routine's own storm group, never another agent's. An append target is left alone.
+          storm = true;
+          appendTarget = null;
+          fingerprint = eventGroupFingerprint(eventStormGroupKey(event.source));
+          effectiveGrouping = { ...grouping, rewakeOnSeverityIncrease: false, issueMode: "group" };
+          open = await findOpenGroup(txDb, routine, fingerprint, null);
+        }
       }
 
       const decision: EventGroupDecision = decideEventGroupAction({
@@ -413,20 +596,6 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         await deps.finalizeRun(gatingRow.id, { status: "skipped", failureReason: reason, completedAt: now, ...gateRecord }, txDb);
         return { ...quiet, runId: gatingRow.id };
       };
-
-      if (gatingRow && gated && gated.decision.action !== "wake") {
-        // Exit 1: nothing is posted and nothing wakes.
-        await deps.finalizeRun(
-          gatingRow.id,
-          { status: "skipped", failureReason: ROUTINE_GATE_SKIP_REASON, completedAt: now, ...gateRecord },
-          txDb,
-        );
-        await deps.updateRoutineTouchedState(
-          { routineId: routine.id, triggerId: trigger.id, triggeredAt: gatingRow.triggeredAt, status: "skipped_gate" },
-          txDb,
-        );
-        return stampOutcome({ status: "gate_skipped", runId: gatingRow.id });
-      }
 
       if (decision.kind === "recovery_without_issue") {
         return settleQuiet(stampOutcome({ status: "recovery_without_issue" }), decision.kind);
@@ -449,20 +618,6 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           decision.kind,
         );
       }
-
-      const responsibleUserId = await deps.resolveResponsibleUserId(txDb, routine);
-      const runValues = {
-        companyId: routine.companyId,
-        routineId: routine.id,
-        triggerId: trigger.id,
-        source: "event" as const,
-        triggeredAt: now,
-        eventDeliveryId: input.deliveryId,
-        triggerPayload: { event, groupFingerprint: fingerprint, ...(storm ? { stormFolded: true } : {}) },
-        dispatchFingerprint: fingerprint,
-        routineRevisionId: routine.latestRevisionId,
-        responsibleUserId,
-      };
 
       // Only a decision that would comment or wake needs the gate; the cheap checks above ran first.
       if (
@@ -490,22 +645,16 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
             .then((rows) => rows[0] ?? null);
         if (inFlight) return stampOutcome({ status: "gating", runId: inFlight.id });
 
-        const stored: GateEventDispatchInput = { v: 1, kind: "event", eventDeliveryId: input.deliveryId, stormFold };
-        const [parked] = await txDb
-          .insert(routineRuns)
-          .values({ ...runValues, status: "gating", gateDispatchInput: stored })
-          .returning();
+        const parked = await startRun(fingerprint, {}, { v: 1, kind: "event", eventDeliveryId: input.deliveryId });
         await deps.updateRoutineTouchedState(
           { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "gating" },
           txDb,
         );
-        parkedRunId = parked!.id;
-        return stampOutcome({ status: "gating", runId: parked!.id });
+        parkedRunId = parked.id;
+        return stampOutcome({ status: "gating", runId: parked.id });
       }
 
-      const createdRun = gatingRow
-        ? ((await deps.finalizeRun(gatingRow.id, { ...runValues, triggeredAt: gatingRow.triggeredAt }, txDb)) ?? gatingRow)
-        : (await txDb.insert(routineRuns).values({ ...runValues, status: "received" }).returning())[0]!;
+      const createdRun = await startRun(fingerprint, storm ? { stormFolded: true } : {});
       const gateBlock = gated ? renderGateDecisionBlock(gated.decision) : null;
       const withGateBlock = (body: string) => (gateBlock ? `${body}\n\n${gateBlock}` : body);
 
@@ -523,10 +672,18 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
             })
             : renderEventRecoveryComment({ event, wake }));
           const comment = await issueSvc.addComment(open.group.issueId, body, {}, { authorType: "system" });
+          await recordPostedComment(createdRun, {
+            commentId: comment.id,
+            issueId: open.group.issueId,
+            kind: decision.kind === "comment" ? "comment" : "recovery",
+            wake,
+            storm,
+            fingerprint,
+          });
           // Re-read after the comment: the issue may have closed meanwhile, and an event never reopens one.
           const current = await currentIssue(txDb, open.group.issueId);
           if (isOpenIssue(current)) {
-            if (wake && current) await wakeForComment(open.group.issueId, comment.id, current);
+            // The group moves on before the wake, so a failed wake does not reopen the cooldown for the next repeat.
             await txDb
               .update(routineEventGroups)
               .set({
@@ -537,12 +694,9 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
                 lastState: event.state,
               })
               .where(eq(routineEventGroups.id, open.group.id));
+            if (wake && current) await wakeForComment(open.group.issueId, comment.id, current);
             const status = decision.kind === "comment" ? "grouped" : "recovered";
-            await deps.finalizeRun(createdRun.id, { status, linkedIssueId: open.group.issueId, completedAt: now, ...gateRecord }, txDb);
-            await deps.updateRoutineTouchedState(
-              { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status, issueId: open.group.issueId },
-              txDb,
-            );
+            await completeRun(createdRun, status, open.group.issueId);
             return stampOutcome({
               status: storm ? "storm_folded" : status,
               runId: createdRun.id,
@@ -551,15 +705,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           }
           if (decision.kind === "recovery_comment") {
             // Closed while the comment was posted: nothing left to wake.
-            await deps.finalizeRun(
-              createdRun.id,
-              { status: "recovered", linkedIssueId: open.group.issueId, completedAt: now, ...gateRecord },
-              txDb,
-            );
-            await deps.updateRoutineTouchedState(
-              { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "recovered", issueId: open.group.issueId },
-              txDb,
-            );
+            await completeRun(createdRun, "recovered", open.group.issueId);
             return stampOutcome({ status: "recovered", runId: createdRun.id, issueId: open.group.issueId });
           }
           // A problem that raced a close: fall through to the no-open-issue path, which wakes once, on a new issue.
@@ -578,9 +724,16 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
             {},
             { authorType: "system" },
           );
+          await recordPostedComment(createdRun, {
+            commentId: comment.id,
+            issueId: appendTarget.id,
+            kind: "append",
+            wake: true,
+            storm: false,
+            fingerprint,
+          });
           const current = await currentIssue(txDb, appendTarget.id);
           if (isOpenIssue(current)) {
-            if (current) await wakeForComment(appendTarget.id, comment.id, current);
             await txDb.insert(routineEventGroups).values({
               companyId: routine.companyId,
               routineId: routine.id,
@@ -593,15 +746,8 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
               lastSeverity: event.severity,
               lastState: event.state,
             });
-            await deps.finalizeRun(
-              createdRun.id,
-              { status: "grouped", linkedIssueId: appendTarget.id, completedAt: now, ...gateRecord },
-              txDb,
-            );
-            await deps.updateRoutineTouchedState(
-              { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "grouped", issueId: appendTarget.id },
-              txDb,
-            );
+            if (current) await wakeForComment(appendTarget.id, comment.id, current);
+            await completeRun(createdRun, "grouped", appendTarget.id);
             return stampOutcome({ status: "grouped", runId: createdRun.id, issueId: appendTarget.id });
           }
           note = "append_target_unavailable";
@@ -621,7 +767,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           status: "todo",
           priority: routine.priority,
           assigneeAgentId: prepared.assigneeAgentId,
-          responsibleUserId,
+          responsibleUserId: await resolveResponsible(),
           trustExplicitResponsibleUserId: true,
           originKind: "routine_execution",
           originId: routine.id,
@@ -663,21 +809,10 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           // The group row cascades with the issue.
           await txDb.delete(issues).where(eq(issues.id, createdIssueId));
         }
-        const failure = failedOutcome(err, { runId: createdRun.id });
-        // A committing run keeps its `gating` row on a transient failure: the claim retries it later.
-        if (gatingRow && failure.failureClass === "transient") throw err;
-        await deps.finalizeRun(
-          createdRun.id,
-          { status: "failed", failureReason: failure.error ?? "Event dispatch failed", completedAt: new Date(), ...gateRecord },
-          txDb,
-        );
-        await deps.updateRoutineTouchedState(
-          { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "failed" },
-          txDb,
-        );
-        return stampOutcome(failure);
+        return stampOutcome(await failOrRetry(createdRun, err, {}));
       }
     });
+    if (retryError) throw retryError;
     if (parkedRunId) deps.onGating?.(parkedRunId);
     return outcome;
   }

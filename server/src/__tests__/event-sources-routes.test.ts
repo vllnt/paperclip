@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import express, { Router, type NextFunction, type Request, type Response } from "express";
+import { rateLimit } from "express-rate-limit";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDb, eventDeliveries } from "@paperclipai/db";
@@ -55,6 +56,8 @@ describeEmbeddedPostgres("event source routes: ingress parsing, auth bypass and 
     };
     app.use("/api/event-sources/public", eventSourceBodyParser(captureRawBody));
     app.use(express.json({ limit: "10mb", verify: captureRawBody }));
+    // The harness authenticates callers like production, so it carries a ceiling no test can reach.
+    app.use(rateLimit({ windowMs: 60_000, limit: 100_000, standardHeaders: false, legacyHeaders: false }));
     app.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: async () => null }));
     app.use("/api", eventSourcePublicRoutes(fx.sources));
     app.use(errorHandler);
@@ -151,6 +154,16 @@ describeEmbeddedPostgres("event source routes: ingress parsing, auth bypass and 
         .set("Content-Encoding", "gzip")
         .set("Authorization", `Bearer ${secret}`)
         .send(gzipSync(Buffer.from(JSON.stringify(wireEvent()))));
+      expect(res.status).toBe(415);
+    });
+
+    it.each(["iso-8859-1", "bogus"])("rejects charset=%s with 415 instead of a server error", async (charset) => {
+      const { app, source, secret } = await seedSource();
+      const res = await request(app)
+        .post(ingestPath(source.publicId))
+        .set("Content-Type", `application/json; charset=${charset}`)
+        .set("Authorization", `Bearer ${secret}`)
+        .send(JSON.stringify(wireEvent()));
       expect(res.status).toBe(415);
     });
 

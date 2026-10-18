@@ -14,17 +14,33 @@ export interface GatedEventSettlement {
   outcome: EventRoutineOutcome;
 }
 
-export type GatedEventSettler = (settlement: GatedEventSettlement) => Promise<void>;
+/** The new-issue budget of the source that received a delivery, for a dispatch that commits later. */
+export interface GatedEventStormSlot {
+  consumeStormSlot: () => Promise<boolean>;
+  releaseStormSlot: () => Promise<void>;
+}
 
-// The event source service owns the delivery log and the fallback rules, and it depends on the
-// routine service; this registry lets the gate worker reach it without a cyclic import.
-const settlers = new WeakMap<object, GatedEventSettler>();
+export interface GatedEventHooks {
+  settle(settlement: GatedEventSettlement): Promise<void>;
+  /** Slot hooks for the source behind a delivery; null when the delivery is gone. */
+  stormSlotForDelivery(deliveryId: string): Promise<GatedEventStormSlot | null>;
+}
 
-export function registerGatedEventSettler(db: Db, settler: GatedEventSettler): void {
-  settlers.set(db, settler);
+// The event source service owns the delivery log, the storm budget and the fallback rules, and it
+// depends on the routine service; this registry lets the gate worker reach it without a cyclic import.
+const registry = new WeakMap<object, GatedEventHooks>();
+
+export function registerGatedEventHooks(db: Db, hooks: GatedEventHooks): void {
+  registry.set(db, hooks);
 }
 
 export async function settleGatedEvent(db: Db, settlement: GatedEventSettlement): Promise<void> {
-  const settler = settlers.get(db);
-  if (settler) await settler(settlement);
+  const hooks = registry.get(db);
+  if (hooks) await hooks.settle(settlement);
+}
+
+export async function gatedEventStormSlot(db: Db, deliveryId: string | null): Promise<GatedEventStormSlot | null> {
+  const hooks = registry.get(db);
+  if (!hooks || !deliveryId) return null;
+  return hooks.stormSlotForDelivery(deliveryId);
 }

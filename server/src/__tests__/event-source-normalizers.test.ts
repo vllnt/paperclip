@@ -452,6 +452,13 @@ describe("normalizeEvent: gatus", () => {
       },
     );
 
+    it("removes credentials, query and fragment from the url", () => {
+      const event = expectOk(
+        normalizeEvent(gatusSource(), gatusBody({ url: "https://ops:hunter2@status.example.com/api?token=abc#frag" }), NOW),
+      );
+      expect(event.url).toBe("https://status.example.com/api");
+    });
+
     it("keeps an http url and trims whitespace", () => {
       expect(expectOk(normalizeEvent(gatusSource(), gatusBody({ url: "http://203.0.113.5:8080/h" }), NOW)).url).toBe(
         "http://203.0.113.5:8080/h",

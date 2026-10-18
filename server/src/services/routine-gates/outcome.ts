@@ -95,7 +95,6 @@ export interface GateEventDispatchInput {
   kind: "event";
   /** The normalized event as `routine_runs.trigger_payload.event` stores it. */
   eventDeliveryId: string | null;
-  stormFold: boolean;
 }
 
 export type StoredGateDispatchInput = GateDispatchInput | GateEventDispatchInput;

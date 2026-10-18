@@ -1,3 +1,4 @@
+import { isIPv6 } from "node:net";
 import crypto from "node:crypto";
 import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -34,7 +35,7 @@ import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import { routineService } from "../routines.js";
 import { secretService } from "../secrets.js";
 import { verifyBearerAuthorization, verifyHmacSha256Signature } from "../webhook-auth.js";
-import { registerGatedEventSettler, type GatedEventSettlement } from "../routine-gates/hooks.js";
+import { registerGatedEventHooks, type GatedEventSettlement } from "../routine-gates/hooks.js";
 import { previewEventRoutine } from "./event-dispatch.js";
 import { pruneEventData } from "./prune.js";
 import { normalizeEvent } from "./normalizers.js";
@@ -143,9 +144,29 @@ function sha256Hex(value: string) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+const GLOBAL_FAILURE_KEY = "global";
+
+/**
+ * The per-client failure bucket. An IPv6 client owns a whole /64, so addresses
+ * inside one are one client; an IPv4-mapped address is the IPv4 client.
+ */
+export function failureKeyForIp(ip: string | null): string {
+  if (!ip) return "ip:unknown";
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return `ip:${mapped[1]}`;
+  if (!isIPv6(ip)) return `ip:${ip}`;
+  const [head = "", tail = ""] = ip.split("::");
+  const headGroups = head === "" ? [] : head.split(":");
+  const tailGroups = ip.includes("::") ? (tail === "" ? [] : tail.split(":")) : [];
+  const groups = ip.includes("::")
+    ? [...headGroups, ...Array(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill("0"), ...tailGroups]
+    : headGroups;
+  return `ip:${groups.slice(0, 4).map((group) => group.toLowerCase().replace(/^0+(?=.)/, "")).join(":")}::/64`;
+}
+
 interface CachedSource {
   row: EventSourceRow;
-  /** `null` when the source has no resolvable secret: every request then fails authentication. */
+  /** `null` when the source has no secret (every request fails authentication) or its secret could not be resolved (503). */
   secret: string | null;
 }
 
@@ -201,7 +222,8 @@ export function eventSourceService(
   const now = deps.now ?? Date.now;
   const secretsSvc = secretService(db);
   const routinesSvc = routineService(db, { heartbeat: deps.heartbeat, pluginWorkerManager: deps.pluginWorkerManager });
-  const failureLimiter = createSlidingWindowLimiter({ now });
+  // The shared ceiling is pinned: a sender rotating client keys must not be able to evict and so reset it.
+  const failureLimiter = createSlidingWindowLimiter({ now, pinnedKeys: [GLOBAL_FAILURE_KEY] });
   const sourceLimiter = createSlidingWindowLimiter({ now });
   const rejectCounters = createRejectCounters({ now });
   const dispatchGate = createSemaphore(EVENT_DISPATCH_CONCURRENCY);
@@ -221,27 +243,29 @@ export function eventSourceService(
     });
   }
 
-  async function loadCachedSource(row: EventSourceRow | null): Promise<CachedSource | null> {
-    // Unknown, disabled and archived sources are indistinguishable to a caller.
-    if (!row || row.archived || !row.enabled) return null;
-    return { row, secret: await resolveSourceSecret(row) };
-  }
-
   const cache = createEventSourceCache<CachedSource>({
     now,
-    load: async (publicId) => {
-      const row = await db.select().from(eventSources).where(eq(eventSources.publicId, publicId)).then((rows) => rows[0] ?? null);
-      return loadCachedSource(row);
-    },
-    loadAll: async () => {
+    loadAll: async (previous) => {
       const rows = await db.select().from(eventSources).where(and(eq(eventSources.enabled, true), eq(eventSources.archived, false)));
+      const previousById = new Map([...previous.values()].map((value) => [value.row.id, value]));
       const loaded: Array<{ publicId: string; value: CachedSource }> = [];
       for (const row of rows) {
         try {
-          const value = await loadCachedSource(row);
-          if (value) loaded.push({ publicId: row.publicId, value });
+          // Resolving a secret writes an access event, so a secret that has not rotated is reused.
+          const before = previousById.get(row.id);
+          const unchanged =
+            before !== undefined &&
+            before.secret !== null &&
+            before.row.secretId === row.secretId &&
+            before.row.lastRotatedAt?.getTime() === row.lastRotatedAt?.getTime();
+          loaded.push({
+            publicId: row.publicId,
+            value: { row, secret: unchanged ? before.secret : await resolveSourceSecret(row) },
+          });
         } catch (err) {
-          logger.warn({ err, eventSourceId: row.id }, "failed to preload event source secret");
+          // Kept without a secret, so the sender gets a retryable 503 and the next reload tries again.
+          logger.warn({ err, eventSourceId: row.id }, "failed to resolve event source secret");
+          loaded.push({ publicId: row.publicId, value: { row, secret: null } });
         }
       }
       return loaded;
@@ -350,8 +374,8 @@ export function eventSourceService(
     return { regular: [...regular.values()], fallback: [...fallbackByRoutine.values()] };
   }
 
-  /** Atomic counter: one short statement, run outside any dispatch transaction. */
-  async function consumeStormSlot(sourceId: string): Promise<boolean> {
+  /** Atomic counter: one short statement on its own connection, never part of a dispatch transaction. */
+  async function consumeStormSlot(sourceId: string): Promise<{ granted: boolean; windowStart: string | null }> {
     const result = await db.execute(sql`
       update event_sources set
         storm_window_start = case
@@ -361,22 +385,37 @@ export function eventSourceService(
           when storm_window_start is null or storm_window_start <= now() - interval '1 hour' then 1
           else least(storm_window_count + 1, max_new_issues_per_hour + 1) end
       where id = ${sourceId}
-      returning storm_window_count, max_new_issues_per_hour
+      returning storm_window_count, max_new_issues_per_hour, storm_window_start::text as window_start
     `);
     const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Array<{
       storm_window_count: number;
       max_new_issues_per_hour: number;
+      window_start: string | null;
     }>;
     const row = rows[0];
-    return !row || Number(row.storm_window_count) <= Number(row.max_new_issues_per_hour);
+    if (!row) return { granted: true, windowStart: null };
+    return {
+      granted: Number(row.storm_window_count) <= Number(row.max_new_issues_per_hour),
+      windowStart: row.window_start ?? null,
+    };
+  }
+
+  /**
+   * Gives back a slot taken in `windowStart` (as the database printed it, microseconds included), for a
+   * dispatch that opened no group. It does nothing once the window has rolled over, and never goes below zero.
+   */
+  async function releaseStormSlot(sourceId: string, windowStart: string): Promise<void> {
+    await db.execute(sql`
+      update event_sources set storm_window_count = greatest(storm_window_count - 1, 0)
+      where id = ${sourceId} and storm_window_start = ${windowStart}::timestamptz
+    `);
   }
 
   // ── ingest ────────────────────────────────────────────────────────────────
 
   function failAuth(source: EventSourceRow | null, ip: string | null, outcome: "unauthorized" | "not_found"): IngestResult {
-    const ipKey = `ip:${ip ?? "unknown"}`;
-    const perIp = failureLimiter.consume(ipKey, EVENT_AUTH_FAILURE_PER_IP_PER_MINUTE);
-    const global = failureLimiter.consume("global", EVENT_AUTH_FAILURE_GLOBAL_PER_MINUTE);
+    const perIp = failureLimiter.consume(failureKeyForIp(ip), EVENT_AUTH_FAILURE_PER_IP_PER_MINUTE);
+    const global = failureLimiter.consume(GLOBAL_FAILURE_KEY, EVENT_AUTH_FAILURE_GLOBAL_PER_MINUTE);
     if (!perIp.allowed || !global.allowed) {
       countReject(source, "auth_failure_rate_limited", ip);
       const retryAfter = Math.max(perIp.retryAfterSeconds, global.retryAfterSeconds, 1);
@@ -392,6 +431,16 @@ export function eventSourceService(
       : { status: 401, body: { error: "unauthorized" } };
   }
 
+  /** A sender must never turn a normalizer defect into a 500, on the public path or in a dry run. */
+  function safeNormalize(source: EventSourceRow, body: unknown, at: Date): ReturnType<typeof normalizeEvent> {
+    try {
+      return normalizeEvent(source, body, at);
+    } catch (err) {
+      logger.warn({ err, sourceId: source.id }, "event normalizer threw");
+      return { ok: false, errors: ["event could not be normalized"] };
+    }
+  }
+
   async function ingest(request: IngestRequest): Promise<IngestResult> {
     const startedAt = now();
     let cached: CachedSource | null;
@@ -403,6 +452,9 @@ export function eventSourceService(
     }
     if (!cached) return failAuth(null, request.ip, "not_found");
     const source = cached.row;
+    if (source.secretId && cached.secret === null) {
+      return { status: 503, body: { error: "unavailable" }, headers: { "Retry-After": "5" } };
+    }
 
     // Authenticate before any shared budget is spent.
     let authenticated = false;
@@ -437,14 +489,7 @@ export function eventSourceService(
       };
     }
 
-    let normalized: ReturnType<typeof normalizeEvent>;
-    try {
-      normalized = normalizeEvent(source, request.body, new Date(startedAt));
-    } catch (err) {
-      // A sender must never turn a normalizer defect into a 500.
-      logger.warn({ err, sourceId: source.id }, "event normalizer threw");
-      normalized = { ok: false, errors: ["event could not be normalized"] };
-    }
+    const normalized = safeNormalize(source, request.body, new Date(startedAt));
     if (!normalized.ok) {
       await db.insert(eventDeliveries).values({
         companyId: source.companyId,
@@ -607,6 +652,23 @@ export function eventSourceService(
     return rows.length > 0;
   }
 
+  /** The slot hooks of one dispatch: it can give back only the slot it took itself. */
+  function stormSlotFor(sourceId: string) {
+    let taken: string | null = null;
+    return {
+      consumeStormSlot: async () => {
+        const slot = await consumeStormSlot(sourceId);
+        taken = slot.granted ? slot.windowStart : null;
+        return slot.granted;
+      },
+      releaseStormSlot: async () => {
+        const windowStart = taken;
+        taken = null;
+        if (windowStart) await releaseStormSlot(sourceId, windowStart);
+      },
+    };
+  }
+
   async function processDelivery(
     source: EventSourceRow,
     event: NormalizedEvent,
@@ -630,7 +692,7 @@ export function eventSourceService(
             trigger: subscriber.trigger,
             event,
             deliveryId: claim.deliveryId,
-            consumeStormSlot: () => consumeStormSlot(source.id),
+            ...stormSlotFor(source.id),
             now: new Date(now()),
           }),
         );
@@ -745,7 +807,7 @@ export function eventSourceService(
           trigger: subscriber.trigger,
           event,
           deliveryId,
-          consumeStormSlot: () => consumeStormSlot(source.id),
+          ...stormSlotFor(source.id),
           now: new Date(now()),
         }),
       );
@@ -754,13 +816,23 @@ export function eventSourceService(
     }
   }
 
-  registerGatedEventSettler(db, settleGatedOutcome);
+  registerGatedEventHooks(db, {
+    settle: settleGatedOutcome,
+    stormSlotForDelivery: async (deliveryId) => {
+      const delivery = await db
+        .select({ sourceId: eventDeliveries.sourceId })
+        .from(eventDeliveries)
+        .where(eq(eventDeliveries.id, deliveryId))
+        .then((rows) => rows[0] ?? null);
+      return delivery ? stormSlotFor(delivery.sourceId) : null;
+    },
+  });
 
   // ── dry run ───────────────────────────────────────────────────────────────
 
   async function dryRun(sourceId: string, payload: Record<string, unknown>): Promise<EventSourceDryRunResult> {
     const source = await getSourceRow(sourceId);
-    const normalized = normalizeEvent(source, payload, new Date(now()));
+    const normalized = safeNormalize(source, payload, new Date(now()));
     if (!normalized.ok) {
       return { event: null, validationErrors: normalized.errors, matched: [], fallback: [], wouldBe: "invalid" };
     }

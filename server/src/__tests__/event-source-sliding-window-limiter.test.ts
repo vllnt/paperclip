@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createSlidingWindowLimiter } from "../services/event-sources/sliding-window-limiter.js";
 
 /** A limiter on a manually advanced clock. `at` moves the clock to an absolute time in ms. */
-function limiterAt(options: { windowMs?: number; maxKeys?: number } = {}) {
+function limiterAt(options: { windowMs?: number; maxKeys?: number; pinnedKeys?: string[] } = {}) {
   let current = 1_000_000_000_000;
   const start = current;
   const limiter = createSlidingWindowLimiter({ ...options, now: () => current });
@@ -148,18 +148,34 @@ describe("createSlidingWindowLimiter", () => {
       expect(limiter.consume("brand-new", 1).allowed).toBe(true);
     });
 
-    it("evicts the oldest live key when every tracked key is still live", () => {
+    it("evicts the least recently used live key when every tracked key is still live", () => {
       const { limiter } = limiterAt({ maxKeys: 2 });
       limiter.consume("a", 1);
       limiter.consume("b", 1);
+      // Touching "a" makes "b" the least recently used one.
       expect(limiter.consume("a", 1).allowed).toBe(false);
 
-      // "c" does not fit: the oldest-inserted key "a" is dropped to make room.
       expect(limiter.consume("c", 1).allowed).toBe(true);
-      expect(limiter.consume("b", 1).allowed).toBe(false);
+      expect(limiter.consume("a", 1).allowed).toBe(false);
       expect(limiter.consume("c", 1).allowed).toBe(false);
-      // "a" lost its history, so it starts a fresh window.
-      expect(limiter.consume("a", 1).allowed).toBe(true);
+      // "b" lost its history, so it starts a fresh window.
+      expect(limiter.consume("b", 1).allowed).toBe(true);
+    });
+
+    it("never evicts a pinned key, however many other keys arrive", () => {
+      const { limiter } = limiterAt({ maxKeys: 3, pinnedKeys: ["global"] });
+      limiter.consume("global", 2);
+      for (let i = 0; i < 500; i += 1) limiter.consume(`ip-${i}`, 1);
+
+      // The pinned counter kept its first hit, so only one more is allowed.
+      expect(limiter.consume("global", 2)).toMatchObject({ allowed: true, remaining: 0 });
+      expect(limiter.consume("global", 2).allowed).toBe(false);
+    });
+
+    it("still admits new keys when the only live key is pinned", () => {
+      const { limiter } = limiterAt({ maxKeys: 1, pinnedKeys: ["global"] });
+      limiter.consume("global", 5);
+      expect(limiter.consume("other", 1).allowed).toBe(true);
     });
 
     it("reclaims expired keys before evicting any live key", () => {

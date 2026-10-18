@@ -24,11 +24,14 @@ export function createSlidingWindowLimiter(options: {
   windowMs?: number;
   maxKeys?: number;
   now?: () => number;
+  /** Keys that are never evicted to make room (a shared ceiling that one sender must not be able to reset). */
+  pinnedKeys?: readonly string[];
 } = {}): SlidingWindowLimiter {
   const windowMs = options.windowMs ?? 60_000;
   const maxKeys = options.maxKeys ?? 10_000;
   const now = options.now ?? Date.now;
   const bucketsPerWindow = Math.max(1, Math.ceil(windowMs / BUCKET_MS));
+  const pinned = new Set(options.pinnedKeys ?? []);
   const hitsByKey = new Map<string, Map<number, number>>();
 
   function prune(buckets: Map<number, number>, currentBucket: number) {
@@ -43,10 +46,13 @@ export function createSlidingWindowLimiter(options: {
       prune(buckets, currentBucket);
       if (buckets.size === 0) hitsByKey.delete(key);
     }
-    // Still full of live keys: drop the oldest-inserted one rather than refuse service.
+    // Still full of live keys: drop the least recently used one rather than refuse service.
     if (hitsByKey.size >= maxKeys) {
-      const oldest = hitsByKey.keys().next().value;
-      if (oldest !== undefined) hitsByKey.delete(oldest);
+      for (const key of hitsByKey.keys()) {
+        if (pinned.has(key)) continue;
+        hitsByKey.delete(key);
+        break;
+      }
     }
   }
 
@@ -60,6 +66,9 @@ export function createSlidingWindowLimiter(options: {
         hitsByKey.set(key, buckets);
       } else {
         prune(buckets, currentBucket);
+        // Re-insert on touch so the oldest-inserted key is the least recently used one.
+        hitsByKey.delete(key);
+        hitsByKey.set(key, buckets);
       }
       let total = 0;
       let oldestBucket = currentBucket;

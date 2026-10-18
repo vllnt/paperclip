@@ -375,5 +375,113 @@ describeEmbeddedPostgres("event source dispatch and grouping", () => {
       const [delivery] = await db.select().from(eventDeliveries).where(eq(eventDeliveries.sourceId, source.id));
       expect(delivery).toMatchObject({ status: "dispatched", attempts: 2 });
     });
+
+    describe("a wake that fails after the comment was posted", () => {
+      function failingWakes() {
+        const control = { fail: false };
+        return {
+          control,
+          beforeWakeup: () => {
+            if (control.fail) throw new Error("adapter unavailable");
+          },
+        };
+      }
+
+      it("does not post a repeat comment twice, and wakes once on the retry", async () => {
+        const { control, beforeWakeup } = failingWakes();
+        const { fx, routine, source, secret } = await setup({ beforeWakeup });
+        await fx.send(source, secret, wireEvent({ eventId: "a" }));
+        const [issue] = await fx.issuesFor(routine.id);
+
+        fx.advance(700_000);
+        control.fail = true;
+        expect((await fx.send(source, secret, wireEvent({ eventId: "b" }))).status).toBe(503);
+        expect(await commentsOf(issue!.id)).toHaveLength(1);
+
+        // The group moved on with the comment: a repeat during the outage stays silent instead of commenting again.
+        fx.advance(30_000);
+        expect(outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "c" }))).status).toBe("grouped_silent");
+        expect(await commentsOf(issue!.id)).toHaveLength(1);
+
+        control.fail = false;
+        const wakeupsBefore = fx.wakeups.length;
+        const retry = await fx.send(source, secret, wireEvent({ eventId: "b" }));
+        expect(retry.status).toBe(202);
+        expect(outcomeOf(retry).status).toBe("grouped");
+        const comments = await commentsOf(issue!.id);
+        expect(comments).toHaveLength(1);
+        const wakes = fx.wakeups.slice(wakeupsBefore);
+        expect(wakes).toHaveLength(1);
+        expect(wakes[0]!.opts).toMatchObject({ reason: "issue_commented", payload: { commentId: comments[0]!.id } });
+        expect((await groupsOf(routine.id))[0]).toMatchObject({ repeatCount: 1 });
+        const deliveries = await db.select().from(eventDeliveries).where(eq(eventDeliveries.sourceId, source.id));
+        expect(deliveries.filter((d) => d.attempts === 2)).toEqual([expect.objectContaining({ status: "dispatched" })]);
+      });
+
+      it("does not post a recovery comment twice", async () => {
+        const { control, beforeWakeup } = failingWakes();
+        const { fx, routine, source, secret } = await setup({ beforeWakeup });
+        await fx.send(source, secret, wireEvent({ eventId: "a" }));
+        const [issue] = await fx.issuesFor(routine.id);
+
+        fx.advance(1000);
+        control.fail = true;
+        expect((await fx.send(source, secret, wireEvent({ eventId: "r", state: "recovery", severity: "info" }))).status).toBe(503);
+        expect(await commentsOf(issue!.id)).toHaveLength(1);
+
+        control.fail = false;
+        const wakeupsBefore = fx.wakeups.length;
+        const retry = await fx.send(source, secret, wireEvent({ eventId: "r", state: "recovery", severity: "info" }));
+        expect(outcomeOf(retry).status).toBe("recovered");
+        expect(await commentsOf(issue!.id)).toHaveLength(1);
+        expect(fx.wakeups.slice(wakeupsBefore)).toHaveLength(1);
+      });
+
+      it("keeps resuming across repeated failures and still posts the comment once", async () => {
+        const { control, beforeWakeup } = failingWakes();
+        const { fx, routine, source, secret } = await setup({ beforeWakeup });
+        await fx.send(source, secret, wireEvent({ eventId: "a" }));
+        const [issue] = await fx.issuesFor(routine.id);
+
+        fx.advance(700_000);
+        control.fail = true;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          expect((await fx.send(source, secret, wireEvent({ eventId: "b" }))).status).toBe(503);
+        }
+        expect(await commentsOf(issue!.id)).toHaveLength(1);
+
+        control.fail = false;
+        const wakeupsBefore = fx.wakeups.length;
+        expect(outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "b" }))).status).toBe("grouped");
+        expect(await commentsOf(issue!.id)).toHaveLength(1);
+        expect(fx.wakeups.slice(wakeupsBefore)).toHaveLength(1);
+      });
+
+      it("does not post the first comment of an append-mode group twice", async () => {
+        const { control, beforeWakeup } = failingWakes();
+        const fx = await seedEventFixture(db, { beforeWakeup });
+        const agentId = await fx.createAgent();
+        const routine = await fx.createRoutine({ assigneeAgentId: agentId });
+        const { source, secret } = await fx.createSource();
+        const target = await fx.issueSvc.create(fx.companyId, {
+          projectId: fx.projectId,
+          title: "ongoing",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: agentId,
+        } as never);
+        await fx.subscribe(routine.id, source.id, { grouping: { issueMode: { appendToIssueId: target.id }, repeatCommentCooldownSec: 600 } });
+
+        control.fail = true;
+        expect((await fx.send(source, secret, wireEvent({ eventId: "p1" }))).status).toBe(503);
+        expect(await commentsOf(target.id)).toHaveLength(1);
+
+        control.fail = false;
+        const retry = await fx.send(source, secret, wireEvent({ eventId: "p1" }));
+        expect(outcomeOf(retry)).toMatchObject({ status: "grouped", issueId: target.id });
+        expect(await commentsOf(target.id)).toHaveLength(1);
+        expect((await groupsOf(routine.id)).filter((g) => g.issueId === target.id)).toHaveLength(1);
+      });
+    });
   });
 });

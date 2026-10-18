@@ -109,9 +109,8 @@ import {
   renderGateDecisionBlock,
   type GateDecision,
   type GateDispatchInput,
-  type GateEventDispatchInput,
 } from "./routine-gates/outcome.js";
-import { settleGatedEvent } from "./routine-gates/hooks.js";
+import { gatedEventStormSlot, settleGatedEvent } from "./routine-gates/hooks.js";
 import { raiseGateFailureNotice } from "./routine-gates/notices.js";
 import { GateEnvironmentError, createGateRunner, type GateRunner } from "./routine-gates/runner.js";
 import {
@@ -2053,16 +2052,18 @@ export function routineService(
         return;
       }
       if (run.source === "event") {
-        const stored = run.gateDispatchInput as GateEventDispatchInput | null;
         const event = (run.triggerPayload as { event?: NormalizedEvent } | null)?.event;
         if (!trigger || !event) throw new Error("Parked event run has no trigger or event");
+        // The new-issue budget is spent here, when the gate has said wake, not when the event was parked.
+        const slot = await gatedEventStormSlot(db, run.eventDeliveryId);
         const outcome = await eventDispatcher.commitGated({
           routine,
           trigger,
           event,
           deliveryId: run.eventDeliveryId,
-          consumeStormSlot: async () => false,
-          gated: { runId: run.id, stormFold: stored?.stormFold ?? false, gateResult, decision },
+          consumeStormSlot: slot?.consumeStormSlot ?? (async () => true),
+          releaseStormSlot: slot?.releaseStormSlot,
+          gated: { runId: run.id, gateResult, decision },
         });
         await settleGatedEvent(db, {
           companyId: routine.companyId,

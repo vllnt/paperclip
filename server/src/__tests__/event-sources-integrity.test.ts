@@ -236,6 +236,31 @@ describeEmbeddedPostgres("event source integrity, isolation and retention", () =
       expect(storm!.assigneeAgentId).toBe(agentId);
     });
 
+    it("applies the breaker to appendToIssueId too: past the budget new groups fold into the routine's storm issue and the standing issue is left alone", async () => {
+      const fx = await seedEventFixture(db);
+      const agentId = await fx.createAgent();
+      const routine = await fx.createRoutine({ assigneeAgentId: agentId });
+      const { source, secret } = await fx.createSource({ maxNewIssuesPerHour: 2 });
+      const target = await fx.issueSvc.create(fx.companyId, { projectId: fx.projectId, title: "ongoing", status: "todo", priority: "medium", assigneeAgentId: agentId } as never);
+      await fx.subscribe(routine.id, source.id, { grouping: { issueMode: { appendToIssueId: target.id }, repeatCommentCooldownSec: 600 } });
+
+      const statuses: string[] = [];
+      for (const key of ["a1", "a2", "a3", "a4", "a5"]) {
+        statuses.push(outcomeOf(await fx.send(source, secret, wireEvent({ eventId: key, dedupeKey: key }))).status);
+      }
+
+      expect(statuses).toEqual(["grouped", "grouped", "storm_folded", "storm_folded", "storm_folded"]);
+      // Only the two budgeted alerts reached the standing issue, its assignee was woken for those two only.
+      expect(await commentsOf(target.id)).toHaveLength(2);
+      expect(fx.wakeups.filter((w) => w.opts.contextSnapshot?.taskId === target.id)).toHaveLength(2);
+      const storm = (await fx.issuesFor(routine.id)).filter((i) => i.title.startsWith("Event storm from"));
+      expect(storm).toHaveLength(1);
+      expect(storm[0]!.assigneeAgentId).toBe(agentId);
+      // Group rows are bounded by the budget as well.
+      const groups = await db.select().from(routineEventGroups).where(eq(routineEventGroups.routineId, routine.id));
+      expect(groups.filter((g) => g.issueId === target.id)).toHaveLength(2);
+    });
+
     it("keeps the storm group per routine so another agent never receives the fold", async () => {
       const fx = await seedEventFixture(db);
       const agentA = await fx.createAgent("A");
@@ -265,6 +290,41 @@ describeEmbeddedPostgres("event source integrity, isolation and retention", () =
       const all = await fx.issuesFor(routine.id);
       expect(all.filter((i) => !i.title.startsWith("Event storm from"))).toHaveLength(3);
       expect(all.filter((i) => i.title.startsWith("Event storm from"))).toHaveLength(1);
+    });
+
+    it("charges one slot for concurrent repeats of the same new alert", async () => {
+      const { fx, routine, source, secret } = await setup({ sourceInput: { maxNewIssuesPerHour: 5 } });
+      const results = await Promise.all(
+        Array.from({ length: 4 }, (_, i) => fx.send(source, secret, wireEvent({ eventId: `same-${i}`, dedupeKey: "same" }))),
+      );
+      expect(results.every((r) => r.status === 202)).toBe(true);
+      expect(await fx.issuesFor(routine.id)).toHaveLength(1);
+      const [row] = await db.select().from(eventSources).where(eq(eventSources.id, source.id));
+      expect(row!.stormWindowCount).toBe(1);
+    });
+
+    it("gives the slot back when the dispatch fails, so a sender retry does not spend a second one", async () => {
+      let failWake = true;
+      const fx = await seedEventFixture(db, {
+        beforeWakeup: () => {
+          if (failWake) throw new Error("adapter unavailable");
+        },
+      });
+      const agentId = await fx.createAgent("Responder");
+      const routine = await fx.createRoutine({ assigneeAgentId: agentId });
+      const { source, secret } = await fx.createSource({ maxNewIssuesPerHour: 5 });
+      await fx.subscribe(routine.id, source.id);
+
+      expect((await fx.send(source, secret, wireEvent({ eventId: "r1", dedupeKey: "r" }))).status).toBe(503);
+      expect((await fx.send(source, secret, wireEvent({ eventId: "r1", dedupeKey: "r" }))).status).toBe(503);
+      const [afterFailures] = await db.select().from(eventSources).where(eq(eventSources.id, source.id));
+      expect(afterFailures!.stormWindowCount).toBe(0);
+
+      failWake = false;
+      expect((await fx.send(source, secret, wireEvent({ eventId: "r1", dedupeKey: "r" }))).status).toBe(202);
+      const [afterRetry] = await db.select().from(eventSources).where(eq(eventSources.id, source.id));
+      expect(afterRetry!.stormWindowCount).toBe(1);
+      expect(await fx.issuesFor(routine.id)).toHaveLength(1);
     });
 
     it("starts a fresh window once the hour has passed", async () => {
@@ -571,6 +631,28 @@ describeEmbeddedPostgres("event source integrity, isolation and retention", () =
       // The source is untouched by pruning.
       const sources = await db.select().from(eventSources).where(and(eq(eventSources.id, source.id), isNull(eventSources.secretId)));
       expect(sources).toHaveLength(0);
+    });
+
+    it("ages out groups on a standing append-mode issue by idleness, and keeps idle groups of the routine's own open issues", async () => {
+      const { fx, routine, source, secret } = await setup();
+      const day = 24 * 3_600_000;
+      await fx.send(source, secret, wireEvent({ eventId: "own", dedupeKey: "own" }));
+      const [ownGroup] = await db.select().from(routineEventGroups).where(eq(routineEventGroups.routineId, routine.id));
+      await db.update(routineEventGroups).set({ lastSeenAt: new Date(Date.now() - 90 * day) }).where(eq(routineEventGroups.id, ownGroup!.id));
+
+      const standing = await fx.issueSvc.create(fx.companyId, { projectId: fx.projectId, title: "standing", status: "todo", priority: "medium" } as never);
+      const base = { companyId: fx.companyId, routineId: routine.id, issueId: standing.id, lastSeverity: "critical", lastState: "problem" };
+      await db.insert(routineEventGroups).values([
+        { ...base, fingerprint: "event:idle-append", lastSeenAt: new Date(Date.now() - 40 * day) },
+        { ...base, fingerprint: "event:active-append", lastSeenAt: new Date(Date.now() - 1 * day) },
+      ]);
+
+      await pruneEventData(db, new Date());
+
+      const fingerprints = (await db.select().from(routineEventGroups).where(eq(routineEventGroups.routineId, routine.id))).map((row) => row.fingerprint);
+      expect(fingerprints).toContain(ownGroup!.fingerprint);
+      expect(fingerprints).toContain("event:active-append");
+      expect(fingerprints).not.toContain("event:idle-append");
     });
 
     it("is idempotent", async () => {
