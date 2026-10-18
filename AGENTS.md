@@ -182,6 +182,8 @@ pnpm build
 
 If anything cannot be run, explicitly report what was not run and why.
 
+Tests that must gate the production image build go in `scripts/ci/image-build-vitest-files.txt` (one path per line, keep it sorted), not on a `Dockerfile` line: concurrent pull requests that rewrite the same line conflict, while additions at different positions of the manifest merge cleanly.
+
 ## 8. API and Auth Expectations
 
 - Base path: `/api`
