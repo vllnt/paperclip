@@ -7868,6 +7868,137 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
+  // Acquires a run lease from a generic plugin driver whose `environmentAcquireLease`
+  // returns `providerMetadata`, and returns the lease and its stored row.
+  async function acquireGenericPluginLease(providerMetadata: Record<string, unknown>) {
+    const pluginId = randomUUID();
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: "plugin-lease-secret-echo", metadata: providerMetadata };
+        }
+        return undefined;
+      }),
+      getWorker: vi.fn(() => ({ supportedMethods: [] })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "plugin",
+      name: "Plugin Secret Echo",
+      config: {
+        pluginKey: "acme.environments",
+        driverKey: "secret-echo-plugin",
+        driverConfig: { template: "base", apiKey: randomUUID() },
+      },
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.environments",
+      packageName: "@acme/paperclip-environments",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.environments",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Acme Environments",
+        description: "Plugin environment driver that returns resolved credentials in lease metadata",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [
+          {
+            driverKey: "secret-echo-plugin",
+            displayName: "Secret echo plugin",
+            configSchema: {
+              type: "object",
+              $defs: {
+                credential: {
+                  type: "object",
+                  properties: { host: { type: "string" }, token: { type: "string", format: "secret-ref" } },
+                },
+              },
+              properties: {
+                template: { type: "string" },
+                apiKey: { type: "string", format: "secret-ref" },
+                connection: {
+                  type: "object",
+                  properties: { token: { type: "string", format: "secret-ref" } },
+                },
+                tokens: { type: "array", items: { type: "string", format: "secret-ref" } },
+                replicas: { type: "array", items: { $ref: "#/$defs/credential" } },
+              },
+            },
+          },
+        ],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+
+    const acquired = await runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+
+    const [stored] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+    return { acquired, stored };
+  }
+
+  it("does not store a declared secret-ref value that a generic plugin driver returns in its lease metadata", async () => {
+    const resolvedApiKey = "resolved-provider-api-key";
+    const resolvedToken = "resolved-connection-token";
+    const resolvedListToken = "resolved-list-token";
+    const resolvedReplicaToken = "resolved-replica-token";
+    const { acquired, stored } = await acquireGenericPluginLease({
+      remoteCwd: "/workspace",
+      apiKey: resolvedApiKey,
+      connection: { host: "sandbox.example.test", token: resolvedToken },
+      tokens: [resolvedListToken],
+      replicas: [{ host: "replica.example.test", token: resolvedReplicaToken }],
+    });
+
+    expect(stored?.metadata).toMatchObject({
+      pluginKey: "acme.environments",
+      driverKey: "secret-echo-plugin",
+      providerMetadata: {
+        remoteCwd: "/workspace",
+        connection: { host: "sandbox.example.test" },
+        replicas: [{ host: "replica.example.test" }],
+      },
+    });
+    const storedJson = JSON.stringify(stored?.metadata);
+    expect(storedJson).not.toContain(resolvedApiKey);
+    expect(storedJson).not.toContain(resolvedToken);
+    expect(storedJson).not.toContain(resolvedListToken);
+    expect(storedJson).not.toContain(resolvedReplicaToken);
+    expect((stored?.metadata as { providerMetadata: Record<string, unknown> }).providerMetadata).not.toHaveProperty("tokens");
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedApiKey);
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedListToken);
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedReplicaToken);
+  });
+
+  it("stores a withheld marker, and still acquires, when provider lease metadata is nested too deeply to check", async () => {
+    let deep: unknown = "leaf";
+    for (let level = 0; level < 10_000; level += 1) deep = { child: deep };
+
+    const { stored } = await acquireGenericPluginLease({ remoteCwd: "/workspace", deep });
+
+    expect(stored?.metadata).toMatchObject({
+      pluginKey: "acme.environments",
+      driverKey: "secret-echo-plugin",
+      providerMetadata: { withheld: expect.any(String) },
+    });
+    expect(JSON.stringify(stored?.metadata).length).toBeLessThan(2_000);
+  });
+
   it("releases with the driver captured on the lease even if the environment driver changes later", async () => {
     const { companyId, environment, runId } = await seedEnvironment();
     const environmentsSvc = environmentService(db);

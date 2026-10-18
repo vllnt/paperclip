@@ -553,7 +553,7 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       const listed = await request(mineApp).get(`/api/issues/${created}/duplicate-pairs`);
       expect(listed.status).toBe(200);
       expect(listed.body).toHaveLength(1);
-      expect((await request(theirApp).get(`/api/issues/${created}/duplicate-pairs`)).status).toBe(403);
+      expect((await request(theirApp).get(`/api/issues/${created}/duplicate-pairs`)).status).toBe(404);
 
       expect((await request(mineApp).post(`/api/companies/${mine.companyId}/issue-duplicate-pairs/${pair.id}/label`).send({ label: "maybe" })).status).toBe(400);
       expect((await request(mineApp).post(`/api/companies/${mine.companyId}/issue-duplicate-pairs/not-a-uuid/label`).send({ label: "duplicate" })).status).toBe(404);

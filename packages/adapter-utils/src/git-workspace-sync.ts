@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { createWorkspaceManifest, workspacePaths, WorkspaceNulParser, type WorkspacePaths } from "./workspace-manifest.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import { runWorkspaceGitProcess } from "./workspace-git-stream.js";
 
 export interface GitCommandResult {
@@ -209,7 +209,7 @@ export async function disposeGitWorkspaceSnapshot(snapshot: GitWorkspaceSnapshot
   if (!ownedDirectory) return;
   ownedSnapshots.delete(snapshot);
   for (const repository of snapshot.repositories ?? []) await disposeGitWorkspaceSnapshot(repository.snapshot);
-  await fs.rm(ownedDirectory, { recursive: true, force: true });
+  await removePaperclipTempDir(ownedDirectory);
 }
 
 /** Snapshot deadlines include disk backpressure. Operators can allow up to 24h. */
@@ -326,7 +326,7 @@ export async function readGitWorkspaceSnapshot(localDir: string, includeReposito
   } catch (error) {
     writer.close(false);
     for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
-    await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    await removePaperclipTempDir(path.dirname(writer.filePath));
     throw error;
   } finally { options.signal?.removeEventListener("abort", abort); }
 }
@@ -641,7 +641,7 @@ export async function withShallowGitWorkspaceClone<T>(
   },
   fn: (cloneDir: string) => Promise<T>,
 ): Promise<T> {
-  const cloneDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-workspace-"));
+  const cloneDir = await createPaperclipTempDir("paperclip-git-workspace-");
   const tempRef = `refs/paperclip/git-sync/import/${randomUUID()}`;
   try {
     const originUrl = await readSanitizedOriginRemoteUrl(input.localDir);
@@ -704,7 +704,7 @@ export async function withShallowGitWorkspaceClone<T>(
       timeout: 10_000,
       maxBuffer: 16 * 1024,
     }).catch(() => undefined);
-    await fs.rm(cloneDir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(cloneDir).catch(() => undefined);
   }
 }
 

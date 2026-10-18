@@ -1156,3 +1156,60 @@ describe.sequential("operator-hidden plugin management floor", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
   }, 20_000);
 });
+
+describe.sequential("GitHub plugin: the agentMergeablePaths config through the save route", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /** The registry answers with the GitHub plugin's real manifest, so the route runs its real instanceConfigSchema. */
+  async function githubPlugin() {
+    const { default: manifest } = await import("../../../packages/plugins/plugin-github/src/manifest.js");
+    mockRegistry.getById.mockResolvedValue({ id: pluginId, pluginKey: manifest.id, version: manifest.version, status: "ready", manifestJson: manifest });
+    mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+  }
+  const optIn = (allow: string[] = [".github/**"]) => [{ repository: "owner/repo", allow, exclude: [".github/workflows/release.yml"] }];
+  const adminActor = () => boardActor({ userId: "admin-1", isInstanceAdmin: true });
+
+  it("refuses a board user who is not an instance admin, and an agent, before anything is saved", async () => {
+    await githubPlugin();
+    for (const actor of [boardActor(), agentActor()]) {
+      const { app } = await createApp(actor);
+      const res = await request(app).post(`/api/plugins/${pluginId}/config`).send({ companyId: companyA, configJson: { agentMergeablePaths: optIn() } });
+      expect(res.status, JSON.stringify(actor)).toBe(403);
+    }
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it("saves a valid opt-in for an instance admin, exactly as sent", async () => {
+    await githubPlugin();
+    const configJson = { agentMergeablePaths: optIn() };
+    mockRegistry.upsertConfig.mockResolvedValue({ id: "config-1", pluginId, companyId: companyA, configJson });
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app).post(`/api/plugins/${pluginId}/config`).send({ companyId: companyA, configJson });
+
+    expect(res.status).toBe(200);
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, { companyId: companyA, configJson });
+  }, 20_000);
+
+  it.each([
+    ["CODEOWNERS", ["CODEOWNERS"]],
+    ["the CODEOWNERS file under .github", [".github/CODEOWNERS"]],
+    ["CODEOWNERS next to a good path", [".github/**", "docs/CODEOWNERS"]],
+    ["a path outside .github", ["scripts/**"]],
+    ["a path that climbs out of .github", [".github/../scripts/**"]],
+  ])("refuses an instance admin's opt-in that allows %s, and saves nothing", async (_name, allow) => {
+    await githubPlugin();
+    const { app } = await createApp(adminActor());
+
+    const res = await request(app).post(`/api/plugins/${pluginId}/config`).send({ companyId: companyA, configJson: { agentMergeablePaths: optIn(allow) } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/instanceConfigSchema/);
+    expect(res.body.fieldErrors?.length).toBeGreaterThan(0);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
+  }, 20_000);
+});

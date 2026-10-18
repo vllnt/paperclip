@@ -1,6 +1,7 @@
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
+import { selectInCommentBatches } from "../comment-id-batches.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import {
@@ -1295,20 +1296,22 @@ export function recoveryService(
     )
       return false;
     const commentIds = ids as string[];
-    const sources = await db
-      .select({ id: issueComments.id })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, binding.companyId),
-          eq(issueComments.issueId, binding.issueId),
-          inArray(issueComments.id, commentIds),
-          isNull(issueComments.createdByRunId),
-          isNull(issueComments.deletedAt),
-          sql`${issueComments.updatedAt} = ${issueComments.createdAt}`,
-          sql`${issueComments.createdAt} <= (select started_at from heartbeat_runs where id = ${binding.runId})`,
+    const sources = await selectInCommentBatches(commentIds, (batch) =>
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, binding.companyId),
+            eq(issueComments.issueId, binding.issueId),
+            inArray(issueComments.id, batch),
+            isNull(issueComments.createdByRunId),
+            isNull(issueComments.deletedAt),
+            sql`${issueComments.updatedAt} = ${issueComments.createdAt}`,
+            sql`${issueComments.createdAt} <= (select started_at from heartbeat_runs where id = ${binding.runId})`,
+          ),
         ),
-      );
+    );
     if (sources.length !== commentIds.length) return false;
     const [newer, pendingInteraction, pendingApproval] = await Promise.all([
       db
@@ -1616,30 +1619,32 @@ export function recoveryService(
           ].filter((id): id is string => id !== null),
         ),
       ];
-      const comments = await tx
+      // The named ids and the "changed since finalization" window are separate
+      // lookups so the id list can be batched.
+      const inIssue = and(
+        eq(issueComments.companyId, current.companyId),
+        eq(issueComments.issueId, current.id),
+      );
+      const named = await selectInCommentBatches(commentIds, (batch) =>
+        tx.select().from(issueComments).where(and(inIssue, inArray(issueComments.id, batch))),
+      );
+      const changedSince = await tx
         .select()
         .from(issueComments)
         .where(
           and(
-            eq(issueComments.companyId, current.companyId),
-            eq(issueComments.issueId, current.id),
+            inIssue,
             or(
-              commentIds.length
-                ? inArray(issueComments.id, commentIds)
-                : sql`false`,
-              and(
-                or(
-                  isNull(issueComments.createdByRunId),
-                  not(eq(issueComments.createdByRunId, source.id)),
-                ),
-                or(
-                  gt(issueComments.createdAt, proof.finalizedAt),
-                  gt(issueComments.updatedAt, proof.finalizedAt),
-                ),
-              ),
+              isNull(issueComments.createdByRunId),
+              not(eq(issueComments.createdByRunId, source.id)),
+            ),
+            or(
+              gt(issueComments.createdAt, proof.finalizedAt),
+              gt(issueComments.updatedAt, proof.finalizedAt),
             ),
           ),
         );
+      const comments = [...new Map([...named, ...changedSince].map((comment) => [comment.id, comment])).values()];
       if (
         comments.some(
           (comment) =>
@@ -2694,6 +2699,14 @@ export function recoveryService(
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
     return db.transaction(async (tx) => {
+      // A run has no foreign key to its issue. The share lock serializes this
+      // insert with the deferred-wake sweep, which locks the issue row before it
+      // finalizes the issue's parked wakes.
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+        .for("share");
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -3280,6 +3293,13 @@ export function recoveryService(
           created = Boolean(enqueuedRun);
         } else {
           scheduledRun = await db.transaction(async (tx) => {
+            // Serializes with the deferred-wake sweep's issue-row lock; see
+            // ensureProviderQuotaWaitRecoveryMonitor.
+            await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+              .for("share");
             const wakeup = await tx
               .insert(agentWakeupRequests)
               .values({
