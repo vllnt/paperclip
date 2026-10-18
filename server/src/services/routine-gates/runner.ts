@@ -209,7 +209,7 @@ export function createGateRunner(deps: GateRunnerDeps) {
     };
   }
 
-  return { run, resolveConnection };
+  return { run, resolveConnection, resolveEnvironmentId, source: deps.source };
 }
 
 export type GateRunner = ReturnType<typeof createGateRunner>;
