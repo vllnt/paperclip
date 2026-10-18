@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issues, routineEventGroups, routineRuns, routines, routineTriggers } from "@paperclipai/db";
 import {
@@ -98,7 +98,44 @@ export interface EventDispatchInput {
   deliveryId: string | null;
   /** Atomically takes one of the source's new-issues-per-hour slots; false means the budget is spent. */
   consumeStormSlot: () => Promise<boolean>;
+  /** Gives back the slot taken by this dispatch, when the group it was for never opened. */
+  releaseStormSlot?: () => Promise<void>;
   now?: Date;
+}
+
+/**
+ * A comment the event path already posted to an issue. It is written to the run
+ * right after the comment commits, so a sender retry after a failed wake wakes
+ * for this comment instead of posting it again.
+ */
+interface PostedComment {
+  commentId: string;
+  issueId: string;
+  kind: "comment" | "recovery" | "append";
+  wake: boolean;
+  storm: boolean;
+  fingerprint: string;
+}
+
+function readPostedComment(payload: unknown): PostedComment | null {
+  const posted = (payload as { postedComment?: Partial<PostedComment> } | null)?.postedComment;
+  if (
+    !posted ||
+    typeof posted.commentId !== "string" ||
+    typeof posted.issueId !== "string" ||
+    typeof posted.fingerprint !== "string" ||
+    (posted.kind !== "comment" && posted.kind !== "recovery" && posted.kind !== "append")
+  ) {
+    return null;
+  }
+  return {
+    commentId: posted.commentId,
+    issueId: posted.issueId,
+    kind: posted.kind,
+    wake: posted.wake !== false,
+    storm: posted.storm === true,
+    fingerprint: posted.fingerprint,
+  };
 }
 
 interface OpenGroup {
@@ -220,32 +257,49 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
   }
 
   async function dispatch(input: EventDispatchInput): Promise<EventRoutineOutcome> {
+    // Set once this dispatch holds one of the source's new-issue slots.
+    const slot = { taken: false };
+    let outcome: EventRoutineOutcome;
     try {
-      return await dispatchUnsafe(input);
+      outcome = await dispatchUnsafe(input, slot);
     } catch (err) {
       logger.warn({ err, routineId: input.routine.id, deliveryId: input.deliveryId }, "event dispatch failed");
-      return failedOutcome(err);
+      outcome = failedOutcome(err);
     }
+    // The slot pays for a new group. A dispatch that failed opened none, and its retry takes a slot of its own.
+    if (slot.taken && (outcome.status === "failed_transient" || outcome.status === "failed_permanent")) {
+      await Promise.resolve(input.releaseStormSlot?.()).catch((err) =>
+        logger.warn({ err, routineId: input.routine.id }, "failed to release event storm slot"),
+      );
+    }
+    return outcome;
   }
 
-  async function dispatchUnsafe(input: EventDispatchInput): Promise<EventRoutineOutcome> {
+  /** The latest failed attempt of this delivery on this routine that had already posted its comment. */
+  async function findPostedComment(executor: Db, deliveryId: string, routineId: string): Promise<PostedComment | null> {
+    const rows = await executor
+      .select({ triggerPayload: routineRuns.triggerPayload })
+      .from(routineRuns)
+      .where(
+        and(
+          eq(routineRuns.eventDeliveryId, deliveryId),
+          eq(routineRuns.routineId, routineId),
+          eq(routineRuns.status, "failed"),
+          sql`${routineRuns.triggerPayload} -> 'postedComment' is not null`,
+        ),
+      )
+      .orderBy(desc(routineRuns.createdAt))
+      .limit(1);
+    return readPostedComment(rows[0]?.triggerPayload);
+  }
+
+  async function dispatchUnsafe(input: EventDispatchInput, slot: { taken: boolean }): Promise<EventRoutineOutcome> {
     const { routine, trigger, event } = input;
     const now = input.now ?? new Date();
     const prepared = await deps.prepareRoutine(routine);
     const grouping = parseGrouping(trigger.eventGrouping);
     const primaryFingerprint = eventGroupFingerprint(renderEventGroupKey(grouping.groupKey, event));
     const appendTargetId = typeof grouping.issueMode === "object" ? grouping.issueMode.appendToIssueId : null;
-
-    // The storm budget is taken before the transaction: the counter is its own
-    // short statement, so the event_sources row is never locked while an issue
-    // is being created. It is only needed when this event would open a new group.
-    let stormFold = false;
-    if (event.state !== "recovery") {
-      const appendTarget = appendTargetId ? await loadAppendTarget(db, routine, appendTargetId) : null;
-      const existing = await findOpenGroup(db, routine, primaryFingerprint, appendTarget?.id ?? null);
-      // Append mode is not exempt: every new group there is a comment and a wake on a standing issue.
-      if (!existing) stormFold = !(await input.consumeStormSlot());
-    }
 
     return db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -283,6 +337,79 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         }
       }
 
+      // Resolved on first use: a silent repeat opens no run and needs none.
+      let responsibleUserId: string | null | undefined;
+      const resolveResponsible = async () => {
+        if (responsibleUserId === undefined) responsibleUserId = await deps.resolveResponsibleUserId(txDb, routine);
+        return responsibleUserId;
+      };
+      const startRun = async (fingerprint: string, extraPayload: Record<string, unknown> = {}) => {
+        const runResponsibleUserId = await resolveResponsible();
+        const [run] = await txDb
+          .insert(routineRuns)
+          .values({
+            companyId: routine.companyId,
+            routineId: routine.id,
+            triggerId: trigger.id,
+            source: "event",
+            status: "received",
+            triggeredAt: now,
+            eventDeliveryId: input.deliveryId,
+            triggerPayload: { event, groupFingerprint: fingerprint, ...extraPayload },
+            dispatchFingerprint: fingerprint,
+            routineRevisionId: routine.latestRevisionId,
+            responsibleUserId: runResponsibleUserId,
+          })
+          .returning();
+        return run!;
+      };
+      const completeRun = async (
+        run: RoutineRunRow,
+        status: "grouped" | "recovered",
+        issueId: string,
+      ) => {
+        await deps.finalizeRun(run.id, { status, linkedIssueId: issueId, completedAt: now }, txDb);
+        await deps.updateRoutineTouchedState(
+          { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status, issueId },
+          txDb,
+        );
+      };
+      const failRun = async (run: RoutineRunRow, err: unknown, extra: Partial<EventRoutineOutcome>) => {
+        const failure = failedOutcome(err, { ...extra, runId: run.id });
+        await deps.finalizeRun(
+          run.id,
+          { status: "failed", failureReason: failure.error ?? "Event dispatch failed", completedAt: new Date() },
+          txDb,
+        );
+        await deps.updateRoutineTouchedState(
+          { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "failed" },
+          txDb,
+        );
+        return failure;
+      };
+      /** Remembers a committed comment on the run, so a retry after a failed wake does not post it again. */
+      const recordPostedComment = async (run: RoutineRunRow, posted: PostedComment) => {
+        await txDb
+          .update(routineRuns)
+          .set({ triggerPayload: { ...(run.triggerPayload ?? {}), postedComment: posted } })
+          .where(eq(routineRuns.id, run.id));
+      };
+
+      // A retry of a delivery whose comment landed but whose wake failed: only the wake is left to do.
+      const posted = input.deliveryId ? await findPostedComment(txDb, input.deliveryId, routine.id) : null;
+      if (posted) {
+        const run = await startRun(posted.fingerprint, { postedComment: posted, resumedWake: true });
+        try {
+          const current = await currentIssue(txDb, posted.issueId);
+          if (posted.wake && current && isOpenIssue(current)) await wakeForComment(posted.issueId, posted.commentId, current);
+          const status = posted.kind === "recovery" ? "recovered" : "grouped";
+          await completeRun(run, status, posted.issueId);
+          return { status: posted.storm ? "storm_folded" : status, runId: run.id, issueId: posted.issueId };
+        } catch (err) {
+          return failRun(run, err, {});
+        }
+      }
+
       let note: string | null = null;
       let appendTarget: Awaited<ReturnType<typeof loadAppendTarget>> = null;
       if (appendTargetId) {
@@ -294,13 +421,20 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
       let fingerprint = primaryFingerprint;
       let storm = false;
       let open = await findOpenGroup(txDb, routine, fingerprint, appendTarget?.id ?? null);
-      if (!open && stormFold && event.state !== "recovery") {
-        // Folded into this routine's own storm group, never another agent's. An append target is left alone.
-        storm = true;
-        appendTarget = null;
-        fingerprint = eventGroupFingerprint(eventStormGroupKey(event.source));
-        effectiveGrouping = { ...grouping, rewakeOnSeverityIncrease: false, issueMode: "group" };
-        open = await findOpenGroup(txDb, routine, fingerprint, null);
+      if (!open && event.state !== "recovery") {
+        // Only now is a new group about to open, so only now is a slot spent: concurrent repeats of one alert
+        // find the group the first of them opened and cost nothing. The counter is its own short statement on
+        // the root connection, so the event_sources row is never locked while an issue is created. Append
+        // mode is not exempt: every new group there is a comment and a wake on a standing issue.
+        slot.taken = await input.consumeStormSlot();
+        if (!slot.taken) {
+          // Folded into this routine's own storm group, never another agent's. An append target is left alone.
+          storm = true;
+          appendTarget = null;
+          fingerprint = eventGroupFingerprint(eventStormGroupKey(event.source));
+          effectiveGrouping = { ...grouping, rewakeOnSeverityIncrease: false, issueMode: "group" };
+          open = await findOpenGroup(txDb, routine, fingerprint, null);
+        }
       }
 
       const decision: EventGroupDecision = decideEventGroupAction({
@@ -328,23 +462,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         return stampOutcome({ status: storm ? "storm_folded" : "grouped_silent", issueId: open.group.issueId });
       }
 
-      const responsibleUserId = await deps.resolveResponsibleUserId(txDb, routine);
-      const [createdRun] = await txDb
-        .insert(routineRuns)
-        .values({
-          companyId: routine.companyId,
-          routineId: routine.id,
-          triggerId: trigger.id,
-          source: "event",
-          status: "received",
-          triggeredAt: now,
-          eventDeliveryId: input.deliveryId,
-          triggerPayload: { event, groupFingerprint: fingerprint, ...(storm ? { stormFolded: true } : {}) },
-          dispatchFingerprint: fingerprint,
-          routineRevisionId: routine.latestRevisionId,
-          responsibleUserId,
-        })
-        .returning();
+      const createdRun = await startRun(fingerprint, storm ? { stormFolded: true } : {});
 
       let createdIssueId: string | null = null;
       try {
@@ -360,10 +478,18 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
             })
             : renderEventRecoveryComment({ event, wake });
           const comment = await issueSvc.addComment(open.group.issueId, body, {}, { authorType: "system" });
+          await recordPostedComment(createdRun, {
+            commentId: comment.id,
+            issueId: open.group.issueId,
+            kind: decision.kind === "comment" ? "comment" : "recovery",
+            wake,
+            storm,
+            fingerprint,
+          });
           // Re-read after the comment: the issue may have closed meanwhile, and an event never reopens one.
           const current = await currentIssue(txDb, open.group.issueId);
           if (isOpenIssue(current)) {
-            if (wake && current) await wakeForComment(open.group.issueId, comment.id, current);
+            // The group moves on before the wake, so a failed wake does not reopen the cooldown for the next repeat.
             await txDb
               .update(routineEventGroups)
               .set({
@@ -374,12 +500,9 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
                 lastState: event.state,
               })
               .where(eq(routineEventGroups.id, open.group.id));
+            if (wake && current) await wakeForComment(open.group.issueId, comment.id, current);
             const status = decision.kind === "comment" ? "grouped" : "recovered";
-            await deps.finalizeRun(createdRun.id, { status, linkedIssueId: open.group.issueId, completedAt: now }, txDb);
-            await deps.updateRoutineTouchedState(
-              { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status, issueId: open.group.issueId },
-              txDb,
-            );
+            await completeRun(createdRun, status, open.group.issueId);
             return stampOutcome({
               status: storm ? "storm_folded" : status,
               runId: createdRun.id,
@@ -388,15 +511,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           }
           if (decision.kind === "recovery_comment") {
             // Closed while the comment was posted: nothing left to wake.
-            await deps.finalizeRun(
-              createdRun.id,
-              { status: "recovered", linkedIssueId: open.group.issueId, completedAt: now },
-              txDb,
-            );
-            await deps.updateRoutineTouchedState(
-              { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "recovered", issueId: open.group.issueId },
-              txDb,
-            );
+            await completeRun(createdRun, "recovered", open.group.issueId);
             return stampOutcome({ status: "recovered", runId: createdRun.id, issueId: open.group.issueId });
           }
           // A problem that raced a close: fall through to the no-open-issue path, which wakes once, on a new issue.
@@ -415,9 +530,16 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
             {},
             { authorType: "system" },
           );
+          await recordPostedComment(createdRun, {
+            commentId: comment.id,
+            issueId: appendTarget.id,
+            kind: "append",
+            wake: true,
+            storm: false,
+            fingerprint,
+          });
           const current = await currentIssue(txDb, appendTarget.id);
           if (isOpenIssue(current)) {
-            if (current) await wakeForComment(appendTarget.id, comment.id, current);
             await txDb.insert(routineEventGroups).values({
               companyId: routine.companyId,
               routineId: routine.id,
@@ -430,15 +552,8 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
               lastSeverity: event.severity,
               lastState: event.state,
             });
-            await deps.finalizeRun(
-              createdRun.id,
-              { status: "grouped", linkedIssueId: appendTarget.id, completedAt: now },
-              txDb,
-            );
-            await deps.updateRoutineTouchedState(
-              { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "grouped", issueId: appendTarget.id },
-              txDb,
-            );
+            if (current) await wakeForComment(appendTarget.id, comment.id, current);
+            await completeRun(createdRun, "grouped", appendTarget.id);
             return stampOutcome({ status: "grouped", runId: createdRun.id, issueId: appendTarget.id });
           }
           note = "append_target_unavailable";
@@ -456,7 +571,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           status: "todo",
           priority: routine.priority,
           assigneeAgentId: prepared.assigneeAgentId,
-          responsibleUserId,
+          responsibleUserId: await resolveResponsible(),
           trustExplicitResponsibleUserId: true,
           originKind: "routine_execution",
           originId: routine.id,
@@ -498,17 +613,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           // The group row cascades with the issue.
           await txDb.delete(issues).where(eq(issues.id, createdIssueId));
         }
-        const failure = failedOutcome(err, { runId: createdRun.id });
-        await deps.finalizeRun(
-          createdRun.id,
-          { status: "failed", failureReason: failure.error ?? "Event dispatch failed", completedAt: new Date() },
-          txDb,
-        );
-        await deps.updateRoutineTouchedState(
-          { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "failed" },
-          txDb,
-        );
-        return stampOutcome(failure);
+        return stampOutcome(await failRun(createdRun, err, {}));
       }
     });
   }

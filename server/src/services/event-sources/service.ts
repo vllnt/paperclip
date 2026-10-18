@@ -372,8 +372,8 @@ export function eventSourceService(
     return { regular: [...regular.values()], fallback: [...fallbackByRoutine.values()] };
   }
 
-  /** Atomic counter: one short statement, run outside any dispatch transaction. */
-  async function consumeStormSlot(sourceId: string): Promise<boolean> {
+  /** Atomic counter: one short statement on its own connection, never part of a dispatch transaction. */
+  async function consumeStormSlot(sourceId: string): Promise<{ granted: boolean; windowStart: string | null }> {
     const result = await db.execute(sql`
       update event_sources set
         storm_window_start = case
@@ -383,14 +383,30 @@ export function eventSourceService(
           when storm_window_start is null or storm_window_start <= now() - interval '1 hour' then 1
           else least(storm_window_count + 1, max_new_issues_per_hour + 1) end
       where id = ${sourceId}
-      returning storm_window_count, max_new_issues_per_hour
+      returning storm_window_count, max_new_issues_per_hour, storm_window_start::text as window_start
     `);
     const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Array<{
       storm_window_count: number;
       max_new_issues_per_hour: number;
+      window_start: string | null;
     }>;
     const row = rows[0];
-    return !row || Number(row.storm_window_count) <= Number(row.max_new_issues_per_hour);
+    if (!row) return { granted: true, windowStart: null };
+    return {
+      granted: Number(row.storm_window_count) <= Number(row.max_new_issues_per_hour),
+      windowStart: row.window_start ?? null,
+    };
+  }
+
+  /**
+   * Gives back a slot taken in `windowStart` (as the database printed it, microseconds included), for a
+   * dispatch that opened no group. It does nothing once the window has rolled over, and never goes below zero.
+   */
+  async function releaseStormSlot(sourceId: string, windowStart: string): Promise<void> {
+    await db.execute(sql`
+      update event_sources set storm_window_count = greatest(storm_window_count - 1, 0)
+      where id = ${sourceId} and storm_window_start = ${windowStart}::timestamptz
+    `);
   }
 
   // ── ingest ────────────────────────────────────────────────────────────────
@@ -634,6 +650,23 @@ export function eventSourceService(
     return rows.length > 0;
   }
 
+  /** The slot hooks of one dispatch: it can give back only the slot it took itself. */
+  function stormSlotFor(sourceId: string) {
+    let taken: string | null = null;
+    return {
+      consumeStormSlot: async () => {
+        const slot = await consumeStormSlot(sourceId);
+        taken = slot.granted ? slot.windowStart : null;
+        return slot.granted;
+      },
+      releaseStormSlot: async () => {
+        const windowStart = taken;
+        taken = null;
+        if (windowStart) await releaseStormSlot(sourceId, windowStart);
+      },
+    };
+  }
+
   async function processDelivery(
     source: EventSourceRow,
     event: NormalizedEvent,
@@ -657,7 +690,7 @@ export function eventSourceService(
             trigger: subscriber.trigger,
             event,
             deliveryId: claim.deliveryId,
-            consumeStormSlot: () => consumeStormSlot(source.id),
+            ...stormSlotFor(source.id),
             now: new Date(now()),
           }),
         );

@@ -292,6 +292,41 @@ describeEmbeddedPostgres("event source integrity, isolation and retention", () =
       expect(all.filter((i) => i.title.startsWith("Event storm from"))).toHaveLength(1);
     });
 
+    it("charges one slot for concurrent repeats of the same new alert", async () => {
+      const { fx, routine, source, secret } = await setup({ sourceInput: { maxNewIssuesPerHour: 5 } });
+      const results = await Promise.all(
+        Array.from({ length: 4 }, (_, i) => fx.send(source, secret, wireEvent({ eventId: `same-${i}`, dedupeKey: "same" }))),
+      );
+      expect(results.every((r) => r.status === 202)).toBe(true);
+      expect(await fx.issuesFor(routine.id)).toHaveLength(1);
+      const [row] = await db.select().from(eventSources).where(eq(eventSources.id, source.id));
+      expect(row!.stormWindowCount).toBe(1);
+    });
+
+    it("gives the slot back when the dispatch fails, so a sender retry does not spend a second one", async () => {
+      let failWake = true;
+      const fx = await seedEventFixture(db, {
+        beforeWakeup: () => {
+          if (failWake) throw new Error("adapter unavailable");
+        },
+      });
+      const agentId = await fx.createAgent("Responder");
+      const routine = await fx.createRoutine({ assigneeAgentId: agentId });
+      const { source, secret } = await fx.createSource({ maxNewIssuesPerHour: 5 });
+      await fx.subscribe(routine.id, source.id);
+
+      expect((await fx.send(source, secret, wireEvent({ eventId: "r1", dedupeKey: "r" }))).status).toBe(503);
+      expect((await fx.send(source, secret, wireEvent({ eventId: "r1", dedupeKey: "r" }))).status).toBe(503);
+      const [afterFailures] = await db.select().from(eventSources).where(eq(eventSources.id, source.id));
+      expect(afterFailures!.stormWindowCount).toBe(0);
+
+      failWake = false;
+      expect((await fx.send(source, secret, wireEvent({ eventId: "r1", dedupeKey: "r" }))).status).toBe(202);
+      const [afterRetry] = await db.select().from(eventSources).where(eq(eventSources.id, source.id));
+      expect(afterRetry!.stormWindowCount).toBe(1);
+      expect(await fx.issuesFor(routine.id)).toHaveLength(1);
+    });
+
     it("starts a fresh window once the hour has passed", async () => {
       const { fx, routine, source, secret } = await setup({ sourceInput: { maxNewIssuesPerHour: 1 } });
       await fx.send(source, secret, wireEvent({ eventId: "w1", dedupeKey: "w1" }));
