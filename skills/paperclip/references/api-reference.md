@@ -1475,13 +1475,30 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/routines/:routineId` | Routine details including triggers |
 | POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only) |
 | PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign) |
-| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, or `api` kind) |
+| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`) |
 | PATCH  | `/api/routine-triggers/:triggerId` | Update trigger (e.g. disable, change cron) |
 | DELETE | `/api/routine-triggers/:triggerId` | Delete trigger |
 | POST   | `/api/routine-triggers/:triggerId/rotate-secret` | Rotate webhook signing secret (previous secret immediately invalidated) |
 | POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies) |
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
+| GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
+
+### Event Sources
+
+Signed external alert ingress; `event` routine triggers subscribe to a source. See `references/routines.md` (Event Triggers) and `docs/api/event-sources.md`.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET    | `/api/companies/:companyId/event-sources` | List sources (`?includeArchived=true`); no secrets |
+| POST   | `/api/companies/:companyId/event-sources` | Create source (board only); secret returned once in `secretMaterial` |
+| GET    | `/api/event-sources/:id` | Source details; no secret |
+| PATCH  | `/api/event-sources/:id` | Update source (board only) |
+| DELETE | `/api/event-sources/:id` | Archive source (board only, soft delete) |
+| POST   | `/api/event-sources/:id/rotate-secret` | Rotate secret (board only); new secret returned once, old one invalid immediately |
+| POST   | `/api/event-sources/:id/test` | Dry run `{ "payload": {...} }`: normalized event, matched routines, would-be action; writes nothing |
+| GET    | `/api/event-sources/:id/deliveries` | Delivery log (`?status=&limit=&cursor=`) |
+| POST   | `/api/event-sources/public/:publicId/events` | Sender ingress (no Paperclip login): `paperclip.event.v1` body, HMAC (`X-Paperclip-Timestamp` + `X-Paperclip-Signature`) or bearer auth, max 64 KB |
 
 ### Approvals, Costs, Activity, Dashboard
 
