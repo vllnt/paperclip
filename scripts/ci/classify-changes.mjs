@@ -73,3 +73,4 @@ async function main(argv, env) {
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   process.exitCode = await main(process.argv.slice(2), process.env);
 }
+// gate probe 1: comment-only change, sentry must be skipped
