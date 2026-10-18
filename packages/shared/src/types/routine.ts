@@ -1,6 +1,7 @@
 import type { AutomationWakeSettings } from "../automation-wake.js";
 import type { EventGrouping, EventMatch } from "../event-sources.js";
 import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
+import type { RoutineGate, RoutineGateResult } from "../routine-gate.js";
 import type {
   IssueOriginKind,
   IssuePriority,
@@ -94,6 +95,8 @@ export interface Routine {
   env?: RoutineEnvConfig | null;
   automationWakeSettings?: AutomationWakeSettings;
   routineNoopSkipSettings?: RoutineNoopSkipSettings;
+  /** A deterministic pre-wake script; see `RoutineGate`. Board-writable only. */
+  gate?: RoutineGate | null;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
   createdByAgentId: string | null;
@@ -238,6 +241,8 @@ export interface RoutineRun {
   linkedIssueId: string | null;
   coalescedIntoRunId: string | null;
   failureReason: string | null;
+  /** What the routine's gate script did for this run; absent for ungated runs. */
+  gateResult?: RoutineGateResult | null;
   completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
