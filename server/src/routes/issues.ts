@@ -8,6 +8,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { selectInCommentBatches } from "../services/comment-id-batches.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -6973,12 +6974,14 @@ export function issueRoutes(
     }
     const ids = queuedCommentIdsFromWakePayload(wake?.payload);
     if (ids.length === 0) return [];
-    const rows = await executor
-      .select()
-      .from(issueComments)
-      .where(
-        and(eq(issueComments.issueId, issueId), inArray(issueComments.id, ids)),
-      );
+    const rows = await selectInCommentBatches(ids, (batch) =>
+      executor
+        .select()
+        .from(issueComments)
+        .where(
+          and(eq(issueComments.issueId, issueId), inArray(issueComments.id, batch)),
+        ),
+    );
     const byId = new Map(rows.map((row) => [row.id, row]));
     return ids.flatMap((id) => {
       const row = byId.get(id);

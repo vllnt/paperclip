@@ -334,8 +334,11 @@ check runs with the App's read-only token, and refuses unless the head equals
 that SHA exactly, the base branch's classic protection is on and binds
 administrators ("Do not allow bypassing the above settings", `enforce_admins`),
 the base branch requires at least one check, and every required check, from
-rulesets and classic branch protection, concluded `success` in its latest run
-(from the pinned integration when the rule names one). GitHub's branch read
+rulesets and classic branch protection, concluded `success` or `skipped` in its
+latest run (from the pinned integration when the rule names one). `skipped` is a
+job that its path filter or condition skipped, which GitHub passes too; a check
+that never reported, one still running, a commit status that is not `success`,
+and every other conclusion (`neutral` included) do not pass. GitHub's branch read
 (`GET /repos/{owner}/{repo}/branches/{branch}`) never includes `enforce_admins`;
 it reports administrators as bound with
 `protection.required_status_checks.enforcement_level: "everyone"`
@@ -385,6 +388,8 @@ changes as the App user (`gh pr edit --base`/`-B`, the REST `base` field or a
 body Paperclip cannot read, the board and tool edit), so a pull request checked
 against one base cannot be retargeted to `main` before its merge; GraphQL
 `updatePullRequest` is refused like every unchecked mutation.
+
+**Opt-in release of protected paths (`agentMergeablePaths`).** An instance administrator can release some protected files for agent merges in chosen repositories, through the GitHub plugin's company config. The setting is a list of entries `{ repository, allow, exclude }`. `repository` is `owner/name`, matched exactly and without regard to case. `allow` lists paths under `.github/` (for example `.github/**`). `exclude` lists paths that stay refused. The default is an empty list, which behaves as before. The config is read at every merge from the plugin config only, never from the pull request head or a repository file, and the host validates it when it is saved. A protected file is released only when `allow` covers it and no `exclude` does. One file that is not released keeps the refusal for the whole pull request, and the refusal lists only the files that are not released. A rename counts both names. Whatever the config says, these are never released: the CODEOWNERS paths (`CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS`), every path of a control repository (a repository in the control list or with a tiers file on its base branch cannot opt in at all), and the tiers paths. An `allow` entry that names CODEOWNERS or reaches outside `.github/` is refused when the config is saved, and an entry that is not valid at the moment of a merge is dropped whole and releases nothing. Every other check is unchanged: the exact head SHA, the file list read again after the head, auto-merge and the merge queue, the admin-merge rules and the rest of the write-identity gates. The merge evidence records `releasedProtectedFiles` (at most 100, with `releasedProtectedFilesCount`) and `releasedBy: "config:agentMergeablePaths"`. A file-name exclusion is a speed bump, not a boundary: a new workflow file or a local action can still reach production. The boundary is GitHub's environment protection (required reviewers) on the deployment.
 
 **Fence check.** At authorization, on save and hourly (from the sync job), the
 plugin compares what the user token reaches with the policy: the user, exactly
