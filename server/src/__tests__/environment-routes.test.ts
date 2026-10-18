@@ -2614,7 +2614,7 @@ describe("environment routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockEnvironmentService.listLeases).toHaveBeenCalledWith(environment.id, {
-      status: "active",
+      status: ["active"],
     });
   });
 

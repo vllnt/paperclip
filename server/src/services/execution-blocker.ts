@@ -6,6 +6,7 @@ import { agentWakeupRequests, chatConversations, chatEndpoints, heartbeatRuns, i
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 import { EXECUTION_RECONCILIATION_CAUSES, type ExecutionBlocker } from "@paperclipai/shared";
 
 /** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
@@ -16,6 +17,32 @@ export function executionBlockerPredicate() {
     or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
       sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
   );
+}
+
+/** Comment ids already sent to a run of this issue (optionally one agent's).
+ * A queued turn cancelled before dispatch has not consumed input, whatever
+ * cancelled it (pause, stale assignment, or rejected admission). Reserved
+ * native identity/process metadata is not proof that its prompt was sent.
+ * Bounded by the issue's run count, not its comment count. */
+export async function consumedWakeCommentIds(db: Db, companyId: string, issueId: string, agentId?: string): Promise<Set<string>> {
+  const runs = await db.select({
+    wakeCommentId: sql<unknown>`${heartbeatRuns.contextSnapshot}->'wakeCommentId'`,
+    wakeCommentIds: sql<unknown>`${heartbeatRuns.contextSnapshot}->'wakeCommentIds'`,
+  }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId),
+    agentId ? eq(heartbeatRuns.agentId, agentId) : undefined,
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+    sql`not (${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null)`,
+    sql`(${heartbeatRuns.contextSnapshot} ? 'wakeCommentId' or ${heartbeatRuns.contextSnapshot} ? 'wakeCommentIds')`,
+  ));
+  const consumed = new Set<string>();
+  for (const { wakeCommentId, wakeCommentIds } of runs) {
+    if (typeof wakeCommentId === "string") consumed.add(wakeCommentId);
+    if (Array.isArray(wakeCommentIds)) {
+      for (const id of wakeCommentIds) if (typeof id === "string") consumed.add(id);
+    }
+  }
+  return consumed;
 }
 
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
@@ -70,15 +97,14 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     return [...queuedCommentIdsFromWakePayload(entry.payload), entry.payload?.commentId, context?.wakeCommentId]
       .filter((id): id is string => z.string().guid().safeParse(id).success);
   }))];
-  const saved = savedIds.length ? await db.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-    inArray(issueComments.id, savedIds), eq(issueComments.authorType, "user"), sql`${issueComments.deletedAt} is null`,
-    sql`not exists (select 1 from ${heartbeatRuns} consumed where consumed.company_id = ${companyId}
-      and consumed.context_snapshot->>'issueId' = ${issueId}
-      and not (consumed.status = 'cancelled' and consumed.started_at is null)
-      and (consumed.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text
-        or consumed.context_snapshot->'wakeCommentIds' @> jsonb_build_array(${issueComments.id}::text)))`,
-  )) : [];
+  // Saved ids grow with the issue. Drop consumed ones in memory, then look the
+  // rest up in bounded batches.
+  const consumed = savedIds.length ? await consumedWakeCommentIds(db, companyId, issueId) : new Set<string>();
+  const saved = await selectInCommentBatches(savedIds.filter(id => !consumed.has(id)), batch => db.select({ id: issueComments.id })
+    .from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+      inArray(issueComments.id, batch), eq(issueComments.authorType, "user"), sql`${issueComments.deletedAt} is null`,
+    )));
   const cancellation = run ? readRunCancellation(run.resultJson) : null;
   const eligibleContinuation = Boolean(run && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && canContinueCancelledRun(run));

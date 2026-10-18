@@ -279,7 +279,7 @@ export function PasteConfigTab({ companyId }: { companyId: string }) {
           spellCheck={false}
           rows={10}
           placeholder={SAMPLE_CONFIG}
-          className="min-h-(--sz-220px) bg-slate-900 font-mono text-(length:--text-compact) leading-relaxed text-slate-100 placeholder:text-slate-500 focus-visible:ring-slate-400"
+          className="min-h-(--sz-220px) bg-muted font-mono text-(length:--text-compact) leading-relaxed text-foreground placeholder:text-muted-foreground focus-visible:ring-ring"
         />
         {localParseError ? (
           <p className="text-xs text-amber-600">{localParseError}</p>
