@@ -243,7 +243,8 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
     if (event.state !== "recovery") {
       const appendTarget = appendTargetId ? await loadAppendTarget(db, routine, appendTargetId) : null;
       const existing = await findOpenGroup(db, routine, primaryFingerprint, appendTarget?.id ?? null);
-      if (!existing && !appendTarget) stormFold = !(await input.consumeStormSlot());
+      // Append mode is not exempt: every new group there is a comment and a wake on a standing issue.
+      if (!existing) stormFold = !(await input.consumeStormSlot());
     }
 
     return db.transaction(async (tx) => {
@@ -293,9 +294,10 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
       let fingerprint = primaryFingerprint;
       let storm = false;
       let open = await findOpenGroup(txDb, routine, fingerprint, appendTarget?.id ?? null);
-      if (!open && stormFold && event.state !== "recovery" && !appendTarget) {
-        // Folded into this routine's own storm group, never another agent's.
+      if (!open && stormFold && event.state !== "recovery") {
+        // Folded into this routine's own storm group, never another agent's. An append target is left alone.
         storm = true;
+        appendTarget = null;
         fingerprint = eventGroupFingerprint(eventStormGroupKey(event.source));
         effectiveGrouping = { ...grouping, rewakeOnSeverityIncrease: false, issueMode: "group" };
         open = await findOpenGroup(txDb, routine, fingerprint, null);

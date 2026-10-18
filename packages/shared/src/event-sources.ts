@@ -121,7 +121,16 @@ const eventUrlSchema = z
     } catch {
       return false;
     }
-  }, { message: "url must be an http(s) URL" });
+  }, { message: "url must be an http(s) URL" })
+  // Credentials in the userinfo, the query or the fragment never reach storage, audit rows or an agent.
+  .transform((value) => {
+    const parsed = new URL(value);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  });
 
 /** Wire format of the `generic_v1` normalizer, the contract for every sender we write. */
 export const genericV1EventSchema = z.object({

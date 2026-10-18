@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createDb, eventDeliveries, issues, routineRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture, wireEvent } from "./helpers/event-source-fixture.js";
 import {
+  failureKeyForIp,
   EVENT_AUTH_FAILURE_GLOBAL_PER_MINUTE,
   EVENT_AUTH_FAILURE_PER_IP_PER_MINUTE,
   EVENT_DELIVERY_LEASE_MS,
@@ -224,6 +225,75 @@ describeEmbeddedPostgres("event source ingest: auth, idempotency and delivery cl
         })).status;
       }
       expect(status).toBe(429);
+    });
+  });
+
+  describe("unknown sources", () => {
+    const ghostRequest = (publicId: string, ip: string) => ({
+      publicId,
+      ip,
+      authorizationHeader: "Bearer x",
+      signatureHeader: undefined,
+      timestampHeader: undefined,
+      rawBody: Buffer.from("{}"),
+      body: {},
+    });
+
+    it("answers a flood of random public ids without touching the database", async () => {
+      const { fx, source, secret } = await setup();
+      // Warm the source map with a real delivery, then watch every query.
+      expect((await fx.send(source, secret, wireEvent({ eventId: "warm" }))).status).toBe(202);
+      const select = vi.spyOn(fx.db, "select");
+      const execute = vi.spyOn(fx.db, "execute");
+      const insert = vi.spyOn(fx.db, "insert");
+      try {
+        for (let i = 0; i < 200; i += 1) {
+          const result = await fx.sources.ingest(ghostRequest(`ghost-${i}`, `192.0.2.${i % 250}`));
+          expect([404, 429]).toContain(result.status);
+        }
+        expect(select).not.toHaveBeenCalled();
+        expect(execute).not.toHaveBeenCalled();
+        expect(insert).not.toHaveBeenCalled();
+      } finally {
+        select.mockRestore();
+        execute.mockRestore();
+        insert.mockRestore();
+      }
+    });
+
+    it("sees a source created by this process at once, without waiting for the backstop reload", async () => {
+      const fx = await seedEventFixture(db);
+      const agentId = await fx.createAgent();
+      const routine = await fx.createRoutine({ assigneeAgentId: agentId });
+      const first = await fx.createSource({ name: "first" });
+      await fx.subscribe(routine.id, first.source.id);
+      expect((await fx.send(first.source, first.secret, wireEvent({ eventId: "1" }))).status).toBe(202);
+
+      const second = await fx.createSource({ name: "second" });
+      await fx.subscribe(routine.id, second.source.id);
+      expect((await fx.send(second.source, second.secret, wireEvent({ eventId: "2" }))).status).toBe(202);
+    });
+
+    it("keys an IPv6 client by its /64 and an IPv4-mapped address as the IPv4 client", () => {
+      expect(failureKeyForIp("2001:db8:1:2:aaaa:bbbb:cccc:dddd")).toBe(failureKeyForIp("2001:db8:1:2::1"));
+      expect(failureKeyForIp("2001:db8:1:2::1")).not.toBe(failureKeyForIp("2001:db8:1:3::1"));
+      expect(failureKeyForIp("2001:DB8:1:2::1")).toBe(failureKeyForIp("2001:db8:1:2::1"));
+      expect(failureKeyForIp("::ffff:198.51.100.9")).toBe(failureKeyForIp("198.51.100.9"));
+      expect(failureKeyForIp("198.51.100.9")).toBe("ip:198.51.100.9");
+      expect(failureKeyForIp(null)).toBe("ip:unknown");
+    });
+
+    it("cannot reset the shared failure ceiling by rotating client addresses", async () => {
+      const { fx, source, secret } = await setup();
+      // Fill the global budget with many addresses, then keep rotating well past the limiter's key capacity.
+      for (let i = 0; i < EVENT_AUTH_FAILURE_GLOBAL_PER_MINUTE; i += 1) {
+        await fx.send(source, secret, wireEvent(), { secretOverride: "bad", ip: `2001:db8:${(i >> 8).toString(16)}:${(i & 255).toString(16)}::1` });
+      }
+      for (let i = 0; i < 300; i += 1) {
+        await fx.send(source, secret, wireEvent(), { secretOverride: "bad", ip: `2001:db9:${i.toString(16)}::1` });
+      }
+      const next = await fx.send(source, secret, wireEvent(), { secretOverride: "bad", ip: "2001:dba::1" });
+      expect(next.status).toBe(429);
     });
   });
 

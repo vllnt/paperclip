@@ -33,7 +33,8 @@ async function deleteInBatches(db: Db, build: (limit: number) => ReturnType<type
 /**
  * Deletes, in batches of at most 5000: delivery rows older than their source's
  * `retentionDays`, event groups whose issue has been closed for more than 30
- * days, and webhook test receipts past their replay window. Idempotent and
+ * days (or that sit on a standing append-mode issue and have been idle that
+ * long), and webhook test receipts past their replay window. Idempotent and
  * safe to run from every server instance.
  */
 export async function pruneEventData(db: Db, nowDate: Date = new Date()): Promise<EventPruneResult> {
@@ -59,6 +60,11 @@ export async function pruneEventData(db: Db, nowDate: Date = new Date()): Promis
       join issues i on i.id = g.issue_id
       where (i.status = 'done' and i.completed_at < ${now} - make_interval(days => ${EVENT_GROUP_CLOSED_RETENTION_DAYS}))
          or (i.status = 'cancelled' and i.cancelled_at < ${now} - make_interval(days => ${EVENT_GROUP_CLOSED_RETENTION_DAYS}))
+         or (
+           -- A group on a standing (append-mode) issue never closes with it, so it ages out by idleness.
+           g.last_seen_at < ${now} - make_interval(days => ${EVENT_GROUP_CLOSED_RETENTION_DAYS})
+           and (i.origin_kind is distinct from 'routine_execution' or i.origin_id is distinct from g.routine_id::text)
+         )
       limit ${limit}
     )
     returning id

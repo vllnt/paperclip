@@ -1,3 +1,4 @@
+import { isIPv6 } from "node:net";
 import crypto from "node:crypto";
 import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -142,9 +143,29 @@ function sha256Hex(value: string) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
+const GLOBAL_FAILURE_KEY = "global";
+
+/**
+ * The per-client failure bucket. An IPv6 client owns a whole /64, so addresses
+ * inside one are one client; an IPv4-mapped address is the IPv4 client.
+ */
+export function failureKeyForIp(ip: string | null): string {
+  if (!ip) return "ip:unknown";
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return `ip:${mapped[1]}`;
+  if (!isIPv6(ip)) return `ip:${ip}`;
+  const [head = "", tail = ""] = ip.split("::");
+  const headGroups = head === "" ? [] : head.split(":");
+  const tailGroups = ip.includes("::") ? (tail === "" ? [] : tail.split(":")) : [];
+  const groups = ip.includes("::")
+    ? [...headGroups, ...Array(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill("0"), ...tailGroups]
+    : headGroups;
+  return `ip:${groups.slice(0, 4).map((group) => group.toLowerCase().replace(/^0+(?=.)/, "")).join(":")}::/64`;
+}
+
 interface CachedSource {
   row: EventSourceRow;
-  /** `null` when the source has no resolvable secret: every request then fails authentication. */
+  /** `null` when the source has no secret (every request fails authentication) or its secret could not be resolved (503). */
   secret: string | null;
 }
 
@@ -199,7 +220,8 @@ export function eventSourceService(
   const now = deps.now ?? Date.now;
   const secretsSvc = secretService(db);
   const routinesSvc = routineService(db, { heartbeat: deps.heartbeat, pluginWorkerManager: deps.pluginWorkerManager });
-  const failureLimiter = createSlidingWindowLimiter({ now });
+  // The shared ceiling is pinned: a sender rotating client keys must not be able to evict and so reset it.
+  const failureLimiter = createSlidingWindowLimiter({ now, pinnedKeys: [GLOBAL_FAILURE_KEY] });
   const sourceLimiter = createSlidingWindowLimiter({ now });
   const rejectCounters = createRejectCounters({ now });
   const dispatchGate = createSemaphore(EVENT_DISPATCH_CONCURRENCY);
@@ -219,27 +241,29 @@ export function eventSourceService(
     });
   }
 
-  async function loadCachedSource(row: EventSourceRow | null): Promise<CachedSource | null> {
-    // Unknown, disabled and archived sources are indistinguishable to a caller.
-    if (!row || row.archived || !row.enabled) return null;
-    return { row, secret: await resolveSourceSecret(row) };
-  }
-
   const cache = createEventSourceCache<CachedSource>({
     now,
-    load: async (publicId) => {
-      const row = await db.select().from(eventSources).where(eq(eventSources.publicId, publicId)).then((rows) => rows[0] ?? null);
-      return loadCachedSource(row);
-    },
-    loadAll: async () => {
+    loadAll: async (previous) => {
       const rows = await db.select().from(eventSources).where(and(eq(eventSources.enabled, true), eq(eventSources.archived, false)));
+      const previousById = new Map([...previous.values()].map((value) => [value.row.id, value]));
       const loaded: Array<{ publicId: string; value: CachedSource }> = [];
       for (const row of rows) {
         try {
-          const value = await loadCachedSource(row);
-          if (value) loaded.push({ publicId: row.publicId, value });
+          // Resolving a secret writes an access event, so a secret that has not rotated is reused.
+          const before = previousById.get(row.id);
+          const unchanged =
+            before !== undefined &&
+            before.secret !== null &&
+            before.row.secretId === row.secretId &&
+            before.row.lastRotatedAt?.getTime() === row.lastRotatedAt?.getTime();
+          loaded.push({
+            publicId: row.publicId,
+            value: { row, secret: unchanged ? before.secret : await resolveSourceSecret(row) },
+          });
         } catch (err) {
-          logger.warn({ err, eventSourceId: row.id }, "failed to preload event source secret");
+          // Kept without a secret, so the sender gets a retryable 503 and the next reload tries again.
+          logger.warn({ err, eventSourceId: row.id }, "failed to resolve event source secret");
+          loaded.push({ publicId: row.publicId, value: { row, secret: null } });
         }
       }
       return loaded;
@@ -372,9 +396,8 @@ export function eventSourceService(
   // ── ingest ────────────────────────────────────────────────────────────────
 
   function failAuth(source: EventSourceRow | null, ip: string | null, outcome: "unauthorized" | "not_found"): IngestResult {
-    const ipKey = `ip:${ip ?? "unknown"}`;
-    const perIp = failureLimiter.consume(ipKey, EVENT_AUTH_FAILURE_PER_IP_PER_MINUTE);
-    const global = failureLimiter.consume("global", EVENT_AUTH_FAILURE_GLOBAL_PER_MINUTE);
+    const perIp = failureLimiter.consume(failureKeyForIp(ip), EVENT_AUTH_FAILURE_PER_IP_PER_MINUTE);
+    const global = failureLimiter.consume(GLOBAL_FAILURE_KEY, EVENT_AUTH_FAILURE_GLOBAL_PER_MINUTE);
     if (!perIp.allowed || !global.allowed) {
       countReject(source, "auth_failure_rate_limited", ip);
       const retryAfter = Math.max(perIp.retryAfterSeconds, global.retryAfterSeconds, 1);
@@ -390,6 +413,16 @@ export function eventSourceService(
       : { status: 401, body: { error: "unauthorized" } };
   }
 
+  /** A sender must never turn a normalizer defect into a 500, on the public path or in a dry run. */
+  function safeNormalize(source: EventSourceRow, body: unknown, at: Date): ReturnType<typeof normalizeEvent> {
+    try {
+      return normalizeEvent(source, body, at);
+    } catch (err) {
+      logger.warn({ err, sourceId: source.id }, "event normalizer threw");
+      return { ok: false, errors: ["event could not be normalized"] };
+    }
+  }
+
   async function ingest(request: IngestRequest): Promise<IngestResult> {
     const startedAt = now();
     let cached: CachedSource | null;
@@ -401,6 +434,9 @@ export function eventSourceService(
     }
     if (!cached) return failAuth(null, request.ip, "not_found");
     const source = cached.row;
+    if (source.secretId && cached.secret === null) {
+      return { status: 503, body: { error: "unavailable" }, headers: { "Retry-After": "5" } };
+    }
 
     // Authenticate before any shared budget is spent.
     let authenticated = false;
@@ -435,14 +471,7 @@ export function eventSourceService(
       };
     }
 
-    let normalized: ReturnType<typeof normalizeEvent>;
-    try {
-      normalized = normalizeEvent(source, request.body, new Date(startedAt));
-    } catch (err) {
-      // A sender must never turn a normalizer defect into a 500.
-      logger.warn({ err, sourceId: source.id }, "event normalizer threw");
-      normalized = { ok: false, errors: ["event could not be normalized"] };
-    }
+    const normalized = safeNormalize(source, request.body, new Date(startedAt));
     if (!normalized.ok) {
       await db.insert(eventDeliveries).values({
         companyId: source.companyId,
@@ -702,7 +731,7 @@ export function eventSourceService(
 
   async function dryRun(sourceId: string, payload: Record<string, unknown>): Promise<EventSourceDryRunResult> {
     const source = await getSourceRow(sourceId);
-    const normalized = normalizeEvent(source, payload, new Date(now()));
+    const normalized = safeNormalize(source, payload, new Date(now()));
     if (!normalized.ok) {
       return { event: null, validationErrors: normalized.errors, matched: [], fallback: [], wouldBe: "invalid" };
     }

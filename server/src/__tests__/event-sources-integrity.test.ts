@@ -236,6 +236,31 @@ describeEmbeddedPostgres("event source integrity, isolation and retention", () =
       expect(storm!.assigneeAgentId).toBe(agentId);
     });
 
+    it("applies the breaker to appendToIssueId too: past the budget new groups fold into the routine's storm issue and the standing issue is left alone", async () => {
+      const fx = await seedEventFixture(db);
+      const agentId = await fx.createAgent();
+      const routine = await fx.createRoutine({ assigneeAgentId: agentId });
+      const { source, secret } = await fx.createSource({ maxNewIssuesPerHour: 2 });
+      const target = await fx.issueSvc.create(fx.companyId, { projectId: fx.projectId, title: "ongoing", status: "todo", priority: "medium", assigneeAgentId: agentId } as never);
+      await fx.subscribe(routine.id, source.id, { grouping: { issueMode: { appendToIssueId: target.id }, repeatCommentCooldownSec: 600 } });
+
+      const statuses: string[] = [];
+      for (const key of ["a1", "a2", "a3", "a4", "a5"]) {
+        statuses.push(outcomeOf(await fx.send(source, secret, wireEvent({ eventId: key, dedupeKey: key }))).status);
+      }
+
+      expect(statuses).toEqual(["grouped", "grouped", "storm_folded", "storm_folded", "storm_folded"]);
+      // Only the two budgeted alerts reached the standing issue, its assignee was woken for those two only.
+      expect(await commentsOf(target.id)).toHaveLength(2);
+      expect(fx.wakeups.filter((w) => w.opts.contextSnapshot?.taskId === target.id)).toHaveLength(2);
+      const storm = (await fx.issuesFor(routine.id)).filter((i) => i.title.startsWith("Event storm from"));
+      expect(storm).toHaveLength(1);
+      expect(storm[0]!.assigneeAgentId).toBe(agentId);
+      // Group rows are bounded by the budget as well.
+      const groups = await db.select().from(routineEventGroups).where(eq(routineEventGroups.routineId, routine.id));
+      expect(groups.filter((g) => g.issueId === target.id)).toHaveLength(2);
+    });
+
     it("keeps the storm group per routine so another agent never receives the fold", async () => {
       const fx = await seedEventFixture(db);
       const agentA = await fx.createAgent("A");
@@ -571,6 +596,28 @@ describeEmbeddedPostgres("event source integrity, isolation and retention", () =
       // The source is untouched by pruning.
       const sources = await db.select().from(eventSources).where(and(eq(eventSources.id, source.id), isNull(eventSources.secretId)));
       expect(sources).toHaveLength(0);
+    });
+
+    it("ages out groups on a standing append-mode issue by idleness, and keeps idle groups of the routine's own open issues", async () => {
+      const { fx, routine, source, secret } = await setup();
+      const day = 24 * 3_600_000;
+      await fx.send(source, secret, wireEvent({ eventId: "own", dedupeKey: "own" }));
+      const [ownGroup] = await db.select().from(routineEventGroups).where(eq(routineEventGroups.routineId, routine.id));
+      await db.update(routineEventGroups).set({ lastSeenAt: new Date(Date.now() - 90 * day) }).where(eq(routineEventGroups.id, ownGroup!.id));
+
+      const standing = await fx.issueSvc.create(fx.companyId, { projectId: fx.projectId, title: "standing", status: "todo", priority: "medium" } as never);
+      const base = { companyId: fx.companyId, routineId: routine.id, issueId: standing.id, lastSeverity: "critical", lastState: "problem" };
+      await db.insert(routineEventGroups).values([
+        { ...base, fingerprint: "event:idle-append", lastSeenAt: new Date(Date.now() - 40 * day) },
+        { ...base, fingerprint: "event:active-append", lastSeenAt: new Date(Date.now() - 1 * day) },
+      ]);
+
+      await pruneEventData(db, new Date());
+
+      const fingerprints = (await db.select().from(routineEventGroups).where(eq(routineEventGroups.routineId, routine.id))).map((row) => row.fingerprint);
+      expect(fingerprints).toContain(ownGroup!.fingerprint);
+      expect(fingerprints).toContain("event:active-append");
+      expect(fingerprints).not.toContain("event:idle-append");
     });
 
     it("is idempotent", async () => {

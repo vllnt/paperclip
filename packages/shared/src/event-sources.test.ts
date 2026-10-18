@@ -565,6 +565,16 @@ describe("genericV1EventSchema", () => {
       expect(genericV1EventSchema.safeParse(validGenericBody({ url: "http://example.com" })).success).toBe(true);
     });
 
+    it.each([
+      ["userinfo", "https://user:s3cret@example.com/health", "https://example.com/health"],
+      ["a username only", "https://token@example.com/health", "https://example.com/health"],
+      ["a query token", "https://example.com/health?token=abc123&env=prod", "https://example.com/health"],
+      ["a fragment", "https://example.com/health#access_token=abc", "https://example.com/health"],
+      ["all of them", "http://u:p@example.com:8080/a/b?x=1#y", "http://example.com:8080/a/b"],
+    ])("removes credentials before the url is stored: %s", (_label, url, expected) => {
+      expect(genericV1EventSchema.parse(validGenericBody({ url })).url).toBe(expected);
+    });
+
     it.each(["ftp://example.com", "javascript:alert(1)", "not a url", "example.com/path", ""])(
       "rejects %j",
       (url) => {

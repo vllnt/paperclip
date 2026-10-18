@@ -39,8 +39,17 @@ export function eventSourceBodyParser(captureRawBody: (req: Request, res: Respon
         next(unsupportedMediaType("Encoded event bodies are not supported"));
         return;
       }
+      if (parserError.type === "charset.unsupported") {
+        next(unsupportedMediaType("Event bodies must be UTF-8 JSON"));
+        return;
+      }
       if (parserError.type === "entity.parse.failed" || parserError instanceof SyntaxError) {
         next(badRequest("Event body must be valid JSON"));
+        return;
+      }
+      // Any other client-side parser error (aborted request, wrong size) is the sender's fault, never a crash report.
+      if (typeof parserError.status === "number" && parserError.status >= 400 && parserError.status < 500) {
+        next(badRequest("Event body could not be read"));
         return;
       }
       next(error);

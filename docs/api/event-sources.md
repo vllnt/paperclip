@@ -191,7 +191,7 @@ For a bearer source, replace the two signature headers with `-H "Authorization: 
 | `summary` | no | Max 4000 chars; control characters other than tab and newline removed |
 | `labels` | no | Max 32 pairs; keys `[a-z0-9_]{1,64}`, values max 256 and single-line |
 | `occurredAt` | no | ISO 8601 with offset; defaults to receipt time |
-| `url` | no | `http(s)`, max 2048, no whitespace; shown only if public `https` (see [rendering](#untrusted-content-rendering)). The server never fetches it |
+| `url` | no | `http(s)`, max 2048, no whitespace. Credentials (`user:pass@`), the query and the fragment are removed before the event is stored. Shown only if public `https` (see [rendering](#untrusted-content-rendering)). The server never fetches it |
 
 Unknown top-level fields are ignored. Pinned labels are merged last; the label total, including pinned ones, may not exceed 32.
 
@@ -237,14 +237,14 @@ A mapped endpoint gets its `type`, optional `severity` and `labels`. An unmapped
 | `202` | `{ "deliveryId", "matched", "fallback", "outcomes": [...] }` | Accepted. `matched` counts routines that matched via regular triggers, `fallback` says whether fallback triggers took over, each outcome has `routineId`, `status`, `issueId`, `failureClass`, `note`. Zero matches and no fallback is still `202` (delivery `unrouted`); so is a delivery where every routine failed permanently (delivery `failed`, outcomes show `failed_permanent`) |
 | `200` | `{ "duplicate": true }` | Delivery already processed (terminal state); nothing was done |
 | `400` | `{ "error", "details" }` | Not valid JSON or not a JSON object. Checked before authentication |
-| `401` | `{ "error": "unauthorized" }` | Bad secret, bad or replayed signature, stale timestamp, or the source has no resolvable secret |
+| `401` | `{ "error": "unauthorized" }` | Bad secret, bad signature, stale timestamp, or a source with no secret. An exact replay of a signed request is not a `401`: it is a `200` duplicate |
 | `404` | `{ "error": "not_found" }` | Unknown, disabled or archived source (indistinguishable) |
 | `409` | `{ "inProgress": true }` + `Retry-After: 30` | Another attempt holds this delivery. Retry |
 | `413` | `{ "error", "details": { "code": "event_body_too_large" } }` | Body over 64 KB. Checked before authentication |
-| `415` | `{ "error" }` | Not `application/json`, or content-encoded. Checked before authentication |
+| `415` | `{ "error" }` | Not `application/json`, a charset other than UTF-8, or content-encoded. Checked before authentication |
 | `422` | `{ "error": "invalid_event", "details": ["field: reason", ...] }` | Authenticated but fails normalization or validation; recorded as an `invalid` delivery |
 | `429` | `{ "error": "too_many_failed_requests" }` or `{ "error": "rate_limited" }` + `Retry-After` | Auth-failure budget exceeded, or the source's `rateLimitPerMinute` exceeded |
-| `503` | `{ "error": "dispatch_failed", "deliveryId", "outcomes" }` + `Retry-After: 30` | A transient dispatch failure; fallback did not run; retry. `{ "error": "unavailable" }` + `Retry-After: 5` if the source lookup failed |
+| `503` | `{ "error": "dispatch_failed", "deliveryId", "outcomes" }` + `Retry-After: 30` | A transient dispatch failure; fallback did not run; retry. `{ "error": "unavailable" }` + `Retry-After: 5` if the source list could not be loaded or the source's secret could not be resolved |
 
 Responses carry `Cache-Control: no-store`.
 
@@ -261,9 +261,10 @@ Outcomes of a repeated key: a delivery that finished (`dispatched`, `grouped_sil
 ## Rate limits and abuse resistance
 
 - Authentication runs first. A request that authenticates is never charged to any failure or shared budget, so a flood of bad requests behind the same proxy IP cannot lock out a real sender.
-- A request that fails authentication (including unknown public IDs) is charged to a per-IP failure budget (60 per minute) and a global one (600 per minute). Within budget the answer is `401`/`404`; beyond it `429` with `Retry-After`. The per-IP key is `req.ip`; set `TRUST_PROXY` correctly behind a reverse proxy.
+- A request that fails authentication (including unknown public IDs) is charged to a per-IP failure budget (60 per minute) and a global one (600 per minute). Within budget the answer is `401`/`404`; beyond it `429` with `Retry-After`. The per-IP key is `req.ip` (an IPv6 client is keyed by its /64); set `TRUST_PROXY` correctly behind a reverse proxy. The global ceiling cannot be reset by rotating client addresses.
 - An authenticated request is charged to the source's `rateLimitPerMinute` (sliding 60 s window): `429 {"error":"rate_limited"}` with `Retry-After`.
-- Limits, the source cache and the reject counters are per server process.
+- Authentication never queries the database per request. Every enabled source and its secret is held in memory; an unknown public ID is answered from that map. The map reloads as a whole after any source create, update, rotate or archive (so a rotated or disabled source stops working at once) and every 30 s as a backstop for writes made by another instance.
+- Limits, the source map and the reject counters are per server process.
 - Rejected and duplicate requests write no per-request rows. They are counted in memory and flushed as one `rejected_aggregate` delivery row per source per minute with `rejectCounts` (`unauthorized`, `not_found`, `auth_failure_rate_limited`, `rate_limited`, `duplicate`) and the first and last IP. Requests to unknown public IDs are only logged in aggregate. Counters are lost on a crash.
 - Public IDs are redacted in HTTP logs.
 
@@ -347,7 +348,7 @@ These are re-checked at dispatch, because the routine can change after the trigg
 
 ### Storm breaker
 
-At most `maxNewIssuesPerHour` new alert groups are opened per source per hour; a routine that would open a new group consumes one slot (recoveries and `appendToIssueId` do not). Beyond it, new groups fold into that routine's own group `storm:<event.source>`: one "Event storm from <source>" issue per routine, receiving digest comments by the same cooldown (outcome `storm_folded`). Alerts for an already open group are unaffected, and one agent's storm never lands on another agent's issue. The window is one hour from the first slot; the counter is an atomic update.
+At most `maxNewIssuesPerHour` new alert groups are opened per source per hour; a routine that would open a new group consumes one slot, in group mode and in `appendToIssueId` mode (recoveries do not). Beyond it, new groups fold into that routine's own group `storm:<event.source>`: one "Event storm from <source>" issue per routine, receiving digest comments by the same cooldown (outcome `storm_folded`). In `appendToIssueId` mode the storm issue is a normal issue owned by the routine's agent; the standing issue is left alone. Alerts for an already open group are unaffected, and one agent's storm never lands on another agent's issue. The window is one hour from the first slot; the counter is an atomic update.
 
 ## Untrusted content rendering
 
@@ -356,7 +357,7 @@ Event text reaches an LLM and is treated as untrusted. Issue descriptions and co
 ## Audit and retention
 
 - `event_deliveries` holds one row per authenticated delivery (plus the aggregate reject rows) and doubles as the replay receipt.
-- An hourly job (first run 2 minutes after start) deletes in batches of at most 5000: delivery rows older than the source's `retentionDays`, event groups whose issue was closed more than 30 days ago, and routine webhook test receipts older than 7 days.
+- An hourly job (first run 2 minutes after start) deletes in batches of at most 5000: delivery rows older than the source's `retentionDays`, event groups whose issue was closed more than 30 days ago (or that sit on an `appendToIssueId` issue and were idle for 30 days), and routine webhook test receipts older than 7 days.
 - The event path writes no `activity_log` rows for issues or comments; configuration changes are logged.
 
 ## CLI
