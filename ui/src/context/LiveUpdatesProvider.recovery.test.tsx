@@ -106,15 +106,39 @@ describe("LiveUpdatesProvider connection recovery", () => {
     expect(readInstance).not.toHaveBeenCalled();
   });
 
+  it("reconciles live data but not instance-level queries when the socket reconnects", async () => {
+    vi.stubGlobal("WebSocket", Socket);
+    const readInstance = vi.fn(async () => "instance settings");
+    client.setQueryData(queryKeys.instance.generalSettings, "instance settings");
+    await render(readInstance);
+    await act(async () => Socket.instances[0].onopen?.());
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    const readsAfterFirstOpen = read.mock.calls.length;
+
+    // The connection drops and the provider reconnects after its first backoff step (1 s).
+    await act(async () => Socket.instances[0].onclose?.());
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(Socket.instances).toHaveLength(2);
+    await act(async () => Socket.instances[1].onopen?.());
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+
+    expect(read.mock.calls.length).toBeGreaterThan(readsAfterFirstOpen);
+    expect(readInstance).not.toHaveBeenCalled();
+  });
+
   it.each(["missing", "throws"])("polls visible data and resumes realtime when the constructor %s", async (failure) => {
     vi.stubGlobal("WebSocket", failure === "missing" ? undefined : class {
       constructor() { throw new DOMException("Blocked", "SecurityError"); }
     });
-    await render();
+    const readInstance = vi.fn(async () => "instance settings");
+    client.setQueryData(queryKeys.instance.generalSettings, "instance settings");
+    await render(readInstance);
     expect(container.textContent).toBe("current task data");
     expect(read).toHaveBeenCalledTimes(1);
     await act(async () => vi.advanceTimersByTimeAsync(15_000));
+    // The disconnected poll refetches live-affected data and skips instance-level queries.
     expect(read).toHaveBeenCalledTimes(2);
+    expect(readInstance).not.toHaveBeenCalled();
 
     vi.stubGlobal("WebSocket", Socket);
     await act(async () => vi.advanceTimersByTimeAsync(15_000));

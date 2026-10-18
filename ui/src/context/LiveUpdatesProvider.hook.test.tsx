@@ -243,8 +243,9 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
     await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    // Pins the shared filter by reference, so a looser predicate fails here.
     expect(invalidate).toHaveBeenCalledExactlyOnceWith(
-      { type: "active", predicate: expect.any(Function) },
+      __liveUpdatesTestUtils.RECONCILE_ACTIVE_QUERIES,
       { cancelRefetch: false },
     );
   });
