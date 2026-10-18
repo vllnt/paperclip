@@ -1,8 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Db } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
 import {
   classifyGitHubOperation,
   parseGitHubOperation,
   readGitHubOperation,
+  registerGitHubWriteIdentityWorkers,
+  resolveGitHubWriteIdentityDecision,
+  type GitHubIdentityPolicyRecord,
 } from "../services/github-write-identity.js";
 
 // Destination parsing itself (URLs, scp, local paths, other hosts) is tested with parseGitHubDestination in @paperclipai/shared.
@@ -399,5 +404,58 @@ describe("destructive branch operations with an incomplete report (review round 
     expect(classifyGitHubOperation({ program: "git", args: ["push", "origin", "feature"], ...clean }).denied).toBeUndefined();
     expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "--force-with-lease", "release"], remote: null, ...clean }).denied).toMatch(refused);
     expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "release"], remote: null, ...clean }).denied).toBeUndefined();
+  });
+});
+
+describe("GitHub write identity decisions from the plugin", () => {
+  const record = {
+    pluginId: "plugin-1", ready: true, policy: { enabled: true },
+    manifest: { projectRepositories: { writeIdentityAction: "write-identity", signCommitAction: "sign-commit" } },
+  } as unknown as GitHubIdentityPolicyRecord;
+  const operation = classifyGitHubOperation({ program: "gh", args: ["pr", "merge", "7", "-R", "acme/site"], remote: null });
+  const decide = () => resolveGitHubWriteIdentityDecision({} as Db, { companyId: "company-1", operation }, record);
+  const answerWith = (answer: () => unknown) => registerGitHubWriteIdentityWorkers({ call: vi.fn(async () => answer()) } as never);
+  // About what the plugin sends when 20 files are protected: the list alone is over 900 characters.
+  const protectedRefusal = `This pull request changes protected paths (${Array.from({ length: 20 }, (_, index) => `packages/plugins/plugin-github/src/protected-${index}.ts`).join(", ")}); agents cannot merge it, ask an administrator.`;
+
+  afterEach(() => {
+    registerGitHubWriteIdentityWorkers(null);
+    vi.restoreAllMocks();
+  });
+
+  it("hands an agent a protected-path refusal longer than 500 characters with its reason", async () => {
+    expect(protectedRefusal.length).toBeGreaterThan(900);
+    const warn = vi.spyOn(logger, "warn");
+    answerWith(() => ({ identity: "user", unavailable: protectedRefusal, evidence: { protectedFiles: ["scripts/ci.sh"] } }));
+    expect(await decide()).toEqual({ identity: "user", unavailable: protectedRefusal, evidence: { protectedFiles: ["scripts/ci.sh"] } });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("shortens a reason past the bound instead of rejecting the decision", async () => {
+    answerWith(() => ({ identity: "user", unavailable: "x".repeat(5000) }));
+    const decision = await decide() as { identity: string; unavailable: string };
+    expect(decision.identity).toBe("user");
+    expect(decision.unavailable).toHaveLength(1500);
+    expect(decision.unavailable.endsWith("…")).toBe(true);
+  });
+
+  it("logs an unreadable decision by path and code only, and fails closed with its own reason", async () => {
+    const warn = vi.spyOn(logger, "warn");
+    answerWith(() => ({ identity: "bot", credential: { login: "paperclip[bot]", userId: "not-a-number", token: "ghs_secret_token_value" } }));
+    expect(await decide()).toMatchObject({ identity: "bot", unavailable: expect.stringContaining("cannot read") });
+    expect(await decide()).not.toMatchObject({ unavailable: "GitHub write identity is temporarily unavailable" });
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ companyId: "company-1", issues: expect.arrayContaining([expect.stringContaining("credential.userId")]) }),
+      expect.stringContaining("unreadable decision"),
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("ghs_secret_token_value");
+  });
+
+  it("keeps a plugin that throws on the generic reason, and logs only the error's name", async () => {
+    const warn = vi.spyOn(logger, "warn");
+    answerWith(() => { throw new TypeError("token leaked in provider error"); });
+    expect(await decide()).toEqual({ identity: "bot", unavailable: "GitHub write identity is temporarily unavailable" });
+    expect(warn).toHaveBeenCalledWith({ companyId: "company-1", errorName: "TypeError" }, expect.stringContaining("plugin call failed"));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("leaked");
   });
 });

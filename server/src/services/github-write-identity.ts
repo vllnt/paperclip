@@ -24,6 +24,7 @@ import {
 } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { protectedBranchRefusal } from "./github-protected-branches.js";
+import { logger } from "../middleware/logger.js";
 
 /**
  * One managed `git`/`gh` invocation as reported by the token-free launcher.
@@ -451,6 +452,10 @@ export async function loadGitHubIdentityPolicy(db: Db, companyId: string): Promi
   return { pluginId: owner.id, ready: owner.status === "ready", manifest: owner.manifest as PaperclipPluginManifestV1, policy };
 }
 
+const UNAVAILABLE_REASON_MAX = 1500;
+/** A refusal can list many protected paths; shorten its reason rather than failing the whole decision. */
+const reasonSchema = z.string().min(1).transform(reason => reason.length > UNAVAILABLE_REASON_MAX ? `${reason.slice(0, UNAVAILABLE_REASON_MAX - 1)}…` : reason);
+
 const identityRef = { login: z.string().regex(/^[A-Za-z0-9-]{1,100}(\[bot\])?$/), userId: z.string().regex(/^[1-9]\d{0,19}$/) };
 const decisionSchema = z.union([
   z.object({ identity: z.literal("user"), missingUserConnection: z.enum(["fail", "use_bot"]) }),
@@ -462,10 +467,11 @@ const decisionSchema = z.union([
     bodyFooter: z.boolean().optional(),
     evidence: z.record(z.string(), z.unknown()).optional(),
   }).refine(value => value.identity === "user" || (value.credential.token !== null && value.credential.login.endsWith("[bot]")), "A bot credential carries a bot token"),
-  z.object({ identity: z.enum(["bot", "user"]), unavailable: z.string().min(1).max(500), evidence: z.record(z.string(), z.unknown()).optional() }),
+  z.object({ identity: z.enum(["bot", "user"]), unavailable: reasonSchema, evidence: z.record(z.string(), z.unknown()).optional() }),
 ]);
 
 const UNAVAILABLE: GitHubWriteIdentityDecision = { identity: "bot", unavailable: "GitHub write identity is temporarily unavailable" };
+const UNREADABLE: GitHubWriteIdentityDecision = { identity: "bot", unavailable: "The GitHub plugin returned a write identity decision Paperclip cannot read; an operator can find the cause in the server log." };
 
 let pluginWorkers: Pick<PluginWorkerManager, "call"> | null = null;
 
@@ -498,23 +504,37 @@ export async function resolveGitHubWriteIdentityDecision(
   const policy = record === undefined ? await loadGitHubIdentityPolicy(db, input.companyId) : record;
   if (!policy) return null;
   const { operation } = input;
+  let raw: unknown;
   try {
-    const raw = await callPlugin(policy, policy.manifest.projectRepositories?.writeIdentityAction, input.companyId, {
+    raw = await callPlugin(policy, policy.manifest.projectRepositories?.writeIdentityAction, input.companyId, {
       repository: operation.repository, access: operation.access, action: operation.action, privileged: operation.privileged,
       wiki: operation.wiki, pullRequest: operation.pullRequest, expectedHeadSha: operation.expectedHeadSha,
       ...(operation.merge ? { merge: true } : {}), ...(operation.autoMerge ? { autoMerge: true } : {}), ...(operation.retarget ? { retarget: true } : {}),
       ...(input.fallback ? { fallback: true } : {}),
     }, 15_000);
-    return raw === null ? UNAVAILABLE : decisionSchema.parse(raw) as GitHubWriteIdentityDecision;
-  } catch {
-    // Provider errors may include credentials; expose only a safe reason.
+  } catch (error) {
+    // Provider errors may include credentials; expose only a safe reason and log only the error's name.
+    logger.warn({ companyId: input.companyId, errorName: error instanceof Error ? error.name : typeof error }, "GitHub write identity plugin call failed");
     return UNAVAILABLE;
   }
+  if (raw === null) return UNAVAILABLE;
+  const parsed = decisionSchema.safeParse(raw);
+  if (parsed.success) return parsed.data as GitHubWriteIdentityDecision;
+  // The decision can carry a token: log where it is wrong, never what it holds. It still fails closed.
+  logger.warn({ companyId: input.companyId, issues: describeIssues(parsed.error.issues) }, "GitHub write identity plugin returned an unreadable decision");
+  return UNREADABLE;
+}
+
+/** Paths and codes only (including each union branch): the rejected values are not logged. */
+function describeIssues(issues: readonly z.core.$ZodIssue[]): string[] {
+  return issues.flatMap(issue => issue.code === "invalid_union"
+    ? issue.errors.flatMap(branch => describeIssues(branch))
+    : [`${issue.path.join(".") || "(root)"}: ${issue.code}`]);
 }
 
 const signSchema = z.union([
   z.object({ signature: z.string().startsWith("-----BEGIN SSH SIGNATURE-----").max(8192), keyFingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{43}$/) }),
-  z.object({ unavailable: z.string().min(1).max(500) }),
+  z.object({ unavailable: reasonSchema }),
 ]);
 
 /** Asks the GitHub plugin to sign one git object for the company's App user. */
