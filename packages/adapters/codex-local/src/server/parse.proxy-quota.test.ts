@@ -18,7 +18,7 @@ describe("Codex provider quota classification behind a credential proxy", () => 
   });
 
   it("classifies the proxy cooldown as provider quota and reads its reset", () => {
-    const input = { stderr: `unexpected status 429 Too Many Requests: ${body}` };
+    const input = { errorMessage: `unexpected status 429 Too Many Requests: ${body}` };
     expect(isCodexProviderQuotaError(input)).toBe(true);
     expect(isCodexTransientUpstreamError(input)).toBe(false);
     expect(extractCodexRetryNotBefore(input, NOW)).toEqual(new Date(NOW.getTime() + 300_000));
@@ -26,7 +26,7 @@ describe("Codex provider quota classification behind a credential proxy", () => 
 
   it("classifies an OpenAI insufficient_quota as provider quota", () => {
     expect(
-      isCodexProviderQuotaError({ stderr: '{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}' }),
+      isCodexProviderQuotaError({ errorMessage: '{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}' }),
     ).toBe(true);
   });
 });

@@ -9,6 +9,34 @@ export const KEYBOARD_SHORTCUT_TEXT_INPUT_SELECTOR = [
 ].join(", ");
 
 const PAGE_SEARCH_SHORTCUT_SELECTOR = "[data-page-search-target='true']";
+
+// Open dialog content. Radix (shadcn `dialog`, `sheet`, `alert-dialog`, and raw
+// `DialogPrimitive.Content` such as the image gallery) marks it with
+// `data-state` but not `aria-modal`. A closing dialog keeps
+// `data-state="closed"` until its exit animation ends, so it no longer counts.
+const OPEN_DIALOG_SELECTOR = [
+  "[role='dialog'][aria-modal='true']:not([data-state='closed'])",
+  "[role='alertdialog'][aria-modal='true']:not([data-state='closed'])",
+  "[role='dialog'][data-state='open']",
+  "[role='alertdialog'][data-state='open']",
+].join(", ");
+// Popover content also has role=dialog, but Radix renders it inside a popper
+// wrapper and it is not modal.
+const POPPER_CONTENT_SELECTOR = "[data-radix-popper-content-wrapper]";
+
+function isModalDialog(dialog: Element): boolean {
+  return dialog.getAttribute("aria-modal") === "true" || !dialog.closest(POPPER_CONTENT_SELECTOR);
+}
+
+/** True when `element` sits inside an open modal dialog (a popover inside one counts). */
+export function isInsideOpenModalDialog(element: Element): boolean {
+  let dialog = element.closest(OPEN_DIALOG_SELECTOR);
+  while (dialog) {
+    if (isModalDialog(dialog)) return true;
+    dialog = dialog.parentElement?.closest(OPEN_DIALOG_SELECTOR) ?? null;
+  }
+  return false;
+}
 const MODIFIER_ONLY_KEYS = new Set(["Shift", "Meta", "Control", "Alt"]);
 
 export type InboxQuickArchiveKeyAction = "ignore" | "archive" | "disarm";
@@ -21,6 +49,11 @@ export type IssueDetailGoKeyAction =
   | "open_file_viewer"
   | "disarm";
 export type AttentionQueueKeyAction = "ignore" | "next" | "previous" | "toggle" | "dismiss";
+export type GoChordKeyAction =
+  | { type: "ignore" }
+  | { type: "arm" }
+  | { type: "disarm" }
+  | { type: "run"; actionId: string };
 
 export function isKeyboardShortcutTextInputTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -28,15 +61,49 @@ export function isKeyboardShortcutTextInputTarget(target: EventTarget | null): b
   return !!target.closest(KEYBOARD_SHORTCUT_TEXT_INPUT_SELECTOR);
 }
 
+// Open popover, menu or select content, which Radix renders inside a popper
+// wrapper. Tooltips also use the wrapper but take no keyboard focus.
+const OPEN_POPUP_SELECTOR = [
+  "[data-radix-popper-content-wrapper] [role='dialog']:not([data-state='closed'])",
+  "[data-radix-popper-content-wrapper] [role='menu']:not([data-state='closed'])",
+  "[data-radix-popper-content-wrapper] [role='listbox']:not([data-state='closed'])",
+].join(", ");
+
+// Radix can leave popper content mounted after it hides or closes. Content
+// counts as open only while it renders and neither it nor an ancestor (such
+// as the popper wrapper) is hidden, aria-hidden or closed.
+function isShownPopup(popup: Element): boolean {
+  if (popup.closest("[hidden], [aria-hidden='true'], [data-state='closed']")) return false;
+  if (typeof popup.checkVisibility === "function") return popup.checkVisibility({ checkVisibilityCSS: true });
+  return popup.getClientRects().length > 0;
+}
+
+// A DOM check that throws counts as "not open": a broken check must never
+// trap the keyboard.
+function failOpen(check: (element: Element) => boolean): (element: Element) => boolean {
+  return (element) => {
+    try {
+      return check(element);
+    } catch {
+      return false;
+    }
+  };
+}
+
+/**
+ * True while a modal dialog or a popover, menu or select is open. Those own
+ * the keyboard until they close, so page shortcuts stay quiet meanwhile.
+ */
 export function hasBlockingShortcutDialog(root: ParentNode = document): boolean {
-  return !!root.querySelector("[role='dialog'][aria-modal='true']");
+  if (Array.from(root.querySelectorAll(OPEN_POPUP_SELECTOR)).some(failOpen(isShownPopup))) return true;
+  return Array.from(root.querySelectorAll(OPEN_DIALOG_SELECTOR)).some(failOpen(isModalDialog));
 }
 
 function isVisibleShortcutTarget(element: HTMLElement): boolean {
   if (!element.isConnected) return false;
   if ("disabled" in element && typeof element.disabled === "boolean" && element.disabled) return false;
   if (element.closest("[hidden], [aria-hidden='true'], [inert]")) return false;
-  if (element.closest("[role='dialog'][aria-modal='true']")) return false;
+  if (isInsideOpenModalDialog(element)) return false;
 
   const style = window.getComputedStyle(element);
   if (style.display === "none" || style.visibility === "hidden") return false;
@@ -210,4 +277,74 @@ export function resolveIssueDetailGoKeyAction({
   if (normalizedKey === "f") return "open_file_viewer";
   if (normalizedKey === "g") return "arm";
   return "disarm";
+}
+
+/**
+ * The global `g` chord: `g` arms it, and the next key runs the action that
+ * `chords` maps it to (see `commandActionGoChords`). Page handlers that claim
+ * a chord first (issue detail's `g c`) prevent the default, which disarms.
+ */
+export function resolveGoChordKeyAction({
+  armed,
+  chords,
+  defaultPrevented,
+  key,
+  metaKey,
+  ctrlKey,
+  altKey,
+  target,
+  hasOpenDialog,
+}: {
+  armed: boolean;
+  chords: ReadonlyMap<string, string>;
+  defaultPrevented: boolean;
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  target: EventTarget | null;
+  hasOpenDialog: boolean;
+}): GoChordKeyAction {
+  if (defaultPrevented) return { type: armed ? "disarm" : "ignore" };
+  if (metaKey || ctrlKey || altKey || isModifierOnlyKey(key)) return { type: "ignore" };
+  if (hasOpenDialog || isKeyboardShortcutTextInputTarget(target)) {
+    return { type: armed ? "disarm" : "ignore" };
+  }
+
+  const normalizedKey = key.toLowerCase();
+  if (!armed) return { type: normalizedKey === "g" ? "arm" : "ignore" };
+  const actionId = chords.get(normalizedKey);
+  if (actionId) return { type: "run", actionId };
+  if (normalizedKey === "g") return { type: "arm" };
+  return { type: "disarm" };
+}
+
+/**
+ * Cmd/Ctrl+K opens the command launcher, but only from the page itself: a
+ * text field or editor keeps its own Cmd/Ctrl+K (for example "insert link"),
+ * IME composition and keys another handler claimed are left alone, and the
+ * launcher never opens on top of another modal dialog.
+ */
+export function shouldOpenCommandLauncher({
+  key,
+  metaKey,
+  ctrlKey,
+  altKey,
+  isComposing,
+  defaultPrevented,
+  target,
+  hasOpenDialog,
+}: {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  isComposing: boolean;
+  defaultPrevented: boolean;
+  target: EventTarget | null;
+  hasOpenDialog: boolean;
+}): boolean {
+  if (key.toLowerCase() !== "k" || !(metaKey || ctrlKey) || altKey) return false;
+  if (isComposing || defaultPrevented || hasOpenDialog) return false;
+  return !isKeyboardShortcutTextInputTarget(target);
 }

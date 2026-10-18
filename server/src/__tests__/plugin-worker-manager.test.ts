@@ -27,6 +27,7 @@ vi.mock("../middleware/logger.js", () => {
 });
 
 import { logger } from "../middleware/logger.js";
+import { currentPluginHostCallAgent } from "../services/plugin-host-call-actor.js";
 import {
   appendStderrExcerpt,
   createDuplexRouteSlotController,
@@ -253,6 +254,84 @@ describe("plugin-worker-manager stderr failure context", () => {
       expect(unhandledRejection).not.toHaveBeenCalled();
     } finally {
       process.off("unhandledRejection", unhandledRejection);
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it.each([
+    {
+      label: "an agent performAction",
+      method: "performAction",
+      params: (probe: Record<string, unknown>) => ({
+        key: "probe",
+        params: probe,
+        actorContext: { type: "agent", userId: null, agentId: "agent-1", runId: "run-1", companyId: "company-a" },
+        renderEnvironment: null,
+      }),
+      expected: { agentId: "agent-1", runId: "run-1", companyId: "company-a" },
+    },
+    {
+      label: "a user performAction",
+      method: "performAction",
+      params: (probe: Record<string, unknown>) => ({
+        key: "probe",
+        params: probe,
+        actorContext: { type: "user", userId: "user-1", agentId: null, runId: null, companyId: "company-a" },
+        renderEnvironment: null,
+      }),
+      expected: null,
+    },
+  ])("exposes the agent behind $label to worker-to-host handlers", async ({ method, params, expected }) => {
+    const seenAgents: Array<ReturnType<typeof currentPluginHostCallAgent>> = [];
+    const companiesGet = vi.fn(async (callParams: { companyId: string }) => {
+      seenAgents.push(currentPluginHostCallAgent());
+      return { id: callParams.companyId };
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "companies.get": companiesGet as never },
+    });
+
+    try {
+      await handle.start();
+      await handle.call(method as "performAction", params({ mode: "echo", requestedCompanyId: "company-a" }) as never);
+      expect(seenAgents).toEqual([expected]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("exposes no agent for a worker call that omits or forges its invocation id", async () => {
+    const seenAgents: Array<ReturnType<typeof currentPluginHostCallAgent>> = [];
+    const companiesGet = vi.fn(async (callParams: { companyId: string }) => {
+      seenAgents.push(currentPluginHostCallAgent());
+      return { id: callParams.companyId };
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: { "companies.get": companiesGet as never },
+    });
+
+    try {
+      await handle.start();
+      for (const mode of ["unknown", "omit"]) {
+        await handle.call("performAction", {
+          key: "probe",
+          params: { mode, requestedCompanyId: "company-a" },
+          actorContext: { type: "agent", userId: null, agentId: "agent-1", runId: "run-1", companyId: "company-a" },
+          renderEnvironment: null,
+        });
+      }
+      expect(seenAgents).toEqual([null, null]);
+    } finally {
       await handle.stop().catch(() => undefined);
     }
   });

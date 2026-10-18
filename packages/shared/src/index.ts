@@ -803,6 +803,7 @@ export type {
   EnvironmentDeleteReusableLeaseHolder,
   EnvironmentDeleteBlockedReason,
   EnvironmentLease,
+  CompanyEnvironmentLeaseListItem,
   EnvironmentProbeResult,
   FakeSandboxEnvironmentConfig,
   LocalEnvironmentConfig,
@@ -1298,6 +1299,9 @@ export type {
   AgentRuntimeState,
   AgentTaskSession,
   AgentWakeupRequest,
+  DeferredWakeAgentStats,
+  DeferredWakeStats,
+  DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
   LiveEvent,
   DashboardRunActivityDay,
@@ -1876,6 +1880,8 @@ export {
   environmentDriverSchema,
   environmentStatusSchema,
   environmentLeaseStatusSchema,
+  listEnvironmentLeasesQuerySchema,
+  COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
   environmentLeaseCleanupStatusSchema,
   createEnvironmentSchema,
   updateEnvironmentSchema,
@@ -2692,6 +2698,7 @@ export {
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
 export * from "./validators/provider-trace.js";
+export * from "./validators/heartbeat-run.js";
 export {
   FEATURE_TIERS,
   INSTANCE_FEATURE_CATALOG,
@@ -2795,6 +2802,8 @@ export type { ExecutionProjection, ExecutionReconciliation, ExecutionBlocker } f
 export { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "./types/execution-projection.js";
 
 export * from "./agent-appearance.js";
+export * from "./run-failure-cause.js";
+export * from "./run-usage-record.js";
 export * from "./ai-connections.js";
 export * from "./ai-connection-usage.js";
 export { questionSetToAskUserQuestionsPayload } from "./question-set.js";
@@ -2839,3 +2848,6 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./duplicate-detection.js";
+export * from "./automation-wake.js";
+export * from "./routine-noop-skip.js";
