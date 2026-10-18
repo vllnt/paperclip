@@ -363,8 +363,8 @@ migration. Slice 4 needs none either, but it waits for `#40`.
   existing `GET /companies/:companyId/search`. Today no CLI command covers
   company search. This gives the launcher's search capability its CLI
   surface (parity), and the API surface already exists.
-- CI: append the new unit tests to the `Dockerfile` `vitest run` list
-  (`Dockerfile:136`). CI runs no other unit tests.
+- CI: add the new unit tests to `scripts/ci/image-build-vitest-files.txt`
+  (the list the `Dockerfile` `vitest run` step reads). CI runs no other unit tests.
 - e2e: `tests/e2e/command-launcher.spec.ts`, keyboard only: open with
   Cmd/Ctrl+K, type, arrow, Enter navigates; `g d` navigates; `?` shows a
   chord that comes from the catalog.
