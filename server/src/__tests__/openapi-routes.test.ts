@@ -281,6 +281,22 @@ describe("openapi routes", () => {
     }
   });
 
+  it("documents the routine gate test as a non-dispatching board-or-agent operation and the board-only gate field", () => {
+    const { spec } = loadSpecRoutes();
+    const test = spec.paths["/api/routines/{id}/gate/test"].post;
+    expect(test["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    expect(test.description).toContain("Creates no run, issue or wake");
+    for (const status of ["200", "401", "403", "404", "422"]) {
+      expect(test.responses[status], `gate test response ${status}`).toBeDefined();
+    }
+    // Only the board may set a gate, because it runs code on a worker; the field is on both write bodies.
+    const create = spec.paths["/api/companies/{companyId}/routines"].post;
+    const update = spec.paths["/api/routines/{id}"].patch;
+    for (const operation of [create, update]) {
+      expect(operation.requestBody.content["application/json"].schema.properties.gate).toBeDefined();
+    }
+  });
+
   it("documents exact failed-run selection and durable accepted retry responses", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
     const wake = res.body.paths["/api/agents/{id}/wakeup"].post;

@@ -54,6 +54,7 @@ Fields:
 | `status` | no | `active` (default), `paused`, `archived` |
 | `concurrencyPolicy` | no | Behaviour when a run fires while a previous one is still active |
 | `catchUpPolicy` | no | Behaviour for missed scheduled runs |
+| `gate` | no | Board only. A pinned script that decides whether a run wakes the agent. See [Gate Scripts](#gate-scripts) |
 
 **Concurrency policies:**
 
@@ -275,6 +276,92 @@ GET /api/routines/{routineId}/event-groups?open=true&limit=50
 
 Lists the alert groups of the routine, newest activity first: the group's issue, `repeatCount`, `lastSeverity` and `lastState`. `open` defaults to `true`; `limit` is 1-200. Event runs appear in run history with `source` `event` and the statuses `issue_created`, `grouped` (comment on the open issue) and `recovered`.
 
+## Gate Scripts
+
+A routine can carry a **gate**: a deterministic script that runs on the routine's SSH worker, with no LLM, before the agent is woken. Exit `0` wakes the agent; exit `1` skips the run at zero tokens. Use it to poll something cheap (a PR list, a queue depth, a status page) and wake the agent only when there is work.
+
+```
+PATCH /api/routines/{routineId}
+{
+  "gate": {
+    "repo": "vllnt/ops-gates",
+    "path": "gates/open-prs.sh",
+    "commitSha": "<40-character sha>",
+    "interpreter": "sh",
+    "args": ["--label", "needs-review"],
+    "timeoutSec": 30,
+    "appliesTo": ["schedule", "webhook", "event"]
+  }
+}
+```
+
+Send `"gate": null` to remove it. Only a **board user** may set, change or remove a gate, because the script runs on a worker. Agents can read it and call the test endpoint below.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `repo` | yes | `owner/name`. Must be on the instance allowlist (`routineGateRepos` in the instance general settings, plus the operator's `PAPERCLIP_ROUTINE_GATE_REPOS`) |
+| `path` | yes | Relative path of the script in the repo |
+| `commitSha` | yes | 40-character commit. It must be reachable from the repo's default branch, so the code went through a reviewed PR. Changing the script means merging a PR and updating this pin |
+| `interpreter` | no | `sh` (default), `bash` or `python3` (run isolated with `-I`) |
+| `args` | no | Up to 16 arguments of at most 256 characters |
+| `timeoutSec` | no | 5-120, default 30 |
+| `appliesTo` | no | Trigger kinds the gate applies to: `schedule`, `webhook`, `event` (default: all three). A manual run and an `api` trigger bypass the gate |
+
+Saving a gate checks that the repo is allowlisted, the commit is on the default branch, the script is at most 64 KB, and the routine's environment is an SSH worker. The local driver is refused.
+
+**How it runs.** The script is fetched at the pinned commit and piped over SSH to the worker, which runs it as the dedicated `gate` user (there is no fallback to the environment's configured user) under `env -i` with a private temp `HOME`, `stdin` from `/dev/null` and a hard `timeout`. It sees only these variables:
+
+| Variable | Value |
+|----------|-------|
+| `PAPERCLIP_GATE_ROUTINE_ID` | Routine id |
+| `PAPERCLIP_GATE_TRIGGER_KIND` | `schedule`, `webhook`, `event` (or `test`) |
+| `PAPERCLIP_GATE_LAST_RESULT_FINGERPRINT` | sha256 of the last committed stdout of this trigger, or empty |
+| `PAPERCLIP_GATE_LAST_DISPATCHED_AT` | ISO time of the last committed run of this trigger, or empty |
+| `PAPERCLIP_GATE_EVENT` | The webhook payload or normalized event as JSON, cut to 16 KB (absent for schedules) |
+
+**Outcomes.**
+
+| Result | Schedule | Webhook / event |
+|--------|----------|-----------------|
+| Exit `0` | Wake. Stdout (trimmed, JSON-encoded in a fenced block marked untrusted) is added to the issue | Same |
+| Exit `1` | Run `skipped` (`gate_skip`), no issue, no tokens | Same |
+| Same non-empty stdout as the last run that produced an issue | Run `skipped` (`gate_unchanged`); set `routineNoopSkipSettings.skipUnchangedGateResult` to `false` to turn this off | Webhook: same. Event: never, because grouping already dedupes |
+| Script fault (other exit code, timeout, output over 128 KB) | Fails open: wake, with a note that the gate failed | Same |
+| Transport fault (SSH down, `gate` user missing, script source unavailable) | Skipped (`gate_unavailable`); the next tick polls again | Retried with backoff (30 s, 2 min, 10 min), then wake with a note |
+
+Empty stdout is never treated as unchanged. Stdout is data for the agent, never instructions, and never part of the run's dedupe fingerprint.
+
+**Run lifecycle.** A gated trigger parks its run as `gating` and returns at once; a worker runs the script (at most 8 at a time per instance, 2 per environment) and then commits the same run row. Claims are compare-and-set and swept on every scheduler tick (30 seconds by default), so a restart or a second server never runs a gate twice. `gating` runs count as active for `coalesce_if_active`/`skip_if_active`, and `gateResult` (class, exit code, duration, script sha, redacted stdout/stderr samples) is stored on the run. For `event` triggers the delivery is answered `gating`; its final outcome lands on the delivery log later, and a permanent failure still fires the source's fallback routines.
+
+**Gate failing issue.** When a gate keeps failing (5 script faults in a row, transport faults for more than an hour, or 3 silent skips that each wrote to stderr), one `Gate failing` issue opens for the routine's responsible user, or for the board when there is none. It is never assigned to the routine's agent, which could not fix PR-only gate code.
+
+### Test a gate
+
+```
+POST /api/routines/{routineId}/gate/test
+```
+
+Runs the gate once on the worker and returns what a real run would do. It creates no run, issue or wake. Board users and the routine's own agent may call it. `422` if the routine has no gate.
+
+```json
+{
+  "result": {
+    "exitCode": 0,
+    "class": "ok",
+    "durationMs": 412,
+    "scriptSha": "…",
+    "environmentId": "…",
+    "resultFingerprint": "…",
+    "stdoutSample": "2 open PRs\n",
+    "stderrTail": "",
+    "detail": null
+  },
+  "verdict": "wake"
+}
+```
+
+`verdict` is `wake`, `skip`, `fail_open` (script fault: a real run would wake with a note) or `unavailable` (transport fault).
+
 ## List Runs
 
 ```
@@ -295,6 +382,8 @@ Agents can read all routines in their company but can only create and manage rou
 | Add / update / delete triggers | ✅ own only | ✅ |
 | Rotate trigger secret | ✅ own only | ✅ |
 | Manual run | ✅ own only | ✅ |
+| Test a gate | ✅ own only | ✅ |
+| Set / change / remove a gate | ❌ | ✅ |
 | Reassign to another agent | ❌ | ✅ |
 
 Agents can add `event` triggers to their own routines and read event sources and event groups. Creating, editing, rotating and archiving event sources is board-only.

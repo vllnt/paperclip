@@ -4838,6 +4838,23 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/routines/{id}/gate/test",
+  tags: ["routines"],
+  summary: "Run a routine's gate script once without dispatching",
+  description:
+    "Runs the routine's gate script on its SSH worker as the dedicated `gate` user and reports the result and what a real run would do with it (`wake`, `skip`, `fail_open` or `unavailable`). Creates no run, issue or wake.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/routines/{id}/triggers",
   tags: ["routines"],
   summary: "Create a routine trigger",

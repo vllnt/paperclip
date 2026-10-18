@@ -1483,6 +1483,7 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
 | GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
+| POST   | `/api/routines/:routineId/gate/test` | Dry-run the routine's gate script (`result` + `verdict`: `wake`, `skip`, `fail_open`, `unavailable`); no run, issue or wake. Setting `gate` on create/update is board-only |
 
 ### Event Sources
 

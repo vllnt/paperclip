@@ -646,6 +646,10 @@ export const runnerApiReference: Record<string, { section: string; description?:
     "section": "Routines",
     "description": "Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`)"
   },
+  "POST /api/routines/{}/gate/test": {
+    "section": "Routines",
+    "description": "Dry-run the routine's gate script (`result` + `verdict`: `wake`, `skip`, `fail_open`, `unavailable`); no run, issue or wake. Setting `gate` on create/update is board-only"
+  },
   "GET /api/companies/{}/event-sources": {
     "section": "Event Sources",
     "description": "List sources (`?includeArchived=true`); no secrets"
