@@ -2101,6 +2101,13 @@
       "when": 1792235020109,
       "tag": "0301_spooky_firebird",
       "breakpoints": true
+    },
+    {
+      "idx": 302,
+      "version": "7",
+      "when": 1792326244638,
+      "tag": "0302_event_sources",
+      "breakpoints": true
     }
   ]
 }
