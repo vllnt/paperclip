@@ -173,7 +173,7 @@ describeEmbeddedPostgres("routine gate scripts: runner", () => {
     expect(outcome.retryable).toBe(false);
   });
 
-  it("refuses a missing environment and an archived one", async () => {
+  it("refuses an archived environment", async () => {
     const scope = await seed("ssh");
     await db.update(environments).set({ status: "archived" }).where(eq(environments.id, scope.environmentId));
     const runner = createGateRunner({ db, source: scriptSource(), runSsh: vi.fn() as never });
