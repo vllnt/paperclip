@@ -340,6 +340,15 @@ describe("normalizeEvent: gatus", () => {
       expect(event.labels).toEqual({ endpoint: "café/api 日本" });
     });
 
+    it("keeps endpoints that differ only by escaping or by where the slash sits apart", () => {
+      const key = (group: string, name: string) =>
+        expectOk(normalizeEvent(gatusSource(), gatusBody({ group, name }), NOW)).dedupeKey;
+      expect(key("café", "api")).not.toBe(key("caf%C3%A9", "api"));
+      expect(key("a/b", "c")).not.toBe(key("a", "b/c"));
+      expect(key("a/b", "c")).toBe("gatus:a%2Fb/c");
+      expect(key("100%", "api")).toBe("gatus:100%25/api");
+    });
+
     it("percent-escapes astral characters as a single sequence", () => {
       const event = expectOk(normalizeEvent(gatusSource(), gatusBody({ group: "", name: "api \u{1F600}" }), NOW));
       expect(event.dedupeKey).toBe("gatus:/api %F0%9F%98%80");

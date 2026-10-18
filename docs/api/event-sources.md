@@ -211,7 +211,7 @@ alerting:
       {"status":"[ALERT_TRIGGERED_OR_RESOLVED]","group":"[ENDPOINT_GROUP]","name":"[ENDPOINT_NAME]","description":"[ALERT_DESCRIPTION]","url":"[ENDPOINT_URL]"}
 ```
 
-Mapping: `status` `TRIGGERED` gives `state: problem`, `RESOLVED` gives `recovery` (anything else is `422`). `source` is `gatus`; `dedupeKey` is `gatus:<group>/<name>`; `title` is `Gatus: <group>/<name> is failing` or `... recovered`; `summary` is `description`. Default `severity` is `critical`.
+Mapping: `status` `TRIGGERED` gives `state: problem`, `RESOLVED` gives `recovery` (anything else is `422`). `source` is `gatus`; `dedupeKey` is `gatus:<group>/<name>` (non-ASCII characters, `%` and `/` inside a component are percent-escaped, so distinct endpoints never share a key); `title` is `Gatus: <group>/<name> is failing` or `... recovered`; `summary` is `description`. Default `severity` is `critical`.
 
 Gatus cannot send labels, so `normalizerConfig.endpointMap` supplies them, keyed `<group>/<name>` (`/<name>` for an ungrouped endpoint):
 

@@ -32,12 +32,16 @@ function describeZodIssues(error: z.ZodError): string[] {
   });
 }
 
-/** Percent-escapes everything outside printable ASCII so the dedupeKey stays within its wire contract. */
+/**
+ * Percent-escapes everything outside printable ASCII so the dedupeKey stays within its wire contract.
+ * `%` and `/` are escaped too, so `group/name` is injective: "café" and "caf%C3%A9", or
+ * ("a/b", "c") and ("a", "b/c"), never share a key.
+ */
 function toPrintableAscii(value: string): string {
   let out = "";
   for (const char of value) {
     const code = char.codePointAt(0)!;
-    out += code >= 0x20 && code <= 0x7e ? char : encodeURIComponent(char);
+    out += code >= 0x20 && code <= 0x7e && char !== "%" && char !== "/" ? char : encodeURIComponent(char);
   }
   return out;
 }
