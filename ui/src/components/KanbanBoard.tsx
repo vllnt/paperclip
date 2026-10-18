@@ -66,11 +66,11 @@ const defaultKanbanColumnTone = {
 export const kanbanColumnTones: Partial<Record<IssueStatus, typeof defaultKanbanColumnTone>> = {
   backlog: {
     rail: "border-border bg-muted/30",
-    railOver: "bg-muted/50 ring-1 ring-neutral-400/25",
+    railOver: "bg-muted/50 ring-1 ring-foreground/20",
     header: "text-muted-foreground",
     count: "text-muted-foreground/60",
     body: "bg-muted/30 ring-1 ring-inset ring-border/50",
-    bodyOver: "bg-muted/50 ring-1 ring-inset ring-neutral-400/25",
+    bodyOver: "bg-muted/50 ring-1 ring-inset ring-foreground/20",
     card: "",
   },
   todo: {
@@ -119,12 +119,12 @@ export const kanbanColumnTones: Partial<Record<IssueStatus, typeof defaultKanban
     card: "",
   },
   cancelled: {
-    rail: "border-neutral-300/70 bg-muted/25 opacity-80 dark:border-neutral-700/70 dark:bg-neutral-900/20",
-    railOver: "bg-muted/45 opacity-90 ring-1 ring-neutral-400/25 dark:bg-neutral-900/35",
+    rail: "border-border bg-muted/25 opacity-80",
+    railOver: "bg-muted/45 opacity-90 ring-1 ring-foreground/20",
     header: "text-muted-foreground/80",
     count: "text-muted-foreground/50",
     body: "bg-muted/25 ring-1 ring-inset ring-border/50",
-    bodyOver: "bg-muted/45 ring-1 ring-inset ring-neutral-400/25",
+    bodyOver: "bg-muted/45 ring-1 ring-inset ring-foreground/20",
     card: "bg-muted/35 text-muted-foreground opacity-80 hover:shadow-none",
   },
 };

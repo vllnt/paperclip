@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { constants, promises as fs } from "node:fs";
 import nodeFs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { createPaperclipTempDir, removePaperclipTempDir, type PaperclipTempPrefix } from "./paperclip-temp.js";
 
 // Limits apply to one record and to SQLite's page cache, never to the list.
 export const WORKSPACE_PATH_MAX_BYTES = 64 * 1024;
@@ -123,10 +123,12 @@ export class WorkspaceManifestMap<T> {
   close(): void { this.db?.close(); this.db = null; this.lookup = null; }
 }
 
-export async function createWorkspaceManifest(prefix = "paperclip-workspace-manifest-"): Promise<WorkspaceManifestWriter> {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+export async function createWorkspaceManifest(
+  prefix: PaperclipTempPrefix = "paperclip-workspace-manifest-",
+): Promise<WorkspaceManifestWriter> {
+  const directory = await createPaperclipTempDir(prefix);
   try { return new WorkspaceManifestWriter(path.join(directory, "paths.sqlite")); }
-  catch (error) { await fs.rm(directory, { recursive: true, force: true }); throw error; }
+  catch (error) { await removePaperclipTempDir(directory); throw error; }
 }
 
 export function* readManifestRecords(manifest: PathManifest, reverse = false): Generator<[string, string]> {

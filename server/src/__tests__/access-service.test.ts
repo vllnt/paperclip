@@ -1159,4 +1159,53 @@ describeEmbeddedPostgres("access service", () => {
     expect(grants[0]?.scope).toEqual(scopedGrant);
     expect(grants[0]?.grantedByUserId).toBe("custom-grant-author");
   });
+
+  // Every agent create re-ensures the shared root agent's default grants, so two
+  // creates in flight make the same membership and grant writes at once.
+  it("grants the same permission to one principal from concurrent callers without a unique-key error", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const agentId = randomUUID();
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 12 }, () =>
+        access.setPrincipalPermission(company.id, "agent", agentId, "tasks:assign", true, null),
+      ),
+    );
+
+    expect(results.filter((result) => result.status === "rejected")).toEqual([]);
+    await expect(
+      db
+        .select()
+        .from(companyMemberships)
+        .where(and(eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, agentId))),
+    ).resolves.toHaveLength(1);
+    await expect(
+      db
+        .select()
+        .from(principalPermissionGrants)
+        .where(and(eq(principalPermissionGrants.companyId, company.id), eq(principalPermissionGrants.principalId, agentId))),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("creates one membership when ensureMembership runs concurrently for the same principal", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const access = accessService(db);
+    const agentId = randomUUID();
+
+    const results = await Promise.allSettled([
+      access.ensureMembership(company.id, "agent", agentId, "member", "active"),
+      access.ensureMembership(company.id, "agent", agentId, "member", "active"),
+      access.ensureMembership(company.id, "agent", agentId, "member", "active"),
+      access.ensureMembership(company.id, "agent", agentId, "member", "active"),
+    ]);
+
+    expect(results.filter((result) => result.status === "rejected")).toEqual([]);
+    const rows = await db
+      .select()
+      .from(companyMemberships)
+      .where(and(eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, agentId)));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "active", membershipRole: "member" });
+  });
 });

@@ -293,6 +293,8 @@ export const queryKeys = {
   },
   issues: {
     list: (companyId: string) => ["issues", companyId] as const,
+    boardColumns: (companyId: string) =>
+      ["issues", companyId, "board-column"] as const,
     mentionPool: (companyId: string) =>
       ["issues", companyId, "mention-pool"] as const,
     search: (

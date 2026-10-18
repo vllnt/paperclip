@@ -425,6 +425,9 @@ Notes:
 npx paperclipai issue list --company-id <company-id> [--status todo,in_progress] [--assignee-agent-id <agent-id>] [--match text]
 npx paperclipai issue get <issue-id-or-identifier>
 npx paperclipai issue create --company-id <company-id> --title "..." [--description "..."] [--status todo] [--priority high]
+npx paperclipai issue similar --company-id <company-id> --title "..." [--description "..."] [--parent-id <issue-id>]
+npx paperclipai issue duplicate-pairs <issue-id-or-identifier>
+npx paperclipai issue duplicate-label --company-id <company-id> <pair-id> duplicate|keep_both
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]
 npx paperclipai issue delete <issue-id> --yes
 npx paperclipai issue comment <issue-id> --body "..." [--attachment-id <id...>] [--reopen]
@@ -872,6 +875,14 @@ npx paperclipai approval comment <approval-id> --body "..."
 npx paperclipai activity list --company-id <company-id> [--agent-id <agent-id>] [--entity-type issue] [--entity-id <id>]
 npx paperclipai activity create --company-id <company-id> --payload-json '{...}'
 npx paperclipai activity issue <issue-id>
+```
+
+## Search Commands
+
+`search` uses the same company search as the board's command palette and `/search` page (`GET /api/companies/:companyId/search`).
+
+```sh
+npx paperclipai search <text...> --company-id <company-id> [--scope all|issues|comments|documents|artifacts|agents|projects] [--limit 20] [--offset 0] [--json]
 ```
 
 ## Dashboard Commands

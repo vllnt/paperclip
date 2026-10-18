@@ -11,6 +11,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
 import { isUuidLike } from "@paperclipai/shared";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
 /** Resolve an explicit click from persisted receipts, never caller context or message authors. */
@@ -248,18 +249,21 @@ export async function initializeRunIdentity(
       correlationId: "dispatch",
     });
     const ids = [...new Set(input.messageIds ?? [])];
+    const issueId = input.issueId;
     const comments =
-      ids.length && input.issueId
-        ? await tx
-            .select()
-            .from(issueComments)
-            .where(
-              and(
-                eq(issueComments.companyId, input.companyId),
-                eq(issueComments.issueId, input.issueId),
-                inArray(issueComments.id, ids),
+      ids.length && issueId
+        ? await selectInCommentBatches(ids, (batch) =>
+            tx
+              .select()
+              .from(issueComments)
+              .where(
+                and(
+                  eq(issueComments.companyId, input.companyId),
+                  eq(issueComments.issueId, issueId),
+                  inArray(issueComments.id, batch),
+                ),
               ),
-            )
+          )
         : [];
     for (const id of ids) {
       const comment = comments.find((c) => c.id === id);
