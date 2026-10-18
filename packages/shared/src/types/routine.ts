@@ -143,6 +143,8 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
   responsibleUserId: string | null;
+  /** Present only on gated routines. */
+  gate?: RoutineGate | null;
 }
 
 export interface RoutineRevisionSnapshotTriggerV1 {
