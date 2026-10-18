@@ -8,7 +8,7 @@ import {
   projects,
   type createDb,
 } from "@paperclipai/db";
-import type { CreateEventSource, EventGrouping, EventMatch } from "@paperclipai/shared";
+import type { CreateEventSource, EventGrouping, EventMatch, RoutineGate } from "@paperclipai/shared";
 import { issueService } from "../../services/issues.ts";
 import { eventSourceService, type IngestResult } from "../../services/event-sources/service.ts";
 import { routineService } from "../../services/routines.ts";
@@ -48,6 +48,8 @@ export async function seedEventFixture(
     now?: () => number;
     /** Runs before every wake; throw to simulate an adapter failure. The default wake still happens afterwards. */
     beforeWakeup?: (agentId: string, opts: WakeupRecord["opts"]) => void | Promise<void>;
+    /** Gate script overrides (a fake runner, `autoKick: false`) for both the routine and the event source service. */
+    gate?: NonNullable<Parameters<typeof routineService>[1]>["gate"];
   } = {},
 ) {
   const companyId = randomUUID();
@@ -92,8 +94,8 @@ export async function seedEventFixture(
     },
   };
 
-  const routinesSvc = routineService(db, { heartbeat });
-  const sources = eventSourceService(db, { heartbeat, now });
+  const routinesSvc = routineService(db, { heartbeat, gate: opts.gate });
+  const sources = eventSourceService(db, { heartbeat, now, gate: opts.gate });
   const issueSvc = issueService(db);
 
   async function createAgent(name = "Responder", status: "active" | "terminated" = "active") {
@@ -119,6 +121,7 @@ export async function seedEventFixture(
     status?: "active" | "paused";
     concurrencyPolicy?: "coalesce_if_active" | "always_enqueue" | "skip_if_active";
     variables?: unknown[];
+    gate?: RoutineGate;
   }) {
     return routinesSvc.create(
       companyId,
@@ -134,8 +137,9 @@ export async function seedEventFixture(
         concurrencyPolicy: input.concurrencyPolicy ?? "coalesce_if_active",
         catchUpPolicy: "skip_missed",
         ...(input.variables ? { variables: input.variables } : {}),
+        ...(input.gate ? { gate: input.gate } : {}),
       } as never,
-      {},
+      input.gate ? { userId: "board-user" } : {},
     );
   }
 

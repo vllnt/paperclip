@@ -217,11 +217,17 @@ export function eventSourceService(
     heartbeat?: IssueAssignmentWakeupDeps;
     pluginWorkerManager?: PluginWorkerManager;
     now?: () => number;
+    /** Gate script overrides for the routine service this service dispatches through; tests inject a fake runner. */
+    gate?: NonNullable<Parameters<typeof routineService>[1]>["gate"];
   } = {},
 ) {
   const now = deps.now ?? Date.now;
   const secretsSvc = secretService(db);
-  const routinesSvc = routineService(db, { heartbeat: deps.heartbeat, pluginWorkerManager: deps.pluginWorkerManager });
+  const routinesSvc = routineService(db, {
+    heartbeat: deps.heartbeat,
+    pluginWorkerManager: deps.pluginWorkerManager,
+    gate: deps.gate,
+  });
   // The shared ceiling is pinned: a sender rotating client keys must not be able to evict and so reset it.
   const failureLimiter = createSlidingWindowLimiter({ now, pinnedKeys: [GLOBAL_FAILURE_KEY] });
   const sourceLimiter = createSlidingWindowLimiter({ now });
