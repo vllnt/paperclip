@@ -13,7 +13,7 @@
  */
 
 export const MODES = ["none", "affected", "full"];
-export const ALWAYS = ["scripts", "secrets"];
+export const ALWAYS = ["scripts", "policy", "secrets"];
 // job id -> classifier output that says whether the job must run
 export const CONDITIONAL = { sentry: "need_sentry" };
 

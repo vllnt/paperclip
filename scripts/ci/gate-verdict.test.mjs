@@ -31,7 +31,7 @@ test("a conditional job the classifier did not ask for must be skipped", () => {
 
 test("fails on failure, cancelled and skipped for an always-on or a needed job", () => {
   for (const result of ["failure", "cancelled", "skipped"]) {
-    assert.equal(evaluate(green({ [always]: { result } })).ok, false, `${always} ${result}`);
+    for (const job of ALWAYS) assert.equal(evaluate(green({ [job]: { result } })).ok, false, `${job} ${result}`);
     assert.equal(evaluate(green({ [conditional]: { result } })).ok, false, `${conditional} ${result}`);
   }
 });

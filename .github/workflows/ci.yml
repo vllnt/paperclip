@@ -10,7 +10,7 @@ name: CI
 # CONDITIONAL plus a classifier output) in scripts/ci/gate-verdict.mjs.
 # ci-workflow.test.mjs fails if they disagree. Require only "CI gate".
 #
-# Runners: `changes`, `scripts`, `secrets` and `gate` are short and always use
+# Runners: `changes`, `scripts`, `policy`, `secrets` and `gate` are short and always use
 # GitHub-hosted ubuntu-latest (the Node it ships is enough; the scripts have no
 # dependencies), so a broken or empty self-hosted pool cannot stop the gate from
 # reporting. Heavy jobs use the repository variable CI_RUNS_ON, a single runner
@@ -75,6 +75,56 @@ jobs:
           persist-credentials: false
       - run: node --test scripts/ci/*.test.mjs
 
+  policy:
+    name: Policy (lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Repository policy checks
+        # The repository has no linter; its rules are these dependency-free scripts.
+        # Every check runs and all failures are reported together (no install needed).
+        run: |
+          fail=0
+          check() {
+            echo "::group::$*"
+            "$@" || { fail=1; echo "::error title=Policy::$* failed"; }
+            echo "::endgroup::"
+          }
+          check node scripts/check-module-boundaries.mjs
+          check node scripts/check-no-git-push.mjs
+          check node scripts/check-node-version-policy.mjs
+          check node scripts/check-forbidden-tokens.mjs
+          check node scripts/check-token-gates.mjs
+          check node scripts/check-grey-gate.mjs
+          check node scripts/sync-agent-palette-tokens.mjs --check
+          check node scripts/sync-cliplab-character.mjs --check
+          check node scripts/check-docker-deps-stage.mjs
+          check node scripts/release-package-map.mjs check
+          check node --test scripts/check-grey-gate.test.mjs scripts/check-module-boundaries.test.mjs scripts/check-no-git-push.test.mjs scripts/release-package-map.test.mjs scripts/check-release-package-bootstrap.test.mjs
+          exit "$fail"
+      - name: Install checksum-pinned actionlint
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/actionlint-bin"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint-bin" actionlint
+      - name: Workflow policy
+        # shellcheck and pyflakes are off: their versions come with the runner image and would drift.
+        run: |
+          fail=0
+          node scripts/ci/workflow-policy.mjs || fail=1
+          "$RUNNER_TEMP/actionlint-bin/actionlint" -shellcheck= -pyflakes= -color || fail=1
+          exit "$fail"
+
   secrets:
     name: Secrets
     uses: ./.github/workflows/security.yml
@@ -117,7 +167,7 @@ jobs:
     name: CI gate
     # Never skipped: a skipped required check counts as passing.
     if: ${{ always() }}
-    needs: [changes, scripts, secrets, sentry]
+    needs: [changes, scripts, policy, secrets, sentry]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
