@@ -1,9 +1,7 @@
 name: Public fork security
+# Called by ci.yml (every PR, merge group and push to main) and deploy.yml; it has
+# no triggers of its own so each scan runs once.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_call:
 permissions:
   contents: read
