@@ -83,6 +83,8 @@ export function createRunSecretRedactionRegistry(db: Db) {
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
+        // Only runs that registered a secret matter; this matches the partial indexes.
+        sql`${heartbeatRuns.contextSnapshot} ? ${REGISTRY_KEY}`,
         or(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,

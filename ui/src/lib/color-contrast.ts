@@ -6,8 +6,11 @@
  * light page backgrounds.
  */
 
-const DARK_BG = { r: 24, g: 24, b: 27 }; // zinc-900 (#18181b)
-const LIGHT_BG = { r: 255, g: 255, b: 255 }; // white
+/** Dark-mode page surface: pure black, matching `--background` under `.dark`. */
+const DARK_BG = { r: 0, g: 0, b: 0 };
+
+/** Light-mode page surface: pure white, matching `--background`. */
+const LIGHT_BG = { r: 255, g: 255, b: 255 };
 
 export function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
   const match = /^#?([0-9a-f]{3,6})$/i.exec(hex.trim());
@@ -69,14 +72,14 @@ function composite(
 }
 
 /**
- * Shared readable-text pair (slate-50 / gray-900) for "pick light or dark
+ * Shared readable-text pair (pure white / pure black) for "pick light or dark
  * text over an arbitrary background" logic. Byte-identical values were
  * previously duplicated in lib/worktree-branding.ts (DECISION-SHEET.md A2);
  * this is the single source. NOT the same thing as ThemeContext.tsx's
- * <meta theme-color> pair (#18181b/#ffffff), which stays separate.
+ * <meta theme-color> pair, which stays separate.
  */
-export const READABLE_TEXT_LIGHT = "#f8fafc";
-export const READABLE_TEXT_DARK = "#111827";
+export const READABLE_TEXT_LIGHT = "#ffffff";
+export const READABLE_TEXT_DARK = "#000000";
 
 const TEXT_LIGHT = READABLE_TEXT_LIGHT;
 const TEXT_DARK = READABLE_TEXT_DARK;

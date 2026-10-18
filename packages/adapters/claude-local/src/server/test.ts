@@ -473,11 +473,7 @@ export async function testEnvironment(
         // separately from generic transient upstream errors: auth works, the
         // subscription's usage window is just spent. Surface it as its own
         // warning instead of a hard probe failure.
-        const usageLimited = isClaudeProviderQuotaError({
-          parsed,
-          stdout: probe.stdout,
-          stderr: probe.stderr,
-        });
+        const usageLimited = isClaudeProviderQuotaError({ parsed });
         const transient = isClaudeTransientUpstreamError({
           parsed,
           stdout: probe.stdout,

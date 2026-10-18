@@ -115,10 +115,13 @@ This repo has four separate data paths. Do not confuse them. Match a change to a
   - `packages/adapter-utils/src/duplex-observability.ts`
   - `server/src/services/duplex-observability-recorder.ts`
   - the span attributes in `packages/adapter-utils/src/acpx-engine/startup-timing.ts`
-- **The run log** holds rows in the local `heartbeat_run_events` table. The data stays in the instance database. Its paths are:
+- **The run log** holds rows in the local `heartbeat_run_events` table, and the `run_usage_records` table that a worker derives from run rows. The data stays in the instance database. Its paths are:
   - `doc/run-log-events.md`
   - `packages/db/src/schema/heartbeat_run_events.ts`
   - the append path `appendRunEvent` in `server/src/services/heartbeat.ts`
+  - `doc/run-usage-records.md`
+  - `packages/db/src/schema/run_usage_records.ts`
+  - `server/src/services/run-usage-records.ts` and `server/src/services/run-usage-record-derive.ts`
 - **The company archive** is a company-directed export of that company's own run history: runs, run events, transcripts, costs and activity. Every record passes the read-time redaction module. Content leaves the instance only to a board user of the company, or to a destination that the company's board configured. Its paths are:
   - `doc/company-archive.md`
   - `packages/shared/src/company-archive.ts`
