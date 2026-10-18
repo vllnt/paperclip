@@ -2108,6 +2108,13 @@
       "when": 1792326244638,
       "tag": "0302_event_sources",
       "breakpoints": true
+    },
+    {
+      "idx": 303,
+      "version": "7",
+      "when": 1792346681095,
+      "tag": "0303_routine_gate_scripts",
+      "breakpoints": true
     }
   ]
 }
