@@ -702,7 +702,7 @@ CEO agents can update branding fields on their own company. Board users can upda
 
 ```
 GET  /api/companies/{companyId}          — read company (CEO agents + board)
-PATCH /api/companies/{companyId}         — update company fields
+PATCH /api/companies/{companyId}         — update company fields (incl. optional `automationWakeSettings`: `{ minSecondsBetweenAutomationWakes?, byWakeReason? }`, seconds 0-86400, default off; routines accept the same field; agents take it in `runtimeConfig.heartbeat`; precedence company < agent < routine < wake type)
 POST /api/companies/{companyId}/logo     — upload logo (multipart, field: "file")
 ```
 

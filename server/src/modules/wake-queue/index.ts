@@ -14,6 +14,7 @@ import {
   listOrphanedDeferredWakes,
   retireClosedIssueDeferredWakes,
 } from "./adapters/deferred-wake-sweep-postgres.js";
+import type { WakeQueuePostgresAdapterDeps } from "./adapters/postgres.js";
 import { createQueuedCommentIssueLockWriter } from "./adapters/queued-comment-postgres.js";
 import type { QueuedCommentQueuePostgresAdapterDeps } from "./adapters/queued-comment-postgres.js";
 import { createAdmitWakeBehindIssueExecution, createReleaseIssueExecution } from "./application/use-cases.js";
@@ -45,6 +46,12 @@ export type {
   TransactionScope,
 } from "./application/ports.js";
 export type { AdmitWakeBehindIssueExecutionInput, AdmitWakeBehindIssueExecutionResult, ReleaseIssueExecutionInput } from "./application/use-cases.js";
+export {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  AUTOMATION_WAKE_REASON_SET,
+  buildAutomationWakeCoalescedState,
+  resolveMinSecondsBetweenAutomationWakes,
+} from "./domain/automation-wake-coalesce.js";
 export {
   buildSelfReblockWakeParkedState,
   decideSelfReblockWakeLimit,
@@ -102,6 +109,8 @@ export type WakeQueueDeps = {
   getRoutineEnv: WakeQueueHost["getRoutineEnv"];
   /** Stays in `heartbeat.ts`; resolves the session-before display id for a wakeup. */
   resolveSessionBeforeForWakeup: WakeQueueHost["resolveSessionBeforeForWakeup"];
+  /** Stays in `heartbeat.ts`; the per-agent automation window every automation-wake promotion passes through. */
+  admitAutomationWake: WakeQueuePostgresAdapterDeps["admitAutomationWake"];
   /**
    * The four wake-admission decision helpers stay in `heartbeat.ts` today;
    * the module receives them here so it never imports the service it is
@@ -129,6 +138,7 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
     resolveResponsibleUserId: deps.resolveResponsibleUserId,
     getRoutineEnv: deps.getRoutineEnv,
     resolveSessionBeforeForWakeup: deps.resolveSessionBeforeForWakeup,
+    admitAutomationWake: deps.admitAutomationWake,
   });
 
   return {

@@ -2680,6 +2680,7 @@ export {
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
 export * from "./validators/provider-trace.js";
+export * from "./validators/heartbeat-run.js";
 export {
   FEATURE_TIERS,
   INSTANCE_FEATURE_CATALOG,
@@ -2830,3 +2831,5 @@ export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
 export * from "./duplicate-detection.js";
+export * from "./automation-wake.js";
+export * from "./routine-noop-skip.js";

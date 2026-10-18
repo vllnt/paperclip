@@ -4,13 +4,15 @@ import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
 import { pipeline } from "node:stream/promises";
+import { isDeepStrictEqual } from "node:util";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, assertManagedAiProjectAuth, findManagedAiRoutingEnvKey, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiGatewayConfigSchema, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
 import { toolConnections } from "@paperclipai/db";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
+import { resolveExecutionWorkspaceEnvironmentId } from "../services/execution-workspace-policy.js";
 import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest, validateAiApiKey } from "./ai-connections.js";
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
@@ -54,6 +56,9 @@ import {
   updateAgentInstructionsPathSchema,
   wakeAgentSchema,
   updateAgentSchema,
+  heartbeatRunListQuerySchema,
+  heartbeatRunStatsQuerySchema,
+  HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
   startAdapterAuthSessionRequestSchema,
@@ -113,6 +118,7 @@ import {
   collectAgentPermissionChanges,
   collectAgentProtectedConfigChanges,
   collectNewAgentProtectedFields,
+  mergePatchedRuntimeConfig,
   type AgentProtectedConfigState,
 } from "../services/agent-self-config-authz.js";
 import { assertAgentProtectedChangeGranted, type AgentProtectedChangeSurface } from "./agent-protected-change-guard.js";
@@ -2478,13 +2484,16 @@ export function agentRoutes(
     adapterType: string,
     adapterConfig: Record<string, unknown>,
     runtimeConfig: unknown,
+    environmentId: string | null | undefined,
   ) {
     const normalized = normalizeNewAgentRuntimeConfig(runtimeConfig);
     if (req.actor.type !== "agent" || normalized.aiConnection) return normalized;
     const manager = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
     if (!manager || manager.companyId !== companyId) throw forbidden("Hiring agent is unavailable");
     const binding = defaultAiConnectionForHire(adapterType, adapterConfig, manager.runtimeConfig?.aiConnection);
-    if (binding) normalized.aiConnection = binding;
+    // An inherited binding must not turn routing into a bind failure: the child stays unbound and inherits the
+    // routing. Explicit bindings still reach the guard and get the 422.
+    if (binding && !(await findManagedAiRoutingConflict(companyId, adapterConfig, environmentId))) normalized.aiConnection = binding;
     return normalized;
   }
 
@@ -3576,7 +3585,53 @@ export function agentRoutes(
     return result;
   }
 
+  // Resolves the environment a run would use, the way heartbeat does: agent default, then the company/instance default,
+  // then the local environment, with the managed-sandbox-only redirect. Forced-Kubernetes execution mode is not mirrored.
+  async function resolveRunEnvironmentId(companyId: string, environmentId: string | null | undefined) {
+    // Non-creating lookup: a missing local row is created empty by the first run, so it can hold no routing.
+    const local = (await environmentsSvc.list({ driver: "local" }))[0] ?? null;
+    const managedSandboxOnly = (await instanceSettings.getExperimental()).enableManagedSandboxOnly === true;
+    const managed = managedSandboxOnly ? await environmentsSvc.findManagedSandboxEnvironment(companyId) : null;
+    return resolveExecutionWorkspaceEnvironmentId({
+      agentDefaultEnvironmentId: environmentId ?? null,
+      instanceDefaultEnvironmentId: resolveCompanyEnvironmentDefault(await instanceSettings.get(), companyId),
+      localDefaultEnvironmentId: local?.id ?? "",
+      managedSandboxOnly,
+      managedSandboxEnvironmentId: managed?.id ?? null,
+    }).environmentId || null;
+  }
+
+  // A managed AI connection owns provider routing, so prepareManagedAiRuntime refuses every run whose environment or
+  // agent env sets a route. This finds that conflict up front. It mirrors the run path: the environment resolves as in
+  // heartbeat, both env layers go through stripAiAuthBindings, the agent env wins key by key, and a plain env binding
+  // counts by its value.
+  async function findManagedAiRoutingConflict(companyId: string, adapterConfig: Record<string, unknown>, environmentId: string | null | undefined) {
+    // Resolution and company-visibility errors belong to the environment checks, so skip that layer here rather than
+    // add a new failure.
+    const effectiveEnvironmentId = await resolveRunEnvironmentId(companyId, environmentId).catch(() => null);
+    const boundCompanyIds = effectiveEnvironmentId ? await environmentsSvc.listBoundCompanyIds(effectiveEnvironmentId) : [];
+    const environment = effectiveEnvironmentId && (boundCompanyIds.length === 0 || boundCompanyIds.includes(companyId)) ? await environmentsSvc.getById(effectiveEnvironmentId) : null;
+    const agentEnv = stripAiAuthBindings(adapterConfig.env);
+    const envKey = findManagedAiRoutingEnvKey({ ...stripAiAuthBindings(environment?.envVars), ...agentEnv });
+    if (!envKey) return null;
+    return { envKey, source: Object.prototype.hasOwnProperty.call(agentEnv, envKey) ? "adapter_config" as const : "environment" as const, environmentId: environment?.id ?? null };
+  }
+
+  async function assertManagedAiRoutingCompatible(req: Request, companyId: string, adapterConfig: Record<string, unknown>, environmentId: string | null | undefined) {
+    const conflict = await findManagedAiRoutingConflict(companyId, adapterConfig, environmentId);
+    if (!conflict) return;
+    // Environment env vars are readable only by full readers (canReadFullInstanceEnvironment in routes/environments.ts),
+    // so only they learn which environment key is set. The caller's own adapter env is always named.
+    const namesKey = conflict.source === "adapter_config" || (req.actor.type === "board" && (req.actor.source === "local_implicit" || Boolean(req.actor.isInstanceAdmin)));
+    const advice = "A managed AI connection cannot be combined with environment or agent provider routing; leave the agent unbound to inherit the environment's routing, or remove the routing.";
+    throw unprocessable(
+      namesKey ? `${conflict.envKey} is set in the agent's ${conflict.source === "environment" ? "environment" : "adapter env"}. ${advice}` : `The agent's environment sets provider routing. ${advice}`,
+      { code: "ai_connection_incompatible", ...(namesKey ? { envKey: conflict.envKey } : {}), source: conflict.source, environmentId: conflict.environmentId },
+    );
+  }
+
   async function validateManagedAgentBinding(req: Request, companyId: string, agentId: string, adapterType: string, config: Record<string, unknown>, binding: AiConnectionBinding, environmentId: string | null | undefined, test: boolean, newAgent = false) {
+    await assertManagedAiRoutingCompatible(req, companyId, config, environmentId);
     const userId = responsibleUserForAiRequest(req);
     const allowUninstalledShared = newAgent && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, binding);
     const selection = await aiConnectionService(db).select({ companyId, agentId, userId, adapterType, model: config.model, runnerProvider: config.provider, acpxAgent: config.acpxAgent, binding, allowUninstalledPersonal: newAgent, allowUninstalledShared, allowLegacyValidation: test }).catch((error: unknown) => {
@@ -3597,7 +3652,7 @@ export function agentRoutes(
       let managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
       try {
         if (!target.executionTarget && target.fallbackChecks.length > 0) throw unprocessable("The agent environment is not available for adoption");
-        managed = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: userId, adapterType, binding, config, allowUninstalledPersonal: newAgent, allowUninstalledShared, allowLegacyValidation: true });
+        managed = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: userId, adapterType, binding, config: { ...config, env: stripAiAuthBindings(config.env) }, allowUninstalledPersonal: newAgent, allowUninstalledShared, allowLegacyValidation: true });
         const result = await testManagedEnvironment(adapterType, { companyId, adapterType, config: managed.config, executionTarget: target.executionTarget, environmentName: target.environmentName }, binding, managed, agentId);
         if (result.status === "fail" || result.checks.some(check => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE)) throw unprocessable("The selected AI connection failed validation in this agent’s environment. Run the agent test to see the failing checks.", {
           code: "ai_connection_validation_failed",
@@ -4780,7 +4835,7 @@ export function agentRoutes(
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
-    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig);
+    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig, hireInput.defaultEnvironmentId);
     const normalizedHireInput = {
       ...withoutInheritedCreateAuthority(req, hireInput),
       adapterConfig: normalizedAdapterConfig,
@@ -5095,7 +5150,7 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
-    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig);
+    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig, createInput.defaultEnvironmentId);
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
       allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
@@ -5826,14 +5881,22 @@ export function agentRoutes(
         adapterConfig: patchData.adapterConfig,
       });
     }
-    if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection) requestedRuntimeConfig.aiConnection = existing.runtimeConfig.aiConnection;
-    const nextAiBinding = aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
+    // An explicit null unbinds an existing binding; an omitted aiConnection keeps the stored one
+    // (see mergePatchedRuntimeConfig).
+    const clearsAiBinding = requestedRuntimeConfig?.aiConnection === null && Boolean(existing.runtimeConfig.aiConnection);
+    if (requestedRuntimeConfig) requestedRuntimeConfig = mergePatchedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig);
+    const nextAiBinding = aiConnectionBindingSchema.safeParse((requestedRuntimeConfig ?? existing.runtimeConfig).aiConnection).data;
     if (nextAiBinding) {
       await assertCanUpdateAgent(req, existing);
-      const changed = JSON.stringify(nextAiBinding) !== JSON.stringify(existing.runtimeConfig.aiConnection);
+      // jsonb does not keep key order, so compare structurally. A kept binding is re-validated only when the adapter
+      // configuration or default environment can change what it runs against.
+      const changed = !isDeepStrictEqual(nextAiBinding, existing.runtimeConfig.aiConnection);
+      const moved = touchesAdapterConfiguration || (patchData.defaultEnvironmentId !== undefined && patchData.defaultEnvironmentId !== existing.defaultEnvironmentId);
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
       if (!isAiConnectionCompatible(nextAiBinding, requestedAdapterType, aiConfig.model, aiConfig.provider, aiConfig.acpxAgent)) throw unprocessable("Select an AI connection compatible with the new harness and model");
-      if (changed) await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding, (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null, true);
+      // The post-patch environment and adapter env are what runs will use, so validation (routing first) also stops
+      // a kept binding from being moved into routing.
+      if (changed || moved) await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding, (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null, true);
     }
     if (requestedRuntimeConfig) patchData.runtimeConfig = requestedRuntimeConfig;
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
@@ -5885,7 +5948,7 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: { ...summarizeAgentUpdateDetails(patchData), ...(clearsAiBinding ? { aiConnectionCleared: true } : {}) },
     });
 
     res.json(redactAgentRowForResponse(agent));
@@ -7123,11 +7186,17 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
-    const agentId = req.query.agentId as string | undefined;
+    const filters = heartbeatRunListQuerySchema.parse(req.query);
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const runs = await heartbeat.list(companyId, agentId, limit, { summary });
+    const runs = await heartbeat.list(companyId, filters.agentId, limit, {
+      summary,
+      statuses: filters.status,
+      errorCodes: filters.errorCode,
+      since: filters.since ? new Date(filters.since) : undefined,
+      until: filters.until ? new Date(filters.until) : undefined,
+    });
     res.json(await runRedactions.redactForRuns(companyId, runs));
   });
 
@@ -7140,6 +7209,20 @@ export function agentRoutes(
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
     res.set("Cache-Control", "no-cache, no-store");
     res.json(await heartbeat.getDeferredWakeStats(companyId));
+  });
+
+  router.get("/companies/:companyId/heartbeat-runs/stats", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
+    const query = heartbeatRunStatsQuerySchema.parse(req.query);
+    const until = query.until ? new Date(query.until) : new Date();
+    const since = query.since ? new Date(query.since) : new Date(until.getTime() - 24 * 60 * 60 * 1000);
+    if (since >= until) throw badRequest("since must be earlier than until");
+    if (until.getTime() - since.getTime() > HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS * 24 * 60 * 60 * 1000) {
+      throw badRequest(`The stats window can be at most ${HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS} days`);
+    }
+    res.json(await heartbeat.runStats(companyId, { since, until, agentId: query.agentId }));
   });
 
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
