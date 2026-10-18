@@ -42,6 +42,10 @@ describe("activity formatting", () => {
     expect(formatIssueActivityAction("issue.blockers_updated", details)).toBe("added blocker PAP-22");
   });
 
+  it("names a deferred wake the sweep keeps holding", () => {
+    expect(formatActivityVerb("heartbeat.deferred_wake_held")).toBe("is holding a deferred wake on");
+  });
+
   it("formats reviewer activity using agent names", () => {
     const details = {
       addedParticipants: [

@@ -579,7 +579,10 @@ Authenticated public deployments must configure a trusted runtime host (`PAPERCL
 When a managed agent creates or hires another agent without an explicit AI binding
 or adapter auth setting, the server inherits its compatible managed connection choice.
 Explicit credentials, blank overrides, credential directories, and provider routing
-settings for the child provider take precedence. Unrelated provider keys do not
+settings for the child provider take precedence. Provider routing set by the
+child's environment (or any routing key in its adapter env) also leaves it
+unbound, because a managed connection cannot run alongside routing; the child
+inherits that routing instead of failing to hire. Unrelated provider keys do not
 suppress the default. Unmanaged parents keep their existing authentication path. The new agent resolves
 the responsible user's account at execution time; it never copies the parent's
 credentials or identity. Same-provider hires preserve subscription/API-key choice.

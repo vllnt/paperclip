@@ -20,7 +20,7 @@ import {
 } from "@paperclipai/shared/github-write-identity";
 import { boardScope, requireInstanceAdmin } from "./setup.js";
 import { GitHubError, type GitHubClient } from "./github.js";
-import { SKILLS_LOCK_FILE, TIERS_FILE, parseProtectedPaths, protectedFiles, protectedPatterns, skillsLockException, type ChangedFile } from "./protected-paths.js";
+import { SKILLS_LOCK_FILE, TIERS_FILE, parseAgentMergeablePaths, parseProtectedPaths, protectedFiles, protectedPatterns, skillsLockException, splitReleased, type AgentMergeableRule, type ChangedFile } from "./protected-paths.js";
 import type { Catalog, Repository } from "./contracts.js";
 import { UserAuthorization, UserAuthorizationError, type FenceStatus } from "./user-authorization.js";
 import { checkGitObjectForSigning, parseSshSigningKey, sshSign, type SshSigningKey } from "./ssh-signature.js";
@@ -39,6 +39,8 @@ const MAX_SIGN_PAYLOAD_BYTES = 1024 * 1024;
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** GitHub lists at most 3,000 files of a pull request, 100 per page: a longer list is cut, and the merge is refused. */
 const MAX_PULL_REQUEST_FILE_PAGES = 30;
+/** Released files named in a merge's evidence; the count says how many there were. */
+const MAX_RELEASED_LISTED = 100;
 /** Pages read for a fence or merge check; a list that still has a next page after this fails closed. */
 const MAX_PAGES = 10;
 /** The conclusions of a finished check run that pass a required check, as GitHub counts them. */
@@ -403,15 +405,30 @@ export function registerWriteIdentity(
     const again = await readPullRequest();
     if (again?.head?.sha !== headSha || again?.base?.sha !== baseSha) throw new Denied(`Pull request #${pullRequest} changed while Paperclip checked it; run the merge again.`, evidence);
     const touched = protectedFiles(files, patterns);
-    if (!touched.length) return { ...evidence, files: files.length, protectedPaths: patterns.length };
-    if (touched.length === 1 && touched[0] === SKILLS_LOCK_FILE) {
+    // An instance admin may release some protected files for this repository (the plugin config, read now, never from the head).
+    // A file the opt-in does not release keeps the refusal for the whole pull request.
+    const optIn = touched.length ? await agentMergeableRule(companyId, repository) : { rule: null, problems: [] as string[] };
+    const { released, kept } = splitReleased(touched, optIn.rule, repository, tiers);
+    const releaseEvidence = released.length ? { releasedProtectedFiles: released.slice(0, MAX_RELEASED_LISTED), releasedProtectedFilesCount: released.length, releasedBy: "config:agentMergeablePaths" } : {};
+    if (!kept.length) return { ...evidence, files: files.length, protectedPaths: patterns.length, ...releaseEvidence };
+    if (kept.length === 1 && kept[0] === SKILLS_LOCK_FILE) {
       const [baseLock, headLock] = await Promise.all([file(SKILLS_LOCK_FILE, baseSha), file(SKILLS_LOCK_FILE, headSha)]).catch(() => [null, null]);
       const reason = baseLock === null || headLock === null ? `${SKILLS_LOCK_FILE} could not be read at both ends` : skillsLockException({ baseLock, headLock, files, patterns });
       if (reason === null) return { ...evidence, files: files.length, protectedPaths: patterns.length, skillsLockSnapshotOnly: true };
-      throw new Denied(`This pull request changes the protected path ${SKILLS_LOCK_FILE} beyond skill snapshot hashes (${reason}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: touched });
+      throw new Denied(`This pull request changes the protected path ${SKILLS_LOCK_FILE} beyond skill snapshot hashes (${reason}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: kept });
     }
-    const listed = touched.slice(0, 20).join(", ") + (touched.length > 20 ? `, and ${touched.length - 20} more` : "");
-    throw new Denied(`This pull request changes protected paths (${listed}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: touched });
+    const listed = kept.slice(0, 20).join(", ") + (kept.length > 20 ? `, and ${kept.length - 20} more` : "");
+    throw new Denied(`This pull request changes protected paths (${listed}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: kept, ...(optIn.problems.length ? { agentMergeablePathsProblems: optIn.problems.slice(0, 5) } : {}) });
+  }
+
+  /**
+   * The instance admin's opt-in for one repository, from the company's plugin config at the moment of the merge. An entry that
+   * is not valid releases nothing; a problem is logged and shown in the refusal's evidence, never guessed around.
+   */
+  async function agentMergeableRule(companyId: string, repository: string): Promise<{ rule: AgentMergeableRule | null; problems: string[] }> {
+    const { rules, problems } = parseAgentMergeablePaths((await ctx.config.get(companyId)).agentMergeablePaths);
+    if (problems.length) ctx.logger.warn("agentMergeablePaths has entries that are not valid and release nothing", { companyId, problems: problems.slice(0, 5) });
+    return { rule: rules.find(rule => rule.repository === repository.toLowerCase()) ?? null, problems };
   }
 
   /**

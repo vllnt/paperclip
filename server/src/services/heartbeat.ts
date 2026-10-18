@@ -1,4 +1,5 @@
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
+import { issueIdEqualsText } from "./issue-id-match.js";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
@@ -16,7 +17,8 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -40,6 +42,7 @@ import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -562,6 +565,7 @@ import {
 import {
   createRunDispatch,
   type PostCommitEffect,
+  type RetryAdmissionPolicy,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
@@ -575,11 +579,15 @@ import {
   isResolvedInteractionContinuationWakeContext,
 } from "../modules/run-dispatch/index.js";
 import {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  AUTOMATION_WAKE_REASON_SET,
+  buildAutomationWakeCoalescedState,
   buildSelfReblockWakeParkedState,
   createWakeQueue,
   DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
   DEFERRED_WAKE_SWEEP_RECHECK_MS,
   decideSelfReblockWakeLimit,
+  resolveMinSecondsBetweenAutomationWakes,
   deriveSelfReblockWakeMarker,
   isSelfReblockWakeOwner,
   readSelfReblockWakeMarker,
@@ -614,7 +622,10 @@ import {
   DIRECT_NON_INVOKABLE_STATUSES,
   type AgentOrgRow,
 } from "./agent-invokability.js";
-import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
+import {
+  isHeartbeatWakeOnDemandEnabled,
+  readAgentAutomationWakeSettings,
+} from "./heartbeat-policy.js";
 import {
   isLowTrustQuarantined,
   redactQuarantinedBodyForHigherTrust,
@@ -883,6 +894,20 @@ export {
 };
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
+const DEFERRED_WAKE_HELD_ACTION = "heartbeat.deferred_wake_held";
+/** A wake the sweep keeps parked this long after it was requested gets one held activity entry. */
+const DEFERRED_WAKE_HELD_NOTICE_MS = 10 * 60 * 1000;
+type DeferredWakeHeldReason =
+  /** The agent has no free run slot. */
+  | "no_free_run_slot"
+  /** The pass budget ran out, or an older wake of the same issue went first. */
+  | "waiting_for_turn"
+  | "agent_not_invokable"
+  | "budget_stop"
+  | "pause_hold"
+  | "execution_blocker"
+  | "operator_stop"
+  | "admission_deferred";
 // A workspace restore or agent directory lock that no queue progress released
 // in time. Contention clears on its own, so the run is retried under the
 // bounded transient budget instead of ending as a plain `adapter_failed`.
@@ -2095,6 +2120,37 @@ function providerQuotaKeyForAgent(
 ) {
   const model = readNonEmptyString(parseObject(agent.adapterConfig).model);
   return model ? `${agent.adapterType}:${model}` : agent.adapterType;
+}
+
+/** One agent's runs in a UTC day, as `computeDailyRunUsage` reads them. */
+interface DailyRunUsage {
+  /** Started runs that are not queued or waiting to retry. */
+  total: number;
+  /** The failed ones among them that hit a provider quota before any useful action. */
+  providerQuotaBeforeUsefulAction: number;
+}
+
+const NO_DAILY_RUNS: DailyRunUsage = { total: 0, providerQuotaBeforeUsefulAction: 0 };
+
+/**
+ * The runs that count toward `maxDailyRuns`. Up to the daily allowance, a
+ * provider quota failure before any useful action is not a run the cap guards
+ * against. Failures beyond the allowance count again, so a permanent outage
+ * still meets the cap. The cap and the run stats both call this, so it is the
+ * one place that applies the allowance.
+ *
+ * @param usage - the agent's raw usage for the day.
+ * @param policy - the agent's heartbeat policy.
+ * @returns the number that the cap compares with `maxDailyRuns`.
+ */
+function countedDailyRuns(
+  usage: DailyRunUsage,
+  policy: { providerQuotaRetry: Pick<ProviderQuotaRetryPolicy, "enabled" | "maxDailyUncountedRuns"> },
+): number {
+  const forgiven = policy.providerQuotaRetry.enabled
+    ? Math.min(usage.providerQuotaBeforeUsefulAction, policy.providerQuotaRetry.maxDailyUncountedRuns)
+    : 0;
+  return usage.total - forgiven;
 }
 
 /** Reads `runtimeConfig.heartbeat.providerQuotaRetry`. */
@@ -8066,32 +8122,34 @@ export async function buildPaperclipWakePayload(input: {
   const commentRows =
     commentIds.length === 0
       ? []
-      : await input.db
-          .select({
-            id: issueComments.id,
-            issueId: issueComments.issueId,
-            body: issueComments.body,
-            authorType: issueComments.authorType,
-            authorAgentId: issueComments.authorAgentId,
-            authorUserId: issueComments.authorUserId,
-            presentation: issueComments.presentation,
-            metadata: issueComments.metadata,
-            deletedAt: issueComments.deletedAt,
-            deletedByType: issueComments.deletedByType,
-            deletedByAgentId: issueComments.deletedByAgentId,
-            deletedByUserId: issueComments.deletedByUserId,
-            deletedByRunId: issueComments.deletedByRunId,
-            sourceTrust: issueComments.sourceTrust,
-            createdAt: issueComments.createdAt,
-          })
-          .from(issueComments)
-          .where(
-            and(
-              eq(issueComments.companyId, input.companyId),
-              issueId ? eq(issueComments.issueId, issueId) : undefined,
-              inArray(issueComments.id, commentIds),
+      : await selectInCommentBatches(commentIds, (batch) =>
+          input.db
+            .select({
+              id: issueComments.id,
+              issueId: issueComments.issueId,
+              body: issueComments.body,
+              authorType: issueComments.authorType,
+              authorAgentId: issueComments.authorAgentId,
+              authorUserId: issueComments.authorUserId,
+              presentation: issueComments.presentation,
+              metadata: issueComments.metadata,
+              deletedAt: issueComments.deletedAt,
+              deletedByType: issueComments.deletedByType,
+              deletedByAgentId: issueComments.deletedByAgentId,
+              deletedByUserId: issueComments.deletedByUserId,
+              deletedByRunId: issueComments.deletedByRunId,
+              sourceTrust: issueComments.sourceTrust,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, input.companyId),
+                issueId ? eq(issueComments.issueId, issueId) : undefined,
+                inArray(issueComments.id, batch),
+              ),
             ),
-          );
+        );
 
   const commentsById = new Map(
     commentRows.map((comment) => [comment.id, comment]),
@@ -10069,6 +10127,7 @@ export function heartbeatService(
       if (!agent) return null;
       return resolveSessionBeforeForWakeup(agent, input.taskKey);
     },
+    admitAutomationWake: ({ tx, ...input }) => admitThroughAutomationWindow(tx as Db, input),
     // These four helpers stay in this file today; the wake-queue module
     // receives them here so it never imports this file, the service it is
     // extracted from.
@@ -10872,7 +10931,7 @@ export function heartbeatService(
     const waits = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`),
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
@@ -11343,19 +11402,22 @@ export function heartbeatService(
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
-        .select({
-          id: issueComments.id,
-          authorUserId: issueComments.authorUserId,
-        })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, input.companyId),
-            eq(issueComments.issueId, input.issueContext.id),
-            inArray(issueComments.id, messageIds),
+      const issueContextId = input.issueContext.id;
+      const messages = await selectInCommentBatches(messageIds, (batch) =>
+        db
+          .select({
+            id: issueComments.id,
+            authorUserId: issueComments.authorUserId,
+          })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, input.companyId),
+              eq(issueComments.issueId, issueContextId),
+              inArray(issueComments.id, batch),
+            ),
           ),
-        );
+      );
       for (const id of [...messageIds].reverse()) {
         const author = messages.find(
           (message) => message.id === id,
@@ -11693,6 +11755,7 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    manualUserWake?: boolean;
   }) {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
@@ -11754,6 +11817,7 @@ export function heartbeatService(
             { issueId: recoveryIssue.id, sourceIssueId: input.claimed.id },
             "status_only",
           ),
+          ...(input.manualUserWake ? { manualUserWake: true } : {}),
           requestedByActorType: input.actorType,
           requestedByActorId: input.actorId,
           contextSnapshot: withRecoveryContext(
@@ -11830,6 +11894,7 @@ export function heartbeatService(
         },
         "status_only",
       ),
+      ...(input.manualUserWake ? { manualUserWake: true } : {}),
       requestedByActorType: input.actorType,
       requestedByActorId: input.actorId,
       contextSnapshot: withRecoveryContext(
@@ -11876,6 +11941,8 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    /** Trusted provenance of a user's check-now: the recovery wake stays exempt from the automation window. */
+    manualUserWake?: boolean;
   }) {
     await db
       .update(issues)
@@ -11922,6 +11989,7 @@ export function heartbeatService(
       agentId: input.agentId,
       runId: input.runId,
       activitySource: input.activitySource,
+      manualUserWake: input.manualUserWake,
     });
 
     return { outcome: "skipped" as const, reason: input.clearReason };
@@ -11940,6 +12008,8 @@ export function heartbeatService(
       runId: string | null;
       clearOnClientError: boolean;
       activitySource: "manual" | "scheduled";
+      /** An authenticated user's check-now: exempt from the automation window like any human wake. */
+      manualUserWake?: boolean;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -12011,6 +12081,7 @@ export function heartbeatService(
         agentId: input.agentId,
         runId: input.runId,
         activitySource: input.activitySource,
+        manualUserWake: input.manualUserWake,
       });
     }
 
@@ -12077,6 +12148,7 @@ export function heartbeatService(
           triggerDetail: input.triggerDetail,
           reason: wakeReason,
           idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
+          ...(input.manualUserWake ? { manualUserWake: true } : {}),
           payload: {
             issueId: claimed.id,
             nextCheckAt: scheduledAtIso,
@@ -12275,11 +12347,60 @@ export function heartbeatService(
       runId: input?.runId ?? null,
       clearOnClientError: false,
       activitySource: "manual",
+      manualUserWake: actorType === "user",
     });
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const parkedMonitors = await db
+      .select(issueMonitorDispatchColumns)
+      .from(issues)
+      .where(
+        and(
+          sql`${issues.monitorNextCheckAt} is not null`,
+          lte(issues.monitorNextCheckAt, now),
+          inArray(issues.status, ["blocked", "done", "cancelled"]),
+        ),
+      )
+      .limit(50);
+    for (const candidate of parkedMonitors) {
+      // Lock and re-read so the cleanup never overwrites a concurrent edit with a stale snapshot.
+      await db.transaction(async (tx) => {
+        const [parked] = await tx
+          .select(issueMonitorDispatchColumns)
+          .from(issues)
+          .where(
+            and(
+              eq(issues.id, candidate.id),
+              sql`${issues.monitorNextCheckAt} is not null`,
+              inArray(issues.status, ["blocked", "done", "cancelled"]),
+            ),
+          )
+          .for("update");
+        if (!parked) return;
+        const { monitor: _monitor, ...policyWithoutMonitor } = (parked.executionPolicy ?? {}) as Record<string, unknown>;
+        const clearedPatch = buildIssueMonitorClearedPatch({
+          issue: parked,
+          policy: normalizeIssueExecutionPolicy(parked.executionPolicy ?? null),
+          clearReason:
+            parked.status === "done" || parked.status === "cancelled"
+              ? parked.status
+              : "invalid_status",
+          clearedAt: now,
+        });
+        await tx
+          .update(issues)
+          .set({
+            ...clearedPatch,
+            // Keep every non-monitor policy field; the normalized policy would drop some.
+            executionPolicy: parked.executionPolicy ? policyWithoutMonitor : null,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, parked.id));
+      });
+    }
+
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
@@ -13011,7 +13132,7 @@ export function heartbeatService(
     lastError: string | null;
   }) {
     return db.transaction(async (tx) => {
-      const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
+      const [issue] = await tx.select().from(issues).where(and(issueIdEqualsText(sql`${input.taskKey}`), eq(issues.companyId, input.companyId))).for("update");
       if (isConversation(issue)) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
         if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
@@ -13095,7 +13216,7 @@ export function heartbeatService(
 
     return db.transaction(async (tx) => {
       if (opts?.taskKey && opts.expectedRunId) {
-        const [issue] = await tx.select().from(issues).where(sql`${issues.id}::text = ${opts.taskKey}`).for("update");
+        const [issue] = await tx.select().from(issues).where(issueIdEqualsText(sql`${opts.taskKey}`)).for("update");
         if (isConversation(issue)) {
           const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, opts.expectedRunId));
           if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return 0;
@@ -15887,7 +16008,7 @@ export function heartbeatService(
     const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
     if (!policy.enabled) return;
     try {
-      const usage = await getHeartbeatDailyRunUsage(agent, null);
+      const usage = (await computeDailyRunUsage(agent.companyId, { agentId: agent.id })).get(agent.id) ?? NO_DAILY_RUNS;
       if (usage.providerQuotaBeforeUsefulAction <= policy.maxDailyUncountedRuns) {
         return;
       }
@@ -17041,7 +17162,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, heartbeatRuns.companyId),
-          sql`${issues.id}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+          issueIdEqualsText(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`),
         ),
       )
       .where(
@@ -17443,6 +17564,131 @@ export function heartbeatService(
     }
   }
 
+  async function resolveAutomationWakeWindowSec(
+    dbOrTx: Db,
+    input: {
+      agent: { companyId: string; runtimeConfig: unknown };
+      reason: string;
+      issue: { originKind: string | null; originId: string | null } | null;
+    },
+  ): Promise<number> {
+    if (!AUTOMATION_WAKE_REASON_SET.has(input.reason)) return 0;
+    const { agent, issue } = input;
+    return resolveMinSecondsBetweenAutomationWakes({
+      reason: input.reason,
+      agent: parseHeartbeatPolicy(agent as typeof agents.$inferSelect).automationWakeSettings,
+      company: await dbOrTx
+        .select({ settings: companies.automationWakeSettings })
+        .from(companies)
+        .where(eq(companies.id, agent.companyId))
+        .then((rows) => rows[0]?.settings ?? null),
+      routine:
+        issue?.originKind === "routine_execution" && issue.originId
+          ? await dbOrTx
+              .select({ settings: routines.automationWakeSettings })
+              .from(routines)
+              .where(and(eq(routines.id, issue.originId), eq(routines.companyId, agent.companyId)))
+              .then((rows) => rows[0]?.settings ?? null)
+          : null,
+    });
+  }
+
+  async function lockAutomationWakeWindow(tx: Db, companyId: string, agentId: string) {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0))`,
+    );
+  }
+
+  async function tryLockAutomationWakeWindow(tx: Db, companyId: string, agentId: string): Promise<boolean> {
+    const rows = await tx.execute<{ acquired: boolean }>(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0)) as acquired`,
+    );
+    return Boolean(rows[0]?.acquired);
+  }
+
+  async function findLastAutomationRun(
+    dbOrTx: Db,
+    input: { companyId: string; agentId: string; since: Date; excludeRunId?: string },
+  ) {
+    const [row] = await dbOrTx
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          gte(heartbeatRuns.createdAt, input.since),
+          inArray(sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`, [...AUTOMATION_WAKE_REASON_SET]),
+          input.excludeRunId ? ne(heartbeatRuns.id, input.excludeRunId) : undefined,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Admits an automation wake that is about to start a run outside the fresh-wake path: a
+   * scheduled retry or a deferred wake promoted on release. Inside the caller's transaction,
+   * under the same per-agent lock as fresh wakes, it is held while the agent's window is open;
+   * otherwise its admission time opens a new window.
+   */
+  async function admitThroughAutomationWindow(
+    txDb: Db,
+    input: {
+      companyId: string;
+      agentId: string;
+      reason: string | null;
+      issueId: string | null;
+      now: Date;
+      excludeRunId?: string;
+      /** Hold, rather than wait, when another transaction owns the window lock. */
+      nonblocking?: boolean;
+    },
+  ): Promise<{ hold: true; holdUntil: Date } | { hold: false; admittedAt?: Date }> {
+    const proceed = { hold: false as const };
+    if (!input.reason) return proceed;
+    const [agent] = await txDb.select().from(agents).where(eq(agents.id, input.agentId));
+    if (!agent) return proceed;
+    const issue = input.issueId
+      ? await txDb
+          .select({ originKind: issues.originKind, originId: issues.originId })
+          .from(issues)
+          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const windowSec = await resolveAutomationWakeWindowSec(txDb, { agent, reason: input.reason, issue });
+    if (windowSec <= 0) return proceed;
+    if (input.nonblocking) {
+      if (!(await tryLockAutomationWakeWindow(txDb, input.companyId, input.agentId))) {
+        return { hold: true as const, holdUntil: input.now };
+      }
+    } else {
+      await lockAutomationWakeWindow(txDb, input.companyId, input.agentId);
+    }
+    // The caller's clock predates any wait for the issue and window locks; admit on a fresh one.
+    const admittedAt = new Date(Math.max(input.now.getTime(), Date.now()));
+    const last = await findLastAutomationRun(txDb, {
+      companyId: input.companyId,
+      agentId: input.agentId,
+      since: new Date(admittedAt.getTime() - windowSec * 1000),
+      excludeRunId: input.excludeRunId,
+    });
+    return last
+      ? { hold: true as const, holdUntil: new Date(last.createdAt.getTime() + windowSec * 1000 + 1) }
+      : { hold: false as const, admittedAt };
+  }
+
+  const admitScheduledRetryThroughAutomationWindow: RetryAdmissionPolicy = ({ tx, run, now }) =>
+    admitThroughAutomationWindow(tx as Db, {
+      companyId: run.companyId,
+      agentId: run.agentId,
+      reason: readNonEmptyString(run.contextSnapshot.wakeReason),
+      issueId: readNonEmptyString(run.contextSnapshot.issueId),
+      now,
+      excludeRunId: run.id,
+    });
+
   async function promoteDueScheduledRetries(now = new Date()) {
     await coalesceProviderQuotaRetries(now).catch((err) => {
       logger.warn({ err }, "failed to coalesce provider quota retries");
@@ -17451,6 +17697,7 @@ export function heartbeatService(
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,
+      admission: admitScheduledRetryThroughAutomationWindow,
     });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
     return { promoted: result.promoted, runIds: result.runIds };
@@ -17683,6 +17930,7 @@ export function heartbeatService(
       maxConcurrentRuns: normalizeMaxConcurrentRuns(
         heartbeat.maxConcurrentRuns,
       ),
+      automationWakeSettings: readAgentAutomationWakeSettings(heartbeat),
       skipTimerWhenNoActionableWork: asBoolean(
         heartbeat.skipTimerWhenNoActionableWork ??
           heartbeat.requireActionableTimerWork ??
@@ -17739,36 +17987,61 @@ export function heartbeatService(
     return { start, end };
   }
 
-  /** Started runs in the current UTC day, as counted by maxDailyRuns. */
-  async function getHeartbeatDailyRunUsage(
-    agent: typeof agents.$inferSelect,
-    excludeRunId: string | null,
+  /**
+   * The single definition of how many runs `maxDailyRuns` counts, per agent,
+   * in one UTC day. The cap check (`getHeartbeatDailyCapBlock`), the run
+   * stats (`runStats`) and the provider quota alarm all read it, so what
+   * automation reads from the stats is exactly what the cap enforces. A run
+   * that the cap should not charge is taken out of the count here and in
+   * `countedDailyRuns`, and nowhere else.
+   *
+   * Counted: runs started in the day that are not queued or waiting to retry.
+   * `providerQuotaBeforeUsefulAction` is the part of them that failed on a
+   * provider quota before any useful action; `countedDailyRuns` decides how
+   * many of those the cap forgives.
+   *
+   * @param companyId - the company whose runs are counted.
+   * @param options.agentId - count one agent; omit to count every agent that has runs.
+   * @param options.excludeRunId - a run to leave out (the run being admitted).
+   * @param options.window - the UTC day; defaults to the current one.
+   * @returns the usage per agent ID; an agent with none is absent.
+   */
+  async function computeDailyRunUsage(
+    companyId: string,
+    options: {
+      agentId?: string;
+      excludeRunId?: string | null;
+      window?: { start: Date; end: Date };
+    } = {},
     client: Pick<Db, "select"> = db,
-  ) {
-    const { start, end } = currentUtcDayWindow();
+  ): Promise<Map<string, DailyRunUsage>> {
+    const window = options.window ?? currentUtcDayWindow();
     const conditions = [
-      eq(heartbeatRuns.companyId, agent.companyId),
-      eq(heartbeatRuns.agentId, agent.id),
-      gte(heartbeatRuns.startedAt, start),
-      lt(heartbeatRuns.startedAt, end),
+      eq(heartbeatRuns.companyId, companyId),
+      gte(heartbeatRuns.startedAt, window.start),
+      lt(heartbeatRuns.startedAt, window.end),
       notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
+      ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
     ];
-    if (excludeRunId) {
-      conditions.push(sql`${heartbeatRuns.id} <> ${excludeRunId}`);
-    }
-    const [row] = await client
+    const rows = await client
       .select({
+        agentId: heartbeatRuns.agentId,
         total: sql<number>`count(*)::integer`,
         providerQuotaBeforeUsefulAction: sql<number>`count(*) filter (where ${heartbeatRuns.status} = 'failed' and ${heartbeatRuns.resultJson} ->> 'providerQuotaBeforeUsefulAction' = 'true')::integer`,
       })
       .from(heartbeatRuns)
-      .where(and(...conditions));
-    return {
-      total: Number(row?.total ?? 0),
-      providerQuotaBeforeUsefulAction: Number(
-        row?.providerQuotaBeforeUsefulAction ?? 0,
-      ),
-    };
+      .where(and(...conditions))
+      .groupBy(heartbeatRuns.agentId);
+    return new Map(
+      rows.map((row) => [
+        row.agentId,
+        {
+          total: Number(row.total),
+          providerQuotaBeforeUsefulAction: Number(row.providerQuotaBeforeUsefulAction),
+        },
+      ]),
+    );
   }
 
   async function getHeartbeatDailyCapBlock(
@@ -17785,22 +18058,12 @@ export function heartbeatService(
     const checkCostCap = options.checkCostCap ?? true;
     const { start, end } = currentUtcDayWindow();
     if (checkRunCap && policy.maxDailyRuns !== null) {
-      const usage = await getHeartbeatDailyRunUsage(
-        agent,
-        options.excludeRunId ?? null,
+      const usage = await computeDailyRunUsage(
+        agent.companyId,
+        { agentId: agent.id, excludeRunId: options.excludeRunId, window: { start, end } },
         client,
       );
-      // Up to the daily allowance, a provider-quota failure before any useful
-      // action is not a run the cap guards against. Failures beyond the
-      // allowance count again, so a permanent outage still meets the cap.
-      const observed =
-        usage.total -
-        (policy.providerQuotaRetry.enabled
-          ? Math.min(
-              usage.providerQuotaBeforeUsefulAction,
-              policy.providerQuotaRetry.maxDailyUncountedRuns,
-            )
-          : 0);
+      const observed = countedDailyRuns(usage.get(agent.id) ?? NO_DAILY_RUNS, policy);
       if (observed >= policy.maxDailyRuns) {
         return {
           reason: "heartbeat.daily_run_limit",
@@ -18697,21 +18960,24 @@ export function heartbeatService(
                   ? { kind: "claimed" as const, run: claimedRun }
                   : { kind: "stale" as const, run: null };
               }
-              const commentRows = await tx
-                .select({
-                  id: issueComments.id,
-                  deletedAt: issueComments.deletedAt,
-                })
-                .from(issueComments)
-                .where(
-                  and(
-                    eq(issueComments.companyId, run.companyId),
-                    eq(issueComments.issueId, issueId),
-                    inArray(issueComments.id, authoritativeIds),
+              const commentRows = await selectInCommentBatches(authoritativeIds, (batch) =>
+                tx
+                  .select({
+                    id: issueComments.id,
+                    deletedAt: issueComments.deletedAt,
+                  })
+                  .from(issueComments)
+                  .where(
+                    and(
+                      eq(issueComments.companyId, run.companyId),
+                      eq(issueComments.issueId, issueId),
+                      inArray(issueComments.id, batch),
+                    ),
                   ),
-                );
+              );
+              const commentsById = new Map(commentRows.map((row) => [row.id, row]));
               const liveIds = authoritativeIds.filter((commentId) => {
-                const comment = commentRows.find((row) => row.id === commentId);
+                const comment = commentsById.get(commentId);
                 return Boolean(comment && !comment.deletedAt);
               });
               if (liveIds.length === 0) {
@@ -20705,7 +20971,8 @@ export function heartbeatService(
    */
   async function readDeferredWakeHolds(candidates: readonly OrphanedDeferredWakeRow[]) {
     const holds = new Map<string, "pause_hold" | "execution_blocker" | "operator_stop">();
-    if (candidates.length === 0) return holds;
+    const blockers = new Map<string, ExecutionBlocker>();
+    if (candidates.length === 0) return { holds, blockers };
 
     const companyIds = [...new Set(candidates.map((candidate) => candidate.companyId))];
     const companiesWithPauseHold = new Set(
@@ -20743,8 +21010,10 @@ export function heartbeatService(
         holds.set(candidate.wakeId, "pause_hold");
         continue;
       }
-      if (await getExecutionBlocker(db, candidate.companyId, candidate.issueId)) {
+      const executionBlocker = await getExecutionBlocker(db, candidate.companyId, candidate.issueId);
+      if (executionBlocker) {
         holds.set(candidate.wakeId, "execution_blocker");
+        blockers.set(candidate.wakeId, executionBlocker);
         continue;
       }
       const latest = latestRunByIssueId.get(candidate.issueId);
@@ -20758,7 +21027,63 @@ export function heartbeatService(
         holds.set(candidate.wakeId, "operator_stop");
       }
     }
-    return holds;
+    return { holds, blockers };
+  }
+
+  /**
+   * Records, once per wake, that the sweep keeps a wake parked longer than
+   * `DEFERRED_WAKE_HELD_NOTICE_MS`, whatever holds it: no free run slot, an agent
+   * that cannot run, a budget stop, a pause hold, an operator Stop, an execution
+   * blocker (with its cause, run and recovery action) or admission deferring it
+   * again. The advisory lock makes the check and the insert atomic.
+   */
+  async function recordDeferredWakeHeld(
+    candidate: OrphanedDeferredWakeRow,
+    reason: DeferredWakeHeldReason,
+    blocker: ExecutionBlocker | null,
+  ) {
+    const publications: ActivityPublication[] = [];
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`deferred-wake-held:${candidate.wakeId}`}, 0))`,
+      );
+      const [existing] = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.action, DEFERRED_WAKE_HELD_ACTION),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.issueId),
+          sql`${activityLog.details} ->> 'wakeId' = ${candidate.wakeId}`,
+        ))
+        .limit(1);
+      if (existing) return;
+      await logActivity(txDb, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: candidate.agentId,
+        action: DEFERRED_WAKE_HELD_ACTION,
+        entityType: "issue",
+        entityId: candidate.issueId,
+        details: {
+          wakeId: candidate.wakeId,
+          reason,
+          parkedSince: candidate.requestedAt.toISOString(),
+          ...(blocker
+            ? {
+                cause: blocker.cause,
+                runId: blocker.runId,
+                recoveryActionId: blocker.recoveryActionId,
+                nextAction: blocker.nextAction,
+              }
+            : {}),
+        },
+      }, publications);
+    });
+    for (const publication of publications) publishActivity(publication);
   }
 
   /**
@@ -20834,6 +21159,16 @@ export function heartbeatService(
     };
     if ((await getSchedulingSuppression()).suppressed) return result;
     const now = opts.now ?? new Date();
+    if (!opts.agentId) {
+      // A wake parked on a closed task will never run; finalize it instead of
+      // keeping it parked.
+      const retiredClosed = await wakeQueue.retireClosedIssueDeferredWakes({
+        now,
+        minAgeMs: DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+      });
+      result.retired += retiredClosed.length;
+      for (const wake of retiredClosed) countersForCompany(wake.companyId).retired += 1;
+    }
 
     const orphans = await wakeQueue.listOrphanedDeferredWakes({
       now,
@@ -20893,6 +21228,20 @@ export function heartbeatService(
       for (const orphan of notInvokableWakes) countersForCompany(orphan.companyId).skippedNotInvokable += 1;
       result.skippedNotInvokable = notInvokableWakes.length;
     }
+    // Why each examined wake stays parked this pass; promoted wakes are removed.
+    const heldReasons = new Map<string, { reason: DeferredWakeHeldReason; blocker: ExecutionBlocker | null }>(
+      orphans.map((orphan) => [
+        orphan.wakeId,
+        {
+          reason: notInvokableAgentIds.has(orphan.agentId)
+            ? "agent_not_invokable"
+            : (freeSlotsByAgent.get(orphan.agentId) ?? 0) === 0
+              ? "no_free_run_slot"
+              : "waiting_for_turn",
+          blocker: null,
+        },
+      ]),
+    );
 
     const selected = selectDeferredWakesToPromote(orphans, freeSlotsByAgent, {
       maxTotal: sweepPromotionBudget(opts.maxPromotions),
@@ -20902,7 +21251,7 @@ export function heartbeatService(
       new Set(orphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId)).map((orphan) => orphan.issueId)).size -
         selected.length,
     );
-    const holds = await readDeferredWakeHolds(selected);
+    const { holds, blockers } = await readDeferredWakeHolds(selected);
     // Company, agent and project decide a budget block, so one read serves every
     // wake that shares them.
     const budgetBlockByScope = new Map<string, boolean>();
@@ -20916,10 +21265,16 @@ export function heartbeatService(
           observedUpdatedAt: candidate.observedUpdatedAt,
           now: new Date(),
         });
-        if (!claimed) continue;
-        if (holds.has(candidate.wakeId)) {
+        if (!claimed) {
+          // Another pass owns this wake now.
+          heldReasons.delete(candidate.wakeId);
+          continue;
+        }
+        const hold = holds.get(candidate.wakeId);
+        if (hold) {
           result.skippedHeld += 1;
           counters.skippedHeld += 1;
+          heldReasons.set(candidate.wakeId, { reason: hold, blocker: blockers.get(candidate.wakeId) ?? null });
           continue;
         }
         const budgetScope = `${candidate.companyId}:${candidate.agentId}:${candidate.projectId ?? ""}`;
@@ -20937,16 +21292,31 @@ export function heartbeatService(
           // created and none is cancelled later. It resumes when the budget does.
           result.skippedBudget += 1;
           counters.skippedBudget += 1;
+          heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
           continue;
         }
         const outcome = await redeliverDeferredWake(candidate);
         result[outcome] += 1;
         counters[outcome] += 1;
+        if (outcome === "stillDeferred") {
+          heldReasons.set(candidate.wakeId, { reason: "admission_deferred", blocker: null });
+        } else {
+          heldReasons.delete(candidate.wakeId);
+        }
       } catch (err) {
         result.failed += 1;
         counters.failed += 1;
+        heldReasons.delete(candidate.wakeId);
         logger.warn({ err, queueId: candidate.wakeId }, "failed to re-deliver an orphaned deferred wake");
       }
+    }
+
+    for (const orphan of orphans) {
+      const held = heldReasons.get(orphan.wakeId);
+      if (!held || now.getTime() - orphan.requestedAt.getTime() < DEFERRED_WAKE_HELD_NOTICE_MS) continue;
+      await recordDeferredWakeHeld(orphan, held.reason, held.blocker).catch((err) => {
+        logger.warn({ err, wakeId: orphan.wakeId }, "failed to record a held deferred wake");
+      });
     }
 
     if (result.promoted > 0 || result.failed > 0) {
@@ -21030,7 +21400,7 @@ export function heartbeatService(
     const strandedQueues = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`),
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -21074,7 +21444,7 @@ export function heartbeatService(
       .select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`))
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
@@ -21178,7 +21548,7 @@ export function heartbeatService(
       .innerJoin(
         issues,
         and(
-          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          issueIdEqualsText(sql`${agentTaskSessions.taskKey}`),
           eq(issues.companyId, agentTaskSessions.companyId),
           eq(issues.assigneeAgentId, agentTaskSessions.agentId),
         ),
@@ -21233,7 +21603,7 @@ export function heartbeatService(
       .innerJoin(
         issues,
         and(
-          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          issueIdEqualsText(sql`${agentTaskSessions.taskKey}`),
           eq(issues.companyId, agentTaskSessions.companyId),
           eq(issues.assigneeAgentId, agentTaskSessions.agentId),
         ),
@@ -23178,6 +23548,13 @@ export function heartbeatService(
         for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
         context.aiConnection = { ...managedAiRuntime.attribution, identity: managedAiRuntime.identity };
         await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
+      } else if (persistedNativeExecutionInput && parseObject(run.contextSnapshot?.aiConnection).identity) {
+        // The suspended run was started on a managed account and the agent has since been unbound.
+        throw new ConfigurationIncompleteFailure("The AI account changed while this native run was suspended. Start a new execution.", { configurationIncomplete: { reason: "ai_connection_changed", actionUrl: `/agents/${agent.id}/runtime` } });
+      } else if (context.aiConnection) {
+        // A retry copies its predecessor's snapshot; an unbound run carries no managed identity or attribution.
+        delete context.aiConnection;
+        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) - 'aiConnection'` }).where(eq(heartbeatRuns.id, run.id));
       }
       if (secretManifest.length > 0) {
         context.paperclipSecrets = {
@@ -28349,6 +28726,7 @@ export function heartbeatService(
       // Loop-guard provenance is derived below from server facts only.
       delete payload[SELF_REBLOCK_WAKE_PAYLOAD_KEY];
       delete payload[SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY];
+      delete payload[AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -29297,6 +29675,8 @@ export function heartbeatService(
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
+              originKind: issues.originKind,
+              originId: issues.originId,
             })
             .from(issues)
             .where(
@@ -30112,6 +30492,94 @@ export function heartbeatService(
             }
           }
 
+          // Automation window: a recovery, retry or monitor wake that lands within
+          // the resolved `minSecondsBetweenAutomationWakes` (company < agent <
+          // routine < wake type) of the agent's last such run is parked, and later
+          // ones merge into the same receipt. The deferred-wake sweep delivers it
+          // once the window ends; nothing is dropped. Assignment and human-driven
+          // wakes never pass through here. Unset everywhere means off.
+          let automationAdmittedAt: Date | undefined;
+          const automationWakeReason = reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason);
+          const automationWakeWindowSec =
+            automationWakeReason &&
+            !reconciledSourceRunId &&
+            !opts.manualUserWake
+              ? await resolveAutomationWakeWindowSec(tx as unknown as Db, {
+                  agent,
+                  reason: automationWakeReason,
+                  issue,
+                })
+              : 0;
+          if (automationWakeReason && automationWakeWindowSec > 0) {
+            const windowMs = automationWakeWindowSec * 1000;
+            // Wakes for different issues of one agent share the window; the lock
+            // makes the check and the run insert below atomic per agent.
+            await lockAutomationWakeWindow(tx as unknown as Db, agent.companyId, agentId);
+            // Read the clock after the lock wait: the transaction-start default would
+            // age a run by that wait and let the next wake into a window it still owns.
+            const gateNow = new Date();
+            automationAdmittedAt = gateNow;
+            const lastAutomationRun = await findLastAutomationRun(tx as unknown as Db, {
+              companyId: agent.companyId,
+              agentId,
+              since: new Date(gateNow.getTime() - windowMs),
+            });
+            if (lastAutomationRun) {
+              // A redelivered receipt already exists; it simply waits longer.
+              if (executionWaitRequestId) return { kind: "deferred" as const };
+              const notBefore = new Date(lastAutomationRun.createdAt.getTime() + windowMs);
+              const [coalesced] = await tx
+                .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.companyId, agent.companyId),
+                    eq(agentWakeupRequests.agentId, agentId),
+                    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                    sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is not null`,
+                  ),
+                )
+                .orderBy(asc(agentWakeupRequests.requestedAt))
+                .limit(1);
+              const coalescedState = buildAutomationWakeCoalescedState({
+                notBefore,
+                existing: coalesced ? parseObject(coalesced.payload) : null,
+                reason: automationWakeReason,
+              });
+              if (coalesced) {
+                await tx
+                  .update(agentWakeupRequests)
+                  .set({
+                    payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY}]::text[], ${JSON.stringify(coalescedState)}::jsonb)`,
+                    coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                    updatedAt: gateNow,
+                  })
+                  .where(eq(agentWakeupRequests.id, coalesced.id));
+              } else {
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason: "automation_wake_coalesced",
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId: issue.id,
+                    [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+                    [AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY]: coalescedState,
+                  },
+                  status: "deferred_issue_execution",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                });
+              }
+              return { kind: "deferred" as const };
+            }
+          }
+
           if (activeExecutionRun) {
             // The resolved action is already a durable retry outbox. Do not merge
             // its fresh-session contract into unrelated work or create a second
@@ -30539,6 +31007,7 @@ export function heartbeatService(
           const newRun = await tx
             .insert(heartbeatRuns)
             .values({
+                            ...(automationAdmittedAt ? { createdAt: automationAdmittedAt } : {}),
               ...(explicitContinuation ? { id: explicitContinuationRunId } : {}),
               companyId: agent.companyId,
               agentId,
@@ -31204,7 +31673,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, companyId),
-          sql`${issues.id}::text = ${runIssueId}`,
+          issueIdEqualsText(sql`${runIssueId}`),
         ),
       )
       .where(
@@ -31240,7 +31709,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, companyId),
-          sql`${issues.id}::text = ${wakeIssueId}`,
+          issueIdEqualsText(sql`${wakeIssueId}`),
         ),
       )
       .where(
@@ -31833,12 +32302,128 @@ export function heartbeatService(
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
     },
+    /**
+     * Run counts for a company over a creation-time window, the most common
+     * error codes, and each agent's runs today against its daily run cap.
+     */
+    runStats: async (
+      companyId: string,
+      input: { since: Date; until: Date; agentId?: string },
+    ): Promise<HeartbeatRunStats> => {
+      const windowFilters = [
+        eq(heartbeatRuns.companyId, companyId),
+        gte(heartbeatRuns.createdAt, input.since),
+        lt(heartbeatRuns.createdAt, input.until),
+        ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
+      ];
+      const capWindow = currentUtcDayWindow();
+      const [statusRows, errorRows, runsToday, agentRows] = await Promise.all([
+        db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters))
+          .groupBy(heartbeatRuns.agentId, heartbeatRuns.status),
+        db
+          .select({ errorCode: heartbeatRuns.errorCode, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters, isNotNull(heartbeatRuns.errorCode)))
+          .groupBy(heartbeatRuns.errorCode)
+          .orderBy(desc(sql`count(*)`), asc(heartbeatRuns.errorCode))
+          .limit(20),
+        computeDailyRunUsage(companyId, { agentId: input.agentId, window: capWindow }),
+        db
+          .select()
+          .from(agents)
+          .where(and(eq(agents.companyId, companyId), ...(input.agentId ? [eq(agents.id, input.agentId)] : []))),
+      ]);
+
+      const isRunStatus = (status: string): status is HeartbeatRunStatus =>
+        HEARTBEAT_RUN_STATUSES.some((known) => known === status);
+      const emptyCounts = () => {
+        const byStatus: Record<HeartbeatRunStatus, number> = {
+          queued: 0,
+          scheduled_retry: 0,
+          running: 0,
+          succeeded: 0,
+          interrupted: 0,
+          failed: 0,
+          cancelled: 0,
+          timed_out: 0,
+        };
+        return { runs: 0, terminal: 0, succeeded: 0, unsuccessful: 0, byStatus };
+      };
+      const addCounts = (counts: ReturnType<typeof emptyCounts>, status: string, count: number) => {
+        counts.runs += count;
+        if (!isRunStatus(status)) return;
+        counts.byStatus[status] += count;
+        if (HEARTBEAT_RUN_TERMINAL_STATUSES.some((terminal) => terminal === status)) counts.terminal += count;
+        if (status === "succeeded") counts.succeeded += count;
+        if (UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.some((unsuccessful) => unsuccessful === status)) {
+          counts.unsuccessful += count;
+        }
+      };
+
+      const totals = emptyCounts();
+      const perAgent = new Map<string, ReturnType<typeof emptyCounts>>();
+      for (const row of statusRows) {
+        const count = Number(row.count);
+        addCounts(totals, row.status, count);
+        const agentCounts = perAgent.get(row.agentId) ?? emptyCounts();
+        addCounts(agentCounts, row.status, count);
+        perAgent.set(row.agentId, agentCounts);
+      }
+
+      const agentStats = agentRows
+        .filter((agent) => agent.status !== "terminated" || perAgent.has(agent.id))
+        .map((agent) => {
+          const policy = parseHeartbeatPolicy(agent);
+          const maxDailyRuns = policy.maxDailyRuns;
+          const today = countedDailyRuns(runsToday.get(agent.id) ?? NO_DAILY_RUNS, policy);
+          return {
+            agentId: agent.id,
+            name: agent.name,
+            status: agent.status,
+            ...(perAgent.get(agent.id) ?? emptyCounts()),
+            runsToday: today,
+            maxDailyRuns,
+            remainingToday: maxDailyRuns === null ? null : Math.max(0, maxDailyRuns - today),
+            capReached: maxDailyRuns !== null && today >= maxDailyRuns,
+          };
+        })
+        .sort((a, b) => b.runs - a.runs || b.runsToday - a.runsToday || a.name.localeCompare(b.name));
+
+      return {
+        companyId,
+        window: { since: input.since.toISOString(), until: input.until.toISOString() },
+        dailyCapWindow: { start: capWindow.start.toISOString(), end: capWindow.end.toISOString() },
+        totals,
+        topErrorCodes: errorRows
+          .filter((row): row is { errorCode: string; count: number } => row.errorCode !== null)
+          .map((row) => ({ errorCode: row.errorCode, count: Number(row.count) })),
+        agents: agentStats,
+      };
+    },
+
     list: async (
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: {
+        summary?: boolean;
+        statuses?: string[];
+        errorCodes?: string[];
+        since?: Date;
+        until?: Date;
+      } = {},
     ) => {
+      const filters = [
+        eq(heartbeatRuns.companyId, companyId),
+        ...(agentId ? [eq(heartbeatRuns.agentId, agentId)] : []),
+        ...(options.statuses?.length ? [inArray(heartbeatRuns.status, options.statuses)] : []),
+        ...(options.errorCodes?.length ? [inArray(heartbeatRuns.errorCode, options.errorCodes)] : []),
+        ...(options.since ? [gte(heartbeatRuns.createdAt, options.since)] : []),
+        ...(options.until ? [lt(heartbeatRuns.createdAt, options.until)] : []),
+      ];
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
       const query = db
@@ -31861,14 +32446,7 @@ export function heartbeatService(
                 },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(
-                eq(heartbeatRuns.companyId, companyId),
-                eq(heartbeatRuns.agentId, agentId),
-              )
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(and(...filters))
         .orderBy(desc(heartbeatRuns.createdAt));
 
       const rows = limit ? await query.limit(limit) : await query;

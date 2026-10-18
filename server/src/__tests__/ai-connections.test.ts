@@ -3,17 +3,18 @@ import { connectionIntentDeliveryService } from "../services/connection-intent-d
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import * as aiGateway from "../services/ai-gateway.js";
 import * as localCredentials from "../services/local-ai-credentials.js";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, access, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, companies, agents, heartbeatRuns, companyMemberships, connectionGrants, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, companies, agents, heartbeatRuns, companyMemberships, connectionGrants, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, principalPermissionGrants, activityLog, builtInManagedResources } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
+import { environmentService } from "../services/environments.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, assertManagedAiProjectAuth, findManagedAiRoutingEnvKey, MANAGED_AI_ROUTING_ENV_KEYS } from "../services/ai-connection-runtime.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
@@ -946,6 +947,390 @@ describe("managed AI connections", () => {
 
 });
 
+
+describe("managed AI provider routing compatibility", () => {
+  const ROUTING_MESSAGE = "The configured provider routing is incompatible with this AI connection";
+
+  it("finds a configured routing key with the same truthy check the runtime uses", () => {
+    expect(MANAGED_AI_ROUTING_ENV_KEYS).toEqual(["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "XAI_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "PAPERCLIP_CODEX_PROVIDERS", "PAPERCLIP_OPENCODE_PROVIDERS"]);
+    for (const key of MANAGED_AI_ROUTING_ENV_KEYS) expect(findManagedAiRoutingEnvKey({ UNRELATED: "x", [key]: "1" })).toBe(key);
+    expect(findManagedAiRoutingEnvKey({ OPENAI_BASE_URL: "https://b", ANTHROPIC_BASE_URL: "https://a" })).toBe("ANTHROPIC_BASE_URL");
+    expect(findManagedAiRoutingEnvKey({ ANTHROPIC_BASE_URL: { type: "plain", value: "https://a" } })).toBe("ANTHROPIC_BASE_URL");
+    // Only a plain binding is unwrapped; a secret ref cannot be read here, so it counts as set.
+    expect(findManagedAiRoutingEnvKey({ OPENAI_BASE_URL: { type: "secret_ref", secretId: randomUUID() } })).toBe("OPENAI_BASE_URL");
+    for (const env of [undefined, null, "ANTHROPIC_BASE_URL", 7, [], {}, { ANTHROPIC_BASE_URL: "", OPENAI_BASE_URL: 0, XAI_BASE_URL: null, CLAUDE_CODE_USE_BEDROCK: false }, { ANTHROPIC_BASE_URL: { type: "plain", value: "" } }, { ANTHROPIC_API_KEY: "sk-x", HTTPS_PROXY: "https://p" }])
+      expect(findManagedAiRoutingEnvKey(env)).toBeNull();
+  });
+
+  it.each(MANAGED_AI_ROUTING_ENV_KEYS)("still refuses %s at run time with the unchanged error", async (key) => {
+    const run = prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: "alice", adapterType: "claude_local", binding, config: { cwd: home, env: { [key]: "https://proxy.example" } } });
+    await expect(run).rejects.toMatchObject({ status: 422, message: ROUTING_MESSAGE, details: { code: "ai_connection_incompatible" } });
+  });
+
+  describe("agent routes", () => {
+    let app: express.Express;
+    let selected: Record<string, unknown>;
+    let account: Awaited<ReturnType<typeof service.save>>;
+    const routing = { ANTHROPIC_BASE_URL: "https://proxy.example/anthropic", OPENAI_BASE_URL: { type: "plain", value: "https://proxy.example/openai" }, PAPERCLIP_CODEX_PROVIDERS: "[{\"id\":\"proxy\"}]" };
+    const patch = (id: string, body: Record<string, unknown>) => request(app).patch(`/api/agents/${id}`).send(body);
+    const readAgent = async (id: string) => (await db.select().from(agents).where(eq(agents.id, id)))[0]!;
+    // Only one local environment can exist, so extra fixtures are sandboxes; none of them is ever executed.
+    const seedEnvironment = async (envVars: Record<string, unknown>) => (await db.insert(environments).values({ name: `Routing env ${randomUUID()}`, driver: "sandbox", config: { provider: "daytona" }, envVars }).returning())[0]!;
+    // The local environment is shared by the whole file, so afterEach puts its env vars back.
+    let localEnvVarsBefore: Record<string, unknown> | undefined;
+    const seedLocalEnvironment = async (envVars: Record<string, unknown>) => {
+      const [existing] = await db.select().from(environments).where(eq(environments.driver, "local"));
+      localEnvVarsBefore ??= (existing?.envVars ?? {}) as Record<string, unknown>;
+      return existing ? (await db.update(environments).set({ envVars }).where(eq(environments.id, existing.id)).returning())[0]! : (await db.insert(environments).values({ name: "Routing local env", driver: "local", envVars }).returning())[0]!;
+    };
+    const seedAgent = async (values: Partial<typeof agents.$inferInsert> = {}, bound = true) => {
+      const id = randomUUID();
+      await db.insert(agents).values({ id, companyId, name: `Routing ${id.slice(0, 8)}`, adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-4-6" }, runtimeConfig: bound ? { aiConnection: selected, note: "stored" } : { note: "stored" }, ...values });
+      return id;
+    };
+    // Spies prove a rejected bind never reaches connection selection's provider probe or the adapter probe.
+    const spyOnProbes = async () => {
+      const { requireServerAdapter } = await import("../adapters/index.js");
+      return { providerRequest: vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(null, { status: 200 })), adapterProbe: vi.spyOn(requireServerAdapter("claude_local"), "testEnvironment").mockImplementation(async () => ({ adapterType: "claude_local", status: "pass", testedAt: new Date().toISOString(), checks: [{ code: "claude_hello_probe_passed", level: "info", message: "fixture" }] })) };
+    };
+    const expectRoutingRejection = (res: request.Response, details: { envKey: string; source: "environment" | "adapter_config"; environmentId?: string | null }) => {
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({ code: "ai_connection_incompatible", ...details });
+      expect(res.body.error).toContain(details.envKey);
+      expect(res.body.error).toContain("cannot be combined");
+      expect(res.body.error).toContain("leave the agent unbound");
+      expect(JSON.stringify(res.body)).not.toContain("proxy.example");
+    };
+
+    beforeAll(async () => {
+      const { agentRoutes } = await import("../routes/agents.js");
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: false }).where(eq(companies.id, companyId));
+      account = await service.save(companyId, "alice", { provider: "anthropic", method: "api_key", ownership: "shared", name: "Routing guard shared", apiKey: "fixture-routing-key", agentIds: [], allAgents: true }, "fixture-routing-guard");
+      // Stored bindings are schema output, which is what the route compares a patched binding against.
+      selected = aiConnectionBindingSchema.parse({ provider: "anthropic", method: "api_key", mode: "shared", ...account });
+      app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: "alice", companyIds: [companyId] }; next(); });
+      app.use("/api", agentRoutes(db));
+      app.use(errorHandler);
+    });
+    afterEach(async () => {
+      vi.restoreAllMocks();
+      vi.spyOn(process, "cwd").mockReturnValue(home);
+      if (localEnvVarsBefore) await db.update(environments).set({ envVars: localEnvVarsBefore }).where(eq(environments.driver, "local"));
+      localEnvVarsBefore = undefined;
+    });
+
+    it("keeps the existing binding when a patch omits aiConnection", async () => {
+      const id = await seedAgent();
+      // jsonb reorders stored keys, but the route compares bindings structurally, so a kept binding is neither re-validated nor probed.
+      const probes = await spyOnProbes();
+      const res = await patch(id, { runtimeConfig: { note: "changed" } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await readAgent(id)).runtimeConfig).toEqual({ aiConnection: selected, note: "changed" });
+      expect(res.body.runtimeConfig.aiConnection).toEqual(selected);
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+    });
+
+    it("clears the binding on an explicit null without persisting null or removing the install", async () => {
+      const id = await seedAgent();
+      await db.insert(toolConnectionInstalls).values({ companyId, connectionId: account.connectionId, targetType: "agent", targetId: id, createdByUserId: "alice" });
+      const probes = await spyOnProbes();
+      const res = await patch(id, { runtimeConfig: { aiConnection: null, note: "sent", heartbeat: { enabled: false } } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const stored = (await readAgent(id)).runtimeConfig;
+      expect(Object.prototype.hasOwnProperty.call(stored, "aiConnection")).toBe(false);
+      expect(stored).toEqual({ note: "sent", heartbeat: { enabled: false } });
+      expect(Object.prototype.hasOwnProperty.call(res.body.runtimeConfig, "aiConnection")).toBe(false);
+      expect(await db.select().from(toolConnectionInstalls).where(and(eq(toolConnectionInstalls.connectionId, account.connectionId), eq(toolConnectionInstalls.targetId, id)))).toHaveLength(1);
+      // The unbind needs no account validation, and later omissions do not bring the binding back.
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+      // The unbind is visible in the activity log, which lists only the keys sent.
+      const clearedUpdates = async () => (await db.select().from(activityLog).where(and(eq(activityLog.entityId, id), eq(activityLog.action, "agent.updated")))).filter((row) => (row.details as Record<string, unknown>).aiConnectionCleared === true);
+      expect(await clearedUpdates()).toHaveLength(1);
+      expect((await patch(id, { runtimeConfig: { note: "after" } })).status).toBe(200);
+      expect((await readAgent(id)).runtimeConfig).toEqual({ note: "after" });
+      // Clearing an unbound agent is a no-op that still stores no null and logs no unbind.
+      expect((await patch(id, { runtimeConfig: { aiConnection: null, note: "again" } })).status).toBe(200);
+      expect((await readAgent(id)).runtimeConfig).toEqual({ note: "again" });
+      expect(await clearedUpdates()).toHaveLength(1);
+    });
+
+    it("unbinds and sets agent env routing in one patch", async () => {
+      const id = await seedAgent();
+      const probes = await spyOnProbes();
+      const res = await patch(id, { runtimeConfig: { aiConnection: null }, adapterConfig: { env: { ANTHROPIC_BASE_URL: "https://proxy.example/a" } } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const saved = await readAgent(id);
+      expect(saved.runtimeConfig).toEqual({});
+      expect(saved.adapterConfig).toMatchObject({ model: "claude-sonnet-4-6", env: { ANTHROPIC_BASE_URL: { type: "plain", value: "https://proxy.example/a" } } });
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+    });
+
+    it("keeps validating a new or changed binding", async () => {
+      const id = await seedAgent();
+      const unknownAccount = { ...selected, connectionId: randomUUID(), grantId: randomUUID() };
+      const unknown = await patch(id, { runtimeConfig: { aiConnection: unknownAccount } });
+      expect(unknown.status, JSON.stringify(unknown.body)).toBe(422);
+      expect(unknown.body.details).toMatchObject({ code: "ai_connection_missing" });
+      const incompatible = await patch(id, { runtimeConfig: { aiConnection: { provider: "openai", method: "api_key", mode: "responsible_user" } } });
+      expect(incompatible.status, JSON.stringify(incompatible.body)).toBe(422);
+      expect(incompatible.body.error).toContain("compatible with the new harness");
+      expect((await patch(id, { runtimeConfig: { aiConnection: { provider: "anthropic" } } })).status).toBe(400);
+      expect((await patch(id, { runtimeConfig: { aiConnection: "managed" } })).status).toBe(400);
+      expect((await readAgent(id)).runtimeConfig).toEqual({ aiConnection: selected, note: "stored" });
+    });
+
+    it("does not accept null on create or hire", async () => {
+      for (const endpoint of ["agents", "agent-hires"]) {
+        const name = `Null binding ${endpoint}`;
+        const res = await request(app).post(`/api/companies/${companyId}/${endpoint}`).send({ name, role: "general", adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-4-6" }, runtimeConfig: { aiConnection: null } });
+        expect(res.status, JSON.stringify(res.body)).toBe(400);
+        expect(await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, name)))).toEqual([]);
+      }
+    });
+
+    it("rejects binding into a routing environment before selecting a connection or probing", async () => {
+      const environment = await seedEnvironment({ ...routing, LOG_LEVEL: "debug" });
+      const probes = await spyOnProbes();
+      for (const aiConnection of [selected, { ...selected, connectionId: randomUUID(), grantId: randomUUID() }]) {
+        const id = await seedAgent({ defaultEnvironmentId: environment.id }, false);
+        const res = await patch(id, { runtimeConfig: { note: "bind", aiConnection } });
+        // PAPERCLIP_CODEX_PROVIDERS is stripped like the run path does, so the first remaining route is named.
+        expectRoutingRejection(res, { envKey: "ANTHROPIC_BASE_URL", source: "environment", environmentId: environment.id });
+        expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored" });
+      }
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+    });
+
+    it("ignores routing keys the run path strips and values that resolve to empty", async () => {
+      const environment = await seedLocalEnvironment({ PAPERCLIP_CODEX_PROVIDERS: routing.PAPERCLIP_CODEX_PROVIDERS, ANTHROPIC_API_KEY: "sk-env", OPENAI_BASE_URL: { type: "plain", value: "" }, XAI_BASE_URL: "" });
+      const probes = await spyOnProbes();
+      const id = await seedAgent({ defaultEnvironmentId: environment.id }, false);
+      const res = await patch(id, { runtimeConfig: { aiConnection: selected, note: "stored" } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored", aiConnection: selected });
+      expect(probes.adapterProbe).toHaveBeenCalled();
+    });
+
+    it("resolves the inherited default environment for an agent without an override", async () => {
+      const { instanceSettingsService } = await import("../services/instance-settings.js");
+      const settings = instanceSettingsService(db);
+      const previous = await settings.get();
+      const environment = await seedEnvironment({ XAI_BASE_URL: "https://proxy.example/xai" });
+      await settings.update({ defaultEnvironmentId: environment.id });
+      try {
+        const id = await seedAgent({}, false);
+        expectRoutingRejection(await patch(id, { runtimeConfig: { aiConnection: selected } }), { envKey: "XAI_BASE_URL", source: "environment", environmentId: environment.id });
+        expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored" });
+      } finally {
+        await settings.update({ defaultEnvironmentId: previous.defaultEnvironmentId });
+      }
+    });
+
+    it("rejects binding when the agent's own env sets a route, whether stored or sent in the same patch", async () => {
+      const probes = await spyOnProbes();
+      const routedEnv = { LOG_LEVEL: "debug", CLAUDE_CODE_USE_BEDROCK: { type: "plain", value: "1" } };
+      const stored = await seedAgent({ adapterConfig: { model: "claude-sonnet-4-6", env: routedEnv } }, false);
+      expectRoutingRejection(await patch(stored, { runtimeConfig: { aiConnection: selected } }), { envKey: "CLAUDE_CODE_USE_BEDROCK", source: "adapter_config" });
+      const sent = await seedAgent({}, false);
+      expectRoutingRejection(await patch(sent, { adapterConfig: { env: { ANTHROPIC_BASE_URL: "https://proxy.example/anthropic" } }, runtimeConfig: { aiConnection: selected } }), { envKey: "ANTHROPIC_BASE_URL", source: "adapter_config" });
+      for (const id of [stored, sent]) expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored" });
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+    });
+
+    it.each(["agents", "agent-hires"])("rejects %s with a managed binding into routing and creates no agent", async (endpoint) => {
+      const environment = await seedEnvironment(routing);
+      const probes = await spyOnProbes();
+      const bodyFor = (name: string, extra: Record<string, unknown>) => ({ name, role: "general", adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-4-6" }, runtimeConfig: { aiConnection: selected }, ...extra });
+      const viaEnvironmentName = `Routed ${endpoint} environment`;
+      expectRoutingRejection(await request(app).post(`/api/companies/${companyId}/${endpoint}`).send(bodyFor(viaEnvironmentName, { defaultEnvironmentId: environment.id })), { envKey: "ANTHROPIC_BASE_URL", source: "environment", environmentId: environment.id });
+      const viaAdapterName = `Routed ${endpoint} adapter env`;
+      expectRoutingRejection(await request(app).post(`/api/companies/${companyId}/${endpoint}`).send(bodyFor(viaAdapterName, { adapterConfig: { model: "claude-sonnet-4-6", env: { OPENAI_BASE_URL: "https://proxy.example/openai" } } })), { envKey: "OPENAI_BASE_URL", source: "adapter_config" });
+      for (const name of [viaEnvironmentName, viaAdapterName]) expect(await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, name)))).toEqual([]);
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      // The same routing is fine for an agent that stays unbound, which inherits the environment's routing.
+      const unbound = await request(app).post(`/api/companies/${companyId}/${endpoint}`).send(bodyFor(`Unbound ${endpoint}`, { defaultEnvironmentId: environment.id, runtimeConfig: {} }));
+      expect(unbound.status, JSON.stringify(unbound.body)).toBe(201);
+    });
+
+    it("rejects moving a bound agent into routing, and lets an already-routed agent unbind first", async () => {
+      const clean = await seedEnvironment({ LOG_LEVEL: "debug" });
+      const routed = await seedEnvironment(routing);
+      const probes = await spyOnProbes();
+      const id = await seedAgent({ defaultEnvironmentId: clean.id });
+      expectRoutingRejection(await patch(id, { defaultEnvironmentId: routed.id }), { envKey: "ANTHROPIC_BASE_URL", source: "environment", environmentId: routed.id });
+      expectRoutingRejection(await patch(id, { adapterConfig: { env: { XAI_BASE_URL: "https://proxy.example/xai" } } }), { envKey: "XAI_BASE_URL", source: "adapter_config", environmentId: clean.id });
+      const unchanged = await readAgent(id);
+      expect(unchanged.defaultEnvironmentId).toBe(clean.id);
+      expect(unchanged.adapterConfig).toEqual({ model: "claude-sonnet-4-6" });
+      expect(unchanged.runtimeConfig).toEqual({ aiConnection: selected, note: "stored" });
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+
+      // An agent already stuck in routing (the production incident) is released by the unbind, after which its config is editable.
+      const stuck = await seedAgent({ defaultEnvironmentId: routed.id });
+      expectRoutingRejection(await patch(stuck, { adapterConfig: { notes: "blocked" } }), { envKey: "ANTHROPIC_BASE_URL", source: "environment", environmentId: routed.id });
+      expect((await patch(stuck, { runtimeConfig: { aiConnection: null, note: "stored" } })).status).toBe(200);
+      expect((await patch(stuck, { adapterConfig: { notes: "now allowed" } })).status).toBe(200);
+      const released = await readAgent(stuck);
+      expect(released.runtimeConfig).toEqual({ note: "stored" });
+      expect(released.adapterConfig).toMatchObject({ notes: "now allowed" });
+      expect(released.defaultEnvironmentId).toBe(routed.id);
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+    });
+
+    it("lets a bound agent stuck in a routed environment change fields that do not affect routing", async () => {
+      const routed = await seedEnvironment(routing);
+      const probes = await spyOnProbes();
+      const stuck = await seedAgent({ defaultEnvironmentId: routed.id });
+      const res = await patch(stuck, { title: "Renamed", budgetMonthlyCents: 500 });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const saved = await readAgent(stuck);
+      expect(saved).toMatchObject({ title: "Renamed", budgetMonthlyCents: 500, defaultEnvironmentId: routed.id });
+      expect(saved.runtimeConfig).toEqual({ aiConnection: selected, note: "stored" });
+      // The same fields still ride along with a routing-relevant change that is blocked.
+      expectRoutingRejection(await patch(stuck, { title: "Blocked", adapterConfig: { notes: "x" } }), { envKey: "ANTHROPIC_BASE_URL", source: "environment", environmentId: routed.id });
+      expect((await readAgent(stuck)).title).toBe("Renamed");
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+    });
+
+    it("applies the agent env over the environment env key by key, like the run path", async () => {
+      const environment = await seedLocalEnvironment({ ANTHROPIC_BASE_URL: routing.ANTHROPIC_BASE_URL, LOG_LEVEL: "debug" });
+      const probes = await spyOnProbes();
+      // The run path merges the agent env over the environment env, so a blank agent value clears the environment's route.
+      const blanked = await seedAgent({ defaultEnvironmentId: environment.id, adapterConfig: { model: "claude-sonnet-4-6", env: { ANTHROPIC_BASE_URL: "" } } }, false);
+      const res = await patch(blanked, { runtimeConfig: { aiConnection: selected, note: "stored" } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await readAgent(blanked)).runtimeConfig).toEqual({ note: "stored", aiConnection: selected });
+      expect(probes.adapterProbe).toHaveBeenCalled();
+      // A set agent value wins over the environment's, so the conflict is the agent's own.
+      const overridden = await seedAgent({ defaultEnvironmentId: environment.id, adapterConfig: { model: "claude-sonnet-4-6", env: { ANTHROPIC_BASE_URL: "https://proxy.example/agent" } } }, false);
+      expectRoutingRejection(await patch(overridden, { runtimeConfig: { aiConnection: selected } }), { envKey: "ANTHROPIC_BASE_URL", source: "adapter_config", environmentId: environment.id });
+      // A blank value for one key does not hide the environment's other routes.
+      const partial = await seedAgent({ defaultEnvironmentId: (await seedEnvironment({ ...routing, XAI_BASE_URL: "https://proxy.example/xai" })).id, adapterConfig: { model: "claude-sonnet-4-6", env: { ANTHROPIC_BASE_URL: "" } } }, false);
+      expectRoutingRejection(await patch(partial, { runtimeConfig: { aiConnection: selected } }), { envKey: "OPENAI_BASE_URL", source: "environment" });
+    });
+
+    it("does not read an environment that is bound to another company", async () => {
+      const foreign = await seedEnvironment(routing);
+      await db.insert(builtInManagedResources).values({ companyId: otherCompanyId, bundleKey: "routing-guard-test", resourceKind: "environment", resourceKey: foreign.id, resourceId: foreign.id, stockVersion: "1", stockHash: "fixture" });
+      const probes = await spyOnProbes();
+      const id = await seedAgent({}, false);
+      const res = await patch(id, { defaultEnvironmentId: foreign.id, runtimeConfig: { aiConnection: selected } });
+      // The environment checks reject it; the routing guard neither reads it nor discloses anything from it.
+      expect(res.status, JSON.stringify(res.body)).toBeGreaterThanOrEqual(400);
+      expect(res.body.details?.code).not.toBe("ai_connection_incompatible");
+      expect(JSON.stringify(res.body)).not.toMatch(/ANTHROPIC_BASE_URL|OPENAI_BASE_URL|PAPERCLIP_CODEX_PROVIDERS|proxy\.example/);
+      const saved = await readAgent(id);
+      expect(saved.runtimeConfig).toEqual({ note: "stored" });
+      expect(saved.defaultEnvironmentId).toBeNull();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+    });
+
+    // Rebuilds the agent routes for one actor; afterEach undoes any spies installed before this runs.
+    const routesFor = async (actor: express.Request["actor"], policy?: { managedSandboxOnly: boolean; managedSandbox: () => Promise<Awaited<ReturnType<ReturnType<typeof environmentService>["getById"]>>> }) => {
+      if (policy) {
+        // No instance or company default, and the given managed-sandbox-only policy.
+        const settingsModule = await import("../services/instance-settings.js");
+        const environmentsModule = await import("../services/environments.js");
+        const realSettings = settingsModule.instanceSettingsService(db);
+        vi.spyOn(settingsModule, "instanceSettingsService").mockReturnValue({ ...realSettings, get: async () => ({ ...(await realSettings.get()), defaultEnvironmentId: null, general: { ...(await realSettings.get()).general, companyEnvironmentDefaults: {} } }), getExperimental: async () => ({ ...(await realSettings.getExperimental()), enableManagedSandboxOnly: policy.managedSandboxOnly }) });
+        vi.spyOn(environmentsModule, "environmentService").mockReturnValue({ ...environmentsModule.environmentService(db), findManagedSandboxEnvironment: policy.managedSandbox });
+      }
+      const { agentRoutes } = await import("../routes/agents.js");
+      const routed = express();
+      routed.use(express.json());
+      routed.use((req, _res, next) => { req.actor = actor; next(); });
+      routed.use("/api", agentRoutes(db));
+      routed.use(errorHandler);
+      return routed;
+    };
+    const boardAdmin: express.Request["actor"] = { type: "board", source: "local_implicit", userId: "alice", companyIds: [companyId] };
+
+    it("falls back to the local environment when neither the agent nor the instance picks one", async () => {
+      const { instanceSettingsService } = await import("../services/instance-settings.js");
+      const settings = instanceSettingsService(db);
+      const previous = await settings.get();
+      const local = await seedLocalEnvironment({ ANTHROPIC_BASE_URL: routing.ANTHROPIC_BASE_URL, LOG_LEVEL: "debug" });
+      await settings.update({ defaultEnvironmentId: null });
+      try {
+        const probes = await spyOnProbes();
+        const id = await seedAgent({}, false);
+        expectRoutingRejection(await patch(id, { runtimeConfig: { aiConnection: selected } }), { envKey: "ANTHROPIC_BASE_URL", source: "environment", environmentId: local.id });
+        expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored" });
+        expect(probes.providerRequest).not.toHaveBeenCalled();
+        expect(probes.adapterProbe).not.toHaveBeenCalled();
+      } finally {
+        await settings.update({ defaultEnvironmentId: previous.defaultEnvironmentId });
+      }
+    });
+
+    it("follows the managed-sandbox-only redirect off the local environment, like the run path", async () => {
+      await seedLocalEnvironment({ LOG_LEVEL: "debug" });
+      const managed = await seedEnvironment(routing);
+      const isolated = await routesFor(boardAdmin, { managedSandboxOnly: true, managedSandbox: () => environmentService(db).getById(managed.id) });
+      const probes = await spyOnProbes();
+      const id = await seedAgent({}, false);
+      expectRoutingRejection(await request(isolated).patch(`/api/agents/${id}`).send({ runtimeConfig: { aiConnection: selected } }), { envKey: "ANTHROPIC_BASE_URL", source: "environment", environmentId: managed.id });
+      expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored" });
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+    });
+
+    it("does not add a failure when the environment cannot be resolved", async () => {
+      // No instance default plus managed-sandbox-only with no managed sandbox makes run-path resolution throw; other checks own that error.
+      const managedSandboxLookup = vi.fn(async () => null);
+      const isolated = await routesFor(boardAdmin, { managedSandboxOnly: true, managedSandbox: managedSandboxLookup });
+      const probes = await spyOnProbes();
+      const send = (name: string, runtimeConfig: Record<string, unknown>) => request(isolated).post(`/api/companies/${companyId}/agents`).send({ name, role: "general", adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-4-6" }, runtimeConfig });
+      // Create does not resolve the environment itself, so any extra lookup for the bound agent is the guard's.
+      expect((await send("Unresolvable unbound", {})).status).toBe(201);
+      const lookupsWithoutBinding = managedSandboxLookup.mock.calls.length;
+      const bound = await send("Unresolvable bound", { aiConnection: selected });
+      expect(bound.status, JSON.stringify(bound.body)).toBe(201);
+      expect(managedSandboxLookup.mock.calls.length).toBeGreaterThan(lookupsWithoutBinding);
+      const [created] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, "Unresolvable bound")));
+      expect(created!.runtimeConfig).toMatchObject({ aiConnection: selected });
+      // Updating an agent still ends in the environment checks' own error, not a routing one.
+      const id = await seedAgent({}, false);
+      const res = await request(isolated).patch(`/api/agents/${id}`).send({ runtimeConfig: { aiConnection: selected } });
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.details).toMatchObject({ code: "managed_sandbox_unavailable" });
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored" });
+    });
+
+    it("names the offending key to a caller who can read environment env vars, and withholds an environment's key from one who cannot", async () => {
+      const userId = `restricted-${randomUUID()}`;
+      await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });
+      await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId, permissionKey: "agents:configure" });
+      const restricted = await routesFor({ type: "board", source: "session", userId, isInstanceAdmin: false, companyIds: [companyId], memberships: [{ companyId, status: "active", membershipRole: "member" }] });
+      const environment = await seedEnvironment(routing);
+      const probes = await spyOnProbes();
+      const bind = (id: string) => request(restricted).patch(`/api/agents/${id}`).send({ runtimeConfig: { aiConnection: selected } });
+      const routedAgent = await seedAgent({ defaultEnvironmentId: environment.id }, false);
+      const withheld = await bind(routedAgent);
+      expect(withheld.status, JSON.stringify(withheld.body)).toBe(422);
+      expect(withheld.body.details).toMatchObject({ code: "ai_connection_incompatible", source: "environment", environmentId: environment.id });
+      expect(withheld.body.details).not.toHaveProperty("envKey");
+      expect(withheld.body.error).toContain("environment sets provider routing");
+      expect(withheld.body.error).toContain("leave the agent unbound");
+      expect(JSON.stringify(withheld.body)).not.toMatch(/ANTHROPIC_BASE_URL|OPENAI_BASE_URL|PAPERCLIP_CODEX_PROVIDERS|proxy\.example/);
+      // The caller's own adapter env is its own data, so that key is still named.
+      const ownAgent = await seedAgent({ adapterConfig: { model: "claude-sonnet-4-6", env: { XAI_BASE_URL: "https://proxy.example/xai" } } }, false);
+      expectRoutingRejection(await bind(ownAgent), { envKey: "XAI_BASE_URL", source: "adapter_config" });
+      for (const id of [routedAgent, ownAgent]) expect((await readAgent(id)).runtimeConfig).toEqual({ note: "stored" });
+      expect(probes.providerRequest).not.toHaveBeenCalled();
+      expect(probes.adapterProbe).not.toHaveBeenCalled();
+    });
+  });
+});
 
 describe("AI connection recovery delivery", () => {
   it.each(["restored", "newer failure", "different blocker", "revoked again", "closed task"])(
