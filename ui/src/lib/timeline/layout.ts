@@ -133,7 +133,7 @@ export const TIMELINE_COLORS = {
   delegated: "#5b9bf6",
   automation: "#f4b740",
   /** stroke/ink for a hollow, cancelled bar. */
-  cancelled: "#9aa3ad",
+  cancelled: "var(--status-neutral)",
   now: "#2563eb", // Gallery feedback r2: "now" liveness marker = status blue (was teal #2dd4bf); shape (1.5px vertical line) still distinguishes it from #5b9bf6 delegated bars.
 } as const;
 

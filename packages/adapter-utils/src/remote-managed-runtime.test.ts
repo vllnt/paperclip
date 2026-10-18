@@ -30,7 +30,7 @@ vi.mock("./ssh.js", async (importOriginal) => ({
   syncDirectoryToSsh,
 }));
 
-import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { prepareRemoteManagedRuntime, sshRunDirectory } from "./remote-managed-runtime.js";
 import { sshSyncBackDependencyExcludes } from "./ssh.js";
 import { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
@@ -427,5 +427,67 @@ describe("remote managed runtime", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  // The SSH run directory reaper claims `runs/<runId>` by looking only at the
+  // leases of that run. That is sound only while a directory belongs to exactly
+  // one run id. These tests pin the half of that which lives here: the path is
+  // a pure function of (root, run id), and distinct ids never share one.
+  describe("run directory ownership", () => {
+    const UUID_A = "11111111-1111-4111-8111-111111111111";
+    const UUID_B = "22222222-2222-4222-8222-222222222222";
+
+    it("puts a run directly under runs/ and names it by the run id alone", () => {
+      expect(sshRunDirectory("/srv/work", UUID_A)).toBe(`/srv/work/.paperclip-runtime/runs/${UUID_A}`);
+      expect(path.posix.basename(sshRunDirectory("/srv/work", UUID_A))).toBe(UUID_A);
+      expect(path.posix.dirname(sshRunDirectory("/srv/work", UUID_A))).toBe("/srv/work/.paperclip-runtime/runs");
+    });
+
+    it("gives two run ids two directories, and one run id on two roots two directories", () => {
+      expect(sshRunDirectory("/srv/work", UUID_A)).not.toBe(sshRunDirectory("/srv/work", UUID_B));
+      expect(sshRunDirectory("/srv/work", UUID_A)).not.toBe(sshRunDirectory("/srv/other", UUID_A));
+    });
+
+    it.each(["", ".", "..", "a/b", "a/../b", "../x", "/abs", "a\0b", "trailing/"])(
+      "refuses the run id %j, which could alias another run's directory",
+      (runId) => {
+        expect(() => sshRunDirectory("/srv/work", runId)).toThrow(/one plain path segment/);
+      },
+    );
+
+    it("accepts any other id as one segment, such as the non-UUID ids the login flows use", () => {
+      expect(sshRunDirectory("/srv/work", "claude-login-3f2a")).toBe("/srv/work/.paperclip-runtime/runs/claude-login-3f2a");
+      expect(sshRunDirectory("/srv/work", "run deps")).toBe("/srv/work/.paperclip-runtime/runs/run deps");
+      expect(path.posix.dirname(sshRunDirectory("/srv/work", ".hidden"))).toBe("/srv/work/.paperclip-runtime/runs");
+    });
+
+    it("prepares each run in the directory of its own run id and in no other", async () => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-own-dir-"));
+      cleanupDirs.push(root);
+      const spec = { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/srv/work", remoteCwd: "/srv/work",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true };
+
+      const first = await prepareRemoteManagedRuntime({ spec, runId: UUID_A, adapterKey: "test", workspaceLocalDir: root });
+      const second = await prepareRemoteManagedRuntime({ spec, runId: UUID_B, adapterKey: "test", workspaceLocalDir: root });
+
+      expect(first.workspaceRemoteDir).toBe(`${sshRunDirectory("/srv/work", UUID_A)}/workspace`);
+      expect(second.workspaceRemoteDir).toBe(`${sshRunDirectory("/srv/work", UUID_B)}/workspace`);
+      expect(first.workspaceRemoteDir).not.toBe(second.workspaceRemoteDir);
+    });
+
+    it("keeps a caller's own base directory out of the root's runs/ directory", async () => {
+      // The agent-file and checkpoint flows pass their own base. Their run
+      // directory is nested under it, so it can never be `<root>/.paperclip-runtime/runs/<id>`.
+      const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-own-base-"));
+      cleanupDirs.push(root);
+      const base = `/srv/work/.paperclip-runtime/agent-files/agent-1/${UUID_A}`;
+      const prepared = await prepareRemoteManagedRuntime({
+        spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/srv/work", remoteCwd: "/srv/work",
+          privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+        runId: UUID_A, adapterKey: "test", workspaceLocalDir: root, workspaceRemoteDir: base,
+      });
+      expect(prepared.workspaceRemoteDir).toBe(`${base}/.paperclip-runtime/runs/${UUID_A}/workspace`);
+      expect(prepared.workspaceRemoteDir.startsWith(`${sshRunDirectory("/srv/work", UUID_A)}/`)).toBe(false);
+    });
   });
 });

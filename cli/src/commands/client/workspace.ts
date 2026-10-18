@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { ENVIRONMENT_LEASE_STATUSES } from "@paperclipai/shared";
 import {
   addCommonClientOptions,
   apiPath,
@@ -24,6 +25,15 @@ interface OrgOutputOptions extends CompanyOptions {
   out?: string;
 }
 
+interface LeaseListOptions extends CompanyOptions {
+  status?: string;
+}
+
+function leaseStatusQuery(status: string | undefined): string {
+  const trimmed = status?.trim();
+  return trimmed ? `?${new URLSearchParams({ status: trimmed }).toString()}` : "";
+}
+
 export function registerWorkspaceCommands(program: Command): void {
   const org = program.command("org").description("Organization chart operations");
   addCompanyGet(org, "get", "Get org chart data", "org");
@@ -45,7 +55,41 @@ export function registerWorkspaceCommands(program: Command): void {
   addCompanyGet(environment, "capabilities", "Get environment capabilities", "environments/capabilities");
   addCompanyPostJson(environment, "create", "Create an environment", "environments");
   addIdGet(environment, "get", "Get an environment", "environments");
-  addIdGet(environment, "leases", "List environment leases", "environments", "leases");
+  addCommonClientOptions(
+    environment
+      .command("leases")
+      .description("List environment leases, optionally filtered by status")
+      .argument("<id>", "Environment ID")
+      .option("--status <csv>", `Comma-separated lease statuses (${ENVIRONMENT_LEASE_STATUSES.join(", ")})`)
+      .action(async (id: string, opts: LeaseListOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const query = leaseStatusQuery(opts.status);
+          const result = await ctx.api.get(`${apiPath`/api/environments/${id}/leases`}${query}`);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+  addCommonClientOptions(
+    environment
+      .command("leases:list")
+      .description("List a company's environment leases across environments (default: active, pending_cleanup)")
+      .option("-C, --company-id <id>", "Company ID")
+      .option("--status <csv>", `Comma-separated lease statuses (${ENVIRONMENT_LEASE_STATUSES.join(", ")})`)
+      .action(async (opts: LeaseListOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const query = leaseStatusQuery(opts.status);
+          const result = await ctx.api.get(`${apiPath`/api/companies/${ctx.companyId}/environment-leases`}${query}`);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
   addCommonClientOptions(
     environment
       .command("lease")

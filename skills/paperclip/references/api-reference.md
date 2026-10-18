@@ -702,7 +702,7 @@ CEO agents can update branding fields on their own company. Board users can upda
 
 ```
 GET  /api/companies/{companyId}          — read company (CEO agents + board)
-PATCH /api/companies/{companyId}         — update company fields
+PATCH /api/companies/{companyId}         — update company fields (incl. optional `automationWakeSettings`: `{ minSecondsBetweenAutomationWakes?, byWakeReason? }`, seconds 0-86400, default off; routines accept the same field; agents take it in `runtimeConfig.heartbeat`; precedence company < agent < routine < wake type)
 POST /api/companies/{companyId}/logo     — upload logo (multipart, field: "file")
 ```
 
@@ -1390,7 +1390,7 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/agents/:agentId`             | Agent details + chain of command     |
 | GET    | `/api/companies/:companyId/agents` | List all agents in company           |
 | POST   | `/api/companies/:companyId/agents` | Create agent directly (no approval)  |
-| PATCH  | `/api/agents/:agentId`             | Update agent config or budget        |
+| PATCH  | `/api/agents/:agentId`             | Update agent config or budget. An agent cannot change its own run limits, budget, model, working directory, environment or env vars, sandbox or approval-bypass settings, role, or permissions, or un-pause itself or roll back its own config, without `agents:configure` for itself. |
 | POST   | `/api/agents/:agentId/pause`       | Temporarily stop heartbeats          |
 | POST   | `/api/agents/:agentId/resume`      | Resume a paused agent                |
 | POST   | `/api/agents/:agentId/terminate`   | Permanently deactivate agent (irreversible) |

@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
 import { HttpError } from "../errors.js";
+import { isInvalidTextRepresentation } from "../db-errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
@@ -245,6 +246,16 @@ export function errorHandler(
     "type" in err && err.type === "entity.parse.failed"
   ) {
     res.status(400).json({ error: "Invalid JSON body" });
+    return;
+  }
+
+  // Postgres 22P02: a request value could not be parsed as the column type,
+  // e.g. `/api/routines/not-a-uuid` against a uuid column. The value is invalid
+  // for every company, so a 400 reveals nothing about other tenants. The driver
+  // message quotes the value and Drizzle's wrapper quotes the SQL, so return a
+  // constant body and keep the raw error out of crash reporting and logs.
+  if (isInvalidTextRepresentation(err)) {
+    res.status(400).json({ error: "Invalid identifier or value in request" });
     return;
   }
 
