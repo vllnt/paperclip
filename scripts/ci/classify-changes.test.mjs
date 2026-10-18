@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { classify, parsePaths } from "./classify-changes.mjs";
@@ -21,35 +24,35 @@ test("anything else is full", () => {
 });
 
 test("fails closed on odd input", () => {
-  assert.equal(pr().mode, "full");
-  assert.equal(pr("docs/../server/a.ts").mode, "full");
-  assert.equal(pr("../docs/a.md").mode, "full");
-  assert.equal(pr("/docs/a.md").mode, "full");
+  for (const paths of [[], ["docs/../server/a.ts"], ["../docs/a.md"], ["/docs/a.md"]]) {
+    const result = pr(...paths);
+    assert.equal(result.mode, "full", paths.join());
+    assert.equal(result.need_sentry, true, paths.join());
+  }
 });
 
 test("every other event is full with sentry", () => {
   for (const event of ["push", "merge_group", "workflow_dispatch", "schedule", ""]) {
-    assert.deepEqual(classify({ event, paths: ["docs/a.md"] }), {
-      mode: "full",
-      need_sentry: true,
-      reason: `event ${event} always runs everything`,
-    });
+    const result = classify({ event, paths: ["docs/a.md"] });
+    assert.equal(result.mode, "full", event);
+    assert.equal(result.need_sentry, true, event);
   }
 });
 
-test("sentry job follows the old path filter, the lockfile and ci.yml", () => {
+test("sentry job follows the files the real-SDK test exercises, plus ci.yml", () => {
   for (const changed of [
     "server/package.json",
     "server/src/sentry.ts",
     "server/src/sentry-init.ts",
     "server/src/peer-version-check.ts",
+    "server/src/services/run-failure-diagnostics.ts",
+    "server/src/services/adapter-stop-timeout.ts",
     "server/src/__tests__/run-failure-sentry-real-sdk.test.ts",
-    "pnpm-lock.yaml",
     ".github/workflows/ci.yml",
   ]) {
     assert.equal(pr(changed).need_sentry, true, changed);
   }
-  for (const changed of ["server/src/other.ts", "server/src/sentry/nested.ts", "server/src/__tests__/other.test.ts", "ui/package.json"]) {
+  for (const changed of ["server/src/other.ts", "server/src/sentry/nested.ts", "server/src/__tests__/other.test.ts", "ui/package.json", "pnpm-lock.yaml"]) {
     assert.equal(pr(changed).need_sentry, false, changed);
   }
 });
@@ -59,13 +62,20 @@ test("parsePaths splits on NUL, keeps spaces and newlines, drops empties", () =>
   assert.deepEqual(parsePaths(""), []);
 });
 
-test("cli reads NUL paths from stdin and prints one JSON object", () => {
-  const run = (args, input) => spawnSync(process.execPath, [script, ...args], { input, encoding: "utf8" });
-  const ok = run(["--event", "pull_request"], "docs/a.md\0");
-  assert.equal(ok.status, 0);
-  assert.equal(JSON.parse(ok.stdout).mode, "none");
-  assert.equal(JSON.parse(run(["--event", "pull_request"], "").stdout).mode, "full");
-  assert.equal(run([], "").status, 2);
-  assert.equal(run(["--event"], "").status, 2);
-  assert.equal(run(["--event", "push", "extra"], "").status, 2);
+test("cli reads NUL paths from stdin, prints JSON and writes GITHUB_OUTPUT", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "classify-"));
+  try {
+    const output = path.join(directory, "output");
+    const run = (args, input, env = {}) => spawnSync(process.execPath, [script, ...args], { input, encoding: "utf8", env: { ...process.env, GITHUB_OUTPUT: "", ...env } });
+    const ok = run(["--event", "pull_request"], "docs/a.md\0", { GITHUB_OUTPUT: output });
+    assert.equal(ok.status, 0);
+    assert.equal(JSON.parse(ok.stdout).mode, "none");
+    assert.equal(readFileSync(output, "utf8"), "mode=none\nneed_sentry=false\n");
+    assert.equal(JSON.parse(run(["--event", "pull_request"], "").stdout).mode, "full");
+    assert.equal(run([], "").status, 2);
+    assert.equal(run(["--event"], "").status, 2);
+    assert.equal(run(["--event", "push", "extra"], "").status, 2);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
