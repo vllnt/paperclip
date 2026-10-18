@@ -240,7 +240,8 @@ export function matchesEvent(match: EventMatch | null | undefined, event: Normal
 
 // ── Group key rendering ─────────────────────────────────────────────────────
 
-const GROUP_KEY_PLACEHOLDER = /\{\{\s*([^{}]*?)\s*\}\}/g;
+// The name is trimmed in code, not in the pattern: `\s*` next to a lazy group made the match quadratic on `{{` plus whitespace.
+const GROUP_KEY_PLACEHOLDER = /\{\{([^{}]*)\}\}/g;
 const GROUP_KEY_FIELD_PLACEHOLDERS = new Set(["source", "type", "severity", "dedupeKey"]);
 const GROUP_KEY_LABEL_PLACEHOLDER = /^labels\.([a-z0-9_]{1,64})$/;
 
@@ -251,7 +252,7 @@ export function validateEventGroupKeyTemplate(template: string): string | null {
     return `groupKey must be at most ${EVENT_GROUP_KEY_TEMPLATE_MAX_LENGTH} characters`;
   }
   for (const match of template.matchAll(GROUP_KEY_PLACEHOLDER)) {
-    const name = match[1] ?? "";
+    const name = (match[1] ?? "").trim();
     if (!GROUP_KEY_FIELD_PLACEHOLDERS.has(name) && !GROUP_KEY_LABEL_PLACEHOLDER.test(name)) {
       return `Unknown groupKey placeholder {{${name}}}. Allowed: {{source}}, {{type}}, {{severity}}, {{dedupeKey}}, {{labels.<key>}}`;
     }

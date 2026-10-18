@@ -276,6 +276,21 @@ describe("group key templates", () => {
         expect(validateEventGroupKeyTemplate(template)).not.toBeNull();
       },
     );
+
+    it("trims whitespace around a placeholder name, including tabs and newlines", () => {
+      expect(validateEventGroupKeyTemplate("{{\t source \n}}")).toBeNull();
+      expect(validateEventGroupKeyTemplate("{{ labels.env }}")).toBeNull();
+    });
+
+    it.each([
+      ["an unclosed opener followed by whitespace", `{{${"\t".repeat(EVENT_GROUP_KEY_TEMPLATE_MAX_LENGTH - 2)}`],
+      ["repeated openers", "{{".repeat(EVENT_GROUP_KEY_TEMPLATE_MAX_LENGTH / 2)],
+      ["openers separated by whitespace", "{{ ".repeat(EVENT_GROUP_KEY_TEMPLATE_MAX_LENGTH / 3)],
+    ])("validates %s in linear time", (_label, template) => {
+      const started = performance.now();
+      expect(validateEventGroupKeyTemplate(template)).not.toBeNull();
+      expect(performance.now() - started).toBeLessThan(200);
+    });
   });
 
   describe("eventGroupKeyTemplateSchema", () => {
