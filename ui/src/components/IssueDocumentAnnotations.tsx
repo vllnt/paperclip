@@ -14,7 +14,7 @@ import {
 } from "@/lib/document-annotation-debug";
 import { DocumentAnnotationLayer, type AnnotationAnchorRect, type PendingAnchor } from "./DocumentAnnotationLayer";
 import { DocumentAnnotationPanel } from "./DocumentAnnotationPanel";
-import { matchesMedia, subscribeToMedia } from "@/lib/safe-match-media";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { DocumentAnnotationPopover } from "./DocumentAnnotationPopover";
 import type { CompanyUserProfile } from "@/lib/company-members";
 
@@ -85,17 +85,11 @@ export function IssueDocumentAnnotations({
   const [selectionAnchor, setSelectionAnchor] = useState<PendingAnchor | null>(null);
   const [composerAnchor, setComposerAnchor] = useState<PendingAnchor | null>(null);
   const [popoverAnchorRect, setPopoverAnchorRect] = useState<AnnotationAnchorRect | null>(null);
-  const [isMobile, setIsMobile] = useState(false);
+  const isMobile = useMediaQuery("(max-width: 1023px)", false);
   const hashHandledRef = useRef<string | null>(null);
   // Bus token to ask the body layer to capture the current selection into a pendingAnchor.
   const [captureSelectionRequestId, setCaptureSelectionRequestId] = useState(0);
   const consumedInitialAnchorRef = useRef<PendingAnchor | null>(null);
-
-  useEffect(() => {
-    const query = "(max-width: 1023px)";
-    setIsMobile(matchesMedia(query, false));
-    return subscribeToMedia(query, setIsMobile);
-  }, []);
 
   const annotationsQuery = useQuery({
     queryKey: target?.kind === "routine"
