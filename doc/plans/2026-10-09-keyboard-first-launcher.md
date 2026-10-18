@@ -503,8 +503,8 @@ Every slice:
   access, rate limit, scope validation, and the judge failure modes
   (`no_key`, `timeout` return `suggestion: null`). OpenAPI coverage passes
   (`openapi-routes.test.ts`).
-- **CI gating:** append the new unit test files to the `Dockerfile:136`
-  list.
+- **CI gating:** add the new unit test files to
+  `scripts/ci/image-build-vitest-files.txt`.
 - **e2e** (`pnpm test:e2e`, Playwright): keyboard-only journeys, plus axe from
   slice 2. Seed an agent first, because the onboarding wizard otherwise
   covers every page.
