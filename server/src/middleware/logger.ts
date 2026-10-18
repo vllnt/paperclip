@@ -64,6 +64,9 @@ function isPrivateWebhook(req: {
 }
 
 function privateWebhookLogUrl(url: unknown) {
+  if (typeof url === "string" && /\/event-sources\/public(?:\/|$)/i.test(url)) {
+    return "/api/event-sources/public/:publicId/events";
+  }
   return typeof url === "string" && /\/routine-triggers\/public(?:\/|$)/i.test(url)
     ? "/api/routine-triggers/public/:publicId/fire"
     : "/api/chat-webhooks/:publicId/:provider";
