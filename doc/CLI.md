@@ -877,6 +877,14 @@ npx paperclipai activity create --company-id <company-id> --payload-json '{...}'
 npx paperclipai activity issue <issue-id>
 ```
 
+## Search Commands
+
+`search` uses the same company search as the board's command palette and `/search` page (`GET /api/companies/:companyId/search`).
+
+```sh
+npx paperclipai search <text...> --company-id <company-id> [--scope all|issues|comments|documents|artifacts|agents|projects] [--limit 20] [--offset 0] [--json]
+```
+
 ## Dashboard Commands
 
 ```sh

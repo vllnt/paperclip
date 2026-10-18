@@ -57,7 +57,30 @@ The operator can edit this skill for each company, repository or organization po
       userClientId: { type: "string", pattern: "^[A-Za-z0-9.]{8,100}$" },
       userClientSecret: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
       userRefreshToken: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
-      signingKey: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false }
+      signingKey: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
+      // Agents never merge a pull request that touches a protected path. An instance administrator may release some of them for
+      // one repository. The host validates this shape when the config is saved; the worker reads it again (and validates it
+      // again) at every merge. CODEOWNERS paths, control repositories and tiers paths are never released, whatever it says.
+      agentMergeablePaths: {
+        type: "array", maxItems: 50,
+        description: "Lets agents merge pull requests that touch protected paths under .github/ (such as workflows) in the repositories listed here. Each entry names one repository (owner/name), the paths to release (allow, under .github/, for example .github/**) and paths to keep refused (exclude). One refused file refuses the whole pull request. CODEOWNERS files, control repositories and repositories with a paperclip/tiers.yaml are never released. Only an instance administrator can change this. A file-name exclusion is a speed bump, not a boundary: a new workflow file or a local action can still reach production. The real boundary is GitHub's environment protection (required reviewers) on the deployment.",
+        items: {
+          type: "object", additionalProperties: false, required: ["repository", "allow"],
+          properties: {
+            repository: { type: "string", pattern: "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$", description: "owner/name. Matched exactly and without regard to case." },
+            allow: {
+              type: "array", minItems: 1, maxItems: 50,
+              description: "Protected paths to release, all under .github/ (for example .github/** or .github/workflows/**). A CODEOWNERS path cannot be listed.",
+              items: { type: "string", maxLength: 200, pattern: "^\\.github/[A-Za-z0-9._\\-/*?]+$", not: { anyOf: [{ pattern: "\\.\\." }, { pattern: "//" }, { pattern: "[Cc][Oo][Dd][Ee][Oo][Ww][Nn][Ee][Rr][Ss]" }] } }
+            },
+            exclude: {
+              type: "array", maxItems: 100,
+              description: "Paths or globs that stay refused even when allow covers them, for example .github/workflows/release.yml.",
+              items: { type: "string", maxLength: 200, pattern: "^[A-Za-z0-9._\\-/*?]+$", not: { anyOf: [{ pattern: "^/" }, { pattern: "\\.\\." }, { pattern: "//" }] } }
+            }
+          }
+        }
+      }
     }
   },
   tools: [

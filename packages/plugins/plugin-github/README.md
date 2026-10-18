@@ -310,6 +310,31 @@ turns writes off; fix it, then save the policy with `"enabled": true` again.
 The kill switch is the same save with `"enabled": false`: writes stop at the
 next command, reads continue.
 
+### Releasing protected paths for agent merges
+
+By default an agent never merges a pull request that touches a protected path (`.github/**`, CODEOWNERS and, in a control repository, its control paths); a person merges it in the GitHub web UI. An **instance administrator** can release some of these paths for chosen repositories with the company's plugin config, field `agentMergeablePaths`:
+
+```sh
+# config:set replaces the whole config, so merge the new field into the current one (as in the setup above).
+current="$(paperclipai plugin config "$PLUGIN" -C "$COMPANY" --json)"
+payload="$(CURRENT="$current" node -e '
+  const current = JSON.parse(process.env.CURRENT || "null")?.configJson ?? {};
+  process.stdout.write(JSON.stringify({ configJson: { ...current, agentMergeablePaths: [
+    { repository: "owner/repo", allow: [".github/**"], exclude: [".github/workflows/release.yml", ".github/workflows/deploy-*.yml"] },
+  ] } }));')"
+paperclipai plugin config:set "$PLUGIN" -C "$COMPANY" --payload-json "$payload" --json
+```
+
+- `repository` is `owner/name`. It is matched exactly and without regard to case. The default is no entries, which behaves as before.
+- `allow` lists paths under `.github/`, as globs (`*`, `?`, `**`). `exclude` lists paths or globs that stay refused.
+- A pull request merges when every protected file it touches is covered by `allow` and by no `exclude`. **One file that is not released refuses the whole pull request.** The refusal names only the files that are not released. A rename counts both names.
+- **Never released, whatever the config says:** the CODEOWNERS paths, every path of a control repository (a repository with a `paperclip/tiers.yaml` on its base branch cannot opt in), and the tiers paths. An `allow` entry that names CODEOWNERS or reaches outside `.github/` is refused when the config is saved. An entry that is not valid at the moment of a merge is dropped and releases nothing.
+- The config is read at every merge, from the plugin config only. It is never read from the pull request or from a file of the repository, so a pull request cannot widen its own release. Only an instance administrator can save it.
+- Unchanged: the exact head SHA of the merge, the file list read again after the head, the refusal of auto-merge and the merge queue, the admin-merge rules and every other write-identity gate.
+- The merge evidence records `releasedProtectedFiles` (at most 100, with `releasedProtectedFilesCount`) and `releasedBy: "config:agentMergeablePaths"`.
+
+**An exclusion by file name is a speed bump, not a boundary.** A pull request can add a new workflow file, or a local action that a released workflow calls, and reach production without touching an excluded name. The boundary that holds is GitHub's **environment protection** (required reviewers) on the deployment environment, together with branch protection. Use `exclude` to keep the obvious production and release files out of an agent's reach, and put the real approval on the environment.
+
 ## Native tasks and synchronization
 ## Native tasks and synchronization
 
@@ -490,7 +515,8 @@ repository/task management actor.
   kill switch, a repository allowlist, privileged-action toggles, a write
   throttle, an admin-merge guard, a protected-path merge guard (no agent merge
   touching `.github/**`, CODEOWNERS or, in the control repository, `paperclip/**`,
-  `scripts/**` and the base branch's `paperclip/tiers.yaml` list; no auto-merge
+  `scripts/**` and the base branch's `paperclip/tiers.yaml` list, except what an instance
+  administrator releases per repository with `agentMergeablePaths`; no auto-merge
   or merge queue) and server-side commit signing.
 - Declares `writeIdentityAction`, `signCommitAction` and the
   `secrets.write-own` capability; upgrading asks the operator to approve it.
