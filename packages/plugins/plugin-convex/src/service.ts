@@ -8,6 +8,7 @@ import {
 import { ConvexApiError, ConvexClient } from "./convex-client.js";
 import { isGranted, hasAnyGrant, type AgentIdentity } from "./grants.js";
 import { GitHubReader } from "./github-reader.js";
+import { hardDeleteBlock } from "./hard-guard.js";
 import { reaperDeadline } from "./policy.js";
 import { assessPreview, recheckCache, Refusal, type GuardCache, type PreviewAssessment } from "./preview-guard.js";
 
@@ -271,6 +272,9 @@ export class ConvexService {
     this.requireGrant(actor, config, target.environment, "lifecycle");
     const now = this.d.now();
     const expiresAt = options.expiryAt ?? now + hours * HOUR_MS;
+    // The hard guard stops an expiry from being scheduled or shortened. Moving an existing deadline later postpones a deletion, so it stays allowed.
+    const hardBlock = hardDeleteBlock(target.deployment);
+    if (hardBlock && !(target.deployment.expiresAt !== null && expiresAt > target.deployment.expiresAt)) throw new Refusal(hardBlock);
     if (expiresAt - now > MAX_PREVIEW_TTL_HOURS * HOUR_MS) throw new Refusal(`A preview expiry can be at most ${MAX_PREVIEW_TTL_HOURS} hours (7 days) from now.`);
     if (expiresAt - now < MIN_EXPIRY_LEAD_MS) throw new Refusal("A preview expiry must be at least 30 minutes from now.");
     // An expiry is a scheduled deletion. Setting one sooner than the preview already has, sooner than the reaper's own deadline for it, or
@@ -364,6 +368,8 @@ export class ConvexService {
     const target = await this.resolveTarget(actor, config, reserved, name);
     this.requirePreview(target);
     this.requireGrant(actor, config, target.environment, "lifecycle");
+    const hardBlock = hardDeleteBlock(target.deployment);
+    if (hardBlock) throw new Refusal(hardBlock);
     // The decision re-reads open pull requests and branches; only the closed-PR evidence list may be shared with the planning pass.
     const assessment = await this.assess(actor.companyId, target, recheckCache(options.cache));
     if (assessment.blocked) throw new Refusal(assessment.blocked);

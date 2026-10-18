@@ -1,5 +1,6 @@
 import { HOUR_MS, type ConnectionConfig, type ReaperProjectReport, type ReaperReport } from "./contracts.js";
 import { classifyDeployment } from "./classify.js";
+import { hardDeleteBlock } from "./hard-guard.js";
 import { EXPIRY_TOLERANCE_MS, MIN_PLANNED_LEAD_MS } from "./policy.js";
 import { GITHUB_UNREADABLE, newGuardCache, Refusal, type PreviewAssessment } from "./preview-guard.js";
 import { isShowable, type Actor, type ConvexService, type DeletionBudget } from "./service.js";
@@ -63,6 +64,14 @@ async function reaperPass(service: ConvexService, companyId: string, options: Re
         // An expiry the plugin set follows a later deploy; one a person chose never moves later. Moving a deadline later deletes nothing, so it needs no GitHub.
         const ours = current !== null && managed[deployment.name] !== undefined && Math.abs(managed[deployment.name] - current) <= EXPIRY_TOLERANCE_MS;
         const extend = ours && deadline - now >= MIN_PLANNED_LEAD_MS && current < deadline - EXPIRY_TOLERANCE_MS;
+        const hardBlock = hardDeleteBlock(deployment);
+        if (hardBlock) {
+          // Never deleted, and never given or shortened an expiry (an expiry is a delayed delete), whatever the grants or config say.
+          // An expiry the plugin already set may still move later: that postpones a deletion.
+          if (extend) { entry.kept += 1; entry.setExpiry.push({ name: deployment.name, from: current, to: deadline }); }
+          else entry.skipped.push({ name: deployment.name, previewIdentifier: deployment.previewIdentifier, reason: hardBlock });
+          continue;
+        }
 
         let assessment: PreviewAssessment | null = null;
         let unreadable: string | null = null;
