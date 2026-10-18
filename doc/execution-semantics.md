@@ -534,6 +534,10 @@ When newer source activity restores a valid live or waiting path, the recovery a
 
 Plain comments alone do not make a recovery action stale. A comment can provide evidence, but the recovery action should remain visible when the source issue is still stalled and the comment does not create a valid action-path primitive such as a wake, monitor, interaction, approval, blocker, human owner, execution participant, terminal disposition, or delegated follow-up.
 
+Clearing a flag that no longer applies to a parked or stopped source uses `POST /api/issues/{id}/recovery-actions/resolve` with `outcome: "false_positive"` (board only) and `sourceIssueStatus` set to the status the source already has, `backlog` or `cancelled`. The route never moves the source there: if the source is in a different status it answers `409 recovery_clear_requires_current_status`. Repeating the call after the flag is cleared is a no-op replay.
+
+A human comment implicitly moves a `done`, `cancelled` or `blocked` agent-assigned issue to `todo`. A comment that sends an explicit `reopen: false` opts out and stays a comment; omitting `reopen` keeps the implicit move, and `resume: true` still reopens.
+
 ### Agent-assigned `todo`
 
 This is dispatch state: ready to start, not yet actively claimed.
