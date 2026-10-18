@@ -51,6 +51,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     resolveResponsibleUserId: async () => "responsible-user",
     getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
     resolveSessionBeforeForWakeup: async () => null,
+    admitAutomationWake: async () => ({ hold: false }),
   };
 
   beforeAll(async () => {

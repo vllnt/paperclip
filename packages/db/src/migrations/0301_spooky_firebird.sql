@@ -1,0 +1,2 @@
+ALTER TABLE "companies" ADD COLUMN "routine_noop_skip_settings" jsonb DEFAULT '{}'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "routines" ADD COLUMN "routine_noop_skip_settings" jsonb DEFAULT '{}'::jsonb NOT NULL;
