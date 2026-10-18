@@ -39,6 +39,8 @@ export interface InstanceGeneralSettings {
   executionMode?: InstanceExecutionMode;
   /** Instance-admin selected execution defaults, keyed by company ID. */
   companyEnvironmentDefaults?: Record<string, string>;
+  /** `owner/name` repositories routine gate scripts may be pinned in (plus `PAPERCLIP_ROUTINE_GATE_REPOS`). */
+  routineGateRepos?: string[];
 }
 
 export interface InstanceExperimentalSettings {
