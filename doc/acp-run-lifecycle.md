@@ -77,6 +77,49 @@ The reuse decision is pure and runs before any close. A save is eligible only wh
 a candidate exists, the settlement cause permits a save, and no run-scoped
 credential that the candidate would carry into the store remains valid.
 
+### The control bridge process
+
+The file-mode control bridge runs on the worker as its own process
+(`paperclip-bridge-server.mjs`), started with `setsid` so it leads its own
+process group. Its command line carries `--paperclip-run-id=<runId>` and its
+environment `PAPERCLIP_BRIDGE_RUN_ID`. `stop_transport` signals the group with
+`SIGTERM`, then `SIGKILL` after two seconds, and only a process that still runs
+this run's bridge. On `SIGTERM` the bridge closes every connection and exits
+within one second, also while a request waits for its response. A bridge that
+starts but fails its readiness check is stopped the same way.
+
+A run that never reaches `stop_transport` (a server restart, a lost run) cannot
+leave the bridge behind. While the host's queue worker runs, it rewrites
+`host-lease` in the queue directory every minute. The bridge exits when that
+file has not changed for ten minutes (measured on its own monotonic clock), when
+its queue directory is gone in two checks in a row (for example after the SSH run
+directory reaper removed the run's directory), or when a newer bridge took over
+its queue directory.
+
+The host's queue worker lists the request queue with one remote command (over
+SSH, one new connection). After it handles a request it lists again at once.
+After an empty listing it waits: 100 ms at first, doubling after each further
+empty listing, up to 3 seconds (or a quarter of the worker's watchdog, if that
+is shorter). Each wait is spread by up to 20% either way, so runs that start
+together do not list in step. The wait counts from the start of the listing
+before it and is never shorter than 100 ms, so a slow listing adds no wait. A
+listing that finds only requests still in flight, and a failed listing, set the
+wait back to 100 ms. An idle run lists about 20 times a minute.
+
+How long a request waits for the worker:
+- With fast listings, a request that arrives while the run is idle is picked up
+  within 3.6 seconds plus a listing round trip.
+- In the worst case, a request lands just after a slow listing started. Its
+  pickup then takes what it took with a fixed 100 ms wait: the listing in
+  progress, 100 ms, and the next listing.
+- A request that waited more than 4 seconds for its handler writes a run-log
+  line: `[paperclip] Bridge request <method> <id> waited <n> s for the host
+  (queued …, listed …, started …)`. The queued time comes from the sandbox's
+  clock.
+
+`stop_transport` ends the wait early; the worker lists once more and still
+serves the requests already queued.
+
 ## The server-owned staging lease outer context
 
 The staging lease is a per-session lease. Only one run of a session may stage into

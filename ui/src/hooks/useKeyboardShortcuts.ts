@@ -1,10 +1,13 @@
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
+import { commandActionGoChords } from "@paperclipai/shared/command-actions";
 import {
   focusPageSearchShortcutTarget,
   hasBlockingShortcutDialog,
   isKeyboardShortcutTextInputTarget,
-  resolveIssueDetailGoKeyAction,
+  resolveGoChordKeyAction,
 } from "../lib/keyboardShortcuts";
+
+const GO_CHORDS = commandActionGoChords();
 
 interface ShortcutHandlers {
   onNewIssue?: () => void;
@@ -12,21 +15,23 @@ interface ShortcutHandlers {
   onToggleSidebar?: () => void;
   onTogglePanel?: () => void;
   onShowShortcuts?: () => void;
-  onGoToInbox?: () => void;
+  /** Runs the launcher action of a `g` chord, e.g. `nav.dashboard` for `g d`. */
+  onRunChord?: (actionId: string) => void;
 }
 
-export function useKeyboardShortcuts({
-  onNewIssue,
-  onSearch,
-  onToggleSidebar,
-  onTogglePanel,
-  onShowShortcuts,
-  onGoToInbox,
-}: ShortcutHandlers) {
+export function useKeyboardShortcuts(handlers: ShortcutHandlers) {
+  // The layout passes inline handlers, so their identities change on every
+  // render. Read them through a ref and subscribe once: re-subscribing would
+  // run the cleanup and drop a half-typed chord (g, re-render, d).
+  const handlersRef = useRef(handlers);
+  useLayoutEffect(() => {
+    handlersRef.current = handlers;
+  });
+
   useEffect(() => {
-    // g → i chord state. IssueDetail runs its own capture-phase handler with
-    // extra chords (g c, g f) and stops propagation when it handles one, so
-    // this bubble-phase chord only fires outside the issue detail page.
+    // g chord state. IssueDetail runs its own capture-phase handler for its
+    // chords (g i, g c, g f) and stops propagation when it handles one, so a
+    // chord it claims never reaches this bubble-phase handler.
     let goChordArmed = false;
     let goChordTimeout: number | null = null;
     const clearGoChordTimeout = () => {
@@ -49,14 +54,16 @@ export function useKeyboardShortcuts({
     };
 
     function handleKeyDown(e: KeyboardEvent) {
+      const { onNewIssue, onSearch, onToggleSidebar, onTogglePanel, onShowShortcuts, onRunChord } = handlersRef.current;
       if (e.defaultPrevented) {
         disarmGoChord();
         return;
       }
 
-      if (onGoToInbox) {
-        const chordAction = resolveIssueDetailGoKeyAction({
+      if (onRunChord) {
+        const chordAction = resolveGoChordKeyAction({
           armed: goChordArmed,
+          chords: GO_CHORDS,
           defaultPrevented: e.defaultPrevented,
           key: e.key,
           metaKey: e.metaKey,
@@ -65,24 +72,19 @@ export function useKeyboardShortcuts({
           target: e.target,
           hasOpenDialog: hasBlockingShortcutDialog(),
         });
-        if (chordAction === "arm") {
+        if (chordAction.type === "arm") {
           armGoChord();
           return;
         }
-        if (chordAction === "navigate_inbox") {
+        if (chordAction.type === "run") {
+          // Swallow the key even when the action has no handler here (g c
+          // outside issue detail), so it can't trigger a bare shortcut (c).
           disarmGoChord();
           e.preventDefault();
-          onGoToInbox();
+          onRunChord(chordAction.actionId);
           return;
         }
-        if (chordAction === "focus_comment" || chordAction === "open_file_viewer") {
-          // Armed chord keys that only mean something on the issue detail
-          // page — swallow them so they don't trigger bare shortcuts (c).
-          disarmGoChord();
-          e.preventDefault();
-          return;
-        }
-        if (chordAction === "disarm") disarmGoChord();
+        if (chordAction.type === "disarm") disarmGoChord();
       }
 
       // Don't fire shortcuts when typing in inputs
@@ -145,5 +147,5 @@ export function useKeyboardShortcuts({
       document.removeEventListener("focusin", handleFocusIn, true);
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [onNewIssue, onSearch, onToggleSidebar, onTogglePanel, onShowShortcuts, onGoToInbox]);
+  }, []);
 }

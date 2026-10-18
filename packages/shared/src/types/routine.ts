@@ -1,3 +1,5 @@
+import type { AutomationWakeSettings } from "../automation-wake.js";
+import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
 import type {
   IssueOriginKind,
   IssuePriority,
@@ -89,6 +91,8 @@ export interface Routine {
   originId?: string | null;
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
+  automationWakeSettings?: AutomationWakeSettings;
+  routineNoopSkipSettings?: RoutineNoopSkipSettings;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
   createdByAgentId: string | null;
