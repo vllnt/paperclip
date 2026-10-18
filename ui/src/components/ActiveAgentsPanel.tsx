@@ -39,7 +39,11 @@ const RUN_GRID_CLASSES = "grid grid-cols-1 items-start gap-2 sm:grid-cols-2 sm:g
 // With no recorded count, reserve one row of the grid above: 1 card on a phone,
 // 2 from `sm`, 4 from `xl`. That never reserves more than a company with a
 // single run will fill, and a company with more runs grows by whole rows only.
+// Entry `i` is the breakpoint from which the grid has more than `i` columns, so
+// keep this list in step with RUN_GRID_CLASSES; a placeholder past the end
+// (more placeholders than `xl` columns) stays hidden below `xl`.
 const FIRST_ROW_CLASSES = ["", "hidden sm:block", "hidden xl:block", "hidden xl:block"];
+const EXTRA_PLACEHOLDER_CLASSES = "hidden xl:block";
 
 /**
  * Stands in for the run cards while the runs load, sized like the content that
@@ -73,7 +77,7 @@ function LiveRunsPlaceholder({
         {Array.from({ length: count }, (_, index) => (
           <Skeleton
             key={index}
-            className={cn("h-32 w-full", knownCardCount === null && FIRST_ROW_CLASSES[index])}
+            className={cn("h-32 w-full", knownCardCount === null && (FIRST_ROW_CLASSES[index] ?? EXTRA_PLACEHOLDER_CLASSES))}
           />
         ))}
       </div>
@@ -120,7 +124,7 @@ export function ActiveAgentsPanel({
     enabled: !!companyId,
     leaderOnly: true,
   });
-  const { data: liveRuns, dataUpdatedAt: liveRunsUpdatedAt, isPending: liveRunsPending } = useQuery({
+  const { data: liveRuns, dataUpdatedAt: liveRunsUpdatedAt, isLoading: liveRunsLoading } = useQuery({
     queryKey: liveRunsQueryKey,
     queryFn: () => heartbeatsApi.liveRunsForCompany(companyId, {
       minCount: minRunCount,
@@ -189,7 +193,7 @@ export function ActiveAgentsPanel({
       <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
         {title}
       </h3>
-      {liveRunsPending ? (
+      {liveRunsLoading ? (
         <LiveRunsPlaceholder
           knownCardCount={knownCardCount}
           cardLimit={cardLimit}

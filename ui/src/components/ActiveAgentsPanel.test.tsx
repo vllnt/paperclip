@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, type ReactNode } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActiveAgentsPanel, AgentRunCard } from "./ActiveAgentsPanel";
@@ -29,6 +29,19 @@ vi.mock("../api/heartbeats", () => ({
 vi.mock("../api/issues", () => ({
   issuesApi: mockIssuesApi,
 }));
+
+const sharedPollingOverride = vi.hoisted(() => ({ enabled: null as boolean | null }));
+
+vi.mock("../hooks/useSharedPolling", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../hooks/useSharedPolling")>();
+  return {
+    ...actual,
+    useSharedPollingQuery: (options: Parameters<typeof actual.useSharedPollingQuery>[0]) => {
+      const state = actual.useSharedPollingQuery(options);
+      return sharedPollingOverride.enabled === null ? state : { ...state, enabled: sharedPollingOverride.enabled };
+    },
+  };
+});
 
 vi.mock("./RunChatSurface", () => ({
   RunChatSurface: () => <div>Run output</div>,
@@ -114,15 +127,28 @@ function createIssue(id: string, identifier: string, title: string) {
 
 describe("ActiveAgentsPanel", () => {
   let container: HTMLDivElement;
+  let roots: Root[];
+
+  // Every root is unmounted in afterEach, so a failing assertion cannot leak one into later tests.
+  function mountRoot() {
+    const root = createRoot(container);
+    roots.push(root);
+    return root;
+  }
 
   beforeEach(() => {
+    roots = [];
+    sharedPollingOverride.enabled = null;
     container = document.createElement("div");
     document.body.appendChild(container);
     mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([1, 2, 3, 4, 5].map(createRun));
     mockIssuesApi.get.mockRejectedValue(new Error("Issue not found"));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await act(async () => {
+      roots.forEach((root) => root.unmount());
+    });
     container.remove();
     document.body.innerHTML = "";
     window.localStorage.clear();
@@ -130,9 +156,10 @@ describe("ActiveAgentsPanel", () => {
   });
 
   describe("while the runs load", () => {
+    let queryClient: QueryClient;
     async function renderPanel(props: { cardLimit?: number; showMoreLink?: boolean } = {}) {
-      const root = createRoot(container);
-      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = mountRoot();
+      queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       await act(async () => {
         root.render(
           <QueryClientProvider client={queryClient}>
@@ -152,14 +179,10 @@ describe("ActiveAgentsPanel", () => {
 
     it("does not reserve the link row when the panel has no link", async () => {
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
-      const root = await renderPanel({ showMoreLink: false });
+      await renderPanel({ showMoreLink: false });
 
       expect(placeholder()).not.toBeNull();
       expect(linkPlaceholder()).toBeNull();
-
-      await act(async () => {
-        root.unmount();
-      });
     });
 
     it("reserves a row of cards instead of the empty message, then swaps in the runs", async () => {
@@ -167,7 +190,7 @@ describe("ActiveAgentsPanel", () => {
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(
         new Promise((resolve) => { resolveRuns = resolve; }),
       );
-      const root = await renderPanel();
+      await renderPanel();
 
       expect(placeholder()?.getAttribute("aria-busy")).toBe("true");
       // No recorded count: one row of the grid is visible (1 card on a phone, 2 from sm, 4 from xl).
@@ -189,37 +212,25 @@ describe("ActiveAgentsPanel", () => {
         expect(linkPlaceholder()).toBeNull();
         expect(container.textContent).toContain("more active/recent");
       });
-
-      await act(async () => {
-        root.unmount();
-      });
     });
 
     it("shows the empty message once the list loads empty", async () => {
       mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
-      const root = await renderPanel();
+      await renderPanel();
 
       await waitForMicrotaskAssertion(() => {
         expect(placeholder()).toBeNull();
         expect(container.textContent).toContain("No recent agent runs.");
-      });
-
-      await act(async () => {
-        root.unmount();
       });
     });
 
     it("falls back to the empty message when the runs fail to load", async () => {
       mockHeartbeatsApi.liveRunsForCompany.mockRejectedValue(new Error("boom"));
-      const root = await renderPanel();
+      await renderPanel();
 
       await waitForMicrotaskAssertion(() => {
         expect(placeholder()).toBeNull();
         expect(container.textContent).toContain("No recent agent runs.");
-      });
-
-      await act(async () => {
-        root.unmount();
       });
     });
 
@@ -233,21 +244,17 @@ describe("ActiveAgentsPanel", () => {
     ])("sizes the placeholder to the recorded count %s (cardLimit %i): %i cards, all shown", async (stored, cardLimit, expected) => {
       window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard", stored);
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
-      const root = await renderPanel({ cardLimit });
+      await renderPanel({ cardLimit });
 
       expect(skeletons()).toHaveLength(expected);
       expect(shownSkeletons()).toHaveLength(expected);
       expect(linkPlaceholder()).not.toBeNull();
-
-      await act(async () => {
-        root.unmount();
-      });
     });
 
     it("reserves the empty box, not cards, when the last load was empty", async () => {
       window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard", "0");
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
-      const root = await renderPanel();
+      await renderPanel();
 
       expect(placeholder()).toBeNull();
       expect(linkPlaceholder()).toBeNull();
@@ -255,23 +262,15 @@ describe("ActiveAgentsPanel", () => {
       expect(box?.className).toContain("rounded-xl border border-border p-4");
       expect(box?.querySelector("p")?.className).toContain("invisible");
       expect(box?.querySelector("p")?.getAttribute("aria-hidden")).toBe("true");
-
-      await act(async () => {
-        root.unmount();
-      });
     });
 
     it("ignores a count recorded for another company or scope", async () => {
       window.localStorage.setItem("paperclip:live-run-cards:company-2:dashboard", "3");
       window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard-live", "3");
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
-      const root = await renderPanel();
+      await renderPanel();
 
       expect(shownSkeletons()).toHaveLength(1);
-
-      await act(async () => {
-        root.unmount();
-      });
     });
 
     it.each([
@@ -282,31 +281,23 @@ describe("ActiveAgentsPanel", () => {
       [[1, 2, 3, 4, 5, 6], 50, "6"],
     ])("records the cards of a finished load: %j runs with cardLimit %i gives %s", async (indexes, cardLimit, expected) => {
       mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue(indexes.map(createRun));
-      const root = await renderPanel({ cardLimit });
+      await renderPanel({ cardLimit });
 
       await waitForMicrotaskAssertion(() => {
         expect(placeholder()).toBeNull();
         expect(storedCount()).toBe(expected);
-      });
-
-      await act(async () => {
-        root.unmount();
       });
     });
 
     it("keeps the recorded count when the runs fail to load", async () => {
       window.localStorage.setItem("paperclip:live-run-cards:company-1:dashboard", "3");
       mockHeartbeatsApi.liveRunsForCompany.mockRejectedValue(new Error("boom"));
-      const root = await renderPanel();
+      await renderPanel();
 
       await waitForMicrotaskAssertion(() => {
         expect(placeholder()).toBeNull();
       });
       expect(storedCount()).toBe("3");
-
-      await act(async () => {
-        root.unmount();
-      });
     });
 
     it.each([
@@ -315,18 +306,70 @@ describe("ActiveAgentsPanel", () => {
       [20, 4],
     ])("reserves at most the dashboard row when no count is recorded: cardLimit %i gives %i placeholders", async (cardLimit, expected) => {
       mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
-      const root = await renderPanel({ cardLimit });
+      await renderPanel({ cardLimit });
 
       expect(placeholder()?.querySelectorAll('[data-slot="skeleton"]')).toHaveLength(expected);
+    });
+
+    it("shows the empty message, not the skeleton, while the query is not fetching", async () => {
+      // A non-leader tab disables the query and waits for the leader's broadcast.
+      sharedPollingOverride.enabled = false;
+      await renderPanel();
+
+      expect(mockHeartbeatsApi.liveRunsForCompany).not.toHaveBeenCalled();
+      expect(placeholder()).toBeNull();
+      expect(container.textContent).toContain("No recent agent runs.");
+    });
+
+    it("still shows the runs when the tab turns out to be a follower while the first load runs", async () => {
+      let resolveRuns: (runs: ReturnType<typeof createRun>[]) => void = () => {};
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(
+        new Promise((resolve) => { resolveRuns = resolve; }),
+      );
+      const root = await renderPanel();
+      expect(placeholder()).not.toBeNull();
+
+      // Leadership is decided after the first fetch has started.
+      sharedPollingOverride.enabled = false;
+      await act(async () => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <ActiveAgentsPanel companyId="company-1" />
+          </QueryClientProvider>,
+        );
+      });
+      expect(placeholder()).not.toBeNull();
 
       await act(async () => {
-        root.unmount();
+        resolveRuns([1, 2].map(createRun));
       });
+      await waitForMicrotaskAssertion(() => {
+        expect(placeholder()).toBeNull();
+        expect(container.textContent).toContain("Agent 1");
+      });
+    });
+
+    it("keeps the cards, not the skeleton, while a loaded list refetches", async () => {
+      await renderPanel();
+      await waitForMicrotaskAssertion(() => {
+        expect(placeholder()).toBeNull();
+        expect(container.textContent).toContain("Agent 1");
+      });
+
+      mockHeartbeatsApi.liveRunsForCompany.mockReturnValue(new Promise(() => {}));
+      await act(async () => {
+        void queryClient.invalidateQueries();
+      });
+      await flushReact();
+
+      expect(mockHeartbeatsApi.liveRunsForCompany).toHaveBeenCalledTimes(2);
+      expect(placeholder()).toBeNull();
+      expect(container.textContent).toContain("Agent 1");
     });
   });
 
   it("links hidden active/recent runs to the full live dashboard", async () => {
-    const root = createRoot(container);
+    const root = mountRoot();
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -368,7 +411,7 @@ describe("ActiveAgentsPanel", () => {
       createRun(6),
     ]);
 
-    const root = createRoot(container);
+    const root = mountRoot();
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -405,7 +448,7 @@ describe("ActiveAgentsPanel", () => {
       createIssueRun(1, "issue-repeated"),
       { ...createIssueRun(2, "issue-repeated"), status: "succeeded" },
     ]);
-    const root = createRoot(container);
+    const root = mountRoot();
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -450,7 +493,7 @@ describe("ActiveAgentsPanel", () => {
       "Phase 4B: Implement LLM Wiki distillation UI",
     ));
 
-    const root = createRoot(container);
+    const root = mountRoot();
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -480,7 +523,7 @@ describe("ActiveAgentsPanel", () => {
   });
 
   it("keeps run outcomes distinct from the linked task status", async () => {
-    const root = createRoot(container);
+    const root = mountRoot();
     const statuses = ["running", "queued", "succeeded", "failed", "timed_out", "cancelled", "interrupted"];
     await act(async () => {
       root.render(<>{statuses.map((status, index) => (
@@ -509,7 +552,7 @@ describe("ActiveAgentsPanel", () => {
   });
 
   it("shows an answered Slack task as idle without changing the run outcome", async () => {
-    const root = createRoot(container);
+    const root = mountRoot();
     await act(async () => {
       root.render(<AgentRunCard companyId="company-1"
         run={{ ...createIssueRun(0, "issue-1"), status: "succeeded" }}
@@ -522,7 +565,7 @@ describe("ActiveAgentsPanel", () => {
   });
 
   it("keeps a failed task lookup navigable and shows a clear error", async () => {
-    const root = createRoot(container);
+    const root = mountRoot();
     await act(async () => {
       root.render(<AgentRunCard companyId="company-1" run={createIssueRun(1, "issue-missing")} issueLoadFailed />);
     });
@@ -532,7 +575,7 @@ describe("ActiveAgentsPanel", () => {
   });
 
   it("does not animate running records while execution is reconnecting", async () => {
-    const root = createRoot(container);
+    const root = mountRoot();
     await act(async () => {
       root.render(<AgentRunCard
         companyId="company-1"
