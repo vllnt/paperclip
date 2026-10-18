@@ -7,6 +7,7 @@ import {
   LIVE_RUN_FAST_POLL_MS,
   LIVE_RUN_IDLE_POLL_MS,
   TASK_BROWSER_ACTIVE_POLL_MS,
+  isRunExpectedOnIssue,
   liveRunsRefetchInterval,
   taskBrowsersRefetchInterval,
 } from "./live-run-polling";
@@ -45,11 +46,52 @@ describe("taskBrowsersRefetchInterval", () => {
     expect(interval({ state: { data: [{ status: "idle" }] } })).toBe(TASK_BROWSER_ACTIVE_POLL_MS);
   });
 
+  it("keeps a session fresh while it is starting or stopping", () => {
+    // The panel shows "Starting browser..." and "Stopping browser..." for these,
+    // so the move to running or closed must not wait for the safety poll.
+    const interval = taskBrowsersRefetchInterval(false);
+    expect(interval({ state: { data: [{ status: "starting" }] } })).toBe(TASK_BROWSER_ACTIVE_POLL_MS);
+    expect(interval({ state: { data: [{ status: "stopping" }] } })).toBe(TASK_BROWSER_ACTIVE_POLL_MS);
+  });
+
   it("falls back to the safety poll with no run and no live session", () => {
     const interval = taskBrowsersRefetchInterval(false);
     expect(interval({ state: { data: [] } })).toBe(LIVE_RUN_IDLE_POLL_MS);
     expect(interval({ state: { data: [{ status: "closed" }] } })).toBe(LIVE_RUN_IDLE_POLL_MS);
+    expect(interval({ state: { data: [{ status: "failed" }, { status: "closed" }] } })).toBe(LIVE_RUN_IDLE_POLL_MS);
     expect(interval({ state: { data: undefined } })).toBe(LIVE_RUN_IDLE_POLL_MS);
+  });
+});
+
+describe("isRunExpectedOnIssue", () => {
+  const todo = { id: "issue-1", status: "todo", executionRunId: null };
+
+  it("expects no run on an idle issue", () => {
+    expect(isRunExpectedOnIssue(todo, [])).toBe(false);
+    expect(isRunExpectedOnIssue(todo, undefined)).toBe(false);
+    expect(isRunExpectedOnIssue(todo, null)).toBe(false);
+  });
+
+  it("expects no run while the issue is still loading", () => {
+    expect(isRunExpectedOnIssue(undefined, [{ issueId: "issue-1" }])).toBe(false);
+    expect(isRunExpectedOnIssue(null, [])).toBe(false);
+  });
+
+  it("expects a run on an in_progress issue", () => {
+    expect(isRunExpectedOnIssue({ ...todo, status: "in_progress" }, [])).toBe(true);
+  });
+
+  it("expects a run when the issue holds an execution run", () => {
+    expect(isRunExpectedOnIssue({ ...todo, executionRunId: "run-1" }, [])).toBe(true);
+  });
+
+  it("expects a run when the company list has a queued or running run for this issue", () => {
+    // A first run by a non-assignee agent on a todo issue: no execution run, not in_progress.
+    expect(isRunExpectedOnIssue(todo, [{ issueId: "issue-2" }, { issueId: "issue-1" }])).toBe(true);
+  });
+
+  it("ignores company runs for other issues or without an issue", () => {
+    expect(isRunExpectedOnIssue(todo, [{ issueId: "issue-2" }, { issueId: null }, {}])).toBe(false);
   });
 });
 

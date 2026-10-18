@@ -18,12 +18,45 @@ interface PolledBrowserList {
   state: { data: ReadonlyArray<{ status: string }> | undefined };
 }
 
+interface RunExpectationIssue {
+  id: string;
+  status: string;
+  executionRunId?: string | null;
+}
+
+/** Browser session states that end the session; every other state is still changing. */
+const SETTLED_BROWSER_STATUSES: ReadonlySet<string> = new Set(["closed", "failed"]);
+
+/**
+ * Tells whether a run is running or about to start on the open issue. This is
+ * the single source for the "run expected" flag that every polled query of the
+ * issue page takes, so the call sites cannot drift apart.
+ *
+ * A run counts as expected when the issue holds an execution run, is
+ * `in_progress`, or the company live-runs list (kept current by live events,
+ * which carry no `issueId` for a queued run) holds a queued or running run
+ * for this issue. The last case covers a first run started by an agent that is
+ * not the assignee.
+ *
+ * @param issue - The open issue, or nullish while it loads.
+ * @param companyLiveRuns - The company's queued and running runs.
+ * @returns True when the fast cadence applies.
+ */
+export function isRunExpectedOnIssue(
+  issue: RunExpectationIssue | null | undefined,
+  companyLiveRuns: ReadonlyArray<{ issueId?: string | null }> | null | undefined,
+): boolean {
+  if (!issue) return false;
+  if (issue.executionRunId || issue.status === "in_progress") return true;
+  return (companyLiveRuns ?? []).some((run) => run.issueId === issue.id);
+}
+
 /**
  * Builds a `refetchInterval` for an issue's live-runs query.
  *
- * Every observer of one query key shares the shortest interval among them, so
- * all observers of the key must use this helper or the shortest unconditional
- * one wins.
+ * Every observer of one query key shares the shortest interval among them: the
+ * key polls fast while any observer wants it fast. Observers that must agree
+ * should take their flag from `isRunExpectedOnIssue`.
  *
  * @param runExpected - True when the issue is in a state where a run is
  * running or about to start (for example `in_progress` or a set execution run).
@@ -51,15 +84,15 @@ export function liveRunsRefetchInterval(
  *
  * @param runExpected - True while a run is live or expected on the issue.
  * @returns A function that returns `TASK_BROWSER_ACTIVE_POLL_MS` while a run is
- * expected or a running or idle session is listed, and `LIVE_RUN_IDLE_POLL_MS`
- * otherwise.
+ * expected or any listed session has not ended (`starting`, `running`, `idle`
+ * or `stopping`), and `LIVE_RUN_IDLE_POLL_MS` otherwise.
  */
 export function taskBrowsersRefetchInterval(
   runExpected: boolean,
 ): (query: PolledBrowserList) => number {
   return (query) => {
     const hasLiveBrowser = (query.state.data ?? []).some(
-      (browser) => browser.status === "running" || browser.status === "idle",
+      (browser) => !SETTLED_BROWSER_STATUSES.has(browser.status),
     );
     return runExpected || hasLiveBrowser ? TASK_BROWSER_ACTIVE_POLL_MS : LIVE_RUN_IDLE_POLL_MS;
   };

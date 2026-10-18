@@ -102,6 +102,8 @@ export interface TaskSidePanelProps {
   onUpdate: (data: Record<string, unknown>) => void;
   inline?: boolean;
   hasActiveRun?: boolean;
+  /** The issue page's run-expected flag, so the browser list polls like the page's other observers. */
+  runExpected?: boolean;
   externalObjects?: IssueExternalObjectGroup[];
   externalObjectsLoading?: boolean;
   externalObjectsError?: boolean;
@@ -249,6 +251,7 @@ export function TaskSidePanel({
   onUpdate,
   inline = false,
   hasActiveRun = false,
+  runExpected,
   externalObjects,
   externalObjectsLoading,
   externalObjectsError,
@@ -351,7 +354,7 @@ export function TaskSidePanel({
     });
   }, [accountScope, issue.companyId, issue.id, launcherOpen]);
   const controller = useSidePanelTabs<TaskSidePanelTabPayload>({ initialState, onStateChange: persist });
-  const browsersQuery = useTaskBrowsers(issue.id, hasActiveRun);
+  const browsersQuery = useTaskBrowsers(issue.id, runExpected ?? hasActiveRun);
   const newestLiveBrowser = browsersQuery.data?.findLast((browser) => browser.status === "running" || browser.status === "idle");
   useEffect(() => {
     if (!openBrowserId) return;
