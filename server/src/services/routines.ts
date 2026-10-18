@@ -8,6 +8,7 @@ import {
   ROUTINE_RUN_UNCHANGED_SKIP_REASON,
 } from "./routine-noop-skip.js";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
+import { verifyBearerAuthorization, verifyGithubHmacSignature, verifyHmacSha256Signature } from "./webhook-auth.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -317,12 +318,6 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
   return status;
-}
-
-function normalizeWebhookTimestampMs(rawTimestamp: string) {
-  const parsed = Number(rawTimestamp);
-  if (!Number.isFinite(parsed)) return null;
-  return parsed > 1e12 ? parsed : parsed * 1000;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -3064,59 +3059,31 @@ export function routineService(
             // Accept X-Hub-Signature-256 (GitHub/Sentry) or fall back to the
             // generic X-Paperclip-Signature header so operators can use github_hmac
             // mode with either header convention.
-            const providedSignature = (input.hubSignatureHeader ?? input.signatureHeader)?.trim() ?? "";
-            if (!providedSignature) throw unauthorized();
-            const expectedHmac = crypto
-              .createHmac("sha256", secretValue)
-              .update(rawBody)
-              .digest("hex");
-            const normalizedSignature = providedSignature.replace(/^sha256=/, "");
-            const normalizedBuf = Buffer.from(normalizedSignature);
-            const expectedBuf = Buffer.from(expectedHmac);
-            const valid =
-              normalizedBuf.length === expectedBuf.length &&
-              crypto.timingSafeEqual(normalizedBuf, expectedBuf);
+            const valid = verifyGithubHmacSignature({
+              secret: secretValue,
+              rawBody,
+              signature: input.hubSignatureHeader ?? input.signatureHeader,
+            });
             if (!valid) throw unauthorized();
           } else if (trigger.signingMode === "bearer") {
             const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
-            const expected = `Bearer ${secretValue}`;
-            const provided = input.authorizationHeader?.trim() ?? "";
-            const expectedBuf = Buffer.from(expected);
-            const providedBuf = Buffer.alloc(expectedBuf.length);
-            providedBuf.write(provided.slice(0, expectedBuf.length));
-            const valid =
-              provided.length === expected.length &&
-              crypto.timingSafeEqual(providedBuf, expectedBuf);
-            if (!valid) {
+            if (!verifyBearerAuthorization({ secret: secretValue, authorizationHeader: input.authorizationHeader })) {
               throw unauthorized();
             }
           } else {
             const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
             const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
-            const providedSignature = input.signatureHeader?.trim() ?? "";
-            const providedTimestamp = input.timestampHeader?.trim() ?? "";
-            if (!providedSignature || !providedTimestamp) throw unauthorized();
-            const tsMillis = normalizeWebhookTimestampMs(providedTimestamp);
-            if (tsMillis == null) throw unauthorized();
-            const replayWindowSec = trigger.replayWindowSec ?? 300;
-            if (Math.abs(Date.now() - tsMillis) > replayWindowSec * 1000) {
-              throw unauthorized();
-            }
-            const expectedHmac = crypto
-              .createHmac("sha256", secretValue)
-              .update(`${providedTimestamp}.`)
-              .update(rawBody)
-              .digest("hex");
-            const normalizedSignature = providedSignature.replace(/^sha256=/, "");
-            const providedBuf = Buffer.from(normalizedSignature);
-            const expectedBuf = Buffer.from(expectedHmac);
-            const valid =
-              providedBuf.length === expectedBuf.length &&
-              crypto.timingSafeEqual(providedBuf, expectedBuf);
-            if (!valid) throw unauthorized();
+            const verification = verifyHmacSha256Signature({
+              secret: secretValue,
+              rawBody,
+              signatureHeader: input.signatureHeader,
+              timestampHeader: input.timestampHeader,
+              replayWindowSec: trigger.replayWindowSec ?? 300,
+            });
+            if (!verification.valid) throw unauthorized();
             hmacReplayKey = `webhook-hmac:${crypto
               .createHash("sha256")
-              .update(`${trigger.id}:${providedTimestamp}:${expectedHmac}`)
+              .update(`${trigger.id}:${verification.timestamp}:${verification.expectedHmac}`)
               .digest("hex")}`;
           }
         } catch (error) {
