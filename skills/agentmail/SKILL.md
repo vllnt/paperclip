@@ -29,7 +29,9 @@ send mail only through `paperclipai email reply --file <request.json>` or
 `paperclipai email send --file <request.json>`.
 
 - **Reply:** use the bound `conversationId` and the exact `replyToMessageId`.
-  Set `replyAll: false` unless replying to all is intended.
+  Also send `endpointId` and `text`. Omit `parentIssueId`, `to`, `cc`, `bcc`,
+  and `subject`: recipients come from the original message. Set `replyAll: false`
+  unless replying to all is intended.
 - **New conversation:** requires `endpointId`, `parentIssueId` (the current task),
   `to`, `subject`, and `text`. `cc`, `bcc`, and `attachmentIds` are optional and
   explicit; attachments must already belong to the source task. This creates an
