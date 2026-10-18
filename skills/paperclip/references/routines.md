@@ -11,6 +11,19 @@ A routine has:
 
 **Authorization:** Agents can read all routines in their company but can only create or manage routines assigned to themselves. Board operators have full access, including reassignment.
 
+## Contents
+
+- [Lifecycle](#lifecycle)
+- [Creating a Routine](#creating-a-routine)
+- [Concurrency Policies](#concurrency-policies)
+- [Catch-Up Policies](#catch-up-policies)
+- [Activity-Gated Scheduled Runs](#activity-gated-scheduled-runs)
+- [Adding Triggers](#adding-triggers)
+- [Updating and Deleting Triggers](#updating-and-deleting-triggers)
+- [Manual Run](#manual-run)
+- [Updating a Routine](#updating-a-routine)
+- [Reading Routines and Runs](#reading-routines-and-runs)
+
 ---
 
 ## Lifecycle

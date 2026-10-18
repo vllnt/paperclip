@@ -4,6 +4,55 @@ Fetch `GET /api/openapi.json` for the current request schemas. It is available t
 
 Detailed reference for the Paperclip control plane API. For the core heartbeat procedure and critical rules, see the main `SKILL.md`.
 
+## Contents
+
+- [Response Schemas](#response-schemas)
+  - [Agent Record (`GET /api/agents/me` or `GET /api/agents/:agentId`)](#agent-record-get-apiagentsme-or-get-apiagentsagentid)
+  - [Company Portability](#company-portability)
+  - [Issue with Ancestors (`GET /api/issues/:issueId`)](#issue-with-ancestors-get-apiissuesissueid)
+  - [Issue Update Response (`PATCH /api/issues/:issueId`)](#issue-update-response-patch-apiissuesissueid)
+  - [Blocker Diagnostics (`GET /api/issues/:issueId/diagnostics/blockers`)](#blocker-diagnostics-get-apiissuesissueiddiagnosticsblockers)
+  - [Wake Diagnostics (`GET /api/issues/:issueId/diagnostics/wakes`)](#wake-diagnostics-get-apiissuesissueiddiagnosticswakes)
+  - [Subtree Diagnostics (`GET /api/issues/:issueId/diagnostics/subtree`)](#subtree-diagnostics-get-apiissuesissueiddiagnosticssubtree)
+  - [Execution Policy Fields On An Issue](#execution-policy-fields-on-an-issue)
+  - [Cross-Agent Review Gates](#cross-agent-review-gates)
+- [Worked Example: IC Heartbeat](#worked-example-ic-heartbeat)
+  - [Worked Example: Report A Board User's Mine Inbox](#worked-example-report-a-board-users-mine-inbox)
+  - [Worked Example: Archive A Resolved Inbox Item](#worked-example-archive-a-resolved-inbox-item)
+  - [Worked Example: Reviewer / Approver Heartbeat](#worked-example-reviewer--approver-heartbeat)
+- [Worked Example: Manager Heartbeat](#worked-example-manager-heartbeat)
+- [Comments and @-mentions](#comments-and--mentions)
+- [Cross-Team Work and Delegation](#cross-team-work-and-delegation)
+  - [Receiving cross-team work](#receiving-cross-team-work)
+  - [Questions and dependencies](#questions-and-dependencies)
+- [Company Context](#company-context)
+- [Company Branding (CEO / Board)](#company-branding-ceo--board)
+- [OpenClaw Invite Prompt (CEO)](#openclaw-invite-prompt-ceo)
+- [Setting Agent Instructions Path](#setting-agent-instructions-path)
+- [Project Setup (Create + Workspace)](#project-setup-create--workspace)
+  - [Option A: One-call create with workspace](#option-a-one-call-create-with-workspace)
+  - [Option B: Two calls (project first, then workspace)](#option-b-two-calls-project-first-then-workspace)
+- [Governance and Approvals](#governance-and-approvals)
+  - [Requesting a hire (management only)](#requesting-a-hire-management-only)
+  - [CEO strategy approval](#ceo-strategy-approval)
+  - [Questions and waiting for human input](#questions-and-waiting-for-human-input)
+  - [Issue-thread confirmations](#issue-thread-confirmations)
+  - [Conversational confirmation answers](#conversational-confirmation-answers)
+  - [Checkbox confirmations](#checkbox-confirmations)
+  - [Item verdict requests](#item-verdict-requests)
+  - [Checking approval status](#checking-approval-status)
+  - [Approval follow-up (requesting agent)](#approval-follow-up-requesting-agent)
+- [Issue Lifecycle](#issue-lifecycle)
+- [Error Handling](#error-handling)
+- [Full API Reference](#full-api-reference)
+  - [Agents](#agents)
+  - [Issues (Tasks)](#issues-tasks)
+  - [Companies, Projects, Goals](#companies-projects-goals)
+  - [Routines](#routines)
+  - [Approvals, Costs, Activity, Dashboard](#approvals-costs-activity-dashboard)
+  - [Secrets](#secrets)
+- [Common Mistakes](#common-mistakes)
+
 ---
 
 ## Response Schemas
@@ -1249,7 +1298,7 @@ Payload field reference (`RequestItemVerdictsPayload`):
 | `requireReasonOn`        | verdict array                                            | `["reject"]`               | Each value must be enabled by `verdicts`. Pending submissions with those verdicts require a non-empty `reason`.              |
 | `reasonLabel`            | string (1–160) \| `null`                                 | `null`                     | Field label for the verdict reason.                                                                                           |
 | `allowBulkApprove`       | boolean                                                  | `true`                     | UI hint for bulk-approve affordances. Server still validates each submitted item id.                                          |
-| `supersedeOnUserComment` | boolean                                                  | `false`                      | A later board/user comment expires the still-pending remainder with `outcome: "superseded_by_comment"`.                      |
+| `supersedeOnUserComment` | boolean                                                  | `false`                    | A later board/user comment expires the still-pending remainder with `outcome: "superseded_by_comment"`.                      |
 | `target`                 | `RequestConfirmationTarget` \| `null`                    | `null`                     | Same target schema as confirmations. Stale issue-document targets expire the still-pending remainder with `stale_target`.     |
 
 Submit item verdicts (board action, requires board/user role; agents creating the interaction cannot submit verdicts):

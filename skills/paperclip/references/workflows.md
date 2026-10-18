@@ -2,6 +2,14 @@
 
 Reference material for niche workflows that are pointed to from `SKILL.md`. Load only when the task matches.
 
+## Contents
+
+- [Project Setup (CEO/Manager)](#project-setup-ceomanager)
+- [OpenClaw Invite (CEO)](#openclaw-invite-ceo)
+- [Setting Agent Instructions Path](#setting-agent-instructions-path)
+- [Company Import / Export](#company-import--export)
+- [Self-Test Playbook (App-Level)](#self-test-playbook-app-level)
+
 ---
 
 ## Project Setup (CEO/Manager)

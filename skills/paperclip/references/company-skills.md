@@ -2,6 +2,18 @@
 
 Use this reference when a board user, CEO, or manager asks you to find a skill, install it into the company library, or assign it to an agent.
 
+## Contents
+
+- [What Exists](#what-exists)
+- [Permission Model](#permission-model)
+- [Core Endpoints](#core-endpoints)
+- [Install A Skill Into The Company](#install-a-skill-into-the-company)
+- [Inspect What Was Installed](#inspect-what-was-installed)
+- [Assign Skills To An Existing Agent](#assign-skills-to-an-existing-agent)
+- [Include Skills During Hire Or Create](#include-skills-during-hire-or-create)
+- [Notes](#notes)
+- [Writing A Skill](#writing-a-skill)
+
 ## What Exists
 
 - App-shipped catalog: a curated set of company skills in `@paperclipai/skills-catalog`, browseable and installable without leaving Paperclip.
@@ -265,11 +277,14 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agents"
   - `POST /api/companies/:companyId/exports`
 - Use skill-only import when the task is specifically to add a skill to the company library without importing the surrounding company/team/package structure.
 
-- Writing a skill for the company library, or reviewing one an agent wrote: create it with `POST /api/companies/:companyId/skills` (`name`, optional `slug`, `markdown`). A slug that already has a skill returns `409` and changes nothing. Check these before you assign it:
-  - Description: third person, saying what the skill does and when to use it ("Use when ..."), under about 300 characters. Agents pick a skill from the list of descriptions, so a vague one is never chosen and a long one crowds the rest.
-  - Body: under 500 lines and as short as the task allows. The body is read in full each time the skill is used.
-  - Detail on demand: put long material in separate files, link them from `SKILL.md` by a path relative to it (`references/api.md`), and keep them one level deep. Skills are installed in different places, so a path rooted at the repository does not resolve.
-  - Contents: start a file longer than about 100 lines with a contents list, so an agent that previews it can see everything it covers.
-  - Reasons: give the reason beside each rule. A rule with its reason lets the agent handle cases you did not list.
-  - No repeats: say each rule once, and do not restate what Paperclip already tells every agent (coordination, task lifecycle). A second copy can drift from the first.
-  - Try it: run the skill on one realistic task and read what the agent did before you assign it widely.
+## Writing A Skill
+
+When you write a skill for the company library, or review one an agent wrote, create it with `POST /api/companies/:companyId/skills` (`name`, optional `slug`, `markdown`). A slug that already has a skill returns `409` and changes nothing. Check these before you assign it:
+
+- Description: third person, saying what the skill does and when to use it ("Use when ..."), under about 300 characters. Agents pick a skill from the list of descriptions, so a vague one is never chosen and a long one crowds the rest.
+- Body: under 500 lines and as short as the task allows. The body is read in full each time the skill is used.
+- Detail on demand: put long material in separate files, link them from `SKILL.md` by a path relative to it (`references/api.md`), and keep them one level deep. Skills are installed in different places, so a path rooted at the repository does not resolve.
+- Contents: start a file longer than about 100 lines with a contents list, so an agent that previews it can see everything it covers.
+- Reasons: give the reason beside each rule. A rule with its reason lets the agent handle cases you did not list.
+- No repeats: say each rule once, and do not restate what Paperclip already tells every agent (coordination, task lifecycle). A second copy can drift from the first.
+- Try it: run the skill on one realistic task and read what the agent did before you assign it widely.

@@ -9,6 +9,19 @@ Cases are experimental and must be enabled with `experimental.enableCases`.
 If a route returns `403 Cases are disabled`, stop and report that the operator
 must enable cases before the skill can use this surface.
 
+## Contents
+
+- [Core Model](#core-model)
+- [Upsert Semantics](#upsert-semantics)
+- [Read And Search](#read-and-search)
+- [Documents](#documents)
+- [Fields](#fields)
+- [Issue Links](#issue-links)
+- [Child Cases](#child-cases)
+- [Attachments](#attachments)
+- [Lifecycle](#lifecycle)
+- [Worked Blog Post Example](#worked-blog-post-example)
+
 ## Core Model
 
 A case has:
