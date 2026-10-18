@@ -653,6 +653,31 @@ export function routineRoutes(
     res.status(202).json(run);
   });
 
+  // Runs the gate once and reports what a real run would do with the result. It creates no run,
+  // issue or wake. The board or the routine's own agent may call it.
+  router.post("/routines/:id/gate/test", async (req, res) => {
+    const routine = await assertCanManageExistingRoutine(req, req.params.id as string);
+    if (!routine) {
+      res.status(404).json({ error: "Routine not found" });
+      return;
+    }
+    const result = await svc.testGate(routine.id);
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: routine.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: "routine.gate_tested",
+      entityType: "routine",
+      entityId: routine.id,
+      details: { routineId: routine.id, class: result.result.class, verdict: result.verdict },
+    });
+    res.json(result);
+  });
+
   router.post("/routine-triggers/public/:publicId/fire", async (req, res) => {
     if (!req.is("application/json")) {
       throw unsupportedMediaType("Send the webhook payload with Content-Type: application/json");

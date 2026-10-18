@@ -43,10 +43,14 @@ import type {
   CreateRoutine,
   CreateRoutineTrigger,
   EventGrouping,
+  NormalizedEvent,
   Routine,
   RoutineDetail,
   RoutineEventGroup,
   RoutineDescriptionDocument,
+  RoutineGate,
+  RoutineGateResult,
+  RoutineGateTestResult,
   RoutineListItem,
   RoutineManagedByPlugin,
   RoutineRevision,
@@ -60,6 +64,10 @@ import type {
   UpdateRoutineTrigger,
 } from "@paperclipai/shared";
 import {
+  ROUTINE_GATE_SKIP_REASON,
+  ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
+  ROUTINE_GATE_UNAVAILABLE_REASON,
+  ROUTINE_GATE_UNCHANGED_REASON,
   WORKSPACE_BRANCH_ROUTINE_VARIABLE,
   getBuiltinRoutineVariableValues,
   extractRoutineVariableNames,
@@ -67,12 +75,14 @@ import {
   isValidRoutineDateString,
   normalizeAgentUrlKey,
   pluginOperationIssueOriginKind,
+  routineGateAppliesToSource,
+  routineGatesEqual,
   routineRevisionSnapshotSchema,
   stringifyRoutineVariableValue,
   syncRoutineVariablesWithTemplate,
 } from "@paperclipai/shared";
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
-import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { HttpError, conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -94,6 +104,25 @@ import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 import { createEventRoutineDispatcher, EventDispatchError } from "./event-sources/event-dispatch.js";
+import {
+  ROUTINE_GATE_ACTOR_ID,
+  renderGateDecisionBlock,
+  type GateDecision,
+  type GateDispatchInput,
+  type GateEventDispatchInput,
+} from "./routine-gates/outcome.js";
+import { settleGatedEvent } from "./routine-gates/hooks.js";
+import { raiseGateFailureNotice } from "./routine-gates/notices.js";
+import { GateEnvironmentError, createGateRunner, type GateRunner } from "./routine-gates/runner.js";
+import {
+  GateSourceError,
+  createGateRepoAllowlist,
+  createGateScriptSource,
+  createGateTokenMinter,
+  type GateScriptSource,
+} from "./routine-gates/source.js";
+import { createGateWorker, type GateProcessContext, type GateWorkerHandlers } from "./routine-gates/worker.js";
+import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -109,6 +138,34 @@ const ACTIVITY_GATE_IGNORED_ACTIONS = [
   "issue.inbox_unarchived",
   "issue.inbox_touched",
 ];
+/** The run row without the gate worker's bookkeeping (the parked dispatch input and the claim). */
+function withoutGateInternals<T extends typeof routineRuns.$inferSelect>(run: T): T {
+  return { ...run, gateDispatchInput: null, gateClaimedAt: null, gateAttempts: 0 };
+}
+
+// The default gate script source keeps its verified-script cache for the life of the database handle,
+// however many `routineService` instances are created.
+const defaultGateSources = new WeakMap<object, GateScriptSource>();
+
+function defaultGateSource(db: Db, runtimeEnv: Record<string, string | undefined>): GateScriptSource {
+  let source = defaultGateSources.get(db);
+  if (!source) {
+    source = createGateScriptSource({
+      allowedRepos: createGateRepoAllowlist(db, runtimeEnv),
+      mintToken: createGateTokenMinter(db),
+    });
+    defaultGateSources.set(db, source);
+  }
+  return source;
+}
+
+const GATE_SKIP_REASONS = new Set<string>([
+  ROUTINE_GATE_SKIP_REASON,
+  ROUTINE_GATE_UNCHANGED_REASON,
+  ROUTINE_GATE_UNAVAILABLE_REASON,
+  ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
+]);
+const ROUTINE_SYSTEM_ACTOR_IDS = ["routine-scheduler", "routine-webhook", ROUTINE_GATE_ACTOR_ID];
 const WEEKDAY_INDEX: Record<string, number> = {
   Sun: 0,
   Mon: 1,
@@ -322,9 +379,35 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "skipped_paused") return "Skipped because the project is paused";
   if (status === "skipped") return "Skipped because a live execution issue already exists";
   if (status === "skipped_unchanged") return "Skipped because nothing changed since the last run";
+  if (status === "skipped_no_activity") return "Skipped because there was no external activity";
+  if (status === "skipped_worktree_execution_cutoff") return "Skipped because the worktree execution cutoff has not passed";
+  if (status === "skipped_gate") return "Skipped by the gate script";
+  if (status === "skipped_gate_unchanged") return "Skipped because the gate output did not change";
+  if (status === "skipped_gate_unavailable") return "Skipped because the gate script could not run";
+  if (status === "gating") return "Waiting for the gate script";
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
   return status;
+}
+
+/** The trigger's last-result status for a skip, by the reason recorded on the skipped run. */
+function skippedStatusForReason(reason: string) {
+  switch (reason) {
+    case "paused":
+      return "skipped_paused";
+    case "no_external_activity":
+      return "skipped_no_activity";
+    case "worktree_execution_cutoff":
+      return "skipped_worktree_execution_cutoff";
+    case ROUTINE_GATE_SKIP_REASON:
+      return "skipped_gate";
+    case ROUTINE_GATE_UNCHANGED_REASON:
+      return "skipped_gate_unchanged";
+    case ROUTINE_GATE_UNAVAILABLE_REASON:
+      return "skipped_gate_unavailable";
+    default:
+      return "skipped";
+  }
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -596,6 +679,8 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
+    // Only gated routines carry it, so snapshots of every other routine keep their stored shape.
+    ...(routine.gate ? { gate: routine.gate } : {}),
   };
 }
 
@@ -704,6 +789,14 @@ export function routineService(
     heartbeat?: IssueAssignmentWakeupDeps;
     pluginWorkerManager?: PluginWorkerManager;
     runtimeEnv?: Record<string, string | undefined>;
+    /** Gate script overrides; tests inject a script source and a mocked SSH runner. */
+    gate?: {
+      runner?: GateRunner;
+      source?: GateScriptSource;
+      runSsh?: typeof runSshCommand;
+      /** False leaves a parked run for `sweepGatingRuns`, so a test controls when the gate runs. */
+      autoKick?: boolean;
+    };
   } = {},
 ) {
   const issueSvc = issueService(db);
@@ -1328,7 +1421,7 @@ export function routineService(
         and(
           eq(routineRuns.companyId, routine.companyId),
           eq(routineRuns.routineId, routine.id),
-          sql`${routineRuns.status} not in ('skipped', 'coalesced')`,
+          sql`${routineRuns.status} not in ('skipped', 'coalesced', 'gating')`,
           // Event runs are driven by external alerts, not by the schedule this gate paces.
           sql`${routineRuns.source} <> 'event'`,
         ),
@@ -1401,10 +1494,24 @@ export function routineService(
           lte(activityLog.createdAt, now),
           sql`${activityLog.action} not in (${sql.join(ACTIVITY_GATE_IGNORED_ACTIONS.map((action) => sql`${action}`), sql`, `)})`,
           sql`not (
-            ${activityLog.actorId} = 'routine-scheduler'
+            ${activityLog.actorId} in ('routine-scheduler', ${ROUTINE_GATE_ACTOR_ID})
             and (
               (${activityLog.details} ->> 'routineId') = ${routine.id}
               or (${activityLog.entityType} = 'routine' and ${activityLog.entityId} = ${routine.id})
+            )
+          )`,
+          // The routine system's own bookkeeping for decisions that did nothing (a gate poll, a skip, a
+          // coalesce) is not activity; otherwise a gated poll would keep every other routine firing.
+          // Rows written by users or agents (a manual `routine.run_triggered`) stay counted.
+          sql`not (
+            ${activityLog.actorType} = 'system'
+            and ${activityLog.actorId} in (${sql.join(ROUTINE_SYSTEM_ACTOR_IDS.map((id) => sql`${id}`), sql`, `)})
+            and (
+              ${activityLog.action} in ('routine.run_skipped', 'routine.gate_failed')
+              or (
+                ${activityLog.action} = 'routine.run_triggered'
+                and (${activityLog.details} ->> 'status') in ('gating', 'skipped', 'coalesced')
+              )
             )
           )`,
           options.ignoreOwnDispatchAudits
@@ -1512,11 +1619,7 @@ export function routineService(
         routineId: input.routine.id,
         triggerId: input.trigger.id,
         triggeredAt,
-        status: input.reason === "paused"
-          ? "skipped_paused"
-          : input.reason === "no_external_activity"
-            ? "skipped_no_activity"
-            : "skipped_worktree_execution_cutoff",
+        status: skippedStatusForReason(input.reason),
         nextRunAt: input.nextRunAt,
       }, txDb);
       return createdRun;
@@ -1864,7 +1967,166 @@ export function routineService(
     prepareRoutine: prepareEventRoutine,
     resolveResponsibleUserId: async (executor, routine) =>
       (await resolveLatestRevisionResponsibleUserId(executor, routine)) ?? routine.responsibleUserId ?? null,
+    gateApplies: (routine) => routineGateAppliesToSource(routine.gate, "event"),
+    onGating: (runId) => kickGate(runId),
   });
+
+  // ── gate scripts ──────────────────────────────────────────────────────────
+  // A gated trigger parks its run as `gating` and returns; the worker runs the script on the
+  // routine's SSH worker and commits through `dispatchRoutineRun` / the event dispatcher.
+
+  const gateWorker = createGateWorker(db);
+  let gateRunnerInstance: GateRunner | null = deps.gate?.runner ?? null;
+
+  function getGateRunner(): GateRunner {
+    if (!gateRunnerInstance) {
+      gateRunnerInstance = createGateRunner({
+        db,
+        source: deps.gate?.source ?? defaultGateSource(db, runtimeEnv),
+        runSsh: deps.gate?.runSsh,
+      });
+    }
+    return gateRunnerInstance;
+  }
+
+  function gateContext(): GateProcessContext {
+    return { runner: getGateRunner(), handlers: gateHandlers };
+  }
+
+  function kickGate(runId: string) {
+    if (deps.gate?.autoKick === false) return;
+    gateWorker.kick(runId, gateContext());
+  }
+
+  /** What saving a gate checks: the pinned script loads (allowlisted repo, merged commit) and the worker is SSH. */
+  async function assertGateConfig(companyId: string, assigneeAgentId: string | null, gate: RoutineGate) {
+    const runner = getGateRunner();
+    try {
+      await runner.source.load(companyId, gate);
+      await runner.resolveConnection(companyId, assigneeAgentId);
+    } catch (error) {
+      if (error instanceof GateSourceError) {
+        if (error.kind === "unavailable") throw new HttpError(503, error.message, { code: error.code });
+        throw unprocessable(error.message, { code: error.code });
+      }
+      if (error instanceof GateEnvironmentError) throw unprocessable(error.message, { code: error.code });
+      throw error;
+    }
+  }
+
+  /** A gate runs code on the worker, so only a board user may set, change or remove one. */
+  function assertCanChangeGate(actor: Actor) {
+    if (!actor.userId) throw forbidden("Only board users can change a routine gate");
+  }
+
+  /** Finalizes a parked run only while it is still `gating`, so a late caller never overwrites a settled run. */
+  async function finalizeGatingRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>) {
+    return db
+      .update(routineRuns)
+      .set({ ...patch, gateDispatchInput: null, updatedAt: new Date() })
+      .where(and(eq(routineRuns.id, runId), eq(routineRuns.status, "gating")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /** Ends a parked run that cannot be dispatched (its trigger is gone) as a skip. */
+  async function skipParkedRun(
+    routine: typeof routines.$inferSelect,
+    run: typeof routineRuns.$inferSelect,
+    reason: string,
+    gateResult: RoutineGateResult | null,
+  ) {
+    const updated = await finalizeGatingRun(run.id, {
+      status: "skipped",
+      failureReason: reason,
+      completedAt: new Date(),
+      gateResult,
+      gateResultFingerprint: gateResult?.resultFingerprint ?? null,
+    });
+    if (updated) await recordDispatchOutcome(routine, updated, false, true);
+  }
+
+  const gateHandlers: GateWorkerHandlers = {
+    async commit({ run, routine, trigger, gateResult, decision }) {
+      if (run.triggerId && !trigger) {
+        await skipParkedRun(routine, run, ROUTINE_GATE_TRIGGER_INACTIVE_REASON, gateResult);
+        return;
+      }
+      if (run.source === "event") {
+        const stored = run.gateDispatchInput as GateEventDispatchInput | null;
+        const event = (run.triggerPayload as { event?: NormalizedEvent } | null)?.event;
+        if (!trigger || !event) throw new Error("Parked event run has no trigger or event");
+        const outcome = await eventDispatcher.commitGated({
+          routine,
+          trigger,
+          event,
+          deliveryId: run.eventDeliveryId,
+          consumeStormSlot: async () => false,
+          gated: { runId: run.id, stormFold: stored?.stormFold ?? false, gateResult, decision },
+        });
+        await settleGatedEvent(db, {
+          companyId: routine.companyId,
+          routineId: routine.id,
+          runId: run.id,
+          deliveryId: run.eventDeliveryId,
+          event,
+          outcome,
+        }).catch((err) => logger.warn({ err, routineId: routine.id, runId: run.id }, "failed to settle gated event outcome"));
+      } else {
+        const stored = run.gateDispatchInput as GateDispatchInput | null;
+        await dispatchRoutineRun({
+          routine,
+          trigger,
+          source: run.source === "webhook" ? "webhook" : "schedule",
+          payload: stored?.payload ?? null,
+          variables: stored?.variables ?? null,
+          projectId: stored?.projectId ?? null,
+          projectWorkspaceId: stored?.projectWorkspaceId ?? null,
+          assigneeAgentId: stored?.assigneeAgentId ?? null,
+          executionWorkspaceId: stored?.executionWorkspaceId ?? null,
+          executionWorkspacePreference: stored?.executionWorkspacePreference ?? null,
+          executionWorkspaceSettings: stored?.executionWorkspaceSettings ?? null,
+          descriptionAppendix: stored?.descriptionAppendix ?? null,
+          idempotencyKey: run.idempotencyKey,
+          actor: { userId: stored?.actorUserId ?? null, agentId: stored?.actorAgentId ?? null },
+          gated: { runId: run.id, gateResult, decision },
+        });
+      }
+      await raiseGateFailureNotice(
+        { db, issueSvc, resolveBoardUserId: (companyId) => resolveCompanyDefaultResponsibleUserId(db, companyId) },
+        routine,
+      ).catch((err) => logger.warn({ err, routineId: routine.id }, "failed to evaluate the gate failure notice"));
+    },
+
+    async abandon({ run, routine, error }) {
+      const reason = `Gate run could not be committed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500);
+      const failed = await finalizeGatingRun(run.id, {
+        status: "failed",
+        failureReason: reason,
+        completedAt: new Date(),
+      });
+      if (!failed) return;
+      if (routine) {
+        await updateRoutineTouchedState({
+          routineId: routine.id,
+          triggerId: failed.triggerId,
+          triggeredAt: failed.triggeredAt,
+          status: "failed",
+        });
+      }
+      if (failed.source === "event") {
+        const event = (failed.triggerPayload as { event?: NormalizedEvent } | null)?.event;
+        await settleGatedEvent(db, {
+          companyId: failed.companyId,
+          routineId: failed.routineId,
+          runId: failed.id,
+          deliveryId: failed.eventDeliveryId,
+          event,
+          outcome: { status: "failed_permanent", runId: failed.id, failureClass: "permanent", error: reason },
+        }).catch((err) => logger.warn({ err, runId: failed.id }, "failed to settle abandoned gated event"));
+      }
+    },
+  };
 
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
@@ -1883,14 +2145,31 @@ export function routineService(
     descriptionAppendix?: string | null;
     nextRunAtOverride?: Date | null;
     actor?: Actor;
+    /**
+     * Set by the gate worker to commit a run that was parked as `gating`: the same run row is
+     * finalized instead of a new one inserted, and the gate's decision is applied.
+     */
+    gated?: { runId: string; gateResult: RoutineGateResult | null; decision: GateDecision };
   }) {
+    const gated = input.gated ?? null;
+    // A gate applies to automatic triggers it is configured for; a manual run or an `api` dispatch never waits on one.
+    const gateApplies = !gated && routineGateAppliesToSource(input.routine.gate, input.source);
     const projectId = input.projectId ?? input.routine.projectId ?? null;
     const projectWorkspaceId = input.projectWorkspaceId ?? null;
     const assigneeAgentId = input.assigneeAgentId ?? input.routine.assigneeAgentId ?? null;
     if (!assigneeAgentId) {
+      if (gated) return finishGatedRunTerminally(input.routine, gated, "Default agent required");
       throw unprocessable("Default agent required");
     }
-    await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
+    try {
+      await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
+    } catch (error) {
+      // The agent was terminated or paused while the gate ran: the run ends here, with no wake.
+      if (gated) {
+        return finishGatedRunTerminally(input.routine, gated, error instanceof Error ? error.message : String(error));
+      }
+      throw error;
+    }
     const automaticVariables: Record<string, string | number | boolean> = {};
     if (input.executionWorkspaceId && routineUsesWorkspaceBranch(input.routine)) {
       const workspace = await db
@@ -1921,6 +2200,12 @@ export function routineService(
     const description = [baseDescription, input.descriptionAppendix]
       .filter((part): part is string => Boolean(part && part.trim()))
       .join("\n\n");
+    // The gate's output goes to the issue description only. The fingerprint is computed from the
+    // description without it, so coalescing and noop-skip keep working across gate runs.
+    const gateBlock = gated ? renderGateDecisionBlock(gated.decision) : null;
+    const issueDescription = gateBlock
+      ? [description, gateBlock].filter((part) => part.trim().length > 0).join("\n\n")
+      : description;
     const triggerPayload = mergeRoutineRunPayload(input.payload, { ...automaticVariables, ...resolvedVariables });
     const managedRoutineBinding = await getManagedRoutineBinding(input.routine);
     const managedIssueTemplate = readManagedRoutineIssueTemplate(managedRoutineBinding?.defaultsJson);
@@ -1944,11 +2229,14 @@ export function routineService(
     });
     // Decided before the transaction so its reads do not take a second pool connection
     // while the routine lock is held; a failed check means "run".
-    const skipUnchanged = await shouldSkipUnchangedRun(input.routine, input.source, assigneeAgentId, dispatchFingerprint)
-      .catch((err) => {
-        logger.warn({ err, routineId: input.routine.id }, "unchanged-run check failed; dispatching");
-        return false;
-      });
+    // A committing gated run already passed this check when it was parked.
+    const skipUnchanged = gated
+      ? false
+      : await shouldSkipUnchangedRun(input.routine, input.source, assigneeAgentId, dispatchFingerprint)
+        .catch((err) => {
+          logger.warn({ err, routineId: input.routine.id }, "unchanged-run check failed; dispatching");
+          return false;
+        });
     let reusedExistingRun = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -1956,15 +2244,43 @@ export function routineService(
         sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
       );
 
+      // The parked row being committed, locked. Anyone else who finalized it first wins; this call then just reports it.
+      let gatingRow: typeof routineRuns.$inferSelect | null = null;
+      if (gated) {
+        gatingRow = await txDb
+          .select()
+          .from(routineRuns)
+          .where(and(eq(routineRuns.id, gated.runId), eq(routineRuns.status, "gating")))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!gatingRow) {
+          reusedExistingRun = true;
+          return txDb.select().from(routineRuns).where(eq(routineRuns.id, gated.runId)).then((rows) => rows[0]!);
+        }
+      }
+
       if (input.trigger && (input.source === "webhook" || input.source === "schedule")) {
         const currentTrigger = await txDb.select().from(routineTriggers).where(eq(routineTriggers.id, input.trigger.id)).then((rows) => rows[0]);
         const currentRoutine = await txDb.select({ status: routines.status }).from(routines).where(eq(routines.id, input.routine.id)).then((rows) => rows[0]);
         if (!currentTrigger || currentTrigger.archived || !currentTrigger.enabled || currentTrigger.setupPending || currentRoutine?.status !== "active") {
+          if (gatingRow) {
+            // Disabled while the gate ran: the parked run ends as a skip instead of failing the caller.
+            const skipped = await finalizeRun(gatingRow.id, {
+              status: "skipped",
+              failureReason: ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
+              completedAt: new Date(),
+              gateResult: gated?.gateResult ?? null,
+              gateResultFingerprint: gated?.gateResult?.resultFingerprint ?? null,
+              gateDispatchInput: null,
+            }, txDb);
+            return skipped ?? gatingRow;
+          }
           throw conflict("Routine trigger is not active");
         }
       }
 
-      if (input.idempotencyKey) {
+      // The parked row holds the idempotency key itself, so a committing run must not look it up.
+      if (input.idempotencyKey && !gatingRow) {
         const existing = await txDb
           .select()
           .from(routineRuns)
@@ -1989,36 +2305,71 @@ export function routineService(
         }
       }
 
-      const triggeredAt = new Date();
+      // A committing run keeps the time the trigger fired, not the time the gate finished.
+      const triggeredAt = gatingRow?.triggeredAt ?? new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
       const latestRevisionResponsibleUserId = await resolveLatestRevisionResponsibleUserId(txDb, input.routine);
       const responsibleUserId =
         manualRunnerUserId ?? latestRevisionResponsibleUserId ?? input.routine.responsibleUserId ?? null;
-      const [createdRun] = await txDb
-        .insert(routineRuns)
-        .values({
-          companyId: input.routine.companyId,
-          routineId: input.routine.id,
-          triggerId: input.trigger?.id ?? null,
-          source: input.source,
-          status: "received",
-          triggeredAt,
-          idempotencyKey: input.idempotencyKey ?? null,
-          triggerPayload,
+      const createdRun = gatingRow
+        ? gatingRow
+        : (await txDb
+          .insert(routineRuns)
+          .values({
+            companyId: input.routine.companyId,
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            source: input.source,
+            status: "received",
+            triggeredAt,
+            idempotencyKey: input.idempotencyKey ?? null,
+            triggerPayload,
+            dispatchFingerprint,
+            routineRevisionId: input.routine.latestRevisionId,
+            responsibleUserId,
+          })
+          .returning())[0]!;
+
+      // The tick already advanced `nextRunAt` when it claimed the firing; a committing run never rewrites it.
+      const nextRunAt = gatingRow
+        ? undefined
+        : input.nextRunAtOverride !== undefined
+          ? input.nextRunAtOverride
+          : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
+            ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
+            : undefined;
+      // What a committed gate run records about the gate, on every way it can end.
+      const gateRecord: Partial<typeof routineRuns.$inferInsert> = gated
+        ? {
+          gateResult: gated.gateResult,
+          gateResultFingerprint: gated.gateResult?.resultFingerprint ?? null,
+          gateDispatchInput: null,
           dispatchFingerprint,
           routineRevisionId: input.routine.latestRevisionId,
           responsibleUserId,
-        })
-        .returning();
-
-      const nextRunAt = input.nextRunAtOverride !== undefined
-        ? input.nextRunAtOverride
-        : input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
-          ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
-          : undefined;
+        }
+        : {};
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
+        if (gated && gated.decision.action !== "wake") {
+          // Exit 1 (skip) or a transport fault on a schedule: no issue, no wake, no tokens.
+          const reason = gated.decision.action === "skip" ? ROUTINE_GATE_SKIP_REASON : ROUTINE_GATE_UNAVAILABLE_REASON;
+          const updated = await finalizeRun(createdRun.id, {
+            status: "skipped",
+            failureReason: reason,
+            completedAt: new Date(),
+            ...gateRecord,
+          }, txDb);
+          await updateRoutineTouchedState({
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            triggeredAt,
+            status: skippedStatusForReason(reason),
+          }, txDb);
+          return updated ?? createdRun;
+        }
+
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
@@ -2037,7 +2388,8 @@ export function routineService(
             status,
             linkedIssueId: activeIssue.id,
             coalescedIntoRunId: activeIssue.originRunId,
-            completedAt: triggeredAt,
+            completedAt: gatingRow ? new Date() : triggeredAt,
+            ...gateRecord,
           }, txDb);
           await updateRoutineTouchedState({
             routineId: input.routine.id,
@@ -2066,6 +2418,96 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        if (gateApplies) {
+          // Single-flight per distinct input, never per routine: a trigger joins an in-flight gate only
+          // when it would produce the same issue. Distinct payloads each get their own gate.
+          const inFlight = input.routine.concurrencyPolicy === "always_enqueue"
+            ? null
+            : await txDb
+              .select({ id: routineRuns.id })
+              .from(routineRuns)
+              .where(
+                and(
+                  eq(routineRuns.companyId, input.routine.companyId),
+                  eq(routineRuns.routineId, input.routine.id),
+                  input.trigger ? eq(routineRuns.triggerId, input.trigger.id) : isNull(routineRuns.triggerId),
+                  eq(routineRuns.status, "gating"),
+                  eq(routineRuns.dispatchFingerprint, dispatchFingerprint),
+                  ne(routineRuns.id, createdRun.id),
+                ),
+              )
+              .orderBy(asc(routineRuns.createdAt), asc(routineRuns.id))
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+          if (inFlight) {
+            const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+            const updated = await finalizeRun(createdRun.id, {
+              status,
+              coalescedIntoRunId: inFlight.id,
+              completedAt: triggeredAt,
+            }, txDb);
+            await updateRoutineTouchedState({
+              routineId: input.routine.id,
+              triggerId: input.trigger?.id ?? null,
+              triggeredAt,
+              status,
+              nextRunAt,
+            }, txDb);
+            return updated ?? createdRun;
+          }
+
+          // Park the run. No audit row and no `nextRunAt` write: the commit logs once, and the tick advanced already.
+          const parked: GateDispatchInput = {
+            v: 1,
+            kind: "dispatch",
+            payload: input.payload ?? null,
+            variables: input.variables ?? null,
+            projectId: input.projectId ?? null,
+            projectWorkspaceId: input.projectWorkspaceId ?? null,
+            assigneeAgentId: input.assigneeAgentId ?? null,
+            executionWorkspaceId: input.executionWorkspaceId ?? null,
+            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            descriptionAppendix: input.descriptionAppendix ?? null,
+            actorUserId: input.actor?.userId ?? null,
+            actorAgentId: input.actor?.agentId ?? null,
+          };
+          const gating = await finalizeRun(createdRun.id, { status: "gating", gateDispatchInput: parked }, txDb);
+          await updateRoutineTouchedState({
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            triggeredAt,
+            status: "gating",
+          }, txDb);
+          return gating ?? createdRun;
+        }
+
+        if (
+          gated &&
+          gated.decision.action === "wake" &&
+          !gated.decision.note &&
+          input.source !== "event" &&
+          input.routine.routineNoopSkipSettings?.skipUnchangedGateResult !== false &&
+          gated.gateResult?.resultFingerprint &&
+          (await lastGateResultFingerprint(txDb, input.routine, input.trigger?.id ?? null, createdRun.id)) ===
+            gated.gateResult.resultFingerprint
+        ) {
+          // Same stdout as the last run that produced a live or finished issue: nothing new to tell the agent.
+          const updated = await finalizeRun(createdRun.id, {
+            status: "skipped",
+            failureReason: ROUTINE_GATE_UNCHANGED_REASON,
+            completedAt: new Date(),
+            ...gateRecord,
+          }, txDb);
+          await updateRoutineTouchedState({
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            triggeredAt,
+            status: skippedStatusForReason(ROUTINE_GATE_UNCHANGED_REASON),
+          }, txDb);
+          return updated ?? createdRun;
+        }
+
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2073,7 +2515,7 @@ export function routineService(
             goalId: input.routine.goalId,
             parentId: input.routine.parentIssueId,
             title,
-            description,
+            description: issueDescription,
             status: "todo",
             priority: input.routine.priority,
             assigneeAgentId,
@@ -2120,7 +2562,8 @@ export function routineService(
             status,
             linkedIssueId: existingIssue.id,
             coalescedIntoRunId: existingIssue.originRunId,
-            completedAt: triggeredAt,
+            completedAt: gatingRow ? new Date() : triggeredAt,
+            ...gateRecord,
           }, txDb);
           await updateRoutineTouchedState({
             routineId: input.routine.id,
@@ -2147,6 +2590,7 @@ export function routineService(
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
+          ...gateRecord,
         }, txDb);
         await updateRoutineTouchedState({
           routineId: input.routine.id,
@@ -2166,6 +2610,7 @@ export function routineService(
           status: "failed",
           failureReason,
           completedAt: new Date(),
+          ...gateRecord,
         }, txDb);
         await updateRoutineTouchedState({
           routineId: input.routine.id,
@@ -2178,28 +2623,50 @@ export function routineService(
       }
     });
 
-    if (!reusedExistingRun && (input.source === "schedule" || input.source === "webhook")) {
-      const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
+    await recordDispatchOutcome(input.routine, run, reusedExistingRun, gated !== null);
+    if (run.status === "gating" && !reusedExistingRun && !gated) kickGate(run.id);
+    return withoutGateInternals(run);
+  }
+
+  /**
+   * The audit row and the telemetry event for a dispatch. A run parked as `gating` records
+   * neither: it is logged once, when the gate worker commits it, so every run has one audit row.
+   */
+  async function recordDispatchOutcome(
+    routine: typeof routines.$inferSelect,
+    run: typeof routineRuns.$inferSelect,
+    reused: boolean,
+    committed: boolean,
+  ) {
+    if (run.status === "gating") return;
+    if (!reused && (run.source === "schedule" || run.source === "webhook")) {
+      const gateSkip = committed && run.status === "skipped" && GATE_SKIP_REASONS.has(run.failureReason ?? "");
+      const gateResult = run.gateResult as RoutineGateResult | null;
       try {
         await logActivity(db, {
-          companyId: input.routine.companyId,
+          companyId: routine.companyId,
           actorType: "system",
-          actorId,
-          action: "routine.run_triggered",
+          // A gate's own skip is written by the gate; every other row keeps the trigger's actor, which
+          // the activity gate's own-routine exclusion relies on.
+          actorId: gateSkip ? ROUTINE_GATE_ACTOR_ID : run.source === "schedule" ? "routine-scheduler" : "routine-webhook",
+          action: gateSkip ? "routine.run_skipped" : "routine.run_triggered",
           entityType: "routine_run",
           entityId: run.id,
           details: {
-            routineId: input.routine.id,
-            triggerId: input.trigger?.id ?? null,
+            routineId: routine.id,
+            triggerId: run.triggerId,
             source: run.source,
             status: run.status,
+            ...(gateSkip ? { reason: run.failureReason } : {}),
+            ...(gateResult ? { gate: { class: gateResult.class, exitCode: gateResult.exitCode, durationMs: gateResult.durationMs } } : {}),
           },
         });
       } catch (err) {
-        logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to log automated routine run");
+        logger.warn({ err, routineId: routine.id, runId: run.id }, "failed to log automated routine run");
       }
     }
 
+    if (reused && committed) return;
     const telemetryClient = getTelemetryClient();
     if (telemetryClient) {
       trackRoutineRun(telemetryClient, {
@@ -2207,7 +2674,73 @@ export function routineService(
         status: run.status,
       });
     }
+  }
 
+  /** The gate result of the last run on this trigger that left an issue which was not cancelled. */
+  async function lastGateResultFingerprint(
+    executor: Db,
+    routine: typeof routines.$inferSelect,
+    triggerId: string | null,
+    excludeRunId: string,
+  ) {
+    return executor
+      .select({ fingerprint: routineRuns.gateResultFingerprint })
+      .from(routineRuns)
+      .innerJoin(issues, eq(issues.id, routineRuns.linkedIssueId))
+      .where(
+        and(
+          eq(routineRuns.companyId, routine.companyId),
+          eq(routineRuns.routineId, routine.id),
+          triggerId ? eq(routineRuns.triggerId, triggerId) : isNull(routineRuns.triggerId),
+          inArray(routineRuns.status, ["issue_created", "completed"]),
+          ne(issues.status, "cancelled"),
+          ne(routineRuns.id, excludeRunId),
+        ),
+      )
+      .orderBy(desc(routineRuns.triggeredAt), desc(routineRuns.id))
+      .limit(1)
+      .then((rows) => rows[0]?.fingerprint ?? null);
+  }
+
+  /** Ends a parked run as `failed` with no wake: its agent can no longer take the work. */
+  async function finishGatedRunTerminally(
+    routine: typeof routines.$inferSelect,
+    gated: { runId: string; gateResult: RoutineGateResult | null },
+    reason: string,
+  ) {
+    let reused = false;
+    const run = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select id from ${routines} where ${routines.id} = ${routine.id} and ${routines.companyId} = ${routine.companyId} for update`,
+      );
+      const row = await txDb
+        .select()
+        .from(routineRuns)
+        .where(and(eq(routineRuns.id, gated.runId), eq(routineRuns.status, "gating")))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!row) {
+        reused = true;
+        return txDb.select().from(routineRuns).where(eq(routineRuns.id, gated.runId)).then((rows) => rows[0]!);
+      }
+      const failed = await finalizeRun(row.id, {
+        status: "failed",
+        failureReason: reason,
+        completedAt: new Date(),
+        gateResult: gated.gateResult,
+        gateResultFingerprint: gated.gateResult?.resultFingerprint ?? null,
+        gateDispatchInput: null,
+      }, txDb);
+      await updateRoutineTouchedState({
+        routineId: routine.id,
+        triggerId: row.triggerId,
+        triggeredAt: row.triggeredAt,
+        status: "failed",
+      }, txDb);
+      return failed ?? row;
+    });
+    await recordDispatchOutcome(routine, run, reused, true);
     return run;
   }
 
@@ -2215,6 +2748,36 @@ export function routineService(
     evaluateActivityGate,
     /** The `source = "event"` branch of dispatch: groups, comments, wakes. Never throws; failures are classified. */
     dispatchEvent: eventDispatcher.dispatch,
+    /**
+     * Starts parked gate runs that are unclaimed or whose claim went stale (a restart, a crash) and
+     * returns how many it started. The server calls it on the scheduler interval; it does not wait for the scripts.
+     */
+    sweepGatingRuns: () => gateWorker.sweep(gateContext()),
+    /** Resolves when every gate run this process has in flight is settled. */
+    settleGateRuns: () => gateWorker.idle(),
+    /**
+     * Runs the routine's gate once and reports what a real run would do with the result,
+     * without creating a run, an issue or a wake.
+     */
+    testGate: async (routineId: string): Promise<RoutineGateTestResult> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+      if (!routine.gate) throw unprocessable("This routine has no gate");
+      const outcome = await getGateRunner().run({
+        companyId: routine.companyId,
+        routine: { id: routine.id, assigneeAgentId: routine.assigneeAgentId },
+        gate: routine.gate,
+        context: { routineId: routine.id, triggerKind: "test", lastResultFingerprint: null, lastDispatchedAt: null },
+      });
+      const verdict = outcome.result.class === "ok"
+        ? "wake"
+        : outcome.result.class === "skip"
+          ? "skip"
+          : outcome.result.class === "transport"
+            ? "unavailable"
+            : "fail_open";
+      return { result: outcome.result, verdict };
+    },
     get: getRoutineById,
     getTrigger: getTriggerById,
 
@@ -2285,6 +2848,7 @@ export function routineService(
             linkedIssueId: routineRuns.linkedIssueId,
             coalescedIntoRunId: routineRuns.coalescedIntoRunId,
             failureReason: routineRuns.failureReason,
+            gateResult: routineRuns.gateResult,
             completedAt: routineRuns.completedAt,
             createdAt: routineRuns.createdAt,
             updatedAt: routineRuns.updatedAt,
@@ -2318,6 +2882,7 @@ export function routineService(
               linkedIssueId: run.linkedIssueId,
               coalescedIntoRunId: run.coalescedIntoRunId,
               failureReason: run.failureReason,
+              ...(run.gateResult ? { gateResult: run.gateResult } : {}),
               completedAt: run.completedAt,
               createdAt: run.createdAt,
               updatedAt: run.updatedAt,
@@ -2379,6 +2944,11 @@ export function routineService(
         sanitizeRoutineVariableInputs(input.variables),
       );
       assertRoutineVariableDefinitions(variables);
+      const gate = input.gate ?? null;
+      if (gate) {
+        assertCanChangeGate(actor);
+        await assertGateConfig(companyId, input.assigneeAgentId ?? null, gate);
+      }
       const status = normalizeDraftRoutineStatus(input.status, input.assigneeAgentId);
       const responsibleUserId = await resolveRoutineResponsibleUserId(db, companyId, actor.userId, input.parentIssueId ?? null);
       if (!responsibleUserId) {
@@ -2405,6 +2975,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            gate,
             automationWakeSettings: input.automationWakeSettings ?? {},
             routineNoopSkipSettings: input.routineNoopSkipSettings ?? {},
             responsibleUserId,
@@ -2465,6 +3036,12 @@ export function routineService(
       if (patch.goalId) await assertGoal(existing.companyId, patch.goalId);
       if (patch.parentIssueId) await assertParentIssue(existing.companyId, patch.parentIssueId);
       assertRoutineVariableDefinitions(nextVariables);
+      const nextGate = patch.gate === undefined ? existing.gate : patch.gate;
+      // Re-checked only when the pin changed: an unrelated edit must not fail on a gate that predates it.
+      if (!routineGatesEqual(existing.gate, nextGate)) {
+        assertCanChangeGate(actor);
+        if (nextGate) await assertGateConfig(existing.companyId, nextAssigneeAgentId, nextGate);
+      }
       const enabledScheduleTriggers = await db
         .select({ id: routineTriggers.id })
         .from(routineTriggers)
@@ -2571,6 +3148,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           variables: nextVariables,
           env: nextEnv,
+          gate: nextGate ?? null,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2636,6 +3214,7 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             variables: candidate.variables,
             env: candidate.env,
+            gate: candidate.gate,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2956,6 +3535,12 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      if (!routineGatesEqual(existingRoutine.gate, routineSnapshot.gate ?? null)) {
+        assertCanChangeGate(actor);
+        if (routineSnapshot.gate) {
+          await assertGateConfig(existingRoutine.companyId, routineSnapshot.assigneeAgentId, routineSnapshot.gate);
+        }
+      }
       for (const triggerSnapshot of snapshot.triggers) {
         if (triggerSnapshot.kind !== "event" || !triggerSnapshot.enabled) continue;
         if (!triggerSnapshot.eventSourceId) throw unprocessable("Event trigger snapshot has no event source");
@@ -3022,6 +3607,7 @@ export function routineService(
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
+            gate: routineSnapshot.gate ?? null,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
@@ -3300,7 +3886,7 @@ export function routineService(
         });
       }
 
-      return dispatchRoutineRun({
+      const dispatched = await dispatchRoutineRun({
         routine,
         trigger,
         source: "webhook",
@@ -3332,6 +3918,8 @@ export function routineService(
         idempotencyKey: deliveryKey,
         rejectIdempotencyReplay: hmacReplayKey !== null,
       });
+      // A gated delivery is accepted now and decided when its gate script finishes.
+      return dispatched.status === "gating" ? { ...dispatched, runId: dispatched.id } : dispatched;
     },
 
     /** Event groups of a routine, newest activity first; `open` keeps those whose issue is still open and visible. */
@@ -3395,6 +3983,7 @@ export function routineService(
           linkedIssueId: routineRuns.linkedIssueId,
           coalescedIntoRunId: routineRuns.coalescedIntoRunId,
           failureReason: routineRuns.failureReason,
+          gateResult: routineRuns.gateResult,
           completedAt: routineRuns.completedAt,
           createdAt: routineRuns.createdAt,
           updatedAt: routineRuns.updatedAt,
@@ -3428,6 +4017,7 @@ export function routineService(
         linkedIssueId: row.linkedIssueId,
         coalescedIntoRunId: row.coalescedIntoRunId,
         failureReason: row.failureReason,
+        ...(row.gateResult ? { gateResult: row.gateResult } : {}),
         completedAt: row.completedAt,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
@@ -3494,7 +4084,9 @@ export function routineService(
         let runCount = 1;
         let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
 
-        if (!projectPaused && !worktreeSuppressed && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
+        // A gated routine collapses a backlog of missed ticks into one run, so one gate decides for all of them.
+        const gatedSchedule = routineGateAppliesToSource(row.routine.gate, "schedule");
+        if (!projectPaused && !worktreeSuppressed && !gatedSchedule && row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
           if (isSubHourlyCronExpression(row.trigger.cronExpression, row.trigger.timezone, now)) {
             claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
           } else {

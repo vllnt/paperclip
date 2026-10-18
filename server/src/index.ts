@@ -1747,6 +1747,20 @@ async function startServerWithDatabaseTeardown(
             logger.error({ err }, "routine scheduler tick failed");
           }));
 
+        // Gate runs a trigger parked are normally started at once; this picks up the ones a restart or a
+        // crash left unclaimed, and the ones whose claim went stale. It never waits for a gate script.
+        if (heartbeatSchedulerStopped) return;
+        trackHeartbeatSchedulerWork(routines
+          .sweepGatingRuns()
+          .then((picked) => {
+            if (picked > 0) {
+              logger.info({ picked }, "routine gate sweep picked up parked runs");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "routine gate sweep failed");
+          }));
+
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork((async () => {
           const experimental = await instanceSettingsService(db).getExperimental();
