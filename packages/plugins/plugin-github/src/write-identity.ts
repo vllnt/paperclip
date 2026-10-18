@@ -1,4 +1,4 @@
-import type { EnvSecretRefBinding, PluginContext } from "@paperclipai/plugin-sdk";
+import type { EnvSecretRefBinding, PluginContext, PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import {
   GITHUB_PRIVILEGED_ACTIONS,
   GITHUB_WRITE_ACTIONS,
@@ -25,6 +25,7 @@ import type { Catalog, Repository } from "./contracts.js";
 import { UserAuthorization, UserAuthorizationError, type FenceStatus } from "./user-authorization.js";
 import { CLOCK_SKEW_ALERT_MS } from "./clock.js";
 import { checkGitObjectForSigning, parseSshSigningKey, sshSign, type SshSigningKey } from "./ssh-signature.js";
+import { createWriteAlerts } from "./write-alerts.js";
 
 const policyKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, ...GITHUB_WRITE_IDENTITY_STATE });
 const BOT_PERMISSIONS = ["contents", "pull_requests", "issues"] as const;
@@ -136,6 +137,7 @@ export function registerWriteIdentity(
    */
   const githubNow = () => now() + github.clock.skewMs();
   const users = new UserAuthorization(ctx, github, githubNow);
+  const alerts = createWriteAlerts(ctx, now, githubNow);
 
   async function stored(companyId: string): Promise<StoredPolicy> {
     const value = await ctx.state.get(policyKey(companyId));
@@ -346,6 +348,7 @@ export function registerWriteIdentity(
       const definitive = error instanceof PagesExceeded || (error instanceof UserAuthorizationError && !error.transient);
       const reason = error instanceof UserAuthorizationError || error instanceof PagesExceeded ? error.message
         : error instanceof GitHubError && error.status === 401 ? "GitHub rejected the App's credentials during the fence check: this host's clock may be off, or the App's private key was revoked or rotated."
+        : error instanceof GitHubError ? `GitHub answered HTTP ${error.status} to a fence check request: ${error.message}`
         : "GitHub could not be reached to check the fence.";
       status = { ok: false, checkedAt, reason, ...(definitive ? {} : { transient: true }) };
     }
@@ -365,6 +368,8 @@ export function registerWriteIdentity(
       if (latest?.enabled) {
         await savePolicy(companyId, { ...latest, enabled: false });
         await ctx.activity.log({ companyId, message: "github.fence_violation", metadata: { reason: status.reason ?? "unknown", writesDisabled: true } });
+        // Tell the board at once: an activity entry alone went unseen for hours (VLL-1197).
+        await alerts.writesOff(companyId, { reason: status.reason ?? "unknown", reauthorize: Boolean((await users.state(companyId))?.needsReauthorization) });
       }
     }
     // Reported after the result is saved, so a failing log never holds back the kill switch; again only when the skew moves.
@@ -372,6 +377,8 @@ export function registerWriteIdentity(
       try { await ctx.activity.log({ companyId, message: "github.clock_skew", metadata: { skewSeconds, fenceOk: status.ok } }); }
       catch { ctx.logger.warn("Could not record the GitHub clock skew in the activity log", { companyId, skewSeconds }); }
     }
+    const after = await stored(companyId);
+    await alerts.observe(companyId, status, !!after && "policy" in after && after.policy.enabled);
     return status;
   }
 
@@ -657,12 +664,22 @@ export function registerWriteIdentity(
     return { companyId, policy: current && "policy" in current ? current.policy : null, invalid: !!current && "invalid" in current };
   });
 
-  ctx.actions.register("write-identity.set", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
+  /** A board action only an instance administrator may take; the administrator is who an alert about this company goes to. */
+  function adminScope(params: Record<string, unknown>, actor: PluginPerformActionContext) {
+    const scope = boardScope(params, actor);
     requireInstanceAdmin(actor);
+    // Not awaited: the action does not wait on it (it never rejects), and the alert queue keeps it ahead of any alert this action raises.
+    void alerts.contact(scope.companyId, scope.userId);
+    return scope;
+  }
+
+  ctx.actions.register("write-identity.set", async (params, actor) => {
+    const { companyId } = adminScope(params, actor);
     const next = params.policy === null ? null : parseGitHubWriteIdentityPolicy(params.policy);
     if (next) await savePolicy(companyId, next);
     else { await ctx.state.delete(policyKey(companyId)); policyChanged(companyId); }
+    // An alert about writes switched off or paused applies only while the company writes as its App user.
+    if (next?.userSource !== "app") await alerts.clear(companyId);
     await ctx.activity.log({ companyId, message: next ? "GitHub write identity updated" : "GitHub write identity reset to default", metadata: next ? {
       ...Object.fromEntries(GITHUB_WRITE_ACTIONS.map(action => [action, next.default[action]])),
       overrideCount: next.overrides.length, missingUserConnection: next.missingUserConnection, userSource: next.userSource, enabled: next.enabled,
@@ -683,15 +700,13 @@ export function registerWriteIdentity(
     return { companyId, authorization: await users.state(companyId) };
   });
   ctx.actions.register("user-authorization.start", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     const current = await policy(companyId);
     if (current?.userSource !== "app" || !current.userLogin) throw new Error("Save a write identity with userSource app and userLogin first.");
     return { companyId, ...(await users.start(companyId)), login: current.userLogin };
   });
   ctx.actions.register("user-authorization.poll", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     const current = await policy(companyId);
     if (current?.userSource !== "app" || !current.userLogin) throw new Error("Save a write identity with userSource app and userLogin first.");
     const result = await users.poll(companyId, current.userLogin);
@@ -700,13 +715,11 @@ export function registerWriteIdentity(
     return { companyId, ...result, fence: await checkFence(companyId) };
   });
   ctx.actions.register("user-authorization.check", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     return { companyId, fence: await checkFence(companyId) };
   });
   ctx.actions.register("user-authorization.revoke", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     await users.forget(companyId, "An administrator revoked the GitHub user authorization. Authorize the GitHub user again.");
     // Writes stay off after a new authorization until an administrator turns them back on.
     const current = await stored(companyId);
@@ -816,6 +829,8 @@ export function registerWriteIdentity(
     },
     /** Hourly fence check from the sync job, for companies using the App user identity. */
     async maintain(companyId: string): Promise<void> {
+      // Every minute: a pause that has lasted long enough alerts, and an alert issue that failed to write is tried again.
+      await alerts.reconcile(companyId);
       const current = await stored(companyId);
       if (!current || !("policy" in current) || current.policy.userSource !== "app") return;
       const state = await users.state(companyId);
