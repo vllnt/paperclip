@@ -1,4 +1,5 @@
 import type { AutomationWakeSettings } from "../automation-wake.js";
+import type { EventGrouping, EventMatch } from "../event-sources.js";
 import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
 import type {
   IssueOriginKind,
@@ -152,6 +153,10 @@ export interface RoutineRevisionSnapshotTriggerV1 {
   publicId: string | null;
   signingMode: RoutineTriggerSigningMode | null;
   replayWindowSec: number | null;
+  eventSourceId?: string | null;
+  eventMatch?: EventMatch | null;
+  eventGrouping?: EventGrouping | null;
+  fallback?: boolean;
 }
 
 export interface RoutineRevisionSnapshotV1 {
@@ -203,6 +208,11 @@ export interface RoutineTrigger {
   secretId: string | null;
   signingMode: string | null;
   replayWindowSec: number | null;
+  /** `event` triggers only. */
+  eventSourceId?: string | null;
+  eventMatch?: EventMatch | null;
+  eventGrouping?: EventGrouping | null;
+  fallback?: boolean;
   lastRotatedAt: Date | null;
   lastResult: string | null;
   createdByAgentId: string | null;
