@@ -144,11 +144,11 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 # after the stable dependency layers, before either application build.
 ARG PAPERCLIP_BUILD_COMMIT=""
 # Tests that gate the production image build. The list lives in
-# scripts/ci/image-build-vitest-files.txt, one path per line and sorted, so that concurrent pull requests that
-# add a test touch different lines instead of rewriting this one. An empty list or a path that does not exist fails the build.
-RUN [ -s scripts/ci/image-build-vitest-files.txt ] || { echo "scripts/ci/image-build-vitest-files.txt is missing or empty" >&2; exit 1; }; \
-  while IFS= read -r f || [ -n "$f" ]; do [ -f "$f" ] || { echo "scripts/ci/image-build-vitest-files.txt: missing $f" >&2; exit 1; }; done < scripts/ci/image-build-vitest-files.txt \
-  && pnpm exec vitest run $(cat scripts/ci/image-build-vitest-files.txt)
+# scripts/ci/image-build-vitest-files.txt, one path per line, so that concurrent pull requests that
+# add a test touch different lines instead of rewriting this one. An empty list or a path that does not exist fails the build;
+# blank lines and # comments are ignored. The script that reads the list has its own test, run first.
+RUN node --test scripts/ci/run-image-build-vitest.test.mjs
+RUN sh scripts/ci/run-image-build-vitest.sh
 RUN pnpm check:token-gates
 RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
