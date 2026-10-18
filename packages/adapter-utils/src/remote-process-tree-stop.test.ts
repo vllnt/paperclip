@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash as sha256Hash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -13,7 +13,7 @@ import {
   createRemoteRunMarker,
   parseRemoteProcessTreeStopSummary,
 } from "./remote-process-identity.js";
-import { sshRunProcessRecordDir } from "./ssh.js";
+import { buildSshSpawnTarget, sshRunProcessRecordDir } from "./ssh.js";
 
 const execFileAsync = promisify(execFile);
 const isLinux = process.platform === "linux";
@@ -114,6 +114,28 @@ async function writeRecord(run: Run, input: { pid: number | string; group: boole
   return file;
 }
 
+/** Runs a launch's record lines for `pid`, as the leader does, and returns how they ended. */
+async function publish(run: Run, input: { pid: number; testOnlyToolDirs?: string[] }) {
+  const lines = buildRemoteRunRecordLines({
+    remoteRoot: quote(run.root),
+    runId: run.runId,
+    launchId: randomBytes(8).toString("hex"),
+    markerSha256: "0".repeat(64),
+    group: true,
+    pidExpression: String(input.pid),
+    ...(input.testOnlyToolDirs ? { testOnlyToolDirs: input.testOnlyToolDirs } : {}),
+  });
+  return new Promise<{ code: number; stderr: string }>((resolve) => {
+    execFile("sh", ["-c", lines.join("\n")], (error, _stdout, stderr) => {
+      resolve({ code: error ? Number(error.code) : 0, stderr });
+    });
+  });
+}
+
+async function recordNames(run: Run): Promise<string[]> {
+  return (await readdir(run.dir).catch(() => [] as string[])).filter((name) => name.endsWith(".json"));
+}
+
 /** Writes a record file directly, as a worker could, bypassing the launch's own checks. */
 async function writeRawRecord(run: Run, input: { pid: string; markerSha256: string }) {
   await mkdir(run.dir, { recursive: true });
@@ -126,6 +148,27 @@ async function stop(run: Run, extra: Partial<Parameters<typeof buildRemoteProces
   const lines = buildRemoteProcessTreeStopLines({ remoteRoot: quote(run.root), runId: run.runId, termWaitSeconds: 1, ...extra });
   const { stdout } = await execFileAsync("sh", ["-c", lines.join("\n")], { timeout: 30_000 });
   return parseRemoteProcessTreeStopSummary(stdout);
+}
+
+type Plant = (at: string, victim: string) => Promise<unknown>;
+
+/** What may already sit at a `refused` name: each kind the review planted. */
+const REFUSED_FORMS: Array<[string, Plant]> = [
+  ["a regular file", (at) => writeFile(at, "planted\n")],
+  ["a directory holding a file", async (at) => {
+    await mkdir(at);
+    await writeFile(path.join(at, "inner"), "planted\n");
+  }],
+  ["a link to a directory outside", (at, victim) => symlink(victim, at)],
+  ["a link to a file outside", (at, victim) => symlink(path.join(victim, "file"), at)],
+  ["a dangling link", (at, victim) => symlink(path.join(victim, "missing", "x"), at)],
+];
+
+/** A directory outside the record directory, holding one file. */
+async function outsideVictim(): Promise<string> {
+  const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+  await writeFile(path.join(victim, "file"), "outside\n");
+  return victim;
 }
 
 async function settle() {
@@ -364,3 +407,492 @@ describe.skipIf(!isLinux)("remote process tree stop", () => {
     expect(alive(bystander.leader!)).toBe(true);
   }, 30_000);
 });
+
+describe.skipIf(!isLinux)("SSH launch wrapper", () => {
+  it("starts the command in its own session with the marker only in its environment, and records it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    await mkdir(path.join(root, "ws"), { recursive: true });
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: path.join(root, "ws"),
+        remoteWorkspacePath: root,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "sh",
+      args: ["-c", 'cat; echo pid=$$; ps_sid=$(cut -d" " -f6 /proc/$$/stat); echo sid=$ps_sid; exit 7'],
+      env: { FOO: "bar" },
+      processRecord: { runId },
+    });
+    expect(target.stdinPrefix).toMatch(/^[0-9a-f]{32}\n$/);
+    const markerValue = target.stdinPrefix!.trim();
+    for (const arg of target.args) expect(arg).not.toContain(markerValue);
+
+    const child = spawn("sh", ["-c", target.args.at(-1)!], { stdio: ["pipe", "pipe", "pipe"], cwd: root });
+    let stdout = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stdin.end(`${target.stdinPrefix}hello\n`);
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    await target.cleanup();
+
+    expect(code).toBe(7);
+    expect(stdout).toContain("hello\n");
+    const pid = Number(/pid=(\d+)/.exec(stdout)?.[1]);
+    expect(stdout).toContain(`sid=${pid}`);
+    const recordDir = sshRunProcessRecordDir(root, runId);
+    const files = await readdir(recordDir);
+    expect(files).toHaveLength(1);
+    const record = await readFile(path.join(recordDir, files[0]!), "utf8");
+    expect(record).toContain(`"pid":${pid},`);
+    expect(record).toContain(`"group":1`);
+    expect(record).not.toContain(markerValue);
+    const marker = createHash(`${REMOTE_RUN_MARKER_ENV}=${markerValue}`);
+    expect(record).toContain(`"marker":"${marker}"`);
+  }, 30_000);
+
+  async function runLaunch(input: {
+    env?: Record<string, string>;
+    home?: string;
+    command: string;
+    root?: string;
+    runId?: string;
+    stdinPrefix?: string;
+    beforeSpawn?: (remoteScript: string) => Promise<void>;
+  }) {
+    const root = input.root ?? (await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-")));
+    await mkdir(path.join(root, "ws"), { recursive: true });
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: path.join(root, "ws"),
+        remoteWorkspacePath: root,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "sh",
+      args: ["-c", input.command],
+      env: input.env ?? {},
+      processRecord: { runId: input.runId ?? randomUUID() },
+    });
+    await input.beforeSpawn?.(target.args.at(-1)!);
+    const child = spawn("sh", ["-c", target.args.at(-1)!], {
+      stdio: ["pipe", "pipe", "pipe"],
+      cwd: root,
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: input.home ?? root },
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.stdin.end(`${input.stdinPrefix ?? target.stdinPrefix}hello\n`);
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    await target.cleanup();
+    return { stdout, stderr, code, marker: target.stdinPrefix!.trim() };
+  }
+
+  it("does not start a launch whose run was already stopped, so a stop cannot miss a late record", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    // The stop runs first, before the launch writes its record.
+    const early = await stop(runOf(root, runId));
+    expect(early).toMatchObject({ records: 0, partial: "no_process_record" });
+
+    const late = await runLaunch({ root, runId, command: "echo started" });
+
+    expect(late.stdout).not.toContain("started");
+    expect(late.code).toBe(143);
+  }, 30_000);
+
+  it("does not start a launch whose record cannot be written", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    await mkdir(path.join(root, ".paperclip-runtime"), { recursive: true });
+    // A file where the record directory belongs makes every record write fail.
+    await writeFile(path.join(root, ".paperclip-runtime", "processes"), "");
+
+    const launch = await runLaunch({ root, command: "echo started" });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    expect(launch.stderr).toContain("not started");
+  }, 30_000);
+
+  it("never runs a tool that the run's login profile puts first on PATH", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
+    const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+    const bin = path.join(home, "bin");
+    await mkdir(bin);
+    // Each fake leaves a trace, the fake link also copies the record outside,
+    // then each runs the real tool, so the launch would still look fine.
+    for (const tool of ["link", "setsid", "id", "ls", "mkdir", "rm", "sed", "cut", "awk", "readlink"]) {
+      await writeFile(
+        path.join(bin, tool),
+        `#!/bin/sh\n: > '${victim}/${tool}'\n${tool === "link" ? `cp "$1" '${victim}/stolen' 2>/dev/null\n` : ""}for d in /usr/bin /bin; do [ -x "$d/${tool}" ] && exec "$d/${tool}" "$@"; done\nexit 127\n`,
+        { mode: 0o755 },
+      );
+    }
+    await writeFile(path.join(home, ".profile"), `PATH=${bin}:$PATH; export PATH\n`);
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+
+    const launch = await runLaunch({ root, runId, home, command: "echo started" });
+
+    expect(await readdir(victim)).toEqual([]);
+    expect(launch.stdout).toContain("started");
+    expect(launch.code).toBe(0);
+    expect(await recordNames(runOf(root, runId))).toHaveLength(1);
+  }, 30_000);
+
+  it("does not publish a record that cannot be read back as the stop reads it, and leaves none", async () => {
+    const run = await newRun();
+    // A process that is gone has no start time to record.
+    const gone = spawn("true");
+    await new Promise((resolve) => gone.on("close", resolve));
+
+    const result = await publish(run, { pid: gone.pid! });
+
+    expect(result.code).toBe(125);
+    expect(result.stderr).toContain("not started");
+    expect(await recordNames(run)).toEqual([]);
+  }, 30_000);
+
+  it("does not publish without a link utility that only root can change", async () => {
+    // A directory under /tmp: owned by this user, or by root inside a directory every user can write.
+    const tools = await mkdtemp(path.join(os.tmpdir(), "paperclip-tools-"));
+    await symlink("/usr/bin/link", path.join(tools, "link"));
+    const run = await newRun();
+
+    const result = await publish(run, { pid: process.pid, testOnlyToolDirs: [tools] });
+
+    expect(result.code).toBe(125);
+    expect(result.stderr).toContain("link utility");
+    expect(await recordNames(run)).toEqual([]);
+    // The real system directories qualify.
+    expect((await publish(run, { pid: process.pid })).code).toBe(0);
+  }, 30_000);
+
+  it.skipIf(!isRoot)("publishes only with a link that is a regular file owned by root and writable by root only", async () => {
+    // Directories under / so that every directory above the tool is root's.
+    const tools = path.join("/", `paperclip-tools-${randomUUID()}`);
+    const elsewhere = await mkdtemp(path.join(os.tmpdir(), "paperclip-tools-"));
+    const tool = path.join(tools, "link");
+    const real = await realpath("/usr/bin/link");
+    await mkdir(tools, { mode: 0o755 });
+    try {
+      const cases: Array<[string, () => Promise<void>, number]> = [
+        ["a root-owned copy", async () => {}, 0],
+        ["a group-writable copy", () => chmod(tool, 0o775), 125],
+        ["a copy owned by another user", async () => {
+          await chmod(tool, 0o755);
+          await chown(tool, 65534, 65534);
+        }, 125],
+        ["a link to a copy in a directory every user can write", async () => {
+          await rm(tool);
+          await copyFile(real, path.join(elsewhere, "link"));
+          await chmod(path.join(elsewhere, "link"), 0o755);
+          await symlink(path.join(elsewhere, "link"), tool);
+        }, 125],
+        ["a copy in a group-writable directory", async () => {
+          await rm(tool);
+          await copyFile(real, tool);
+          await chmod(tool, 0o755);
+          await chmod(tools, 0o775);
+        }, 125],
+      ];
+      await copyFile(real, tool);
+      await chmod(tool, 0o755);
+      for (const [label, arrange, code] of cases) {
+        await arrange();
+        const run = await newRun();
+        const result = await publish(run, { pid: process.pid, testOnlyToolDirs: [tools] });
+        expect({ label, code: result.code, records: (await recordNames(run)).length })
+          .toEqual({ label, code, records: code === 0 ? 1 : 0 });
+      }
+
+      // The record name is taken right before link(2) runs: the launch
+      // refuses and leaves the note that the run's stop reports.
+      await chmod(tools, 0o755);
+      await rm(tool);
+      await writeFile(tool, `#!/bin/sh\nln -s /nonexistent "$2"\nexec '${real}' "$@"\n`);
+      await chmod(tool, 0o755);
+      const raced = await newRun();
+      const result = await publish(raced, { pid: process.pid, testOnlyToolDirs: [tools] });
+      expect(result.code).toBe(125);
+      expect(result.stderr).toContain("already taken");
+      expect((await stop(raced))?.partial).toBe("unsafe_record_dir");
+    } finally {
+      await rm(tools, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("does not start a launch whose marker line is missing or malformed", async () => {
+    for (const stdinPrefix of ["\n", "not-a-marker\n", `${"a".repeat(31)}\n`]) {
+      const launch = await runLaunch({ command: "echo started", stdinPrefix });
+      expect(launch.stdout).not.toContain("started");
+      expect(launch.code).toBe(125);
+    }
+  }, 30_000);
+
+  it.each([["the run directory", (root: string, runId: string) => sshRunProcessRecordDir(root, runId)], [".paperclip-runtime", (root: string) => path.join(root, ".paperclip-runtime")]])(
+    "does not start a launch when %s is a planted link, and writes nothing outside it",
+    async (_level, linkPath) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+      const runId = randomUUID();
+      const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+      await mkdir(path.dirname(linkPath(root, runId)), { recursive: true });
+      await symlink(victim, linkPath(root, runId));
+
+      const launch = await runLaunch({ root, runId, command: "echo started" });
+
+      expect(launch.stdout).not.toContain("started");
+      expect(launch.code).toBe(125);
+      expect(await readdir(victim)).toEqual([]);
+    },
+    30_000,
+  );
+
+  it("does not start a launch when a stop mark of any kind is there, even a dangling link", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    await mkdir(sshRunProcessRecordDir(root, runId), { recursive: true });
+    await symlink(path.join(root, "missing", "target"), path.join(sshRunProcessRecordDir(root, runId), "stopped"));
+
+    const launch = await runLaunch({ root, runId, command: "echo started" });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(143);
+  }, 30_000);
+
+  it.each([
+    ["a link to a directory outside", (victim: string) => ({ kind: "symlink", target: victim })],
+    ["a link to a file outside", (victim: string) => ({ kind: "symlink", target: path.join(victim, "file") })],
+    ["a dangling link", (victim: string) => ({ kind: "symlink", target: path.join(victim, "missing", "x") })],
+    ["a real directory", () => ({ kind: "directory", target: "" })],
+  ])("does not start a launch whose record name is already taken by %s, and changes nothing outside", async (_kind, plant) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    const victim = await mkdtemp(path.join(os.tmpdir(), "paperclip-victim-"));
+    await writeFile(path.join(victim, "file"), "outside\n");
+    await mkdir(sshRunProcessRecordDir(root, runId), { recursive: true });
+    const entry = plant(victim);
+
+    const launch = await runLaunch({
+      root,
+      runId,
+      command: "echo started",
+      // The launch id is in the remote command, so a same-user process can plant it.
+      beforeSpawn: async (remoteScript) => {
+        const launchId = /([0-9a-f]{16})\.json/.exec(remoteScript)?.[1];
+        expect(launchId).toBeDefined();
+        const name = path.join(sshRunProcessRecordDir(root, runId), `${launchId}.json`);
+        if (entry.kind === "symlink") await symlink(entry.target, name);
+        else await mkdir(name);
+      },
+    });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    expect(await readdir(victim)).toEqual(["file"]);
+    expect(await readFile(path.join(victim, "file"), "utf8")).toBe("outside\n");
+    // The run's stop reports the refusal, not a missing record.
+    expect((await stop(runOf(root, runId)))?.partial).toBe("unsafe_record_dir");
+  }, 30_000);
+
+  it.each(REFUSED_FORMS.map(([label, plant]): [string, string, Plant] => [`${label} named \`refused\``, "refused", plant]))(
+    "does not start a launch when %s is already in the record directory", async (_label, name, plant) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const run = runOf(root, randomUUID());
+    const victim = await outsideVictim();
+    await mkdir(run.dir, { recursive: true });
+    await plant(path.join(run.dir, name), victim);
+
+    const launch = await runLaunch({ root, runId: run.runId, command: "echo started" });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    expect(await recordNames(run)).toEqual([]);
+    // The stop reports the launch's own note and leaves the planted entry alone.
+    expect((await stop(run))?.partial).toBe("unsafe_record_dir");
+    await expect(lstat(path.join(run.dir, name))).resolves.toBeDefined();
+    expect(await readdir(victim)).toEqual(["file"]);
+    expect(await readFile(path.join(victim, "file"), "utf8")).toBe("outside\n");
+  }, 30_000);
+
+  it("does not start a launch after an earlier launch of the run was refused", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const run = runOf(root, randomUUID());
+    await mkdir(path.join(run.dir, "0123456789abcdef.refused.abcdefghij"), { recursive: true });
+
+    const launch = await runLaunch({ root, runId: run.runId, command: "echo started" });
+
+    expect(launch.stdout).not.toContain("started");
+    expect(launch.code).toBe(125);
+    // Both notes are real refusals: the stop reports them and removes them.
+    expect((await readdir(run.dir)).filter((name) => name.includes(".refused."))).toHaveLength(2);
+    expect((await stop(run))?.partial).toBe("unsafe_record_dir");
+    expect((await readdir(run.dir)).filter((name) => name.includes(".refused."))).toEqual([]);
+  }, 30_000);
+
+  it.each([
+    ...REFUSED_FORMS.map(([label, plant]): [string, string, Plant] => [`${label} named \`refused\``, "refused", plant]),
+    ["a note-shaped directory holding a file", "0123456789abcdef.refused.abcdefghij", async (at: string) => {
+      await mkdir(at);
+      await writeFile(path.join(at, "inner"), "planted\n");
+    }] as [string, string, Plant],
+    ["a note-shaped link to an empty directory outside", "0123456789abcdef.refused.abcdefghij", async (at: string, victim: string) => {
+      await mkdir(path.join(victim, "empty"));
+      await symlink(path.join(victim, "empty"), at);
+    }] as [string, string, Plant],
+  ])("does not take %s as a refused launch, and leaves it alone", async (_label, name, plant) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const run = runOf(root, randomUUID());
+    expect((await runLaunch({ root, runId: run.runId, command: "echo started" })).code).toBe(0);
+    const victim = await outsideVictim();
+    await plant(path.join(run.dir, name), victim);
+    const outside = await readdir(victim);
+
+    const summary = await stop(run);
+
+    expect(summary).toMatchObject({ records: 1, partial: null });
+    await expect(lstat(path.join(run.dir, name))).resolves.toBeDefined();
+    expect(await readdir(victim)).toEqual(outside);
+  }, 30_000);
+
+  it("never takes or removes another run's refusal note", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const refusedRun = runOf(root, randomUUID());
+    await mkdir(refusedRun.dir, { recursive: true });
+    const refused = await runLaunch({
+      root,
+      runId: refusedRun.runId,
+      command: "echo started",
+      beforeSpawn: async (remoteScript) => {
+        const launchId = /([0-9a-f]{16})\.json/.exec(remoteScript)?.[1];
+        await mkdir(path.join(refusedRun.dir, `${launchId}.json`));
+      },
+    });
+    expect(refused.code).toBe(125);
+    const notes = (await readdir(refusedRun.dir)).filter((name) => /^[0-9a-f]{16}\.refused\.[0-9A-Za-z]{10}$/.test(name));
+    expect(notes).toHaveLength(1);
+    const other = runOf(root, randomUUID());
+    expect((await runLaunch({ root, runId: other.runId, command: "echo started" })).code).toBe(0);
+
+    expect((await stop(other))?.partial).toBeNull();
+    expect(await readdir(refusedRun.dir)).toContain(notes[0]);
+    expect((await stop(refusedRun))?.partial).toBe("unsafe_record_dir");
+    expect(await readdir(refusedRun.dir)).not.toContain(notes[0]);
+  }, 30_000);
+
+  it("leaves no record behind when a launch finds the run already stopped, so the stop mark can age out", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    await stop(runOf(root, runId));
+
+    const late = await runLaunch({ root, runId, command: "echo started" });
+
+    expect(late.code).toBe(143);
+    expect(await readdir(sshRunProcessRecordDir(root, runId))).toEqual(["stopped"]);
+    // With no record left, a later stop of another run ages the old mark out.
+    await execFileAsync("touch", ["-d", "10 days ago", path.join(sshRunProcessRecordDir(root, runId), "stopped")]);
+    await stop(runOf(root, randomUUID()));
+    await expect(readdir(sshRunProcessRecordDir(root, runId))).rejects.toThrow();
+  }, 30_000);
+
+  it("removes stop marks older than a week, and keeps newer ones", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const [oldRun, newRun, current] = [randomUUID(), randomUUID(), randomUUID()];
+    for (const runId of [oldRun, newRun]) {
+      await mkdir(sshRunProcessRecordDir(root, runId), { recursive: true });
+      await writeFile(path.join(sshRunProcessRecordDir(root, runId), "stopped"), "");
+    }
+    await execFileAsync("touch", ["-d", "10 days ago", path.join(sshRunProcessRecordDir(root, oldRun), "stopped")]);
+
+    await stop(runOf(root, current));
+
+    await expect(readdir(sshRunProcessRecordDir(root, oldRun))).rejects.toThrow();
+    expect(await readdir(sshRunProcessRecordDir(root, newRun))).toEqual(["stopped"]);
+    expect(await readdir(sshRunProcessRecordDir(root, current))).toEqual(["stopped"]);
+  }, 30_000);
+
+  it("keeps its own marker when the caller's environment names the same variable", async () => {
+    const { stdout, marker } = await runLaunch({
+      env: { [REMOTE_RUN_MARKER_ENV]: "0".repeat(32) },
+      command: `tr '\\000' '\\n' < /proc/$$/environ | grep '^${REMOTE_RUN_MARKER_ENV}='`,
+    });
+    expect(stdout.trim()).toBe(`${REMOTE_RUN_MARKER_ENV}=${marker}`);
+  }, 30_000);
+
+  it("keeps the marker line and the command's stdin from login profiles", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
+    await writeFile(
+      path.join(home, ".profile"),
+      'read -r stolen; printf %s "$stolen" > "$HOME/stolen"\n',
+    );
+    const { stdout } = await runLaunch({ home, command: "cat" });
+    expect(stdout).toBe("hello\n");
+    expect(await readFile(path.join(home, "stolen"), "utf8")).toBe("");
+  }, 30_000);
+
+  it("stops a launch that is still sourcing its login profiles, with what the profiles started", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-home-"));
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    // The profile starts a background process, then waits until it is stopped.
+    await writeFile(path.join(home, ".profile"), 'sleep 600 & echo "$!" > "$HOME/child"; while :; do sleep 0.1; done\n');
+    const launch = runLaunch({ root, runId, home, command: "echo started" });
+    let child = 0;
+    for (const deadline = Date.now() + 10_000; !child && Date.now() < deadline; await settle()) {
+      child = Number((await readFile(path.join(home, "child"), "utf8").catch(() => "")).trim());
+    }
+    expect(child).toBeGreaterThan(0);
+
+    const summary = await stop(runOf(root, runId));
+    const { stdout, code } = await launch;
+    await settle();
+
+    expect(summary).toMatchObject({ records: 1, survived: 0, partial: null });
+    expect(summary?.matched).toBeGreaterThanOrEqual(2);
+    expect(alive(child)).toBe(false);
+    expect(stdout).not.toContain("started");
+    expect(code).toBe(143);
+  }, 30_000);
+
+  it("leaves a launch without a run record unchanged", async () => {
+    const target = await buildSshSpawnTarget({
+      spec: {
+        host: "ssh.example.test",
+        port: 22,
+        username: "ssh-user",
+        remoteCwd: "/srv/ws",
+        remoteWorkspacePath: "/srv",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+      command: "node",
+      args: ["--version"],
+      env: {},
+    });
+    expect(target.stdinPrefix).toBeUndefined();
+    expect(target.args.at(-1)).not.toContain("read -r");
+    expect(target.args.at(-1)).not.toContain(REMOTE_RUN_MARKER_ENV);
+    await target.cleanup();
+  });
+});
+
+function createHash(value: string): string {
+  return sha256Hash("sha256").update(value).digest("hex");
+}

@@ -39,6 +39,7 @@ import {
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { environmentService } from "./environments.js";
 import { assertRunDirectoryNotBeingRemoved, sshRunDirectoryReaperService } from "./ssh-run-directory-reaper.js";
+import { stopSshLeaseRunProcesses, type RemoteRunProcessStopOutcome } from "./ssh-run-process-stop.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
@@ -611,6 +612,12 @@ export interface EnvironmentRuntimeDriver {
    * receipt must be validated and persisted by the caller at lease release.
    */
   retryPendingSandboxTeardown?(input: { environment: Environment | null; lease: EnvironmentLease }): Promise<unknown>;
+  /**
+   * Stop the processes the lease's run started in the environment, before its
+   * lease is released. The SSH driver needs it because signalling the local
+   * `ssh` client never reaches the remote command. Once per lease; never throws.
+   */
+  stopRunProcesses?(input: { environment: Environment | null; lease: EnvironmentLease }): Promise<RemoteRunProcessStopOutcome | null>;
   /**
    * Report whether the provider worker can run an orphan teardown now. A plugin
    * sandbox provider worker can be briefly down during its own restart window.
@@ -1186,7 +1193,11 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       return lease;
     },
 
+    stopRunProcesses: (input) => stopSshLeaseRunProcesses(db, input),
+
     async releaseRunLease(input) {
+      // Every release path ends here, so nothing of the run outlives its lease.
+      await stopSshLeaseRunProcesses(db, { environment: input.environment, lease: input.lease });
       const released = await environmentsSvc.releaseLease(input.lease.id, input.status);
       // Never awaited: it cannot throw, and a large delete must not delay the
       // run's teardown.
@@ -1194,7 +1205,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       return released;
     },
 
-    async retryPendingSandboxTeardown({ lease }) {
+    async retryPendingSandboxTeardown({ environment, lease }) {
       // An SSH lease is bookkeeping on a shared host: like `releaseRunLease`
       // above, releasing it destroys nothing there. A crash between a run's
       // end and its lease release leaves the lease to the orphan sweeps, which
@@ -1203,6 +1214,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       if (lease.provider !== "ssh") {
         throw new Error("SSH lease cleanup cannot release a non-SSH provider resource.");
       }
+      await stopSshLeaseRunProcesses(db, { environment, lease });
     },
 
     async realizeWorkspace(input) {
@@ -3847,6 +3859,29 @@ export function environmentRuntimeService(
 
   return {
     getDriver,
+
+    /**
+     * Stop what the run started in each environment it holds an active lease
+     * on, before the lease is released and before its launchers are removed.
+     * Drivers without the hook are skipped; a lease is stopped once.
+     *
+     * @returns One outcome per lease that this call stopped.
+     */
+    async stopRunProcesses(heartbeatRunId: string): Promise<RemoteRunProcessStopOutcome[]> {
+      const leaseRows = await db
+        .select()
+        .from(environmentLeases)
+        .where(and(eq(environmentLeases.heartbeatRunId, heartbeatRunId), eq(environmentLeases.status, "active")));
+      const outcomes: RemoteRunProcessStopOutcome[] = [];
+      for (const leaseRow of leaseRows) {
+        const lease = toEnvironmentLeaseSnapshot(leaseRow);
+        const environment = leaseRow.environmentId ? await environmentsSvc.getById(leaseRow.environmentId) : null;
+        const driver = getDriver(getLeaseDriverKey(lease, environment));
+        const outcome = await driver?.stopRunProcesses?.({ environment, lease });
+        if (outcome) outcomes.push(outcome);
+      }
+      return outcomes;
+    },
 
     /**
      * Read the sandbox duplex bridge kill switch for a new run. The host calls it
