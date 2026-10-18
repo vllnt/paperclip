@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Workflow policy: every `uses:` is pinned to a full commit SHA (or a local path,
+ * Workflow policy (workflows and composite actions): every `uses:` is pinned to a full commit SHA (or a local path,
  * or a docker digest), and the privileged triggers `pull_request_target` and
  * `workflow_run` are not used (they run fork-controllable code with secrets).
  * Prints one line per problem and exits 1 if there is any.
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -26,11 +26,18 @@ export function findProblems(name, text) {
   return problems;
 }
 
+const yamlIn = (directory) =>
+  existsSync(directory) ? readdirSync(directory).filter((file) => /\.ya?ml$/.test(file)).map((file) => path.join(directory, file)) : [];
+
+// Workflows and the composite actions under .github/actions/<name>/.
+export function policyFiles(root = ".github") {
+  const actions = path.join(root, "actions");
+  const composites = existsSync(actions) ? readdirSync(actions, { withFileTypes: true }).filter((entry) => entry.isDirectory()) : [];
+  return [path.join(root, "workflows"), ...composites.map((entry) => path.join(actions, entry.name))].flatMap(yamlIn);
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  const directory = process.argv[2] ?? ".github/workflows";
-  const problems = readdirSync(directory)
-    .filter((file) => /\.ya?ml$/.test(file))
-    .flatMap((file) => findProblems(path.join(directory, file), readFileSync(path.join(directory, file), "utf8")));
+  const problems = policyFiles(process.argv[2]).flatMap((file) => findProblems(file, readFileSync(file, "utf8")));
   for (const problem of problems) console.log(problem);
   process.exitCode = problems.length === 0 ? 0 : 1;
 }

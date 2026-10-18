@@ -125,6 +125,31 @@ jobs:
           "$RUNNER_TEMP/actionlint-bin/actionlint" -shellcheck= -pyflakes= -color || fail=1
           exit "$fail"
 
+  typecheck:
+    name: Typecheck (${{ matrix.lane }})
+    # Same coverage as `pnpm run typecheck`, in three lanes that run in parallel. New workspaces with a
+    # `typecheck` script land in `packages` automatically. `cli` follows `server` in one lane because its
+    # types come from the runner build that the server typecheck triggers (the Rust compile is most of that lane).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: packages
+            run: pnpm -r --no-bail --filter '!@paperclipai/server' --filter '!paperclipai' --filter '!@paperclipai/paperclip-runner' typecheck
+          - lane: server and cli
+            run: pnpm --filter @paperclipai/server typecheck && pnpm --filter paperclipai typecheck
+          - lane: runner
+            run: pnpm --filter @paperclipai/paperclip-runner typecheck
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-workspace
+      - run: pnpm run preflight:workspace-links
+      - run: ${{ matrix.run }}
+
   secrets:
     name: Secrets
     uses: ./.github/workflows/security.yml
@@ -139,20 +164,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          package-manager-cache: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
-        with:
-          version: 9.15.4
-      - name: Install workspace dependencies
-        # This narrow contract needs no dependency or workspace lifecycle scripts.
-        run: |
-          if ! pnpm install --frozen-lockfile --ignore-scripts; then
-            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
-            pnpm install --frozen-lockfile --ignore-scripts
-          fi
+      - uses: ./.github/actions/setup-workspace
       - name: Install the audited optional SDK outside the workspace
         run: |
           sentry_version=$(node -p 'require("./server/package.json").peerDependencies["@sentry/node"]')
@@ -167,7 +179,7 @@ jobs:
     name: CI gate
     # Never skipped: a skipped required check counts as passing.
     if: ${{ always() }}
-    needs: [changes, scripts, policy, secrets, sentry]
+    needs: [changes, scripts, policy, typecheck, secrets, sentry]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
