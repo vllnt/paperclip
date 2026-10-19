@@ -3143,17 +3143,22 @@ describe("SSH run directory reaper", () => {
       const sub = path.join(host.rootDir, `sub-${randomUUID()}`);
       await mkdir(sub, { recursive: true });
       await git(sub, ["init", "-q", "-b", "main"]);
+      await git(sub, ["config", "user.name", "Paperclip Test"]);
+      await git(sub, ["config", "user.email", "test@paperclip.dev"]);
       await writeFile(path.join(sub, "lib.txt"), "library\n");
       await git(sub, ["add", "lib.txt"]);
-      await git(sub, ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "library"]);
+      await git(sub, ["commit", "-q", "-m", "library"]);
       const run = await host.pushedRun();
       await git(run.workspace, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "libs/sub"]);
       await git(run.workspace, ["commit", "-q", "-m", "add submodule"]);
       await git(run.workspace, ["push", "-q", "origin", "main"]);
       const nested = path.join(run.workspace, "libs", "sub");
+      // The submodule clone has its own config: give it an identity so the annotated tag below does not need a global one.
+      await git(nested, ["config", "user.name", "Paperclip Test"]);
+      await git(nested, ["config", "user.email", "test@paperclip.dev"]);
       await writeFile(path.join(nested, "local.txt"), "only in the submodule\n");
       await git(nested, ["add", "local.txt"]);
-      await git(nested, ["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "submodule local only"]);
+      await git(nested, ["commit", "-q", "-m", "submodule local only"]);
       await git(nested, ["tag", "-a", "-m", "local", "local-only"]);
       return run;
     }
