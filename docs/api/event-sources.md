@@ -140,7 +140,7 @@ No Paperclip login: the source's own secret is the only credential, and an agent
 The signature covers the exact bytes sent; sign and send the same buffer (`--data-binary`, not a re-serialized object).
 
 ```sh
-BODY='{"schema":"paperclip.event.v1","source":"upkeep","type":"disk.usage","severity":"critical","state":"problem","dedupeKey":"vm141/disk.usage:/","title":"worker-ops: / at 93%","labels":{"host_id":"vm141","check":"disk.usage"}}'
+BODY='{"schema":"paperclip.event.v1","source":"upkeep","type":"disk.usage","severity":"critical","state":"problem","dedupeKey":"vm141/disk.usage:/","title":"example-worker: / at 93%","labels":{"host_id":"vm141","check":"disk.usage"}}'
 TS=$(date +%s)
 SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$EVENT_SOURCE_SECRET" -hex | sed 's/^.* //')
 curl --fail-with-body -sS "$INGRESS_URL" \
@@ -170,9 +170,9 @@ For a bearer source, replace the two signature headers with `-H "Authorization: 
   "severity": "critical",
   "state": "problem",
   "dedupeKey": "vm141/disk.usage:/",
-  "title": "worker-ops: / at 93%",
+  "title": "example-worker: / at 93%",
   "summary": "Root filesystem usage crossed the critical threshold.",
-  "labels": { "host_id": "vm141", "host": "worker-ops", "check": "disk.usage" },
+  "labels": { "host_id": "vm141", "host": "example-worker", "check": "disk.usage" },
   "occurredAt": "2026-10-18T12:00:00Z",
   "url": "https://monitor.example.com/hosts/vm141"
 }
