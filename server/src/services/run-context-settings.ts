@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { agents, companies, issues, routines, type Db } from "@paperclipai/db";
 import { resolveRunContextSettings, type ResolvedRunContextSettings } from "@paperclipai/shared";
 
@@ -6,7 +6,7 @@ import { resolveRunContextSettings, type ResolvedRunContextSettings } from "@pap
  * Load the company, agent and routine run-context policies that apply to a run
  * and resolve them with the wake reason. The routine is the one that created
  * the run's issue (`routine_execution` origin). Unset levels fall back to the
- * pre-setting behavior.
+ * pre-setting behavior. The levels load in a single query.
  *
  * @param input.db Database handle.
  * @param input.companyId Company that owns the run.
@@ -23,38 +23,41 @@ export async function loadRunContextSettings(input: {
   wakeReason?: string | null;
 }): Promise<ResolvedRunContextSettings> {
   const { db, companyId, agentId, issueId } = input;
-  const company = await db
-    .select({ policy: companies.runContextPolicy })
+  // One round trip for every level: the agent, the issue and its originating
+  // routine are left-joined to the company, each pinned to the company so a
+  // foreign id resolves to nothing. The routine joins only for issues that a
+  // routine execution created.
+  const row = await db
+    .select({
+      companyPolicy: companies.runContextPolicy,
+      agentRuntimeConfig: agents.runtimeConfig,
+      routinePolicy: routines.runContextPolicy,
+    })
     .from(companies)
+    .leftJoin(
+      agents,
+      agentId ? and(eq(agents.id, agentId), eq(agents.companyId, companyId)) : sql`false`,
+    )
+    .leftJoin(
+      issues,
+      issueId ? and(eq(issues.id, issueId), eq(issues.companyId, companyId)) : sql`false`,
+    )
+    .leftJoin(
+      routines,
+      and(
+        eq(issues.originKind, "routine_execution"),
+        sql`${routines.id}::text = ${issues.originId}`,
+        eq(routines.companyId, companyId),
+      ),
+    )
     .where(eq(companies.id, companyId))
+    .limit(1)
     .then((rows) => rows[0] ?? null);
-  const agent = agentId
-    ? await db
-        .select({ runtimeConfig: agents.runtimeConfig })
-        .from(agents)
-        .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
-        .then((rows) => rows[0] ?? null)
-    : null;
-  const origin = issueId
-    ? await db
-        .select({ originKind: issues.originKind, originId: issues.originId })
-        .from(issues)
-        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
-        .then((rows) => rows[0] ?? null)
-    : null;
-  const routine =
-    origin?.originKind === "routine_execution" && origin.originId
-      ? await db
-          .select({ policy: routines.runContextPolicy })
-          .from(routines)
-          .where(and(eq(routines.id, origin.originId), eq(routines.companyId, companyId)))
-          .then((rows) => rows[0] ?? null)
-      : null;
   return resolveRunContextSettings(
     {
-      company: company?.policy,
-      agent: agent?.runtimeConfig?.runContext,
-      routine: routine?.policy,
+      company: row?.companyPolicy,
+      agent: row?.agentRuntimeConfig?.runContext,
+      routine: row?.routinePolicy,
     },
     input.wakeReason,
   );
