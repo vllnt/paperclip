@@ -1890,6 +1890,12 @@ export {
   builtInAgentResetSchema,
   createAgentHireSchema,
   updateAgentSchema,
+  AGENT_CONFIG_FORBIDDEN_KEYS,
+  AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH,
+  AGENT_CONFIG_MERGE_PATCH_MAX_VALUES,
+  describeAgentConfigMergePatchViolation,
+  findAgentConfigMergePatchViolation,
+  updateAgentMergePatchSchema,
   agentInstructionsBundleModeSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
@@ -1911,6 +1917,8 @@ export {
   type BuiltInAgentReset,
   type CreateAgentHire,
   type UpdateAgent,
+  type AgentConfigMergePatchViolation,
+  type UpdateAgentMergePatch,
   type UpdateAgentInstructionsBundle,
   type UpsertAgentInstructionsFile,
   type UpdateAgentInstructionsPath,
@@ -2845,3 +2853,4 @@ export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
 export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
+export * from "./run-context.js";
