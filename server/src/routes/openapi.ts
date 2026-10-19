@@ -237,6 +237,9 @@ import {
   resolveIssueRecoveryActionSchema,
   reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  issueRecoveryActionReadModelSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  ISSUE_STATUSES,
   cancelIssueThreadInteractionSchema,
   issueWaitRequestSchema,
   // Secret provider configs and remote import
@@ -1600,6 +1603,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
+  "GET /api/instance/resource-capacity",
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
@@ -8655,6 +8659,32 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/instance/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get host CPU, memory and disk for every server host and environment (instance admins)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get CPU, memory and disk of the environments the company's agents run on",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/environments/{id}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get an environment's CPU, memory and disk (404 unless the caller's company runs on it)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/environments/{id}/delete-blast-radius",
   tags: ["environments"],
   summary: "Get environment delete blast radius",
@@ -10519,6 +10549,33 @@ registerCurrentRoute({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["issues"],
+  summary:
+    "List issue recovery actions across a company, newest first, with their source issue. " +
+    "Read-only (no revalidation). Actors without company-scope read only see actions on issues they can read.",
+  query: listCompanyIssueRecoveryActionsQuerySchema,
+  responses: {
+    200: r.ok(
+      z.array(
+        issueRecoveryActionReadModelSchema.extend({
+          issue: z.object({
+            id: z.string(),
+            identifier: z.string().nullable(),
+            title: z.string(),
+            status: z.enum(ISSUE_STATUSES),
+          }),
+        }),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
   },
 });
 

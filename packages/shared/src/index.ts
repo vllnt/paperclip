@@ -1132,6 +1132,7 @@ export type {
   IssueBlockedInboxSeverity,
   IssueBlockedInboxState,
   IssueRecoveryAction,
+  CompanyIssueRecoveryActionListItem,
   IssueWatchdog,
   IssueWatchdogStatus,
   IssueWatchdogSummary,
@@ -1984,9 +1985,14 @@ export {
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
+  issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
   reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT,
+  COMPANY_RECOVERY_ACTIONS_MAX_LIMIT,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -2092,6 +2098,7 @@ export {
   type UpdateIssue,
   type StalledReviewDecision,
   type ResolveIssueRecoveryAction,
+  type ListCompanyIssueRecoveryActionsQuery,
   type CheckoutIssue,
   type AddIssueComment,
   type CreateIssueThreadInteraction,
@@ -2843,6 +2850,7 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./resource-capacity.js";
 export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
 export * from "./automation-wake.js";

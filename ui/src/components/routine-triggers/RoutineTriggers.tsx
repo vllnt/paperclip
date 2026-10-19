@@ -1,9 +1,18 @@
 import { useCallback, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { CalendarClock, Plus, Webhook } from "lucide-react";
+import { BellRing, CalendarClock, Plus, Webhook } from "lucide-react";
 import type { RoutineTrigger } from "@paperclipai/shared";
 import { useSearchParams } from "@/lib/router";
 import { routinesApi } from "@/api/routines";
+import { eventSourcesApi, isEventTrigger, type EventRoutineTrigger } from "@/api/eventSources";
+import {
+  buildEventTriggerPayload,
+  describeEventMatch,
+  eventDraftFromTrigger,
+  normalizeEventDraft,
+  validateEventDraft,
+  type EventTriggerDraft,
+} from "@/lib/event-trigger";
 import { queryKeys } from "@/lib/queryKeys";
 import { describeCron } from "@/lib/cron-readable";
 import { Button } from "@/components/ui/button";
@@ -18,6 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { ScheduleEditor } from "@/components/ScheduleEditor";
 import { useRoutineDetail } from "@/components/routine-sections/context";
+import { EventGroupingFields, EventMatchFields, type EventSourcesState } from "./EventTriggerFields";
 import { RoutineTriggerCard } from "./TriggerCard";
 import {
   RoutineTriggerWizard,
@@ -31,8 +41,13 @@ import { WebhookUrlWarning } from "./WebhookUrlWarning";
 function readDraft(key: string): TriggerDraft | null {
   try {
     const draft = JSON.parse(sessionStorage.getItem(key) ?? "null");
-    return draft && ["choose", "schedule", "webhook"].includes(draft.kind)
-      ? { ...defaultTriggerDraft, ...draft, sender: draft.sender === "github" ? "github" : "custom" }
+    return draft && ["choose", "schedule", "webhook", "event"].includes(draft.kind)
+      ? {
+          ...defaultTriggerDraft,
+          ...draft,
+          sender: draft.sender === "github" ? "github" : "custom",
+          event: normalizeEventDraft(draft.event),
+        }
       : null;
   } catch {
     return null;
@@ -73,6 +88,8 @@ export function RoutineTriggers() {
     refetchInterval: 3000,
   });
   const routine = data ?? ctx.routine;
+  const hasEventTrigger = routine.triggers.some(isEventTrigger);
+  const eventSources = useEventSources(routine.companyId, hasEventTrigger);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [removed, setRemoved] = useState<RoutineTrigger[]>([]);
   const [error, setError] = useState("");
@@ -166,7 +183,9 @@ export function RoutineTriggers() {
               ? "Schedule"
               : trigger.kind === "api"
                 ? "API trigger"
-                : "Webhook"}{" "}
+                : trigger.kind === "event"
+                  ? "Event trigger"
+                  : "Webhook"}{" "}
             removed.
           </span>
           <Button
@@ -204,7 +223,7 @@ export function RoutineTriggers() {
       )}
       {routine.triggers.length === 0 && (
         <p className="py-6 text-sm text-muted-foreground">
-          Run this routine on a schedule or when another app sends a webhook.
+          Run this routine on a schedule, when another app sends a webhook, or when a monitoring alert arrives.
         </p>
       )}
       <fieldset disabled={busy} className="min-w-0 space-y-3">
@@ -216,11 +235,15 @@ export function RoutineTriggers() {
                 ? "schedule"
                 : trigger.kind === "api"
                   ? "api"
-                  : "webhook"
+                  : trigger.kind === "event"
+                    ? "event"
+                    : "webhook"
             }
             icon={
               trigger.kind === "schedule" ? (
                 <CalendarClock className="h-4 w-4" />
+              ) : trigger.kind === "event" ? (
+                <BellRing className="h-4 w-4" />
               ) : (
                 <Webhook className="h-4 w-4" />
               )
@@ -230,9 +253,11 @@ export function RoutineTriggers() {
                 ? (describeCron(trigger.cronExpression) ?? "Schedule")
                 : trigger.kind === "api"
                   ? "API trigger"
-                  : trigger.signingMode === "github_hmac"
-                    ? "GitHub webhook"
-                    : "Webhook"
+                  : isEventTrigger(trigger)
+                    ? eventTriggerTitle(trigger, eventSources)
+                    : trigger.signingMode === "github_hmac"
+                      ? "GitHub webhook"
+                      : "Webhook"
             }
             summary={
               trigger.setupPending
@@ -243,6 +268,8 @@ export function RoutineTriggers() {
                     ? (trigger.timezone ?? "UTC")
                     : trigger.kind === "api"
                       ? "Run through the API"
+                      : isEventTrigger(trigger)
+                        ? describeEventMatch(trigger.eventMatch, trigger.fallback)
                       : trigger.lastWebhookDelivery?.status === "rejected"
                         ? "Authentication failed · Check the key in your app"
                         : trigger.lastWebhookDelivery?.status === "received" &&
@@ -282,6 +309,17 @@ export function RoutineTriggers() {
               <p className="text-sm text-muted-foreground">
                 This trigger starts the routine through the API.
               </p>
+            ) : isEventTrigger(trigger) ? (
+              <EventSettings
+                trigger={trigger}
+                eventSources={eventSources}
+                onSave={async (patch) => {
+                  await routinesApi.updateTrigger(trigger.id, patch);
+                  await refresh();
+                  setExpanded(null);
+                }}
+                onCancel={() => setExpanded(null)}
+              />
             ) : (
               <WebhookSettings
                 trigger={trigger}
@@ -329,6 +367,7 @@ function TriggerSetup({
   const [, setParams] = useSearchParams();
   const storagePrefix = `routine-trigger-draft:${companyId}:${routineId}:`;
   const createdRef = useRef<RoutineTrigger | undefined>(trigger);
+  const eventSources = useEventSources(companyId, true);
   const [created, setCreated] = useState(trigger);
   const [secret, setSecret] = useState("");
   const currentTrigger = trigger ?? created;
@@ -395,7 +434,14 @@ function TriggerSetup({
           cronExpression: scheduleCron(draft),
           timezone: draft.timezone,
         });
-      else {
+      else if (draft.kind === "event") {
+        if (!validateEventDraft(draft.event).valid)
+          throw new Error("Complete the event trigger settings before adding it.");
+        await routinesApi.createTrigger(routineId, {
+          kind: "event",
+          ...buildEventTriggerPayload(draft.event),
+        });
+      } else {
         if (!createdRef.current)
           throw new Error("Create the webhook before finishing setup.");
         await routinesApi.updateTrigger(createdRef.current.id, {
@@ -435,7 +481,94 @@ function TriggerSetup({
         await onRefresh();
       }}
       checkResult={currentTrigger?.lastWebhookDelivery?.status ?? "waiting"}
+      eventSources={eventSources}
     />
+  );
+}
+
+function useEventSources(companyId: string, enabled: boolean): EventSourcesState {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: queryKeys.eventSources.list(companyId),
+    queryFn: () => eventSourcesApi.list(companyId),
+    enabled,
+  });
+  return {
+    sources: data ?? [],
+    status: isError ? "error" : isLoading && enabled ? "loading" : "ready",
+  };
+}
+
+function eventTriggerTitle(trigger: EventRoutineTrigger, eventSources: EventSourcesState) {
+  const source = eventSources.sources.find((item) => item.id === trigger.eventSourceId);
+  return source ? `Event · ${source.name}` : "Event trigger";
+}
+
+function EventSettings({
+  trigger,
+  eventSources,
+  onSave,
+  onCancel,
+}: {
+  trigger: EventRoutineTrigger;
+  eventSources: EventSourcesState;
+  onSave: (patch: Record<string, unknown>) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState<EventTriggerDraft>(() => eventDraftFromTrigger(trigger));
+  const [showErrors, setShowErrors] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const check = validateEventDraft(draft);
+  const patch = (values: Partial<EventTriggerDraft>) =>
+    setDraft((current) => ({ ...current, ...values }));
+  return (
+    <fieldset disabled={busy} className="min-w-0 space-y-6">
+      <EventMatchFields
+        draft={draft}
+        onChange={patch}
+        showErrors={showErrors}
+        errors={check.errors}
+        eventSources={eventSources}
+      />
+      <EventGroupingFields
+        draft={draft}
+        onChange={patch}
+        showErrors={showErrors}
+        errors={check.errors}
+        groupKey={check.groupKey}
+      />
+      {error && (
+        <p role="alert" className="text-sm text-destructive">
+          {error}
+        </p>
+      )}
+      <div className="flex gap-2">
+        <Button
+          onClick={async () => {
+            if (!check.valid) {
+              setShowErrors(true);
+              return;
+            }
+            setBusy(true);
+            setError("");
+            try {
+              await onSave(buildEventTriggerPayload(draft));
+            } catch (cause) {
+              setError(
+                cause instanceof Error ? cause.message : "Couldn’t save the event trigger.",
+              );
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          Save event trigger
+        </Button>
+        <Button variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </fieldset>
   );
 }
 

@@ -106,10 +106,12 @@ const CompanySkills = lazy(() => import("./pages/CompanySkills").then((m) => ({ 
 const SkillSources = lazy(() => import("./pages/SkillSources").then((m) => ({ default: m.SkillSources })));
 const SkillStudio = lazy(() => import("./pages/SkillStudio").then((m) => ({ default: m.SkillStudio })));
 const Secrets = lazy(() => import("./pages/Secrets").then((m) => ({ default: m.Secrets })));
+const CompanyEventSources = lazy(() => import("./pages/CompanyEventSources").then((m) => ({ default: m.CompanyEventSources })));
 const CompanyImport = lazy(() => import("./pages/CompanyImport").then((m) => ({ default: m.CompanyImport })));
 const DesignGuide = lazy(() => import("./pages/DesignGuide").then((m) => ({ default: m.DesignGuide })));
 const InstanceExperimentalSettings = lazy(() => import("./pages/InstanceExperimentalSettings").then((m) => ({ default: m.InstanceExperimentalSettings })));
 const InstanceAccess = lazy(() => import("./pages/InstanceAccess").then((m) => ({ default: m.InstanceAccess })));
+const InstanceResourceCapacity = lazy(() => import("./pages/InstanceResourceCapacity").then((m) => ({ default: m.InstanceResourceCapacity })));
 const ProfileSettings = lazy(() => import("./pages/ProfileSettings").then((m) => ({ default: m.ProfileSettings })));
 const PluginManager = lazy(() => import("./pages/PluginManager").then((m) => ({ default: m.PluginManager })));
 const PluginSettings = lazy(() => import("./pages/PluginSettings").then((m) => ({ default: m.PluginSettings })));
@@ -201,6 +203,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route element={<HiddenSettingsPageGate pageKey="company.secrets" />}>
         <Route path="company/settings/secrets" element={<Secrets />} />
       </Route>
+      <Route path="company/settings/event-sources" element={<CompanyEventSources />} />
       <Route path="company/settings/tools" element={<LegacyToolsSettingsRedirect />} />
       <Route path="company/settings/tools/:tab" element={<LegacyToolsSettingsRedirect />} />
       <Route path="tools" element={<LegacyToolsRedirect />} />
@@ -253,6 +256,9 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
         <Route path="company/settings/instance/environments" element={<CompanyEnvironments />} />
         <Route path="company/settings/instance/environments/new" element={<CompanyEnvironments mode="create" />} />
         <Route path="company/settings/instance/environments/:environmentId/edit" element={<CompanyEnvironments mode="edit" />} />
+      </Route>
+      <Route element={<HiddenSettingsPageGate pageKey="instance.resource-capacity" />}>
+        <Route path="company/settings/instance/resource-capacity" element={<InstanceResourceCapacity />} />
       </Route>
       <Route element={<HiddenSettingsPageGate pageKey="instance.access" />}>
         <Route path="company/settings/instance/access" element={<InstanceAccess />} />

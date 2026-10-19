@@ -45,6 +45,32 @@ object: `adapterConfig` (keys that override the agent's adapter config for runs 
 `useProjectWorkspace` (boolean). Unknown keys are rejected before the request is sent. Use only one of the
 two options.
 
+### Issue Recovery Actions
+
+```sh
+# Open recovery actions across a company, newest first
+npx paperclipai issue recovery-actions:list [-C <company-id>] [--status active,escalated] [--limit 50] [--json]
+
+# The open recovery action of one issue
+npx paperclipai issue recovery-actions <issue-id>
+
+# Resolve a recovery action
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  [--action-id <id>] [--resolution-note "..."]
+
+# Resolve an execution recovery with a reconciliation (board only)
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  --reconciliation-run-id <run-id> --provider-stopped --action-outcome completed \
+  --outcome-evidence "..." [--workspace-repair-evidence "..."]
+```
+
+`recovery-actions:list` statuses are `active`, `escalated`, `resolved`, and
+`cancelled`; the default is the open ones (`active,escalated`). The limit is
+1-200 (default 50). The list is read-only and does not re-check stale actions.
+For `recovery:resolve`, any reconciliation flag sends an `executionReconciliation`
+object; `--provider-stopped` is required in that case, and evidence texts need
+20-12000 characters.
+
 ### Issue Tree
 
 ```sh
@@ -115,6 +141,25 @@ compared as whole values. Secret values are redacted by the server, so a key the
 server recorded as changed with no visible difference prints as
 `<key>: changed (values redacted)`. `--json` prints
 `{ changedKeys, changes: [{ path, kind, before, after }], redactedOnlyKeys }`.
+
+```sh
+# Change one config value; other keys and secrets stay as they are
+npx paperclipai agent config set <agent-id> runtimeConfig.heartbeat.maxDailyRuns=64
+npx paperclipai agent config set <agent-id> adapterConfig.model=gpt-5 adapterConfig.effort=high
+npx paperclipai agent config set <agent-id> --unset adapterConfig.env.DEBUG
+npx paperclipai agent config set <agent-id> adapterConfig.model=gpt-5 --dry-run   # print the patch only
+
+# Read config (secrets stay redacted)
+npx paperclipai agent config get <agent-id>
+npx paperclipai agent config get <agent-id> runtimeConfig.heartbeat
+```
+
+`agent config set` takes `path=value` pairs under `adapterConfig.` or `runtimeConfig.`. A value that is
+valid JSON (`64`, `true`, `{"type":"secret_ref","secretId":"..."}`) is sent as JSON; anything else is sent
+as text. Quote a number to keep it as text: `adapterConfig.effort='"64"'`. Put `--unset` after the
+assignments, because it takes every following path. The command sends a merge patch
+(`PATCH /api/agents/{id}` with `mergeConfig: true`), so the server records a config revision and nothing
+else in the config changes.
 
 ## Skills Commands
 
