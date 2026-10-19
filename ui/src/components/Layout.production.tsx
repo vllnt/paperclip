@@ -36,6 +36,7 @@ import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
+import { RouteSuspense } from "./RouteSuspense";
 import { SidebarShell } from "./SidebarShell.production";
 import { SecondarySidebar } from "./SecondarySidebar.production";
 import { SidebarAccountMenu } from "./SidebarAccountMenu.production";
@@ -44,6 +45,8 @@ import { usePanel } from "../context/PanelContext";
 import { useCompany } from "../context/CompanyContext";
 import { useSidebar } from "../context/SidebarContext";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
+import { CommandActionsProvider, type CommandActionsHandle } from "../context/CommandActionsContext";
+import { useGlobalCommandActionBindings } from "../lib/command-action-bindings";
 import { useCompanyPageMemory } from "../hooks/useCompanyPageMemory";
 import { healthApi } from "../api/health";
 import {
@@ -351,15 +354,16 @@ export function Layout() {
   ]);
 
   const togglePanel = togglePanelVisible;
-  const openSearch = useCallback(() => {
-    document.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "k",
-        metaKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+  const showShortcuts = useCallback(() => setShortcutsOpen(true), []);
+  const globalCommandActionBindings = useGlobalCommandActionBindings({
+    onToggleSidebar: toggleSidebar,
+    onTogglePanel: togglePanel,
+    onShowShortcuts: showShortcuts,
+  });
+  const commandActionsRef = useRef<CommandActionsHandle | null>(null);
+  const openSearch = useCallback(() => commandActionsRef.current?.openCommandPalette(), []);
+  const runChord = useCallback((actionId: string) => {
+    commandActionsRef.current?.run(actionId);
   }, []);
 
   // Peek (hover flyout) triggers for the collapsed rail. Opening has a tiny
@@ -465,8 +469,8 @@ export function Layout() {
     onSearch: openSearch,
     onToggleSidebar: toggleSidebar,
     onTogglePanel: togglePanel,
-    onShowShortcuts: () => setShortcutsOpen(true),
-    onGoToInbox: () => navigate("/inbox"),
+    onShowShortcuts: showShortcuts,
+    onRunChord: runChord,
   });
 
   useEffect(() => {
@@ -630,6 +634,7 @@ export function Layout() {
   }, [location.key, location.pathname, location.state, navigationType]);
 
   return (
+    <CommandActionsProvider globalBindings={globalCommandActionBindings} handleRef={commandActionsRef}>
     <ChatSetupSidebarProvider>
       <div
         className={cn(
@@ -762,7 +767,9 @@ export function Layout() {
                   />
                 ) : (
                   <RouteErrorBoundary>
-                    <Outlet />
+                    <RouteSuspense>
+                      <Outlet />
+                    </RouteSuspense>
                   </RouteErrorBoundary>
                 )}
               </main>
@@ -784,5 +791,6 @@ export function Layout() {
         <PluginAppShellOverlays localTrusted={health?.deploymentMode === "local_trusted"} />
       </div>
     </ChatSetupSidebarProvider>
+    </CommandActionsProvider>
   );
 }

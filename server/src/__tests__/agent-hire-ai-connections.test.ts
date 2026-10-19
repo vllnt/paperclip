@@ -6,7 +6,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants, toolConnectionInstalls } from "@paperclipai/db";
+import { agents, companies, companyMemberships, createDb, environments, heartbeatRuns, issues, principalPermissionGrants, toolConnectionInstalls } from "@paperclipai/db";
 import { type AiConnectionBinding } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -64,6 +64,15 @@ async function fixture(provider: "anthropic" | "openai", method: "api_key" | "su
   return { app, companyId, agentId, userId, binding, adapterType, account, runId: run!.id };
 }
 
+/**
+ * Saving the agent's own model is a protected self change, so the agent needs
+ * the same agents:configure grant (for itself) that its responsible user holds.
+ */
+async function grantSelfConfigure(f: { companyId: string; agentId: string }) {
+  await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, membershipRole: "member", status: "active" });
+  await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, permissionKey: "agents:configure", scope: { agentIds: [f.agentId] } });
+}
+
 function hired(response: request.Response) {
   expect(response.status, JSON.stringify(response.body)).toBe(201);
   return response.body.agent ?? response.body;
@@ -74,6 +83,7 @@ describe("agent-created hires use managed AI connections", () => {
     it.each([401, 403, 429, 503, null])(`${operation} changes API-key health only for a provider rejection (status: %s)`, async (status) => {
       const f = await fixture("anthropic", "api_key");
       await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+      await grantSelfConfigure(f);
       const original = getServerAdapter(f.adapterType);
       registerServerAdapter({ ...original, testEnvironment: async () => ({ adapterType: f.adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }) });
       const network = vi.spyOn(globalThis, "fetch");
@@ -93,6 +103,7 @@ describe("agent-created hires use managed AI connections", () => {
   it.each(["test", "save"] as const)("%s marks a hello-test authentication rejection as needing attention and reconnect repairs the same default", async (operation) => {
     const f = await fixture("anthropic", "subscription");
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+    await grantSelfConfigure(f);
     const original = getServerAdapter(f.adapterType);
     registerServerAdapter({ ...original, testEnvironment: async () => ({
       adapterType: f.adapterType, status: "fail", testedAt: new Date().toISOString(),
@@ -181,6 +192,31 @@ describe("agent-created hires use managed AI connections", () => {
       expect(agent.runtimeConfig.aiConnection).toBeUndefined();
       const [saved] = await db.select().from(agents).where(eq(agents.id, agent.id));
       expect((saved.adapterConfig.env as Record<string, unknown>)[key]).toEqual({ type: "plain", value });
+    });
+  }
+
+  for (const endpoint of ["agent-hires", "agents"]) {
+    it(`${endpoint}: leaves the child unbound, not rejected, when its environment sets provider routing`, async () => {
+      const f = await fixture("anthropic");
+      // Choosing an environment for a new agent is a protected field, so the hiring agent and its responsible user both hold a company-wide agents:configure grant.
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, membershipRole: "member", status: "active" });
+      await db.insert(principalPermissionGrants).values(["agent", "user"].map((principalType) => ({ companyId: f.companyId, principalType, principalId: principalType === "agent" ? f.agentId : f.userId, permissionKey: "agents:configure" })));
+      const [environment] = await db.insert(environments).values({ name: `Routed ${endpoint} ${randomUUID()}`, driver: "sandbox", config: { provider: "daytona" }, envVars: { ANTHROPIC_BASE_URL: "https://proxy.example/anthropic", LOG_LEVEL: "debug" } }).returning();
+      const send = (name: string, extra: Record<string, unknown> = {}) => request(f.app).post(`/api/companies/${f.companyId}/${endpoint}`).send({ name, role: "engineer", adapterType: f.adapterType, defaultEnvironmentId: environment!.id, ...extra });
+      // The manager's binding is only a default: the child inherits the environment's routing instead.
+      const agent = hired(await send("Routed child"));
+      expect(agent.runtimeConfig.aiConnection).toBeUndefined();
+      const [saved] = await db.select().from(agents).where(eq(agents.id, agent.id));
+      expect(saved!.defaultEnvironmentId).toBe(environment!.id);
+      expect(saved!.runtimeConfig).not.toHaveProperty("aiConnection");
+      // An explicit binding into the same environment is still rejected, and no agent is created.
+      const explicit = await send("Routed explicit", { runtimeConfig: { aiConnection: f.binding } });
+      expect(explicit.status, JSON.stringify(explicit.body)).toBe(422);
+      expect(explicit.body.details).toMatchObject({ code: "ai_connection_incompatible", source: "environment", environmentId: environment!.id });
+      expect(await db.select().from(agents).where(and(eq(agents.companyId, f.companyId), eq(agents.name, "Routed explicit")))).toEqual([]);
+      // Without routing in the environment the default is inherited again.
+      await db.update(environments).set({ envVars: { LOG_LEVEL: "debug" } }).where(eq(environments.id, environment!.id));
+      expect(hired(await send("Clean child")).runtimeConfig.aiConnection).toEqual(f.binding);
     });
   }
 

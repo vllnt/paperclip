@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { withProtectedBranchFacts } from "../services/github-protected-branches.js";
 import {
   attachGitHubCaller,
   classifyGitHubOperation,
@@ -238,7 +239,7 @@ describe("security review round 2c (attack regressions)", () => {
   it("N4: refuses git network options it cannot read, and a push never becomes a local command", () => {
     for (const args of [["push", "--push-o", "x", "https://github.com/o/r2", "HEAD:refs/heads/main"], ["push", "--rep=https://github.com/o/r2"], ["push", "-fx", "origin", "main"]]) {
       expect(classifyGitHubOperation({ program: "git", args, remote: origin, currentBranch: "main", touchesWorkflows: false }), args.join(" "))
-        .toMatchObject({ access: "write", denied: expect.stringContaining("does not know the git push option") });
+        .toMatchObject({ access: "write", denied: expect.stringContaining("does not know the git push option") }); // paperclip:allow-git-push: test input: the classifier must reject this push option
     }
     expect(classifyGitHubOperation({ program: "git", args: ["push", "-fo", "ci.skip", "origin", "HEAD:refs/heads/main"], remote: null, pushUrls: [origin], touchesWorkflows: false }))
       .toMatchObject({ access: "write", privileged: ["pushToMain"], repository: "anthm-fr/songtrivia" });
@@ -323,11 +324,16 @@ describe("security review round 3 (attack regressions)", () => {
 describe("security review round 4 (attack regressions)", () => {
   const origin = "https://github.com/Anthm-FR/songtrivia.git";
   it("N3: gh repo verbs without a repository argument are checked against the saved default and remotes, not only GH_REPO", () => {
-    for (const args of [["repo", "edit", "--description", "x"], ["repo", "archive", "--yes"], ["repo", "fork"], ["repo", "unarchive", "--yes"]]) {
+    for (const args of [["repo", "fork"], ["repo", "fork", "--clone=false"]]) {
       const classified = classifyGitHubOperation({ program: "gh", args, remote: origin, ghRepo: "Anthm-FR/anthm-fr", ghResolved: ["Anthm-FR/linkzic"] });
       expect(classified.denied, args.join(" ")).toMatch(/cannot tell which repository/);
       // Without a saved default, the remote counts as well.
       expect(classifyGitHubOperation({ program: "gh", args, remote: origin, ghRepo: "Anthm-FR/anthm-fr" }).denied, args.join(" ")).toMatch(/cannot tell which repository/);
+    }
+    // Archiving, unarchiving or editing a repository is refused whichever repository it names, for every company.
+    for (const args of [["repo", "edit", "--description", "x"], ["repo", "archive", "--yes"], ["repo", "unarchive", "--yes"]]) {
+      expect(classifyGitHubOperation({ program: "gh", args, remote: origin, ghRepo: "Anthm-FR/anthm-fr", ghResolved: ["Anthm-FR/linkzic"] }), args.join(" "))
+        .toMatchObject({ denied: expect.stringMatching(/^Denied: agents never/), integrity: true });
     }
     // GH_REPO and the checkout agree, or the repository is named: one repository.
     expect(classifyGitHubOperation({ program: "gh", args: ["repo", "edit", "--description", "x"], remote: origin, ghRepo: "Anthm-FR/songtrivia" })).toMatchObject({ repository: "anthm-fr/songtrivia" });
@@ -414,17 +420,31 @@ describe("security review round 5 (attack regressions)", () => {
     });
     const expected = { branch: "feature/x", tip: sha, files: workflowFiles, commits: workflowCommits, entries: workflowEntries };
 
-    it("keeps editWorkflows on the push and hands the plugin its one branch, the commits and the files", () => {
-      for (const args of [["push", "origin", "feature/x"], ["push"], ["push", "origin", "HEAD"], ["push", "-u", "origin", "HEAD:refs/heads/feature/x"], ["push", "origin", "refs/heads/feature/x"],
-        ["push", "--force-with-lease", "origin", "+feature/x"], ["push", "origin", "heads/feature/x"]]) {
-        const classified = push(args);
-        expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: expected });
-        expect(classified.denied, args.join(" ")).toBeUndefined();
-      }
+    const githubSaysFeatureXIsNeitherDefaultNorProtected = { repository: "acme/site", defaultBranch: "main", protection: new Map([["feature/x", false]]) };
+
+    it("keeps editWorkflows on the push and hands the plugin its one branch, the commits and the files", async () => {
+      await withProtectedBranchFacts(githubSaysFeatureXIsNeitherDefaultNorProtected, async () => {
+        for (const args of [["push", "origin", "feature/x"], ["push"], ["push", "origin", "HEAD"], ["push", "-u", "origin", "HEAD:refs/heads/feature/x"], ["push", "origin", "refs/heads/feature/x"],
+          ["push", "--force-with-lease", "origin", "+feature/x"], ["push", "origin", "heads/feature/x"]]) {
+          const classified = push(args);
+          expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: expected });
+          expect(classified.denied, args.join(" ")).toBeUndefined();
+        }
+      });
       // A push to another branch name is that branch.
       expect(push(["push", "origin", "HEAD:refs/heads/release/1.2"])).toMatchObject({ workflowPush: { ...expected, branch: "release/1.2" } });
       // A push that only moves the branch to an existing commit has no new commit to list.
       expect(push(["push", "--force", "origin", "feature/x"], { workflowCommits: [], workflowEntries: [sha] })).toMatchObject({ workflowPush: { ...expected, commits: [], entries: [sha] } });
+    });
+
+    it("keeps the workflow branch of a forced push, which is refused until GitHub's answer on that branch is read", async () => {
+      const args = ["push", "--force-with-lease", "origin", "+feature/x"];
+      const unread = push(args);
+      expect(unread).toMatchObject({ privileged: ["editWorkflows"], workflowPush: expected, branchRewrites: ["feature/x"] });
+      expect(unread.denied).toMatch(/could not read from GitHub whether feature\/x is the default or a protected branch of acme\/site/);
+      const protectedOne = { ...githubSaysFeatureXIsNeitherDefaultNorProtected, protection: new Map([["feature/x", true]]) };
+      const protectedPush = await withProtectedBranchFacts(protectedOne, async () => push(args));
+      expect(protectedPush.denied).toMatch(/feature\/x is a protected branch of acme\/site/);
     });
 
     it("offers nothing the plugin could check when the push is not exactly one commit to one named branch, or the report is partial", () => {
@@ -491,5 +511,42 @@ describe("security review round 5 (attack regressions)", () => {
         expect(calls[1]).not.toHaveProperty("workflowPush");
       } finally { registerGitHubWriteIdentityWorkers(null); }
     });
+  });
+});
+
+describe("destructive branch operations with an incomplete report (review round 3)", () => {
+  const remote = "https://github.com/acme/site.git";
+  const clean = { currentBranch: "feature", touchesWorkflows: false };
+  const refused = /^Denied: .*never delete or force-push a default or protected branch.*could not tell which repository/s;
+
+  it.each([
+    ["force push without remote or pushUrls", ["push", "origin", "--force", "release"]],
+    ["delete push without remote or pushUrls", ["push", "origin", "--delete", "release"]],
+    ["colon delete refspec without remote", ["push", "origin", ":release"]],
+    ["plus refspec without remote", ["push", "origin", "+HEAD:release"]],
+    ["force-with-lease without remote", ["push", "--force-with-lease", "origin", "release"]],
+  ])("refuses a %s", (_name, args) => {
+    const classified = classifyGitHubOperation({ program: "git", args, ...clean });
+    expect(classified).toMatchObject({ access: "write", repository: null, integrity: true });
+    expect(classified.denied).toMatch(refused);
+  });
+
+  it("refuses a rewrite whose report names a remote Paperclip cannot resolve, or a null remote and empty pushUrls", () => {
+    for (const operation of [
+      { program: "git" as const, args: ["push", "origin", "--force", "release"], remote: null, pushUrls: [], ...clean },
+      { program: "git" as const, args: ["push", "origin", "--force", "release"], remote: null, ...clean },
+      { program: "gh" as const, args: ["api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/release"], remote: null },
+      { program: "gh" as const, args: ["repo", "sync", "--force", "--branch", "release"], remote: null },
+    ]) {
+      expect(classifyGitHubOperation(operation).denied, operation.args.join(" ")).toMatch(/Denied: /);
+    }
+  });
+
+  it("keeps complete reports and plain pushes working, and refuses a rewrite to a target that only looks like a local path", () => {
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "origin", "--force", "release"], remote, pushUrls: [remote], ...clean }))
+      .toMatchObject({ repository: "acme/site", branchRewrites: ["release"] });
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "origin", "feature"], ...clean }).denied).toBeUndefined();
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "--force-with-lease", "release"], remote: null, ...clean }).denied).toMatch(refused);
+    expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "release"], remote: null, ...clean }).denied).toBeUndefined();
   });
 });

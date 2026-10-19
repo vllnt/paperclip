@@ -5,12 +5,24 @@ import {
   ENVIRONMENT_LEASE_STATUSES,
   ENVIRONMENT_STATUSES,
 } from "../constants.js";
+import { commaSeparatedEnumQuerySchema } from "./query.js";
 import { envConfigSchema } from "./secret.js";
 
 export const environmentDriverSchema = z.enum(ENVIRONMENT_DRIVERS);
 export const environmentStatusSchema = z.enum(ENVIRONMENT_STATUSES);
 export const environmentLeaseStatusSchema = z.enum(ENVIRONMENT_LEASE_STATUSES);
 export const environmentLeaseCleanupStatusSchema = z.enum(ENVIRONMENT_LEASE_CLEANUP_STATUSES);
+
+/** Lease statuses listed by `GET /api/companies/:companyId/environment-leases` when `status` is omitted. */
+export const COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES = ["active", "pending_cleanup"] as const;
+
+export const listEnvironmentLeasesQuerySchema = z.object({
+  status: commaSeparatedEnumQuerySchema(ENVIRONMENT_LEASE_STATUSES).describe(
+    "Comma-separated lease statuses: active, released, expired, failed, retained, pending_cleanup. " +
+      "Omitted lists every status for an environment and active,pending_cleanup for a company.",
+  ),
+});
+export type ListEnvironmentLeasesQuery = z.infer<typeof listEnvironmentLeasesQuerySchema>;
 
 const environmentFields = {
   name: z.string().min(1),

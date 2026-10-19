@@ -1,6 +1,5 @@
 import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
-import os from "node:os";
 import path from "node:path";
 import {
   createTarballFromDirectory,
@@ -15,6 +14,7 @@ import {
   type WorkspaceDurableSeedPaths,
   type WorkspaceInboundMode,
 } from "./sandbox-managed-runtime.js";
+import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
@@ -433,7 +433,7 @@ export function createCommandManagedRuntimeClient(input: {
   // rides the shared `execute` seam.
   const fallbackSyncIn = async (operations: SandboxSyncOperation[]): Promise<SandboxSyncResult> => {
     const resultOperations: SandboxSyncResult["operations"] = [];
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-syncin-fallback-"));
+    const tempDir = await createPaperclipTempDir("paperclip-syncin-fallback-");
     try {
       for (const operation of operations) {
         let filesTransferred = 0;
@@ -498,7 +498,7 @@ export function createCommandManagedRuntimeClient(input: {
         });
       }
     } finally {
-      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+      await removePaperclipTempDir(tempDir).catch(() => undefined);
     }
     return { operations: resultOperations };
   };

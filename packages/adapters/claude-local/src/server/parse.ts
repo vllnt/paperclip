@@ -548,24 +548,29 @@ export function isClaudeTransientUpstreamError(input: {
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
 
+/**
+ * Classifies a provider quota failure from structured provider errors only:
+ * the `result` text of a terminal result event that Claude marked
+ * `is_error`, its `errors` entries, and a caller-supplied structured message
+ * such as an ACP failure title. Raw stdout and stderr are not read, because a
+ * task's tools can print any text there.
+ *
+ * @param input.parsed Claude's terminal result event.
+ * @param input.errorMessage A structured provider message, never process output.
+ * @returns True when Claude reported a usage or session limit.
+ */
 export function isClaudeProviderQuotaError(input: {
   parsed?: Record<string, unknown> | null;
-  stdout?: string | null;
-  stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
   const parsed = input.parsed ?? null;
   if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
-  const loginMeta = detectClaudeLoginRequired({
-    parsed,
-    stdout: input.stdout ?? "",
-    stderr: input.stderr ?? "",
-  });
-  if (loginMeta.requiresLogin) return false;
+  if (detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin) return false;
 
-  const haystack = buildClaudeTransientHaystack(input);
+  const errorFields = parsed && parsed.is_error !== true ? { errors: parsed.errors } : parsed;
+  const haystack = buildClaudeTransientHaystack({ errorMessage: input.errorMessage, parsed: errorFields });
   if (!haystack) return false;
   return CLAUDE_PROVIDER_QUOTA_RE.test(haystack);
 }

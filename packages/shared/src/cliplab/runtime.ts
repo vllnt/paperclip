@@ -10,6 +10,10 @@ export interface CharacterOptions {
 
 /** One renderer; no frame callbacks or pointer listeners while hidden. */
 export function createCharacter(target: HTMLElement, definition: Definition, options: CharacterOptions = {}) {
+  // Read before the canvas and renderer exist: some embedded webviews throw from matchMedia, and
+  // a throw after them would leave a half-built renderer and its canvas in `target`.
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)')
+  const coarse = window.matchMedia('(pointer: coarse)')
   const canvas = document.createElement('canvas')
   canvas.style.cssText = 'display:block;width:100%;height:100%;touch-action:pan-y;'
   canvas.setAttribute('aria-hidden', 'true')
@@ -19,8 +23,6 @@ export function createCharacter(target: HTMLElement, definition: Definition, opt
   let visible = false, destroyed = false, playing = true, tracking = false
   let gaze = centeredGaze(), goal = centeredGaze()
   const region = options.trackingScope === 'page' ? target.ownerDocument.documentElement : options.trackingRegion ?? target
-  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)')
-  const coarse = window.matchMedia('(pointer: coarse)')
   const canRun = () => !destroyed && visible && !document.hidden && !reduced.matches
   const render = () => renderer.render({ ...definition.character, followCursor: options.followCursor !== false, followRotation: options.followRotation !== false }, sampleDefinition(definition, animation, elapsed), { cursor: gaze, reducedMotion: reduced.matches }, gaze)
   const pointer = (event: PointerEvent) => { if (event.pointerType !== 'touch') goal = pointerGaze(event, target.getBoundingClientRect()) }

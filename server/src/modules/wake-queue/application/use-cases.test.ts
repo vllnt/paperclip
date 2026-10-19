@@ -120,6 +120,8 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
+    admitAutomationWake: vi.fn(async () => ({ hold: false as const })),
+    parkHeldAutomationWake: vi.fn(async () => undefined),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
     finalizePromotedWake: vi.fn(async (input) => runSummary(input.wakeId)),
     hasExistingExecutionPath: vi.fn(async () => false),
@@ -163,6 +165,7 @@ describe("releaseIssueExecution self-reblock guard", () => {
     run?: RunSnapshot;
     recentRuns?: number;
     anchorRunOnly?: boolean;
+    transaction?: Partial<WakeQueueTransaction>;
   }) {
     const queue = [input.candidate];
     const transaction = createFakeTransaction({
@@ -171,6 +174,7 @@ describe("releaseIssueExecution self-reblock guard", () => {
         return next && excludedWakeIds?.includes(next.id) ? null : next;
       }),
       countRecentSelfReblockWakeRuns: vi.fn(async () => input.recentRuns ?? 0),
+      ...input.transaction,
     });
     const release = createReleaseIssueExecution({
       issueLock: createFakeIssueLock(createFakeHost(), transaction, input.issue ?? ISSUE, input.run ?? RUN),
@@ -219,6 +223,38 @@ describe("releaseIssueExecution self-reblock guard", () => {
     expect(transaction.suppressSelfReblockDeferredWake).not.toHaveBeenCalled();
     expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
     expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+  });
+
+  it("admits a deferred automation wake through the window and stamps its admission time", async () => {
+    const admittedAt = new Date(NOW.getTime() + 5);
+    const { result, transaction } = await releaseWith({
+      candidate: wakeCandidate({ wakeReason: "issue_monitor_due", requestedByActorType: "system" }),
+      transaction: { admitAutomationWake: vi.fn(async () => ({ hold: false as const, admittedAt })) },
+    });
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.admitAutomationWake).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: AGENT.id, reason: "issue_monitor_due", issueId: ISSUE.id }),
+    );
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({ admittedAt }));
+  });
+
+  it("keeps a deferred automation wake in place while the window holds it", async () => {
+    const { result, transaction } = await releaseWith({
+      candidate: wakeCandidate({ wakeReason: "issue_monitor_due", requestedByActorType: "system" }),
+      transaction: { admitAutomationWake: vi.fn(async () => ({ hold: true as const, holdUntil: new Date(NOW.getTime() + 60_000) })) },
+    });
+    expect(result.outcome.kind).not.toBe("promoted");
+    expect(transaction.claimDeferredWakeForPromotion).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+  });
+
+  it("does not run window admission for a human-requested or non-automation wake", async () => {
+    const human = await releaseWith({
+      candidate: wakeCandidate({ wakeReason: "issue_monitor_due", requestedByActorType: "user" }),
+    });
+    expect(human.transaction.admitAutomationWake).not.toHaveBeenCalled();
+    const ordinary = await releaseWith({ candidate: wakeCandidate({ wakeReason: "issue_commented", requestedByActorType: "system" }) });
+    expect(ordinary.transaction.admitAutomationWake).not.toHaveBeenCalled();
   });
 
   it("promotes a non-owner's own re-block wake under the limit", async () => {

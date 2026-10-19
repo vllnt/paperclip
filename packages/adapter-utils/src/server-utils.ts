@@ -776,9 +776,16 @@ type PaperclipWakeRecovery = {
 export type PaperclipExternalChatProvider =
   "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "imessage-photon";
 
+type PaperclipWakeWait = {
+  note: string;
+  attempt: number | null;
+};
+
 type PaperclipWakePayload = {
   executionContinuation: ExecutionContinuationEnvelope | null;
   reason: string | null;
+  // The note of the wait (issue monitor) that woke the agent.
+  wait: PaperclipWakeWait | null;
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
@@ -1831,8 +1838,14 @@ export function normalizePaperclipWakePayload(
     return null;
   }
 
+  const waitRecord = parseObject(payload.wait);
+  const waitNote = asString(waitRecord.note, "").trim();
+  const waitAttempt = asNumber(waitRecord.attempt, 0);
   return {
     reason: asString(payload.reason, "").trim() || null,
+    wait: waitNote
+      ? { note: waitNote.slice(0, 600), attempt: waitAttempt > 0 ? Math.floor(waitAttempt) : null }
+      : null,
     executionContinuation: parseObject(payload.executionContinuation).version === 1 ? payload.executionContinuation as ExecutionContinuationEnvelope : null,
     recovery,
     issue,
@@ -2417,6 +2430,12 @@ function renderPaperclipWakePromptBody(
       : [];
   const wakeSummaryLines = [
     `- reason: ${normalized.reason ?? "unknown"}`,
+    ...(normalized.wait
+      ? [
+          `- wait note: ${normalized.wait.note}`,
+          ...(normalized.wait.attempt ? [`- wait check: ${normalized.wait.attempt}`] : []),
+        ]
+      : []),
     `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
     ...(hasWakeCommentBatch
       ? [
@@ -4717,13 +4736,21 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
-        const child = spawn(target.command, target.args, {
-          cwd: target.cwd ?? opts.cwd,
-          env: childEnv,
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-        }) as ChildProcessWithEvents;
+        let child: ChildProcessWithEvents;
+        try {
+          child = spawn(target.command, target.args, {
+            cwd: target.cwd ?? opts.cwd,
+            env: childEnv,
+            detached: process.platform !== "win32",
+            shell: false,
+            stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          }) as ChildProcessWithEvents;
+        } catch (err) {
+          // A synchronous spawn failure emits no "error" or "close" event, so
+          // remove the target's temp files (an SSH key) here.
+          void target.cleanup?.();
+          throw err;
+        }
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 

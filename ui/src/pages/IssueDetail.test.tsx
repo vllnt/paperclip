@@ -37,6 +37,7 @@ import {
   shouldScrollIssueDetailToTopOnNavigation,
 } from "./IssueDetail";
 import { queryKeys } from "../lib/queryKeys";
+import { LIVE_RUN_IDLE_POLL_MS } from "../lib/live-run-polling";
 import {
   armIssueDetailInboxQuickArchive,
   createIssueDetailLocationState,
@@ -89,6 +90,7 @@ const mockActivityApi = vi.hoisted(() => ({
 const mockHeartbeatsApi = vi.hoisted(() => ({
   get: vi.fn(),
   liveRunsForIssue: vi.fn(),
+  liveRunsForCompany: vi.fn(),
   activeRunForIssue: vi.fn(),
   cancel: vi.fn(),
 }));
@@ -1367,6 +1369,7 @@ describe("IssueDetail", () => {
     mockActivityApi.forIssue.mockResolvedValue([]);
     mockActivityApi.runsForIssue.mockResolvedValue([]);
     mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
     mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
     mockAgentsApi.list.mockResolvedValue([]);
     mockAccessApi.getCurrentBoardAccess.mockResolvedValue({
@@ -5452,6 +5455,92 @@ describe("IssueDetail", () => {
       "Draft follow-up message",
     );
     localStorage.removeItem("paperclip:issue-comment-draft:issue-1");
+  });
+
+  describe("run polling cadence", () => {
+    // These read the real `refetchInterval` of every live-runs observer the page
+    // mounts, so reverting a call site to a fixed 1 s / 3 s interval fails here.
+    function liveRunIntervals(): number[] {
+      const cache = queryClient.getQueryCache();
+      return cache.findAll({ queryKey: ["issues", "live-runs"] }).flatMap((query) =>
+        query.observers.map((observer) => {
+          const interval = observer.options.refetchInterval;
+          const resolved = typeof interval === "function" ? interval(query as never) : interval;
+          // `false` or unset means the observer never polls.
+          return typeof resolved === "number" ? resolved : Number.POSITIVE_INFINITY;
+        }),
+      );
+    }
+
+    async function mountIssue(issue: Issue, companyRuns: Array<{ id: string; issueId: string | null }> = []) {
+      mockIssuesApi.get.mockResolvedValue(issue);
+      mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue(companyRuns);
+      await act(async () => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+      await flushReact();
+      await flushReact();
+    }
+
+    it("polls an idle todo issue no faster than the safety cadence", async () => {
+      await mountIssue(createIssue({ status: "todo", executionRunId: null }));
+
+      const intervals = liveRunIntervals();
+      expect(intervals.length).toBeGreaterThan(0);
+      expect(intervals.every((interval) => interval === LIVE_RUN_IDLE_POLL_MS)).toBe(true);
+    });
+
+    it("polls fast while the issue is in_progress", async () => {
+      await mountIssue(createIssue({ status: "in_progress" }));
+
+      const intervals = liveRunIntervals();
+      expect(intervals.length).toBeGreaterThan(0);
+      expect(intervals.every((interval) => interval <= 3000)).toBe(true);
+    });
+
+    it("polls fast when the issue holds an execution run", async () => {
+      await mountIssue(createIssue({ status: "todo", executionRunId: "run-1" }));
+
+      expect(liveRunIntervals().every((interval) => interval <= 3000)).toBe(true);
+    });
+
+    it("polls fast when a non-assignee run is queued for the issue, though it is todo", async () => {
+      // The queued event carries no issueId; the company live-runs list does.
+      await mountIssue(createIssue({ status: "todo", executionRunId: null }), [
+        { id: "run-new", issueId: "issue-1" },
+      ]);
+
+      const intervals = liveRunIntervals();
+      expect(intervals.length).toBeGreaterThan(0);
+      expect(intervals.every((interval) => interval <= 3000)).toBe(true);
+    });
+
+    it.each([
+      ["todo", false],
+      ["in_progress", true],
+    ] as const)("hands the task panel the page's run-expected flag (%s -> %s)", async (status, expected) => {
+      // The mobile panel is the one the page mounts itself in this harness.
+      mockSidebarState.isMobile = true;
+      mockPanelState.panelVisible = false;
+      mockLocation.search = "?taskPlugin=vllnt.paperclip-github&taskRecord=1153792656%3Apull%3A6";
+      await mountIssue(createIssue({ status, originKind: "plugin:vllnt.paperclip-github:issue" }));
+
+      await waitForAssertion(() => {
+        expect(mockTaskSidePanelRender).toHaveBeenCalledWith(expect.objectContaining({ runExpected: expected }));
+      });
+    });
+
+    it("stays on the safety cadence when the company runs belong to other issues", async () => {
+      await mountIssue(createIssue({ status: "todo", executionRunId: null }), [
+        { id: "run-other", issueId: "issue-2" },
+      ]);
+
+      expect(liveRunIntervals().every((interval) => interval === LIVE_RUN_IDLE_POLL_MS)).toBe(true);
+    });
   });
 
   describe.each([false, true])("composer tree control (mobile=%s)", (isMobile) => {

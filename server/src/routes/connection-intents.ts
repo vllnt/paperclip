@@ -16,7 +16,8 @@ import { logActivity } from "../services/activity-log.js";
 import { accessService } from "../services/access.js";
 import type { heartbeatService } from "../services/heartbeat.js";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
-import { resolveGitHubCommitSignature, resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { CallerGaveUp, resolveGitHubCommitSignature } from "../services/github-operation-credentials.js";
+import { resolveGitHubOperationAccess } from "../services/github-operation-access.js";
 import { attachGitHubCaller, readGitHubOperation } from "../services/github-write-identity.js";
 
 function bearer(req: Request) {
@@ -59,7 +60,17 @@ export function runtimeConnectionIntentRoutes(db: Db) {
     const run = githubCapability(req);
     res.setHeader("Cache-Control", "no-store");
     // The agent and run come from the capability token above, never from the report.
-    res.json(await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation(req.body), run)));
+    // The launcher stops waiting after 10 seconds and asks again. Work for a connection that has closed is wasted, so the
+    // resolver stops before its expensive steps (the secret store, the plugin, GitHub) when the caller is gone.
+    const callerGone = new AbortController();
+    res.once("close", () => { if (!res.writableEnded) callerGone.abort(); });
+    try {
+      res.json(await resolveGitHubOperationAccess(db, run, attachGitHubCaller(readGitHubOperation(req.body), run), { signal: callerGone.signal }));
+    } catch (error) {
+      // Nobody is listening for the answer, and it is not a failure of the route.
+      if (error instanceof CallerGaveUp) return;
+      throw error;
+    }
   });
 
   // The managed git signing program sends each commit object here (tags are refused); the

@@ -10,8 +10,8 @@ vi.mock("../api/issues", () => ({
   },
 }));
 
-import { describe, expect, it, vi } from "vitest";
-import { QueryClient } from "@tanstack/react-query";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { __liveUpdatesTestUtils } from "./LiveUpdatesProvider";
 import { queryKeys } from "../lib/queryKeys";
 
@@ -157,6 +157,150 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     });
   });
 
+  it("collapses a burst of issue activity into one immediate and one trailing issue-list refresh", () => {
+    vi.useFakeTimers();
+    try {
+      const invalidations: unknown[] = [];
+      const queryClient = {
+        invalidateQueries: (input: unknown) => {
+          invalidations.push(input);
+        },
+        getQueryData: () => undefined,
+      };
+      const listRefreshes = () =>
+        invalidations.filter((input) =>
+          JSON.stringify(input) === JSON.stringify({ queryKey: queryKeys.issues.list("company-1") })).length;
+      const emit = (entityId: string) =>
+        __liveUpdatesTestUtils.invalidateActivityQueries(
+          queryClient as never,
+          "company-1",
+          { entityType: "issue", entityId, action: "issue.updated", details: null },
+          { userId: null, agentId: null },
+        );
+
+      emit("issue-1");
+      expect(listRefreshes()).toBe(1);
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.listMineByMe("company-1") });
+
+      // Agents keep working: many more events inside the window.
+      for (let index = 2; index <= 10; index += 1) {
+        vi.advanceTimersByTime(200);
+        emit(`issue-${index}`);
+      }
+      expect(listRefreshes()).toBe(1);
+      // Per-issue detail queries still refresh on every event.
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.detail("issue-10") });
+
+      vi.advanceTimersByTime(1_200);
+      expect(listRefreshes()).toBe(2);
+      // Activity keeps going in the next window: one more refresh at its end.
+      emit("issue-11");
+      vi.advanceTimersByTime(3_000);
+      expect(listRefreshes()).toBe(3);
+
+      // Once the activity stops, no further refreshes are scheduled.
+      vi.advanceTimersByTime(10_000);
+      expect(listRefreshes()).toBe(3);
+
+      // A later lone event refreshes immediately, then once more after the
+      // server's short list cache has expired, and then stops.
+      emit("issue-12");
+      expect(listRefreshes()).toBe(4);
+      vi.advanceTimersByTime(3_000);
+      expect(listRefreshes()).toBe(5);
+      vi.advanceTimersByTime(10_000);
+      expect(listRefreshes()).toBe(5);
+
+      // Another company is not held back by this company's window.
+      __liveUpdatesTestUtils.invalidateActivityQueries(
+        queryClient as never,
+        "company-2",
+        { entityType: "issue", entityId: "issue-x", action: "issue.updated", details: null },
+        { userId: null, agentId: null },
+      );
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.list("company-2") });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe("board column scoping", () => {
+    const columnKey = (status: string) => [
+      ...queryKeys.issues.boardColumns("company-1"),
+      status, "", "__all-projects__", {}, "compact", 200, "without-routine-executions",
+    ];
+    const seedBoard = () => {
+      const client = new QueryClient();
+      client.setQueryData(columnKey("todo"), [{ id: "issue-1" }]);
+      client.setQueryData(columnKey("in_progress"), [{ id: "issue-2" }]);
+      client.setQueryData(columnKey("done"), [{ id: "issue-3" }]);
+      client.setQueryData(queryKeys.issues.labels("company-1"), []);
+      return client;
+    };
+    const emit = (client: QueryClient, entityId: string, action = "issue.comment_added", details: unknown = null) =>
+      __liveUpdatesTestUtils.invalidateActivityQueries(
+        client,
+        "company-1",
+        { entityType: "issue", entityId, action, details },
+        { userId: null, agentId: null },
+      );
+    const listRefreshes = (invalidate: { mock: { calls: unknown[][] } }) =>
+      invalidate.mock.calls
+        .map(([filters]) => filters)
+        .filter((filters): filters is { queryKey: unknown[]; predicate?: (query: unknown) => boolean } =>
+          typeof filters === "object" && filters !== null && "queryKey" in filters
+          && JSON.stringify((filters as { queryKey: unknown }).queryKey) === JSON.stringify(queryKeys.issues.list("company-1")));
+    const refreshed = (client: QueryClient, filters: { predicate?: (query: never) => boolean }) =>
+      client.getQueryCache().getAll()
+        .filter((query) => (filters.predicate ? filters.predicate(query as never) : true))
+        .map((query) => String(query.queryKey[2] === "board-column" ? query.queryKey[3] : query.queryKey[2]))
+        .sort();
+
+    it("refreshes only the column holding the commented issue, and not the label catalog", () => {
+      vi.useFakeTimers();
+      try {
+        const client = seedBoard();
+        const invalidate = vi.spyOn(client, "invalidateQueries");
+        emit(client, "issue-1");
+        const [first] = listRefreshes(invalidate);
+        expect(first.predicate).toBeTypeOf("function");
+        expect(refreshed(client, first)).toEqual(["todo"]);
+        client.clear();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("covers every collapsed event in the trailing refresh, and widens to all for a status change", () => {
+      vi.useFakeTimers();
+      try {
+        const client = seedBoard();
+        const invalidate = vi.spyOn(client, "invalidateQueries");
+        emit(client, "issue-1");
+        vi.advanceTimersByTime(500);
+        emit(client, "issue-2");
+        emit(client, "issue-1", "issue.updated", { changes: { priority: { from: "low", to: "high" } } });
+        expect(listRefreshes(invalidate)).toHaveLength(1);
+
+        vi.advanceTimersByTime(2_500);
+        const [, trailing] = listRefreshes(invalidate);
+        expect(refreshed(client, trailing)).toEqual(["in_progress", "todo"]);
+
+        // The trailing refresh opened a new window: these two collapse into its
+        // trailing refresh, and the status change widens that one to every list.
+        emit(client, "issue-1");
+        emit(client, "issue-3", "issue.updated", { changes: { status: { from: "in_progress", to: "done" } }, status: "done" });
+        vi.advanceTimersByTime(3_000);
+        const refreshesNow = listRefreshes(invalidate);
+        expect(refreshesNow).toHaveLength(3);
+        expect(refreshesNow[2]).toEqual({ queryKey: queryKeys.issues.list("company-1") });
+        client.clear();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it("still refreshes comments when a comment activity event arrives", () => {
     const invalidations: unknown[] = [];
     const queryClient = {
@@ -164,6 +308,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         invalidations.push(input);
       },
       getQueryData: () => undefined,
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -591,6 +736,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
         invalidations.push(input);
       },
       getQueryData: () => undefined,
+      getQueriesData: () => [],
     };
 
     __liveUpdatesTestUtils.invalidateActivityQueries(
@@ -810,6 +956,7 @@ describe("LiveUpdatesProvider issue invalidation", () => {
       invalidateQueries: (input: unknown) => {
         invalidations.push(input);
       },
+      getQueriesData: () => [],
       getQueryData: (key: unknown) => {
         if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
           return {
@@ -1024,6 +1171,174 @@ describe("LiveUpdatesProvider issue invalidation", () => {
 
     expect(invalidated).toBe(false);
     expect(invalidations).toEqual([]);
+  });
+
+  function visibleIssueClient(invalidations: unknown[]) {
+    return {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
+          return {
+            id: "issue-1",
+            identifier: "PAP-759",
+            assigneeAgentId: "agent-1",
+          };
+        }
+        return undefined;
+      },
+      setQueryData: vi.fn(),
+    };
+  }
+
+  // Payloads as `server/src/services/heartbeat.ts` publishes them. A queued run
+  // and its queued->running claim carry no `issueId`; the progress event does.
+  const serverQueuedPayload = (agentId: string) => ({
+    runId: "run-new",
+    agentId,
+    invocationSource: "automation",
+    triggerDetail: "system",
+    wakeupRequestId: "wake-1",
+  });
+  const serverClaimStatusPayload = (agentId: string) => ({
+    runId: "run-new",
+    agentId,
+    status: "running",
+    invocationSource: "automation",
+    triggerDetail: "system",
+  });
+  const serverProgressPayload = (agentId: string, issueId: string) => ({
+    runId: "run-new",
+    agentId,
+    issueId,
+    phase: "tool_call",
+    message: "Running a tool",
+    currentToolName: "Bash",
+    lastAssistantSnippet: null,
+    lastEventAt: "2026-07-24T10:00:00.000Z",
+    updatedAt: "2026-07-24T10:00:00.000Z",
+  });
+
+  it("refreshes the visible issue on a progress event from a different agent that names the issue", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverProgressPayload("agent-2", "issue-1"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("PAP-759") });
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("issue-1") });
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.activeRun("PAP-759") });
+  });
+
+  it("matches the visible issue by its identifier as well", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverProgressPayload("agent-2", "PAP-759"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+  });
+
+  it("still ignores a run that names a different issue", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverProgressPayload("agent-2", "issue-2"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(false);
+    expect(invalidations).toEqual([]);
+  });
+
+  it("does not match a non-assignee run by its queued or claim event, which carry no issue", () => {
+    // The page covers this start through the company live-runs list instead
+    // (see the next test and `isRunExpectedOnIssue`).
+    for (const payload of [serverQueuedPayload("agent-2"), serverClaimStatusPayload("agent-2")]) {
+      const invalidations: unknown[] = [];
+      const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+        visibleIssueClient(invalidations) as never,
+        "/PAP/issues/PAP-759",
+        payload,
+        { isForegrounded: true },
+      );
+      expect(invalidated).toBe(false);
+      expect(invalidations).toEqual([]);
+    }
+  });
+
+  it("still matches the assignee's own queued run by agent", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverQueuedPayload("agent-1"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+  });
+
+  it("refetches the company live-runs list for a queued run it cannot patch", () => {
+    // `applyRunLifecycleToCompanyLiveRuns` returns false without a status, and
+    // the event handler then invalidates `liveRuns(companyId)`. The issue page
+    // reads that list to learn a non-assignee run started on its issue.
+    const client = { getQueryData: () => undefined, setQueryData: vi.fn() };
+
+    const patched = __liveUpdatesTestUtils.applyRunLifecycleToCompanyLiveRuns(
+      client as never,
+      "company-1",
+      serverQueuedPayload("agent-2"),
+    );
+
+    expect(patched).toBe(false);
+  });
+
+  describe("when the window is visible but not focused", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("still refreshes the open issue's run queries", () => {
+      vi.stubGlobal("document", { visibilityState: "visible", hasFocus: () => false });
+      const invalidations: unknown[] = [];
+
+      const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+        visibleIssueClient(invalidations) as never,
+        "/PAP/issues/PAP-759",
+        serverProgressPayload("agent-1", "issue-1"),
+      );
+
+      expect(invalidated).toBe(true);
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("PAP-759") });
+    });
+
+    it("does not refresh while the page is hidden", () => {
+      vi.stubGlobal("document", { visibilityState: "hidden", hasFocus: () => false });
+      const invalidations: unknown[] = [];
+
+      const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+        visibleIssueClient(invalidations) as never,
+        "/PAP/issues/PAP-759",
+        serverProgressPayload("agent-1", "issue-1"),
+      );
+
+      expect(invalidated).toBe(false);
+      expect(invalidations).toEqual([]);
+    });
   });
 });
 
@@ -1626,5 +1941,54 @@ describe("task subtree notification context", () => {
   });
   it("suppresses the run shown on its own run detail page", () => {
     expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/agents/alex/runs/child-run", { runId: "child-run" }, { isForegrounded: true })).toBe(true);
+  });
+});
+
+describe("LiveUpdatesProvider reconcile after a gap", () => {
+  it.each([
+    ["health", queryKeys.health, false],
+    ["session", queryKeys.auth.session, false],
+    ["general settings", queryKeys.instance.generalSettings, false],
+    ["experimental settings", queryKeys.instance.experimentalSettings, false],
+    ["adapters", queryKeys.adapters.all, true],
+    ["sidebar order", queryKeys.sidebarPreferences.companyOrder("user-1"), false],
+    ["board access", queryKeys.access.currentBoardAccess, false],
+    ["staging commit", queryKeys.stagingCommit, false],
+    ["cloud stacks", queryKeys.cloud.stacks, false],
+    ["issue detail", queryKeys.issues.detail("PAP-1"), true],
+    ["dashboard", queryKeys.dashboard("company-1"), true],
+    ["company live runs", queryKeys.liveRuns("company-1"), true],
+    ["company list", queryKeys.companies.all, true],
+    ["plugin contributions", queryKeys.plugins.uiContributions, true],
+    ["resource memberships", queryKeys.resourceMemberships.mine("company-1"), true],
+    ["sidebar badges", queryKeys.sidebarBadges("company-1"), true],
+    ["other access data", queryKeys.access.invite("token"), true],
+    ["a key nobody listed", ["a-new-feature", "x"], true],
+  ])("%s: reconciled = %s", (_name, queryKey, reconciled) => {
+    expect(__liveUpdatesTestUtils.shouldReconcileActiveQuery({ queryKey })).toBe(reconciled);
+  });
+
+  it("refetches live-affected active queries and skips instance-level ones", async () => {
+    const client = new QueryClient();
+    const readHealth = vi.fn(async () => "health");
+    const readIssue = vi.fn(async () => "issue");
+    const readBoardAccess = vi.fn(async () => "access");
+    const unsubscribe = [
+      new QueryObserver(client, { queryKey: queryKeys.health, queryFn: readHealth }),
+      new QueryObserver(client, { queryKey: queryKeys.issues.detail("PAP-1"), queryFn: readIssue }),
+      new QueryObserver(client, { queryKey: queryKeys.access.currentBoardAccess, queryFn: readBoardAccess }),
+    ].map((observer) => observer.subscribe(() => undefined));
+    await vi.waitFor(() => {
+      expect(readIssue).toHaveBeenCalledTimes(1);
+      expect(client.isFetching()).toBe(0);
+    });
+
+    await client.invalidateQueries(__liveUpdatesTestUtils.RECONCILE_ACTIVE_QUERIES, { cancelRefetch: false });
+
+    expect(readIssue).toHaveBeenCalledTimes(2);
+    expect(readHealth).toHaveBeenCalledTimes(1);
+    expect(readBoardAccess).toHaveBeenCalledTimes(1);
+    unsubscribe.forEach((stop) => stop());
+    client.clear();
   });
 });
