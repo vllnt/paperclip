@@ -58,7 +58,8 @@ async function seed(db: Db) {
       companyId: company!.id,
       name: "Builder",
       role: "general",
-      adapterType: "process",
+      // Upstream refuses agent keys any process adapter config change; agents here must be able to merge-patch themselves.
+      adapterType: "http",
       adapterConfig: {
         command: "echo",
         promptTemplate: "Do the work",
@@ -252,7 +253,7 @@ describeEmbeddedPostgres("PATCH /api/agents/:id with mergeConfig", () => {
     const { company, agent } = await seed(db);
     const res = await request(createApp(db, boardKeyActor(company.id)))
       .patch(`/api/agents/${agent.id}`)
-      .send({ mergeConfig: true, adapterType: "process", adapterConfig: { promptTemplate: "Same adapter" } });
+      .send({ mergeConfig: true, adapterType: "http", adapterConfig: { promptTemplate: "Same adapter" } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect((await storedAgent(db, agent.id)).adapterConfig).toMatchObject({ promptTemplate: "Same adapter" });
@@ -283,7 +284,7 @@ describeEmbeddedPostgres("PATCH /api/agents/:id with mergeConfig", () => {
     const app = createApp(db, boardKeyActor(company.id));
     for (const body of [
       { mergeConfig: true, replaceAdapterConfig: true, adapterConfig: { command: "true" } },
-      { mergeConfig: true, adapterType: "http", adapterConfig: { url: "https://example.test" } },
+      { mergeConfig: true, adapterType: "process", adapterConfig: { command: "true" } },
     ]) {
       const res = await request(app).patch(`/api/agents/${agent.id}`).send(body);
       expect(res.status, JSON.stringify(res.body)).toBe(422);
