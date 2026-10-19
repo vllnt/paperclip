@@ -1,7 +1,9 @@
 import type { AutomationWakeSettings } from "../automation-wake.js";
 import type { EventGrouping, EventMatch } from "../event-sources.js";
 import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
+import type { RoutineGate, RoutineGateResult } from "../routine-gate.js";
 import type { RunContextPolicy } from "../run-context.js";
+import type { TransientRetryPolicy } from "../transient-retry-policy.js";
 import type {
   IssueOriginKind,
   IssuePriority,
@@ -89,12 +91,15 @@ export interface Routine {
   catchUpPolicy: string;
   activityGatePolicy: string;
   activityGateScope: string;
+  transientRetryPolicy?: TransientRetryPolicy;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
   automationWakeSettings?: AutomationWakeSettings;
   routineNoopSkipSettings?: RoutineNoopSkipSettings;
+  /** A deterministic pre-wake script; see `RoutineGate`. Board-writable only. */
+  gate?: RoutineGate | null;
   runContextPolicy?: RunContextPolicy | null;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
@@ -143,6 +148,8 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   env: RoutineEnvConfig | null;
   runContextPolicy?: RunContextPolicy;
   responsibleUserId: string | null;
+  /** Present only on gated routines. */
+  gate?: RoutineGate | null;
 }
 
 export interface RoutineRevisionSnapshotTriggerV1 {
@@ -241,6 +248,8 @@ export interface RoutineRun {
   linkedIssueId: string | null;
   coalescedIntoRunId: string | null;
   failureReason: string | null;
+  /** What the routine's gate script did for this run; absent for ungated runs. */
+  gateResult?: RoutineGateResult | null;
   completedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;

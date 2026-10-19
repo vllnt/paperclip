@@ -8,6 +8,7 @@ import { usePanel } from "../context/PanelContext";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
+import { useToastActions } from "../context/ToastContext";
 import { queryKeys } from "../lib/queryKeys";
 import { GoalProperties } from "../components/GoalProperties";
 import { GoalTree } from "../components/GoalTree";
@@ -19,7 +20,7 @@ import { cn, projectUrl } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Plus, SlidersHorizontal } from "lucide-react";
-import type { Goal, Project } from "@paperclipai/shared";
+import { GOAL_TEXT_MAX_LENGTH, type Goal, type Project } from "@paperclipai/shared";
 
 interface GoalPropertiesToggleButtonProps {
   panelVisible: boolean;
@@ -53,6 +54,7 @@ export function GoalDetail() {
   const { openPanel, closePanel, panelVisible, setPanelVisible } = usePanel();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
+  const { pushToast } = useToastActions();
 
   const {
     data: goal,
@@ -85,6 +87,9 @@ export function GoalDetail() {
   const updateGoal = useMutation({
     mutationFn: (data: Record<string, unknown>) =>
       goalsApi.update(goalId!, data),
+    onError: (error: Error) => {
+      pushToast({ title: "Goal not saved", body: error.message, tone: "error" });
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.goals.detail(goalId!)
@@ -128,7 +133,7 @@ export function GoalDetail() {
       openPanel(
         <GoalProperties
           goal={goal}
-          onUpdate={(data) => updateGoal.mutate(data)}
+          onUpdate={(data) => updateGoal.mutateAsync(data)}
         />
       );
     }
@@ -158,6 +163,7 @@ export function GoalDetail() {
         <InlineEditor
           value={goal.title}
           onSave={(title) => updateGoal.mutate({ title })}
+          maxLength={GOAL_TEXT_MAX_LENGTH}
           as="h2"
           className="text-xl font-bold"
         />

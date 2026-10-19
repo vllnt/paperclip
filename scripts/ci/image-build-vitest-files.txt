@@ -1,6 +1,7 @@
 cli/src/__tests__/agent-lifecycle.test.ts
 # Vitest files required before building the production image.
 # One path per line; blank lines and comments are ignored.
+cli/src/__tests__/archive-export.test.ts
 cli/src/__tests__/routine-list-filters.test.ts
 cli/src/__tests__/agent-config.test.ts
 cli/src/__tests__/convex.test.ts
@@ -43,7 +44,9 @@ packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts
 packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
+packages/shared/src/company-archive.test.ts
 packages/shared/src/company-environment-defaults.test.ts
+packages/shared/src/routine-gate.test.ts
 packages/shared/src/validators/routine-list-query.test.ts
 server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
@@ -59,6 +62,13 @@ server/src/__tests__/periodic-heartbeat-recovery.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
 server/src/modules/run-dispatch/domain/policy.test.ts
+server/src/__tests__/routine-gate-command.test.ts
+server/src/__tests__/routine-gate-outcome.test.ts
+server/src/__tests__/routine-gate-source.test.ts
+server/src/__tests__/routine-gate-worker.test.ts
+server/src/__tests__/run-log-chunk-compactor.test.ts
+server/src/__tests__/run-log-redaction-policy.test.ts
+server/src/__tests__/run-read-redaction-text.test.ts
 server/src/__tests__/ssh-run-directory-reaper-settings.test.ts
 server/src/services/heartbeat-remote-run-temp.test.ts
 server/src/shutdown-budget.test.ts
@@ -67,6 +77,7 @@ ui/src/components/AgentCharacterRuntime.test.ts
 ui/src/components/BuiltInBundlePanel.test.tsx
 ui/src/components/CommandPalette.real.test.tsx
 ui/src/components/CommandPalette.test.tsx
+ui/src/components/CompanyDataExportPanel.test.tsx
 ui/src/components/IssueFiltersPopover.test.tsx
 ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
 ui/src/components/RoutineListFilters.test.tsx

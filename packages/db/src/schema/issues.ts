@@ -121,6 +121,12 @@ export const issues = pgTable(
     originIdx: index("issues_company_origin_idx").on(table.companyId, table.originKind, table.originId),
     projectWorkspaceIdx: index("issues_company_project_workspace_idx").on(table.companyId, table.projectWorkspaceId),
     executionWorkspaceIdx: index("issues_company_execution_workspace_idx").on(table.companyId, table.executionWorkspaceId),
+    // The issue execution lock finds every issue a run still holds by these two
+    // columns. Operators first added them by hand under these names.
+    opsExecutionRunIdx: index("ops_issues_execution_run_id_idx").on(table.executionRunId)
+      .where(sql`${table.executionRunId} is not null`),
+    opsCheckoutRunIdx: index("ops_issues_checkout_run_id_idx").on(table.checkoutRunId)
+      .where(sql`${table.checkoutRunId} is not null`),
     dueMonitorIdx: index("issues_company_monitor_due_idx").on(table.companyId, table.monitorNextCheckAt),
     companyUpdatedIdx: index("issues_company_updated_idx").on(table.companyId, table.updatedAt),
     companyCreatedIdx: index("issues_company_created_idx").on(table.companyId, table.createdAt),

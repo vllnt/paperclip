@@ -2304,6 +2304,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           status: input.status ?? "planned",
           parentId: input.parentId ?? null,
           ownerAgentId: input.ownerAgentId ?? null,
+          kind: "goal",
+          horizon: null,
+          targetDate: null,
+          successCriteria: null,
           createdAt: now,
           updatedAt: now,
         };
@@ -2314,6 +2318,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "goals.update");
         const record = goals.get(goalId);
         if (!isInCompany(record, companyId)) throw new Error(`Goal not found: ${goalId}`);
+        // Same rule as the host: the company focus shows these goals to every agent.
+        if (record.horizon === "short" || record.kind === "milestone") {
+          throw new Error("Only the board can change or delete a short term goal or a milestone");
+        }
         const updated: Goal = {
           ...record,
           ...patch,
