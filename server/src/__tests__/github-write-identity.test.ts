@@ -238,7 +238,7 @@ describe("security review round 2c (attack regressions)", () => {
   it("N4: refuses git network options it cannot read, and a push never becomes a local command", () => {
     for (const args of [["push", "--push-o", "x", "https://github.com/o/r2", "HEAD:refs/heads/main"], ["push", "--rep=https://github.com/o/r2"], ["push", "-fx", "origin", "main"]]) {
       expect(classifyGitHubOperation({ program: "git", args, remote: origin, currentBranch: "main", touchesWorkflows: false }), args.join(" "))
-        .toMatchObject({ access: "write", denied: expect.stringContaining("does not know the git push option") });
+        .toMatchObject({ access: "write", denied: expect.stringContaining("does not know the git push option") }); // paperclip:allow-git-push: test input: the classifier must reject this push option
     }
     expect(classifyGitHubOperation({ program: "git", args: ["push", "-fo", "ci.skip", "origin", "HEAD:refs/heads/main"], remote: null, pushUrls: [origin], touchesWorkflows: false }))
       .toMatchObject({ access: "write", privileged: ["pushToMain"], repository: "anthm-fr/songtrivia" });

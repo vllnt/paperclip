@@ -67,6 +67,9 @@ import { environmentService } from "./services/environments.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
+import { issueDuplicateRoutes } from "./routes/issue-duplicates.js";
+import { createDuplicateDetection } from "./services/duplicate-detection-factory.js";
+import { setIssueCreatedListener } from "./services/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
 import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
@@ -86,6 +89,7 @@ import {
 } from "./routes/chat-channels.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
 import { costRoutes } from "./routes/costs.js";
+import { observabilityRoutes } from "./routes/observability.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { attentionRoutes } from "./routes/attention.js";
@@ -180,6 +184,7 @@ import {
 } from "./http/body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
+import { precompressedStatic } from "./middleware/precompressed-static.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
 
@@ -790,6 +795,7 @@ export async function createApp(
     process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST ??
     null;
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(observabilityRoutes(db));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(attentionRoutes(db));
@@ -839,6 +845,9 @@ export async function createApp(
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
+  const duplicateDetection = createDuplicateDetection(db);
+  setIssueCreatedListener((event) => void duplicateDetection.checkAfterCreate(event));
+  api.use(issueDuplicateRoutes(db, duplicateDetection));
   api.use(issueRoutes(db, opts.storageService, {
     chatRunRetries: chatChannels,
     feedbackExportService: opts.feedbackExportService,
@@ -983,10 +992,14 @@ export async function createApp(
     );
     if (uiDist) {
       // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>)
-      // never change once built, so they can be cached aggressively.
+      // never change once built, so they can be cached aggressively. The UI
+      // build writes .br and .gz siblings next to each script and stylesheet;
+      // serve those to clients that accept them instead of the plain file.
+      const assetsDir = path.join(uiDist, "assets");
       app.use(
         "/assets",
-        express.static(path.join(uiDist, "assets"), {
+        precompressedStatic(assetsDir, { maxAge: "1y", immutable: true }),
+        express.static(assetsDir, {
           maxAge: "1y",
           immutable: true,
         }),

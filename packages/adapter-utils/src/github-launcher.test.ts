@@ -364,7 +364,7 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     await run("git", "init");
     await run("git", "remote", "add", "origin", "https://github.com/vllnt/paperclip.git");
     await run("git", "-c", "user.name=A", "-c", "user.email=a@example.test", "commit", "--allow-empty", "-m", "x");
-    await run("git", "push", "https://github.com/acme/elsewhere.git", "HEAD");
+    await run("git", "push", "https://github.com/acme/elsewhere.git", "HEAD"); // paperclip:allow-git-push: test input for the launcher's push policy
     await run("git", "status");
     await run("gh", "pr", "create", "-R", "acme/explicit");
     await run("gh", "issue", "comment", "1", "--body", "hi");
@@ -434,12 +434,12 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
     await writeFile(path.join(f.repo, "app.ts"), "x\n");
     git("add", "app.ts"); git("commit", "-m", "app");
     git("tag", "engine@1.4.0");
-    await f.run("git", ["push", "origin", "feature/x"]);
-    await f.run("git", ["push", "origin", "engine@1.4.0"]);
+    await f.run("git", ["push", "origin", "feature/x"]); // paperclip:allow-git-push: test input for the launcher's push policy
+    await f.run("git", ["push", "origin", "engine@1.4.0"]); // paperclip:allow-git-push: test input for the launcher's push policy
     await mkdir(path.join(f.repo, ".github", "workflows"), { recursive: true });
     await writeFile(path.join(f.repo, ".github", "workflows", "ci.yml"), "on: push\n");
     git("add", "."); git("commit", "-m", "ci");
-    await f.run("git", ["push"]);
+    await f.run("git", ["push"]); // paperclip:allow-git-push: test input for the launcher's push policy
     await f.run("git", ["fetch", "origin"]);
     await f.run("gh", ["pr", "view", "1"]);
     // A push reported free of workflow changes is read against the refs GitHub lists before it runs. GitHub cannot be read
@@ -470,7 +470,7 @@ require('node:fs').appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args:
       /** The remote branch now has everything up to this ref (as after a fetch or an accepted push). */
       const remote = (ref: string, branch: string) => git("update-ref", `refs/remotes/origin/${branch}`, sha(ref));
       git("init", "-b", "main");
-      git("remote", "add", "origin", "https://github.com/Anthm-FR/songtrivia.git");
+      git("remote", "add", "origin", "https://github.com/Example-Org/app.git");
       await write(ci, "on: push\n");
       await write(`${W}/release.yml`, "on: release\n");
       await write("app.ts", "x\n");
@@ -1970,7 +1970,7 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), { stdi
     const refused = await f.run("gh", ["pr", "create", "--fill"]);
     expect(refused.code).toBe(1);
     expect(refused.stderr).toContain("GitHub refused this command: This is a privileged GitHub action (tagPush)");
-    const push = await f.run("git", ["push", "origin", "v1"]);
+    const push = await f.run("git", ["push", "origin", "v1"]); // paperclip:allow-git-push: test input for the launcher's push policy
     expect(push.code).toBe(1);
     expect(push.stderr).toContain("It does not run with any other GitHub credential");
     // A refused read still runs, without credentials.
@@ -2027,7 +2027,7 @@ require('node:fs').appendFileSync(${JSON.stringify(seen)}, JSON.stringify({ host
     git("remote", "set-url", "--push", "origin", "https://github.com/Anthm-FR/songtrivia.git");
     await f.run("git", ["fetch", "origin"]);
     expect(f.requests.at(-1)!.body.operation).toMatchObject({ args: ["fetch", "origin"], remote: "https://evil.invalid/Anthm-FR/songtrivia.git" });
-    await f.run("git", ["push", "origin", "main"]);
+    await f.run("git", ["push", "origin", "main"]); // paperclip:allow-git-push: test input for the launcher's push policy
     expect(f.requests.at(-1)!.body.operation).toMatchObject({ args: ["push", "origin", "main"], remote: "https://github.com/Anthm-FR/songtrivia.git" });
   }, 30_000);
 
@@ -2173,7 +2173,7 @@ require('node:fs').appendFileSync(${JSON.stringify(seen)}, JSON.stringify(proces
     git(f.repo, "commit", "-m", "bump sub");
     for (const [key, value] of [["submodule.recurse", "true"], ["push.recurseSubmodules", "on-demand"], ["protocol.file.allow", "always"]]) git(f.repo, "config", key, value!);
     git(path.join(f.repo, "sub"), "config", "protocol.file.allow", "always");
-    const pushed = await f.run("git", ["push", "origin", "HEAD:refs/heads/feature"]);
+    const pushed = await f.run("git", ["push", "origin", "HEAD:refs/heads/feature"]); // paperclip:allow-git-push: test input for the launcher's push policy
     expect(pushed.code, pushed.stderr).toBe(0);
     expect(() => execFileSync("git", ["cat-file", "-e", `${secret}^{commit}`], { cwd: subRemote, env: plain, stdio: "ignore" })).toThrow();
     expect((await f.run("git", ["config", "--get", "push.recurseSubmodules"])).stdout.trim()).toBe("no");
