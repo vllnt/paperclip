@@ -126,6 +126,25 @@ export function onboardingSeedService(db: Db) {
       .then((rows) => rows.length > 0);
   }
 
+  /** The goal a mission updates: the one this seed recorded if it still exists, else the company's default goal. */
+  async function missionTargetGoalId(dbx: Db, companyId: string, recordedGoalId: string | null) {
+    return (await goalStillExists(dbx, companyId, recordedGoalId))
+      ? recordedGoalId
+      : (await goalService(dbx).getDefaultCompanyGoal(companyId))?.id ?? null;
+  }
+
+  /**
+   * The hire commits before the content transaction, so a mission write the goal service would refuse
+   * must be refused before it: otherwise a refused seed would still leave the hired agent behind.
+   */
+  async function assertMissionWritable(dbx: Db, companyId: string, seed: ApplyOnboardingSeed, writer: GoalWriter) {
+    if (writer === "board" || !seed.mission?.trim()) return;
+    const existing = await readRecord(dbx, companyId);
+    if (existing?.revision === seed.revision) return;
+    const target = await missionTargetGoalId(dbx, companyId, existing?.goalId ?? null);
+    if (target) await goalService(dbx).assertWritable(target, writer);
+  }
+
   /**
    * The agent a re-push should update rather than duplicate: the one this
    * seed created if it is still around, else a pre-existing lead the tenant
@@ -252,9 +271,7 @@ export function onboardingSeedService(db: Db) {
     let goalId = existing?.goalId ?? null;
     if (mission) {
       const parsed = parseSeedMission(mission);
-      const target = (await goalStillExists(dbx, companyId, goalId))
-        ? goalId
-        : (await goalSvc.getDefaultCompanyGoal(companyId))?.id ?? null;
+      const target = await missionTargetGoalId(dbx, companyId, goalId);
       if (target) {
         await goalSvc.update(target, {
           title: parsed.title,
@@ -368,13 +385,15 @@ export function onboardingSeedService(db: Db) {
 
     const database = db;
     const lockKey = `paperclip:onboarding-seed:${companyId}`;
+    // Cloud pushes as the board. Anyone else is held to the goal service's company focus rule.
+    const writer: GoalWriter = audit?.actorType === "user" ? "board" : "agent";
     return withDedicatedDbConnection(db, lockDb => lockDb.transaction(async lock => {
       await lock.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      await assertMissionWritable(database, companyId, seed, writer);
       const preparedAgentId = await prepareAgent(database, companyId, seed, audit);
       const result = await database.transaction(async (tx) => {
         const dbx = tx as unknown as Db;
-        // Cloud pushes as the board. Anyone else is held to the goal service's company focus rule.
-        const applied = await applyWithin(dbx, companyId, seed, preparedAgentId, audit?.actorType === "user" ? "board" : "agent");
+        const applied = await applyWithin(dbx, companyId, seed, preparedAgentId, writer);
 
         if (applied.changed && audit) {
           await logActivity(
