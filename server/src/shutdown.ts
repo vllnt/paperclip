@@ -454,7 +454,7 @@ export async function runBoundedShutdown(input: {
     maxMs: number,
     work: (signal: AbortSignal) => Promise<unknown>,
     afterTimeout: "await" | "keep" | "abandon" = "abandon",
-  ): Promise<{ pending: Promise<unknown> | null }> => {
+  ): Promise<{ pending: Promise<unknown> | null; outcome: ShutdownStepOutcome }> => {
     currentStep = step;
     const stepStartedAt = Date.now();
     const limitMs = Math.max(0, Math.min(maxMs, remainingMs()));
@@ -487,7 +487,7 @@ export async function runBoundedShutdown(input: {
       if (outcome === "done") log.info(fields, "shutdown step finished");
       else log.error(fields, "shutdown step finished");
     }
-    return { pending };
+    return { pending, outcome };
   };
 
   // New work is refused at once: the new-work endpoints answer 503 and run
@@ -521,10 +521,10 @@ export async function runBoundedShutdown(input: {
   });
   await runStep("run_log_flush", RUN_LOG_FLUSH_MAX_MS, steps.flushRunLogMirrors);
   await runStep("http_listener_close", HTTP_LISTENER_CLOSE_MAX_MS + 1_000, steps.closeHttpListener);
-  await runStep("teardown", Number.POSITIVE_INFINITY, steps.finalize);
+  const teardown = await runStep("teardown", Number.POSITIVE_INFINITY, steps.finalize);
 
   if (hardDeadline) clearTimeout(hardDeadline);
-  exit("complete");
+  exit(teardown.outcome === "timed_out" ? "hard_deadline" : "complete");
 }
 
 const COORDINATED_SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM"] as const;

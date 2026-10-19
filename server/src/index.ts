@@ -1615,7 +1615,9 @@ async function startServerWithDatabaseTeardown(
           reconciled.continuationRequeued > 0 ||
           reconciled.successfulRunHandoffEscalated > 0 ||
           reconciled.successfulRunHandoffRetried > 0 ||
-          reconciled.escalated > 0
+          reconciled.escalated > 0 ||
+          reconciled.dispatchDeferredForCapacity > 0 ||
+          reconciled.failed > 0
         ) {
           logger.warn(
             { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
@@ -1859,7 +1861,9 @@ async function startServerWithDatabaseTeardown(
                 reconciled.continuationRequeued > 0 ||
                 reconciled.successfulRunHandoffEscalated > 0 ||
                 reconciled.successfulRunHandoffRetried > 0 ||
-                reconciled.escalated > 0
+                reconciled.escalated > 0 ||
+                reconciled.dispatchDeferredForCapacity > 0 ||
+                reconciled.failed > 0
               ) {
                 logger.warn(
                   { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },

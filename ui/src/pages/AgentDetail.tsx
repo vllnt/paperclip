@@ -68,6 +68,7 @@ import { cn } from "../lib/utils";
 import { describeRunRetryState } from "../lib/runRetryState";
 import { Button } from "@/components/ui/button";
 import { Tabs } from "@/components/ui/tabs";
+import { AgentRoutinesTab } from "./AgentRoutinesTab";
 import { PageTabBar } from "../components/PageTabBar";
 import { AuditFeed } from "./audit/AuditFeed";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -1338,8 +1339,10 @@ export function AgentDetail() {
         </InlineBanner>
       )}
 
-      {builtInState?.definition.bundle && (
+      {/* The Routines tab shows the built-in routine itself, so it skips this summary. */}
+      {builtInState?.definition.bundle && activeView !== "routines" && (
         <BuiltInBundlePanel
+          sections="resources"
           state={builtInState}
           agentRef={canonicalAgentRef}
           onConfigure={() => setShowBuiltInConfigure(true)}
@@ -1447,6 +1450,27 @@ export function AgentDetail() {
         <AgentSkillsTab
           agent={agent}
           companyId={resolvedCompanyId ?? undefined}
+        />
+      )}
+
+      {activeView === "routines" && (
+        <AgentRoutinesTab
+          agentId={agent.id}
+          managedRoutineId={builtInState?.resources?.find((resource) => resource.resourceKind === "routine")?.resourceId ?? null}
+          builtInRoutine={builtInState?.definition.bundle ? (
+            <BuiltInBundlePanel
+              sections="routine"
+              state={builtInState}
+              agentRef={canonicalAgentRef}
+              onConfigure={() => setShowBuiltInConfigure(true)}
+              onResetResource={(kind) => resetBuiltInResource.mutate(kind)}
+              onRunRoutine={(routineKey) => runBuiltInRoutine.mutate(routineKey)}
+              onEnableSchedule={(routineKey) => enableBuiltInSchedule.mutate(routineKey)}
+              onDisableSchedule={(routineKey) => disableBuiltInSchedule.mutate(routineKey)}
+              resettingResource={resetBuiltInResource.isPending ? resetBuiltInResource.variables ?? null : null}
+              routineActionPending={builtInRoutineActionPending}
+            />
+          ) : undefined}
         />
       )}
 
@@ -3682,6 +3706,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 <div className="text-(length:--text-micro) text-muted-foreground font-mono flex items-center gap-1.5 flex-wrap">
                   {runAdapterType && (
                     <span className="bg-muted rounded px-1.5 py-0.5 text-(length:--text-nano) font-medium uppercase tracking-wide">{runAdapterType.replace(/_/g, " ")}</span>
+                  )}
+                  {run.targetSource && run.targetSource !== "agent_default" && (
+                    <span data-testid="run-detail-target-source">{run.targetSource.replace(/_/g, " ")}</span>
                   )}
                   {run.fallbackReason && (
                     <span data-testid="run-detail-fallback-reason">fallback · {run.fallbackReason.replace(/_/g, " ")}</span>

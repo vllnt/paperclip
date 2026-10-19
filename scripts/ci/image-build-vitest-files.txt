@@ -1,6 +1,9 @@
+cli/src/__tests__/agent-lifecycle.test.ts
 # Vitest files required before building the production image.
 # One path per line; blank lines and comments are ignored.
+cli/src/__tests__/routine-list-filters.test.ts
 cli/src/__tests__/agent-config.test.ts
+cli/src/__tests__/convex.test.ts
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
 packages/adapter-utils/src/execution-target-run-temp.test.ts
@@ -8,6 +11,7 @@ packages/adapter-utils/src/log-value-redaction.test.ts
 packages/adapter-utils/src/paperclip-temp.test.ts
 packages/adapter-utils/src/redact-env-for-logs.test.ts
 packages/adapter-utils/src/remote-process-identity.test.ts
+packages/adapter-utils/src/remote-process-tree-stop.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-abort.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-idle-poll.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-lifecycle.test.ts
@@ -19,12 +23,30 @@ packages/adapters/codex-local/src/company-model-catalog.test.ts
 packages/adapters/codex-local/src/server/execute.remote.test.ts
 packages/adapters/codex-local/src/server/runtime-config.test.ts
 packages/adapters/codex-local/src/server/test.remote.test.ts
+packages/plugins/plugin-convex/tests/ci-previews.spec.ts
+packages/plugins/plugin-convex/tests/client.spec.ts
+packages/plugins/plugin-convex/tests/contract.spec.ts
+packages/plugins/plugin-convex/tests/dev-reaper.spec.ts
+packages/plugins/plugin-convex/tests/dry-run.spec.ts
+packages/plugins/plugin-convex/tests/evidence.spec.ts
+packages/plugins/plugin-convex/tests/guards.spec.ts
+packages/plugins/plugin-convex/tests/hard-guard.spec.ts
+packages/plugins/plugin-convex/tests/model.spec.ts
+packages/plugins/plugin-convex/tests/reaper.spec.ts
+packages/plugins/plugin-convex/tests/resilience.spec.ts
+packages/plugins/plugin-convex/tests/review.spec.ts
+packages/plugins/plugin-convex/tests/ui.spec.tsx
+packages/plugins/plugin-github/tests/sync-job-context.spec.ts
+packages/plugins/plugin-github/tests/sync-queued-ui.spec.tsx
+packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts
 packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
 packages/shared/src/company-environment-defaults.test.ts
+packages/shared/src/validators/routine-list-query.test.ts
 server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
+server/src/__tests__/bundled-plugins.test.ts
 server/src/__tests__/decision-wakeup.test.ts
 server/src/__tests__/external-objects-service.test.ts
 server/src/__tests__/github-commit-details.test.ts
@@ -38,10 +60,12 @@ server/src/services/heartbeat-remote-run-temp.test.ts
 server/src/shutdown-budget.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/AgentCharacterRuntime.test.ts
+ui/src/components/BuiltInBundlePanel.test.tsx
 ui/src/components/CommandPalette.real.test.tsx
 ui/src/components/CommandPalette.test.tsx
 ui/src/components/IssueFiltersPopover.test.tsx
 ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
+ui/src/components/RoutineListFilters.test.tsx
 ui/src/components/onboarding/onboarding-motion-reduced.test.ts
 ui/src/components/task-side-panel/TaskSidePanel.test.tsx
 ui/src/components/ui/command.test.tsx
@@ -63,7 +87,11 @@ ui/src/lib/main-content-focus.test.ts
 ui/src/lib/no-direct-match-media.test.ts
 ui/src/lib/onboarding-motion-tokens.test.ts
 ui/src/lib/pwa-display-mode.test.ts
+ui/src/lib/queryKeys.test.ts
 ui/src/lib/safe-match-media.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
+ui/src/pages/AgentRoutinesTab.test.tsx
 ui/src/pages/IssueDetail.test.tsx
+ui/src/pages/Routines.test.tsx
+ui/src/pages/agent-detail-navigation.test.ts

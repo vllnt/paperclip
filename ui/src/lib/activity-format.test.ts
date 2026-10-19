@@ -20,6 +20,12 @@ describe("activity formatting", () => {
     expect(formatActivityVerb("agent.harness_fallback_returned")).toBe("returned to the primary harness for");
   });
 
+  it("uses readable verbs for run profile and run tier changes", () => {
+    expect(formatActivityVerb("issue.run_profile_updated")).toBe("changed the run profile of");
+    expect(formatActivityVerb("issue.run_profile_denied")).toBe("was refused a run profile on");
+    expect(formatActivityVerb("company.run_tiers_updated")).toBe("updated the run tiers of");
+  });
+
   it("uses readable verbs for task read-state changes", () => {
     expect(formatActivityVerb("issue.read_marked")).toBe("read");
     expect(formatActivityVerb("issue.read_unmarked")).toBe("marked unread");
