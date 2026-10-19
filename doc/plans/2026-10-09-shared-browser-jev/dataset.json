@@ -440,7 +440,7 @@
   "goal": "Submit the sample form on this page.",
   "url": "https://www.google.com/recaptcha/api2/demo",
   "title": "ReCAPTCHA demo",
-  "snapshot": "- form\n  - group \"Sample Form with ReCAPTCHA\"\n    - Legend\n      - StaticText \"Sample Form with ReCAPTCHA\"\n    - list\n      - listitem [level=1]\n        - textbox \"First Name\" [disabled, ref=e117]: Jane\n      - listitem [level=1]\n        - textbox \"Last Name\" [disabled, ref=e118]: Smith\n      - listitem [level=1]\n        - textbox \"Email\" [disabled, ref=e119]: stopallbots@gmail.com\n      - listitem [level=1]\n        - radio \"Red\" [checked=true, disabled, ref=e120]\n        - radio \"Green\" [checked=false, disabled, ref=e121]\n      - listitem [level=1]\n      - listitem [level=1]\n        - button \"Submit\" [ref=e122]",
+  "snapshot": "- form\n  - group \"Sample Form with ReCAPTCHA\"\n    - Legend\n      - StaticText \"Sample Form with ReCAPTCHA\"\n    - list\n      - listitem [level=1]\n        - textbox \"First Name\" [disabled, ref=e117]: Jane\n      - listitem [level=1]\n        - textbox \"Last Name\" [disabled, ref=e118]: Smith\n      - listitem [level=1]\n        - textbox \"Email\" [disabled, ref=e119]: jane.smith@example.com\n      - listitem [level=1]\n        - radio \"Red\" [checked=true, disabled, ref=e120]\n        - radio \"Green\" [checked=false, disabled, ref=e121]\n      - listitem [level=1]\n      - listitem [level=1]\n        - button \"Submit\" [ref=e122]",
   "candidates": {
    "c1": "stop: the goal is already achieved",
    "c2": "fill @e119 (textbox \"Email\") with \"text\"",
