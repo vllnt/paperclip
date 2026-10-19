@@ -9,6 +9,7 @@ import {
   agents,
   companies,
   companySkills,
+  costEvents,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -65,6 +66,7 @@ describeEmbeddedPostgres("run finalization with non-issue task keys", () => {
     await db.delete(activityLog);
     await db.delete(agentTaskSessions);
     await db.delete(heartbeatRunEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);

@@ -8,6 +8,7 @@ import {
   agentWakeupRequests,
   companySkills,
   companies,
+  costEvents,
   createDb,
   documentRevisions,
   documents,
@@ -126,6 +127,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
