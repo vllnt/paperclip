@@ -2011,6 +2011,7 @@ export {
   type CompanySearchExtractQuery,
   type CompanySearchQuery,
   createIssueSchema,
+  isValidExistingBranchName,
   setIssueTitleSchema,
   type SetIssueTitle,
   createIssueInputSchema,
@@ -2908,3 +2909,4 @@ export * from "./routine-gate.js";
 export * from "./event-sources.js";
 export * from "./run-context.js";
 export * from "./transient-retry-policy.js";
+export * from "./issue-git.js";

@@ -4,6 +4,7 @@ import { executionWorkspaces, heartbeatRunEvents, issueWorkProducts, workspaceRu
 import type { IssueWorkProduct } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
+import { linkedWorkProductCondition } from "./work-product-visibility.js";
 import {
   createPullRequestMergeDetailsResolver,
   extractGitHubPullRequestReferences,
@@ -205,7 +206,7 @@ export function workProductService(
       const rows = await db
         .select()
         .from(issueWorkProducts)
-        .where(eq(issueWorkProducts.issueId, issueId))
+        .where(and(eq(issueWorkProducts.issueId, issueId), linkedWorkProductCondition()))
         .orderBy(desc(issueWorkProducts.isPrimary), desc(issueWorkProducts.updatedAt));
       const products = rows.map(toIssueWorkProduct);
       const runtimeServiceIds = products
