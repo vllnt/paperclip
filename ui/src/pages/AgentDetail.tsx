@@ -42,6 +42,7 @@ import { toolsApi } from "../api/tools";
 import { getUIAdapter, buildTranscript, onAdapterChange } from "../adapters";
 import { StatusBadge } from "../components/StatusBadge";
 import { AgentFallbacksSection, AgentHarnessFallbackBadge } from "../components/AgentHarnessFallback";
+import { AgentGrokSwitchNotice } from "../components/AgentGrokSwitch";
 import { MarkdownBody } from "../components/MarkdownBody";
 import { CopyText } from "../components/CopyText";
 import { IssueRow } from "../components/IssueRow";
@@ -2093,6 +2094,7 @@ export function ConfigurationTab({
 
   return (
     <div className="agent-settings-form space-y-6">
+      {content === "runtime" && companyId ? <AgentGrokSwitchNotice agent={agent} companyId={companyId} /> : null}
       {content !== "permissions" ? <AgentConfigForm
         mode="edit"
         agent={agent}
@@ -3704,6 +3706,9 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 <div className="text-(length:--text-micro) text-muted-foreground font-mono flex items-center gap-1.5 flex-wrap">
                   {runAdapterType && (
                     <span className="bg-muted rounded px-1.5 py-0.5 text-(length:--text-nano) font-medium uppercase tracking-wide">{runAdapterType.replace(/_/g, " ")}</span>
+                  )}
+                  {run.targetSource && run.targetSource !== "agent_default" && (
+                    <span data-testid="run-detail-target-source">{run.targetSource.replace(/_/g, " ")}</span>
                   )}
                   {run.fallbackReason && (
                     <span data-testid="run-detail-fallback-reason">fallback · {run.fallbackReason.replace(/_/g, " ")}</span>

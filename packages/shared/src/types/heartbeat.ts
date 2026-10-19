@@ -204,6 +204,8 @@ export interface HeartbeatRun {
   executedAdapterType?: string | null;
   executedModel?: string | null;
   fallbackReason?: string | null;
+  /** Where the run's harness and model came from: issue_profile, routine_profile, fallback or agent_default. */
+  targetSource?: string | null;
   externalRunId: string | null;
   processPid: number | null;
   processGroupId?: number | null;
