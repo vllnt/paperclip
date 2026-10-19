@@ -118,6 +118,55 @@ server-authored event among these three types; provider
 source events cannot supply stop authority. These records stay in the local run
 log and do not add Telemetry or OpenTelemetry data.
 
+## SSH Remote Process Stop Events
+
+The local child of a legacy run on an SSH environment is the `ssh` client.
+Signalling it ends the connection but not the remote command, which keeps
+running without a pty. So before the run's GitHub launchers are removed and
+before its environment lease is released, the server stops what the run left
+on the worker over a separate SSH connection, within 20 seconds, once per
+lease. Each launch records its leader in
+`<remoteWorkspacePath>/.paperclip-runtime/processes/<runId>/` and gives every
+child a random marker in the `PAPERCLIP_RUN_MARKER` environment variable; the
+stop signals only the worker user's processes that are in the verified leader's
+process group or carry an exact recorded marker, and checks each start time
+again before `SIGKILL`; `SIGKILL` and the final count use only what the first
+scan found. Both the launch and the stop work only inside that directory after
+checking that each part is a real directory owned by the worker user, never a
+link (`unsafe_record_dir` otherwise, and the launch does not start). A launch
+whose record name is already taken, or that finds a refusal note already there,
+does not start either. It leaves a note of its own: an empty directory named
+after the launch with a random suffix. The run's stop reports
+`unsafe_record_dir` for a note in exactly that form, and leaves any other entry
+alone. The launch writes
+its record before any login profile runs and the stop sources none: both use
+only the tools in `/usr/bin` and `/bin`, and the launch publishes its record
+with a `link` from there that only root can change, or does not start. The stop
+first leaves a `stopped` mark there, so a launch that has not written its
+record yet does not start; marks older than a week are removed once their run
+has no record left. A lease's stop is claimed before any remote work, so two
+release paths never stop the same lease twice. It connects to the worker and root
+recorded when the lease was acquired, even if the environment was edited since.
+
+The server writes one of these events per SSH lease:
+
+| Event | Level | When |
+|---|---|---|
+| `remote_processes_stopped` | info | Nothing of the run is left on the worker. |
+| `remote_processes_survived` | warn | Some processes were still running after `SIGKILL`. |
+| `remote_kill_partial` | warn | The stop could not cover every process. `reason` names why: `worker_unreachable`, `no_process_record`, `bad_record`, `uid_mismatch`, `unverified_group`, `no_session`, `no_proc`, `no_tools`, `no_sha256sum`, `no_stop_mark`, `unsafe_record_dir`, `no_summary`, `config_unavailable`, `environment_changed` or `environment_deleted`. |
+
+The payload holds the environment id and the counts `records`, `matched`
+(split into `matchedByMarker` and `matchedByGroup`, by why each process joined),
+`killed`, `skipped` and `survived`, plus `reason` when there is one. A process's
+identity is its pid, start time and uid: the marker only decides who joins at
+the first scan, so a member that clears it later is still signalled and
+counted. The marker
+value never appears in a run event, a log, argv or the launch record, which
+stores only its SHA-256. The lease metadata keeps the same outcome under
+`remoteProcessStop`. These records stay in the local run log and add no
+Telemetry or OpenTelemetry data.
+
 ## Verified Local Codex Replacement Evidence
 
 The server writes `native.stopped_text_turn_verified` in the same transaction

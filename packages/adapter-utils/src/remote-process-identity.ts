@@ -332,7 +332,7 @@ export const REMOTE_RUN_REFUSED_MARK = "refused";
  * @param input.runId - The heartbeat run id; letters, digits and dashes only.
  * @param input.launchId - Names this launch's record; letters and digits only.
  * @param input.markerSha256 - {@link RemoteRunMarker.entrySha256}.
- * @param input.group - Whether the launch made the process lead its own session (`setsid`).
+ * @param input.group - Whether the launch made the process lead its own session (`setsid`). A string is a shell expression that expands to `1` or `0`, for a launch that learns it at run time.
  * @param input.pidExpression - The process; `$$` (the running shell) by default.
  * @param input.testOnlyToolDirs - Test seam: where `link` may come from instead of `/usr/bin` and `/bin`.
  * @returns Lines for a launch script.
@@ -342,7 +342,7 @@ export function buildRemoteRunRecordLines(input: {
   runId: string;
   launchId: string;
   markerSha256: string;
-  group: boolean;
+  group: boolean | string;
   pidExpression?: string;
   testOnlyToolDirs?: string[];
 }): string[] {
@@ -351,7 +351,7 @@ export function buildRemoteRunRecordLines(input: {
   const record = `${input.launchId}.json`;
   return [
     `pid=${input.pidExpression ?? "$$"}`,
-    `group=${input.group ? 1 : 0}`,
+    `group=${typeof input.group === "string" ? input.group : input.group ? 1 : 0}`,
     ...PIN_RECORD_DIR_LINES,
     ...RECORD_FIELDS_LINES,
     ...trustedToolLines(input.testOnlyToolDirs ?? TRUSTED_TOOL_DIRS),
