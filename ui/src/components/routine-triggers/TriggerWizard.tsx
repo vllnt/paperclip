@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  BellRing,
   CalendarClock,
   Check,
   CheckCircle2,
@@ -17,12 +18,24 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
+import {
+  defaultEventDraft,
+  validateEventDraft,
+  type EventTriggerDraft,
+  type EventTriggerErrors,
+} from "@/lib/event-trigger";
 import { cn } from "@/lib/utils";
+import {
+  EventGroupingFields,
+  EventMatchFields,
+  EventTriggerSummary,
+  type EventSourcesState,
+} from "./EventTriggerFields";
 import { AgentInstructions, CopyField } from "./WebhookFields";
 import { WebhookUrlWarning } from "./WebhookUrlWarning";
 
 export type TriggerDraft = {
-  kind: "choose" | "schedule" | "webhook";
+  kind: "choose" | "schedule" | "webhook" | "event";
   step: number;
   availableStep: number;
   sender: "custom" | "github";
@@ -33,6 +46,8 @@ export type TriggerDraft = {
   weekday: string;
   timezone: string;
   created: boolean;
+  /** Settings for the Event kind. Plain data, so it is safe to persist with the draft. */
+  event: EventTriggerDraft;
 };
 export const defaultTriggerDraft: TriggerDraft = {
   kind: "choose",
@@ -44,6 +59,7 @@ export const defaultTriggerDraft: TriggerDraft = {
   weekday: "Monday",
   timezone: "America/Chicago",
   created: false,
+  event: defaultEventDraft(),
 };
 export function webhookAgentInstructions(
   sender: TriggerDraft["sender"],
@@ -113,6 +129,7 @@ export function RoutineTriggerWizard({
   webhookUrl = "",
   webhookSecret = "",
   checkResult = "waiting",
+  eventSources = { sources: [], status: "ready" },
 }: {
   initialDraft: TriggerDraft;
   routineTitle: string;
@@ -125,10 +142,12 @@ export function RoutineTriggerWizard({
   onSaveExit: (draft: TriggerDraft) => void | Promise<void>;
   onFinish: (draft: TriggerDraft) => void | Promise<void>;
   checkResult?: "waiting" | "received" | "rejected" | "no_event";
+  eventSources?: EventSourcesState;
 }) {
   const [draft, setDraft] = useState(initialDraft);
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [showEventErrors, setShowEventErrors] = useState(false);
   const { setBreadcrumbs } = useBreadcrumbs();
   const perform = useCallback(
     async (action: () => void | Promise<void>) => {
@@ -174,12 +193,48 @@ export function RoutineTriggerWizard({
     ]);
   }, [saveAndExit, setBreadcrumbs, routineTitle, routineId]);
   const schedule = draft.kind === "schedule";
+  const event = draft.kind === "event";
+  const webhook = draft.kind === "webhook";
   const github = draft.sender === "github";
   const labels = schedule
     ? ["Choose trigger", "Set schedule", "Review schedule"]
-    : ["Choose trigger", "Connect your app", "Check connection"];
+    : event
+      ? ["Choose trigger", "Match events", "Group alerts"]
+      : ["Choose trigger", "Connect your app", "Check connection"];
+  const eventCheck = validateEventDraft(draft.event);
+  // Which fields each Event step owns, so a step only blocks on its own errors.
+  const eventStepErrors: Array<keyof EventTriggerErrors> =
+    draft.step === 0
+      ? []
+      : draft.step === 1
+        ? ["source", "sources", "types", "labels"]
+        : ["groupKey", "cooldown", "appendToIssueId"];
+  const eventStepValid = eventStepErrors.every((field) => !eventCheck.errors[field]);
   function patch(values: Partial<TriggerDraft>) {
     setDraft((current) => ({ ...current, ...values }));
+  }
+  function patchEvent(values: Partial<EventTriggerDraft>) {
+    setDraft((current) => ({ ...current, event: { ...current.event, ...values } }));
+  }
+  function goToStep(step: number) {
+    setShowEventErrors(false);
+    patch({ step });
+  }
+  function advanceEvent() {
+    if (!eventStepValid) {
+      setShowEventErrors(true);
+      return;
+    }
+    setShowEventErrors(false);
+    const step = draft.step + 1;
+    patch({ step, availableStep: Math.max(draft.availableStep, step) });
+  }
+  function finishEvent() {
+    if (!eventCheck.valid) {
+      setShowEventErrors(true);
+      return;
+    }
+    void perform(() => onFinish(draft));
   }
   function advance() {
     void perform(async () => {
@@ -201,6 +256,10 @@ export function RoutineTriggerWizard({
         ? draft.step === 1
           ? "Set a schedule"
           : "Review your schedule"
+        : event
+          ? draft.step === 1
+            ? "Choose which events to react to"
+            : "Group repeated alerts"
         : draft.step === 1
           ? `Connect ${github ? "GitHub" : "your app"}`
           : "Check your connection";
@@ -211,13 +270,17 @@ export function RoutineTriggerWizard({
         ? draft.step === 1
           ? "Choose when Paperclip should start this routine automatically."
           : "This schedule starts the routine automatically. You can pause or change it later."
+        : event
+          ? draft.step === 1
+            ? "Pick the event source and describe the alerts that should wake this routine’s agent."
+            : "Decide how repeats, recoveries and new issues are handled."
         : draft.step === 1
           ? "Copy these details into the sending app, then save its webhook settings."
           : "Test that events arrive and authentication works. This won’t start the routine.";
   const selectClass =
     "w-full rounded-md border border-input bg-background px-3 py-2 text-sm";
   const goBack = (
-    <Button variant="outline" onClick={() => patch({ step: draft.step - 1 })}>
+    <Button variant="outline" onClick={() => goToStep(draft.step - 1)}>
       Back
     </Button>
   );
@@ -230,14 +293,14 @@ export function RoutineTriggerWizard({
         labels={labels}
         step={draft.step}
         availableStep={draft.availableStep}
-        onSelect={(step) => patch({ step })}
+        onSelect={goToStep}
       />
       <fieldset disabled={busy} className="min-w-0 space-y-6">
         <div className="space-y-1">
           <h1 className="text-xl font-bold">{title}</h1>
           <p className="text-sm text-muted-foreground">{subtitle}</p>
         </div>
-        {!schedule && draft.step > 0 && <WebhookUrlWarning url={webhookUrl} />}
+        {webhook && draft.step > 0 && <WebhookUrlWarning url={webhookUrl} />}
         {draft.step === 0 && (
           <fieldset className="space-y-3">
             <legend className="sr-only">Trigger type</legend>
@@ -255,6 +318,13 @@ export function RoutineTriggerWizard({
                   detail:
                     "When something happens in GitHub, another app, or a script.",
                   Icon: Webhook,
+                },
+                {
+                  kind: "event",
+                  label: "When a monitoring alert arrives",
+                  detail:
+                    "Wake this agent for alerts from Gatus, Wazuh or a script. Repeats are grouped into one issue.",
+                  Icon: BellRing,
                 },
               ] as const
             ).map(({ kind, label, detail, Icon }) => (
@@ -433,7 +503,31 @@ export function RoutineTriggerWizard({
             Public services need a publicly reachable HTTPS webhook URL.
           </p>
         )}
-        {!schedule && draft.step === 1 && (
+        {event && draft.step === 1 && (
+          <EventMatchFields
+            draft={draft.event}
+            onChange={patchEvent}
+            showErrors={showEventErrors}
+            errors={eventCheck.errors}
+            eventSources={eventSources}
+          />
+        )}
+        {event && draft.step === 2 && (
+          <div className="space-y-6">
+            <EventGroupingFields
+              draft={draft.event}
+              onChange={patchEvent}
+              showErrors={showEventErrors}
+              errors={eventCheck.errors}
+              groupKey={eventCheck.groupKey}
+            />
+            <EventTriggerSummary
+              draft={draft.event}
+              sourceName={eventSources.sources.find((item) => item.id === draft.event.sourceId)?.name}
+            />
+          </div>
+        )}
+        {webhook && draft.step === 1 && (
           <div className="space-y-5">
             {webhookSecret && (
               <AgentInstructions
@@ -481,7 +575,7 @@ export function RoutineTriggerWizard({
             )}
           </div>
         )}
-        {!schedule && draft.step === 2 && (
+        {webhook && draft.step === 2 && (
           <div className="space-y-5">
             <div className="space-y-1 rounded-md border border-border p-4">
               <p className="text-sm font-medium">Connection test only</p>
@@ -547,7 +641,7 @@ export function RoutineTriggerWizard({
             </details>
           </div>
         )}
-        {!schedule && draft.step === 2 && (
+        {webhook && draft.step === 2 && (
           <p className="text-xs text-muted-foreground">
             {routineActive
               ? "Finish setup to enable this webhook. Future events will start the routine; this test event won’t be replayed."
@@ -558,6 +652,12 @@ export function RoutineTriggerWizard({
           <p className="text-sm text-muted-foreground">
             The routine is paused. Enable its automatic triggers when you’re
             ready to use this schedule.
+          </p>
+        )}
+        {event && draft.step === 2 && !routineActive && (
+          <p className="text-sm text-muted-foreground">
+            The routine is paused. Enable its automatic triggers when you’re
+            ready to use this event trigger.
           </p>
         )}
         {saveError && (
@@ -571,6 +671,12 @@ export function RoutineTriggerWizard({
             <Button disabled={draft.kind === "choose"} onClick={advance}>
               Continue
             </Button>
+          ) : event ? (
+            draft.step === 1 ? (
+              <Button onClick={advanceEvent}>Continue</Button>
+            ) : (
+              <Button onClick={finishEvent}>Add event trigger</Button>
+            )
           ) : schedule ? (
             draft.step === 1 ? (
               <Button disabled={!draft.time} onClick={advance}>

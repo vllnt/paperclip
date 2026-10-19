@@ -1151,6 +1151,7 @@ export type {
   IssueBlockedInboxSeverity,
   IssueBlockedInboxState,
   IssueRecoveryAction,
+  CompanyIssueRecoveryActionListItem,
   IssueWatchdog,
   IssueWatchdogStatus,
   IssueWatchdogSummary,
@@ -1909,6 +1910,12 @@ export {
   builtInAgentResetSchema,
   createAgentHireSchema,
   updateAgentSchema,
+  AGENT_CONFIG_FORBIDDEN_KEYS,
+  AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH,
+  AGENT_CONFIG_MERGE_PATCH_MAX_VALUES,
+  describeAgentConfigMergePatchViolation,
+  findAgentConfigMergePatchViolation,
+  updateAgentMergePatchSchema,
   agentInstructionsBundleModeSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
@@ -1930,6 +1937,8 @@ export {
   type BuiltInAgentReset,
   type CreateAgentHire,
   type UpdateAgent,
+  type AgentConfigMergePatchViolation,
+  type UpdateAgentMergePatch,
   type UpdateAgentInstructionsBundle,
   type UpsertAgentInstructionsFile,
   type UpdateAgentInstructionsPath,
@@ -1995,9 +2004,14 @@ export {
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
+  issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
   reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT,
+  COMPANY_RECOVERY_ACTIONS_MAX_LIMIT,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -2103,6 +2117,7 @@ export {
   type UpdateIssue,
   type StalledReviewDecision,
   type ResolveIssueRecoveryAction,
+  type ListCompanyIssueRecoveryActionsQuery,
   type CheckoutIssue,
   type AddIssueComment,
   type CreateIssueThreadInteraction,
@@ -2858,4 +2873,5 @@ export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
 export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
+export * from "./event-sources.js";
 export * from "./run-context.js";

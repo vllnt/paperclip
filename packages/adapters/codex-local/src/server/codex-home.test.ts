@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CODEX_HOME_SEED_MAX_BYTES } from "@paperclipai/adapter-utils/codex-home-seed";
 import {
   CODEX_SYNC_ALLOWLIST,
   codexHomeHasUsableAuth,
@@ -1408,5 +1409,161 @@ describe("stageCodexHomeForSync", () => {
       if (staged) await fs.rm(staged, { recursive: true, force: true });
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("worker Codex file seeding", () => {
+  async function withHomes(
+    run: (homes: { root: string; sharedHome: string; agentHome: string }) => Promise<void>,
+  ) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-worker-seed-"));
+    try {
+      const sharedHome = path.join(root, "worker-codex");
+      const agentHome = path.join(
+        root,
+        "instances",
+        "default",
+        "companies",
+        "company-1",
+        "agents",
+        "agent-7",
+        "codex-home",
+      );
+      await fs.mkdir(sharedHome, { recursive: true });
+      await fs.writeFile(path.join(sharedHome, "AGENTS.md"), "# Worker tooling\n@RTK.md\n");
+      await fs.writeFile(path.join(sharedHome, "RTK.md"), "# RTK\n");
+      await fs.writeFile(path.join(sharedHome, "hooks.json"), '{"hooks":{}}\n');
+      await run({ root, sharedHome, agentHome });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("seeds the configured worker files into the managed home", async () => {
+    await withHomes(async ({ sharedHome, agentHome }) => {
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedHome }, async () => {}, {
+        codexHomeSeed: ["AGENTS.md", "RTK.md", "hooks.json"],
+      });
+
+      expect(await fs.readFile(path.join(agentHome, "AGENTS.md"), "utf8")).toContain("@RTK.md");
+      expect(await fs.readFile(path.join(agentHome, "RTK.md"), "utf8")).toBe("# RTK\n");
+      expect(await fs.readFile(path.join(agentHome, "hooks.json"), "utf8")).toBe('{"hooks":{}}\n');
+    });
+  });
+
+  it("seeds the worker env list when the adapter config sets none", async () => {
+    await withHomes(async ({ sharedHome, agentHome }) => {
+      await seedManagedCodexHome(
+        agentHome,
+        { CODEX_HOME: sharedHome, PAPERCLIP_CODEX_HOME_SEED: "hooks.json" },
+        async () => {},
+      );
+
+      expect(await fs.readdir(agentHome)).toEqual(["hooks.json"]);
+    });
+  });
+
+  it("changes nothing when no seed list is configured", async () => {
+    await withHomes(async ({ sharedHome, agentHome }) => {
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedHome }, async () => {});
+
+      expect(await fs.readdir(agentHome)).toEqual([]);
+    });
+  });
+
+  it("keeps the agent AGENTS.md first and never overwrites it", async () => {
+    await withHomes(async ({ sharedHome, agentHome }) => {
+      await fs.mkdir(agentHome, { recursive: true });
+      await fs.writeFile(path.join(agentHome, "AGENTS.md"), "# Agent instructions\n");
+
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedHome }, async () => {}, {
+        codexHomeSeed: ["AGENTS.md"],
+      });
+
+      const merged = await fs.readFile(path.join(agentHome, "AGENTS.md"), "utf8");
+      expect(merged.startsWith("# Agent instructions\n")).toBe(true);
+      expect(merged.indexOf("# Worker tooling")).toBeGreaterThan(merged.indexOf("# Agent instructions"));
+    });
+  });
+
+  it("refuses a symlinked worker file and a traversal name", async () => {
+    await withHomes(async ({ root, sharedHome, agentHome }) => {
+      await fs.writeFile(path.join(root, "outside.md"), "outside");
+      await fs.rm(path.join(sharedHome, "RTK.md"));
+      await fs.symlink(path.join(root, "outside.md"), path.join(sharedHome, "RTK.md"));
+
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedHome }, async () => {}, {
+        codexHomeSeed: ["RTK.md", "../outside.md"],
+      });
+
+      expect(await fs.readdir(agentHome)).toEqual([]);
+    });
+  });
+
+  it("never lets the seed list reach auth.json", async () => {
+    await withHomes(async ({ sharedHome, agentHome }) => {
+      await fs.writeFile(path.join(sharedHome, "auth.json"), '{"OPENAI_API_KEY":"shared"}');
+
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedHome }, async () => {}, {
+        codexHomeSeed: ["auth.json"],
+      });
+
+      // Only the existing symlink handling creates auth.json; it is never a copy.
+      expect((await fs.lstat(path.join(agentHome, "auth.json"))).isSymbolicLink()).toBe(true);
+    });
+  });
+
+  it.each(["symlink", "credentials", "oversized", "directory"] as const)(
+    "refuses unsafe extra entries from an external Codex home: %s",
+    async (kind) => {
+      await withHomes(async ({ root, sharedHome }) => {
+        const entry = "notes.md";
+        const source = path.join(sharedHome, entry);
+        if (kind === "symlink") {
+          const outside = path.join(root, "outside.md");
+          await fs.writeFile(outside, "synthetic private contents");
+          await fs.symlink(outside, source);
+        } else if (kind === "credentials") {
+          await fs.writeFile(source, 'OPENAI_API_KEY="synthetic-test-credential"');
+        } else if (kind === "oversized") {
+          await fs.writeFile(source, "x".repeat(CODEX_HOME_SEED_MAX_BYTES + 1));
+        } else {
+          await fs.mkdir(source);
+          await fs.writeFile(path.join(source, "nested.md"), "synthetic private contents");
+        }
+
+        const staged = await stageCodexHomeForSync(sharedHome, {
+          extraEntries: [entry, "RTK.md"],
+        });
+        try {
+          expect(await fs.readdir(staged)).toEqual(["RTK.md"]);
+          expect(await fs.readFile(path.join(staged, "RTK.md"), "utf8")).toBe("# RTK\n");
+          expect((await fs.stat(path.join(staged, "RTK.md"))).mode & 0o777).toBe(0o600);
+        } finally {
+          await fs.rm(staged, { recursive: true, force: true });
+        }
+      });
+    },
+  );
+
+  it("stages the seeded files for a sandbox run", async () => {
+    await withHomes(async ({ sharedHome, agentHome }) => {
+      await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedHome }, async () => {}, {
+        codexHomeSeed: ["AGENTS.md", "hooks.json"],
+      });
+      await fs.writeFile(path.join(agentHome, "unrelated.sqlite"), "x");
+
+      const staged = await stageCodexHomeForSync(agentHome, {
+        extraEntries: ["AGENTS.md", "hooks.json"],
+      });
+      try {
+        expect((await fs.readdir(staged)).sort()).toEqual(["AGENTS.md", "hooks.json"]);
+        const stagedAgents = await fs.readFile(path.join(staged, "AGENTS.md"), "utf8");
+        expect(stagedAgents).toBe(await fs.readFile(path.join(agentHome, "AGENTS.md"), "utf8"));
+        expect(stagedAgents.match(/BEGIN PAPERCLIP WORKER SEED/g)).toHaveLength(1);
+      } finally {
+        await fs.rm(staged, { recursive: true, force: true });
+      }
+    });
   });
 });
