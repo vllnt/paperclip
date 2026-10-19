@@ -1,6 +1,6 @@
-cli/src/__tests__/convex.test.ts
 # Vitest files required before building the production image.
 # One path per line; blank lines and comments are ignored.
+cli/src/__tests__/convex.test.ts
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
 packages/adapter-utils/src/execution-target-run-temp.test.ts
