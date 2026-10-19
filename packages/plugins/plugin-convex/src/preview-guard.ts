@@ -43,7 +43,9 @@ const sameRef = (ref: string, identifier: string) => ref === identifier || (norm
 const sameNumber = (number: number, identifier: string, bare: boolean) =>
   [`pr-${number}`, `pr${number}`, `pr_${number}`, ...(bare ? [String(number)] : [])].includes(identifier.toLowerCase());
 /** A bare number (`42`) protects an open pull request but is not accepted as evidence that a finished one belongs to the preview. */
-const matchesPull = (pr: PullRequestRef, identifier: string, evidence: boolean) => sameRef(pr.headRef, identifier) || sameNumber(pr.number, identifier, !evidence);
+const matchesPull = (pr: PullRequestRef, identifier: string, evidence = false) => sameRef(pr.headRef, identifier) || sameNumber(pr.number, identifier, !evidence);
+/** Text from GitHub or Convex that reaches a refusal message or an agent: control characters removed, length bounded, quoted so it reads as data. */
+export const quoted = (value: string, max = 128): string => JSON.stringify(value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, max));
 
 const once = <T>(cache: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> => {
   let pending = cache.get(key);
@@ -82,7 +84,7 @@ export async function assessPreview(input: GuardInput): Promise<PreviewAssessmen
     const openList = await once(cache.open, repo, () => github.openPullRequests(repo, token));
     // A pull request number read by the company's pattern wins; names and `pr-<n>` forms only add protection when it finds nothing open.
     const open = (prNumber === null ? undefined : openList.find(pr => pr.number === prNumber)) ?? openList.find(pr => matchesPull(pr, identifier, false));
-    if (open) return keep(`Preview ${identifier} belongs to open pull request #${open.number}.`, open.number);
+    if (open) return keep(`Preview ${quoted(identifier)} belongs to open pull request #${open.number}.`, open.number);
     const matched = (await once(cache.branches, repo, () => github.branchNames(repo, token))).filter(name => sameRef(name, identifier));
     let lastCommitAt: number | null = null;
     for (const name of matched.slice(0, 5)) {
@@ -90,23 +92,28 @@ export async function assessPreview(input: GuardInput): Promise<PreviewAssessmen
       if (!branch) continue;
       const since = branch.lastCommitAt === null ? null : now - branch.lastCommitAt;
       if (since === null || since < activityHours * HOUR_MS) {
-        return keep(`Branch ${name} has recent activity (last commit ${since === null ? "at an unknown time" : `${Math.max(0, Math.floor(since / HOUR_MS))}h ago`}).`);
+        return keep(`Branch ${quoted(name)} has recent activity (last commit ${since === null ? "at an unknown time" : `${Math.max(0, Math.floor(since / HOUR_MS))}h ago`}).`);
       }
       lastCommitAt = Math.max(lastCommitAt ?? 0, branch.lastCommitAt ?? 0);
     }
+    const lastDeployAt = deployment.lastDeployTime ?? deployment.createTime ?? now;
+    const idleMs = now - lastDeployAt;
+    const idle = idleMs >= activityHours * HOUR_MS;
     let finished: PullRequestRef | null = null;
     try {
-      // Evidence that a pull request owns this preview comes from the pattern's number alone when there is one, never from a branch name that happens to match.
-      const closed = (await once(cache.closed, repo, () => github.recentClosedPullRequests(repo, token))).filter(pr => (prNumber === null ? matchesPull(pr, identifier, true) : pr.number === prNumber));
+      // A pull request from a fork can carry any branch name, so only one whose branch lives in the mapped repository is evidence. It must also have
+      // been closed after the preview's last deploy and after the branch's last commit; otherwise the branch name was reused and the preview is live.
+      const closed = (await once(cache.closed, repo, () => github.recentClosedPullRequests(repo, token)))
+        .filter(pr => (prNumber === null ? matchesPull(pr, identifier, true) : pr.number === prNumber) && pr.headRepo === repo.toLowerCase() && pr.closedAt !== null && pr.closedAt > lastDeployAt && pr.closedAt > (lastCommitAt ?? 0));
       finished = closed.find(pr => pr.state === "merged") ?? closed[0] ?? null;
     } catch { /* positive evidence only: without it the "branch gone and idle" rule below still needs the full branch list */ }
-    const idleMs = now - (deployment.lastDeployTime ?? deployment.createTime ?? now);
     const evidence: PreviewEvidence = {
       prState: finished ? finished.state as "closed" | "merged" : "none", prNumber: finished?.number ?? null,
       branchExists: matched.length > 0, lastCommitAt, idleMs,
     };
-    const reapReason = finished ? `pull request #${finished.number} is ${finished.state}`
-      : matched.length === 0 && idleMs >= activityHours * HOUR_MS ? `branch is gone and the preview has been idle for ${Math.floor(idleMs / HOUR_MS)}h` : null;
+    // Both reasons need the preview to have been idle for the activity window: a fresh deploy is never reaped.
+    const reapReason = !idle ? null : finished ? `pull request #${finished.number} is ${finished.state}`
+      : matched.length === 0 ? `branch is gone and the preview has been idle for ${Math.floor(idleMs / HOUR_MS)}h` : null;
     return { blocked: null, checked: true, openPullRequest: null, evidence, reapReason };
   } catch {
     return unchecked(GITHUB_UNREADABLE);

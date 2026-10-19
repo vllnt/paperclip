@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { COMPANY_A, COMPANY_B, GITHUB_TOKEN, PREVIEW_KEY, PROJECT_TOKEN, TEAM_TOKEN, admin, baseConfig, member, ref, run, secretValues, setup, type Fixture } from "./fixture.js";
 import { HOUR, NOW, deployment } from "./fakes.js";
+import { ConvexApiError } from "../src/convex-client.js";
 import { newGuardCache } from "../src/preview-guard.js";
 
 const expire = (f: Fixture, name: string, hours: number, extra: Record<string, unknown> = {}, ctx = run("janitor")) =>
   f.h.executeTool<{ data?: any; error?: string }>("convex_set_preview_expiry", { name, hours, ...extra }, ctx);
-const del = (f: Fixture, name: string, ctx = run("janitor")) => f.h.executeTool<{ data?: any; error?: string }>("convex_delete_preview", { name }, ctx);
+const del = (f: Fixture, name: string, ctx = run("janitor")) => f.h.executeTool<{ data?: any; error?: string }>("convex_delete_preview", { name, dryRun: false }, ctx);
 const closed = (f: Fixture, name: string, number = 5) => {
   f.convex.add(deployment(name));
   f.github.pulls.push({ number, ref: name, state: "closed", merged: true });
@@ -16,7 +17,7 @@ const richConfig = (extra: Record<string, unknown> = {}) => baseConfig({
   ...extra,
 });
 
-describe("an expiry that deletes soon follows the deletion guards (review #1)", () => {
+describe("an expiry that deletes soon follows the deletion guards", () => {
   it("refuses a short expiry on a preview with an open pull request or an active branch", async () => {
     const f = await setup();
     f.convex.add(deployment("feat-open"), deployment("feat-busy"));
@@ -46,7 +47,7 @@ describe("an expiry that deletes soon follows the deletion guards (review #1)", 
   });
 });
 
-describe("the reaper only follows a redeploy for expiries it set itself (review #2)", () => {
+describe("the reaper only follows a redeploy for expiries it set itself", () => {
   const enabled = () => baseConfig({ reaper: { enabled: true } });
   it("moves its own expiry later after a redeploy, and leaves one a person set", async () => {
     const f = await setup({ configs: { [COMPANY_A]: enabled() } });
@@ -67,7 +68,7 @@ describe("the reaper only follows a redeploy for expiries it set itself (review 
   });
 });
 
-describe("branch and pull request matching (review #3, #4)", () => {
+describe("branch and pull request matching", () => {
   it("matches a preview named feat-login to the branch feat/login", async () => {
     const f = await setup();
     f.convex.add(deployment("feat-login", { previewIdentifier: "feat-login" }));
@@ -114,7 +115,7 @@ describe("branch and pull request matching (review #3, #4)", () => {
   });
 });
 
-describe("credentials (review #5, #6)", () => {
+describe("credentials", () => {
   it("resolves each secret once per operation, so a pass over many previews stays under the host's secret rate limit", async () => {
     const f = await setup({ configs: { [COMPANY_A]: richConfig({ reaper: { enabled: true } }) } });
     f.convex.validTokens.add(PREVIEW_KEY);
@@ -134,7 +135,8 @@ describe("credentials (review #5, #6)", () => {
     expect((await expire(f, "feat-x", 48)).data.expiresAt).toBe(NOW + 48 * HOUR);
     expect((await del(f, "feat-done")).data.deleted).toBe(true);
     const used = f.convex.calls.filter(call => call.method !== "GET").map(call => call.authorization);
-    expect(used).toEqual([`Bearer ${PREVIEW_KEY}`, `Bearer ${PROJECT_TOKEN}`, `Bearer ${PREVIEW_KEY}`, `Bearer ${PROJECT_TOKEN}`]);
+    // The rejected key is tried once; the credential that worked is tried first from then on.
+    expect(used).toEqual([`Bearer ${PREVIEW_KEY}`, `Bearer ${PROJECT_TOKEN}`, `Bearer ${PROJECT_TOKEN}`]);
   });
 
   it("uses the cheapest working credential: the preview deploy key", async () => {
@@ -161,7 +163,7 @@ describe("credentials (review #5, #6)", () => {
   });
 });
 
-describe("delete outcome (review #7)", () => {
+describe("delete outcome", () => {
   it("reports success when the response was lost after Convex deleted the deployment", async () => {
     const f = await setup();
     closed(f, "feat-done");
@@ -180,7 +182,7 @@ describe("delete outcome (review #7)", () => {
   });
 });
 
-describe("responses are projected (review #8)", () => {
+describe("responses are projected", () => {
   it("drops fields the plugin does not name from info, usage and usage limits", async () => {
     const f = await setup();
     f.convex.add(deployment("feat-x"));
@@ -194,7 +196,7 @@ describe("responses are projected (review #8)", () => {
   });
 });
 
-describe("what a deployment lookup reveals (review #9, #10)", () => {
+describe("what a deployment lookup reveals", () => {
   it("refuses when Convex answers with a different deployment than the one asked for", async () => {
     const f = await setup();
     f.convex.add(deployment("feat-x"));
@@ -231,7 +233,7 @@ describe("what a deployment lookup reveals (review #9, #10)", () => {
   });
 });
 
-describe("board actions need the right administrator rights (review test gaps)", () => {
+describe("board actions need the right administrator rights", () => {
   it("lets a board member read and plan, but not connect, delete or run live", async () => {
     const f = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true } }) } });
     closed(f, "feat-done");
@@ -249,7 +251,7 @@ describe("board actions need the right administrator rights (review test gaps)",
     closed(f, "feat-done");
     f.convex.add(deployment("feat-open"), deployment("happy-prod", { deploymentType: "prod", isDefault: true, previewIdentifier: null }));
     f.github.pulls.push({ number: 3, ref: "feat-open" });
-    expect((await f.h.performAction<any>("deployments.delete-preview", { name: "feat-done" }, admin(COMPANY_A))).deleted).toBe(true);
+    expect((await f.h.performAction<any>("deployments.delete-preview", { name: "feat-done", dryRun: false }, admin(COMPANY_A))).deleted).toBe(true);
     await expect(f.h.performAction("deployments.delete-preview", { name: "feat-open" }, admin(COMPANY_A))).rejects.toThrow(/open pull request/i);
     await expect(f.h.performAction("deployments.delete-preview", { name: "happy-prod" }, admin(COMPANY_A))).rejects.toThrow(/only previews/i);
   });
@@ -263,7 +265,7 @@ describe("board actions need the right administrator rights (review test gaps)",
 });
 
 
-describe("round 2: an expiry is a scheduled deletion", () => {
+describe("an expiry is a scheduled deletion", () => {
   const withExpiry = (f: Fixture, name: string, expiresAt: number | null, extra: Record<string, unknown> = {}) => f.convex.add(deployment(name, { expiresAt, ...extra }));
 
   it("refuses to shorten the deadline of a guarded preview, even to a day or more, and still allows extending it", async () => {
@@ -323,7 +325,7 @@ describe("round 2: an expiry is a scheduled deletion", () => {
   });
 });
 
-describe("round 2: reaper scheduling", () => {
+describe("reaper scheduling", () => {
   const enabled = () => baseConfig({ reaper: { enabled: true } });
   it("keeps a two hour lead so a pass can see a redeploy before the deadline, and works for an agent through the viaReaper policy", async () => {
     const f = await setup({ configs: { [COMPANY_A]: enabled() } });
@@ -373,7 +375,7 @@ describe("round 2: reaper scheduling", () => {
   });
 });
 
-describe("round 2: secrets, counters and evidence", () => {
+describe("secrets, counters and evidence", () => {
   it("resolves a secret once a minute across tool calls, and drops one Convex rejects", async () => {
     const f = await setup();
     f.convex.add(deployment("feat-x"));
@@ -437,7 +439,7 @@ describe("round 2: secrets, counters and evidence", () => {
 });
 
 
-describe("round 3: reaper bookkeeping", () => {
+describe("reaper bookkeeping", () => {
   const enabled = (extra: Record<string, unknown> = {}) => baseConfig({ reaper: { enabled: true }, ...extra });
   const managedKey = { scopeKind: "company" as const, scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" };
   const twoProjects = () => enabled({ projects: [
@@ -484,7 +486,7 @@ describe("round 3: reaper bookkeeping", () => {
   });
 });
 
-describe("round 3: secrets and dry runs", () => {
+describe("secrets and dry runs", () => {
   it("drops a cached credential on a 401 from any call, so a corrected token works at once", async () => {
     const f = await setup({ connect: [], configs: { [COMPANY_A]: baseConfig({ projects: [{ convexProjectId: "100", name: "app", repository: "org/app", token: ref("s-project") }] }) } });
     f.convex.validTokens.delete(PROJECT_TOKEN);
@@ -519,7 +521,7 @@ describe("round 3: secrets and dry runs", () => {
 });
 
 
-describe("round 4: reaper bookkeeping edges", () => {
+describe("reaper bookkeeping edges", () => {
   const enabled = (extra: Record<string, unknown> = {}) => baseConfig({ reaper: { enabled: true }, ...extra });
   const managedKey = { scopeKind: "company" as const, scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" };
 
@@ -548,18 +550,34 @@ describe("round 4: reaper bookkeeping edges", () => {
     expect(f.convex.deployments.get("np")?.expiresAt).toBe(f.clock.now - HOUR + 36 * HOUR);
   });
 
-  it("reports an expiry as set even if remembering it fails afterwards, and audits it first", async () => {
+  it("records an expiry as ours before Convex is changed, and changes nothing when it cannot be recorded", async () => {
     const f = await setup();
     f.convex.add(deployment("feat-x"));
     const original = f.h.ctx.state.set.bind(f.h.ctx.state);
-    vi.spyOn(f.h.ctx.state, "set").mockImplementation(async (key, value) => {
+    const spy = vi.spyOn(f.h.ctx.state, "set").mockImplementation(async (key, value) => {
       if (key.stateKey === "managed-expiry") throw new Error("state unavailable");
       return original(key, value);
     });
     const result = await expire(f, "feat-x", 48);
-    expect(result.error).toBeUndefined();
-    expect(result.data.expiresAt).toBe(NOW + 48 * HOUR);
-    expect(f.h.activity.some(item => item.metadata?.outcome === "expiry-set")).toBe(true);
-    expect(f.h.logs.some(entry => entry.level === "warn" && /managed expiry/.test(entry.message))).toBe(true);
+    expect(result.error).toMatch(/could not record this expiry, so nothing was changed/);
+    expect(f.convex.mutations()).toHaveLength(0);
+    expect(f.convex.deployments.get("feat-x")?.expiresAt ?? null).toBeNull();
+    spy.mockRestore();
+    expect((await expire(f, "feat-x", 48)).data.expiresAt).toBe(NOW + 48 * HOUR);
+    expect(f.h.getState({ scopeKind: "company", scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" })).toEqual({ "feat-x": NOW + 48 * HOUR });
+  });
+
+  it("takes the record back when Convex definitively refuses the change, and keeps it when the answer is lost", async () => {
+    const f = await setup();
+    f.convex.add(deployment("feat-x"), deployment("feat-y"));
+    const managed = () => f.h.getState({ scopeKind: "company", scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" });
+    f.convex.scopes.set(TEAM_TOKEN, new Set([999]));
+    expect((await expire(f, "feat-x", 48)).error).toBeDefined();
+    expect(managed() ?? {}).toEqual({});
+    f.convex.scopes.delete(TEAM_TOKEN);
+    const lost = vi.spyOn(f.runtime.service.d.convex, "setExpiry").mockRejectedValueOnce(new ConvexApiError(0, "Convex could not be reached."));
+    expect((await expire(f, "feat-y", 48)).error).toMatch(/could not be reached/);
+    lost.mockRestore();
+    expect(managed()).toEqual({ "feat-y": NOW + 48 * HOUR });
   });
 });

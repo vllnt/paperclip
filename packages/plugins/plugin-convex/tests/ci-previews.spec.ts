@@ -8,6 +8,7 @@ describe("compileTemplate", () => {
     ["pr{pr}-{pr}", /more than once/],
     ["pr{pr}-run{run}-r{run}", /more than once/],
     ["pr{pr}[-run{run}[x]]", /only one flat optional/],
+    ["pr{pr}[-run{run}][-attempt{attempt}]", /only one flat optional/],
     ["pr{pr}[-run{run}", /\[ without a matching \]/],
     ["pr{pr}-run{run}]", /\] without a matching \[/],
     ["pr{pr}[]", /empty optional/],

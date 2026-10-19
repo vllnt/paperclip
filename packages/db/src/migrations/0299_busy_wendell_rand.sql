@@ -1,0 +1,2 @@
+ALTER TABLE "companies" ADD COLUMN "automation_wake_settings" jsonb DEFAULT '{}'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "routines" ADD COLUMN "automation_wake_settings" jsonb DEFAULT '{}'::jsonb NOT NULL;

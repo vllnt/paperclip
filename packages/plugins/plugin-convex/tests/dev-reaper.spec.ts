@@ -10,7 +10,7 @@ const dev = (name: string, reference: string, ageDays: number | null, extra: Rec
   lastDeployTime: ageDays === null ? null : NOW - ageDays * DAY, createTime: NOW - ((ageDays ?? 0) + 1) * DAY, ...extra,
 });
 const config = (devPolicy: Record<string, unknown> = {}, reaper: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
-  baseConfig({ reaper: { enabled: true, dev: { enabled: true, onlyPatterns: ["dev/ship-*", "dev/issue-*", "dev/songtrivia-*"], ...devPolicy }, ...reaper }, ...extra });
+  baseConfig({ reaper: { enabled: true, dev: { enabled: true, onlyPatterns: ["dev/ship-*", "dev/issue-*", "dev/example-app-*"], ...devPolicy }, ...reaper }, ...extra });
 const report = (f: Fixture) => f.h.performAction<any>("reaper.report", {}, member(COMPANY_A));
 const deleted = (f: Fixture) => f.convex.deletes().map(call => decodeURIComponent(call.url.split("/deployments/")[1].replace("/delete", ""))).sort();
 const closed = (f: Fixture, name: string, number: number, extra: Record<string, unknown> = {}) => {
@@ -65,7 +65,7 @@ describe("hard delete guard (regardless of grants or config)", () => {
 
   it("never lets an agent delete a dev deployment, directly or through the reap tool", async () => {
     const f = await setup({ configs: { [COMPANY_A]: config() } });
-    f.convex.add(dev("old-dev", "dev/ship-3561-x", 30));
+    f.convex.add(dev("old-dev", "dev/ship-103-x", 30));
     const { service } = f.runtime;
     const { config: cfg, reserved } = await service.requireConnected(COMPANY_A);
     await expect(service.deleteDev({ kind: "agent", companyId: COMPANY_A, agent: { id: "janitor", role: "devops" }, runId: "r" }, cfg, reserved, "old-dev", { dryRun: false })).rejects.toThrow(/agent/i);
@@ -78,12 +78,23 @@ describe("hard delete guard (regardless of grants or config)", () => {
 });
 
 describe("dev policy", () => {
+  it("bounds the dev cleanup plan returned to an agent without executing it", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: config() } });
+    for (let i = 0; i < 30; i++) f.convex.add(dev(`old-dev-${i}`, `dev/ship-${i}`, 30));
+    const result = await f.h.executeTool<{ data?: any }>("convex_reap_previews", { dryRun: false }, run("janitor"));
+    expect(result.data.projects[0].dev.delete).toHaveLength(25);
+    expect(result.data.projects[0].dev.counts.delete).toBe(30);
+    expect(result.data.projects[0].dev.truncated).toBe(true);
+    expect(result.data.projects[0].dev.executed).toBe(false);
+    expect(f.convex.deletes()).toHaveLength(0);
+  });
+
   it("deletes dev deployments older than seven days, using createTime when never deployed, and keeps younger or undated ones", async () => {
     const f = await setup({ configs: { [COMPANY_A]: config() } });
     f.convex.add(
-      dev("old", "dev/ship-3561-a", 8), dev("young", "dev/ship-3562-b", 6), dev("edge", "dev/ship-3563-c", 6.9),
-      dev("never-deployed", "dev/issue-3555-d", null, { lastDeployTime: null, createTime: NOW - 9 * DAY }),
-      dev("undated", "dev/issue-3556-e", null, { lastDeployTime: null, createTime: null }),
+      dev("old", "dev/ship-103-a", 8), dev("young", "dev/ship-104-b", 6), dev("edge", "dev/ship-105-c", 6.9),
+      dev("never-deployed", "dev/issue-101-d", null, { lastDeployTime: null, createTime: NOW - 9 * DAY }),
+      dev("undated", "dev/issue-102-e", null, { lastDeployTime: null, createTime: null }),
     );
     await f.h.runJob("convex-reaper");
     expect(deleted(f)).toEqual(["never-deployed", "old"]);
@@ -98,12 +109,12 @@ describe("dev policy", () => {
   });
 
   it("protects defaults, personal developers, shared pools and the company's own list", async () => {
-    const f = await setup({ configs: { [COMPANY_A]: config({ protect: ["dev/keep-*", "dev/pinned"], onlyPatterns: ["dev/songtrivia-*", "dev/keep-*", "dev/pinned", "dev/paperclip-agents", "dev/local-*", "dev/qa-*", "dev/alice", "dev/sam-k"] }) } });
+    const f = await setup({ configs: { [COMPANY_A]: config({ protect: ["dev/keep-*", "dev/pinned"], onlyPatterns: ["dev/example-app-*", "dev/keep-*", "dev/pinned", "dev/paperclip-agents", "dev/local-*", "dev/qa-*", "dev/alice", "dev/sam-k"] }) } });
     f.convex.add(
       dev("human-1", "dev/alice", 90, { isDefault: true }), dev("human-2", "dev/sam-k", 90, { isDefault: true }),
-      dev("pool-1", "dev/paperclip-agents", 90), dev("pool-2", "dev/local-abc", 90), dev("pool-3", "dev/qa-songtrivia", 90),
+      dev("pool-1", "dev/paperclip-agents", 90), dev("pool-2", "dev/local-abc", 90), dev("pool-3", "dev/qa-example-app", 90),
       dev("mine-1", "dev/keep-this-one", 90), dev("mine-2", "dev/pinned", 90), dev("mine-3", "DEV/Keep-Upper", 90),
-      dev("agent-made", "dev/songtrivia-3444-feature", 90),
+      dev("agent-made", "dev/example-app-3444-feature", 90),
     );
     await f.h.runJob("convex-reaper");
     expect(deleted(f)).toEqual(["agent-made"]);
@@ -111,7 +122,7 @@ describe("dev policy", () => {
 
   it("can be limited to an allow list of reference patterns", async () => {
     const f = await setup({ configs: { [COMPANY_A]: config({ onlyPatterns: ["dev/ship-*", "dev/issue-*"] }) } });
-    f.convex.add(dev("a", "dev/ship-1-a", 30), dev("b", "dev/issue-2-b", 30), dev("c", "dev/songtrivia-3-c", 30), dev("d", "dev/someone-else", 30));
+    f.convex.add(dev("a", "dev/ship-1-a", 30), dev("b", "dev/issue-2-b", 30), dev("c", "dev/example-app-3-c", 30), dev("d", "dev/someone-else", 30));
     await f.h.runJob("convex-reaper");
     expect(deleted(f)).toEqual(["a", "b"]);
   });
@@ -247,10 +258,10 @@ describe("superseded previews of open pull requests", () => {
     expect(f.convex.deletes()).toHaveLength(0);
   });
 
-  it("deletes every preview of a pull request once it is closed, matching them by the pattern", async () => {
+  it("deletes idle previews of a closed pull request by its pattern and keeps recent deployments", async () => {
     const f = await setup({ configs: { [COMPANY_A]: withPattern() } });
-    f.convex.add(ci(4320, 100, 1, 1, 30), ci(4320, 101, 1, 1, 3));
-    f.github.pulls.push({ number: 4320, ref: "feature/x", state: "closed", merged: true });
+    f.convex.add(ci(4320, 100, 1, 1, 30), ci(4320, 101, 1, 1, 27), ci(4320, 102, 1, 1, 3));
+    f.github.pulls.push({ number: 4320, ref: "feature/x", state: "closed", merged: true, closedAt: NOW - HOUR });
     await f.h.runJob("convex-reaper");
     expect(deleted(f)).toEqual(["pr4320-run100-s1-a1", "pr4320-run101-s1-a1"]);
   });
@@ -318,9 +329,9 @@ describe("configuration", () => {
     expect(parseConfig({ reaper: { dev: { protect: ["*", "dev/*"] } } }).reaper.dev.protect).toEqual(["*", "dev/*"]);
   });
 
-  it("parses the example config printed in the design doc", async () => {
+  it("parses the example config printed in the operator reference", async () => {
     const { parseConfig } = await import("../src/config.js");
-    const doc = readFileSync(new URL("../../../../docs/plugins/convex.md", import.meta.url), "utf8");
+    const doc = readFileSync(new URL("../../../../doc/convex-plugin.md", import.meta.url), "utf8");
     const example = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(doc)![1]);
     const parsed = parseConfig(example);
     expect(parsed.reaper.dev.maxAgeDays).toBe(7);

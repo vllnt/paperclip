@@ -3,7 +3,7 @@ import { COMPANY_A, COMPANY_B, GITHUB_TOKEN, PROJECT_TOKEN, TEAM_TOKEN, baseConf
 import { HOUR, NOW, deployment } from "./fakes.js";
 
 const del = (f: Fixture, agent: string, name: string, extra: Record<string, unknown> = {}, ctx = run(agent)) =>
-  f.h.executeTool<{ data?: any; error?: string }>("convex_delete_preview", { name, ...extra }, ctx);
+  f.h.executeTool<{ data?: any; error?: string }>("convex_delete_preview", { name, dryRun: false, ...extra }, ctx);
 
 /** A closed PR and a gone branch: the preview is eligible for deletion. */
 function eligible(f: Fixture, name = "feat-done") {

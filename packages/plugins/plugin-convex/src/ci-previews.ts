@@ -17,6 +17,7 @@ export function compileTemplate(template: string): RegExp {
   if (!template || template.length > 200) throw new Error("must be 1 to 200 characters");
   let source = "";
   let optional = false;
+  let optionalSeen = false;
   let optionalLength = 0;
   const seen = new Set<string>();
   // What can come right before the next element: a number (a placeholder or a digit) or anything else. Two numbers next to each other
@@ -39,7 +40,8 @@ export function compileTemplate(template: string): RegExp {
       before = new Set(["number"]);
       i = end;
     } else if (char === "[") {
-      if (optional) throw new Error("allows only one flat optional [ ] part");
+      if (optionalSeen) throw new Error("allows only one flat optional [ ] part");
+      optionalSeen = true;
       optional = true;
       optionalLength = 0;
       beforeOptional = new Set(before);

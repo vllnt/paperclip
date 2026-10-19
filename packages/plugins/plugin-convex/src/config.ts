@@ -1,6 +1,6 @@
 import { compileTemplate } from "./ci-previews.js";
 import {
-  CAPABILITIES, ENVIRONMENT_CLASSES, PRESETS, PRODUCTION_WRITE_CAPABILITIES,
+  CAPABILITIES, ENVIRONMENT_CLASSES, PRESETS, isRepositoryName,
   type Capability, type ConnectionConfig, type EnvironmentClass, type Grant, type ProjectMapping, type SecretRef,
 } from "./contracts.js";
 
@@ -39,14 +39,12 @@ function flag(value: unknown, path: string, fallback: boolean): boolean {
   if (typeof value !== "boolean") throw new ConfigError(`${path} must be true or false.`);
   return value;
 }
-const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-
 function project(raw: unknown, index: number): ProjectMapping {
   const path = `projects[${index}]`;
   if (!isRecord(raw)) throw new ConfigError(`${path} must be an object.`);
   const environments = isRecord(raw.environments) ? raw.environments : {};
   const repository = raw.repository === undefined || raw.repository === null ? null : raw.repository;
-  if (repository !== null && (typeof repository !== "string" || !REPOSITORY.test(repository))) throw new ConfigError(`${path}.repository must be owner/name.`);
+  if (repository !== null && (typeof repository !== "string" || !isRepositoryName(repository))) throw new ConfigError(`${path}.repository must be owner/name.`);
   const convexProjectId = id(raw.convexProjectId, `${path}.convexProjectId`);
   return {
     convexProjectId,
@@ -66,6 +64,8 @@ function grant(raw: unknown, index: number): Grant {
   const agentId = typeof raw.agentId === "string" && raw.agentId ? raw.agentId : null;
   const role = typeof raw.role === "string" && raw.role ? raw.role : null;
   if ((agentId === null) === (role === null)) throw new ConfigError(`${path} needs exactly one of agentId or role.`);
+  // There is no per-call approval flow in this version, so a grant that asks for one would parse and then never apply.
+  if (raw.approval !== undefined) throw new ConfigError(`${path}.approval is not available in this version; remove it.`);
   if (!Array.isArray(raw.environments) || !raw.environments.length || raw.environments.some(env => !(ENVIRONMENT_CLASSES as readonly string[]).includes(env as string))) {
     throw new ConfigError(`${path}.environments must list environment classes: ${ENVIRONMENT_CLASSES.join(", ")}.`);
   }
@@ -76,7 +76,7 @@ function grant(raw: unknown, index: number): Grant {
   }
   if (raw.capabilities !== undefined) {
     if (!Array.isArray(raw.capabilities) || raw.capabilities.some(capability => !(CAPABILITIES as readonly string[]).includes(capability as string))) {
-      throw new ConfigError(`${path}.capabilities must list capabilities: ${CAPABILITIES.join(", ")}.`);
+      throw new ConfigError(`${path}.capabilities must list capabilities that this version enforces: ${CAPABILITIES.join(", ")}.`);
     }
     for (const capability of raw.capabilities as Capability[]) capabilities.add(capability);
   }
@@ -84,12 +84,7 @@ function grant(raw: unknown, index: number): Grant {
   const environments = [...new Set(raw.environments as EnvironmentClass[])];
   // Agents may only manage the lifecycle of previews. Reject the grant instead of ignoring it, so an operator sees the mistake.
   if (capabilities.has("lifecycle") && environments.some(env => env !== "preview")) throw new ConfigError(`${path}: lifecycle can only be granted on preview.`);
-  const approval = raw.approval === undefined || raw.approval === null ? null : raw.approval;
-  if (approval !== null && approval !== "per-call") throw new ConfigError(`${path}.approval must be "per-call".`);
-  if (environments.includes("production") && [...capabilities].some(capability => PRODUCTION_WRITE_CAPABILITIES.includes(capability)) && approval !== "per-call") {
-    throw new ConfigError(`${path}: production writes need approval "per-call".`);
-  }
-  return { agentId, role, environments, capabilities: [...capabilities], approval };
+  return { agentId, role, environments, capabilities: [...capabilities] };
 }
 
 /**

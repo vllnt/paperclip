@@ -1,5 +1,7 @@
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
+import { runUsageRecordService } from "./services/run-usage-records.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
+import { sshRunDirectoryReaperService } from "./services/ssh-run-directory-reaper.js";
 /// <reference path="./types/express.d.ts" />
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
@@ -97,6 +99,8 @@ import {
   createProductionLoginSessionReaperRuntime,
 } from "./services/device-login-reaper.js";
 import { createProductionSetupTokenReaper } from "./services/setup-token-reaper.js";
+import { createPaperclipTempSweep, startPaperclipTempSweeper } from "./services/paperclip-temp-sweeper.js";
+import { isHeartbeatRunExecuting } from "./services/heartbeat.js";
 import { localAiLoginService } from "./services/local-ai-login.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
@@ -1179,6 +1183,33 @@ async function startServerWithDatabaseTeardown(
   const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();
+  const runUsageRecords = runUsageRecordService(db);
+  let runUsageDerivationInFlight = false;
+  const deriveRunUsageRecords = () => {
+    if (heartbeatSchedulerStopped || runUsageDerivationInFlight) return;
+    runUsageDerivationInFlight = true;
+    trackHeartbeatSchedulerWork(runUsageRecords.runScheduledPass()
+      .then((result) => {
+        if (result.written > 0) {
+          logger.info({ scanned: result.scanned, written: result.written, sweep: result.sweep }, "run usage records derived");
+        }
+      })
+      .catch((err) => logger.error({ err }, "run usage record derivation failed"))
+      .finally(() => { runUsageDerivationInFlight = false; }));
+  };
+  const runUsageRecordInterval = setInterval(deriveRunUsageRecords, config.runUsageRecordIntervalMs);
+  runUsageRecordInterval.unref?.();
+  // Remove per-run temp entries of dead runs: on startup, then on the
+  // interval. It runs whether or not the heartbeat scheduler does.
+  const tempSweeper = startPaperclipTempSweeper({
+    sweep: createPaperclipTempSweep(db, {
+      runGraceMs: config.tempSweepRunGraceMinutes * 60 * 1000,
+      isRunExecuting: isHeartbeatRunExecuting,
+    }),
+    intervalMs: config.tempSweepIntervalMinutes * 60 * 1000,
+    log: (record) => logger.info(record, "paperclip temp sweep finished"),
+    onError: (err) => logger.error({ err, event: "paperclip_tmp_sweep" }, "paperclip temp sweep failed"),
+  });
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
@@ -1254,6 +1285,27 @@ async function startServerWithDatabaseTeardown(
   const scheduleEnvironmentLeaseCleanupSweep = () => {
     if (heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
+  };
+  // Finished SSH runs leave a directory on the worker that fills its disk. The
+  // lease release removes it; this sweep removes the ones that removal missed
+  // and shortens its age threshold when the worker's disk is nearly full. The
+  // scheduler tick is much shorter than a sweep needs, so this one runs at most
+  // every ten minutes, starting with the first tick.
+  const SSH_RUN_DIRECTORY_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+  const sshRunDirectoryReaper = sshRunDirectoryReaperService(db as any);
+  let lastSshRunDirectorySweepAt = 0;
+  const scheduleSshRunDirectorySweep = () => {
+    if (heartbeatSchedulerStopped) return;
+    if (Date.now() - lastSshRunDirectorySweepAt < SSH_RUN_DIRECTORY_SWEEP_INTERVAL_MS) return;
+    lastSshRunDirectorySweepAt = Date.now();
+    trackHeartbeatSchedulerWork(sshRunDirectoryReaper
+      .sweep()
+      .then((summary) => {
+        if (summary.examined > 0) logger.info(summary, "SSH run directory sweep completed");
+      })
+      .catch((err) => {
+        logger.error({ err }, "SSH run directory sweep failed");
+      }));
   };
   const githubConnectionEvents = githubConnectionEventService(db as any, {
     wakeup: environmentLeaseCleanupHeartbeat.wakeup,
@@ -1681,6 +1733,7 @@ async function startServerWithDatabaseTeardown(
         scheduleAdapterLoginReaperSweep();
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
+        scheduleSshRunDirectorySweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
@@ -1836,6 +1889,7 @@ async function startServerWithDatabaseTeardown(
     startHeartbeatSchedulerInterval(() => {
       scheduleExternalObjectRefreshSweep(new Date());
       scheduleEnvironmentLeaseCleanupSweep();
+      scheduleSshRunDirectorySweep();
       scheduleGitHubConnectionEventPoll();
       scheduleGitHubConnectionContinuitySweep();
     });
@@ -1936,6 +1990,8 @@ async function startServerWithDatabaseTeardown(
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
     clearInterval(executionControlInterval);
+    clearInterval(runUsageRecordInterval);
+    tempSweeper.stop();
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
       heartbeatSchedulerInterval = null;

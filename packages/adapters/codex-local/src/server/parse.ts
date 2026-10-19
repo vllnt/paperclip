@@ -318,11 +318,18 @@ export function isCodexTransientUpstreamError(input: {
   return CODEX_REMOTE_COMPACTION_RE.test(haystack) || /high\s+demand|temporary\s+errors/i.test(haystack);
 }
 
+/**
+ * Classifies a provider quota failure from Codex's structured error only: the
+ * message of a JSONL `error` or `turn.failed` event. Raw stdout and stderr are
+ * not read, because a task's tools can print any text there.
+ *
+ * @param input.errorMessage The message parsed from Codex's error event.
+ * @returns True when Codex reported a usage or capacity limit.
+ */
 export function isCodexProviderQuotaError(input: {
-  stdout?: string | null;
-  stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
-  const haystack = buildCodexErrorHaystack(input);
-  return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
+  const surface = { errorMessage: input.errorMessage };
+  const haystack = buildCodexErrorHaystack(surface);
+  return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(surface) != null;
 }

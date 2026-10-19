@@ -64,6 +64,8 @@ import {
   restoreIssueDocumentRevisionSchema,
   upsertIssueFeedbackVoteSchema,
   upsertIssueWatchdogSchema,
+  findSimilarIssuesSchema,
+  labelDuplicatePairSchema,
   runnerGoalActionRequestSchema,
   // Project
   createProjectSchema,
@@ -87,6 +89,9 @@ import {
   updateDecisionQueueSchema,
   updateDecisionTriageSchema,
   updateDecisionRetentionSchema,
+  // Heartbeat runs
+  heartbeatRunStatsQuerySchema,
+  heartbeatRunStatsSchema,
   // Routine
   createRoutineSchema,
   updateRoutineSchema,
@@ -138,6 +143,9 @@ import {
   workspaceRuntimeControlTargetSchema,
   // Environments
   createEnvironmentSchema,
+  listEnvironmentLeasesQuerySchema,
+  ENVIRONMENT_DRIVERS,
+  ENVIRONMENT_LEASE_STATUSES,
   cancelEnvironmentCustomImageSetupSessionSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageSetupSessionSchema,
@@ -220,8 +228,10 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
   cancelIssueThreadInteractionSchema,
+  issueWaitRequestSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
@@ -303,6 +313,11 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  observabilityFailuresQuerySchema,
+  observabilityFailuresResponseSchema,
+  observabilityHealthSchema,
+  observabilityUsageQuerySchema,
+  observabilityUsageResponseSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1355,6 +1370,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
   "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
 
+  "GET /api/companies/{companyId}/chats",
+  "GET /api/companies/{companyId}/chats/{agentRef}",
+  "POST /api/companies/{companyId}/chats/{agentRef}",
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
   "DELETE /api/issues/{id}/documents/{key}",
@@ -1652,6 +1670,20 @@ const FORBIDDEN_RESPONSE = {
   },
 };
 
+// A path value that the database cannot parse (e.g. a malformed UUID) returns
+// 400 from the central error handler, so every operation with a path parameter
+// can answer 400.
+const BAD_REQUEST_RESPONSE = {
+  description: "Bad request",
+  content: {
+    "application/json": {
+      schema: { $ref: "#/components/schemas/Error" },
+    },
+  },
+};
+
+const PATH_PARAMETER_PATTERN = /\{[^}]+\}/;
+
 function operationKey(method: string, path: string) {
   return `${method.toUpperCase()} ${path}`;
 }
@@ -1769,6 +1801,13 @@ function applyDocumentFixups(document: any): any {
         if (!responses["403"]) {
           responses["403"] = FORBIDDEN_RESPONSE;
         }
+      }
+      if (PATH_PARAMETER_PATTERN.test(path)) {
+        const responses = (operation.responses ??= {}) as Record<
+          string,
+          unknown
+        >;
+        responses["400"] ??= BAD_REQUEST_RESPONSE;
       }
       if (CREATED_OPERATIONS.has(key)) {
         applyOperationStatusOverride(operation, "200", "201");
@@ -2076,8 +2115,10 @@ registry.registerPath({
   path: "/api/companies/{companyId}",
   tags: ["companies"],
   summary: "Delete a company",
+  description:
+    "Deletes the company and every row it owns, in one transaction. Before it checks anything it locks the company row and the rows of the company that other rows could point at, so a concurrent write cannot add a reference after the check. A write that waits for these locks fails with a foreign-key error when the delete commits. Returns 409 and deletes nothing when a row of another company would be deleted or changed (`details.code` is `company_delete_cross_company_references`, with `details.references` as a list of `{ table, count }`), when a row still blocks the delete (`details.table` and `details.blockingRows`), or when a lock could not be had within 5 seconds or the database ended the delete to break a deadlock (`details.code` is `company_delete_busy`; trying again can work). The response names no ids, companies or content. A successful delete writes one `company_deleted` server log entry with the actor and the row count per table.",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -3909,6 +3950,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Get the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. `agentRef` is an agent ID or URL key. Returns the conversation issue, or null when none exists yet. Read-only.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Open the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. Returns the existing conversation issue, or creates it. `agentRef` is an agent ID or URL key.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
@@ -3968,7 +4029,9 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
+    "Agents may name themselves or `\"board\"` as `unblockDescriptor.owner`, never a specific user or another agent (403). " +
+    "While the board or a user owns a block, an agent may not move the issue out of `blocked` or change or clear its descriptor (403). The same rule applies to a comment that asks to `resume` or `reopen` the issue (POST /api/issues/{id}/comments).",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateIssueSchema.partial()),
@@ -3977,6 +4040,7 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     422: r.unprocessable,
   },
@@ -4091,6 +4155,54 @@ registry.registerPath({
   request: { params: z.object({ id: z.string() }) },
   responses: {
     200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issues/similar",
+  tags: ["issues"],
+  summary: "Check a draft issue for likely duplicates before creating it",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(findSimilarIssuesSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/duplicate-pairs",
+  tags: ["issues"],
+  summary: "List scored duplicate candidates recorded for an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    404: { ...r.notFound, description: "Issue not found, or it belongs to another company" },
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issue-duplicate-pairs/{pairId}/label",
+  tags: ["issues"],
+  summary: "Label a scored duplicate pair as duplicate or keep both",
+  request: {
+    params: z.object({ companyId: z.string(), pairId: z.string() }),
+    body: jsonBody(labelDuplicatePairSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
@@ -4239,11 +4351,13 @@ registry.registerPath({
   path: "/api/issues/{id}/comments",
   tags: ["issues"],
   summary: "Add a comment to an issue",
+  description:
+    "An agent may not use `resume` or `reopen` to move an issue out of a block that the board or a user owns, or change that block's descriptor (403). Nothing is posted when this refuses. A board user may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(addIssueCommentSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -4290,11 +4404,13 @@ registry.registerPath({
   path: "/api/issues/{id}/checkout",
   tags: ["issues"],
   summary: "Check out an issue",
+  description:
+    "While the board or a user owns a block, an agent may not check the issue out of `blocked` (403), the same rule as for PATCH /api/issues/{id}. A board user may. The issue stays blocked and keeps its `unblockDescriptor`.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(checkoutIssueSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -5289,6 +5405,47 @@ registry.registerPath({
     body: jsonBody(createCostEventSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/health",
+  tags: ["observability"],
+  summary: "Usage collector health for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(observabilityHealthSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/usage",
+  tags: ["observability"],
+  summary: "Tokens, cost and duration of runs, grouped by one dimension",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityUsageQuerySchema },
+  responses: {
+    200: r.ok(observabilityUsageResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/failures",
+  tags: ["observability"],
+  summary: "Failed runs by cause or other dimension, with the count of all runs for a rate",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityFailuresQuerySchema },
+  responses: {
+    200: r.ok(observabilityFailuresResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registry.registerPath({
@@ -6814,8 +6971,46 @@ registry.registerPath({
   path: "/api/companies/{companyId}/heartbeat-runs",
   tags: ["runs"],
   summary: "List heartbeat runs for a company",
+  description:
+    "Newest first. `status` and `errorCode` take comma-separated values. `since` and `until` (ISO 8601) bound the " +
+    "run's creation time; `until` is exclusive, and an empty or inverted window returns 400. `limit` is 1-1000. " +
+    "`summary=true` returns lighter rows.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().uuid().optional(),
+      status: z.string().optional(),
+      errorCode: z.string().optional(),
+      since: z.string().datetime({ offset: true }).optional(),
+      until: z.string().datetime({ offset: true }).optional(),
+      limit: z.string().optional(),
+      summary: z.enum(["true", "1"]).optional(),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/heartbeat-runs/stats",
+  tags: ["runs"],
+  summary: "Get heartbeat run stats and daily cap usage for a company",
+  description:
+    "Counts runs created in the window (default: the last 24 hours, at most 90 days) by status, the top error " +
+    "codes, and for each agent its runs today against `runtimeConfig.heartbeat.maxDailyRuns`. `runsToday` is the " +
+    "value the daily cap itself compares against the limit (one shared function), so `capReached` matches whether " +
+    "the next wake is allowed.",
+  request: { params: z.object({ companyId: z.string() }), query: heartbeatRunStatsQuerySchema },
+  responses: { 200: r.ok(heartbeatRunStatsSchema), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/deferred-wakes",
+  tags: ["runs"],
+  summary: "Get deferred-wake queue health for a company",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7736,7 +7931,8 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     body: jsonBody(companySkillCreateSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  // 201 for a new skill, 200 when an idempotency key replays a prior create, 409 when the slug already has a skill.
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -8317,9 +8513,43 @@ registry.registerPath({
   method: "get",
   path: "/api/environments/{id}/leases",
   tags: ["environments"],
-  summary: "List leases for an environment",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "List leases for an environment, optionally filtered by status",
+  description:
+    "Board only. Returns only the leases of the caller's companies (the local board and instance admins see all). " +
+    "Lease metadata is redacted.",
+  request: { params: z.object({ id: z.string() }), query: listEnvironmentLeasesQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/environment-leases",
+  tags: ["environments"],
+  summary:
+    "List a company's environment leases across environments, most recently used first (default status active,pending_cleanup). " +
+    "Board only; lease metadata is redacted",
+  request: { params: z.object({ companyId: z.string() }), query: listEnvironmentLeasesQuerySchema },
+  responses: {
+    200: r.ok(
+      z.array(
+        z
+          .object({
+            id: z.string(),
+            companyId: z.string(),
+            environmentId: z.string().nullable(),
+            status: z.enum(ENVIRONMENT_LEASE_STATUSES),
+            environment: z
+              .object({ id: z.string(), name: z.string(), driver: z.enum(ENVIRONMENT_DRIVERS) })
+              .nullable()
+              .describe("Null for an orphan lease whose environment was deleted"),
+          })
+          .passthrough(),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registry.registerPath({
@@ -8327,6 +8557,9 @@ registry.registerPath({
   path: "/api/environment-leases/{leaseId}",
   tags: ["environments"],
   summary: "Get an environment lease",
+  description:
+    "Board only. A lease of a company the caller is not in returns 404, the same as a missing lease (the local " +
+    "board and instance admins can read any). Lease metadata is redacted.",
   request: { params: z.object({ leaseId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
@@ -8898,7 +9131,9 @@ registry.registerPath({
 // ─── Convex plugin action contracts ───────────────────────────────────────────
 // The bundled Convex plugin (vllnt.paperclip-convex) serves these board actions
 // through the URL-keyed action route below. Agents use the plugin's tools
-// (GET /api/plugins/tools) instead; the grants and guards apply to both.
+// (GET /api/plugins/tools) instead. The guards (activity window, delete cap,
+// call rate, dry-run-only) apply to both; the grants apply to agent tools only,
+// because a board action and the reaper are not subject to them.
 const convexEnvironment = z.enum(["production", "staging", "preview", "dev", "custom"]);
 const convexDeploymentSchema = z.object({
   name: z.string(),
@@ -8916,28 +9151,65 @@ const convexDeploymentSchema = z.object({
   creator: z.string().nullable(),
   project: z.string().nullable(),
 });
-registry.register("ConvexDeployment", convexDeploymentSchema);
-registry.register("ConvexStatus", z.object({
+// The compact row of deployments.list; the detail above is the plugin's get tool and the delete-preview result.
+const convexDeploymentSummarySchema = z.object({
+  name: z.string(),
+  environment: convexEnvironment,
+  deploymentType: z.string().nullable(),
+  previewIdentifier: z.string().nullable(),
+  lastDeployTime: z.number().nullable().describe("Milliseconds since epoch"),
+  expiresAt: z.number().nullable().describe("Milliseconds since epoch"),
+});
+const convexQuotaSchema = z.object({
+  count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional(),
+  lowerBound: z.boolean().optional().describe("True when the team has more deployments than could be counted; count is then a minimum"),
+});
+const convexStatusSchema = z.object({
   connection: z.enum(["connected", "disconnected", "not-configured", "not-connected"]),
-  configError: z.string().optional(),
-  teamId: z.string().nullable(),
+  configError: z.string().optional().describe("Set when the company's Convex config is invalid; connection is then not-configured and projects is empty"),
+  // The config-error branch omits or nulls everything below.
+  teamId: z.string().nullable().optional(),
   projects: z.array(z.object({ convexProjectId: z.string(), name: z.string(), repository: z.string().nullable(), paperclipProjectId: z.string().nullable(), reserved: z.boolean() })),
-  credentials: z.object({ teamToken: z.boolean(), github: z.boolean() }).describe("Whether a credential is configured; values are never returned"),
-  grants: z.number(),
-}));
-registry.register("ConvexDeploymentsListParams", z.object({
+  credentials: z.object({ teamToken: z.boolean(), github: z.boolean() }).nullable().optional().describe("Whether a credential is configured; values are never returned"),
+  grants: z.number().nullable().optional().describe("Number of agent grants; grants apply to agent tools only"),
+  guards: z.object({ activityHours: z.number(), maxDeletesPerRun: z.number(), callsPerMinute: z.number(), dryRunOnly: z.boolean() }).nullable().optional(),
+  reaper: z.object({ enabled: z.boolean(), ttlHours: z.number(), quota: z.number(), alertPercent: z.number() }).nullable().optional(),
+  lastReport: z.object({ at: z.string(), dryRun: z.boolean(), quota: convexQuotaSchema.nullable() }).nullable().optional().describe("Summary of the last reaper report"),
+});
+const convexConnectResultSchema = z.object({ projects: z.array(z.string()).describe("Convex project ids now reserved for the company") });
+const convexDisconnectResultSchema = z.object({ connection: z.literal("disconnected") });
+const convexDeploymentsListParamsSchema = z.object({
   convexProjectId: z.string().optional(),
   deploymentType: z.enum(["preview", "dev", "prod", "custom"]).optional(),
-}));
-registry.register("ConvexDeploymentsList", z.object({ deployments: z.array(convexDeploymentSchema), truncated: z.boolean() }));
-registry.register("ConvexDeletePreviewParams", z.object({
+  limit: z.number().int().min(1).max(200).optional().describe("Rows per page, 1 to 200; default 50"),
+  cursor: z.string().optional().describe("Opaque; the nextCursor of the previous page"),
+});
+const convexDeploymentsListSchema = z.object({
+  deployments: z.array(convexDeploymentSummarySchema),
+  total: z.number().int().describe("Rows in the whole listing, not only this page"),
+  nextCursor: z.string().nullable().describe("Pass as cursor to get the next page; null on the last page"),
+  truncated: z.boolean(),
+});
+const convexDeletePreviewParamsSchema = z.object({
   name: z.string(),
-  dryRun: z.boolean().optional().describe("Run every guard and delete nothing"),
-}));
-registry.register("ConvexReaperRunParams", z.object({
+  dryRun: z.boolean().optional().describe("Absent or true runs every guard and deletes nothing. Only false deletes"),
+});
+const convexDeletePreviewResultSchema = z.object({
+  dryRun: z.boolean().describe("True also when the plugin's dryRunOnly guard turned a real request into a plan"),
+  wouldDelete: z.boolean(),
+  deleted: z.boolean(),
+  environment: convexEnvironment,
+  deployment: convexDeploymentSchema,
+  evidence: z.object({
+    prState: z.enum(["none", "closed", "merged"]), prNumber: z.number().nullable(), branchExists: z.boolean(), lastCommitAt: z.number().nullable(), idleMs: z.number(),
+  }).nullable(),
+  reason: z.string().nullable(),
+  note: z.string().optional().describe("Set when a real request was turned into a plan by the dryRunOnly guard"),
+});
+const convexReaperRunParamsSchema = z.object({
   dryRun: z.boolean().optional().describe("Absent or true only plans. false runs for real and needs reaper.enabled and an instance administrator"),
-}));
-registry.register("ConvexReaperReport", z.object({
+});
+const convexReaperReportSchema = z.object({
   at: z.string(),
   trigger: z.enum(["schedule", "manual", "retry", "api"]),
   dryRun: z.boolean(),
@@ -8958,14 +9230,49 @@ registry.register("ConvexReaperReport", z.object({
       skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
       error: z.string().optional(),
     }).optional().describe("Dev deployments older than the company's age limit; deleted only by the scheduled or a board-run reaper"),
+    deferred: z.number().int().optional().describe("Previews not examined, and expiry changes not planned, because the time budget or the per-pass limit was reached; the next pass continues with the oldest"),
     error: z.string().optional(),
   })),
-  quota: z.object({ count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional() }).nullable(),
+  quota: convexQuotaSchema.nullable(),
   errors: z.array(z.string()),
-}));
+  incomplete: z.string().optional().describe("Why the pass stopped early, when it did"),
+});
+// The body of every failure of a plugin bridge call; a permission refusal or a plugin error is code WORKER_ERROR.
+const pluginBridgeErrorSchema = z.object({
+  code: z.enum(["WORKER_UNAVAILABLE", "CAPABILITY_DENIED", "INVOCATION_SCOPE_DENIED", "WORKER_ERROR", "TIMEOUT", "UNKNOWN"]),
+  message: z.string(),
+  details: z.unknown().optional(),
+});
+const convexSchemaRefs = {
+  deployment: registry.register("ConvexDeployment", convexDeploymentSchema),
+  deploymentSummary: registry.register("ConvexDeploymentSummary", convexDeploymentSummarySchema),
+  status: registry.register("ConvexStatus", convexStatusSchema),
+  connectResult: registry.register("ConvexConnectResult", convexConnectResultSchema),
+  disconnectResult: registry.register("ConvexDisconnectResult", convexDisconnectResultSchema),
+  deploymentsListParams: registry.register("ConvexDeploymentsListParams", convexDeploymentsListParamsSchema),
+  deploymentsList: registry.register("ConvexDeploymentsList", convexDeploymentsListSchema),
+  deletePreviewParams: registry.register("ConvexDeletePreviewParams", convexDeletePreviewParamsSchema),
+  deletePreviewResult: registry.register("ConvexDeletePreviewResult", convexDeletePreviewResultSchema),
+  reaperRunParams: registry.register("ConvexReaperRunParams", convexReaperRunParamsSchema),
+  reaperReport: registry.register("ConvexReaperReport", convexReaperReportSchema),
+  bridgeError: registry.register("PluginBridgeError", pluginBridgeErrorSchema),
+};
 export const CONVEX_PLUGIN_ACTIONS = [
   "status", "connection.connect", "connection.disconnect", "deployments.list", "deployments.delete-preview", "reaper.run", "reaper.report",
 ] as const;
+/** The result and params schemas of the Convex actions, for tests and typed callers. */
+export const CONVEX_PLUGIN_SCHEMAS = {
+  status: convexStatusSchema,
+  connectResult: convexConnectResultSchema,
+  disconnectResult: convexDisconnectResultSchema,
+  deploymentsListParams: convexDeploymentsListParamsSchema,
+  deploymentsList: convexDeploymentsListSchema,
+  deletePreviewParams: convexDeletePreviewParamsSchema,
+  deletePreviewResult: convexDeletePreviewResultSchema,
+  reaperRunParams: convexReaperRunParamsSchema,
+  reaperReport: convexReaperReportSchema,
+  bridgeError: pluginBridgeErrorSchema,
+} as const;
 
 registry.registerPath({
   method: "post",
@@ -8990,10 +9297,18 @@ registry.registerPath({
   tags: ["plugins"],
   summary: "Invoke a plugin action (URL-keyed bridge)",
   description:
-    "Board-authorised actions of a plugin. The bundled Convex plugin (pluginId vllnt.paperclip-convex) serves: " +
-    `${CONVEX_PLUGIN_ACTIONS.join(", ")}. Their params and results are the ConvexStatus, ConvexDeploymentsListParams, ConvexDeploymentsList, ` +
-    "ConvexDeletePreviewParams, ConvexReaperRunParams and ConvexReaperReport components. Mutating Convex actions need an instance administrator " +
-    "and run the same server-side guards as the agent tools; no action returns a credential.",
+    "Board-authorised actions of a plugin. The body is { companyId, params }. A success is wrapped in the host envelope { data: T }; " +
+    "a failure of the plugin, of its guards or of a permission check is HTTP 502 with the PluginBridgeError body { code, message, details } " +
+    "(a refusal is code WORKER_ERROR; the host does not answer 403 for it). " +
+    "The bundled Convex plugin (pluginId vllnt.paperclip-convex) serves: " +
+    `${CONVEX_PLUGIN_ACTIONS.join(", ")}. ` +
+    "Results: status is ConvexStatus; connection.connect is ConvexConnectResult; connection.disconnect is ConvexDisconnectResult; " +
+    "deployments.list (ConvexDeploymentsListParams, paged by limit and cursor) is ConvexDeploymentsList; " +
+    "deployments.delete-preview (ConvexDeletePreviewParams) is ConvexDeletePreviewResult; " +
+    "reaper.run (ConvexReaperRunParams) is ConvexReaperReport; reaper.report is ConvexReaperReport or null. " +
+    "Mutating Convex actions (connection.connect, connection.disconnect, deployments.delete-preview and a real reaper.run) need an instance administrator; " +
+    "a real reaper.run also needs reaper.enabled. An omitted dryRun means plan only: only dryRun false deletes. " +
+    "The plugin's guards apply to board actions as they do to agent tools; the grants apply to agents only. No action returns a credential.",
   request: {
     params: z.object({ pluginId: z.string(), key: z.string() }),
     body: jsonBody(
@@ -9003,7 +9318,39 @@ registry.registerPath({
       }),
     ),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: {
+      description: "Success. The body is { data: T }; for the Convex plugin T is the result of the action as listed in the description.",
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            required: ["data"],
+            properties: {
+              data: {
+                nullable: true,
+                anyOf: [
+                  convexSchemaRefs.status,
+                  convexSchemaRefs.connectResult,
+                  convexSchemaRefs.disconnectResult,
+                  convexSchemaRefs.deploymentsList,
+                  convexSchemaRefs.deletePreviewResult,
+                  convexSchemaRefs.reaperReport,
+                  { type: "object", additionalProperties: true, description: "The result of an action of another plugin" },
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+    401: r.unauthorized,
+    404: r.notFound,
+    502: {
+      description: "The plugin worker is unavailable or the action failed. This includes a refusal by a guard or a missing instance administrator (code WORKER_ERROR).",
+      content: { "application/json": { schema: convexSchemaRefs.bridgeError } },
+    },
+  },
 });
 
 // ─── Instance database backups ────────────────────────────────────────────────
@@ -10152,11 +10499,45 @@ registerCurrentRoute({
   summary: "Get wake diagnostics for an issue",
 });
 
+const issueSubtreeDiagnosticLastRunSchema = z
+  .object({
+    id: z.string().nullable().describe("Null for actors without company-scope read"),
+    status: z.string(),
+    agentId: z.string().nullable().describe("Null for actors without company-scope read"),
+    startedAt: z.string().nullable(),
+    finishedAt: z.string().nullable(),
+    createdAt: z.string(),
+    errorCode: z.string().nullable(),
+  })
+  .describe("Latest heartbeat run whose context issue is this node");
+
 registerCurrentRoute({
   method: "get",
   path: "/api/issues/{id}/diagnostics/subtree",
   tags: ["issues"],
   summary: "Get bounded subtree wake and blocker diagnostics for an issue",
+  responses: {
+    200: r.ok(
+      z
+        .object({
+          nodes: z.array(
+            z
+              .object({
+                issue: z.object({ id: z.string(), identifier: z.string().nullable(), title: z.string() }).passthrough(),
+                parentId: z.string().nullable(),
+                depth: z.number().int(),
+                lastRun: issueSubtreeDiagnosticLastRunSchema.nullable(),
+              })
+              .passthrough(),
+          ),
+        })
+        .passthrough(),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registerCurrentRoute({
@@ -10164,6 +10545,15 @@ registerCurrentRoute({
   path: "/api/issues/{id}/recovery-actions",
   tags: ["issues"],
   summary: "List issue recovery actions",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/execution/reconcile",
+  tags: ["issues"],
+  summary: "Reconcile stopped issue executions and queue a continuation",
+  body: reconcileIssueExecutionSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registerCurrentRoute({
@@ -10195,6 +10585,14 @@ registerCurrentRoute({
   path: "/api/issues/{id}/monitor/check-now",
   tags: ["issues"],
   summary: "Run an issue monitor check now",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/wait",
+  tags: ["issues"],
+  summary: "Wait on the caller's own issue and re-check it after a bounded delay",
+  body: issueWaitRequestSchema,
 });
 
 registerCurrentRoute({

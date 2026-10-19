@@ -1,10 +1,7 @@
 export const PLUGIN_ID = "vllnt.paperclip-convex";
-export const PAGE_PATH = "/convex";
 
-export const CAPABILITIES = [
-  "meta-read", "health-read", "logs-read", "data-read-pii", "env-read-names", "env-read-values", "env-write",
-  "run-query", "run-write", "deploy", "lifecycle", "backup", "restore-import", "admin",
-] as const;
+/** Only capabilities that a tool in this version enforces. A grant for anything else is refused at config time, never silently ignored. */
+export const CAPABILITIES = ["meta-read", "health-read", "logs-read", "data-read-pii", "lifecycle"] as const;
 export type Capability = (typeof CAPABILITIES)[number];
 
 export const ENVIRONMENT_CLASSES = ["production", "staging", "preview", "dev", "custom"] as const;
@@ -13,13 +10,13 @@ export type EnvironmentClass = (typeof ENVIRONMENT_CLASSES)[number];
 /** Presets expand to capabilities; they never widen the environments a grant lists. */
 export const PRESETS = {
   observer: ["meta-read", "health-read"],
-  triager: ["meta-read", "health-read", "logs-read", "env-read-names", "run-query"],
   janitor: ["meta-read", "health-read", "lifecycle"],
 } as const satisfies Record<string, readonly Capability[]>;
 export type Preset = keyof typeof PRESETS;
 
-/** Writes that on production need a per-call board approval (slice 3) and so cannot be granted without it. */
-export const PRODUCTION_WRITE_CAPABILITIES: readonly Capability[] = ["env-write", "run-write", "deploy", "restore-import", "admin"];
+/** `owner/name` with no `.` or `..` segment: the value is placed in a GitHub API path, where those would change the endpoint. */
+export const isRepositoryName = (value: string): boolean =>
+  /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value) && value.split("/").every(part => part !== "." && part !== "..");
 
 export const MAX_PREVIEW_TTL_HOURS = 168;
 export const MIN_EXPIRY_LEAD_MS = 30 * 60_000;
@@ -43,7 +40,6 @@ export interface Grant {
   role: string | null;
   environments: EnvironmentClass[];
   capabilities: Capability[];
-  approval: "per-call" | null;
 }
 
 export interface ConnectionConfig {
@@ -109,6 +105,8 @@ export interface ReaperProjectReport {
   /** How many previews the CI template matched; shown so a template that never matches is visible. Absent without a template. */
   ciMatched?: number;
   dev?: ReaperDevReport;
+  /** Previews not examined, and expiry changes not planned, because the time budget or the per-pass limit was reached. The next pass continues with the oldest. */
+  deferred?: number;
   error?: string;
 }
 export interface ReaperReport {
@@ -116,6 +114,8 @@ export interface ReaperReport {
   trigger: "schedule" | "manual" | "retry" | "api";
   dryRun: boolean;
   projects: ReaperProjectReport[];
-  quota: { count: number; quota: number; percent: number; partial: boolean; alert: boolean; issueId?: string | null } | null;
+  quota: { count: number; quota: number; percent: number; partial: boolean; alert: boolean; lowerBound?: boolean; issueId?: string | null } | null;
   errors: string[];
+  /** Why the pass stopped before it finished (time budget, repeated outage, operator stop). The next hourly pass starts over, oldest previews first. */
+  incomplete?: string;
 }
