@@ -58,6 +58,7 @@ COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-w
 COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
 COPY packages/plugins/plugin-providers/package.json packages/plugins/plugin-providers/
 COPY packages/plugins/plugin-github/package.json packages/plugins/plugin-github/
+COPY packages/plugins/plugin-convex/package.json packages/plugins/plugin-convex/
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
@@ -143,6 +144,8 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 # Both the browser bundle and server stamp need the source commit. Declare it
 # after the stable dependency layers, before either application build.
 ARG PAPERCLIP_BUILD_COMMIT=""
+# Plugin tests and the UI use the SDK exports, so build them before the test manifest.
+RUN pnpm --filter @paperclipai/plugin-sdk build
 # Tests that gate the production image build. The list lives in
 # scripts/ci/image-build-vitest-files.txt, one path per line, so that concurrent pull requests that
 # add a test touch different lines instead of rewriting this one. An empty list or a path that does not exist fails the build;
@@ -158,9 +161,6 @@ RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.te
 # route does when its caller has gone. No database: the embedded Postgres tests of the same change are skipped in this build
 # (it runs as root), so they gate on a host that does not.
 RUN pnpm exec vitest run server/src/__tests__/github-read-decision-cache.test.ts server/src/__tests__/github-credentials-route-caller.test.ts
-# The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
-# after the SDK build, so build the SDK before typechecking the UI.
-RUN pnpm --filter @paperclipai/plugin-sdk build
 # Provider-quota classification of the Codex and Claude adapters, and the GitHub plugin's
 # refusal to send a request without credentials (it needs the SDK test export built above; no database).
 RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts packages/plugins/plugin-github/tests/no-unauthenticated-requests.spec.ts
@@ -170,17 +170,17 @@ RUN pnpm --filter @paperclipai/ui build
 # the config schema as the host validates it when it is saved, and the save route's admin check. No database. After the plugin SDK build.
 RUN pnpm exec vitest run packages/plugins/plugin-github/tests/protected-paths.spec.ts packages/plugins/plugin-github/tests/write-identity.spec.ts server/src/__tests__/plugin-github-merge-opt-in-config.test.ts
 RUN pnpm exec vitest run server/src/__tests__/plugin-routes-authz.test.ts -t agentMergeablePaths
+# The manifest includes the Convex guard, page, CLI and bundled-plugin tests.
+RUN pnpm --filter @vllnt/paperclip-convex typecheck
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
-# The GitHub plugin syncs only in its scheduled job: these specs fail if an event handler or a button starts a sync again, if a
-# sync keeps calling the host after the host denied it, or if a button says "started" for a request that only waits.
-RUN pnpm exec vitest run packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts packages/plugins/plugin-github/tests/sync-job-context.spec.ts packages/plugins/plugin-github/tests/sync-queued-ui.spec.tsx
+RUN pnpm --filter @vllnt/paperclip-convex build
 # Build the remaining bundled local plugins here. The production root filesystem
 # is read-only and cannot run the server's install-time auto-build, so a bundled
 # plugin without its dist entrypoints cannot be installed from the UI.
 RUN pnpm --filter @paperclipai/plugin-llm-wiki build \
   && pnpm --filter @paperclipai/plugin-workspace-diff build \
-  && for plugin in plugin-llm-wiki plugin-workspace-diff plugin-providers plugin-github; do \
+  && for plugin in plugin-llm-wiki plugin-workspace-diff plugin-providers plugin-github plugin-convex; do \
        test -f "packages/plugins/$plugin/dist/manifest.js" \
          || { echo "ERROR: bundled plugin $plugin has no dist/manifest.js" >&2; exit 1; }; \
      done
