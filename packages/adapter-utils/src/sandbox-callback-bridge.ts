@@ -281,6 +281,14 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/routines\/[^/]+\/triggers$/ },
   { method: "PATCH", path: /^\/api\/routine-triggers\/[^/]+$/ },
   { method: "DELETE", path: /^\/api\/routine-triggers\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/routines\/[^/]+\/event-groups$/ },
+
+  // Event sources: agents read sources (never secrets) and dry-run a payload against them. Creating, editing,
+  // rotating and archiving a source is board-only on the server, so it is not reachable through this bridge.
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/event-sources$/ },
+  { method: "GET", path: /^\/api\/event-sources\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/event-sources\/[^/]+\/deliveries$/ },
+  { method: "POST", path: /^\/api\/event-sources\/[^/]+\/test$/ },
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.
