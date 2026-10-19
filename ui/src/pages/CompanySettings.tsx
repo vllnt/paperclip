@@ -33,6 +33,7 @@ import {
   type GovernanceSelectValue,
 } from "../components/InteractionGovernancePanel";
 import { CompanyPatternIcon } from "../components/CompanyPatternIcon";
+import { CompanyDataExportPanel } from "../components/CompanyDataExportPanel";
 import {
   Field,
   ToggleField,
@@ -599,6 +600,8 @@ export function CompanySettings() {
           )}
         </div>
       </div>
+
+      <CompanyDataExportPanel companyId={selectedCompany.id} />
 
       <InstanceGeneralSettings embedded />
 
