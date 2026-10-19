@@ -33,6 +33,7 @@ import {
   type GovernanceSelectValue,
 } from "../components/InteractionGovernancePanel";
 import { CompanyPatternIcon } from "../components/CompanyPatternIcon";
+import { CompanyStorageDestinationsPanel } from "../components/CompanyStorageDestinationsPanel";
 import { CompanyDataExportPanel } from "../components/CompanyDataExportPanel";
 import {
   Field,
@@ -571,6 +572,8 @@ export function CompanySettings() {
             : null
         }
       />
+
+      {!isCloudManaged && <CompanyStorageDestinationsPanel companyId={selectedCompany.id} />}
 
       {/* Automation wake window */}
       <div className="max-w-2xl space-y-4" data-testid="company-settings-automation-wake-section">
