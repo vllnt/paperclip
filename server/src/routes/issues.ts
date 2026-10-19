@@ -263,6 +263,7 @@ import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
+import { assertCanSetIssueRunProfile, logIssueRunProfileChange } from "./issue-run-profile-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   formatAttachmentSize,
@@ -3648,6 +3649,20 @@ export function issueRoutes(
     opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
+  const loadCompanyRunTiers = async (companyId: string) =>
+    (await instanceSettings.getGeneral()).companyRunTiers?.[companyId] ?? null;
+  const loadRunProfileAssignee = async (agentId: string) => {
+    const agent = await agentsSvc.getById(agentId);
+    return agent
+      ? {
+          companyId: agent.companyId,
+          adapterType: agent.adapterType,
+          adapterConfig: agent.adapterConfig,
+          runtimeConfig: agent.runtimeConfig,
+          fallbacks: agent.fallbacks,
+        }
+      : null;
+  };
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
@@ -11953,6 +11968,18 @@ export function issueRoutes(
         req,
         collectIssueWorkspaceCommandPaths(req.body),
       );
+      const runProfileChange = await assertCanSetIssueRunProfile({
+        db,
+        access,
+        loadTiers: loadCompanyRunTiers,
+        loadAssignee: loadRunProfileAssignee,
+        req,
+        companyId,
+        existing: null,
+        nextOverrides: req.body.assigneeAdapterOverrides,
+        assigneeAgentId: req.body.assigneeAgentId,
+        actorInfo: getActorInfo(req),
+      });
       const sanitizedBody = await sanitizeIssueCreateAttribution(
         db,
         req,
@@ -12218,6 +12245,13 @@ export function issueRoutes(
         return;
       }
       await retainBacklogHumanAssignment(db, issue, actor);
+      await logIssueRunProfileChange(db, {
+        companyId,
+        issueId: issue.id,
+        change: runProfileChange,
+        actorInfo: actor,
+        assigneeAgentId: issue.assigneeAgentId,
+      });
       await issueReferencesSvc.syncIssue(issue.id);
       await externalObjectsSvc.syncIssueSafely(issue.id);
       const referenceSummary =
@@ -12433,6 +12467,18 @@ export function issueRoutes(
         req,
         collectIssueWorkspaceCommandPaths(req.body),
       );
+      const runProfileChange = await assertCanSetIssueRunProfile({
+        db,
+        access,
+        loadTiers: loadCompanyRunTiers,
+        loadAssignee: loadRunProfileAssignee,
+        req,
+        companyId: parent.companyId,
+        existing: null,
+        nextOverrides: req.body.assigneeAdapterOverrides,
+        assigneeAgentId: req.body.assigneeAgentId,
+        actorInfo: getActorInfo(req),
+      });
       const sanitizedBody = await sanitizeIssueCreateAttribution(
         db,
         req,
@@ -12622,6 +12668,13 @@ export function issueRoutes(
       }
 
       await retainBacklogHumanAssignment(db, issue, actor);
+      await logIssueRunProfileChange(db, {
+        companyId: parent.companyId,
+        issueId: issue.id,
+        change: runProfileChange,
+        actorInfo: actor,
+        assigneeAgentId: issue.assigneeAgentId,
+      });
       if (!serializationContext || !currentSerializedChild) {
         void queueIssueAssignmentWakeup({
           heartbeat,
@@ -12708,6 +12761,26 @@ export function issueRoutes(
           req,
           collectIssueWorkspaceCommandPaths(childBody),
         );
+        const childRunProfileChange = await assertCanSetIssueRunProfile({
+          db,
+          access,
+          loadTiers: loadCompanyRunTiers,
+          loadAssignee: loadRunProfileAssignee,
+          req,
+          companyId: sourceIssue.companyId,
+          existing: null,
+          nextOverrides: childBody.assigneeAdapterOverrides,
+          assigneeAgentId: childBody.assigneeAgentId,
+          actorInfo: getActorInfo(req),
+        });
+        await logIssueRunProfileChange(db, {
+          companyId: sourceIssue.companyId,
+          issueId: sourceIssue.id,
+          change: childRunProfileChange,
+          actorInfo: getActorInfo(req),
+          assigneeAgentId: childBody.assigneeAgentId,
+          childTitle: typeof childBody.title === "string" ? childBody.title : null,
+        });
         if (childBody.assigneeAgentId || childBody.assigneeUserId) {
           await assertCanAssignTasks(req, sourceIssue.companyId, {
             projectId: childBody.projectId ?? sourceIssue.projectId ?? null,
@@ -13210,6 +13283,21 @@ export function issueRoutes(
         req,
         collectIssueWorkspaceCommandPaths(req.body),
       );
+      const runProfileChange = await assertCanSetIssueRunProfile({
+        db,
+        access,
+        loadTiers: loadCompanyRunTiers,
+        loadAssignee: loadRunProfileAssignee,
+        req,
+        companyId: existing.companyId,
+        existing,
+        nextOverrides: req.body.assigneeAdapterOverrides,
+        assigneeAgentId:
+          req.body.assigneeAgentId !== undefined
+            ? req.body.assigneeAgentId
+            : existing.assigneeAgentId,
+        actorInfo: getActorInfo(req),
+      });
       if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
         await auditAgentIssueCommentAttributionSpoof({
           db,
@@ -14296,6 +14384,14 @@ export function issueRoutes(
       if (req.body.assigneeAgentId !== undefined) {
         await retainBacklogHumanAssignment(db, issue, actor);
       }
+
+      await logIssueRunProfileChange(db, {
+        companyId: existing.companyId,
+        issueId: existing.id,
+        change: runProfileChange,
+        actorInfo: actor,
+        assigneeAgentId: issue.assigneeAgentId,
+      });
 
       if (titleOrDescriptionChanged) {
         await issueReferencesSvc.syncIssue(issue.id);
