@@ -12,9 +12,9 @@ import {
   isSelectionDebugEnabled,
   recordAnnotationCommit,
 } from "@/lib/document-annotation-debug";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { DocumentAnnotationLayer, type AnnotationAnchorRect, type PendingAnchor } from "./DocumentAnnotationLayer";
 import { DocumentAnnotationPanel } from "./DocumentAnnotationPanel";
-import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { DocumentAnnotationPopover } from "./DocumentAnnotationPopover";
 import type { CompanyUserProfile } from "@/lib/company-members";
 

@@ -7,13 +7,14 @@ const SRC = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HELPER = join(SRC, "lib", "safe-match-media.ts");
 
 /**
- * Matches a call, an optional call, a bind or a bracket read of `matchMedia`, with or without
- * `window.`. Mentions in prose and `typeof` checks do not match. The scan is best-effort: it reads
- * one line at a time, so an alias (`const mm = window.matchMedia; mm(q)`) split across lines can
- * still slip through; review catches that.
+ * Matches a call, an optional call, a bind, a `.call` / `.apply`, or a bracket read of
+ * `matchMedia`, with or without `window.`. Mentions in prose and `typeof` checks do not match.
+ * The scan is best-effort and reads one line at a time, so it does not see through indirection:
+ * an alias (`const mm = window.matchMedia; mm(q)`), a call written across lines, or
+ * `Reflect.apply(window.matchMedia, ...)` still passes. Review catches those.
  */
 const DIRECT_CALL =
-  /(?<![\w$])matchMedia\s*(?:\?\.\s*)?\(|(?<![\w$])matchMedia\.bind\b|\[\s*["'`]matchMedia["'`]\s*\]/;
+  /(?<![\w$])matchMedia\s*(?:\?\.\s*)?\(|(?<![\w$])matchMedia\.(?:bind|call|apply)\b|\[\s*["'`]matchMedia["'`]\s*\]/;
 
 function sourceFiles(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -48,6 +49,8 @@ describe("window.matchMedia", () => {
       "window.matchMedia(q)",
       "  matchMedia (q)",
       "window.matchMedia.bind(window)",
+      "window.matchMedia.call(window, q)",
+      "window.matchMedia.apply(window, [q])",
       "x = matchMedia(q).matches",
       "window.matchMedia?.(q)",
       "window.matchMedia ?. (q)",

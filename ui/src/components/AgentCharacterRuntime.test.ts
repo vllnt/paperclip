@@ -3,8 +3,8 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createCharacter } from "@paperclipai/shared/cliplab/runtime";
 import { characterDefinition } from "@paperclipai/shared/cliplab/definition";
 import { appearanceForPalette } from "@paperclipai/shared";
-const renderer = vi.hoisted(() => ({ render: vi.fn(), resize: vi.fn(), dispose: vi.fn() }));
-vi.mock("@paperclipai/shared/cliplab/renderer", () => ({ CharacterRenderer: class { render = renderer.render; resize = renderer.resize; dispose = renderer.dispose; } }));
+const renderer = vi.hoisted(() => ({ constructed: vi.fn(), render: vi.fn(), resize: vi.fn(), dispose: vi.fn() }));
+vi.mock("@paperclipai/shared/cliplab/renderer", () => ({ CharacterRenderer: class { constructor() { renderer.constructed(); } render = renderer.render; resize = renderer.resize; dispose = renderer.dispose; } }));
 let intersect: (entries: any[]) => void;
 let hidden = false;
 let frames: Map<number, FrameRequestCallback>;
@@ -57,6 +57,7 @@ it("tracks only its region, ignores touch, and removes listeners for coarse poin
 it("throws before building a renderer or canvas when matchMedia throws", () => {
   vi.stubGlobal("matchMedia", () => { throw new Error("matchMedia failed"); });
   expect(() => create()).toThrow("matchMedia failed");
+  expect(renderer.constructed).not.toHaveBeenCalled();
   expect(target.querySelector("canvas")).toBeNull(); expect(players).toHaveLength(0);
 });
 it("disposes the canvas and subscriptions when the first render fails", () => {
