@@ -1283,6 +1283,7 @@ export type {
   AgentTaskSession,
   AgentWakeupRequest,
   DeferredWakeAgentStats,
+  DeferredWakeParkedBreakdown,
   DeferredWakeStats,
   DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
@@ -2833,3 +2834,5 @@ export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
 export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
+export * from "./automation-wake.js";
+export * from "./routine-noop-skip.js";

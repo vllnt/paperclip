@@ -152,7 +152,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   async function seedFixture(input?: {
     agentStatus?: "active" | "paused" | "terminated";
     wakeOnDemand?: boolean;
-    issueStatus?: "in_progress" | "in_review";
+    issueStatus?: "in_progress" | "in_review" | "blocked" | "done" | "cancelled";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
   }) {
@@ -283,6 +283,93 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_triggered");
+  });
+
+  it.each(["blocked", "done", "cancelled"] as const)(
+    "skips the wake and clears a due monitor on a %s issue",
+    async (issueStatus) => {
+      const { issueId, agentId } = await seedFixture({ issueStatus });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+      expect(result.enqueued).toBe(0);
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
+    },
+  );
+
+  it("keeps non-monitor policy fields when clearing a parked monitor", async () => {
+    const { issueId, companyId } = await seedFixture({ issueStatus: "blocked" });
+    const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const editedPolicy = {
+      ...before.executionPolicy,
+      maxReviewRounds: 7,
+      stages: [
+        {
+          id: randomUUID(),
+          type: "review",
+          participants: [{ id: randomUUID(), type: "agent", agentId: randomUUID() }],
+        },
+      ],
+      authorizationPolicy: {
+        trustPreset: "low_trust_review",
+        trustBoundary: {
+          mode: "low_trust_review",
+          companyId,
+          issueIds: [issueId],
+          allowedToolClasses: ["git.read"],
+        },
+      },
+    };
+    await db.update(issues).set({ executionPolicy: editedPolicy }).where(eq(issues.id, issueId));
+
+    await heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const { monitor: _monitor, ...expectedPolicy } = editedPolicy as Record<string, unknown>;
+    expect(after.monitorNextCheckAt).toBeNull();
+    expect(after.executionPolicy).toEqual(expectedPolicy);
+  });
+
+  it("does not overwrite a concurrent policy and state edit while clearing a parked monitor", async () => {
+    const { issueId } = await seedFixture({ issueStatus: "blocked" });
+    const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const workflowId = randomUUID();
+    const editedPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [],
+      authorizationPolicy: { assignmentPolicy: { mode: "protected" } },
+    };
+    const editedState = { ...before.executionState, lastDecisionId: workflowId };
+    let finished = false;
+    let tick: Promise<unknown> | undefined;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      tick = heartbeatService(db).tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+      void tick.then(() => {
+        finished = true;
+      });
+      const deadline = Date.now() + 5000;
+      while (!finished && Date.now() < deadline) {
+        const waiting = await db.execute(sql`select pid from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'`);
+        if (waiting.length > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await tx
+        .update(issues)
+        .set({ executionPolicy: editedPolicy, executionState: editedState, updatedAt: new Date() })
+        .where(eq(issues.id, issueId));
+    });
+    await tick;
+
+    const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(after.executionPolicy).toEqual(editedPolicy);
+    expect(after.executionState?.lastDecisionId).toBe(workflowId);
   });
 
   it.each(["unknown", "exhausted"] as const)("does not replay a quota monitor with %s execution evidence", async (kind) => {

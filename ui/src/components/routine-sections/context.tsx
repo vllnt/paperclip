@@ -1,6 +1,7 @@
 import { createContext, useContext } from "react";
 import type { UseMutationResult } from "@tanstack/react-query";
 import type {
+  AutomationWakeSettings,
   CompanySecret,
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
@@ -45,7 +46,7 @@ export const SECTION_FIELD_KEYS: Record<string, string[]> = {
   overview: ["title", "description", "projectId", "assigneeAgentId", "priority"],
   variables: ["variables"],
   secrets: ["env"],
-  delivery: ["concurrencyPolicy", "catchUpPolicy", "activityGatePolicy", "activityGateScope"],
+  delivery: ["concurrencyPolicy", "catchUpPolicy", "activityGatePolicy", "activityGateScope", "automationWakeSettings"],
 };
 
 export type RoutineEditDraft = {
@@ -60,6 +61,7 @@ export type RoutineEditDraft = {
   activityGateScope: string;
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
+  automationWakeSettings: AutomationWakeSettings;
 };
 
 export type NewTriggerDraft = {
@@ -99,6 +101,8 @@ export type RoutineDetailContextValue = {
   // edit state
   editDraft: RoutineEditDraft;
   setEditDraft: React.Dispatch<React.SetStateAction<RoutineEditDraft>>;
+  /** Resets the draft and its captured wake-settings base to the saved routine. */
+  discardEdits: () => void;
   routineDefaults: RoutineEditDraft;
   dirtyFields: RoutineHistoryDirtyFieldDescriptor[];
   isEditDirty: boolean;
