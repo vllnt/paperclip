@@ -1,3 +1,4 @@
+cli/src/__tests__/agent-config.test.ts
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
 packages/adapter-utils/src/log-value-redaction.test.ts
@@ -17,8 +18,6 @@ packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
 packages/shared/src/company-environment-defaults.test.ts
-server/src/__tests__/agent-config-merge-patch-routes.test.ts
-server/src/__tests__/agent-config-merge-patch-self-guard-routes.test.ts
 server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
 server/src/__tests__/decision-wakeup.test.ts
@@ -30,6 +29,7 @@ server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
+server/src/shutdown-budget.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/AgentCharacterRuntime.test.ts
 ui/src/components/CommandPalette.real.test.tsx
@@ -61,4 +61,3 @@ ui/src/lib/safe-match-media.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
 ui/src/pages/IssueDetail.test.tsx
-server/src/shutdown-budget.test.ts
