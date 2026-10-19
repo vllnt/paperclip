@@ -77,6 +77,21 @@ export function isPrivateMuseHttpRequest(url:string|undefined):boolean {
   return false;
 }
 
+const BROWSER_SIGN_IN_INPUT_PATH = /^\/api\/companies\/[^/]+\/browser\/profiles\/[^/]+\/signin\/input\/?$/i;
+
+/**
+ * Board keystrokes sent to a shared browser sign-in: the typed text can be a
+ * password or one-time code. The match follows what Express routes: any method
+ * (a rejected one still carries the body), any letter case, a dropped fragment,
+ * an absolute-form target with any `scheme://authority` prefix, and backslashes
+ * read as slashes (Express parses a target with a fragment through `url.parse`).
+ */
+export function isBrowserSignInInputHttpRequest(url: string | undefined): boolean {
+  if (!url) return false;
+  const target = normalizePath((url.split("#")[0] ?? "").replace(/\\/g, "/"));
+  return BROWSER_SIGN_IN_INPUT_PATH.test(target.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, ""));
+}
+
 /** Provider payloads are private even when a method/signature is rejected. */
 export function isPrivateWebhookHttpRequest(
   method: string | undefined,

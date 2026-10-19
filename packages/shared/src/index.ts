@@ -2871,6 +2871,7 @@ export type { AgentInstructionCandidate } from "./types/agent.js";
 export { resolveAgentInstructionCandidateSchema, type ResolveAgentInstructionCandidate } from "./validators/agent.js";
 export { isHeartbeatRunVisibleInMine } from "./heartbeat-inbox.js";
 export * from "./browser-use.js";
+export * from "./browser-profiles.js";
 export * from "./types/skill-source.js";
 export * from "./validators/skill-source.js";
 export * from "./validators/agent-commentary.js";

@@ -875,3 +875,104 @@ describe("HTTP logger redaction", () => {
     },
   );
 });
+
+describe("browser sign-in input failure logs", () => {
+  const companyId = "11111111-1111-4111-8111-111111111111";
+  const profileId = "22222222-2222-4222-8222-222222222222";
+  const route = `/api/companies/${companyId}/browser/profiles/${profileId}/signin/input`;
+
+  async function failingSignInApp(signInInput: () => Promise<never>) {
+    const { browserProfileRoutes } = await import("../routes/browser-profiles.js");
+    type Service = NonNullable<Parameters<typeof browserProfileRoutes>[1]>;
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    app.use("/api", browserProfileRoutes({} as never, { signInInput } as unknown as Service));
+    app.use(errorHandler);
+    return { app, output: () => chunks.join("") };
+  }
+
+  it.each([
+    ["409 when the live browser already closed", 409, "PASSWORD-CANARY-409"],
+    ["400 when the text is too long", 400, `PASSWORD-CANARY-400-${"x".repeat(500)}`],
+    ["500 when the browser fails", 500, "PASSWORD-CANARY-500"],
+  ])("keeps typed text out of the log on %s", async (_label, status, text) => {
+    const { app, output } = await failingSignInApp(async () => {
+      if (status === 409) throw new HttpError(409, "Start a sign-in session first", { code: "signin_not_active" });
+      throw new Error("browser input failed");
+    });
+    await request(app).post(route).send({ type: "type", text }).expect(status);
+    const log = output();
+    expect(log).toContain(`"statusCode":${status}`);
+    expect(log).not.toContain("PASSWORD-CANARY");
+  });
+
+  // Express matches routes case-insensitively and accepts absolute-form targets.
+  it.each([
+    ["an uppercase /API prefix", "POST", `/API/companies/${companyId}/browser/profiles/${profileId}/signin/input`, 409],
+    ["mixed-case segments", "POST", `/api/companies/${companyId}/Browser/Profiles/${profileId}/SignIn/Input`, 409],
+    ["an absolute-form target", "POST", `http://paperclip.invalid${route}`, 409],
+    ["a trailing slash", "POST", `${route}/`, 409],
+    ["a fragment", "POST", `${route}#x`, 409],
+    ["a query and a fragment", "POST", `${route}?a=1#x`, 409],
+    ["an absolute-form target with a custom scheme", "POST", `foo://h${route}`, 409],
+    ["an absolute-form target with the ftp scheme", "POST", `ftp://h${route}`, 409],
+    ["backslash separators with a fragment", "POST", `${route.replace(/\/(?=browser|profiles|signin|input|[0-9a-f]{8}-)/g, "\\")}#x`, 409],
+    ["another method with a body", "PUT", route, 404],
+  ])("keeps typed text out of the log for %s", async (_label, method, target, status) => {
+    const { app, output } = await failingSignInApp(async () => {
+      throw new HttpError(409, "Start a sign-in session first", { code: "signin_not_active" });
+    });
+    const server = createServer(app);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Fixture listener unavailable");
+      const body = JSON.stringify({ type: "type", text: "PASSWORD-CANARY-VARIANT" });
+      const received = await new Promise<number | undefined>((resolve, reject) => {
+        const client = httpRequest(
+          {
+            hostname: "127.0.0.1",
+            port: address.port,
+            method,
+            path: target,
+            headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode));
+          },
+        );
+        client.on("error", reject);
+        client.end(body);
+      });
+      expect(received).toBe(status);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+    const log = output();
+    expect(log).toContain(`"statusCode":${status}`);
+    expect(log).not.toContain("PASSWORD-CANARY");
+  });
+});

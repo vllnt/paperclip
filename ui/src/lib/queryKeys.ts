@@ -221,6 +221,10 @@ export const queryKeys = {
     installed: (companyId: string) =>
       ["team-catalog", "installed", companyId] as const,
   },
+  browserProfiles: {
+    overview: (companyId: string) =>
+      ["browser-profiles", companyId, "overview"] as const,
+  },
   agents: {
     identity: (id: string) => ["agents", "identity", id] as const,
     list: (companyId: string) => ["agents", companyId] as const,
