@@ -228,8 +228,10 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
   cancelIssueThreadInteractionSchema,
+  issueWaitRequestSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
@@ -311,7 +313,11 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  observabilityFailuresQuerySchema,
+  observabilityFailuresResponseSchema,
   observabilityHealthSchema,
+  observabilityUsageQuerySchema,
+  observabilityUsageResponseSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1364,6 +1370,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
   "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
 
+  "GET /api/companies/{companyId}/chats",
+  "GET /api/companies/{companyId}/chats/{agentRef}",
+  "POST /api/companies/{companyId}/chats/{agentRef}",
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
   "DELETE /api/issues/{id}/documents/{key}",
@@ -3941,6 +3950,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Get the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. `agentRef` is an agent ID or URL key. Returns the conversation issue, or null when none exists yet. Read-only.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Open the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. Returns the existing conversation issue, or creates it. `agentRef` is an agent ID or URL key.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
@@ -4000,7 +4029,9 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
+    "Agents may name themselves or `\"board\"` as `unblockDescriptor.owner`, never a specific user or another agent (403). " +
+    "While the board or a user owns a block, an agent may not move the issue out of `blocked` or change or clear its descriptor (403). The same rule applies to a comment that asks to `resume` or `reopen` the issue (POST /api/issues/{id}/comments).",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateIssueSchema.partial()),
@@ -4009,6 +4040,7 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     422: r.unprocessable,
   },
@@ -4319,11 +4351,13 @@ registry.registerPath({
   path: "/api/issues/{id}/comments",
   tags: ["issues"],
   summary: "Add a comment to an issue",
+  description:
+    "An agent may not use `resume` or `reopen` to move an issue out of a block that the board or a user owns, or change that block's descriptor (403). Nothing is posted when this refuses. A board user may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(addIssueCommentSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -4370,11 +4404,13 @@ registry.registerPath({
   path: "/api/issues/{id}/checkout",
   tags: ["issues"],
   summary: "Check out an issue",
+  description:
+    "While the board or a user owns a block, an agent may not check the issue out of `blocked` (403), the same rule as for PATCH /api/issues/{id}. A board user may. The issue stays blocked and keeps its `unblockDescriptor`.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(checkoutIssueSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -5379,6 +5415,34 @@ registry.registerPath({
   request: { params: z.object({ companyId: z.string() }) },
   responses: {
     200: r.ok(observabilityHealthSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/usage",
+  tags: ["observability"],
+  summary: "Tokens, cost and duration of runs, grouped by one dimension",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityUsageQuerySchema },
+  responses: {
+    200: r.ok(observabilityUsageResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/failures",
+  tags: ["observability"],
+  summary: "Failed runs by cause or other dimension, with the count of all runs for a rate",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityFailuresQuerySchema },
+  responses: {
+    200: r.ok(observabilityFailuresResponseSchema),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
   },
@@ -10244,11 +10308,45 @@ registerCurrentRoute({
   summary: "Get wake diagnostics for an issue",
 });
 
+const issueSubtreeDiagnosticLastRunSchema = z
+  .object({
+    id: z.string().nullable().describe("Null for actors without company-scope read"),
+    status: z.string(),
+    agentId: z.string().nullable().describe("Null for actors without company-scope read"),
+    startedAt: z.string().nullable(),
+    finishedAt: z.string().nullable(),
+    createdAt: z.string(),
+    errorCode: z.string().nullable(),
+  })
+  .describe("Latest heartbeat run whose context issue is this node");
+
 registerCurrentRoute({
   method: "get",
   path: "/api/issues/{id}/diagnostics/subtree",
   tags: ["issues"],
   summary: "Get bounded subtree wake and blocker diagnostics for an issue",
+  responses: {
+    200: r.ok(
+      z
+        .object({
+          nodes: z.array(
+            z
+              .object({
+                issue: z.object({ id: z.string(), identifier: z.string().nullable(), title: z.string() }).passthrough(),
+                parentId: z.string().nullable(),
+                depth: z.number().int(),
+                lastRun: issueSubtreeDiagnosticLastRunSchema.nullable(),
+              })
+              .passthrough(),
+          ),
+        })
+        .passthrough(),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registerCurrentRoute({
@@ -10256,6 +10354,15 @@ registerCurrentRoute({
   path: "/api/issues/{id}/recovery-actions",
   tags: ["issues"],
   summary: "List issue recovery actions",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/execution/reconcile",
+  tags: ["issues"],
+  summary: "Reconcile stopped issue executions and queue a continuation",
+  body: reconcileIssueExecutionSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registerCurrentRoute({
@@ -10287,6 +10394,14 @@ registerCurrentRoute({
   path: "/api/issues/{id}/monitor/check-now",
   tags: ["issues"],
   summary: "Run an issue monitor check now",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/wait",
+  tags: ["issues"],
+  summary: "Wait on the caller's own issue and re-check it after a bounded delay",
+  body: issueWaitRequestSchema,
 });
 
 registerCurrentRoute({

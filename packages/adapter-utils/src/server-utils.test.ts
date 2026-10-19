@@ -1481,6 +1481,31 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("shows the wait note when an issue monitor wakes the agent", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_monitor_due",
+      wait: {
+        note: "Waiting: re-check after background task stop. Re-check what you were waiting for and continue.",
+        attempt: 2,
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-4320",
+        title: "Ship and wait for CI",
+        status: "in_progress",
+      },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("- reason: issue_monitor_due");
+    expect(prompt).toContain(
+      "- wait note: Waiting: re-check after background task stop. Re-check what you were waiting for and continue.",
+    );
+    expect(prompt).toContain("- wait check: 2");
+  });
+
   it("does not restore generic procedures on resume or with the legacy opt-in", () => {
     const payload = {
       reason: "issue_assigned",
