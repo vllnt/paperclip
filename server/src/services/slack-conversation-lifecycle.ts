@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { chatConversations, chatEndpoints, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 
 /** Both run finalization and provider publication can arrive first. Re-read
  * durable evidence under the task lock; never infer completion from prose. */
@@ -44,8 +45,14 @@ export async function settleSlackConversation(db: Db, companyId: string, issueId
       ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
     ].filter((id): id is string => typeof id === "string" && /^[a-f0-9-]{36}$/i.test(id)))];
     if (!commentIds.length) return false;
-    const [wake] = await tx.select().from(issueComments)
-      .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)))
+    // Newest of the wake's comments. Batch winners are re-ranked in SQL: JS Dates
+    // truncate PostgreSQL's microseconds and could pick an older row.
+    const newestPerBatch = await selectInCommentBatches(commentIds, batch => tx.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch)))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1));
+    const [wake] = await tx.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+        inArray(issueComments.id, newestPerBatch.map(row => row.id))))
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
     if (!wake) return false;
     const [evidence] = await tx.execute<{ ready: boolean }>(sql`select

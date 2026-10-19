@@ -10,6 +10,7 @@ import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
 import { GitHubClient, GitHubError, assertReadOnlyInstallationToken } from "../src/github.js";
 import { WriteThrottle } from "../src/write-identity.js";
+import { CONTROL_REPOSITORIES } from "../src/protected-paths.js";
 import { parseSshSigningKey } from "../src/ssh-signature.js";
 import { RepositoryManager } from "../src/management-repository.js";
 
@@ -154,15 +155,18 @@ function signingKeyPem() {
   return generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString();
 }
 
-async function appFixture(options: { revoked?: () => boolean } = {}) {
+async function appFixture(options: { revoked?: () => boolean; config?: Record<string, unknown> } = {}) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-10-08T08:00:00Z"));
   const { admin, server } = actors("anthm");
   const h = createTestHarness({ manifest });
   const signing = signingKeyPem();
+  /** More fields of the company's plugin config; a test may change them between two calls, as an instance admin does. */
+  const config: Record<string, unknown> = { ...options.config };
   vi.spyOn(h.ctx.config, "get").mockImplementation(async company => company === "anthm" ? {
     appId: APP, privateKey: secretRef("a-key"), userClientId: "Iv23liAbcdef12", userClientSecret: secretRef("client-secret"),
     userRefreshToken: secretRef("refresh"), signingKey: secretRef("signing"), personalToken: secretRef("pat"),
+    ...config,
   } : {});
   const github = {
     refresh: "unset", issued: 0, revoked: false,
@@ -179,10 +183,21 @@ async function appFixture(options: { revoked?: () => boolean } = {}) {
     /** Pull request reads, to move the head between two of them. */
     prReads: 0,
     rules: [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "lint", integration_id: 15368 }, { context: "typecheck" }] } }] as any[],
-    protection: {} as Record<string, unknown>,
+    /** Classic protection of main in the shape GitHub's branch read returns (never with enforce_admins): it binds administrators. */
+    protection: { enabled: true, required_status_checks: { enforcement_level: "everyone", contexts: [], checks: [] } } as Record<string, unknown>,
     appPermissions: { ...permissions } as Record<string, string>,
     unreachable: false,
     refreshGate: null as Promise<void> | null,
+    /** GitHub's clock minus this host's (a VM paused and resumed lags behind). */
+    offsetMs: 0,
+    /** When GitHub expires each user access token, on GitHub's clock. */
+    expiresAt: new Map<string, number>(),
+    /** GitHub refuses every user token at the API, even a fresh one, while refreshes still work. */
+    rejectUser: false,
+    /** 401s GitHub answered to user tokens. */
+    unauthorized: 0,
+    /** Runs as GitHub receives a refresh, before it answers (another worker rotating the token first). */
+    beforeRefresh: null as (() => void) | null,
     checkRuns: [{ name: "lint", status: "completed", conclusion: "success", app: { id: 15368 } }, { name: "typecheck", status: "completed", conclusion: "success", app: { id: 15368 } }] as any[],
     statuses: [] as any[],
   };
@@ -190,6 +205,9 @@ async function appFixture(options: { revoked?: () => boolean } = {}) {
     ref.secretId === "refresh" ? github.refresh : ref.secretId === "signing" ? signing : `value-${ref.secretId}`);
   const storeOwn = vi.spyOn(h.ctx.secrets, "storeOwn").mockImplementation(async (value: string) => { github.refresh = value; });
   const client = new GitHubClient((async () => { throw new Error("GitHub network is blocked in tests."); }) as unknown as typeof fetch);
+  const githubTime = () => Date.now() + github.offsetMs;
+  // Every GitHub answer carries its Date header, as the real transport reads it.
+  const answered = () => client.clock.observe(new Date(githubTime()).toUTCString(), client.clock.started());
   vi.spyOn(client, "verify").mockImplementation(async id => ({ id, slug: "anthm-agents", name: "anthm-agents" }));
   vi.spyOn(client, "catalog").mockImplementation(async id => ({ app: { id, slug: "anthm-agents", name: "anthm-agents", permissions: github.appPermissions },
     installations: [{ id: 101, login: "Anthm-FR", accountId: 1, accountType: "Organization" as const, suspended: false, permissions }], repositories: repos, warnings: [], truncated: false }));
@@ -199,15 +217,19 @@ async function appFixture(options: { revoked?: () => boolean } = {}) {
   const oauth = vi.spyOn(client, "oauth").mockImplementation(async (path, body) => {
     if (path === "/login/device/code") return { device_code: "device-code", user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", expires_in: 900, interval: 5 };
     if (body.grant_type === "refresh_token" && github.refreshGate) await github.refreshGate;
+    if (body.grant_type === "refresh_token") github.beforeRefresh?.();
+    answered();
     if (body.grant_type === "refresh_token" && (github.revoked || options.revoked?.() || body.refresh_token !== github.refresh)) return { error: "bad_refresh_token" };
     github.issued += 1;
     current = token("ghu", github.issued);
     userTokens.add(current);
+    github.expiresAt.set(current, githubTime() + 28_800_000);
     return { access_token: current, refresh_token: token("ghr", github.issued), expires_in: 28_800, refresh_token_expires_in: 15_897_600, token_type: "bearer" };
   });
   const request = vi.spyOn(client, "request").mockImplementation(async (path: string, auth?: string, body?: unknown, method?: string) => {
+    answered();
     const user = !!auth && userTokens.has(auth);
-    if (user && github.revoked) throw new GitHubError(401);
+    if (user && (github.revoked || github.rejectUser || github.expiresAt.get(auth)! <= githubTime())) { github.unauthorized += 1; throw new GitHubError(401); }
     if (user && github.unreachable) throw new Error("GitHub did not return a valid response. Please try again.");
     if (path === "/users/anthm-agents%5Bbot%5D") return { data: { id: 99 } as any, next: false };
     if (path === "/user" && user) return { data: { login: "agent-owner", id: Number(USER_ID) } as any, next: false };
@@ -258,7 +280,7 @@ async function appFixture(options: { revoked?: () => boolean } = {}) {
     return result;
   }
   const policy = async () => (await h.performAction<any>("write-identity.get", { companyId: "anthm" }, admin)).policy;
-  return { h, client, github, scoped, oauth, request, resolve, storeOwn, decide, sign, setPolicy, action, write, read, authorize, policy, signing, current: () => current };
+  return { h, client, github, scoped, oauth, request, resolve, storeOwn, decide, sign, setPolicy, action, write, read, authorize, policy, signing, config, current: () => current };
 }
 
 describe("GitHub write identity: App user (anthm)", () => {
@@ -377,7 +399,7 @@ describe("GitHub write identity: App user (anthm)", () => {
     expect(await merge({ pullRequest: 7, expectedHeadSha: "b".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("not the expected"), evidence: { headSha: "a".repeat(40) } });
     const granted = await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) });
     expect(granted).toMatchObject({ identity: "user", credential: { login: "agent-owner" }, evidence: { adminMerge: {
-      pullRequest: 7, headSha: "a".repeat(40), requiredChecks: ["lint", "typecheck"],
+      pullRequest: 7, headSha: "a".repeat(40), enforcementLevel: "everyone", requiredChecks: ["lint", "typecheck"],
       checks: [{ name: "lint", result: "success" }, { name: "typecheck", result: "success" }],
     } } });
     // The pinned integration must report it; a failing or pending required check blocks the merge.
@@ -394,17 +416,141 @@ describe("GitHub write identity: App user (anthm)", () => {
     expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("lint") });
     // Classic branch protection adds required checks the ruleset does not list.
     f.github.rules = [];
-    f.github.protection = { required_status_checks: { contexts: ["e2e"], checks: [{ context: "e2e", app_id: 15368 }] } };
+    f.github.protection = { enabled: true, required_status_checks: { enforcement_level: "everyone", contexts: ["e2e"], checks: [{ context: "e2e", app_id: 15368 }] } };
     f.github.checkRuns = [{ id: 4, name: "lint", status: "completed", conclusion: "success", app: { id: 15368 } }];
     expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("e2e"), evidence: { requiredChecks: ["e2e"] } });
-    // Without required checks, every reported check must have passed, and some check must have reported.
-    f.github.protection = {};
-    f.github.checkRuns = [{ id: 5, name: "e2e", status: "completed", conclusion: "failure", app: { id: 15368 } }];
-    expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("e2e") });
     f.github.checkRuns = [];
     expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("No check has reported") });
-    f.github.checkRuns = [{ id: 6, name: "build", status: "completed", conclusion: "success", app: { id: 15368 } }];
-    expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ credential: { login: "agent-owner" } });
+    f.github.checkRuns = [{ id: 5, name: "e2e", status: "completed", conclusion: "success", app: { id: 15368 } }];
+    expect(await merge({ pullRequest: 7, expectedHeadSha: "a".repeat(40) })).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: { requiredChecks: ["e2e"] } } });
+  });
+
+  it("counts a required check that was skipped as passing, as GitHub does, and no other result that is not a success", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    const merge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: ["adminMerge"], pullRequest: 7, expectedHeadSha: "a".repeat(40) });
+    const run = (name: string, conclusion: string | null, extra: Record<string, unknown> = {}) => ({ name, status: "completed", conclusion, app: { id: 15368 }, ...extra });
+    // A docs-only change: the job behind "typecheck" is skipped by its path filter. Both checks are required.
+    f.github.checkRuns = [run("lint", "success"), run("typecheck", "skipped")];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: {
+      requiredChecks: ["lint", "typecheck"], checks: [{ name: "lint", result: "success" }, { name: "typecheck", result: "skipped" }],
+    } } });
+    f.github.checkRuns = [run("lint", "skipped"), run("typecheck", "skipped")];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" } });
+    // A skipped check does not cover another required check, and every other result still blocks the merge.
+    const blocked: Array<[string, unknown[], string[]]> = [
+      ["a skipped check next to a failed one", [run("lint", "skipped"), run("typecheck", "failure")], ["typecheck"]],
+      ["a required check that never reported", [run("lint", "skipped")], ["typecheck"]],
+      ["a required check in progress", [run("lint", "skipped"), run("typecheck", null, { status: "in_progress" })], ["typecheck"]],
+      ["a required check queued", [run("lint", "success"), run("typecheck", null, { status: "queued" })], ["typecheck"]],
+      ...["neutral", "cancelled", "timed_out", "action_required", "stale", "startup_failure", "failure"].map((conclusion): [string, unknown[], string[]] =>
+        [`a ${conclusion} required check`, [run("lint", "success"), run("typecheck", conclusion)], ["typecheck"]]),
+      // The ruleset pins lint to one integration: a skipped run from another app is not that check.
+      ["a skipped run from another app than the pinned one", [run("lint", "skipped", { app: { id: 1 } }), run("typecheck", "success")], ["lint"]],
+    ];
+    for (const [label, runs, failing] of blocked) {
+      f.github.checkRuns = runs;
+      const decision = await merge();
+      expect(decision, label).toMatchObject({ identity: "user", unavailable: expect.stringContaining(failing.join(", ")), evidence: { failing } });
+      expect(decision, label).not.toHaveProperty("credential");
+    }
+    // Only the latest run of a check counts: a skipped rerun after a failure passes, a failed rerun after a skip does not.
+    f.github.checkRuns = [{ id: 1, ...run("lint", "failure") }, { id: 2, ...run("lint", "skipped") }, run("typecheck", "success")];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" } });
+    f.github.checkRuns = [{ id: 1, ...run("lint", "skipped") }, { id: 2, ...run("lint", "failure") }, run("typecheck", "success")];
+    expect(await merge()).toMatchObject({ unavailable: expect.stringContaining("lint"), evidence: { failing: ["lint"] } });
+    // A commit status has no skipped state: only success counts there.
+    f.github.checkRuns = [run("lint", "success")];
+    f.github.statuses = [{ context: "typecheck", state: "skipped" }];
+    expect(await merge()).toMatchObject({ unavailable: expect.stringContaining("typecheck"), evidence: { failing: ["typecheck"] } });
+    f.github.statuses = [{ context: "typecheck", state: "success" }];
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  // An admin merge is bounded only where the base branch binds administrators and requires a check.
+  async function adminMergeFixture() {
+    const f = await appFixture();
+    await f.authorize();
+    const merge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: ["adminMerge"], pullRequest: 7, expectedHeadSha: "a".repeat(40) });
+    const refused = async (reason: string, evidence: Record<string, unknown>) => {
+      const decision = await merge();
+      expect(decision).toMatchObject({ identity: "user", unavailable: expect.stringContaining(reason), evidence });
+      expect(decision).not.toHaveProperty("credential");
+    };
+    return { ...f, merge, refused };
+  }
+
+  it("allows an admin merge on GitHub's live branch shape: enforcement_level everyone and no enforce_admins key (regression)", async () => {
+    const f = await adminMergeFixture();
+    // GET /branches/{branch} as GitHub returns it live, even to an owner: enforce_admins is never part of it.
+    f.github.protection = { enabled: true, required_status_checks: { enforcement_level: "everyone", contexts: ["lint", "typecheck"], checks: [{ context: "lint", app_id: 15368 }, { context: "typecheck", app_id: 15368 }] } };
+    expect(Object.keys(f.github.protection)).toEqual(["enabled", "required_status_checks"]);
+    const decision = await f.merge();
+    expect(decision).toMatchObject({ identity: "user", credential: { login: "agent-owner" }, evidence: { adminMerge: { headSha: "a".repeat(40), enforcementLevel: "everyone", requiredChecks: ["lint", "typecheck"] } } });
+    expect(decision.evidence.adminMerge).not.toHaveProperty("enforceAdmins");
+  });
+
+  it("refuses an admin merge where administrators may bypass the base branch protection (enforcement_level not everyone)", async () => {
+    const f = await adminMergeFixture();
+    // Required checks green or not, --admin would skip every rule of such a branch.
+    const cases: Array<[string, unknown, string, Record<string, unknown>]> = [
+      ["administrators exempt, no required check (live shape)", { enabled: true, required_status_checks: { enforcement_level: "non_admins", contexts: [], checks: [] } }, "enforcement_level non_admins", { base: "main", enforcementLevel: "non_admins" }],
+      ["administrators exempt from required checks", { enabled: true, required_status_checks: { enforcement_level: "non_admins", contexts: ["lint"], checks: [] } }, "enforcement_level non_admins", { enforcementLevel: "non_admins" }],
+      ["required checks off", { enabled: true, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } }, "enforcement_level off", { enforcementLevel: "off" }],
+      ["enforcement_level missing", { enabled: true, required_status_checks: { contexts: ["lint"], checks: [] } }, "enforcement_level not reported", { enforcementLevel: null }],
+      ["an unprotected branch", { enabled: false, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } }, "branch protection off", { enforcementLevel: "off" }],
+      ["protection off, whatever the level says", { enabled: false, required_status_checks: { enforcement_level: "everyone", contexts: ["lint"], checks: [] } }, "branch protection off", { enforcementLevel: "everyone" }],
+      ["no protection object", undefined, "enforcement_level not reported", { enforcementLevel: null }],
+      ["enforce_admins reported off", { enabled: true, enforce_admins: { enabled: false }, required_status_checks: { enforcement_level: "everyone", contexts: ["lint"], checks: [] } }, "enforce_admins off", { enforceAdmins: false }],
+    ];
+    for (const [label, protection, reason, evidence] of cases) {
+      f.github.protection = protection as Record<string, unknown>;
+      const decision = await f.merge();
+      expect(decision, label).toMatchObject({ identity: "user", unavailable: expect.stringContaining(reason), evidence });
+      expect(decision.unavailable, label).toContain('enforcement_level "everyone"');
+      expect(decision, label).not.toHaveProperty("credential");
+    }
+  });
+
+  it("refuses an admin merge when enforce_admins says on but an explicit enforcement_level says administrators are exempt (regression)", async () => {
+    const f = await adminMergeFixture();
+    // Contradictory data fails closed: an explicit enforcement_level decides, enforce_admins counts only when the level is absent.
+    for (const level of ["non_admins", "off"]) {
+      f.github.protection = { enabled: true, enforce_admins: { enabled: true }, required_status_checks: { enforcement_level: level, contexts: ["lint"], checks: [] } };
+      const decision = await f.merge();
+      expect(decision, level).toMatchObject({ identity: "user", unavailable: expect.stringContaining(`enforcement_level ${level}`), evidence: { enforcementLevel: level, enforceAdmins: true } });
+      expect(decision, level).not.toHaveProperty("credential");
+    }
+  });
+
+  it("refuses an admin merge when GitHub does not let Paperclip read the base branch protection", async () => {
+    const f = await adminMergeFixture();
+    const original = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      if (path === "/repos/anthm-fr/songtrivia/branches/main") throw new GitHubError(403);
+      return (original as any)(path, ...rest);
+    });
+    await f.refused("cannot read the base branch protection", { base: "main" });
+  });
+
+  it("refuses an admin merge when the base branch requires no check, even with every reported check green", async () => {
+    const f = await adminMergeFixture();
+    f.github.rules = [];
+    await f.refused("requires no status check", { enforcementLevel: "everyone", requiredChecks: [] });
+    f.github.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [] } }];
+    await f.refused("requires no status check", { requiredChecks: [] });
+  });
+
+  it("allows an admin merge bound by enforcement_level everyone, or by enforce_admins if GitHub reports it, with green required checks; a merge without --admin ignores both", async () => {
+    const f = await adminMergeFixture();
+    expect(await f.merge()).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: { headSha: "a".repeat(40), enforcementLevel: "everyone", requiredChecks: ["lint", "typecheck"] } } });
+    // enforce_admins is accepted when a response carries it, not required.
+    f.github.protection = { enabled: true, enforce_admins: { enabled: true }, required_status_checks: { contexts: [], checks: [] } };
+    expect(await f.merge()).toMatchObject({ credential: { login: "agent-owner" }, evidence: { adminMerge: { enforceAdmins: true, enforcementLevel: null } } });
+    f.github.protection = { enabled: true, required_status_checks: { enforcement_level: "non_admins", contexts: [], checks: [] } };
+    f.github.rules = [];
+    expect(await f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: "a".repeat(40) }))
+      .toMatchObject({ credential: { login: "agent-owner" } });
   });
 
   it("kill switch: denies every user-identity write and keeps reads", async () => {
@@ -622,6 +768,446 @@ describe("GitHub write identity: App user (anthm)", () => {
 // Security review, round 2: each test is an attack the previous code let through.
 // ---------------------------------------------------------------------------
 
+describe("VLL-1192: a 401 alone is not a revocation, and GitHub's clock decides token expiry", () => {
+  const HOUR = 3_600_000;
+  const SUSPECTED = "GitHub rejected the user token (authorization revoked). Authorize the GitHub user again.";
+  const authorizationKey = { scopeKind: "company" as const, scopeId: "anthm", namespace: "identity", stateKey: "user-authorization" };
+  const status = async (f: Awaited<ReturnType<typeof appFixture>>) =>
+    (await f.h.performAction<any>("user-authorization.status", { companyId: "anthm" }, actors("anthm").member)).authorization;
+  const refreshes = (f: Awaited<ReturnType<typeof appFixture>>) => f.oauth.mock.calls.filter(([, body]) => body.grant_type === "refresh_token").length;
+  const messages = (f: Awaited<ReturnType<typeof appFixture>>) => f.h.activity.map(entry => entry.message);
+  /** Writes stay on and nothing was revoked. */
+  async function stillAuthorized(f: Awaited<ReturnType<typeof appFixture>>) {
+    expect((await f.policy()).enabled).toBe(true);
+    expect(messages(f)).not.toContain("github.fence_violation");
+    expect((await status(f)).needsReauthorization).toBeUndefined();
+  }
+
+  it("transient 401: a cached token GitHub expired early is refreshed and the check retried once; writes stay on", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // GitHub expires the cached token early; this host still calls it fresh.
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(1);
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    await stillAuthorized(f);
+    // The rotated refresh token was stored and the new access token is the one handed out.
+    expect(f.github.refresh).toBe(token("ghr", 2));
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2), login: "agent-owner" } });
+  });
+
+  it("clock behind (the incident): after a VM paused 4.5 hours, GitHub's 401 refreshes instead of switching writes off, and the skew is reported", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    vi.setSystemTime(Date.now() + 4 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    // The VM is paused 4.5 hours: GitHub's clock moves on, this host's does not. GitHub has
+    // expired the token (8 hours on its clock) while this host still gives it 3 more hours.
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(1);
+    expect(refreshes(f)).toBe(1);
+    const after = await status(f);
+    expect(after.fence).toMatchObject({ ok: true });
+    expect(Math.abs(after.fence.clockSkewSeconds - 4.5 * 3600)).toBeLessThanOrEqual(1);
+    expect(f.h.activity).toContainEqual(expect.objectContaining({ message: "github.clock_skew", metadata: expect.objectContaining({ fenceOk: true }) }));
+    await stillAuthorized(f);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2) } });
+  });
+
+  it("clock behind: once a GitHub answer shows the skew, a token GitHub expired is refreshed before use, never handed out", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    vi.setSystemTime(Date.now() + 4 * HOUR);
+    await f.h.runJob("github-sync");
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 60_000);
+    // Any GitHub answer carries its Date: the plugin now knows the last check is 4.5 hours old on GitHub's clock.
+    f.client.clock.observe(new Date(Date.now() + f.github.offsetMs).toUTCString(), f.client.clock.started());
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("out of date") });
+    await f.h.runJob("github-sync");
+    // The token was refreshed before GitHub could refuse it.
+    expect(f.github.unauthorized).toBe(0);
+    expect(refreshes(f)).toBe(1);
+    await stillAuthorized(f);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2) } });
+  });
+
+  it("clock ahead: a host clock 2 hours ahead, then corrected backwards, neither keeps an expired token nor revokes", async () => {
+    const f = await appFixture();
+    // This host runs 2 hours ahead of GitHub from the start.
+    f.github.offsetMs = -2 * HOUR;
+    await f.authorize();
+    expect(f.client.clock.skewMs()).toBeLessThan(-2 * HOUR + 2_000);
+    // The host clock is corrected: it jumps back 2 hours and now agrees with GitHub.
+    vi.setSystemTime(Date.now() - 2 * HOUR);
+    f.github.offsetMs = 0;
+    vi.setSystemTime(Date.now() + 7 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(0);
+    expect(f.client.clock.skewMs()).toBe(0);
+    // 7h58 after GitHub issued it: GitHub's clock says the token expires within the margin, so it is
+    // refreshed first. By this host's clock at issue time it would have looked good for 2 more hours.
+    vi.setSystemTime(Date.now() + 58 * 60_000);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2) } });
+    expect(f.github.unauthorized).toBe(0);
+    await stillAuthorized(f);
+  });
+
+  it("real revocation: GitHub refuses a fresh-looking token and then the refresh; writes go off and the refresh token is kept", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // agent-owner revokes the App on GitHub: every token, the refresh token included, is dead.
+    f.github.revoked = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    // The 401 alone decided nothing: the refresh GitHub refused (bad_refresh_token) did.
+    expect(f.github.unauthorized).toBe(1);
+    expect(refreshes(f)).toBe(1);
+    expect(f.h.activity).toContainEqual(expect.objectContaining({ message: "github.fence_violation", metadata: expect.objectContaining({
+      writesDisabled: true, reason: expect.stringContaining("refused to refresh"),
+    }) }));
+    expect((await f.policy()).enabled).toBe(false);
+    expect((await status(f)).needsReauthorization).toMatch(/refused to refresh/);
+    expect(f.github.refresh).toBe(token("ghr", 1));
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+  });
+
+  it("a 401 right after a good refresh pauses writes without revoking anything; they resume after the next good check", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(2);
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("right after a refresh") });
+    await stillAuthorized(f);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("right after a refresh") });
+    f.github.rejectUser = false;
+    expect((await f.action("user-authorization.check")).fence).toMatchObject({ ok: true });
+    expect(await f.write("anthm-fr/songtrivia")).toHaveProperty("credential");
+  });
+
+  it("an OAuth error that is not about the authorization (incorrect_client_credentials) keeps it and only pauses writes", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.oauth.mockImplementationOnce(async () => ({ error: "incorrect_client_credentials" }));
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("incorrect_client_credentials") });
+    await stillAuthorized(f);
+    expect(f.github.refresh).toBe(token("ghr", 1));
+    expect((await f.action("user-authorization.check")).fence).toMatchObject({ ok: true });
+  });
+
+  it("bad_refresh_token for a refresh token another worker already rotated is not a revocation: the newer one is used", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // Another worker refreshes first and stores GitHub's next refresh token; ours is then stale.
+    f.github.beforeRefresh = () => { f.github.beforeRefresh = null; f.github.refresh = token("ghr", 50); };
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(2);
+    expect(f.oauth.mock.calls.filter(([, body]) => body.grant_type === "refresh_token").map(([, body]) => body.refresh_token)).toEqual([token("ghr", 1), token("ghr", 50)]);
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    await stillAuthorized(f);
+  });
+
+  it("a revocation recorded for a bare 401 before this fix is cleared by the next good refresh; the kill switch stays an administrator's", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // What the old fence check left after the incident: writes off and a suspected revocation.
+    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    await f.h.ctx.state.set(authorizationKey, { ...(await status(f)), needsReauthorization: SUSPECTED });
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+    // Hours later the cached token has expired: the next check refreshes.
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).needsReauthorization).toBeUndefined();
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    // Writes stay off until an administrator turns them on.
+    expect((await f.policy()).enabled).toBe(false);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+    expect((await f.setPolicy(anthmPolicy)).fence).toMatchObject({ ok: true });
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("a suspected revocation whose refresh GitHub refuses becomes a confirmed one", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    await f.h.ctx.state.set(authorizationKey, { ...(await status(f)), needsReauthorization: SUSPECTED });
+    f.github.revoked = true;
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).needsReauthorization).toMatch(/refused to refresh/);
+    expect((await f.setPolicy(anthmPolicy)).fence).toMatchObject({ ok: false, reason: expect.stringContaining("refused to refresh") });
+    expect((await f.policy()).enabled).toBe(false);
+  });
+
+  it("a transient pause is retried within minutes, so writes resume on their own", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, pausedSince: expect.any(String) });
+    f.github.rejectUser = false;
+    vi.setSystemTime(Date.now() + 4 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("right after a refresh") });
+    vi.setSystemTime(Date.now() + 60_000);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    expect((await status(f)).fence).not.toHaveProperty("pausedSince");
+    expect(await f.write("anthm-fr/songtrivia")).toHaveProperty("credential");
+    await stillAuthorized(f);
+  });
+
+  it("refreshes at most once per call: a token GitHub refuses right after it was minted is not refreshed again", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    // The cached token expired: the check refreshes first, and GitHub refuses the new token too.
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(1);
+    expect(f.github.unauthorized).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true });
+    await stillAuthorized(f);
+  });
+
+  it("a 401 to the App's own credentials (a JWT a skewed clock dated) never touches the user's authorization", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    vi.mocked(f.client.catalog).mockRejectedValueOnce(new GitHubError(401));
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(0);
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("App's credentials") });
+    await stillAuthorized(f);
+  });
+
+  it("a fence check stamped in the future (under another clock offset) proves nothing: writes wait and it is re-checked at once", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    const current = await status(f);
+    await f.h.ctx.state.set(authorizationKey, { ...current, fence: { ...current.fence, checkedAt: new Date(Date.now() + 2 * HOUR).toISOString() } });
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("out of date") });
+    const checks = f.request.mock.calls.filter(([path]) => path === "/user").length;
+    await f.h.runJob("github-sync");
+    expect(f.request.mock.calls.filter(([path]) => path === "/user").length).toBe(checks + 1);
+    expect(await f.write("anthm-fr/songtrivia")).toHaveProperty("credential");
+  });
+
+  it("records a lasting skew once, not at every check, and a failing activity log never holds back the kill switch", async () => {
+    const f = await appFixture();
+    f.github.offsetMs = 2 * HOUR;
+    await f.authorize();
+    expect(messages(f).filter(message => message === "github.clock_skew")).toHaveLength(1);
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(messages(f).filter(message => message === "github.clock_skew")).toHaveLength(1);
+    // The skew moves (the host lags further) while the installation drifts and the activity log is failing for it.
+    f.github.offsetMs = 4 * HOUR;
+    f.github.installationRepos.push("Anthm-FR/spotzic");
+    const log = f.h.ctx.activity.log.bind(f.h.ctx.activity);
+    vi.spyOn(f.h.ctx.activity, "log").mockImplementation(async entry => {
+      if (entry.message === "github.clock_skew") throw new Error("activity log unavailable");
+      return log(entry);
+    });
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect((await f.policy()).enabled).toBe(false);
+    expect((await status(f)).fence).toMatchObject({ ok: false, reason: expect.stringContaining("extra: anthm-fr/spotzic") });
+    expect(messages(f)).toContain("github.fence_violation");
+  });
+
+  it("a network failure while refreshing keeps the authorization and only pauses writes", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.oauth.mockImplementationOnce(async () => { throw new Error("socket hang up"); });
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("could not be reached to refresh") });
+    await stillAuthorized(f);
+    expect(f.github.refresh).toBe(token("ghr", 1));
+    expect((await f.action("user-authorization.check")).fence).toMatchObject({ ok: true });
+  });
+
+  it("two checks that both meet GitHub's 401 share one refresh", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    const [a, b] = await Promise.all([f.action("user-authorization.check"), f.action("user-authorization.check")]);
+    expect(a.fence).toMatchObject({ ok: true });
+    expect(b.fence).toMatchObject({ ok: true });
+    expect(refreshes(f)).toBe(1);
+    expect(f.github.unauthorized).toBe(2);
+    await stillAuthorized(f);
+  });
+
+  it("a late 401 for the old token does not throw away the token another check already refreshed", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    const original = f.request.getMockImplementation()!;
+    let seen = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.request.mockImplementation(async (path: string, auth?: string, ...rest: any[]) => {
+      if (path === "/user" && auth === token("ghu", 1) && ++seen === 2) await gate;
+      return (original as any)(path, auth, ...rest);
+    });
+    const a = f.action("user-authorization.check"), b = f.action("user-authorization.check");
+    await Promise.race([a, b]);
+    release();
+    const [ra, rb] = await Promise.all([a, b]);
+    expect(ra.fence).toMatchObject({ ok: true });
+    expect(rb.fence).toMatchObject({ ok: true });
+    expect(f.github.unauthorized).toBe(2);
+    expect(refreshes(f)).toBe(1);
+  });
+
+  it("an administrator's revoke while the retry's refresh is in flight wins: nothing handed out, refresh token stays overwritten", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    let release!: () => void;
+    f.github.refreshGate = new Promise<void>(resolve => { release = resolve; });
+    const check = f.action("user-authorization.check");
+    await vi.waitFor(() => expect(refreshes(f)).toBe(1));
+    const revoke = f.action("user-authorization.revoke");
+    release();
+    await Promise.allSettled([check, revoke]);
+    expect(f.github.refresh).toBe("revoked");
+    expect((await status(f)).needsReauthorization).toMatch(/revoked/);
+    expect((await f.policy()).enabled).toBe(false);
+    expect(await f.write("anthm-fr/songtrivia")).not.toHaveProperty("credential");
+  });
+
+  it.each(["/user/installations?", "/user/installations/101/repositories"])("a 401 on a later call (%s) of the same check is also refreshed and retried", async (prefix) => {
+    const f = await appFixture();
+    await f.authorize();
+    const original = f.request.getMockImplementation()!;
+    let thrown = false;
+    f.request.mockImplementation(async (path: string, auth?: string, ...rest: any[]) => {
+      if (!thrown && path.startsWith(prefix)) { thrown = true; f.github.unauthorized += 1; throw new GitHubError(401); }
+      return (original as any)(path, auth, ...rest);
+    });
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    await stillAuthorized(f);
+  });
+
+  it("the stored refresh token was rotated by another worker AND GitHub refuses the newer one too: confirmed revocation", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.beforeRefresh = () => { f.github.beforeRefresh = null; f.github.refresh = token("ghr", 50); f.github.revoked = true; };
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(2);
+    expect((await status(f)).needsReauthorization).toMatch(/refused to refresh/);
+    expect((await f.policy()).enabled).toBe(false);
+  });
+
+  it("after the post-refresh 401 the refused token is not reused: the next check refreshes again", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    f.github.rejectUser = false;
+    await f.action("user-authorization.check");
+    expect(refreshes(f)).toBe(2);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 3) } });
+  });
+
+  it("logs the skew warning once and the recovery once", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.h.logs.filter(l => l.level === "warn" && /clock differs/.test(l.message))).toHaveLength(1);
+    f.github.offsetMs = 0;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.h.logs.filter(l => /agrees with GitHub's again/.test(l.message))).toHaveLength(1);
+  });
+
+  it("a cached read token GitHub's clock says is expired is minted again", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    await f.read("anthm-fr/linkzic");
+    expect(f.scoped).toHaveBeenCalledTimes(1);
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    f.client.clock.observe(new Date(Date.now() + f.github.offsetMs).toUTCString(), f.client.clock.started());
+    await f.read("anthm-fr/linkzic");
+    expect(f.scoped).toHaveBeenCalledTimes(2);
+  });
+
+  it("the first answer that shows a host clock 2h ahead is the refresh: the new token's expiry is on GitHub's clock", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.offsetMs = -2 * HOUR;
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");          // The refresh: its answer is the first to show the skew.
+    expect(refreshes(f)).toBe(1);
+    for (let i = 0; i < 4; i += 1) { vi.setSystemTime(Date.now() + 2 * HOUR); await f.h.runJob("github-sync"); }
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(0);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 3) } });
+  });
+
+
+  it("a failing activity log does not fail the admin's check action", async () => {
+    const f = await appFixture();
+    f.github.offsetMs = 2 * HOUR;
+    const log = f.h.ctx.activity.log.bind(f.h.ctx.activity);
+    await f.setPolicy(anthmPolicy);
+    vi.spyOn(f.h.ctx.activity, "log").mockImplementation(async entry => { if (entry.message === "github.clock_skew") throw new Error("down"); return log(entry); });
+    await f.action("user-authorization.start");
+    vi.setSystemTime(Date.now() + 6_000);
+    await expect(f.action("user-authorization.poll")).resolves.toMatchObject({ status: "authorized" });
+  });
+
+  it("after the first hour of a pause the retry backs off to hourly", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");              // The pause starts.
+    const calls = () => f.request.mock.calls.filter(([path]) => path === "/user").length;
+    for (let i = 0; i < 12; i += 1) { vi.setSystemTime(Date.now() + 5 * 60_000); await f.h.runJob("github-sync"); }
+    const afterHour = calls();
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    await f.h.runJob("github-sync");              // 70 minutes into the pause: hourly now, so not due yet.
+    expect(calls()).toBe(afterHour);
+  });
+
+  it("an administrator's revoke still overwrites the stored refresh token", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    await f.action("user-authorization.revoke");
+    expect(f.github.refresh).toBe("revoked");
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+    expect(refreshes(f)).toBe(0);
+  });
+});
+
 describe("security review round 2 (attack regressions)", () => {
   const me = () => `agent-owner <${USER_ID}+agent-owner@users.noreply.github.com> ${Math.floor(Date.now() / 1000)} +0000`;
   const at = (offsetSeconds: number) => `agent-owner <${USER_ID}+agent-owner@users.noreply.github.com> ${Math.floor(Date.now() / 1000) + offsetSeconds} +0000`;
@@ -724,14 +1310,17 @@ describe("security review round 2 (attack regressions)", () => {
     await f.authorize();
     const original = f.request.getMockImplementation()!;
     const merge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: ["adminMerge"], pullRequest: 7, expectedHeadSha: "a".repeat(40) });
-    // Without required checks, a failing status on page 2 must block the merge.
-    f.github.rules = [];
+    // A required status reported on page 2 counts: failing it blocks the merge, passing it lets the merge through.
+    f.github.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "security/scan" }] } }];
     f.github.statuses = Array.from({ length: 100 }, (_, n) => ({ context: `ci/${n}`, state: "success" }));
+    let scan = "failure";
     f.request.mockImplementation(async (path: string, ...rest: any[]) => path === `/repos/anthm-fr/songtrivia/commits/${"a".repeat(40)}/status?per_page=100&page=2`
-      ? { data: { statuses: [{ context: "security/scan", state: "failure" }] } as any, next: false }
+      ? { data: { statuses: [{ context: "security/scan", state: scan }] } as any, next: false }
       : path.startsWith(`/repos/anthm-fr/songtrivia/commits/${"a".repeat(40)}/status`) ? { data: { statuses: f.github.statuses } as any, next: true }
       : (original as any)(path, ...rest));
     expect(await merge()).toMatchObject({ unavailable: expect.stringContaining("security/scan") });
+    scan = "success";
+    expect(await merge()).toMatchObject({ credential: { login: "agent-owner" } });
     // More pages of rules than Paperclip reads: refused.
     f.request.mockImplementation(async (path: string, ...rest: any[]) => path.startsWith("/repos/anthm-fr/songtrivia/rules/branches/main?")
       ? { data: [] as any, next: true } : (original as any)(path, ...rest));
@@ -1387,5 +1976,268 @@ describe("security review round 5 (attack regressions)", () => {
       f.github.prFiles = [{ filename }];
       expect(await merge(f), filename).toMatchObject({ unavailable: expect.stringContaining(`protected paths (${filename})`) });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An instance admin's per-repository opt-in (`agentMergeablePaths` in the plugin config): agents may merge pull requests that
+// touch `.github/**`, except for the CODEOWNERS paths, control repositories, tiers paths and the admin's own exclusions.
+// ---------------------------------------------------------------------------
+
+describe("agentMergeablePaths: an instance admin releases some protected paths for agent merges", () => {
+  const head = "a".repeat(40), base = "c".repeat(40);
+  // Synthetic repositories for these tests (the fixture is extended below to answer for them). The control repository is the
+  // code's own list's first entry, which the fixture answers as it is.
+  const OWNER = "example-org", ORDINARY = `${OWNER}/app`, OTHER = `${OWNER}/other`, CONTROL = CONTROL_REPOSITORIES[0]!;
+  const optIn = (extra: Record<string, unknown> = {}, repository = ORDINARY) => [{ repository, allow: [".github/**"], exclude: [".github/workflows/release.yml"], ...extra }];
+  const merge = (f: Awaited<ReturnType<typeof appFixture>>, repository = ORDINARY, extra: Record<string, unknown> = {}) =>
+    f.write(repository, { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head, ...extra });
+  const tiersFile = (paths: string[]) => `version: 1\nprotectedPaths:\n${paths.map(path => `  - ${path}`).join("\n")}\n`;
+  /** The synthetic repositories as the plugin's catalog lists them: the fixture's one installation, owner example-org. */
+  const synthetic = [ORDINARY, OTHER].map((fullName, index) => ({ id: 900 + index, name: fullName.split("/")[1]!, fullName, url: `https://github.com/${fullName}`, installationId: 101, owner: OWNER, ownerId: 1, private: true, permissions }));
+  /** Extends the fixture's fake GitHub, catalog and installation so that they answer for the synthetic repositories as for their own. */
+  function addSyntheticRepositories(f: Awaited<ReturnType<typeof appFixture>>) {
+    const catalog = vi.mocked(f.client.catalog), listed = catalog.getMockImplementation()!;
+    catalog.mockImplementation(async (...args) => { const result = await listed(...args); return { ...result, repositories: [...result.repositories, ...synthetic] }; });
+    const own = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      const mine = new RegExp(`^/repos/(${OWNER}/[a-z-]+)/(.+)$`).exec(path);
+      if (!mine) return (own as any)(path, ...rest);
+      const [, repository, tail] = mine as unknown as [string, string, string];
+      const answer = (data: unknown, next = false) => ({ data: data as any, next });
+      if (tail === "pulls/7") { f.github.prReads += 1; return answer({ ...f.github.pr, changed_files: f.github.changedFiles ?? f.github.prFiles.length }); }
+      const files = /^pulls\/7\/files\?per_page=100&page=(\d+)$/.exec(tail);
+      if (files) { const page = Number(files[1]); return answer(f.github.prFiles.slice((page - 1) * 100, page * 100), f.github.prFiles.length > page * 100); }
+      const content = /^contents\/(.+)\?ref=([0-9a-f]{40})$/.exec(tail);
+      if (content) {
+        const entry = f.github.contents[`${repository}/${content[1]}@${content[2]}`];
+        if (entry === undefined) throw new GitHubError(404);
+        if (typeof entry === "number") throw new GitHubError(entry);
+        return answer({ type: "file", encoding: "base64", content: Buffer.from(entry).toString("base64") });
+      }
+      if (tail === "pulls/7/merge") return answer({ merged: true, sha: head, message: "Pull Request successfully merged" });
+      if (tail.startsWith("rules/branches/main?per_page=100")) return answer(f.github.rules);
+      if (tail === "branches/main") return answer({ name: "main", protection: f.github.protection });
+      if (tail.startsWith(`commits/${head}/check-runs`)) return answer({ check_runs: f.github.checkRuns });
+      if (tail.startsWith(`commits/${head}/status`)) return answer({ statuses: f.github.statuses });
+      throw new Error(`Unexpected GitHub request ${path}`);
+    });
+  }
+  async function fixture(agentMergeablePaths?: unknown) {
+    const f = await appFixture(agentMergeablePaths === undefined ? {} : { config: { agentMergeablePaths } });
+    addSyntheticRepositories(f);
+    await f.authorize();
+    // The user's installation, the write allowlist and the installation fence of the stored policy now also name the synthetic repositories.
+    const stored = await f.policy(), names = synthetic.map(repo => repo.fullName);
+    f.github.installationRepos.push(...names);
+    await f.setPolicy({ ...stored, allowedRepositories: [...stored.allowedRepositories, ...names], installationRepositories: [...stored.installationRepositories, ...names] });
+    return f;
+  }
+  /** The company's id, as the fixture's own actions answer it. */
+  const companyOf = async (f: Awaited<ReturnType<typeof appFixture>>) => String((await f.action("write-identity.get")).companyId);
+  const refused = (files: string[], by = "a human must merge it: agent-owner in the GitHub web UI") =>
+    ({ unavailable: expect.stringMatching(new RegExp(`protected paths \\(${files.map(file => file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(", ")}\\); agents cannot merge it, ${by.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)) });
+
+  it("refuses a workflow change exactly as before when no repository is opted in (no config, an empty list)", async () => {
+    for (const config of [undefined, [], [{ repository: OTHER, allow: [".github/**"] }]]) {
+      const f = await fixture(config);
+      f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }];
+      const decision = await merge(f);
+      expect(decision, JSON.stringify(config)).toMatchObject({ ...refused([".github/workflows/ci.yml"]), evidence: { protectedFiles: [".github/workflows/ci.yml"] } });
+      expect(decision).not.toHaveProperty("credential");
+    }
+  });
+
+  it("lets an opted-in repository merge a workflow change, and records which files the config released", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }, { filename: ".github/actions/setup/action.yml" }];
+    const decision = await merge(f);
+    expect(decision).toMatchObject({
+      credential: { login: "agent-owner" },
+      evidence: { protectedPaths: { pullRequest: 7, headSha: head, baseSha: base, files: 3,
+        releasedProtectedFiles: [".github/actions/setup/action.yml", ".github/workflows/ci.yml"], releasedBy: "config:agentMergeablePaths" } },
+    });
+    // A pull request that touches nothing protected records no release.
+    f.github.prFiles = [{ filename: "src/ok.ts" }];
+    const plain = await merge(f);
+    expect(plain).toHaveProperty("credential");
+    expect(plain.evidence.protectedPaths).not.toHaveProperty("releasedProtectedFiles");
+    expect(plain.evidence.protectedPaths).not.toHaveProperty("releasedBy");
+  });
+
+  it("applies to admin merges and to the plugin's own merge tool, which share the guard", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, ORDINARY, { privileged: ["adminMerge"] })).toMatchObject({ credential: { login: "agent-owner" }, evidence: { protectedPaths: { releasedBy: "config:agentMergeablePaths" } } });
+    // The tool counts as an admin merge too: it passes the guard and then merges, as the App user, with GitHub's own answer.
+    const run = { companyId: await companyOf(f), agentId: "agent-1", projectId: "p1", runId: "run-1" };
+    const input = { repository: ORDINARY, number: 7, sha: head, method: "squash", confirm: `${ORDINARY}#7` };
+    const tool = await f.h.executeTool<any>("github_merge_pull_request", input, run);
+    expect(tool.error).toBeUndefined();
+    expect(f.request.mock.calls.some(([path, , , method]) => method === "PUT" && String(path) === `/repos/${ORDINARY}/pulls/7/merge`)).toBe(true);
+  });
+
+  it("keeps the plugin's merge tool refused without the opt-in, before any merge is sent", async () => {
+    const f = await fixture();
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    const run = { companyId: await companyOf(f), agentId: "agent-1", projectId: "p1", runId: "run-1" };
+    const tool = await f.h.executeTool<any>("github_merge_pull_request", { repository: ORDINARY, number: 7, sha: head, method: "squash", confirm: `${ORDINARY}#7` }, run);
+    expect(tool.error).toMatch(/protected paths \(\.github\/workflows\/ci\.yml\)/);
+    expect(f.request.mock.calls.some(([, , , method]) => method === "PUT")).toBe(false);
+  });
+
+  it("keeps the refusal for the whole pull request when one touched file is not released, and lists only that file", async () => {
+    const f = await fixture(optIn());
+    for (const [label, files, expected] of [
+      ["an excluded file alone", [".github/workflows/release.yml"], [".github/workflows/release.yml"]],
+      ["an excluded file next to allowed ones", [".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/dependabot.yml"], [".github/workflows/release.yml"]],
+      ["an excluded file next to an ordinary change", ["src/ok.ts", ".github/workflows/release.yml"], [".github/workflows/release.yml"]],
+      ["the exclusion in another case", [".GitHub/Workflows/Release.yml"], [".GitHub/Workflows/Release.yml"]],
+    ] as const) {
+      f.github.prFiles = files.map(filename => ({ filename }));
+      const decision = await merge(f);
+      expect(decision, label).toMatchObject({ ...refused([...expected]), evidence: { protectedFiles: [...expected] } });
+      expect(decision, label).not.toHaveProperty("credential");
+    }
+  });
+
+  it("releases only what `allow` covers: a narrower glob leaves the rest of .github refused", async () => {
+    const f = await fixture(optIn({ allow: [".github/workflows/**"], exclude: [] }));
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f)).toHaveProperty("credential");
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }, { filename: ".github/dependabot.yml" }, { filename: ".github/scripts/deploy.sh" }];
+    expect(await merge(f)).toMatchObject({ ...refused([".github/dependabot.yml", ".github/scripts/deploy.sh"]) });
+  });
+
+  it("never releases a CODEOWNERS path, alone or mixed with released files, whatever `allow` says", async () => {
+    const f = await fixture(optIn({ exclude: [] }));
+    for (const filename of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS", "sub/dir/CODEOWNERS", ".github/codeowners"]) {
+      f.github.prFiles = [{ filename }];
+      expect(await merge(f), filename).toMatchObject(refused([filename]));
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }, { filename }];
+      expect(await merge(f), `${filename} with a workflow`).toMatchObject({ ...refused([filename]), evidence: { protectedFiles: [filename] } });
+    }
+    // A rename out of CODEOWNERS counts both names.
+    f.github.prFiles = [{ filename: ".github/workflows/owners.yml", previous_filename: ".github/CODEOWNERS", status: "renamed" }];
+    expect(await merge(f)).toMatchObject(refused([".github/CODEOWNERS"]));
+  });
+
+  it("drops an entry that names CODEOWNERS or reaches outside .github, so nothing is released and the refusal is the old one", async () => {
+    for (const allow of [["CODEOWNERS"], [".github/CODEOWNERS"], ["docs/CODEOWNERS"], [".github/**", "CODEOWNERS"], ["**"], ["scripts/**"], ["/.github/**"], [".github/../scripts/**"], [".github/**/CODEOWNERS"], []]) {
+      const f = await fixture(optIn({ allow }));
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f), JSON.stringify(allow)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    }
+    // Other entries of the same config keep working: only the invalid one is dropped.
+    const f = await fixture([...optIn({ allow: ["CODEOWNERS"] }, ORDINARY), ...optIn({}, OTHER)]);
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+  });
+
+  it("fails closed on a config that is not a list, on unknown keys, on a repeated repository and on a bad exclusion", async () => {
+    for (const config of ["yes", { repository: ORDINARY, allow: [".github/**"] }, [{ repository: ORDINARY, allow: [".github/**"], extra: true }],
+      [...optIn(), ...optIn({ exclude: [] })], optIn({ exclude: ["../escape"] }), optIn({ exclude: "no" }), [null], [{ repository: `${OWNER}/*`, allow: [".github/**"] }]]) {
+      const f = await fixture(config);
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    }
+  });
+
+  it("never lets a control repository opt in, even when it is listed, and keeps its other protected paths", async () => {
+    const f = await fixture(optIn({}, CONTROL));
+    for (const filename of [".github/workflows/ci.yml", "paperclip/gates.yaml", "scripts/build.sh"]) {
+      f.github.prFiles = [{ filename }];
+      expect(await merge(f, CONTROL), filename).toMatchObject(refused([filename]));
+    }
+  });
+
+  it("never lets a repository with a tiers file on its base branch opt in, and its tiers paths win", async () => {
+    const f = await fixture(optIn());
+    f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`] = tiersFile([".github/workflows/deploy.yml"]);
+    for (const filename of [".github/workflows/ci.yml", ".github/workflows/deploy.yml"]) {
+      f.github.prFiles = [{ filename }];
+      expect(await merge(f), filename).toMatchObject(refused([filename]));
+    }
+    // Without the tiers file the same repository is released again.
+    delete f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`];
+    f.github.prFiles = [{ filename: ".github/workflows/deploy.yml" }];
+    expect(await merge(f)).toHaveProperty("credential");
+    // An unreadable tiers file refuses, as before.
+    f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`] = 500;
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringMatching(/cannot read paperclip\/tiers\.yaml on the base branch/) });
+  });
+
+  it("refuses a rename between an excluded name and an allowed one, in both directions", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml", previous_filename: ".github/workflows/release.yml", status: "renamed" }];
+    expect(await merge(f)).toMatchObject({ ...refused([".github/workflows/release.yml"]), evidence: { protectedFiles: [".github/workflows/release.yml"] } });
+    f.github.prFiles = [{ filename: ".github/workflows/release.yml", previous_filename: ".github/workflows/ci.yml", status: "renamed" }];
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/release.yml"]));
+    // A rename between two allowed names merges.
+    f.github.prFiles = [{ filename: ".github/workflows/build.yml", previous_filename: ".github/workflows/ci.yml", status: "renamed" }];
+    expect(await merge(f)).toHaveProperty("credential");
+  });
+
+  it("matches the repository exactly and without regard to case, and nothing else", async () => {
+    for (const [repository, merges] of [["Example-Org/App", true], ["EXAMPLE-ORG/APP", true], ["example-org/ap", false], ["example-org/app-2", false], ["example-org", false]] as const) {
+      const f = await fixture(optIn({ repository }));
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      const decision = await merge(f);
+      expect(decision.credential !== undefined, repository).toBe(merges);
+    }
+  });
+
+  it("still refuses when the head moved, when it is not the expected head, and when no head SHA is given", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, ORDINARY, { expectedHeadSha: "b".repeat(40) })).toMatchObject({ unavailable: expect.stringContaining("not the expected") });
+    expect(await merge(f, ORDINARY, { expectedHeadSha: null })).toMatchObject({ unavailable: expect.stringContaining("--match-head-commit") });
+    const original = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      const result = await (original as any)(path, ...rest);
+      if (/\/pulls\/7$/.test(path) && f.github.prReads === 1) f.github.pr = { ...f.github.pr, head: { sha: "b".repeat(40) } };
+      return result;
+    });
+    f.github.prReads = 0;
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringContaining("changed while Paperclip checked it") });
+  });
+
+  it("still refuses auto-merge, the merge queue and a base change, and every other write-identity gate", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, ORDINARY, { autoMerge: true })).toMatchObject({ unavailable: expect.stringMatching(/auto-merge or the merge queue: a human must merge/) });
+    expect(await merge(f, ORDINARY, { retarget: true })).toMatchObject({ unavailable: expect.stringMatching(/base branch: a human must/) });
+    await f.setPolicy({ ...await f.policy(), enabled: false });
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+  });
+
+  it("reads the config on every merge, so a change by the instance admin applies at once, in both directions", async () => {
+    const f = await fixture();
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    f.config.agentMergeablePaths = optIn();
+    expect(await merge(f)).toHaveProperty("credential");
+    f.config.agentMergeablePaths = optIn({ exclude: [".github/workflows/ci.yml"] });
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    delete f.config.agentMergeablePaths;
+    expect(await merge(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+  });
+
+  it("takes the opt-in from the plugin config only, never from the pull request's head or any file of the repository", async () => {
+    const f = await fixture();
+    f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }, { filename: "paperclip/tiers.yaml" }];
+    f.github.contents[`${ORDINARY}/.github/agent-mergeable-paths.json`] = JSON.stringify(optIn());
+    f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${head}`] = "agentMergeablePaths: all\n";
+    expect(await merge(f)).toMatchObject({ unavailable: expect.stringContaining("protected paths (.github/workflows/ci.yml)") });
+    const reads = f.request.mock.calls.map(([path]) => String(path)).filter(path => path.includes("/contents/"));
+    expect(reads.every(path => path.includes("paperclip/tiers.yaml?ref=" + base))).toBe(true);
+  });
+
+  it("lists at most 100 released files in the evidence and says how many there are", async () => {
+    const f = await fixture(optIn());
+    f.github.prFiles = Array.from({ length: 150 }, (_, n) => ({ filename: `.github/workflows/w${String(n).padStart(3, "0")}.yml` }));
+    const decision = await merge(f);
+    expect(decision.evidence.protectedPaths.releasedProtectedFiles).toHaveLength(100);
+    expect(decision.evidence.protectedPaths).toMatchObject({ releasedProtectedFilesCount: 150, releasedBy: "config:agentMergeablePaths" });
   });
 });

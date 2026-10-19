@@ -256,6 +256,7 @@ function makeContext(
     activityGateScope: "company",
     variables: routineDetail.variables,
     env: routineDetail.env ?? null,
+    automationWakeSettings: {},
   };
   const editDraft: RoutineEditDraft = dirty
     ? { ...defaults, description: `${defaults.description}\n\nAlways CC the account owner.` }
@@ -268,6 +269,7 @@ function makeContext(
     companyId: COMPANY_ID,
     editDraft,
     setEditDraft: () => {},
+    discardEdits: () => {},
     routineDefaults: defaults,
     dirtyFields,
     isEditDirty: dirty,

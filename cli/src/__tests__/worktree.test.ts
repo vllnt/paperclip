@@ -157,12 +157,10 @@ async function seedValidWorktreeSource(
     userId,
     role: "instance_admin",
   });
-  await db.insert(companies).values({
-    id: companyId,
-    name: "Seed Source",
-    issuePrefix: "SEED",
-    requireBoardApprovalForNewAgents: false,
-  });
+  await db.$client`
+    insert into companies (id, name, issue_prefix, require_board_approval_for_new_agents)
+    values (${companyId}, 'Seed Source', 'SEED', false)
+  `;
   await db.insert(companyMemberships).values({
     companyId,
     principalType: "user",

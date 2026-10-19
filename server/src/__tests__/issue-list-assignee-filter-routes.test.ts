@@ -12,6 +12,7 @@ import { errorHandler } from "../middleware/index.js";
 import {
   __clearIssueListResponseCacheForTests,
   __getIssueListResponseCacheSizeForTests,
+  ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT,
   ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES,
   issueRoutes,
 } from "../routes/issues.js";
@@ -524,6 +525,89 @@ describeEmbeddedPostgres("issue list routes assigneeAgentId filter", () => {
     );
     expect(computeCount).toBe(1);
     expect(responses.some((res) => res.headers["x-paperclip-request-cache"] === "coalesced")).toBe(true);
+  });
+
+  async function seedSingleIssueCompany(title: string) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: uniqueIssuePrefix(),
+      requireBoardApprovalForNewAgents: false,
+    });
+    await seedCloudTenantMember(companyId);
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title,
+      status: "todo",
+      priority: "medium",
+    });
+    return companyId;
+  }
+
+  // Holds every computation until `expected` are in flight together (or a
+  // short timeout), so the requests overlap the way an HTTP/2 burst does.
+  function holdUntilConcurrent(expected: number) {
+    let started = 0;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const timeout = setTimeout(() => release(), 1_000);
+    return {
+      async onComputeStart() {
+        started += 1;
+        if (started >= expected) {
+          clearTimeout(timeout);
+          release();
+        }
+        await released;
+      },
+    };
+  }
+
+  it("serves the Tasks board's concurrent issue-list fan-out without rejecting any request", async () => {
+    const companyId = await seedSingleIssueCompany("Board fan-out issue");
+    // One board load: seven status columns, the task list, and the inbox badge.
+    const boardFanout = [
+      ...["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"].map((status) => ({
+        view: "compact",
+        status,
+        limit: "200",
+        includeRoutineExecutions: "true",
+      })),
+      { view: "compact", limit: "100", offset: "0", sortField: "updated", sortDir: "desc", includeRoutineExecutions: "true" },
+      { status: "backlog,todo,in_progress,in_review,blocked,done", touchedByUserId: "me", limit: "500" },
+    ];
+    const app = createApp(companyId, {
+      issueListDiagnostics: holdUntilConcurrent(boardFanout.length),
+    });
+
+    const responses = await Promise.all(boardFanout.map((query) =>
+      request(app).get(`/api/companies/${companyId}/issues`).query(query)
+    ));
+
+    expect(responses.map((res) => res.status)).toEqual(boardFanout.map(() => 200));
+  });
+
+  it("still rejects a client that exceeds the concurrent issue-list cap", async () => {
+    const companyId = await seedSingleIssueCompany("Runaway client issue");
+    const app = createApp(companyId, {
+      issueListDiagnostics: holdUntilConcurrent(ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT),
+    });
+
+    const responses = await Promise.all(
+      Array.from({ length: ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT + 1 }, (_, index) =>
+        request(app)
+          .get(`/api/companies/${companyId}/issues`)
+          .query({ view: "compact", limit: "20", q: `distinct-${index}` })),
+    );
+
+    const rejected = responses.filter((res) => res.status === 429);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.headers["retry-after"]).toBe("1");
+    expect(responses.filter((res) => res.status === 200)).toHaveLength(ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT);
   });
 
   it("keeps compact issue-list cache keys separated by board user identity", async () => {
