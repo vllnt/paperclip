@@ -1,5 +1,7 @@
 import { Command } from "commander";
+import { planCodexToGrokSwitch } from "@paperclipai/adapter-grok-local";
 import {
+  agentFallbacksSchema,
   agentSkillSyncSchema,
   createAgentSchema,
   resetAgentSessionSchema,
@@ -57,6 +59,15 @@ interface AgentWakeOptions extends BaseClientOptions {
   payload?: string;
   idempotencyKey?: string;
   forceFreshSession?: boolean;
+}
+
+interface AgentFallbacksSetOptions extends BaseClientOptions {
+  fallbacksJson: string;
+}
+
+interface AgentSetAdapterOptions extends BaseClientOptions {
+  dryRun?: boolean;
+  xaiBaseUrl?: string;
 }
 
 interface AgentJsonPayloadOptions extends BaseClientOptions {
@@ -459,6 +470,96 @@ export function registerAgentCommands(program: Command): void {
 
   addCommonClientOptions(
     agent
+      .command("fallbacks:set")
+      .description(
+        "Set an agent's ordered harness/model fallback chain. Env values that hold credentials must be secret references.",
+      )
+      .argument("<agentId>", "Agent ID")
+      .requiredOption(
+        "--fallbacks-json <json>",
+        'Fallback entries, for example [{"adapterType":"codex_local","model":"gpt-5.5","effort":"high","env":{"OPENAI_API_KEY":{"type":"secret_ref","secretId":"<id>"}}}]',
+      )
+      .action(async (agentId: string, opts: AgentFallbacksSetOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const fallbacks = agentFallbacksSchema.parse(parseJson(opts.fallbacksJson));
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("fallbacks:clear")
+      .description("Remove an agent's fallback chain; runs use only the primary harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks: [] });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("cooldowns:clear")
+      .description("Clear an agent's provider quota cooldowns so its next run may use any harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const result = await ctx.api.post(apiPath`/api/agents/${agentId}/harness-cooldowns/clear`, {});
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("set-adapter")
+      .description(
+        "Move a codex_local agent that runs a Grok model onto grok_local, keeping its model, instructions, working directory and skills",
+      )
+      .argument("<agentId>", "Agent ID")
+      .argument("<adapterType>", "Target adapter; only grok_local is supported")
+      .option("--dry-run", "Print the planned change without applying it")
+      .option(
+        "--xai-base-url <url>",
+        "Gateway URL for GROK_XAI_API_BASE_URL. The API hides the agent's OPENAI_BASE_URL, so pass it here",
+      )
+      .action(async (agentId: string, adapterType: string, opts: AgentSetAdapterOptions) => {
+        try {
+          if (adapterType !== "grok_local") {
+            throw new Error(`set-adapter supports only grok_local; got "${adapterType}". Use the agent update API for other changes.`);
+          }
+          const ctx = resolveCommandContext(opts);
+          const row = await ctx.api.get<Agent>(apiPath`/api/agents/${agentId}`);
+          if (!row) throw new Error(`Agent ${agentId} not found`);
+          const plan = planCodexToGrokSwitch(row, { xaiBaseUrl: opts.xaiBaseUrl });
+          if (!plan.ok) throw new Error(plan.message);
+          if (opts.dryRun) {
+            printOutput({ dryRun: true, patch: plan.patch, changes: plan.changes, warnings: plan.warnings }, { json: ctx.json });
+            return;
+          }
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, plan.patch);
+          printOutput({ agent: updated, changes: plan.changes, warnings: plan.warnings }, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
       .command("delete")
       .description("Delete an agent")
       .argument("<agentId>", "Agent ID")
@@ -480,7 +581,6 @@ export function registerAgentCommands(program: Command): void {
     ["resume", "resume", "Resume an agent"],
     ["approve", "approve", "Approve a pending agent"],
     ["terminate", "terminate", "Terminate an agent"],
-    ["heartbeat:invoke", "heartbeat/invoke", "Invoke an agent heartbeat"],
     ["claude-login", "claude-login", "Trigger Claude login for an agent"],
   ] as const) {
     addCommonClientOptions(
@@ -499,6 +599,24 @@ export function registerAgentCommands(program: Command): void {
         }),
     );
   }
+
+  addCommonClientOptions(
+    agent
+      .command("heartbeat:invoke")
+      .description("Invoke an agent heartbeat, optionally for one assigned issue")
+      .argument("<agentId>", "Agent ID")
+      .option("--issue <issueId>", "Wake the agent for this issue (sends payload.issueId)")
+      .action(async (agentId: string, opts: BaseClientOptions & { issue?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body = opts.issue ? { payload: { issueId: opts.issue } } : {};
+          const result = await ctx.api.post(`${apiPath`/api/agents/${agentId}`}/heartbeat/invoke`, body);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
 
   addCommonClientOptions(
     agent

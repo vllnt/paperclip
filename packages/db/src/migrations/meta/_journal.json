@@ -2126,15 +2126,8 @@
     {
       "idx": 305,
       "version": "7",
-      "when": 1792430009694,
-      "tag": "0305_illegal_rattler",
-      "breakpoints": true
-    },
-    {
-      "idx": 306,
-      "version": "7",
-      "when": 1792430009695,
-      "tag": "0306_issue_run_lookup_indexes",
+      "when": 1792430335310,
+      "tag": "0305_absurd_power_pack",
       "breakpoints": true
     }
   ]

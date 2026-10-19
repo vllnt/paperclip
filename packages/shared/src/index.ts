@@ -1,5 +1,37 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  DEFAULT_RUN_TIER,
+  RUN_TARGET_SOURCES,
+  companyRunTiersSchema,
+  issueRunProfileFromOverrides,
+  resolveRunProfile,
+  runProfileSchema,
+  type CompanyRunTiers,
+  type ResolvedRunTarget,
+  type RunProfile,
+  type RunProfileResolution,
+  type RunTargetSource,
+} from "./run-profile.js";
+export {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  HARNESS_ALLOWED_MODEL_VENDORS,
+  MAX_AGENT_FALLBACKS,
+  MODEL_VENDORS,
+  agentFallbackTargetSchema,
+  agentFallbacksSchema,
+  checkHarnessModelCompatibility,
+  classifyModelVendor,
+  fallbackEffortConfigKey,
+  harnessTargetKey,
+  readModelOverridesFromArgs,
+  type AgentFallbackTarget,
+  type AgentHarnessFallbackState,
+  type HarnessFallbackAdapterType,
+  type HarnessModelCompatibilityInput,
+  type HarnessModelCompatibilityResult,
+  type ModelVendor,
+} from "./harness-fallback.js";
+export {
   RUNNER_GOAL_MAX_OBJECTIVE_CHARS,
   runnerGoalAvailabilitySchema,
   runnerGoalCapabilityActionSchema,
@@ -1971,6 +2003,7 @@ export {
   type CompanySearchExtractQuery,
   type CompanySearchQuery,
   createIssueSchema,
+  isValidExistingBranchName,
   setIssueTitleSchema,
   type SetIssueTitle,
   createIssueInputSchema,
@@ -2277,6 +2310,10 @@ export {
   updateToolProfileWithEntriesSchema,
   upsertToolCatalogEntrySchema,
   createRoutineSchema,
+  listRoutinesQuerySchema,
+  parseListRoutinesQuery,
+  ROUTINE_LIST_QUERY_MAX_LENGTH,
+  ROUTINE_LIST_TRIGGER_FILTERS,
   updateRoutineSchema,
   createRoutineTriggerSchema,
   updateRoutineTriggerSchema,
@@ -2346,6 +2383,8 @@ export {
   type UnbindToolProfileBinding,
   type UpsertToolCatalogEntry,
   type CreateRoutine,
+  type ListRoutinesQuery,
+  type RoutineListTriggerFilter,
   type UpdateRoutine,
   type CreateRoutineTrigger,
   type UpdateRoutineTrigger,
@@ -2860,3 +2899,4 @@ export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
 export * from "./event-sources.js";
 export * from "./run-context.js";
+export * from "./issue-git.js";

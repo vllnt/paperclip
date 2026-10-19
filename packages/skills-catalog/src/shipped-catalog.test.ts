@@ -111,6 +111,15 @@ describe("shipped skills catalog", () => {
     expect(violations).toEqual([]);
   });
 
+  it("names when to use every bundled skill in its description", () => {
+    // The description is the only text an agent sees before it picks a skill, so it has to name the trigger.
+    const withoutUseWhen = catalogSkills
+      .filter((skill) => skill.kind === "bundled" && !/\buse (?:when|for)\b/i.test(skill.description))
+      .map((skill) => skill.key);
+
+    expect(withoutUseWhen).toEqual([]);
+  });
+
   it("ships the expected bundled and optional skill set", () => {
     const bundledKeys = catalogSkills
       .filter((skill) => skill.kind === "bundled")

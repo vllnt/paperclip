@@ -396,6 +396,7 @@ export const queryKeys = {
       ["issues", "runner-goal", issueId, agentId ?? "__effective__"] as const,
     workProducts: (issueId: string) =>
       ["issues", "work-products", issueId] as const,
+    git: (issueId: string) => ["issues", "git", issueId] as const,
     fileResources: (
       issueId: string,
       options: {
@@ -436,12 +437,13 @@ export const queryKeys = {
       ["issues", "file-resources", issueId, "availability", refKeys] as const,
   },
   routines: {
-    list: (companyId: string, filters?: { projectId?: string | null }) =>
-      [
-        "routines",
-        companyId,
-        filters?.projectId ?? "__all-projects__",
-      ] as const,
+    list: (companyId: string, filters?: { projectId?: string | null; q?: string | null; assigneeAgentId?: string | null; folderId?: string | null; status?: string | null; trigger?: string | null }) => {
+      const { projectId, ...rest } = filters ?? {};
+      const narrowing = Object.fromEntries(Object.entries(rest).filter(([, value]) => value));
+      return Object.keys(narrowing).length > 0
+        ? (["routines", companyId, projectId ?? "__all-projects__", narrowing] as const)
+        : (["routines", companyId, projectId ?? "__all-projects__"] as const);
+    },
     detail: (id: string) => ["routines", "detail", id] as const,
     runs: (id: string) => ["routines", "runs", id] as const,
     revisions: (id: string) => ["routines", "revisions", id] as const,
