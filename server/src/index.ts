@@ -93,6 +93,7 @@ import { deliverNativeQuestionResponse } from "./services/native-runtime/native-
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
+import { startResourceCapacitySampler } from "./services/resource-capacity-sampler.js";
 import { createDbAdapterAuthSessionStore } from "./services/device-login-service.js";
 import {
   createDeviceLoginReaper,
@@ -1192,6 +1193,7 @@ async function startServerWithDatabaseTeardown(
   const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   executionControlInterval.unref?.();
   sweepExecutionControl();
+  const stopResourceCapacitySampler = startResourceCapacitySampler(db);
   const runUsageRecords = runUsageRecordService(db);
   let runUsageDerivationInFlight = false;
   const deriveRunUsageRecords = () => {
@@ -1613,7 +1615,9 @@ async function startServerWithDatabaseTeardown(
           reconciled.continuationRequeued > 0 ||
           reconciled.successfulRunHandoffEscalated > 0 ||
           reconciled.successfulRunHandoffRetried > 0 ||
-          reconciled.escalated > 0
+          reconciled.escalated > 0 ||
+          reconciled.dispatchDeferredForCapacity > 0 ||
+          reconciled.failed > 0
         ) {
           logger.warn(
             { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
@@ -1857,7 +1861,9 @@ async function startServerWithDatabaseTeardown(
                 reconciled.continuationRequeued > 0 ||
                 reconciled.successfulRunHandoffEscalated > 0 ||
                 reconciled.successfulRunHandoffRetried > 0 ||
-                reconciled.escalated > 0
+                reconciled.escalated > 0 ||
+                reconciled.dispatchDeferredForCapacity > 0 ||
+                reconciled.failed > 0
               ) {
                 logger.warn(
                   { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
@@ -2007,6 +2013,7 @@ async function startServerWithDatabaseTeardown(
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
     clearInterval(executionControlInterval);
+    stopResourceCapacitySampler();
     clearInterval(runUsageRecordInterval);
     tempSweeper.stop();
     if (heartbeatSchedulerInterval) {

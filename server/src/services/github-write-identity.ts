@@ -8,6 +8,7 @@ import {
   ghApiRoute,
   ghVerbIndex,
   gitNetworkArguments,
+  gitPushDestinations,
   normalizeGhArgs,
   gitSubcommandIndex,
   parseGhApiArgs,
@@ -18,6 +19,7 @@ import {
   type GitHubOperationAction,
   type GitHubPrivilegedAction,
   type GitHubSignDecision,
+  type GitHubWorkflowPush,
   type GitHubWriteIdentityDecision,
   type GitHubWriteIdentityPolicy,
   type PaperclipPluginManifestV1,
@@ -49,6 +51,23 @@ export const gitHubOperationSchema = z.object({
   // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push: whether the new commits change `.github/workflows/**`; null when unknown. */
   touchesWorkflows: z.boolean().nullable().optional(),
+  /**
+   * git push of one commit that changes workflow files: every file under `.github/workflows` at the pushed commit, the new
+   * commits that change workflow paths (with their parents and those paths as they have them: git mode and blob id, null
+   * when gone), and the parents where new history joins commits that already exist. Absent when unknown or too much.
+   */
+  workflowFiles: z.array(z.object({ path: z.string().max(300), mode: z.string().regex(/^\d{6}$/), oid: z.string().regex(/^[0-9a-f]{40,64}$/) })).max(100).optional(),
+  workflowCommits: z.array(z.object({
+    sha: z.string().regex(/^[0-9a-f]{40,64}$/),
+    parents: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(16),
+    changes: z.array(z.object({
+      path: z.string().max(300),
+      mode: z.string().regex(/^\d{6}$/).nullable(),
+      oid: z.string().regex(/^[0-9a-f]{40,64}$/).nullable(),
+    })).min(1).max(100),
+  })).max(100).optional()
+    .refine(value => !value || value.reduce((total, commit) => total + commit.changes.length, 0) <= 400, "Too many workflow changes"),
+  workflowEntries: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(8).optional(),
   // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push: the commit SHAs being pushed (for the audit record). */
   shas: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(64).optional(),
@@ -67,7 +86,13 @@ export const gitHubOperationSchema = z.object({
   /** The launcher shortened the command to report it. */
   truncated: z.boolean().optional(),
 });
-export type GitHubOperation = z.infer<typeof gitHubOperationSchema>;
+/**
+ * The agent and run an operation came from. The server sets it from the run's own token with
+ * {@link attachGitHubCaller}; the launcher's report can never name them (the schema above has no such field and
+ * drops one), so no command can claim to come from another agent.
+ */
+export interface GitHubOperationCaller { agentId: string; runId: string }
+export type GitHubOperation = z.infer<typeof gitHubOperationSchema> & { caller?: GitHubOperationCaller };
 
 /** A launcher body that names an operation Paperclip cannot read. */
 export const UNREADABLE_GITHUB_OPERATION = "unreadable" as const;
@@ -83,6 +108,14 @@ export function readGitHubOperation(body: unknown): GitHubOperation | typeof UNR
 export function parseGitHubOperation(body: unknown): GitHubOperation | null {
   const operation = readGitHubOperation(body);
   return operation === UNREADABLE_GITHUB_OPERATION ? null : operation;
+}
+
+/**
+ * The reported operation with the run that sent it, taken from the run's token on the server (never from the
+ * report). Scoped privileged grants match on this agent. A report that is missing or unreadable stays as it is.
+ */
+export function attachGitHubCaller<T extends GitHubOperation | typeof UNREADABLE_GITHUB_OPERATION | null>(operation: T, run: { agentId: string; runId: string }): T {
+  return operation && typeof operation === "object" ? { ...operation, caller: { agentId: run.agentId, runId: run.runId } } : operation;
 }
 
 /** Values of gh flags that always hold free text, never a repository or URL selector. */
@@ -249,6 +282,15 @@ export interface ClassifiedGitHubOperation {
    * refused until that answer is read (resolveGitHubOperationAccess reads it).
    */
   branchRewrites?: string[];
+  /**
+   * A push of one commit to one named branch that asks for `editWorkflows`, with the workflow paths it changes. The
+   * plugin lets it through without the toggle only when every path is the base branch's own.
+   */
+  workflowPush?: GitHubWorkflowPush;
+  /** The endpoint of a `gh api` write that needs `editWorkflows`: the plugin records it with the allowed write. */
+  route?: string;
+  /** The agent and run that sent the command, when the server attached them (see {@link GitHubOperationCaller}). */
+  caller?: GitHubOperationCaller;
 }
 
 /** A reported command Paperclip could not read: it is treated as a write it cannot check. */
@@ -354,6 +396,21 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     retarget = operation.args.slice(1).some(arg => arg === "--base" || arg.startsWith("--base=") || arg.startsWith("-B"));
   }
   if (operation.program === "git" && subcommand === "push" && operation.shas?.length) target.shas = operation.shas;
+  // One commit to one named branch, reported whole, is the only push whose workflow history the plugin can check against GitHub.
+  let workflowPush: GitHubWorkflowPush | undefined;
+  if (operation.program === "git" && subcommand === "push" && privileged.includes("editWorkflows") && operation.touchesWorkflows === true
+    && operation.shas?.length === 1 && operation.workflowFiles && operation.workflowCommits && operation.workflowEntries?.length) {
+    const destinations = gitPushDestinations(operation.args.slice(index + 1), {
+      currentBranch: operation.currentBranch ?? null, refs: operation.refs, followTags: operation.followTags, implicitPush: operation.implicitPush,
+    });
+    const [only] = destinations;
+    if (destinations.length === 1 && only!.startsWith("refs/heads/") && !only!.includes("*")) {
+      workflowPush = {
+        branch: only!.slice("refs/heads/".length), tip: operation.shas[0]!,
+        files: operation.workflowFiles, commits: operation.workflowCommits, entries: operation.workflowEntries,
+      };
+    }
+  }
   if (operation.program === "gh" && operation.args[0] === "pr" && ghVerb === "merge") {
     const merge = ghPrMergeArguments(operation.args);
     merging = true;
@@ -407,6 +464,9 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     ...(autoMerge ? { autoMerge: true as const } : {}),
     ...(retarget ? { retarget: true as const } : {}),
     ...(branchRewrites ? { branchRewrites } : {}),
+    ...(workflowPush ? { workflowPush } : {}),
+    ...(command.route ? { route: command.route } : {}),
+    ...(operation.caller ? { caller: operation.caller } : {}),
     ...(operation.program === "git" && command.action === "commit" ? { signing: true } : {}),
   };
 }
@@ -509,6 +569,9 @@ export async function resolveGitHubWriteIdentityDecision(
       repository: operation.repository, access: operation.access, action: operation.action, privileged: operation.privileged,
       wiki: operation.wiki, pullRequest: operation.pullRequest, expectedHeadSha: operation.expectedHeadSha,
       ...(operation.merge ? { merge: true } : {}), ...(operation.autoMerge ? { autoMerge: true } : {}), ...(operation.retarget ? { retarget: true } : {}),
+      ...(operation.workflowPush ? { workflowPush: operation.workflowPush } : {}),
+      ...(operation.route ? { route: operation.route } : {}),
+      ...(operation.caller ? { agentId: operation.caller.agentId, runId: operation.caller.runId } : {}),
       ...(input.fallback ? { fallback: true } : {}),
     }, 15_000);
     return raw === null ? UNAVAILABLE : decisionSchema.parse(raw) as GitHubWriteIdentityDecision;

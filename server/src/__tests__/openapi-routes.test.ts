@@ -13,6 +13,7 @@ const ROUTES_DIR = path.resolve(__dirname, "../routes");
 
 const apiPrefixes: Record<string, string> = {
   "pipelines.ts": "/api",
+  "resource-capacity.ts": "/api",
   "cases.ts": "/api",
   "smoke-lab.ts": "/api",
   "access.ts": "/api",
@@ -32,6 +33,7 @@ const apiPrefixes: Record<string, string> = {
   "chat-channels.ts": "/api",
   "slack-tools.ts": "/api",
   "email.ts": "/api",
+  "event-sources.ts": "/api",
   "cloud.ts": "/api/cloud",
   "companies.ts": "/api/companies",
   "company-skills.ts": "/api",
@@ -263,6 +265,37 @@ describe("openapi routes", () => {
       required: ["companyId"], additionalProperties: false,
     });
     expect(dismiss.description).toContain("viewers may dismiss their own");
+  });
+
+  it("documents event-source ingress as a public secret-authenticated operation and management as board-only", () => {
+    const { spec } = loadSpecRoutes();
+    const ingest = spec.paths["/api/event-sources/public/{publicId}/events"].post;
+    expect(ingest.security).toEqual([]);
+    expect(ingest["x-paperclip-authorization"]).toEqual({ actor: "public" });
+    for (const status of ["200", "202", "401", "404", "409", "413", "415", "422", "429", "503"]) {
+      expect(ingest.responses[status], `ingress response ${status}`).toBeDefined();
+    }
+    expect(ingest.requestBody.content["application/json"].schema.properties.dedupeKey).toBeDefined();
+
+    const create = spec.paths["/api/companies/{companyId}/event-sources"].post;
+    expect(create["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(create.responses["201"]).toBeDefined();
+    for (const [route, method] of [
+      ["/api/event-sources/{id}", "patch"],
+      ["/api/event-sources/{id}", "delete"],
+      ["/api/event-sources/{id}/rotate-secret", "post"],
+    ] as const) {
+      expect(spec.paths[route][method]["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    }
+    for (const [route, method] of [
+      ["/api/companies/{companyId}/event-sources", "get"],
+      ["/api/event-sources/{id}", "get"],
+      ["/api/event-sources/{id}/test", "post"],
+      ["/api/event-sources/{id}/deliveries", "get"],
+      ["/api/routines/{id}/event-groups", "get"],
+    ] as const) {
+      expect(spec.paths[route][method]["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    }
   });
 
   it("documents exact failed-run selection and durable accepted retry responses", async () => {
@@ -758,6 +791,16 @@ describe("openapi routes", () => {
       extraInSpec: [],
       excludedRoutes: [...explicitOpenApiOperationCoverageExclusions].sort(),
     });
+  });
+
+  it("documents merge-patch updates for agent config", () => {
+    const { spec } = loadSpecRoutes();
+    const update = spec.paths["/api/agents/{id}"].patch;
+    expect(update.requestBody.content["application/json"].schema.properties.mergeConfig).toMatchObject({
+      type: "boolean",
+    });
+    expect(update.description).toContain("JSON merge patches (RFC 7396)");
+    expect(update.description).toContain("never have to be resent");
   });
 
   it("documents board-only repository discovery and selection", () => {

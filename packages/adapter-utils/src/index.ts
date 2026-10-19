@@ -7,6 +7,8 @@ export type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
   AdapterRuntimeEvent,
+  AdapterSteerResult,
+  AdapterSteeringHandle,
   AdapterRuntimeMcpServer,
   AdapterRuntimeMcpAccess,
   AdapterExecutionContext,
@@ -88,6 +90,11 @@ export type {
   RuntimeStatusUpdate,
 } from "./runtime-progress.js";
 export { inferOpenAiCompatibleBiller } from "./billing.js";
+export {
+  ADAPTER_STEERING_ACKNOWLEDGEMENT_KIND,
+  adapterSteeringAcknowledgementEvent,
+  readAdapterSteeringAcknowledgement,
+} from "./steering.js";
 export {
   ADAPTER_LOGIN_PANEL_MODES,
   ADAPTER_LOGIN_TIMEOUT_POLICIES,

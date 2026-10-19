@@ -39,6 +39,7 @@ async function finishedRun(options: { git?: boolean } = {}) {
   const runDir = sshRunDirectory(root, runId);
   const workspace = path.join(runDir, "workspace");
   await mkdir(workspace, { recursive: true });
+  let seed: string | null = null;
   if (options.git !== false) {
     await git(workspace, ["init", "-q", "-b", "main"]);
     await git(workspace, ["config", "user.name", "Paperclip Test"]);
@@ -46,12 +47,14 @@ async function finishedRun(options: { git?: boolean } = {}) {
     await writeFile(path.join(workspace, "tracked.txt"), "base\n");
     await git(workspace, ["add", "tracked.txt"]);
     await git(workspace, ["commit", "-q", "-m", "base"]);
+    // The commit the run's workspace was uploaded from, as the server records it.
+    seed = await git(workspace, ["rev-parse", "HEAD"]);
   } else {
     await writeFile(path.join(workspace, "work.txt"), "only copy\n");
   }
-  const reap = (extra: { removeNotGitBacked?: boolean; maxBundleKb?: number } = {}) => reapSshRunDirectory({
-    spec, remoteRoot: root, runId, removeNotGitBacked: extra.removeNotGitBacked,
-    testHooks: { runScript: runLocally, maxBundleKb: extra.maxBundleKb },
+  const reap = (extra: { removeNotGitBacked?: boolean; maxBundleKb?: number; afterRead?: string } = {}) => reapSshRunDirectory({
+    spec, remoteRoot: root, runId, seed, removeNotGitBacked: extra.removeNotGitBacked,
+    testHooks: { runScript: runLocally, maxBundleKb: extra.maxBundleKb, afterRead: extra.afterRead },
   });
   return { root, runId, runDir, workspace, reap };
 }
@@ -114,9 +117,10 @@ describe("reapSshRunDirectory and extra worktrees", () => {
   it("keeps the run directory when the temporary index cannot be written, also as root", async () => {
     const run = await finishedRun();
     await dirtyExtraWorktree(run);
-    await mkdir(path.join(run.runDir, ".paperclip-reap-index-0", "sub"), { recursive: true });
+    // A directory at the index's name in the script's scratch directory, which is made fresh for each reap.
+    const blockIndex = `if [ "$rname" = wtstatus ]; then mkdir -p "$scratch/index-wt-0/sub"; fi`;
 
-    await expect(run.reap()).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
+    await expect(run.reap({ afterRead: blockIndex })).resolves.toMatchObject({ outcome: "kept", reason: "preserve_failed" });
 
     expect(existsSync(path.join(run.runDir, "wt-agent", "notes.txt"))).toBe(true);
   });
