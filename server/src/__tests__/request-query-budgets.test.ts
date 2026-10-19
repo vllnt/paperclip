@@ -83,12 +83,18 @@ const REQUESTS: Array<{
   { name: "routines", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/routines`, budget: 7, rows: 3 }, // 6
   // Equal to the count, not above it. Each list request imports the bundled
   // skills again from disk, and each skill ensures its bundled category folder
-  // in its own folder-lock transaction: 12 statements per skill (8 listed here,
-  // 27 + 12 * 8 = 123). The budget follows the number of bundled skills and
-  // keeps the count per skill from growing; it is not a target.
-  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 27, perRow: 12 }, // 123
+  // in its own folder-lock transaction: 14 statements per skill (10 listed here,
+  // 29 + 14 * 10 = 169). Two of them, per skill and once for the list, read the
+  // skill sources' access scope (company_skill_sources, project_skill_sources).
+  // The budget follows the number of bundled skills and keeps the count per
+  // skill from growing; it is not a target.
+  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 29, perRow: 14 }, // 169
   { name: "plugins", actor: "operator", path: () => "/api/plugins", budget: 2, rows: 0 }, // 1
-  { name: "heartbeat runs", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30 }, // 2
+  // Includes 1 statement per distinct issue of the listed runs: the run
+  // privacy check confirms the issue exists before it decides issue:read
+  // (getHeartbeatRunReadDecisions in services/heartbeat-run-privacy.ts). Each
+  // seeded run has its own issue. The budget is not a target.
+  { name: "heartbeat runs", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30, perRow: 1 }, // 32
   { name: "dashboard", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/dashboard`, budget: 9 }, // 8
   { name: "sidebar badges", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/sidebar-badges`, budget: 5 }, // 4
   // Includes 2 statements per agent: the list authorizes each agent on its own
@@ -96,8 +102,12 @@ const REQUESTS: Array<{
   { name: "agents", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/agents`, budget: 17, rows: 6 }, // 16
   { name: "issues list", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/issues`, budget: 29, rows: 40 }, // 26
   { name: "issue detail", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}`, budget: 35 }, // 32
-  { name: "issue comments", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 9, rows: 12 }, // 8
-  { name: "heartbeat runs", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 5, rows: 30 }, // 4
+  // Includes 2 statements that read the issue's privacy for the member.
+  { name: "issue comments", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 11, rows: 12 }, // 10
+  // Includes 5 statements per distinct issue of the listed runs: the existence
+  // check and the member's issue:read decision with its privacy reads (see the
+  // operator entry). The budget is not a target.
+  { name: "heartbeat runs", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 5, rows: 30, perRow: 5 }, // 154
   { name: "sidebar badges", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/sidebar-badges`, budget: 7 }, // 6
 ];
 
