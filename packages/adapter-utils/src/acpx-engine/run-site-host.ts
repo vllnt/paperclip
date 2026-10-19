@@ -52,6 +52,7 @@ export interface ChildStderrState {
  * time and its own optional idle timer, which the store reads and writes.
  */
 export interface RuntimeCacheEntry {
+  observabilityCompatibilityKey?: string;
   runtime: AcpRuntime;
   handle: AcpRuntimeHandle;
   childStderrState: ChildStderrState;

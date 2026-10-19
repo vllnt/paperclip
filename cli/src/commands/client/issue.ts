@@ -75,6 +75,7 @@ interface IssueCreateOptions extends BaseClientOptions, RunProfileOptions {
   projectId?: string;
   goalId?: string;
   parentId?: string;
+  standalone?: boolean;
   requestDepth?: string;
   billingCode?: string;
   adapterOverridesJson?: string;
@@ -383,6 +384,10 @@ export function registerIssueCommands(program: Command): void {
       .option("--project-id <id>", "Project ID")
       .option("--goal-id <id>", "Goal ID")
       .option("--parent-id <id>", "Parent issue ID")
+      .option(
+        "--standalone",
+        "Create a top-level issue. Without --parent-id, an agent run's issue otherwise becomes the parent.",
+      )
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
       .option("--run-profile <tier>", "Run this issue on a company tier (for example fast, standard or deep)")
@@ -393,6 +398,9 @@ export function registerIssueCommands(program: Command): void {
       .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .action(async (opts: IssueCreateOptions) => {
         try {
+          if (opts.standalone && opts.parentId) {
+            throw new Error("--standalone cannot be combined with --parent-id");
+          }
           const ctx = resolveCommandContext(opts, { requireCompany: true });
           const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
           const payload = createIssueSchema.parse({
@@ -403,7 +411,7 @@ export function registerIssueCommands(program: Command): void {
             assigneeAgentId: opts.assigneeAgentId,
             projectId: opts.projectId,
             goalId: opts.goalId,
-            parentId: opts.parentId,
+            parentId: opts.standalone ? null : opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
             assigneeAdapterOverrides: hasRunProfileOptions(opts)

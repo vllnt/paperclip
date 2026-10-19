@@ -132,6 +132,11 @@ export type ReleaseIssueExecutionInput = {
    * it did not just execute on the issue, so its agent gains no ownership.
    */
   anchorRunOnly?: boolean;
+  /**
+   * Re-drive a queue stranded behind the latest finished issue run. That run
+   * also only anchors the drain, so its agent gains no ownership either.
+   */
+  resumeStrandedQueue?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -163,12 +168,12 @@ async function runReleaseDrain(
   // The `processedWakeIds` guard below makes a break of the invariant
   // fail loudly, instead of holding this transaction open forever.
   const processedWakeIds = new Set<string>();
-  const excludedWakeIds: string[] = [];
+  const preservedWakeIds: string[] = [];
 
   while (true) {
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
-      ...(excludedWakeIds.length ? { excludedWakeIds } : {}),
+      ...(preservedWakeIds.length ? { excludedWakeIds: preservedWakeIds } : {}),
     });
     if (!candidate) break;
     if (processedWakeIds.has(candidate.id)) {
@@ -184,7 +189,7 @@ async function runReleaseDrain(
     // the window ends, whoever releases; the deferred-wake sweep delivers it.
     const coalescedUntil = candidate.automationCoalescedUntil ?? null;
     if (coalescedUntil && coalescedUntil.getTime() > input.now.getTime()) {
-      excludedWakeIds.push(candidate.id);
+      preservedWakeIds.push(candidate.id);
       continue;
     }
 
@@ -196,12 +201,12 @@ async function runReleaseDrain(
       // A parked wake keeps its place until its window ends, whoever releases.
       const parkedUntil = candidate.selfReblockParkedUntil ?? null;
       if (parkedUntil && parkedUntil.getTime() > input.now.getTime()) {
-        excludedWakeIds.push(candidate.id);
+        preservedWakeIds.push(candidate.id);
         continue;
       }
       if (isSelfReblockWakeOwner({
         agentId: candidate.agentId,
-        holdingRunAgentId: input.anchorRunOnly ? null : run.agentId,
+        holdingRunAgentId: input.anchorRunOnly || input.resumeStrandedQueue ? null : run.agentId,
       })) {
         await ports.transaction.suppressSelfReblockDeferredWake({
           companyId: run.companyId,
@@ -230,7 +235,7 @@ async function runReleaseDrain(
           notBefore: limit.notBefore,
           now: input.now,
         });
-        excludedWakeIds.push(candidate.id);
+        preservedWakeIds.push(candidate.id);
         continue;
       }
     }
@@ -267,11 +272,11 @@ async function runReleaseDrain(
       !candidate.preservesIndependentContinuation && candidate.queuedCommentIds.length > 0 &&
       ["issue_commented", "issue_reopened_via_comment"].includes(candidate.wakeReason ?? candidate.reason ?? "");
     if (ordinaryTaskComment && candidate.agentId !== issue.assigneeAgentId) {
-      if (run.agentId !== issue.assigneeAgentId) {
+      if (input.resumeStrandedQueue || run.agentId !== issue.assigneeAgentId) {
         // The old owner can release before assignment admission adopts these
         // exact IDs. Leave its receipt intact, skip it for this drain, and let
         // a current-assignee wake behind it proceed.
-        excludedWakeIds.push(candidate.id);
+        preservedWakeIds.push(candidate.id);
       } else {
         // The current owner has finished. An obsolete assignment cannot
         // launch another former-owner run or reopen its completed task.
@@ -349,12 +354,17 @@ async function runReleaseDrain(
 
     // A comment-id rewrite cannot change the agent or pause-hold facts already fetched above, so one decision covers both the rewritten and un-rewritten cases.
     const wakeOutcome = decideWakeOutcome({
-      agent: { agentFound: deferredAgent !== null, invokable: deferredAgent?.invokable ?? false },
+      agent: { agentFound: deferredAgent !== null, invokable: deferredAgent?.invokable ?? false, paused: deferredAgent?.paused === true },
       pauseHold: { activePauseHold: pauseHold.activePauseHold, treeHoldInteractionWake: pauseHold.treeHoldInteractionWake },
     });
 
     if (wakeOutcome.kind === "fail_not_invokable") {
       await ports.transaction.failDeferredWake({ companyId: run.companyId, wakeId: workingCandidate.id, now: input.now });
+      continue;
+    }
+
+    if (wakeOutcome.kind === "defer_agent_pause") {
+      preservedWakeIds.push(workingCandidate.id);
       continue;
     }
 
@@ -391,7 +401,7 @@ async function runReleaseDrain(
         nonblocking: true,
       });
       if (admission.hold) {
-        excludedWakeIds.push(workingCandidate.id);
+        preservedWakeIds.push(workingCandidate.id);
         continue;
       }
       admittedAt = admission.admittedAt;
@@ -588,7 +598,13 @@ async function runReleaseRecoveryTail(
   input: ReleaseIssueExecutionInput,
   postCommitEffects: PostCommitEffect[],
 ): Promise<ReleaseTransactionResult> {
-  const suppressImmediateRecovery = input.suppressImmediateRecovery === true || Boolean(
+  // A run a person deliberately stopped (board cancel, operator interrupt, agent
+  // pause) is not stranded work. Re-queuing it here re-created the cancelled wake
+  // within a second of the cancel (issue_continuation_needed / assignment_recovery),
+  // and for a paused agent escalated the issue to `blocked`. The periodic sweep
+  // already stands down for operator cancels; this keeps release consistent.
+  const operatorStopped = run.status === "cancelled" && run.operatorStopped === true;
+  const suppressImmediateRecovery = input.suppressImmediateRecovery === true || operatorStopped || Boolean(
     issue.conversationAgentId && issue.conversationUserId &&
     issue.conversationState === "waiting" && issue.status === "in_review"
   );
@@ -1090,7 +1106,8 @@ export function createReleaseIssueExecution(deps: {
     input: ReleaseIssueExecutionInput,
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
-      { companyId: input.companyId, runId: input.runId, now: input.now },
+      { companyId: input.companyId, runId: input.runId, now: input.now,
+        ...(input.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}) },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 

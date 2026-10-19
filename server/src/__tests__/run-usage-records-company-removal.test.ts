@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, companies, createDb, heartbeatRuns, runUsageRecords } from "@paperclipai/db";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
 import { companyService } from "../services/companies.js";
 import { runUsageRecordService } from "../services/run-usage-records.js";
 import {
@@ -12,13 +13,15 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-describeEmbeddedPostgres.sequential("run usage records and company removal", () => {
+describeEmbeddedPostgres("run usage records and company removal", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-run-usage-removal-");
     db = createDb(tempDb.connectionString);
+    // A company delete terminates its agents through the lifecycle worker first.
+    configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
   }, 30_000);
 
   afterAll(async () => {

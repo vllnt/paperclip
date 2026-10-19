@@ -1,6 +1,7 @@
-import express, { type RequestHandler } from "express";
+import type { RequestHandler } from "express";
 import fs from "node:fs";
 import path from "node:path";
+import { staticUiFiles } from "./static-ui.js";
 
 const COMPRESSIBLE_EXTENSIONS: ReadonlySet<string> = new Set([".js", ".mjs", ".css", ".svg", ".json"]);
 
@@ -55,7 +56,8 @@ function listPrecompressedFiles(root: string): ReadonlySet<string> {
  */
 export function precompressedStatic(root: string, options: PrecompressedStaticOptions = {}): RequestHandler {
   const siblings = listPrecompressedFiles(root);
-  const sendSibling = express.static(root, {
+  // staticUiFiles also releases idle-drain tracking when a download is aborted.
+  const sendSibling = staticUiFiles(root, {
     maxAge: options.maxAge,
     immutable: options.immutable,
     dotfiles: "deny",

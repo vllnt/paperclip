@@ -1,13 +1,14 @@
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
+import { readRunCancellation } from "../../../services/run-cancellation.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
-import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { selectInCommentBatches } from "../../../services/comment-id-batches.js";
 import { ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON } from "../../../services/issue-dependency-wakeups.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
+import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -115,7 +116,21 @@ function toRunSnapshot(row: HeartbeatRunRow): RunSnapshot {
     responsibleUserId: row.responsibleUserId,
     contextSnapshot: parseObject(row.contextSnapshot),
     configurationIncompletePayload: Object.keys(configurationIncompletePayload).length > 0 ? configurationIncompletePayload : null,
+    operatorStopped: isOperatorStoppedRunRow(row),
   };
+}
+
+const OPERATOR_STOP_ERROR_CODES = new Set(["operator_interrupted", "agent_paused"]);
+
+/** Mirrors recovery's `isOperatorCancelledRun`, plus agent pause, for the release-time recovery tail. */
+export function isOperatorStoppedRunRow(row: Pick<HeartbeatRunRow, "status" | "errorCode" | "resultJson">): boolean {
+  if (row.status !== "cancelled") return false;
+  const cancellation = readRunCancellation(row.resultJson);
+  if (cancellation?.source === "queued_message") return false;
+  if (cancellation?.source === "operator" && cancellation.expected) return true;
+  if (row.errorCode && OPERATOR_STOP_ERROR_CODES.has(row.errorCode)) return true;
+  const actorType = parseObject(row.resultJson).cancelledByActorType;
+  return actorType === "user" || actorType === "board";
 }
 
 function toIssueSnapshot(row: IssueRow): IssueSnapshot {
@@ -220,7 +235,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .then((rows) => rows[0] ?? null);
       if (!agent) return null;
       const invokability = await evaluateAgentInvokabilityFromDb(tx, agent);
-      return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable };
+      return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable,
+        paused: !invokability.invokable && invokability.reason === "paused" };
     },
 
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
@@ -292,13 +308,22 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds }) {
-      const rows = await selectInCommentBatches(queuedCommentIds, (batch) => tx
+      // Malformed ids (for example an 8-char short form written into a wake
+      // payload) can never match a comment row, but Postgres rejects the whole
+      // `inArray` statement on the first invalid uuid and blocks every queued
+      // wake for the issue. Skip them up front so one bad id cannot take down
+      // the batch; the liveness filters below already treat them as not live.
+      const queryableCommentIds = queuedCommentIds
+        .map((commentId) => commentId.trim())
+        .filter((commentId) => isUuidLike(commentId));
+      // Long issues can queue more ids than one bound statement accepts.
+      const rows = await selectInCommentBatches(queryableCommentIds, (batch) => tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch), currentConversationCommentCondition())));
       const rowsById = new Map(rows.map((row) => [row.id, row]));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
-      const liveNonSelfCommentIds = queuedCommentIds.filter((commentId) => {
+      const liveNonSelfCommentIds = queryableCommentIds.filter((commentId) => {
         const row = rowsById.get(commentId);
         return Boolean(row && !row.deletedAt && (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });
@@ -1249,6 +1274,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           throw new Error(`wake-queue: run ${input.runId} was not found while releasing issue execution`);
         }
         const runSnapshot = toRunSnapshot(run);
+        if (input.resumeStrandedQueue && (!run.finishedAt || !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status))) {
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
         const contextIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
 
         // Lock the context issue (if any) and every issue that still references this
@@ -1275,6 +1303,19 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
                 for update
               `,
         );
+
+        if (input.resumeStrandedQueue && run.runtimeMode === "native") {
+          const [finalized] = contextIssueId && run.nativeIssueId === contextIssueId
+            ? await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+                eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, run.id),
+                eq(nativeRunFinalizations.issueId, run.nativeIssueId), eq(nativeRunFinalizations.phase, "committed"),
+              )).limit(1)
+            : [];
+          if (!finalized) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
+        if (input.resumeStrandedQueue && await hasPendingRunCleanup(tx, input.companyId, run.id)) {
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
 
         const candidateIssues = await tx
           .select()
@@ -1317,6 +1358,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
             )).limit(1)
           : [];
+        const cancellation = readRunCancellation(run.resultJson);
+        const queuedOperatorStop = run.runtimeMode === "legacy" && run.status === "cancelled" &&
+          run.runtimeModeResolvedAt === null && run.startedAt === null && run.processStartedAt === null &&
+          run.processPid === null && run.processGroupId === null &&
+          cancellation?.source === "operator" && cancellation.expected;
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1332,7 +1378,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           executionCancellationAcknowledged:
             isAcknowledgedNativeReassignmentStop(run) ||
             (run.status === "cancelled" &&
-            (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
+            (queuedOperatorStop || parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
             !interruptedQueue),
         };
         const preDrain = decidePreDrain(preDrainFacts);
@@ -1352,11 +1398,14 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // agent's review participation retains its separate recovery path.
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, input.companyId),
-          eq(heartbeatRuns.agentId, run.agentId),
-          sql`${heartbeatRuns.id} <> ${run.id}`,
+          input.resumeStrandedQueue ? undefined : eq(heartbeatRuns.agentId, run.agentId),
+          input.resumeStrandedQueue ? undefined : sql`${heartbeatRuns.id} <> ${run.id}`,
           or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
             sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
-          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          or(inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            input.resumeStrandedQueue ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (
+              SELECT source.created_at, source.id FROM heartbeat_runs source
+              WHERE source.company_id = ${input.companyId} AND source.id = ${run.id})` : undefined),
         )).limit(1);
         if (successor) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
 
@@ -1417,6 +1466,18 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
         const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+        // Explicit retry admission requires the exact source's task claim.
+        // Preserve it only when the existing queue-first recovery policy
+        // requests that retry. The clear/restore stays inside this task lock.
+        if (run.runtimeMode === "legacy" && ["failed", "timed_out"].includes(run.status) &&
+            run.contextSnapshot?.explicitUserContinuation && issueRow.executionRunId === run.id &&
+            result.postCommitEffects.some(effect => effect.kind === "conversation_retry_requested" && effect.runId === run.id)) {
+          await tx.update(issues).set({ executionRunId: run.id,
+            executionAgentNameKey: issueRow.executionAgentNameKey,
+            executionLockedAt: issueRow.executionLockedAt,
+          }).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueRow.id),
+            sql`${issues.executionRunId} is null`));
+        }
         return { ...result, run: runSnapshot };
       });
     },

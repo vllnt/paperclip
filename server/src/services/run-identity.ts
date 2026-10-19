@@ -10,6 +10,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
+import { boundRunIssueId } from "./run-task-binding.js";
 import { isUuidLike } from "@paperclipai/shared";
 import { selectInCommentBatches } from "./comment-id-batches.js";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -58,9 +59,23 @@ export async function explicitOperatorRunIdentity(
 export type RunIdentityContext = typeof runIdentityContexts.$inferSelect;
 type Executor = Pick<Db, "select" | "insert" | "update">;
 
-/** The task a run is bound to (null when none). A bound id that is not a UUID fails closed, locked path or not. */
-function boundTaskId(issueId: unknown): string | null {
-  if (issueId !== undefined && issueId !== null && (typeof issueId !== "string" || !isUuidLike(issueId))) {
+/**
+ * The task a run is bound to (null when none). A bound id, or the legacy
+ * context id beside it, that is not a UUID fails closed, locked path or not.
+ */
+function boundTaskId(
+  run:
+    | {
+        contextSnapshot?: Record<string, unknown> | null;
+        nativeIssueId?: string | null;
+        issueId?: string | null;
+      }
+    | undefined,
+): string | null {
+  const issueId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+  const legacyIssueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+  if ([issueId, legacyIssueId].some(id => id !== undefined && id !== null &&
+      (typeof id !== "string" || !isUuidLike(id)))) {
     throw forbidden("Run task identity is invalid");
   }
   return typeof issueId === "string" ? issueId : null;
@@ -80,14 +95,15 @@ async function lockIdentityTask(
 ) {
   const [run] = await executor
     .select({
-      context: heartbeatRuns.contextSnapshot,
-      issueId: heartbeatRuns.nativeIssueId,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      issueId: heartbeatRuns.issueId,
     })
     .from(heartbeatRuns)
     .where(
       and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)),
     );
-  const issueId = boundTaskId(run?.context?.issueId ?? run?.context?.taskId ?? run?.issueId);
+  const issueId = boundTaskId(run);
   if (issueId !== null)
     await executor
       .select({ id: issues.id })
@@ -153,7 +169,7 @@ async function activate(executor: Executor, context: RunIdentityContext) {
       ),
     )
     .returning();
-  const issueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+  const issueId = run ? boundRunIssueId(run) : null;
   if (typeof issueId === "string")
     await executor
       .update(issues)
@@ -324,8 +340,7 @@ export async function prepareSteeredIdentity(
     throw forbidden("Steering requires an authenticated message author");
   if (
     run.status !== "running" ||
-    (run.contextSnapshot?.issueId !== input.issueId &&
-      run.contextSnapshot?.taskId !== input.issueId)
+    boundRunIssueId(run) !== input.issueId
   ) {
     throw conflict("Steering targets a different or inactive execution");
   }
@@ -487,7 +502,7 @@ async function captureSettledRunIdentity(
     .from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId)));
   if (!run || run.status !== "running" || !run.activeIdentityContextId) return null;
-  boundTaskId(run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId ?? run.nativeIssueId);
+  boundTaskId(run);
   const [pending] = await db
     .select({ id: runIdentityContexts.id })
     .from(runIdentityContexts)

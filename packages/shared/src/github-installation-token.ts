@@ -70,6 +70,15 @@ export interface GitHubInstallationTokenCall {
 }
 
 /**
+ * Whether `path` is the REST path of an installation token request
+ * ({@link GitHubInstallationTokenCall.path}). HTTP clients use it to recognise
+ * that POST (for example, to retry it); only this module names the endpoint.
+ */
+export function isGitHubInstallationTokenPath(path: string): boolean {
+  return /^\/app\/installations\/[1-9][0-9]*\/access_tokens$/.test(path);
+}
+
+/**
  * Mints one installation token through `send`, the caller's GitHub client,
  * which returns the token GitHub issued. `fence` is null when no company
  * writes as this App's user; otherwise the request is checked against I-RO

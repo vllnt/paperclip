@@ -5,6 +5,7 @@ import type { IssueWorkProduct } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import { linkedWorkProductCondition } from "./work-product-visibility.js";
+import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
 import {
   createPullRequestMergeDetailsResolver,
   extractGitHubPullRequestReferences,
@@ -93,10 +94,12 @@ export async function refreshPullRequestWorkProductMetadata(
   return await Promise.all(products.map(async (product) => {
     if (product.type !== "pull_request") return product;
     const metadata = product.metadata ?? {};
-    const repo = typeof metadata.repo === "string" ? metadata.repo : null;
+    const repo = typeof metadata.repo === "string" ? metadata.repo
+      : typeof metadata.repository === "string" ? metadata.repository : null;
     const number = nonNegativeInteger(metadata.number);
     const references = extractGitHubPullRequestReferences([
       product.url,
+      typeof metadata.url === "string" ? metadata.url : null,
       repo && number ? `${repo}#${number}` : null,
     ]);
     const reference = references[0];
@@ -271,6 +274,7 @@ export function workProductService(
 
     createForIssue: async (issueId: string, companyId: string, data: Omit<typeof issueWorkProducts.$inferInsert, "issueId" | "companyId">) => {
       const row = await db.transaction(async (tx) => {
+        if (data.type === "pull_request") await notifyTerminalWorkspaceWork(tx, `issue:${issueId}`);
         await validateExecutionWorkspace(tx, companyId, data.executionWorkspaceId);
         if (data.isPrimary) {
           await tx
@@ -305,6 +309,8 @@ export function workProductService(
           .where(eq(issueWorkProducts.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
+
+        if (existing.type === "pull_request" || patch.type === "pull_request") await notifyTerminalWorkspaceWork(tx, `issue:${existing.issueId}`);
 
         await validateExecutionWorkspace(tx, existing.companyId, patch.executionWorkspaceId);
 
@@ -373,16 +379,21 @@ export function workProductService(
       // prefix behind (which a retry would then duplicate). Mirrors the
       // per-writer transaction the batched issue/document writers use.
       await db.transaction(async (tx) => {
+        for (const value of values) {
+          if (value.type === "pull_request") await notifyTerminalWorkspaceWork(tx, `issue:${value.issueId}`);
+        }
         await insertRowsInChunks(tx, issueWorkProducts, values);
       });
     },
 
     remove: async (id: string) => {
-      const row = await db
-        .delete(issueWorkProducts)
-        .where(eq(issueWorkProducts.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const row = await db.transaction(async tx => {
+        const [existing] = await tx.select({ type: issueWorkProducts.type, issueId: issueWorkProducts.issueId })
+          .from(issueWorkProducts).where(eq(issueWorkProducts.id, id));
+        if (existing?.type === "pull_request") await notifyTerminalWorkspaceWork(tx, `issue:${existing.issueId}`);
+        return tx.delete(issueWorkProducts).where(eq(issueWorkProducts.id, id))
+          .returning().then(rows => rows[0] ?? null);
+      });
       return row ? toIssueWorkProduct(row) : null;
     },
   };

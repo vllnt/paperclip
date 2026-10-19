@@ -24,6 +24,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { isForeignKeyViolation } from "../db-errors.ts";
 import { HttpError } from "../errors.ts";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.ts";
 import { companyService } from "../services/companies.ts";
 import {
   COMPANY_DELETE_CROSS_COMPANY_REFERENCES,
@@ -59,6 +60,8 @@ describeEmbeddedPostgres("deleting a company that other companies' rows depend o
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-company-removal-cross-company-");
     db = createDb(tempDb.connectionString);
+    // A company delete terminates its agents through the lifecycle worker first.
+    configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
     const rows = await db.execute(sql`
       SELECT table_name FROM information_schema.columns
       WHERE table_schema = 'public' AND column_name = 'company_id'

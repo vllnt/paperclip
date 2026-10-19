@@ -108,6 +108,7 @@ export type ScheduledRetryFacts = {
 };
 
 export type QueuedRunStalenessErrorCode =
+  | "issue_waiting_for_response"
   | "execution_reconciliation_required"
   | "issue_dependencies_blocked"
   | "issue_not_found"
@@ -130,6 +131,7 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  pendingResponse?: "interaction" | "approval" | null;
   /**
    * Another open copy of the same routine execution (same origin and dispatch
    * fingerprint) that already holds the execution slot. The index
@@ -554,6 +556,12 @@ export function decideQueuedRunStaleness(
         },
       };
     }
+  }
+
+  if (facts.pendingResponse) {
+    return { stale: true, errorCode: "issue_waiting_for_response",
+      reason: "Cancelled because the continuation is still waiting for an authorized response",
+      details: { issueId: facts.issueId, pendingResponse: facts.pendingResponse } };
   }
 
   if (facts.continuationParkApplies && facts.continuationParksExecutor) {

@@ -146,13 +146,13 @@ test("agent provider selection changes models, saves, and fails closed", async (
     runtimeConfig: { heartbeat: { enabled: false }, aiConnection: { provider: "openai", method: "api_key", mode: "shared", ...first } },
   } }));
   await page.goto(`/${org.issuePrefix}/agents/${agent.id}/runtime`);
-  const provider = page.getByRole("combobox", { name: "Provider", exact: true });
+  const provider = page.getByRole("combobox", { name: "Connection", exact: true });
   await provider.click();
-  await page.getByRole("option", { name: "Second proxy · API key", exact: true }).click();
+  await page.getByRole("option", { name: "Second proxy", exact: true }).click();
   await page.getByRole("button", { name: "Model", exact: true }).click();
-  await expect(page.getByRole("button", { name: "other-model", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "fixture-claude", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "other-model", exact: true }).click();
+  await expect(page.getByRole("option", { name: "other-model", exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "fixture-claude", exact: true })).toHaveCount(0);
+  await page.getByRole("option", { name: "other-model", exact: true }).click();
   const [savedResponse] = await Promise.all([
     page.waitForResponse(response => response.request().method() === "PATCH" && /\/api\/agents\/[^/]+$/.test(response.url())),
     page.getByRole("button", { name: "Save changes", exact: true }).click(),
@@ -169,11 +169,11 @@ test("agent provider selection changes models, saves, and fails closed", async (
     await page.getByRole("button", { name: "Model", exact: true }).click();
     await page.getByRole("button", { name: "Refresh models", exact: true }).click();
     await expect(page.getByRole("alert").filter({ hasText: "gateway" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "fixture-codex", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("option", { name: "fixture-codex", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Detect model", exact: true })).toHaveCount(0);
   } finally { unavailable = false; }
   await page.getByRole("button", { name: "Refresh models", exact: true }).click();
-  await expect(page.getByRole("button", { name: "other-model", exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "other-model", exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
   // Subscription rendering uses a browser fixture; no OAuth token or host account is read.
@@ -192,8 +192,8 @@ test("agent provider selection changes models, saves, and fails closed", async (
   await provider.click();
   await page.getByRole("option", { name: /Fixture ChatGPT/ }).click();
   await page.getByRole("button", { name: "Model", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Subscription model", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "fixture-codex", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("option", { name: "Subscription model", exact: true })).toBeVisible();
+  await expect(page.getByRole("option", { name: "fixture-codex", exact: true })).toHaveCount(0);
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Discard", exact: true }).click();
   await page.goto(`/${org.issuePrefix}/providers`);

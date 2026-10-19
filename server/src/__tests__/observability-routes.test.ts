@@ -29,7 +29,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 
 type Actor = Express.Request["actor"];
 
-describeEmbeddedPostgres.sequential("observability routes", () => {
+describeEmbeddedPostgres("observability routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 

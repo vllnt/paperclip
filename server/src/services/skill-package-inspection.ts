@@ -9,8 +9,9 @@ function referencesIn(markdown: string) {
   // lines becomes quadratic, which blocks the server on a hostile package.
   const text = markdown.replace(/^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\1[ \t]*$/gm, '');
   const references: { target: string; rootRelative: boolean }[] = [];
+  const prose = text.replace(/(`+)[\s\S]*?\1/g, '');
   // Link/image destinations and reference definitions; optional titles are not part of the path.
-  for (const match of text.matchAll(/(?:!?\[[^\]\n]*\]\(|^[ \t]*\[[^\]\n]+\]:\s*)(?:<([^>\n]+)>|([^\s)]+))/gm)) {
+  for (const match of prose.matchAll(/(?:!?\[[^\]\n]*\]\(|^[ \t]*\[[^\]\n]+\]:\s*)(?:<([^>\n]+)>|([^\s)]+))/gm)) {
     references.push({ target: match[1] ?? match[2]!, rootRelative: false });
   }
   for (const match of text.matchAll(/(?<!`)`([^`\n]+)`(?!`)/g)) {
@@ -48,19 +49,21 @@ export function inspectSkillPackage(
   repositoryPaths: ReadonlySet<string>,
   frontmatter: Record<string, unknown>,
   findings: CompanySkillAuditFinding[],
+  includedPaths?: ReadonlySet<string>,
 ): SkillPackageInspection {
   const root = path.posix.dirname(skillPath);
-  const inPackage = indexSkillPackagePaths(files.map(file => file.path === 'SKILL.md' ? skillPath : path.posix.join(root, file.path)));
+  const inPackage = includedPaths ?? indexSkillPackagePaths(files.map(file => file.path === 'SKILL.md' ? skillPath : path.posix.join(root, file.path)));
   const references = new Map<string, SkillPackageReference>();
   const contains = (paths: ReadonlySet<string>, target: string) => paths.has(target);
   for (const file of files) {
     if (file.encoding === 'base64' || !/\.md$/i.test(file.path)) continue;
     for (const { target, rootRelative } of referencesIn(file.content)) {
-      if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(target)) continue;
+      if (/^(?:[a-z][a-z0-9+.-]*:|\/|#)/i.test(target)) continue;
       let decoded: string;
       try { decoded = decodeURIComponent(target.split(/[?#]/)[0]!); } catch { continue; }
       if (!decoded) continue;
-      const resolvedPath = path.posix.normalize(path.posix.join(root, rootRelative ? '' : path.posix.dirname(file.path), decoded)).replace(/\/+$/, '');
+      let resolvedPath = path.posix.normalize(path.posix.join(root, rootRelative ? '' : path.posix.dirname(file.path), decoded)).replace(/\/+$/, '');
+      if (!decoded.startsWith('.') && !repositoryPaths.has(resolvedPath) && repositoryPaths.has(decoded)) resolvedPath = decoded;
       if (!decoded.startsWith('/') && contains(inPackage, resolvedPath)) continue;
       const outsideRoot = decoded.startsWith('/') || resolvedPath === '..' || resolvedPath.startsWith('../')
         || (root !== '.' && !resolvedPath.startsWith(`${root}/`) && resolvedPath !== root);

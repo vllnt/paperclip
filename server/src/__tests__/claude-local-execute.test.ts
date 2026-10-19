@@ -25,7 +25,7 @@ async function writeFailingClaudeCommand(
   const payload = JSON.stringify(options.resultEvent);
   const exit = options.exitCode ?? 1;
   const script = `#!/usr/bin/env node
-if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 console.log(${JSON.stringify(payload)});
 process.exit(${exit});
 `;
@@ -39,7 +39,7 @@ async function writeTextFailingClaudeCommand(
 ): Promise<void> {
   const exit = options.exitCode ?? 1;
   const script = `#!/usr/bin/env node
-if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 if (${JSON.stringify(options.stdout ?? "")}) {
   process.stdout.write(${JSON.stringify(options.stdout ?? "")});
 }
@@ -74,12 +74,12 @@ function readPrompt() {
 
 async function writeFakeClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
 ${READ_FAKE_CLAUDE_PROMPT}
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
-if (argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 const addDirIndex = argv.indexOf("--add-dir");
 const addDir = addDirIndex >= 0 ? argv[addDirIndex + 1] : null;
 const instructionsIndex = argv.indexOf("--append-system-prompt-file");
@@ -121,12 +121,12 @@ console.log(JSON.stringify({ type: "result", session_id: "11111111-1111-4111-811
 
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
 ${READ_FAKE_CLAUDE_PROMPT}
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
-if (argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 if (argv.includes("--help")) {
   process.stdout.write("Usage: claude [options]\\n  --print\\n  --model <id>\\n");
   process.exit(0);
@@ -161,12 +161,12 @@ console.log(JSON.stringify({ type: "result", session_id: "33333333-3333-4333-833
 
 async function writeHelpWithEffortClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
 ${READ_FAKE_CLAUDE_PROMPT}
 const path = require("node:path");
 
 const argv = process.argv.slice(2);
-if (argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 if (argv.includes("--help")) {
   const helpCountPath = process.env.PAPERCLIP_TEST_HELP_COUNT_PATH;
   if (helpCountPath) {
@@ -222,9 +222,9 @@ afterEach(() => {
 
 async function writePoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
 ${READ_FAKE_CLAUDE_PROMPT}
-if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;
@@ -260,9 +260,9 @@ console.log(JSON.stringify({ type: "result", session_id: "bbbbbbbb-bbbb-4bbb-8bb
 
 async function writeAlwaysPoisonedMessageIdClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
 ${READ_FAKE_CLAUDE_PROMPT}
-if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
@@ -292,9 +292,9 @@ process.exit(1);
 
 async function writeRetryThenSucceedClaudeCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("2.1.286 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
 ${READ_FAKE_CLAUDE_PROMPT}
-if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const statePath = process.env.PAPERCLIP_TEST_STATE_PATH;
@@ -787,8 +787,9 @@ describe("claude execute", () => {
       expect(captured[1]?.appendedSystemPromptFilePath).toContain("agent-instructions.md");
       expect(captured[1]?.appendedSystemPromptFilePath).not.toBe(instructionsFile);
       expect(captured[1]?.appendedSystemPromptFileContents).toContain("# Agent instructions");
-      expect(captured[1]?.appendedSystemPromptFileContents).toContain(
-        `The above agent instructions were loaded from ${instructionsFile}. ` +
+      expect(captured[1]?.appendedSystemPromptFileContents).not.toContain(instructionsFile);
+      for (const prompt of prompts) expect(prompt).toContain(
+        `Agent instructions for this run were loaded from ${instructionsFile}. ` +
         `Resolve any relative file references from ${path.dirname(instructionsFile)}/. ` +
         `This base directory is authoritative for sibling instruction files such as ` +
         `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`,
@@ -1443,7 +1444,9 @@ describe("claude execute", () => {
       expect(capture1.addDir?.startsWith(expectedRoot)).toBe(true);
       expect(capture1.instructionsFilePath?.startsWith(expectedRoot)).toBe(true);
       expect(capture1.instructionsContents).toContain("You are managed instructions.");
-      expect(capture1.instructionsContents).toContain(`The above agent instructions were loaded from ${instructionsPath}.`);
+      expect(capture1.instructionsContents).not.toContain(instructionsPath);
+      expect(capture1.prompt).toContain(`Agent instructions for this run were loaded from ${instructionsPath}.`);
+      expect(capture2.prompt).toContain(`Agent instructions for this run were loaded from ${instructionsPath}.`);
       expect(capture1.skillEntries).toContain("paperclip");
       expect(capture2.argv).toContain("--resume");
       expect(capture2.argv).toContain("11111111-1111-4111-8111-111111111111");
@@ -1456,6 +1459,81 @@ describe("claude execute", () => {
       else process.env.PAPERCLIP_HOME = previousPaperclipHome;
       if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
       else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes across per-run instruction copies and refreshes their location", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-working-copy-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    const capturePath = path.join(root, "capture.json");
+    const skillDir = path.join(root, "skill");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(skillDir);
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "First skill version.\n");
+    await writeFakeClaudeCommand(commandPath);
+    vi.stubEnv("PAPERCLIP_HOME", path.join(root, "paperclip-home"));
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "default");
+
+    try {
+      let sessionParams: Record<string, unknown> | null = null;
+      let previousBundleKey: unknown;
+      let previousInstructionsPath = "";
+      for (const [index, change] of ["initial", "location", "instructions", "skill"].entries()) {
+        const runId = `run-${index}`;
+        const instructionsPath = path.join(root, "companies", "company-1", "agents", "agent-1",
+          "file-sync", "runs", runId, "live", "AGENTS.md");
+        await fs.mkdir(path.dirname(instructionsPath), { recursive: true });
+        await fs.writeFile(instructionsPath, index < 2 ? "First instructions.\n" : "Changed instructions.\n");
+        if (change === "skill") {
+          await fs.writeFile(path.join(skillDir, "SKILL.md"), "Changed skill version.\n");
+        }
+        const logs: string[] = [];
+        const result = await execute({
+          runId,
+          agent: { id: "agent-1", companyId: "company-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+          runtime: { sessionId: null, sessionParams, sessionDisplayId: null, taskKey: "issue-1" },
+          config: {
+            engine: "cli",
+            command: commandPath,
+            cwd: workspace,
+            instructionsFilePath: instructionsPath,
+            paperclipRuntimeSkills: [{ key: "test-skill", runtimeName: "test-skill", source: skillDir }],
+            paperclipSkillSync: { desiredSkills: ["test-skill"] },
+            env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath, CLAUDE_CONFIG_DIR: path.join(root, "claude-config") },
+          },
+          context: { issueId: "issue-1" },
+          onLog: async (_stream, chunk) => { logs.push(chunk); },
+        });
+        expect(result.exitCode).toBe(0);
+        const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+        if (change === "location") {
+          expect(capture.argv).toContain("--resume");
+          expect(capture.argv).toContain("11111111-1111-4111-8111-111111111111");
+          expect(capture.instructionsFilePath).toBeNull();
+          expect(result.sessionParams?.promptBundleKey).toBe(previousBundleKey);
+        } else {
+          expect(capture.argv).not.toContain("--resume");
+          expect(capture.instructionsContents).toContain(index < 2 ? "First instructions." : "Changed instructions.");
+          expect(result.sessionParams?.promptBundleKey).not.toBe(previousBundleKey);
+          if (index > 0) {
+            expect(capture.instructionsContents).not.toContain(instructionsPath);
+            expect(logs.join("")).toContain("was saved for prompt bundle");
+            expect(logs.join("")).not.toContain("was saved for cwd");
+          }
+        }
+        if (index > 0) {
+          expect(capture.prompt).toContain(instructionsPath);
+          expect(capture.prompt).toContain(`Resolve any relative file references from ${path.dirname(instructionsPath)}/.`);
+        }
+        if (previousInstructionsPath) expect(capture.prompt).not.toContain(previousInstructionsPath);
+        sessionParams = sessionCodec.deserialize(sessionCodec.serialize(result.sessionParams ?? null));
+        previousBundleKey = result.sessionParams?.promptBundleKey;
+        previousInstructionsPath = instructionsPath;
+      }
+    } finally {
+      vi.unstubAllEnvs();
       await fs.rm(root, { recursive: true, force: true });
     }
   });

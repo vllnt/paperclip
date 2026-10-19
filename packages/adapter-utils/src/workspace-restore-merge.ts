@@ -7,7 +7,8 @@ import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, ty
 import { shouldExcludePath } from "./exclude-patterns.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
 import { removePaperclipTempDir } from "./paperclip-temp.js";
-import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
+import { runSnapshotThread } from "./workspace-snapshot-thread.js";
+import type { WorkspaceRestoreDiagnostic } from "./workspace-restore-diagnostics.js";
 
 export type SnapshotEntry =
   | { kind: "dir" }
@@ -168,26 +169,47 @@ function absentIfVanished(error: unknown): null {
 async function* walkDirectory(
   root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, relative = "",
 ): AsyncGenerator<[string, SnapshotEntry]> {
+  // An entry that vanished after the listing reads as null (absent).
+  const readEntry = async (nextRelative: string): Promise<[string, SnapshotEntry | null]> => {
+    const fullPath = path.join(root, nextRelative);
+    const stats = await fs.lstat(fullPath).catch(absentIfVanished);
+    if (stats?.isDirectory()) return [nextRelative, { kind: "dir" }];
+    if (stats?.isSymbolicLink()) {
+      const target = await fs.readlink(fullPath).catch(absentIfVanished);
+      return [nextRelative, target === null ? null : { kind: "symlink", target }];
+    }
+    if (stats?.isFile()) {
+      const hash = await hashFile(fullPath).catch(absentIfVanished);
+      return [nextRelative, hash === null ? null : { kind: "file", mode: stats.mode, hash }];
+    }
+    return [nextRelative, null];
+  };
+  const visitBatch = async function* (paths: string[]): AsyncGenerator<[string, SnapshotEntry]> {
+    const results = await Promise.allSettled(paths.map(readEntry));
+    for (const result of results) if (result.status === "rejected") throw result.reason;
+    for (const result of results) {
+      if (result.status !== "fulfilled") continue;
+      const [nextRelative, entry] = result.value;
+      if (!entry) continue;
+      yield [nextRelative, entry];
+      if (entry.kind === "dir") yield* walkDirectory(root, exclude, ignored, nextRelative);
+    }
+  };
   // The root must exist. Only a directory below it may vanish mid-walk.
   const directory = relative ? await fs.opendir(path.join(root, relative)).catch(absentIfVanished) : await fs.opendir(root);
   if (!directory) return;
+  let batch: string[] = [];
   for await (const entry of directory) {
     if (MERGE_STAGING_NAME.test(entry.name)) continue;
     const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
     if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
-    const fullPath = path.join(root, nextRelative);
-    const stats = await fs.lstat(fullPath).catch(absentIfVanished);
-    if (stats?.isDirectory()) {
-      yield [nextRelative, { kind: "dir" }];
-      yield* walkDirectory(root, exclude, ignored, nextRelative);
-    } else if (stats?.isSymbolicLink()) {
-      const target = await fs.readlink(fullPath).catch(absentIfVanished);
-      if (target !== null) yield [nextRelative, { kind: "symlink", target }];
-    } else if (stats?.isFile()) {
-      const hash = await hashFile(fullPath).catch(absentIfVanished);
-      if (hash !== null) yield [nextRelative, { kind: "file", mode: stats.mode, hash }];
+    batch.push(nextRelative);
+    if (batch.length === 16) {
+      yield* visitBatch(batch);
+      batch = [];
     }
   }
+  if (batch.length) yield* visitBatch(batch);
 }
 
 async function readSnapshotEntry(root: string, relative: string): Promise<SnapshotEntry | null> {
@@ -226,6 +248,14 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
     return left.mode === right.mode && left.hash === right.hash;
   }
   return false;
+}
+
+function directorySnapshotsMatch(left: DirectorySnapshot, right: DirectorySnapshot): boolean {
+  if (left.entries.size !== right.entries.size) return false;
+  for (const [relative, entry] of right.entries) {
+    if (!entriesMatch(left.entries.get(relative), entry)) return false;
+  }
+  return true;
 }
 
 const LOCK_WAIT_MS = 30_000;
@@ -325,7 +355,7 @@ export type WorkspaceRestoreFailureCode =
  */
 export type WorkspaceRestoreOutcome =
   | { readonly ok: true }
-  | { readonly ok: false; readonly code: WorkspaceRestoreFailureCode };
+  | { readonly ok: false; readonly code: WorkspaceRestoreFailureCode; readonly diagnostic?: WorkspaceRestoreDiagnostic };
 
 /**
  * Classifies a caught workspace-restore error into one allowlisted code. Maps
@@ -676,6 +706,7 @@ function nonEmpty(value: string | undefined): string | null {
  * would follow the symlink) before any caller treats it as the lock root.
  */
 async function resolveDirectoryMergeLockRoot(env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const { resolvePaperclipInstanceRootForAdapter } = await import("./server-utils.js");
   const instanceRoot = resolvePaperclipInstanceRootForAdapter({
     homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
     instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
@@ -714,6 +745,50 @@ export async function withDirectoryMergeLock<T>(
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
   // lock protect one directory while the caller mutates another.
   const canonicalTargetDir = await fs.realpath(targetDir);
+  return withCanonicalDirectoryMergeLock(canonicalTargetDir, fn, env, diagnosticOperation, waitMs);
+}
+
+export async function withDirectoryPublicationLock<T>(
+  targetDir: string,
+  fn: (canonicalTargetDir: string) => Promise<T>,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<T> {
+  const absoluteTarget = path.resolve(targetDir);
+  const parent = await fs.realpath(path.dirname(absoluteTarget));
+  const canonicalTargetDir = path.join(parent, path.basename(absoluteTarget));
+  const assertSafeLeaf = async () => {
+    const leaf = await fs.lstat(canonicalTargetDir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (leaf && (!leaf.isDirectory() || leaf.isSymbolicLink())) {
+      throw new Error(`Directory publication target at ${canonicalTargetDir} is not a plain directory.`);
+    }
+  };
+  await assertSafeLeaf();
+  return withCanonicalDirectoryMergeLock(canonicalTargetDir, async () => {
+    await assertSafeLeaf();
+    return fn(canonicalTargetDir);
+  }, env);
+}
+
+export async function tryWithDirectoryMergeLock<T>(targetDir: string, fn: () => Promise<T>): Promise<T | undefined> {
+  const canonicalTargetDir = await fs.realpath(targetDir);
+  try {
+    return await withCanonicalDirectoryMergeLock(canonicalTargetDir, fn, process.env, undefined, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE) return undefined;
+    throw error;
+  }
+}
+
+async function withCanonicalDirectoryMergeLock<T>(
+  canonicalTargetDir: string,
+  fn: (canonicalTargetDir: string) => Promise<T>,
+  env: NodeJS.ProcessEnv,
+  diagnosticOperation?: DirectoryMergeLockOperation,
+  waitMs: number = LOCK_WAIT_MS,
+): Promise<T> {
   const lockRoot = await resolveDirectoryMergeLockRoot(env);
   const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
   const releaseLock = await acquireDirectoryMergeLock(path.join(lockRoot, `${lockKey}.lock`), diagnosticOperation, waitMs, onWait);
@@ -1097,6 +1172,22 @@ export async function captureDirectorySnapshot(
   } finally { ignored.close(); }
 }
 
+export async function captureDirectorySnapshotOffThread(
+  rootDir: string,
+  options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean } = {},
+): Promise<DirectorySnapshot> {
+  if (!options.diskBacked) return captureDirectorySnapshot(rootDir, options);
+  const result = await runSnapshotThread({ rootDir, exclude: options.exclude, ignoredPaths: options.ignoredPaths });
+  try {
+    const snapshot = openDirectorySnapshot(result.snapshot);
+    ownedDirectorySnapshots.set(snapshot, result.directory);
+    return snapshot;
+  } catch (error) {
+    await removePaperclipTempDir(result.directory);
+    throw error;
+  }
+}
+
 /** A disk-backed subset for independent nested-repository merges. */
 export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, options: {
   prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
@@ -1175,45 +1266,43 @@ export function workspaceRestoreLockWaitMs(): number {
   return Number.isFinite(configured) && configured >= 1000 ? Math.min(configured, 60 * 60_000) : WORKSPACE_RESTORE_LOCK_WAIT_MS;
 }
 
-function snapshotsMatch(left: DirectorySnapshot, right: DirectorySnapshot): boolean {
-  if (left.entries.size !== right.entries.size) return false;
-  for (const [relative, entry] of left.entries) {
-    if (!entriesMatch(entry, right.entries.get(relative))) return false;
-  }
-  return true;
-}
-
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
   targetDir: string;
   conflictPolicy?: "reject";
+  workspaceSnapshotIsolation?: "worker";
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
   /** Test seam only: runs after every preflight check and before the first write. */
   afterPreflight?: () => Promise<void>;
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
-  snapshots?: { source: DirectorySnapshot; current: DirectorySnapshot };
+  snapshots?: { source: DirectorySnapshot; current?: DirectorySnapshot };
   /** Run log of a workspace copy-back: gets a line about every 30 s while the
    * merge waits for the target's lock, so a long teardown says why it waits. */
   onLockWaitProgress?: RuntimeProgressSink;
 }): Promise<void> {
+  const capture = input.workspaceSnapshotIsolation === "worker" ? captureDirectorySnapshotOffThread : captureDirectorySnapshot;
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
-  const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
+  const source = input.snapshots?.source ?? await capture(input.sourceDir, options);
   try {
     // A source equal to its baseline deletes and copies nothing and cannot
     // conflict. With no hooks to run, it skips the lock, so read-only runs do
     // not queue behind other restores into the same workspace.
-    if (!input.beforeApply && !input.afterApply && snapshotsMatch(input.baseline, source)) {
+    if (!input.beforeApply && !input.afterApply && directorySnapshotsMatch(input.baseline, source)) {
       await disposeDirectorySnapshot(input.snapshots?.current ?? null);
       return;
     }
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
       await input.beforeApply?.();
+      if (!input.snapshots?.current && directorySnapshotsMatch(input.baseline, source)) {
+        await input.afterApply?.();
+        return;
+      }
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
-      const current = input.snapshots?.current ?? await captureDirectorySnapshot(canonicalTargetDir,
+      const current = input.snapshots?.current ?? await capture(canonicalTargetDir,
         input.conflictPolicy === "reject" ? { exclude: [], diskBacked: true } : options);
       try {
         if (input.conflictPolicy === "reject") {

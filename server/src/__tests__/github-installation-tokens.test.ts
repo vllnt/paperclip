@@ -24,7 +24,8 @@ describe("GitHub App installation tokens (security review round 3, I-RO)", () =>
       }
     };
     for (const directory of ["server/src", "packages/shared/src", "packages/adapter-utils/src", "packages/plugins"]) walk(path.join(root, directory));
-    const minting = sources.filter(file => /access_tokens/.test(readFileSync(file, "utf8"))).map(file => path.relative(root, file));
+    // The GitHub endpoint segment, not a longer identifier such as Slack's `api_access_tokens` field.
+    const minting = sources.filter(file => /(?<!\w)access_tokens/.test(readFileSync(file, "utf8"))).map(file => path.relative(root, file));
     expect(minting).toEqual(["packages/shared/src/github-installation-token.ts"]);
   });
 });

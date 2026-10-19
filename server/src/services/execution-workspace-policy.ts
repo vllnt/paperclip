@@ -4,8 +4,10 @@ import type {
   IssueExecutionWorkspaceSettings,
   ProjectExecutionWorkspaceDefaultMode,
   ProjectExecutionWorkspacePolicy,
+  RunProfile,
   SharedWorkspaceConcurrency,
 } from "@paperclipai/shared";
+import { runProfileSchema } from "@paperclipai/shared";
 import { asString, parseObject } from "../adapters/utils.js";
 
 export type ParsedExecutionWorkspaceMode = Exclude<ExecutionWorkspaceMode, "inherit" | "reuse_existing">;
@@ -272,6 +274,7 @@ export function selectEnvironmentExecutionWorkspaceSettings(
 }
 
 export type ExecutionWorkspaceEnvironmentSource =
+  | "issue"
   | "agent"
   | "instance"
   | "default"
@@ -294,6 +297,8 @@ export class ManagedSandboxUnavailableError extends Error {
 }
 
 export function resolveExecutionWorkspaceEnvironmentId(input: {
+  /** Explicit operator-selected sandbox for a task with a low-trust boundary. */
+  lowTrustIssueEnvironmentId?: string | null;
   agentDefaultEnvironmentId: string | null;
   instanceDefaultEnvironmentId: string | null;
   localDefaultEnvironmentId: string;
@@ -309,6 +314,9 @@ export function resolveExecutionWorkspaceEnvironmentId(input: {
   managedSandboxEnvironmentId?: string | null;
 }): ExecutionWorkspaceEnvironmentResolution {
   const resolved = ((): ExecutionWorkspaceEnvironmentResolution => {
+    if (input.lowTrustIssueEnvironmentId) {
+      return {environmentId: input.lowTrustIssueEnvironmentId, source: "issue"};
+    }
     if (input.agentDefaultEnvironmentId) {
       return {
         environmentId: input.agentDefaultEnvironmentId,
@@ -387,6 +395,35 @@ export function resolveExecutionWorkspaceMode(input: {
   return "shared_workspace";
 }
 
+interface ParsedIssueAssigneeAdapterOverrides {
+  adapterConfig: Record<string, unknown> | null;
+  useProjectWorkspace: boolean | null;
+  runProfile: RunProfile | null;
+}
+
+export function parseIssueAssigneeAdapterOverrides(
+  raw: unknown,
+): ParsedIssueAssigneeAdapterOverrides | null {
+  const parsed = parseObject(raw);
+  const parsedAdapterConfig = Object.fromEntries(
+    Object.entries(parseObject(parsed.adapterConfig)).filter(([key]) => key !== "homeMode"),
+  );
+  const adapterConfig =
+    Object.keys(parsedAdapterConfig).length > 0 ? parsedAdapterConfig : null;
+  const useProjectWorkspace =
+    typeof parsed.useProjectWorkspace === "boolean"
+      ? parsed.useProjectWorkspace
+      : null;
+  const parsedProfile = runProfileSchema.safeParse(parsed.runProfile);
+  const runProfile = parsedProfile.success ? parsedProfile.data : null;
+  if (!adapterConfig && useProjectWorkspace === null && !runProfile) return null;
+  return {
+    adapterConfig,
+    useProjectWorkspace,
+    runProfile,
+  };
+}
+
 function parseSharedWorkspaceConcurrency(raw: unknown): SharedWorkspaceConcurrency | undefined {
   return raw === "auto" || raw === "serialize" || raw === "allow" ? raw : undefined;
 }
@@ -402,6 +439,7 @@ export function resolveSharedWorkspaceConcurrency(input: {
 
 export function buildExecutionWorkspaceAdapterConfig(input: {
   agentConfig: Record<string, unknown>;
+  adapterConfigOverrides?: Record<string, unknown> | null;
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   mode: ParsedExecutionWorkspaceMode;
@@ -444,5 +482,21 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
     }
   }
 
-  return nextConfig;
+  return { ...nextConfig, ...input.adapterConfigOverrides };
+}
+
+export function taskWorkspaceRuntimeSelectionEnabled(input: {
+  legacyUiEnabled: boolean;
+  hasTypedSelection: boolean;
+  hasBinding: boolean;
+}): boolean {
+  return input.legacyUiEnabled || input.hasTypedSelection || input.hasBinding;
+}
+
+export function canApplyTaskWorkspaceSelectionAtAdmission(input: {
+  admittedInput: unknown;
+  restarting: boolean;
+  hasLeaseOwner: boolean;
+}): boolean {
+  return input.admittedInput == null && !input.restarting && !input.hasLeaseOwner;
 }
