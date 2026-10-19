@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +9,7 @@ import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import { githubBrokerEnvironment } from "./github-launcher.js";
 import {
   ensureAdapterExecutionTargetCommandResolvable,
+  GitHubLauncherStagingError,
   prepareGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
   runAdapterExecutionTargetProcess,
@@ -305,5 +306,122 @@ describe("managed GitHub launcher environment", () => {
       runId: "run-failure", target: fixture.target, cwd: fixture.root, env: {},
     })).rejects.toThrow("Could not resolve remote PATH for managed GitHub launchers");
     expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+// A slow or dropped exec on a loaded worker used to end the run with one fixed
+// string. Staging now repeats a failed pass and, when it still fails, says
+// which step failed and how.
+describe("managed GitHub launcher staging failures", () => {
+  const chmodCall = (input: { args?: string[] }) => (input.args ?? []).join(" ").includes("chmod 700");
+  const failed = (overrides: { exitCode: number | null; timedOut: boolean; stderr?: string }) => ({
+    signal: null, stdout: "", stderr: "", pid: null, startedAt: new Date().toISOString(), ...overrides,
+  });
+
+  /** Replaces the fixture runner so `fail` decides, per call, whether to fake a failed result. */
+  function failing(
+    fixture: Awaited<ReturnType<typeof sandbox>>,
+    fail: (input: { args?: string[] }, call: number) => ReturnType<typeof failed> | null,
+  ) {
+    const real = fixture.runner.execute.getMockImplementation()!;
+    let call = 0;
+    fixture.runner.execute.mockImplementation(async (input) => fail(input, ++call) ?? real(input));
+  }
+
+  const stage = (fixture: Awaited<ReturnType<typeof sandbox>>, retryDelaysMs: readonly number[] = [0, 0]) =>
+    prepareGitHubOperationLaunchers({
+      runId: "run-staging", target: fixture.target, cwd: fixture.root,
+      env: { PATH: fixture.remotePath }, retryDelaysMs,
+    });
+
+  it("stages a healthy target in one pass of eleven execs", async () => {
+    const fixture = await sandbox("usr/bin");
+    await stage(fixture);
+    expect(fixture.runner.execute).toHaveBeenCalledTimes(11);
+  });
+
+  it("repeats the staging when the permissions step times out once", async () => {
+    const fixture = await sandbox("usr/bin");
+    let chmods = 0;
+    failing(fixture, (input) => chmodCall(input) && ++chmods === 1 ? failed({ exitCode: null, timedOut: true }) : null);
+
+    const env = await stage(fixture);
+
+    expect(chmods).toBe(2);
+    expect((await stat(path.join(env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "git"))).mode & 0o777).toBe(0o700);
+    expect((await stat(env.GH_CONFIG_DIR)).isDirectory()).toBe(true);
+  });
+
+  it("repeats the staging when a launcher upload fails once", async () => {
+    const fixture = await sandbox("usr/bin");
+    failing(fixture, (_input, call) => call === 3 ? failed({ exitCode: 255, timedOut: false, stderr: "ssh: connect timed out" }) : null);
+
+    const env = await stage(fixture);
+
+    expect(await readFile(path.join(env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "package.json"), "utf8")).toContain("commonjs");
+    expect(fixture.runner.execute.mock.calls.length).toBeGreaterThan(11);
+  });
+
+  it("names the step, exit code and stderr when every attempt fails", async () => {
+    const fixture = await sandbox("usr/bin");
+    let chmods = 0;
+    failing(fixture, (input) => chmodCall(input) && ++chmods > 0
+      ? failed({ exitCode: 1, timedOut: false, stderr: "chmod: cannot access: Input/output error\n" })
+      : null);
+
+    const error = await stage(fixture).then(() => null, (cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(GitHubLauncherStagingError);
+    expect(error).toMatchObject({
+      step: "setting launcher permissions", exitCode: 1, timedOut: false, attempts: 3,
+      detail: "chmod: cannot access: Input/output error",
+    });
+    expect((error as Error).message).toBe(
+      "Could not prepare managed GitHub launchers: setting launcher permissions failed with exit code 1 (3 attempts): chmod: cannot access: Input/output error",
+    );
+    expect(chmods).toBe(3);
+  });
+
+  it("says so when the last attempt timed out", async () => {
+    const fixture = await sandbox("usr/bin");
+    failing(fixture, (input) => chmodCall(input) ? failed({ exitCode: null, timedOut: true }) : null);
+
+    const error = await stage(fixture).then(() => null, (cause: unknown) => cause);
+
+    expect(error).toMatchObject({ exitCode: null, timedOut: true, attempts: 3 });
+    expect((error as Error).message).toBe(
+      "Could not prepare managed GitHub launchers: setting launcher permissions timed out after 15 s (3 attempts)",
+    );
+  });
+
+  it("reports the launcher file that failed to upload", async () => {
+    const fixture = await sandbox("usr/bin");
+    failing(fixture, (input) => chmodCall(input) ? null : failed({ exitCode: 255, timedOut: false, stderr: "Connection reset by peer" }));
+
+    const error = await stage(fixture, [0]).then(() => null, (cause: unknown) => cause);
+
+    expect(error).toMatchObject({ step: "staging package.json", exitCode: null, attempts: 2 });
+    expect((error as Error).message).toContain("staging package.json failed (2 attempts)");
+    expect((error as Error).message).toContain("Connection reset by peer");
+  });
+
+  it("makes one attempt when the retry budget is empty", async () => {
+    const fixture = await sandbox("usr/bin");
+    failing(fixture, (input) => chmodCall(input) ? failed({ exitCode: 1, timedOut: false }) : null);
+
+    await expect(stage(fixture, [])).rejects.toMatchObject({ attempts: 1 });
+    expect(fixture.runner.execute.mock.calls.filter(([input]) => chmodCall(input))).toHaveLength(1);
+  });
+
+  it("keeps only the tail of a long stderr", async () => {
+    const fixture = await sandbox("usr/bin");
+    failing(fixture, (input) => chmodCall(input)
+      ? failed({ exitCode: 1, timedOut: false, stderr: `${"x".repeat(5_000)}END` })
+      : null);
+
+    const error = await stage(fixture, []).then(() => null, (cause: unknown) => cause) as GitHubLauncherStagingError;
+
+    expect(error.detail).toHaveLength(300);
+    expect(error.detail.endsWith("END")).toBe(true);
   });
 });
