@@ -9098,6 +9098,7 @@ const convexDeploymentSummarySchema = z.object({
 });
 const convexQuotaSchema = z.object({
   count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional(),
+  lowerBound: z.boolean().optional().describe("True when the team has more deployments than could be counted; count is then a minimum"),
 });
 const convexStatusSchema = z.object({
   connection: z.enum(["connected", "disconnected", "not-configured", "not-connected"]),
@@ -9139,6 +9140,7 @@ const convexDeletePreviewResultSchema = z.object({
     prState: z.enum(["none", "closed", "merged"]), prNumber: z.number().nullable(), branchExists: z.boolean(), lastCommitAt: z.number().nullable(), idleMs: z.number(),
   }).nullable(),
   reason: z.string().nullable(),
+  note: z.string().optional().describe("Set when a real request was turned into a plan by the dryRunOnly guard"),
 });
 const convexReaperRunParamsSchema = z.object({
   dryRun: z.boolean().optional().describe("Absent or true only plans. false runs for real and needs reaper.enabled and an instance administrator"),
@@ -9154,6 +9156,7 @@ const convexReaperReportSchema = z.object({
     deleted: z.array(z.string()), expirySet: z.array(z.string()),
     failed: z.array(z.object({ name: z.string(), error: z.string() })),
     skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    deferred: z.number().int().optional().describe("Previews not examined, and expiry changes not planned, because the time budget or the per-pass limit was reached; the next pass continues with the oldest"),
     error: z.string().optional(),
   })),
   quota: convexQuotaSchema.nullable(),

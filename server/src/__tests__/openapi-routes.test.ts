@@ -810,8 +810,21 @@ describe("openapi routes", () => {
       },
     }).deleted).toBe(false);
 
+    // z.object drops keys it does not know, so a field missing from a schema shows as a lost value here.
+    const gated = S.deletePreviewResult.parse({
+      dryRun: true, wouldDelete: true, deleted: false, environment: "preview", reason: null, evidence: null, note: "Nothing was changed: dry-run-only.",
+      deployment: {
+        name: "happy-animal-123", environment: "preview", deploymentType: "preview", reference: null, previewIdentifier: "feat-x", isDefault: false,
+        createTime: 1791300000000, lastDeployTime: 1791367200000, expiresAt: null, region: null, deploymentClass: null, creator: null, project: "100",
+      },
+    });
+    expect(gated.note).toMatch(/dry-run-only/);
+
     expect(S.reaperRunParams.parse({}).dryRun).toBeUndefined();
     expect(S.reaperReport.parse(report).incomplete).toBe("Deletion limit of 20 reached for this run.");
+    const cut = S.reaperReport.parse({ ...report, quota: { ...quota, lowerBound: true }, projects: [{ ...report.projects[0], deferred: 30 }] });
+    expect(cut.quota?.lowerBound).toBe(true);
+    expect(cut.projects[0].deferred).toBe(30);
     expect(S.reaperReport.parse({ ...report, incomplete: undefined, quota: null }).quota).toBeNull();
     expect(S.reaperReport.safeParse({ ...report, trigger: "cron" }).success).toBe(false);
     expect(S.bridgeError.parse({ code: "WORKER_ERROR", message: "Enable the reaper first.", details: { key: "reaper.run" } }).code).toBe("WORKER_ERROR");

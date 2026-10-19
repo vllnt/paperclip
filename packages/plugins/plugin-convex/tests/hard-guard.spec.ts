@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { hardDeleteBlock } from "../src/hard-guard.js";
 import { normalizeDeployment } from "../src/convex-client.js";
 import { COMPANY_A, admin, baseConfig, member, run, setup } from "./fixture.js";
-import { deployment } from "./fakes.js";
+import { HOUR, NOW, deployment } from "./fakes.js";
 
 const block = (overrides: Record<string, unknown>) => hardDeleteBlock(normalizeDeployment({ ...deployment("feat-x"), ...overrides })!);
 
@@ -72,7 +72,7 @@ describe("the hard delete guard on every delete and expiry path", () => {
     const f = await guarded();
     await expect(f.h.performAction("deployments.delete-preview", { name: "release-notes" }, admin(COMPANY_A))).rejects.toThrow(/production, staging, main or release/);
     expect(f.convex.deletes()).toHaveLength(0);
-    await f.h.performAction("deployments.delete-preview", { name: "feat-done" }, admin(COMPANY_A));
+    await f.h.performAction("deployments.delete-preview", { name: "feat-done", dryRun: false }, admin(COMPANY_A));
     expect(f.convex.deletes()).toHaveLength(1);
   });
 
@@ -91,5 +91,55 @@ describe("the hard delete guard on every delete and expiry path", () => {
     expect(f.convex.deployments.get("release-notes")?.expiresAt ?? null).toBeNull();
     const last = await f.h.performAction<any>("reaper.report", {}, member(COMPANY_A));
     expect(last.projects[0].skipped).toEqual([expect.objectContaining({ name: "release-notes", reason: expect.stringMatching(/production, staging, main or release/) })]);
+  });
+});
+
+describe("a hard-blocked preview may have its expiry moved later, never earlier", () => {
+  const managedKey = { scopeKind: "company" as const, scopeId: COMPANY_A, namespace: "reaper", stateKey: "managed-expiry" };
+  const expire = (f: Awaited<ReturnType<typeof setup>>, hours: number) => f.h.executeTool<{ data?: any; error?: string }>("convex_set_preview_expiry", { name: "release-notes", hours }, run("janitor"));
+  const withExpiry = async (expiresAt: number | null, managed: Record<string, number> | null = null) => {
+    const f = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true } }) } });
+    f.convex.add(deployment("release-notes", { previewIdentifier: "feat/release", lastDeployTime: NOW - 2 * HOUR, expiresAt }));
+    if (managed) await f.h.ctx.state.set(managedKey, managed);
+    return f;
+  };
+
+  it("refuses an agent a shorter or equal expiry on a preview that has one, and accepts a later one", async () => {
+    const f = await withExpiry(NOW + 60 * HOUR);
+    expect((await expire(f, 48)).error).toMatch(/production, staging, main or release/);
+    expect((await expire(f, 60)).error).toMatch(/production, staging, main or release/);
+    expect(f.convex.mutations()).toHaveLength(0);
+    expect((await expire(f, 100)).data).toMatchObject({ dryRun: false, expiresAt: NOW + 100 * HOUR, previousExpiresAt: NOW + 60 * HOUR });
+    expect(f.convex.deployments.get("release-notes")?.expiresAt).toBe(NOW + 100 * HOUR);
+  });
+
+  it("refuses an agent any expiry on a preview that has none", async () => {
+    const f = await withExpiry(null);
+    expect((await expire(f, 48)).error).toMatch(/production, staging, main or release/);
+    expect(f.convex.mutations()).toHaveLength(0);
+  });
+
+  it("lets the reaper move an expiry it set itself later, and nothing else", async () => {
+    // Last deployed 2 hours ago, so the reaper's deadline is now + 34 hours; its own earlier expiry of now + 10 hours moves up to it.
+    const f = await withExpiry(NOW + 10 * HOUR, { "release-notes": NOW + 10 * HOUR });
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.deployments.get("release-notes")?.expiresAt).toBe(NOW + 34 * HOUR);
+    const last = await f.h.performAction<any>("reaper.report", {}, member(COMPANY_A));
+    expect(last.projects[0]).toMatchObject({ kept: 1, expirySet: ["release-notes"], skipped: [] });
+  });
+
+  it("never lets the reaper shorten an expiry it set itself", async () => {
+    const f = await withExpiry(NOW + 100 * HOUR, { "release-notes": NOW + 100 * HOUR });
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.mutations()).toHaveLength(0);
+    const last = await f.h.performAction<any>("reaper.report", {}, member(COMPANY_A));
+    expect(last.projects[0].skipped).toEqual([expect.objectContaining({ name: "release-notes", reason: expect.stringMatching(/production, staging, main or release/) })]);
+  });
+
+  it("never moves an expiry a person set, later or earlier", async () => {
+    const f = await withExpiry(NOW + 10 * HOUR);
+    await f.h.runJob("convex-reaper");
+    expect(f.convex.mutations()).toHaveLength(0);
+    expect(f.convex.deployments.get("release-notes")?.expiresAt).toBe(NOW + 10 * HOUR);
   });
 });
