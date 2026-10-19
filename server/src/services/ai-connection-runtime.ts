@@ -68,6 +68,30 @@ export function stripAiAuthBindings(env: unknown): Record<string, unknown> {
       delete result[key];
   return result;
 }
+// A managed AI connection owns provider routing, so a configured route conflicts.
+export const MANAGED_AI_ROUTING_ENV_KEYS = [
+  "ANTHROPIC_BASE_URL",
+  "OPENAI_BASE_URL",
+  "XAI_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "PAPERCLIP_CODEX_PROVIDERS",
+  "PAPERCLIP_OPENCODE_PROVIDERS",
+] as const;
+/**
+ * Returns the first routing key with a truthy value, or null when none is set.
+ * A `{ type: "plain", value }` binding counts by its value; secret refs and
+ * other objects count as set.
+ */
+export function findManagedAiRoutingEnvKey(env: unknown): string | null {
+  const record = env && typeof env === "object" ? (env as Record<string, unknown>) : {};
+  const valueOf = (value: unknown) => {
+    const binding = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+    return binding?.type === "plain" ? binding.value : value;
+  };
+  return MANAGED_AI_ROUTING_ENV_KEYS.find((key) => valueOf(record[key])) ?? null;
+}
 export async function assertManagedAiProjectAuth(
   config: Record<string, unknown>,
   provider: AiConnectionBinding["provider"],
@@ -209,26 +233,11 @@ export async function prepareManagedAiRuntime(
     config: Record<string, unknown>;
   },
 ) {
-  const configuredEnv =
-    input.config.env && typeof input.config.env === "object"
-      ? (input.config.env as Record<string, unknown>)
-      : {};
-  for (const key of [
-    "ANTHROPIC_BASE_URL",
-    "OPENAI_BASE_URL",
-    "XAI_BASE_URL",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "PAPERCLIP_CODEX_PROVIDERS",
-    "PAPERCLIP_OPENCODE_PROVIDERS",
-  ]) {
-    if (configuredEnv[key])
-      throw unprocessable(
-        "The configured provider routing is incompatible with this AI connection",
-        { code: "ai_connection_incompatible" },
-      );
-  }
+  if (findManagedAiRoutingEnvKey(input.config.env))
+    throw unprocessable(
+      "The configured provider routing is incompatible with this AI connection",
+      { code: "ai_connection_incompatible" },
+    );
   await assertManagedAiProjectAuth(input.config, input.binding.provider);
   const service = aiConnectionService(db);
   let selection = await service.select({

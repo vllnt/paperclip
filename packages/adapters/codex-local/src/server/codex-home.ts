@@ -2,7 +2,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { createPaperclipTempDir, removePaperclipTempDir } from "@paperclipai/adapter-utils/paperclip-temp";
 import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
+import {
+  resolveCodexHomeSeedSelection,
+  seedCodexHomeFiles,
+} from "@paperclipai/adapter-utils/codex-home-seed";
 import { isCodexAuthCachePath, readSubscriptionAccountId } from "./codex-auth-cache.js";
 
 const TRUTHY_ENV_RE = /^(1|true|yes|on)$/i;
@@ -362,8 +367,12 @@ export async function writeApiKeyAuthJson(home: string, apiKey: string): Promise
 }
 
 export interface StageCodexHomeForSyncOptions {
-  /** Run id, used only to make the staged temp-dir name traceable in logs. */
-  runId?: string;
+  /**
+   * Requested worker-seed file names, validated with `seedCodexHomeFiles` and staged
+   * in addition to {@link CODEX_SYNC_ALLOWLIST}, so a sandbox run gets them too.
+   */
+  extraEntries?: readonly string[];
+  onLog?: AdapterExecutionContext["onLog"];
 }
 
 /**
@@ -554,13 +563,15 @@ async function stageCodexHomeEntry(
 }
 
 /**
- * Stages exactly {@link CODEX_SYNC_ALLOWLIST} from `effectiveCodexHome` into a
+ * Stages {@link CODEX_SYNC_ALLOWLIST} and validated optional seed files into a
  * fresh private temp dir and returns its path, for registration as the sandbox
  * `home` asset. This replaces syncing the whole managed home + a name denylist:
  * only the files Codex actually needs are uploaded, so oversized runtime state
  * (`sessions/`, `*.sqlite`, `plugins/`, …) never reaches the sandbox.
  *
- * - **Symlinks are dereferenced to bytes** — the single-use `auth.json`
+ * - **Extra seed files use the same name, symlink, credential and size checks**
+ *   as worker-home seeding. Rejected files are logged and skipped.
+ * - **Allowlisted symlinks are dereferenced to bytes** — the single-use `auth.json`
  *   credential (a symlink into the shared source home) and each `skills/` entry
  *   land as real files, never dangling links.
  * - **Missing-but-optional entries are skipped** — no `auth.json` in
@@ -578,19 +589,24 @@ export async function stageCodexHomeForSync(
   effectiveCodexHome: string,
   options: StageCodexHomeForSyncOptions = {},
 ): Promise<string> {
-  const runIdPart = nonEmpty(options.runId ?? undefined);
-  const stagedHome = await fs.mkdtemp(
-    path.join(os.tmpdir(), `paperclip-codex-home-sync-${runIdPart ? `${runIdPart}-` : ""}`),
-  );
+  // Inside a run the name carries the run id (`runWithPaperclipTempRun`).
+  const stagedHome = await createPaperclipTempDir("paperclip-codex-home-sync-");
   try {
     for (const entry of CODEX_SYNC_ALLOWLIST) {
       await stageCodexHomeEntry(effectiveCodexHome, stagedHome, entry);
     }
+    await seedCodexHomeFiles({
+      sourceHome: effectiveCodexHome,
+      targetHome: stagedHome,
+      selection: resolveCodexHomeSeedSelection(options.extraEntries ?? [], {}),
+      mergeAgentsInstructions: false,
+      onLog: options.onLog ?? (async () => {}),
+    });
     return stagedHome;
   } catch (error) {
     // Fail-closed: never hand back a partial home. Remove the temp dir we
     // created before propagating the failure.
-    await fs.rm(stagedHome, { recursive: true, force: true }).catch(() => {});
+    await removePaperclipTempDir(stagedHome).catch(() => {});
     throw error;
   }
 }
@@ -611,7 +627,7 @@ export async function seedManagedCodexHome(
   targetHome: string,
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
-  options: { apiKey?: string | null } = {},
+  options: { apiKey?: string | null; codexHomeSeed?: unknown } = {},
 ): Promise<void> {
   const apiKey = nonEmpty(options.apiKey ?? undefined);
 
@@ -742,6 +758,15 @@ export async function seedManagedCodexHome(
       await ensureCopiedFile(path.join(targetHome, name), source);
     }
 
+    // Opt-in worker files (global AGENTS.md, files it includes, hooks.json).
+    // Nothing is copied unless `codexHomeSeed` or PAPERCLIP_CODEX_HOME_SEED says so.
+    await seedCodexHomeFiles({
+      sourceHome,
+      targetHome,
+      selection: resolveCodexHomeSeedSelection(options.codexHomeSeed, env),
+      onLog,
+    });
+
     await onLog(
       "stdout",
       `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
@@ -772,7 +797,7 @@ export async function prepareManagedCodexHome(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
   companyId?: string,
-  options: { apiKey?: string | null } = {},
+  options: { apiKey?: string | null; codexHomeSeed?: unknown } = {},
 ): Promise<string> {
   const targetHome = resolveManagedCodexHomeDir(env, companyId);
   await seedManagedCodexHome(targetHome, env, onLog, options);

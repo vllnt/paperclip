@@ -44,6 +44,7 @@ import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudControlMiddleware } from "./middleware/cloud-control.js";
+import { refuseNewWorkWhileStopping } from "./shutdown.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
@@ -67,12 +68,20 @@ import { environmentService } from "./services/environments.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
+import { issueDuplicateRoutes } from "./routes/issue-duplicates.js";
+import { createDuplicateDetection } from "./services/duplicate-detection-factory.js";
+import { setIssueCreatedListener } from "./services/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
+import { issueGitLinkRoutes } from "./routes/issue-git-links.js";
 import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
 import { routineRoutes } from "./routes/routines.js";
+import { eventSourcePublicRoutes, eventSourceRoutes } from "./routes/event-sources.js";
+import { eventSourceBodyParser } from "./middleware/event-source-body.js";
+import { eventSourceService } from "./services/event-sources/service.js";
 import { pipelineRoutes } from "./routes/pipelines.js";
 import { environmentRoutes } from "./routes/environments.js";
+import { resourceCapacityRoutes } from "./routes/resource-capacity.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { goalRoutes } from "./routes/goals.js";
 import { onboardingSeedRoutes } from "./routes/onboarding-seed.js";
@@ -86,6 +95,7 @@ import {
 } from "./routes/chat-channels.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
 import { costRoutes } from "./routes/costs.js";
+import { observabilityRoutes } from "./routes/observability.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { attentionRoutes } from "./routes/attention.js";
@@ -181,6 +191,7 @@ import {
 } from "./http/body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
+import { precompressedStatic } from "./middleware/precompressed-static.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
 
@@ -536,6 +547,9 @@ export async function createApp(
     createChatWebhookDiagnostics(),
     chatWebhookBodyParser,
   );
+  // Event sources authenticate with their own secret over an unauthenticated
+  // route, so their body is capped at 64 KB before the 10 MB parser can run.
+  app.use("/api/event-sources/public", eventSourceBodyParser(captureRawBody));
   app.use(
     express.json({
       limit: DEFAULT_JSON_BODY_LIMIT,
@@ -574,6 +588,9 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  // While the process stops, requests that only start new work get 503 with
+  // Retry-After; run callbacks and every other request are still served.
+  app.use(refuseNewWorkWhileStopping());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -601,6 +618,15 @@ export async function createApp(
   const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
   app.use(emailWebhookRoutes(emailChannels));
   app.use(chatWebhookRoutes(chatChannels));
+  // Signed event ingress: the source's own secret is the only credential, and
+  // it is verified before any shared budget is spent. One service instance
+  // owns the source cache, rate limiters and background timers.
+  const eventSources = eventSourceService(db, {
+    heartbeat: connectionIntentHeartbeat,
+    pluginWorkerManager: workerManager,
+  });
+  void eventSources.start();
+  app.use("/api", eventSourcePublicRoutes(eventSources));
   // The instance validates single-use registration state and its trusted
   // current origin. This exact GET is the only public setup return.
   app.get("/api/chat-github/manifest/callback", async (req, res) => {
@@ -755,9 +781,12 @@ export async function createApp(
   api.use(projectRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(caseRoutes(db, opts.storageService));
   api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(issueGitLinkRoutes(db));
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(eventSourceRoutes(db, eventSources));
   api.use(pipelineRoutes(db));
+  api.use(resourceCapacityRoutes(db));
   api.use(
     environmentRoutes(db, {
       pluginWorkerManager: workerManager,
@@ -792,6 +821,7 @@ export async function createApp(
     process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST ??
     null;
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(observabilityRoutes(db));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(attentionRoutes(db));
@@ -841,6 +871,9 @@ export async function createApp(
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
+  const duplicateDetection = createDuplicateDetection(db);
+  setIssueCreatedListener((event) => void duplicateDetection.checkAfterCreate(event));
+  api.use(issueDuplicateRoutes(db, duplicateDetection));
   api.use(issueRoutes(db, opts.storageService, {
     chatRunRetries: chatChannels,
     feedbackExportService: opts.feedbackExportService,
@@ -985,10 +1018,14 @@ export async function createApp(
     );
     if (uiDist) {
       // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>)
-      // never change once built, so they can be cached aggressively.
+      // never change once built, so they can be cached aggressively. The UI
+      // build writes .br and .gz siblings next to each script and stylesheet;
+      // serve those to clients that accept them instead of the plain file.
+      const assetsDir = path.join(uiDist, "assets");
       app.use(
         "/assets",
-        express.static(path.join(uiDist, "assets"), {
+        precompressedStatic(assetsDir, { maxAge: "1y", immutable: true }),
+        express.static(assetsDir, {
           maxAge: "1y",
           immutable: true,
         }),
@@ -1345,6 +1382,7 @@ export async function createApp(
       hostServiceCleanup.teardown();
       await emailChannels.shutdown();
       await chatChannels.shutdown();
+      await eventSources.stop();
       // End the avatar worker pool, if a request ever started one, so no
       // render outlives the HTTP teardown.
       await agentAvatars.close();

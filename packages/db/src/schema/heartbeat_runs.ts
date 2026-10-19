@@ -66,6 +66,10 @@ export const heartbeatRuns = pgTable(
     stdoutExcerpt: text("stdout_excerpt"),
     stderrExcerpt: text("stderr_excerpt"),
     errorCode: text("error_code"),
+    /** The harness and model this run executed, and why it ran on a fallback target. */
+    executedAdapterType: text("executed_adapter_type"),
+    executedModel: text("executed_model"),
+    fallbackReason: text("fallback_reason"),
     externalRunId: text("external_run_id"),
     // Legacy controller lease. A PID alone is not an identity across containers.
     controllerBootId: uuid("controller_boot_id"),
@@ -105,6 +109,9 @@ export const heartbeatRuns = pgTable(
     nativeReplacementPredecessorUq: uniqueIndex("heartbeat_runs_native_replacement_predecessor_uq")
       .on(table.companyId, table.retryOfRunId)
       .where(sql`${table.scheduledRetryReason} = 'native_safe_replacement'`),
+    fallbackSuccessorIdx: index("heartbeat_runs_harness_fallback_successor_idx")
+      .on(table.companyId, table.retryOfRunId)
+      .where(sql`${table.scheduledRetryReason} = 'harness_fallback'`),
     companyNativeIssueRunUq: unique("heartbeat_runs_company_native_issue_id_uq").on(
       table.companyId,
       table.nativeIssueId,
@@ -152,6 +159,12 @@ export const heartbeatRuns = pgTable(
       sql`(${table.contextSnapshot} ->> 'issueId')`,
       table.createdAt.desc(),
     ),
+    companyCtxIssueRedactionIdx: index("heartbeat_runs_company_ctx_issue_redaction_idx")
+      .on(table.companyId, sql`(${table.contextSnapshot} ->> 'issueId')`)
+      .where(sql`${table.contextSnapshot} ? 'paperclipSecretRedactions'`),
+    companyCtxPaperclipIssueRedactionIdx: index("heartbeat_runs_company_ctx_pcissue_redaction_idx")
+      .on(table.companyId, sql`(${table.contextSnapshot} -> 'paperclipIssue' ->> 'id')`)
+      .where(sql`${table.contextSnapshot} ? 'paperclipSecretRedactions'`),
     companyCtxTaskCreatedIdx: index("heartbeat_runs_company_ctx_task_created_idx").on(
       table.companyId,
       sql`(${table.contextSnapshot} ->> 'taskId')`,

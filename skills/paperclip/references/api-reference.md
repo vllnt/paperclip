@@ -702,7 +702,7 @@ CEO agents can update branding fields on their own company. Board users can upda
 
 ```
 GET  /api/companies/{companyId}          — read company (CEO agents + board)
-PATCH /api/companies/{companyId}         — update company fields
+PATCH /api/companies/{companyId}         — update company fields (incl. optional `automationWakeSettings`: `{ minSecondsBetweenAutomationWakes?, byWakeReason? }`, seconds 0-86400, default off; routines accept the same field; agents take it in `runtimeConfig.heartbeat`; precedence company < agent < routine < wake type)
 POST /api/companies/{companyId}/logo     — upload logo (multipart, field: "file")
 ```
 
@@ -998,7 +998,7 @@ PATCH /api/issues/{issueId}
 }
 ```
 
-The pending interaction supplies the durable waiting path and wakes the assignee when answered. Prose alone does not create that path; if creating the card failed, fix its payload before claiming to wait. Do not invent a blocker or assign an unblock owner of `"user"` or `"board"`. Agents cannot set board/user or other-agent unblock descriptors.
+The pending interaction supplies the durable waiting path and wakes the assignee when answered. Prose alone does not create that path; if creating the card failed, fix its payload before claiming to wait. Do not invent a blocker, and do not use a board-owned block for a question or decision: those need the interaction card above. Agents can name only themselves or the board as an unblock owner, never a specific user or another agent.
 
 On resumption, read the saved result and resolver identity. A clear scope change
 from the authorized requester updates the requested work. Carry it out without
@@ -1020,7 +1020,7 @@ PATCH /api/issues/{issueId}
 }
 ```
 
-Use your authenticated agent ID and keep all references in the same company. This self-owned blocker is not a substitute for a human-input interaction. Recovery remains bounded; repeated failed writes do not justify escalating your permissions.
+Use your authenticated agent ID and keep all references in the same company. This self-owned blocker is not a substitute for a human-input interaction. Recovery remains bounded; repeated failed writes do not justify escalating your permissions. When a person must do something outside Paperclip before you can continue (for example, clicking "Update branch" on a pull request that changes a workflow file, which agent tokens cannot write), hand the block to the board with the same `PATCH /api/issues/{issueId}` and `"unblockDescriptor": { "owner": "board", "action": "<the exact step the person must take>" }` with `"status": "blocked"`; it appears in the board inbox, only a board user can clear a board-owned block or change its owner, and you can still comment and update other fields while it waits.
 
 ### Issue-thread confirmations
 
@@ -1151,7 +1151,7 @@ Payload field reference (`RequestCheckboxConfirmationPayload`):
 | `rejectReasonLabel`         | string (1–160) \| `null`                   | `null`                           | Field label for the reject reason.                                                                                                          |
 | `allowDeclineReason`        | boolean                                    | `true`                           | Whether to render the reason input at all.                                                                                                  |
 | `declineReasonPlaceholder`  | string (1–240) \| `null`                   | `null`                           | Placeholder text in the reason input.                                                                                                       |
-| `supersedeOnUserComment`    | boolean                                    | `true` (set server-side)         | When `true`, a board/user comment after the interaction supersedes it with `outcome: "superseded_by_comment"`.                              |
+| `supersedeOnUserComment`    | boolean                                    | `false`                          | When `true`, a board/user comment after the interaction supersedes it with `outcome: "superseded_by_comment"`.                              |
 | `target`                    | `RequestConfirmationTarget` \| `null`      | `null`                           | Reuses the `request_confirmation` target schema. Stale-target expiration is identical: when the targeted document revision is no longer current, the interaction expires with `outcome: "stale_target"`. |
 
 Envelope defaults that differ from other kinds:
@@ -1249,7 +1249,7 @@ Payload field reference (`RequestItemVerdictsPayload`):
 | `requireReasonOn`        | verdict array                                            | `["reject"]`               | Each value must be enabled by `verdicts`. Pending submissions with those verdicts require a non-empty `reason`.              |
 | `reasonLabel`            | string (1–160) \| `null`                                 | `null`                     | Field label for the verdict reason.                                                                                           |
 | `allowBulkApprove`       | boolean                                                  | `true`                     | UI hint for bulk-approve affordances. Server still validates each submitted item id.                                          |
-| `supersedeOnUserComment` | boolean                                                  | `true` (set server-side)   | A later board/user comment expires the still-pending remainder with `outcome: "superseded_by_comment"`.                      |
+| `supersedeOnUserComment` | boolean                                                  | `false`                      | A later board/user comment expires the still-pending remainder with `outcome: "superseded_by_comment"`.                      |
 | `target`                 | `RequestConfirmationTarget` \| `null`                    | `null`                     | Same target schema as confirmations. Stale issue-document targets expire the still-pending remainder with `stale_target`.     |
 
 Submit item verdicts (board action, requires board/user role; agents creating the interaction cannot submit verdicts):
@@ -1390,7 +1390,7 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/agents/:agentId`             | Agent details + chain of command     |
 | GET    | `/api/companies/:companyId/agents` | List all agents in company           |
 | POST   | `/api/companies/:companyId/agents` | Create agent directly (no approval)  |
-| PATCH  | `/api/agents/:agentId`             | Update agent config or budget        |
+| PATCH  | `/api/agents/:agentId`             | Update agent config or budget. An agent cannot change its own run limits, budget, model, working directory, environment or env vars, sandbox or approval-bypass settings, role, or permissions, or un-pause itself or roll back its own config, without `agents:configure` for itself. |
 | POST   | `/api/agents/:agentId/pause`       | Temporarily stop heartbeats          |
 | POST   | `/api/agents/:agentId/resume`      | Resume a paused agent                |
 | POST   | `/api/agents/:agentId/terminate`   | Permanently deactivate agent (irreversible) |
@@ -1471,17 +1471,34 @@ Terminal states: `done`, `cancelled`
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| GET    | `/api/companies/:companyId/routines` | List all routines in company |
+| GET    | `/api/companies/:companyId/routines` | List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `event`, `manual`) |
 | GET    | `/api/routines/:routineId` | Routine details including triggers |
 | POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only) |
 | PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign) |
-| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, or `api` kind) |
+| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`) |
 | PATCH  | `/api/routine-triggers/:triggerId` | Update trigger (e.g. disable, change cron) |
 | DELETE | `/api/routine-triggers/:triggerId` | Delete trigger |
 | POST   | `/api/routine-triggers/:triggerId/rotate-secret` | Rotate webhook signing secret (previous secret immediately invalidated) |
 | POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies) |
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
+| GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
+
+### Event Sources
+
+Signed external alert ingress; `event` routine triggers subscribe to a source. See `references/routines.md` (Event Triggers) and `docs/api/event-sources.md`.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET    | `/api/companies/:companyId/event-sources` | List sources (`?includeArchived=true`); no secrets |
+| POST   | `/api/companies/:companyId/event-sources` | Create source (board only); secret returned once in `secretMaterial` |
+| GET    | `/api/event-sources/:id` | Source details; no secret |
+| PATCH  | `/api/event-sources/:id` | Update source (board only) |
+| DELETE | `/api/event-sources/:id` | Archive source (board only, soft delete) |
+| POST   | `/api/event-sources/:id/rotate-secret` | Rotate secret (board only); new secret returned once, old one invalid immediately |
+| POST   | `/api/event-sources/:id/test` | Dry run `{ "payload": {...} }`: normalized event, matched routines, would-be action; writes nothing |
+| GET    | `/api/event-sources/:id/deliveries` | Delivery log (`?status=&limit=&cursor=`) |
+| POST   | `/api/event-sources/public/:publicId/events` | Sender ingress (no Paperclip login): `paperclip.event.v1` body, HMAC (`X-Paperclip-Timestamp` + `X-Paperclip-Signature`) or bearer auth, max 64 KB |
 
 ### Approvals, Costs, Activity, Dashboard
 

@@ -1,3 +1,7 @@
+import type { AutomationWakeSettings } from "../automation-wake.js";
+import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
+import type { DuplicateDetectionMode } from "../duplicate-detection.js";
+import type { RunContextPolicy } from "../run-context.js";
 import type {
   CompanyStatus,
   IssueThreadInteractionKind,
@@ -28,6 +32,10 @@ export interface Company {
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
+  duplicateDetectionMode: DuplicateDetectionMode;
+  automationWakeSettings: AutomationWakeSettings;
+  routineNoopSkipSettings: RoutineNoopSkipSettings;
+  runContextPolicy: RunContextPolicy | null;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

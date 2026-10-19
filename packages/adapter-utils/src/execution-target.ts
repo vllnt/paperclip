@@ -15,8 +15,10 @@ import {
 } from "./command-managed-runtime.js";
 import {
   buildRemoteExecutionSessionIdentity,
+  isNormalizedRemoteRoot,
   prepareRemoteManagedRuntime,
   remoteExecutionSessionMatches,
+  sshRunDirectory,
 } from "./remote-managed-runtime.js";
 import type {
   AdditionalSourceStagingFailure,
@@ -34,6 +36,7 @@ export type {
 } from "./sandbox-managed-runtime.js";
 import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
+  formatSandboxCallbackBridgeSlowPickup,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
@@ -73,11 +76,13 @@ import {
   type Http2TelemetryEventName,
 } from "./duplex-observability.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
+import { openSshMultiplex, type SshMultiplex } from "./ssh-multiplex.js";
 import {
   ensureCommandResolvable,
   resolveCommandForLogs,
   runChildProcess,
   type RunProcessResult,
+  type ChildProcessStdinWriter,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -285,6 +290,12 @@ export interface AdapterExecutionTargetProcessOptions {
    * after local child close or a remotely observed exit, including nonzero exits. */
   onProcessStopped?: () => void;
   terminalResultCleanup?: TerminalResultCleanupOptions;
+  /**
+   * Keep stdin open after the initial `stdin` write and hand the caller a
+   * writer. Only local and SSH targets have live stdin; sandbox targets never
+   * call it, so callers must treat a missing writer as "no live stdin".
+   */
+  onStdinReady?: (writer: ChildProcessStdinWriter) => void;
   /**
    * Sandbox-only: factory from the Paperclip bridge handle that streams the
    * CLI's stdout/stderr during the run. When provided, the batched provider
@@ -679,12 +690,16 @@ type AdapterCommandCapableExecutionTarget = AdapterSshExecutionTarget | AdapterS
 // bridge limit change never resizes this buffer as a side effect.
 const SSH_COMMAND_MAX_BUFFER_BYTES = 1024 * 1024;
 
-function adapterExecutionTargetCommandRunner(target: AdapterCommandCapableExecutionTarget): CommandManagedRuntimeRunner {
+function adapterExecutionTargetCommandRunner(
+  target: AdapterCommandCapableExecutionTarget,
+  options: { multiplex?: SshMultiplex | null } = {},
+): CommandManagedRuntimeRunner {
   if (target.transport === "ssh") {
     return createSshCommandManagedRuntimeRunner({
       spec: target.spec,
       defaultCwd: target.remoteCwd,
       maxBufferBytes: SSH_COMMAND_MAX_BUFFER_BYTES,
+      multiplex: options.multiplex,
     });
   }
   return requireSandboxRunner(target);
@@ -917,6 +932,7 @@ export async function runAdapterExecutionTargetProcess(
     cwd: options.cwd,
     env,
     stdin: options.stdin,
+    onStdinReady: options.onStdinReady,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
     onLog: options.onLog,
@@ -954,6 +970,7 @@ export async function runAdapterExecutionTargetShellCommand(
         const result = await runSshCommand(target.spec, command, {
           env,
           timeoutMs: (options.timeoutSec ?? 15) * 1000,
+          storeHints: { cwd: options.cwd },
         });
         if (result.stdout) await onLog("stdout", result.stdout);
         if (result.stderr) await onLog("stderr", result.stderr);
@@ -1575,6 +1592,183 @@ export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocat
   }
 }
 
+type RemoteRunTempLocation = {
+  runId: string; target: AdapterExecutionTarget | null | undefined;
+};
+
+/** The run's directory under `root`: the real directories `parents`, then `entry`, which the run owns. */
+type RemoteRunTempLayout = { root: string; parents: string[]; entry: string };
+
+function remoteRunTempLayout(input: RemoteRunTempLocation): RemoteRunTempLayout | null {
+  // Only controller-generated run IDs may name a removable directory.
+  if (!/^[a-zA-Z0-9_-]+$/.test(input.runId)) throw new Error("Invalid run temp directory run ID");
+  if (input.target?.kind !== "remote") return null;
+  if (input.target.transport === "ssh") {
+    // The lease root, which the SSH run directory reaper also uses.
+    const root = input.target.spec.remoteCwd;
+    if (!isNormalizedRemoteRoot(root)) return null;
+    return { root, parents: path.posix.relative(root, sshRunDirectory(root, input.runId)).split("/"), entry: "tmp" };
+  }
+  const root = input.target.remoteCwd;
+  if (!isNormalizedRemoteRoot(root)) return null;
+  return { root, parents: [".paperclip-runtime", "tmp"], entry: input.runId };
+}
+
+/**
+ * The per-run temp directory of a remote run, or `null` when there is none.
+ * Over SSH it is `tmp` beside the run's `workspace` in
+ * `<root>/.paperclip-runtime/runs/<runId>`, so the SSH run directory reaper
+ * also removes it after a crash. In a sandbox it is
+ * `<remoteCwd>/.paperclip-runtime/tmp/<runId>`, which workspace sync excludes.
+ *
+ * @param input.runId - A controller-generated run id: one segment of letters, digits, `_` or `-`.
+ * @param input.target - The run's execution target.
+ * @returns The directory on the target, or `null` when the target is local or
+ *   its root is not one the SSH run directory reaper accepts (absolute,
+ *   normalized, not `/`).
+ * @throws When the run id is not such a segment.
+ */
+export function remoteRunTempDirectory(input: RemoteRunTempLocation): string | null {
+  const layout = remoteRunTempLayout(input);
+  return layout && path.posix.join(layout.root, ...layout.parents, layout.entry);
+}
+
+// Shell lines that resolve the root once, then enter each of `dirs` below it
+// as a real directory and prove the physical path, as the SSH run directory
+// reaper does. A link an agent planted anywhere in the path is never followed:
+// the working directory is an inode, so later commands use names relative to
+// it. `onUnsafe` runs when a link or a non-directory is found, `onMissing`
+// when a directory is missing; with `create`, missing directories are made. A
+// directory that exists but cannot be entered fails the script.
+function enterRemoteRunTempDirs(
+  root: string,
+  dirs: string[],
+  options: { create: boolean; onUnsafe: string; onMissing: string },
+): string[] {
+  const q = shellQuote;
+  return [
+    `if [ ! -e ${q(root)} ]; then ${options.onMissing}; fi`,
+    `canon=$(cd -P ${q(root)} && pwd -P) || exit 1`,
+    'cd -P "$canon" || exit 1',
+    `for dir in ${dirs.map(q).join(" ")}; do`,
+    `  if [ -L "./$dir" ]; then ${options.onUnsafe}; fi`,
+    // Another run may create a shared parent at the same moment; the checks
+    // below decide, not mkdir's status.
+    ...(options.create ? ['  if [ ! -e "./$dir" ]; then mkdir "./$dir" 2>/dev/null; fi'] : []),
+    `  if [ ! -e "./$dir" ] && [ ! -L "./$dir" ]; then ${options.onMissing}; fi`,
+    `  if [ -L "./$dir" ] || [ ! -d "./$dir" ]; then ${options.onUnsafe}; fi`,
+    '  cd -P "./$dir" || exit 1',
+    "done",
+    `if [ "$(pwd -P)" != "$canon"/${q(dirs.join("/"))} ]; then ${options.onUnsafe}; fi`,
+  ];
+}
+
+/**
+ * Creates the per-run temp directory of a remote run with mode `0700`.
+ *
+ * @param runner - Runs the command on the target; tests pass a local one.
+ * @returns The directory, or `null` when the target is local.
+ * @throws When the target's root is not one the SSH run directory reaper
+ *   accepts, when a link or a file replaced a directory in its path, or when
+ *   the target cannot create it.
+ */
+export async function prepareRemoteRunTempDirectory(
+  input: RemoteRunTempLocation,
+  runner?: CommandManagedRuntimeRunner,
+): Promise<string | null> {
+  const layout = remoteRunTempLayout(input);
+  if (input.target?.kind !== "remote") return null;
+  if (!layout) {
+    throw new Error("Refusing to create a run temp directory under a root that is not a normalized absolute path");
+  }
+  const script = [
+    "umask 077",
+    ...enterRemoteRunTempDirs(layout.root, [...layout.parents, layout.entry], {
+      create: true, onUnsafe: "echo unsafe; exit 1", onMissing: "exit 1",
+    }),
+    // BSD chmod reads a `--` after the mode as a file name; `.` needs no `--`.
+    "chmod 700 .",
+  ].join("\n");
+  const result = await (runner ?? adapterExecutionTargetCommandRunner(input.target)).execute({
+    command: "sh",
+    args: ["-c", script],
+    cwd: input.target.remoteCwd,
+    timeoutMs: 15_000,
+  });
+  if (result.stdout.trim().split("\n").pop() === "unsafe") {
+    throw new Error("Could not create the run temp directory: a link or a file replaced a directory in its path");
+  }
+  if (result.timedOut || result.exitCode !== 0) throw new Error("Could not create the run temp directory");
+  return path.posix.join(layout.root, ...layout.parents, layout.entry);
+}
+
+/**
+ * What {@link cleanupRemoteRunTempDirectory} did: `removed` the directory, found
+ * it `absent`, or kept it because a link or a file replaced a directory in its
+ * path (`symlink`), so removing it could have deleted something else.
+ */
+export type RemoteRunTempCleanup = "removed" | "absent" | "symlink";
+
+/**
+ * Removes the per-run temp directory of a remote run. Over SSH it then
+ * removes the run directory too when nothing else is left in it (a run that
+ * never synced a workspace). Call only once the run's remote process is known
+ * to have stopped, before releasing the run's remote environment lease.
+ *
+ * @param runner - Runs the command on the target; tests pass a local one.
+ * @throws When the removal fails or times out, or a directory in the path
+ *   cannot be entered.
+ */
+export async function cleanupRemoteRunTempDirectory(
+  input: RemoteRunTempLocation,
+  runner?: CommandManagedRuntimeRunner,
+): Promise<RemoteRunTempCleanup> {
+  const layout = remoteRunTempLayout(input);
+  if (!layout || input.target?.kind !== "remote") return "absent";
+  const entry = `./${layout.entry}`;
+  const script = [
+    ...enterRemoteRunTempDirs(layout.root, layout.parents, {
+      create: false, onUnsafe: "echo symlink; exit 0", onMissing: "echo absent; exit 0",
+    }),
+    `if [ ! -e ${shellQuote(entry)} ] && [ ! -L ${shellQuote(entry)} ]; then outcome=absent; else`,
+    // `rm -rf` cannot empty a directory that lacks owner rwx (a Go module
+    // cache, say), so grant it first, as the SSH run directory reaper does.
+    // `find` follows no link, not even the entry itself if the agent replaced
+    // it with one; `rm -rf` then removes only that link.
+    `  find ${shellQuote(entry)} -type d ! -perm -700 -exec chmod u+rwx {} \\; 2>/dev/null`,
+    // The exit status is the removal's.
+    `  rm -rf ${shellQuote(entry)} || exit 1`,
+    "  outcome=removed",
+    "fi",
+    ...(input.target.transport === "ssh"
+      ? [`cd -P .. && rmdir ${shellQuote(`./${input.runId}`)} 2>/dev/null`]
+      : []),
+    'echo "$outcome"',
+  ].join("\n");
+  const result = await (runner ?? adapterExecutionTargetCommandRunner(input.target)).execute({
+    command: "sh",
+    args: ["-c", script],
+    cwd: input.target.remoteCwd,
+    timeoutMs: 60_000,
+  });
+  if (result.timedOut || result.exitCode !== 0) throw new Error("Could not remove the run temp directory");
+  const outcome = result.stdout.trim().split("\n").pop();
+  if (outcome === "removed" || outcome === "absent" || outcome === "symlink") return outcome;
+  throw new Error("Removing the run temp directory returned an unexpected result");
+}
+
+/** Error code of a pre-dispatch remote probe that failed for a transient reason. */
+export const REMOTE_PREFLIGHT_UNAVAILABLE_CODE = "remote_preflight_unavailable";
+
+/**
+ * The remote execution target could not be reached in time before dispatch
+ * (an SSH connection failure, exit 255, or the probe timed out). Retrying
+ * later can succeed, unlike a missing directory or a broken login profile.
+ */
+export class RemotePreflightUnavailableError extends Error {
+  readonly code = REMOTE_PREFLIGHT_UNAVAILABLE_CODE;
+}
+
 async function githubOperationLauncherBasePath(
   target: AdapterCommandCapableExecutionTarget | null,
   env: Record<string, string>,
@@ -1594,7 +1788,10 @@ async function githubOperationLauncherBasePath(
   });
   // Frame the value so login banners cannot become executable search paths.
   const remotePath = result.stdout.match(/\0([^\0]+)\0/)?.[1];
-  if (result.timedOut || result.exitCode !== 0 || !remotePath) {
+  if (result.timedOut || result.exitCode === 255) {
+    throw new RemotePreflightUnavailableError("Could not resolve remote PATH for managed GitHub launchers");
+  }
+  if (result.exitCode !== 0 || !remotePath) {
     throw new Error("Could not resolve remote PATH for managed GitHub launchers");
   }
   return remotePath;
@@ -1714,9 +1911,113 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
   };
 }
 
-/** Stage token-free launchers next to the execution, not in shared global Git config. */
+const GITHUB_LAUNCHER_STAGING_TIMEOUT_MS = 15_000;
+const GITHUB_LAUNCHER_STAGING_RETRY_DELAYS_MS: readonly number[] = [1_000, 3_000];
+const GITHUB_LAUNCHER_STAGING_DETAIL_LIMIT = 300;
+
+interface GitHubLauncherStagingFailure {
+  step: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  detail: string;
+}
+
+/**
+ * The remote staging of the managed GitHub launchers failed on every attempt.
+ * It names the step that failed last, its exit code, whether it timed out and
+ * the tail of its output, so a failed run row says why. The staging used to
+ * throw one fixed string and drop all of this.
+ */
+export class GitHubLauncherStagingError extends Error {
+  readonly step: string;
+  readonly exitCode: number | null;
+  readonly timedOut: boolean;
+  /** Last characters of the failed step's stderr (or stdout), trimmed. */
+  readonly detail: string;
+  readonly attempts: number;
+
+  constructor(failure: GitHubLauncherStagingFailure & { attempts: number }) {
+    const outcome = failure.timedOut
+      ? `timed out after ${GITHUB_LAUNCHER_STAGING_TIMEOUT_MS / 1000} s`
+      : failure.exitCode === null ? "failed" : `failed with exit code ${failure.exitCode}`;
+    const tries = failure.attempts === 1 ? "1 attempt" : `${failure.attempts} attempts`;
+    super(
+      `Could not prepare managed GitHub launchers: ${failure.step} ${outcome} (${tries})` +
+        (failure.detail ? `: ${failure.detail}` : ""),
+    );
+    this.name = "GitHubLauncherStagingError";
+    this.step = failure.step;
+    this.exitCode = failure.exitCode;
+    this.timedOut = failure.timedOut;
+    this.detail = failure.detail;
+    this.attempts = failure.attempts;
+  }
+}
+
+function launcherStagingDetail(...outputs: string[]): string {
+  const text = outputs.map((output) => output.trim()).find((output) => output.length > 0) ?? "";
+  return text.length > GITHUB_LAUNCHER_STAGING_DETAIL_LIMIT ? text.slice(-GITHUB_LAUNCHER_STAGING_DETAIL_LIMIT) : text;
+}
+
+/**
+ * One pass over the remote staging: every launcher file, then the permissions.
+ * A pass is safe to run again. Each file is content-hash-skipped, written under
+ * a lock and renamed into place, and `chmod` plus `mkdir -p` are idempotent, so
+ * a pass that timed out part-way can be repeated without a torn file.
+ * Returns the failure instead of throwing so the caller can count attempts.
+ */
+async function stageRemoteGitHubLaunchers(input: {
+  remote: AdapterExecutionTarget & { kind: "remote" };
+  directory: string;
+  configDirectory: string;
+  files: Record<string, string>;
+}): Promise<GitHubLauncherStagingFailure | null> {
+  const { remote, directory, configDirectory, files } = input;
+  const runner = adapterExecutionTargetCommandRunner(remote);
+  for (const [program, body] of Object.entries(files)) {
+    try {
+      await syncRemoteTextFileWithHashSkip({
+        runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
+        remotePath: path.posix.join(directory, program), body,
+        label: "GitHub operation launcher", action: "stage GitHub operation launcher",
+        lockDir: path.posix.join(directory, `.${program}.lock`),
+        timeoutMs: GITHUB_LAUNCHER_STAGING_TIMEOUT_MS, shellCommand: adapterExecutionTargetShellCommand(remote),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { step: `staging ${program}`, exitCode: null, timedOut: /timed out/i.test(message), detail: launcherStagingDetail(message) };
+    }
+  }
+  const step = "setting launcher permissions";
+  try {
+    const permissions = await runner.execute({
+      command: "sh",
+      args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh ${shellQuote(directory)}/paperclip-ssh-sign && mkdir -p ${shellQuote(configDirectory)}`],
+      cwd: remote.remoteCwd, timeoutMs: GITHUB_LAUNCHER_STAGING_TIMEOUT_MS,
+    });
+    if (permissions.exitCode === 0 && !permissions.timedOut) return null;
+    return {
+      step, exitCode: permissions.exitCode, timedOut: permissions.timedOut,
+      detail: launcherStagingDetail(permissions.stderr, permissions.stdout),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { step, exitCode: null, timedOut: /timed out/i.test(message), detail: launcherStagingDetail(message) };
+  }
+}
+
+/**
+ * Stage token-free launchers next to the execution, not in shared global Git config.
+ *
+ * A remote target needs eleven round trips (ten files, then the permissions). One slow or dropped exec on a loaded
+ * worker used to end the run, so a failed pass is repeated, with a short
+ * backoff, before it fails as a {@link GitHubLauncherStagingError}.
+ *
+ * @param input.retryDelaysMs Wait before retry N; its length is the retry budget.
+ */
 export async function prepareGitHubOperationLaunchers(input: {
   runId: string; target: AdapterExecutionTarget | null | undefined; cwd: string; env: Record<string, string>;
+  retryDelaysMs?: readonly number[];
 }): Promise<Record<string, string>> {
   const remote = input.target?.kind === "remote" ? input.target : null;
   const directory = githubOperationLauncherDirectory(input);
@@ -1741,18 +2042,14 @@ export async function prepareGitHubOperationLaunchers(input: {
     ...[".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"].map((name) => [name, profile] as const),
   ]);
   if (remote) {
-    const runner = adapterExecutionTargetCommandRunner(remote);
-    for (const [program, body] of Object.entries(files)) {
-      await syncRemoteTextFileWithHashSkip({
-        runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
-        remotePath: path.posix.join(directory, program), body,
-        label: "GitHub operation launcher", action: "stage GitHub operation launcher",
-        lockDir: path.posix.join(directory, `.${program}.lock`),
-        timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
-      });
+    const retryDelaysMs = input.retryDelaysMs ?? GITHUB_LAUNCHER_STAGING_RETRY_DELAYS_MS;
+    for (let attempt = 1; ; attempt += 1) {
+      const failure = await stageRemoteGitHubLaunchers({ remote, directory, configDirectory, files });
+      if (!failure) break;
+      const delayMs = retryDelaysMs[attempt - 1];
+      if (delayMs === undefined) throw new GitHubLauncherStagingError({ ...failure, attempts: attempt });
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     }
-    const permissions = await runner.execute({ command: "sh", args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh ${shellQuote(directory)}/paperclip-ssh-sign && mkdir -p ${shellQuote(configDirectory)}`], cwd: remote.remoteCwd, timeoutMs: 15_000 });
-    if (permissions.exitCode !== 0) throw new Error("Could not prepare managed GitHub launchers");
   } else {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     await fs.mkdir(configDirectory, { recursive: true, mode: 0o700 });
@@ -4370,7 +4667,6 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // input.hostApiUrl stays available as an explicit override seam.
   const hostApiUrl = input.hostApiUrl?.trim() || resolveDefaultPaperclipApiUrl();
   const shellCommand = adapterExecutionTargetShellCommand(target);
-  const runner = adapterExecutionTargetCommandRunner(target);
   const bridgeTimeoutMs =
     typeof input.timeoutSec === "number" && Number.isFinite(input.timeoutSec) && input.timeoutSec > 0
       ? Math.trunc(input.timeoutSec * 1000)
@@ -4382,6 +4678,12 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   );
 
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
+  // Over SSH every bridge step is a short command, so the steps share one
+  // master connection per environment and target instead of one login each.
+  // The agent's own session does not use it. The hold ends when the bridge
+  // stops, and on a failed start.
+  const multiplex = target.transport === "ssh" ? openSshMultiplex(target.spec, target.environmentId) : null;
+  const runner = adapterExecutionTargetCommandRunner(target, { multiplex });
 
   // The provider-scoped telemetry facade for the fixed duplex observability
   // surface. It maps the raw provider key through the allowlist one time, so no
@@ -4864,6 +5166,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       maxBodyBytes,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
+      // A request the worker picked up late goes to the run log, without
+      // waiting for it: the operator's measure of pickup delay.
+      onSlowPickup: (pickup) => {
+        void Promise.resolve().then(() => onLog("stdout", formatSandboxCallbackBridgeSlowPickup(pickup))).catch(() => undefined);
+      },
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
@@ -4879,6 +5186,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
       shellCommand,
+      runId: input.runId,
     });
   } catch (error) {
     await Promise.allSettled([
@@ -4886,6 +5194,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       worker?.stop(),
       bridgeAsset.cleanup(),
     ]);
+    await multiplex?.release();
     throw error;
   }
 
@@ -4916,6 +5225,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         worker?.stop(),
         bridgeAsset.cleanup(),
       ]);
+      await multiplex?.release();
     },
   };
 }

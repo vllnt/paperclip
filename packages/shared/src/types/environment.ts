@@ -175,3 +175,9 @@ export interface EnvironmentLease {
   createdAt: Date;
   updatedAt: Date;
 }
+
+/** One row of `GET /api/companies/:companyId/environment-leases`. */
+export interface CompanyEnvironmentLeaseListItem extends EnvironmentLease {
+  /** Null for an orphan lease whose environment was deleted. */
+  environment: { id: string; name: string; driver: EnvironmentDriver } | null;
+}

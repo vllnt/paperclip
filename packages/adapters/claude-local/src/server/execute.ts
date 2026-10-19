@@ -77,6 +77,7 @@ import {
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
 } from "./parse.js";
+import { claudeStreamJsonUserMessage, createClaudeSteeringSession } from "./steering.js";
 import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
@@ -425,6 +426,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
   const executionTargetIsSandbox = executionTarget?.kind === "remote" && executionTarget.transport === "sandbox";
+  // Local and SSH processes keep a live stdin, so a board message can steer the
+  // run mid-turn. Sandbox runners take stdin once and report steering unsupported.
+  const liveInput = !executionTargetIsSandbox;
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -851,6 +855,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
+    if (liveInput) args.push("--input-format", "stream-json");
     if (config.managedAiConnection) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
@@ -963,24 +968,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-      onProcessStopped: providerStop.beginInvocation(),
-      cwd,
-      env,
-      stdin: prompt,
-      timeoutSec,
-      graceSec,
-      onSpawn,
-      onRuntimeProgress: ctx.onRuntimeProgress,
-      onLog,
-      runLogTail: paperclipBridge?.runLogTail,
-      settleRunDisposition: paperclipBridge?.settleRunDisposition,
-      terminalResultCleanup: {
-        graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
-      },
-      localProcessSandbox,
-    });
+    const steering = liveInput
+      ? createClaudeSteeringSession({ runId, onSteeringReady: ctx.onSteeringReady, onEvent: ctx.onEvent })
+      : null;
+    let proc: RunProcessResult;
+    try {
+      proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+        onProcessStopped: providerStop.beginInvocation(),
+        cwd,
+        env,
+        stdin: steering ? claudeStreamJsonUserMessage(prompt) : prompt,
+        onStdinReady: steering?.attachStdin,
+        timeoutSec,
+        graceSec,
+        onSpawn,
+        onRuntimeProgress: ctx.onRuntimeProgress,
+        onLog: steering
+          ? async (stream, chunk) => {
+              try {
+                if (stream === "stdout") await steering.observeStdout(chunk);
+              } finally {
+                await onLog(stream, chunk);
+              }
+            }
+          : onLog,
+        runLogTail: paperclipBridge?.runLogTail,
+        settleRunDisposition: paperclipBridge?.settleRunDisposition,
+        terminalResultCleanup: {
+          graceMs: terminalResultCleanupGraceMs,
+          hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+          holdWhile: steering?.holdTerminalCleanup,
+        },
+        localProcessSandbox,
+      });
+    } finally {
+      steering?.close();
+    }
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
@@ -1022,18 +1045,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
-      const providerQuota =
-        !loginMeta.requiresLogin &&
-        (proc.exitCode ?? 0) !== 0 &&
-        isClaudeProviderQuotaError({
-          parsed: null,
-          stdout: proc.stdout,
-          stderr: proc.stderr,
-          errorMessage: fallbackErrorMessage,
-        });
+      // Without a result event there is no structured provider error, so this
+      // path never reports provider_quota.
       const transientUpstream =
         !loginMeta.requiresLogin &&
-        !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
           parsed: null,
@@ -1041,7 +1056,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
-      const transientRetryNotBefore = providerQuota || transientUpstream
+      const transientRetryNotBefore = transientUpstream
         ? extractClaudeRetryNotBefore({
             parsed: null,
             stdout: proc.stdout,
@@ -1064,12 +1079,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         })
         ? "model_not_found"
-        : providerQuota
-        ? "provider_quota"
         : transientUpstream
         ? "claude_transient_upstream"
         : null;
-      const errorFamily = providerQuota ? "provider_quota" : transientUpstream ? "transient_upstream" : null;
+      const errorFamily = transientUpstream ? "transient_upstream" : null;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -1088,9 +1101,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : {}),
           ...(transientRetryNotBefore
             ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
-            : {}),
-          ...(providerQuota && transientRetryNotBefore
-            ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
         },
@@ -1174,12 +1184,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
-      isClaudeProviderQuotaError({
-        parsed,
-        stdout: proc.stdout,
-        stderr: proc.stderr,
-        errorMessage,
-      });
+      isClaudeProviderQuotaError({ parsed });
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&

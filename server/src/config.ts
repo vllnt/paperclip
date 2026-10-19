@@ -76,6 +76,8 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  tempSweepRunGraceMinutes: number;
+  tempSweepIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -92,6 +94,7 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  runUsageRecordIntervalMs: number;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
   announcementsEnabled: boolean;
@@ -288,6 +291,24 @@ export function loadConfig(): Config {
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
       : 7;
+  // The temp sweep removes a per-run temp entry only after its run finished
+  // this many minutes ago. Values between 0 and 1 use 1; zero, a negative or a
+  // non-numeric value uses 15.
+  const tempSweepRunGraceMinutesEnv = process.env.PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES?.trim();
+  const tempSweepRunGraceMinutesRaw = Number(tempSweepRunGraceMinutesEnv);
+  const tempSweepRunGraceMinutes =
+    tempSweepRunGraceMinutesEnv && Number.isFinite(tempSweepRunGraceMinutesRaw) && tempSweepRunGraceMinutesRaw > 0
+      ? Math.max(tempSweepRunGraceMinutesRaw, 1)
+      : 15;
+  // The sweep also runs on this period. 0 sweeps on startup only; other values
+  // are kept between 1 and 1440 (one day, well inside the timer limit); a
+  // negative or non-numeric value uses 60.
+  const tempSweepIntervalMinutesEnv = process.env.PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES?.trim();
+  const tempSweepIntervalMinutesRaw = Number(tempSweepIntervalMinutesEnv);
+  const tempSweepIntervalMinutes =
+    tempSweepIntervalMinutesEnv && Number.isFinite(tempSweepIntervalMinutesRaw) && tempSweepIntervalMinutesRaw >= 0
+      ? tempSweepIntervalMinutesRaw === 0 ? 0 : Math.min(Math.max(tempSweepIntervalMinutesRaw, 1), 24 * 60)
+      : 60;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -334,6 +355,8 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    tempSweepRunGraceMinutes,
+    tempSweepIntervalMinutes,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"
@@ -358,6 +381,7 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    runUsageRecordIntervalMs: Math.max(10000, Number(process.env.RUN_USAGE_RECORD_INTERVAL_MS) || 60000),
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",

@@ -12,6 +12,8 @@ import { RoutineHistoryTab } from "../RoutineHistoryTab";
 import { RoutineActivityRow } from "../RoutineActivityRow";
 import { useRoutineDetail } from "./context";
 
+export { EventGroupsSection } from "./EventGroupsSection";
+
 export function RunsSection() {
   const { routine, companyId, agents, projects, hasLiveRun, activeIssueId } = useRoutineDetail();
   const queryClient = useQueryClient();
@@ -106,8 +108,7 @@ export function HistorySection() {
     routine,
     isEditDirty,
     dirtyFields,
-    routineDefaults,
-    setEditDraft,
+    discardEdits,
     saveRoutine,
     agentById,
     projectById,
@@ -121,7 +122,7 @@ export function HistorySection() {
       routine={routine}
       isEditDirty={isEditDirty}
       dirtyFields={dirtyFields}
-      onDiscardEdits={() => setEditDraft(routineDefaults)}
+      onDiscardEdits={discardEdits}
       onSaveEdits={() => {
         if (!saveRoutine.isPending && routine.title.trim()) {
           saveRoutine.mutate();

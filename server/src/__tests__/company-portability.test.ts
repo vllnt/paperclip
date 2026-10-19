@@ -2454,6 +2454,34 @@ describe("company portability", () => {
             createdAt: new Date(),
             updatedAt: new Date(),
           },
+          {
+            id: "trigger-3",
+            companyId: "company-1",
+            routineId: "routine-1",
+            kind: "event",
+            label: "Gatus alerts",
+            enabled: true,
+            cronExpression: null,
+            timezone: null,
+            nextRunAt: null,
+            lastFiredAt: null,
+            publicId: null,
+            secretId: null,
+            signingMode: null,
+            replayWindowSec: null,
+            eventSourceId: "event-source-secret-marker",
+            eventMatch: { types: ["uptime.down"] },
+            eventGrouping: null,
+            fallback: false,
+            lastRotatedAt: null,
+            lastResult: null,
+            createdByAgentId: null,
+            createdByUserId: null,
+            updatedByAgentId: null,
+            updatedByUserId: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
         ],
         lastRun: null,
         activeIssue: null,
@@ -2478,6 +2506,9 @@ describe("company portability", () => {
     expect(extension).toContain('signingMode: "hmac_sha256"');
     expect(extension).not.toContain("secretId");
     expect(extension).not.toContain("publicId");
+    // Event triggers point at an instance-specific source and are never exported.
+    expect(extension).not.toContain("event-source-secret-marker");
+    expect(extension).not.toContain("Gatus alerts");
     expect(exported.manifest.issues).toEqual([
       expect.objectContaining({
         slug: "monday-review",
@@ -2494,6 +2525,7 @@ describe("company portability", () => {
         }),
       }),
     ]);
+    expect(exported.manifest.issues[0]?.routine?.triggers.map((trigger) => trigger.kind)).toEqual(["schedule", "webhook"]);
   });
 
   it("skips built-in managed agents and routines during export", async () => {

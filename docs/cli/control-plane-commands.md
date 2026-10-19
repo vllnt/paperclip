@@ -16,9 +16,13 @@ npx paperclipai issue get <issue-id-or-identifier>
 
 # Create issue
 npx paperclipai issue create --title "..." [--description "..."] [--status todo] [--priority high]
+npx paperclipai issue similar --title "..." [--description "..."] [--parent-id <issue-id>]
 
 # Update issue
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]
+
+# Block an issue on a human step; the board sees it in its inbox and must unblock it
+npx paperclipai issue update <issue-id> --status blocked --unblock-owner board --unblock-action "Click Update branch on PR #123"
 
 # Add comment
 npx paperclipai issue comment <issue-id> --body "..." [--reopen]
@@ -28,7 +32,57 @@ npx paperclipai issue checkout <issue-id> --agent-id <agent-id>
 
 # Release task
 npx paperclipai issue release <issue-id>
+
+# Per-issue adapter overrides: run this issue's assignee with a different model or effort
+npx paperclipai issue update <issue-id> --adapter-overrides-json '{"adapterConfig":{"model":"gpt-5","effort":"high"}}'
+npx paperclipai issue update <issue-id> --adapter-overrides-file overrides.json
+npx paperclipai issue update <issue-id> --adapter-overrides-json null     # clear them
+npx paperclipai issue create -C <company-id> --title "..." --adapter-overrides-json '{"useProjectWorkspace":true}'
 ```
+
+`--adapter-overrides-json` and `--adapter-overrides-file` take the issue's `assigneeAdapterOverrides`
+object: `adapterConfig` (keys that override the agent's adapter config for runs on this issue) and
+`useProjectWorkspace` (boolean). Unknown keys are rejected before the request is sent. Use only one of the
+two options.
+
+### Issue Recovery Actions
+
+```sh
+# Open recovery actions across a company, newest first
+npx paperclipai issue recovery-actions:list [-C <company-id>] [--status active,escalated] [--limit 50] [--json]
+
+# The open recovery action of one issue
+npx paperclipai issue recovery-actions <issue-id>
+
+# Resolve a recovery action
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  [--action-id <id>] [--resolution-note "..."]
+
+# Resolve an execution recovery with a reconciliation (board only)
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  --reconciliation-run-id <run-id> --provider-stopped --action-outcome completed \
+  --outcome-evidence "..." [--workspace-repair-evidence "..."]
+```
+
+`recovery-actions:list` statuses are `active`, `escalated`, `resolved`, and
+`cancelled`; the default is the open ones (`active,escalated`). The limit is
+1-200 (default 50). The list is read-only and does not re-check stale actions.
+For `recovery:resolve`, any reconciliation flag sends an `executionReconciliation`
+object; `--provider-stopped` is required in that case, and evidence texts need
+20-12000 characters.
+
+### Issue Tree
+
+```sh
+npx paperclipai issue tree <issue-id> [-C <company-id>] [--json]
+```
+
+Prints the issue and its sub-issues as an indented tree, one line per issue:
+`identifier [status] assignee=<agent name | user:<id> | -> lastRun=<status(errorCode) age | ->  title`.
+Agent names are looked up with the company ID (`-C`, context, or
+`PAPERCLIP_COMPANY_ID`); without one, agent IDs are shown. Nodes you cannot read
+are omitted and counted in a footer line. `--json` prints the raw
+`GET /api/issues/{issueId}/diagnostics/subtree` response.
 
 ## Company Commands
 
@@ -73,7 +127,39 @@ command.
 ```sh
 npx paperclipai agent list
 npx paperclipai agent get <agent-id>
+
+# Config history
+npx paperclipai agent config-revisions <agent-id>
+npx paperclipai agent config-revision:get <agent-id> <revision-id>
+npx paperclipai agent config-revision:diff <agent-id> <revision-id> [--json]
+npx paperclipai agent config-revision:rollback <agent-id> <revision-id>
 ```
+
+`config-revision:diff` prints one line per changed leaf as
+`path: before -> after` (`(unset)` marks an added or removed key). Arrays are
+compared as whole values. Secret values are redacted by the server, so a key the
+server recorded as changed with no visible difference prints as
+`<key>: changed (values redacted)`. `--json` prints
+`{ changedKeys, changes: [{ path, kind, before, after }], redactedOnlyKeys }`.
+
+```sh
+# Change one config value; other keys and secrets stay as they are
+npx paperclipai agent config set <agent-id> runtimeConfig.heartbeat.maxDailyRuns=64
+npx paperclipai agent config set <agent-id> adapterConfig.model=gpt-5 adapterConfig.effort=high
+npx paperclipai agent config set <agent-id> --unset adapterConfig.env.DEBUG
+npx paperclipai agent config set <agent-id> adapterConfig.model=gpt-5 --dry-run   # print the patch only
+
+# Read config (secrets stay redacted)
+npx paperclipai agent config get <agent-id>
+npx paperclipai agent config get <agent-id> runtimeConfig.heartbeat
+```
+
+`agent config set` takes `path=value` pairs under `adapterConfig.` or `runtimeConfig.`. A value that is
+valid JSON (`64`, `true`, `{"type":"secret_ref","secretId":"..."}`) is sent as JSON; anything else is sent
+as text. Quote a number to keep it as text: `adapterConfig.effort='"64"'`. Put `--unset` after the
+assignments, because it takes every following path. The command sends a merge patch
+(`PATCH /api/agents/{id}` with `mergeConfig: true`), so the server records a config revision and nothing
+else in the config changes.
 
 ## Skills Commands
 
@@ -97,6 +183,43 @@ npx paperclipai skills import owner/repo/path/to/skill --company-id <company-id>
 # Attach desired company skills to an agent after install/import
 npx paperclipai skills agent sync <agent-id> --skill github-pr-workflow --mode add --company-id <company-id>
 ```
+
+### Company Skill Versions
+
+```sh
+# List saved versions of a company skill, newest revision first
+npx paperclipai skill versions <skill-id> [-C <company-id>]
+
+# Get one version, including the content of every file
+npx paperclipai skill version:get <skill-id> <version-id> [-C <company-id>]
+
+# Unified line diff of the files between two versions
+npx paperclipai skill version:diff <skill-id> <from-version-id> <to-version-id> [-C <company-id>] [--json]
+```
+
+`version:diff` fetches both versions and diffs their files client-side: one
+`--- a/<path>` / `+++ b/<path>` block with `@@` hunks (3 lines of context) per
+added, removed, or modified file. Base64 (binary) files print
+`Binary file <path> differs`; an executable-bit change prints
+`executable: false -> true`. `--json` prints
+`{ fromVersionId, toVersionId, fromRevisionNumber, toRevisionNumber, files: [{ path, change, binary, diff }] }`.
+
+## Environment Lease Commands
+
+```sh
+# Leases of one environment (all statuses unless filtered)
+npx paperclipai environment leases <environment-id> [--status released,failed] [--json]
+
+# A company's leases across environments (default status: active,pending_cleanup)
+npx paperclipai environment leases:list [-C <company-id>] [--status active,expired] [--json]
+
+# One lease
+npx paperclipai environment lease <lease-id>
+```
+
+Lease statuses are `active`, `released`, `expired`, `failed`, `retained`, and
+`pending_cleanup`; `--status` takes a comma-separated list and an unknown value
+is rejected with `400`. These commands need board authentication.
 
 ## Approval Commands
 
@@ -126,6 +249,25 @@ npx paperclipai approval resubmit <approval-id> [--payload '{"..."}']
 npx paperclipai approval comment <approval-id> --body "..."
 ```
 
+## Event Source Commands
+
+External signed events that wake routines. See `docs/api/event-sources.md`.
+
+```sh
+npx paperclipai event-sources list --company-id <id> [--include-archived]
+
+# Board only. The ingress URL and signing secret are shown once.
+npx paperclipai event-sources create --company-id <id> --name "Gatus" [--signing-mode hmac_sha256|bearer] [--normalizer generic_v1|gatus]
+
+# Board only. The previous secret stops working immediately.
+npx paperclipai event-sources rotate <source-id>
+
+# Dry run: shows each stage and writes nothing
+npx paperclipai event-sources test <source-id> --file event.json
+
+npx paperclipai event-sources deliveries <source-id> [--status failed] [--limit 50] [--cursor <cursor>]
+```
+
 ## Activity Commands
 
 ```sh
@@ -149,8 +291,60 @@ npx paperclipai instance settings:experimental:update --payload-json '{...}'
 
 Experimental features are opt-in and are provided without compatibility guarantees. They may break, change, or be removed at any time. Use them at your own risk.
 
+## Run Commands
+
+```sh
+# Filter runs: status and error code take comma-separated values; times are ISO 8601 or a duration back from now
+npx paperclipai run list --status failed,timed_out --since 6h
+npx paperclipai run list --agent-id <agent-id> --error-code adapter_failed --since 2026-10-08T00:00:00Z --limit 50
+
+# Health: counts by status, top error codes, and each agent's runs today against its daily cap
+npx paperclipai run stats
+npx paperclipai run stats --since 7d --agent-id <agent-id> --json
+```
+
+`runsToday` counts what `runtimeConfig.heartbeat.maxDailyRuns` counts: runs started in the current UTC day that
+are not queued or waiting to retry, less the provider quota failures that the cap forgives (see
+`providerQuotaRetry.maxDailyUncountedRuns`).
+
+## Plugin Actions
+
+Plugin actions that the board UI runs also work from the CLI with a board API key (from
+`paperclipai auth login`), with no browser session. The CLI sends the company from `-C`, `PAPERCLIP_COMPANY_ID`
+or the context profile; the server overrides any `companyId` inside `--params-json` with it.
+
+```sh
+# GitHub write identity and user authorization (set/check/start need a board key whose user is an instance admin)
+npx paperclipai plugin action vllnt.paperclip-github write-identity.get --params-json '{}'
+npx paperclipai plugin action vllnt.paperclip-github write-identity.set --params-file policy.json
+npx paperclipai plugin action vllnt.paperclip-github user-authorization.status --params-json '{}'
+npx paperclipai plugin action vllnt.paperclip-github user-authorization.check --params-json '{}'
+
+# Repositories and sync
+npx paperclipai plugin action vllnt.paperclip-github repositories.list --params-json '{"refresh":true}'
+npx paperclipai plugin action vllnt.paperclip-github sync.trigger --params-json '{}'
+
+# Update a PR branch from its base (board-only; the head SHA must match)
+npx paperclipai plugin action vllnt.paperclip-github manage-repository \
+  --params-json '{"op":"update-branch","repositoryId":123,"number":45,"sha":"<head-sha>","requestId":"update-45-1"}'
+```
+
+Board-only GitHub actions refuse an agent credential with "board-only, but it was called with an agent credential".
+Use `paperclipai auth whoami` to check which credential the CLI is using.
+
 ## Heartbeat
 
 ```sh
 npx paperclipai heartbeat run --agent-id <agent-id> [--api-base http://localhost:3100]
 ```
+
+### Continue a stopped issue execution
+
+```sh
+paperclipai issue reconcile <issue-id> \
+  --outcome none \
+  --note "The provider stopped before any external write was made." \
+  --expected-run-id <latest-stopped-run-id>
+```
+
+Use `done`, `none`, or `mixed` for `--outcome`. This records board evidence for all stacked stopped-run holds and queues one fresh continuation. Add `--workspace-repair-note` when the recovery record reports an unsafe workspace restore.

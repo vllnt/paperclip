@@ -2,13 +2,14 @@
 # No image here comes from Docker Hub: its anonymous pull limit returned 429 on
 # GitHub-hosted runners, and a failed release build cuts no release. Each
 # reference names a mirror and pins the index digest docker.io serves for the
-# same tag, so the bytes are identical. Docker library images come from
-# Docker's ECR Public mirror; other Docker Hub images come from mirror.gcr.io,
-# which serves only what it has cached. The BuildKit image is pinned the same
-# way in the workflows' setup-buildx-action steps. To bump a pin, read the new
-# digest with `docker buildx imagetools inspect docker.io/<image>:<tag>`,
-# confirm the mirror returns the same digest, and replace the @sha256 part.
-FROM public.ecr.aws/docker/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
+# same tag, so the bytes are identical. Images come from mirror.gcr.io, which
+# serves only what it has cached. Docker's ECR Public mirror is not used: its
+# anonymous data limit also returned 429 on GitHub-hosted runners. The BuildKit
+# image is pinned the same way in the workflows' setup-buildx-action steps. To
+# bump a pin, read the new digest with
+# `docker buildx imagetools inspect docker.io/<image>:<tag>`, confirm the
+# mirror returns the same digest, and replace the @sha256 part.
+FROM mirror.gcr.io/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
@@ -57,6 +58,7 @@ COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-w
 COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
 COPY packages/plugins/plugin-providers/package.json packages/plugins/plugin-providers/
 COPY packages/plugins/plugin-github/package.json packages/plugins/plugin-github/
+COPY packages/plugins/plugin-convex/package.json packages/plugins/plugin-convex/
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
@@ -142,21 +144,43 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 # Both the browser bundle and server stamp need the source commit. Declare it
 # after the stable dependency layers, before either application build.
 ARG PAPERCLIP_BUILD_COMMIT=""
-RUN pnpm exec vitest run packages/shared/src/company-environment-defaults.test.ts server/src/__tests__/instance-settings-service.test.ts server/src/__tests__/instance-settings-routes.test.ts packages/adapters/codex-local/src/company-model-catalog.test.ts packages/adapters/claude-local/src/current-model-catalog.test.ts ui/src/lib/agent-setup-fields.test.ts ui/src/lib/test-agent-setup.test.ts ui/src/lib/saved-provider-credentials.test.ts packages/adapters/codex-local/src/server/test.remote.test.ts packages/adapters/codex-local/src/server/runtime-config.test.ts packages/adapters/codex-local/src/server/execute.remote.test.ts packages/adapter-utils/src/workspace-restore-merge.test.ts packages/adapter-utils/src/directory-merge-lock.test.ts
-RUN pnpm check:token-gates
-# The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
-# after the SDK build, so build the SDK before typechecking the UI.
+# Plugin tests and the UI use the SDK exports, so build them before the test manifest.
 RUN pnpm --filter @paperclipai/plugin-sdk build
+# Tests that gate the production image build. The list lives in
+# scripts/ci/image-build-vitest-files.txt, one path per line, so that concurrent pull requests that
+# add a test touch different lines instead of rewriting this one. An empty list or a path that does not exist fails the build;
+# blank lines and # comments are ignored. The script that reads the list has its own test, run first.
+RUN node --test scripts/ci/run-image-build-vitest.test.mjs
+RUN sh scripts/ci/run-image-build-vitest.sh
+
+RUN pnpm check:token-gates
+# The GitHub launcher's retry of a busy or slow Paperclip server (bounded backoff, a clear final error); no database.
+RUN pnpm exec vitest run packages/adapter-utils/src/github-launcher-backoff.test.ts
+RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
+# The GitHub credentials route: the short per-run cache of ordinary reads (what it keeps, for how long, for whom) and what the
+# route does when its caller has gone. No database: the embedded Postgres tests of the same change are skipped in this build
+# (it runs as root), so they gate on a host that does not.
+RUN pnpm exec vitest run server/src/__tests__/github-read-decision-cache.test.ts server/src/__tests__/github-credentials-route-caller.test.ts
+# Provider-quota classification of the Codex and Claude adapters, and the GitHub plugin's
+# refusal to send a request without credentials (it needs the SDK test export built above; no database).
+RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts packages/plugins/plugin-github/tests/no-unauthenticated-requests.spec.ts
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
+# The GitHub plugin's merge guard and the instance admin's per-repository opt-in (agentMergeablePaths): the guard and path rules,
+# the config schema as the host validates it when it is saved, and the save route's admin check. No database. After the plugin SDK build.
+RUN pnpm exec vitest run packages/plugins/plugin-github/tests/protected-paths.spec.ts packages/plugins/plugin-github/tests/write-identity.spec.ts server/src/__tests__/plugin-github-merge-opt-in-config.test.ts
+RUN pnpm exec vitest run server/src/__tests__/plugin-routes-authz.test.ts -t agentMergeablePaths
+# The manifest includes the Convex guard, page, CLI and bundled-plugin tests.
+RUN pnpm --filter @vllnt/paperclip-convex typecheck
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
+RUN pnpm --filter @vllnt/paperclip-convex build
 # Build the remaining bundled local plugins here. The production root filesystem
 # is read-only and cannot run the server's install-time auto-build, so a bundled
 # plugin without its dist entrypoints cannot be installed from the UI.
 RUN pnpm --filter @paperclipai/plugin-llm-wiki build \
   && pnpm --filter @paperclipai/plugin-workspace-diff build \
-  && for plugin in plugin-llm-wiki plugin-workspace-diff plugin-providers plugin-github; do \
+  && for plugin in plugin-llm-wiki plugin-workspace-diff plugin-providers plugin-github plugin-convex; do \
        test -f "packages/plugins/$plugin/dist/manifest.js" \
          || { echo "ERROR: bundled plugin $plugin has no dist/manifest.js" >&2; exit 1; }; \
      done
@@ -201,12 +225,15 @@ ARG CLI_TOOLS_CACHE_EPOCH=""
 # Remote-worker deployments do not need global inference CLIs on the control host.
 ARG INSTALL_LOCAL_CLIS=true
 WORKDIR /app
+# Grok Build is pinned and checksum-verified, unlike the @latest CLI tools.
+COPY scripts/install-grok-build.sh /tmp/install-grok-build.sh
 # Tool and OS layer BEFORE the app copy: it references nothing from /app, and
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && if [ "$INSTALL_LOCAL_CLIS" = "true" ]; then npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest; fi \
+  && if [ "$INSTALL_LOCAL_CLIS" = "true" ]; then npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest && sh /tmp/install-grok-build.sh; fi \
+  && rm -f /tmp/install-grok-build.sh \
   && npm cache clean --force \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \

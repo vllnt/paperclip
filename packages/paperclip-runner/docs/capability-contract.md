@@ -8,9 +8,9 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 
 ## Baseline Counts
 
-- Skill/reference headings: 160
+- Skill/reference headings: 163
 - Eval cases: 106 across 16 groups
-- Total normative rows: 266
+- Total normative rows: 269
 - Legacy MCP aliases folded into normative rows: 42
 
 | Eval group | Cases |
@@ -137,11 +137,12 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/api-reference.md:issues-tasks:1405 | optional_agent_tool | skills/paperclip/references/api-reference.md:1405 |
 | skill:skills/paperclip/references/api-reference.md:companies-projects-goals:1446 | optional_agent_tool | skills/paperclip/references/api-reference.md:1446 |
 | skill:skills/paperclip/references/api-reference.md:routines:1470 | optional_agent_tool | skills/paperclip/references/api-reference.md:1470 |
-| skill:skills/paperclip/references/api-reference.md:approvals-costs-activity-dashboard:1486 | optional_agent_tool | skills/paperclip/references/api-reference.md:1486 |
-| skill:skills/paperclip/references/api-reference.md:secrets:1508 | optional_agent_tool | skills/paperclip/references/api-reference.md:1508 |
-| skill:skills/paperclip/references/api-reference.md:agent-secret-proposals:1521 | optional_agent_tool | skills/paperclip/references/api-reference.md:1521 |
-| skill:skills/paperclip/references/api-reference.md:agent-secret-access:1621 | optional_agent_tool | skills/paperclip/references/api-reference.md:1621 |
-| skill:skills/paperclip/references/api-reference.md:common-mistakes:1661 | optional_agent_tool | skills/paperclip/references/api-reference.md:1661 |
+| skill:skills/paperclip/references/api-reference.md:event-sources:1487 | optional_agent_tool | skills/paperclip/references/api-reference.md:1487 |
+| skill:skills/paperclip/references/api-reference.md:approvals-costs-activity-dashboard:1503 | optional_agent_tool | skills/paperclip/references/api-reference.md:1503 |
+| skill:skills/paperclip/references/api-reference.md:secrets:1525 | optional_agent_tool | skills/paperclip/references/api-reference.md:1525 |
+| skill:skills/paperclip/references/api-reference.md:agent-secret-proposals:1538 | optional_agent_tool | skills/paperclip/references/api-reference.md:1538 |
+| skill:skills/paperclip/references/api-reference.md:agent-secret-access:1638 | optional_agent_tool | skills/paperclip/references/api-reference.md:1638 |
+| skill:skills/paperclip/references/api-reference.md:common-mistakes:1678 | optional_agent_tool | skills/paperclip/references/api-reference.md:1678 |
 | skill:skills/paperclip/references/artifacts.md:generated-artifacts-and-work-products:1 | always_agent_tool | skills/paperclip/references/artifacts.md:1 |
 | skill:skills/paperclip/references/artifacts.md:workspace-only-file-references:15 | optional_agent_tool | skills/paperclip/references/artifacts.md:15 |
 | skill:skills/paperclip/references/cases.md:cases:1 | optional_agent_tool | skills/paperclip/references/cases.md:1 |
@@ -191,10 +192,12 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/routines.md:schedule-cron:136 | optional_agent_tool | skills/paperclip/references/routines.md:136 |
 | skill:skills/paperclip/references/routines.md:webhook:150 | optional_agent_tool | skills/paperclip/references/routines.md:150 |
 | skill:skills/paperclip/references/routines.md:api-manual-only:167 | optional_agent_tool | skills/paperclip/references/routines.md:167 |
-| skill:skills/paperclip/references/routines.md:updating-and-deleting-triggers:179 | optional_agent_tool | skills/paperclip/references/routines.md:179 |
-| skill:skills/paperclip/references/routines.md:manual-run:196 | optional_agent_tool | skills/paperclip/references/routines.md:196 |
-| skill:skills/paperclip/references/routines.md:updating-a-routine:212 | optional_agent_tool | skills/paperclip/references/routines.md:212 |
-| skill:skills/paperclip/references/routines.md:reading-routines-and-runs:223 | optional_agent_tool | skills/paperclip/references/routines.md:223 |
+| skill:skills/paperclip/references/routines.md:event:177 | optional_agent_tool | skills/paperclip/references/routines.md:177 |
+| skill:skills/paperclip/references/routines.md:event-triggers:183 | optional_agent_tool | skills/paperclip/references/routines.md:183 |
+| skill:skills/paperclip/references/routines.md:updating-and-deleting-triggers:230 | optional_agent_tool | skills/paperclip/references/routines.md:230 |
+| skill:skills/paperclip/references/routines.md:manual-run:247 | optional_agent_tool | skills/paperclip/references/routines.md:247 |
+| skill:skills/paperclip/references/routines.md:updating-a-routine:263 | optional_agent_tool | skills/paperclip/references/routines.md:263 |
+| skill:skills/paperclip/references/routines.md:reading-routines-and-runs:274 | optional_agent_tool | skills/paperclip/references/routines.md:274 |
 | skill:skills/paperclip/references/workflows.md:paperclip-workflow-playbooks:1 | optional_agent_tool | skills/paperclip/references/workflows.md:1 |
 | skill:skills/paperclip/references/workflows.md:project-setup-ceo-manager:7 | optional_agent_tool | skills/paperclip/references/workflows.md:7 |
 | skill:skills/paperclip/references/workflows.md:openclaw-invite-ceo:22 | optional_agent_tool | skills/paperclip/references/workflows.md:22 |

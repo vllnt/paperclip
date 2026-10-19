@@ -1,6 +1,7 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { isDeepStrictEqual } from "node:util";
+import { and, desc, eq, gt, gte, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -20,6 +21,7 @@ import {
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  agentFallbacksSchema,
   agentRuntimeConfigSchema,
   getAgentWorkEligibility,
   isUuidLike,
@@ -33,8 +35,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import {
-  collectSecretRefs,
-  collectUserSecretRefs,
+  collectAgentBindingRefs,
   syncAgentAdapterEnvBindings,
 } from "./agent-secret-bindings.js";
 import { logActivity } from "./activity-log.js";
@@ -75,6 +76,7 @@ const CONFIG_REVISION_FIELDS = [
   "adapterType",
   "adapterConfig",
   "runtimeConfig",
+  "fallbacks",
   "defaultEnvironmentId",
   "budgetMonthlyCents",
   "metadata",
@@ -119,7 +121,22 @@ interface ClaudeLoginContext {
 }
 
 interface UpdateAgentOptions {
+  /**
+   * Runs inside the update transaction after the agent row is locked with
+   * `SELECT ... FOR NO KEY UPDATE`, so a caller that authorized against an earlier
+   * read can check the committed row before it writes. A throw aborts the update.
+   * The lock waits for a concurrent update of the row but, unlike `FOR UPDATE`,
+   * not for the key-share lock that the denial log's `agent_id` foreign key
+   * takes on another connection while the hook runs.
+   */
+  verifyLockedRow?: (locked: typeof agents.$inferSelect) => Promise<void>;
   recordRevision?: RevisionMetadata;
+  /**
+   * The configs a merge patch was applied to. The update locks the agent row
+   * and fails with 409 when the stored configs changed since they were read,
+   * so a concurrent change is never overwritten with a stale merge base.
+   */
+  expectedConfig?: { adapterConfig: unknown; runtimeConfig: unknown };
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
@@ -175,6 +192,7 @@ function buildConfigSnapshot(
     adapterType: row.adapterType,
     adapterConfig,
     runtimeConfig,
+    fallbacks: Array.isArray(row.fallbacks) ? row.fallbacks.filter(isPlainRecord).map((entry) => sanitizeRecord(entry)) : [],
     defaultEnvironmentId: row.defaultEnvironmentId,
     budgetMonthlyCents: row.budgetMonthlyCents,
     metadata,
@@ -263,7 +281,11 @@ function diffConfigSnapshot(
   return CONFIG_REVISION_FIELDS.filter((field) => !jsonEqual(before[field], after[field]));
 }
 
-function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$inferInsert> {
+/**
+ * Maps a config revision snapshot to the exact patch a rollback applies.
+ * Exported so the rollback route can check that same patch before applying it.
+ */
+export function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$inferInsert> {
   if (!isPlainRecord(snapshot)) throw unprocessable("Invalid revision snapshot");
 
   if (typeof snapshot.name !== "string" || snapshot.name.length === 0) {
@@ -284,6 +306,12 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
   if (!runtimeConfig.success) {
     throw unprocessable("Invalid revision snapshot: runtimeConfig");
   }
+  const fallbacks = Object.prototype.hasOwnProperty.call(snapshot, "fallbacks")
+    ? agentFallbacksSchema.safeParse(snapshot.fallbacks)
+    : null;
+  if (fallbacks && !fallbacks.success) {
+    throw unprocessable("Invalid revision snapshot: fallbacks");
+  }
 
   return {
     name: snapshot.name,
@@ -298,6 +326,7 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
     adapterType: snapshot.adapterType,
     adapterConfig: isPlainRecord(snapshot.adapterConfig) ? snapshot.adapterConfig : {},
     runtimeConfig: runtimeConfig.data,
+    ...(fallbacks ? { fallbacks: fallbacks.data } : {}),
     defaultEnvironmentId:
       typeof snapshot.defaultEnvironmentId === "string" || snapshot.defaultEnvironmentId === null
         ? snapshot.defaultEnvironmentId
@@ -431,6 +460,45 @@ export function agentService(db: Db) {
     }));
   }
 
+  // Derived for display: an agent with no live run but at least one active
+  // wait (a future issue monitor on its own open issue) is "waiting", not idle.
+  // The stored status is unchanged so invocation rules stay the same.
+  async function getAgentWaitStates(companyId: string, agentIds: string[]) {
+    const rows = await db
+      .select({
+        agentId: issues.assigneeAgentId,
+        activeWaitCount: sql<number>`count(*)::int`,
+        nextCheckAt: sql<string>`min(${issues.monitorNextCheckAt})`,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.assigneeAgentId, agentIds),
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, ["in_progress", "in_review"]),
+          gt(issues.monitorNextCheckAt, new Date()),
+        ),
+      )
+      .groupBy(issues.assigneeAgentId);
+    return new Map(
+      rows.map((row) => [
+        row.agentId,
+        {
+          activeWaitCount: Number(row.activeWaitCount),
+          nextCheckAt: row.nextCheckAt ? new Date(row.nextCheckAt).toISOString() : null,
+        },
+      ]),
+    );
+  }
+
+  async function withAgentWaitState<T extends { id: string; companyId: string }>(rows: T[]) {
+    const companyId = rows[0]?.companyId;
+    if (!companyId) return rows.map((row) => ({ ...row, waitState: null }));
+    const waitStates = await getAgentWaitStates(companyId, rows.map((row) => row.id));
+    return rows.map((row) => ({ ...row, waitState: waitStates.get(row.id) ?? null }));
+  }
+
   async function getById(id: string) {
     const row = await db
       .select()
@@ -442,7 +510,8 @@ export function agentService(db: Db) {
       listCompanyAgentRows(row.companyId),
       hydrateAgentSpend([row]).then((rows) => rows[0]!),
     ]);
-    return normalizeAgentRow(hydrated, companyRows);
+    const [withWaitState] = await withAgentWaitState([normalizeAgentRow(hydrated, companyRows)]);
+    return withWaitState!;
   }
 
   async function requireGetById(id: string) {
@@ -498,9 +567,9 @@ export function agentService(db: Db) {
   }
 
   async function syncAgentSecretBindings(
-    agent: { id: string; companyId: string; adapterConfig: unknown },
+    agent: { id: string; companyId: string; adapterConfig: unknown; fallbacks?: unknown },
     dbClient: Db = db,
-    previousAdapterConfig: unknown = null,
+    previous: { adapterConfig: unknown; fallbacks?: unknown } | null = null,
     actor: RevisionMetadata = {},
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
@@ -509,20 +578,23 @@ export function agentService(db: Db) {
       companyId: agent.companyId,
       agentId: agent.id,
       adapterConfig: agent.adapterConfig,
+      fallbacks: agent.fallbacks,
     });
+    const previousBindingRefs = collectAgentBindingRefs(previous?.adapterConfig ?? null, previous?.fallbacks);
+    const currentBindingRefs = collectAgentBindingRefs(agent.adapterConfig, agent.fallbacks);
     const previousRefs = new Set([
-      ...collectSecretRefs(previousAdapterConfig).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
-      ...collectUserSecretRefs(previousAdapterConfig).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
+      ...previousBindingRefs.secretRefs.map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
+      ...previousBindingRefs.userSecretRefs.map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
     ]);
     const createdRefs = [
-      ...collectSecretRefs(agent.adapterConfig).map((ref) => ({
+      ...currentBindingRefs.secretRefs.map((ref) => ({
         key: `secret:${ref.secretId}:${ref.configPath}`,
         configPath: ref.configPath,
         bindingType: "secret_ref",
         secretId: ref.secretId,
         definitionKey: null,
       })),
-      ...collectUserSecretRefs(agent.adapterConfig).map((ref) => ({
+      ...currentBindingRefs.userSecretRefs.map((ref) => ({
         key: `user:${ref.definitionKey}:${ref.configPath}`,
         configPath: ref.configPath,
         bindingType: "user_secret_ref",
@@ -788,6 +860,26 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
+      if (options?.verifyLockedRow || options?.expectedConfig) {
+        const locked = await txDb
+          .select()
+          .from(agents)
+          .where(eq(agents.id, id))
+          .for("no key update")
+          .then((rows) => rows[0] ?? null);
+        if (!locked) return null;
+        if (options.expectedConfig) {
+          const current = await agentService(txDb).getById(id);
+          if (
+            !current
+            || !isDeepStrictEqual(current.adapterConfig, options.expectedConfig.adapterConfig)
+            || !isDeepStrictEqual(current.runtimeConfig, options.expectedConfig.runtimeConfig)
+          ) {
+            throw conflict("The agent config changed while this merge patch was applied. Read it again and retry.");
+          }
+        }
+        await options.verifyLockedRow?.(locked);
+      }
       const updated = await txDb
         .update(agents)
         .set({ ...normalizedPatch, updatedAt: new Date() })
@@ -808,7 +900,10 @@ export function agentService(db: Db) {
           .where(and(eq(agentRuntimeState.companyId, existing.companyId), eq(agentRuntimeState.agentId, id)));
       }
 
-      if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
+      if (
+        Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig") ||
+        Object.prototype.hasOwnProperty.call(normalizedPatch, "fallbacks")
+      ) {
         if (bindingDecision) {
           await enforceClaudeOAuthBindingClaim(txDb, {
             companyId: existing.companyId,
@@ -821,7 +916,7 @@ export function agentService(db: Db) {
         await syncAgentSecretBindings(
           updated,
           txDb,
-          existing.adapterConfig,
+          { adapterConfig: existing.adapterConfig, fallbacks: existing.fallbacks },
           options?.recordRevision,
         );
       }
@@ -870,7 +965,7 @@ export function agentService(db: Db) {
         listCompanyAgentRows(companyId),
       ]);
       const hydrated = await hydrateAgentSpend(rows);
-      return normalizeAgentRows(hydrated, allCompanyRows);
+      return withAgentWaitState(normalizeAgentRows(hydrated, allCompanyRows));
     },
 
     getById,
@@ -1149,7 +1244,7 @@ export function agentService(db: Db) {
             environmentId: null,
           });
         }
-        await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+        await syncAgentSecretBindings(updated, txDb, { adapterConfig: existing.adapterConfig, fallbacks: existing.fallbacks });
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {
           throw notFound("Agent not found");
@@ -1207,6 +1302,7 @@ export function agentService(db: Db) {
       id: string,
       revisionId: string,
       actor: { agentId?: string | null; userId?: string | null },
+      rollbackOptions?: Pick<UpdateAgentOptions, "verifyLockedRow">,
     ) => {
       const revision = await db
         .select()
@@ -1220,6 +1316,7 @@ export function agentService(db: Db) {
 
       const patch = configPatchFromSnapshot(revision.afterConfig);
       return updateAgent(id, patch, {
+        verifyLockedRow: rollbackOptions?.verifyLockedRow,
         recordRevision: {
           createdByAgentId: actor.agentId ?? null,
           createdByUserId: actor.userId ?? null,

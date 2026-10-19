@@ -6,13 +6,14 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
-import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
+import { buildOpenApiSpec, CONVEX_PLUGIN_ACTIONS, CONVEX_PLUGIN_SCHEMAS, openApiRoutes } from "../routes/openapi.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROUTES_DIR = path.resolve(__dirname, "../routes");
 
 const apiPrefixes: Record<string, string> = {
   "pipelines.ts": "/api",
+  "resource-capacity.ts": "/api",
   "cases.ts": "/api",
   "smoke-lab.ts": "/api",
   "access.ts": "/api",
@@ -32,6 +33,7 @@ const apiPrefixes: Record<string, string> = {
   "chat-channels.ts": "/api",
   "slack-tools.ts": "/api",
   "email.ts": "/api",
+  "event-sources.ts": "/api",
   "cloud.ts": "/api/cloud",
   "companies.ts": "/api/companies",
   "company-skills.ts": "/api",
@@ -54,9 +56,12 @@ const apiPrefixes: Record<string, string> = {
   "instance-database-backups.ts": "/api",
   "instance-settings.ts": "/api",
   "issues.ts": "/api",
+  "issue-duplicates.ts": "/api",
   "issue-tree-control.ts": "/api",
+  "issue-git-links.ts": "/api",
   "llms.ts": "/api",
   "managed-agent-profiles.ts": "/api",
+  "observability.ts": "/api",
   "onboarding-seed.ts": "/api",
   "openapi.ts": "/api",
   "plugin-ui-static.ts": "/api",
@@ -80,6 +85,8 @@ const apiPrefixes: Record<string, string> = {
 const ROUTE_LITERAL_PATTERN =
   /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
 const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
+const ROUTE_METHOD_LOOP_PATTERN =
+  /for\s*\(\s*const\s+method\s+of\s+\[([^\]]+)\][^)]*\)\s*\{\s*router\[method\]\(\s*["'`]([^"'`]+)["'`]/g;
 const HTTP_METHODS = new Set([
   "get",
   "put",
@@ -178,6 +185,20 @@ function loadActualRoutes() {
       continue;
     }
 
+    // `for (const method of ["get", "post"] as const) router[method]("/path", ...)`.
+    // Any other computed registration would be invisible here, so it fails the test.
+    const loopMatches = [...source.matchAll(ROUTE_METHOD_LOOP_PATTERN)].length;
+    if ((source.match(/\brouter\[/g) ?? []).length !== loopMatches) {
+      unknownRouteFiles.push(`${file} (computed router[...] registration)`);
+    }
+    for (const match of source.matchAll(ROUTE_METHOD_LOOP_PATTERN)) {
+      for (const method of match[1].match(/get|post|put|patch|delete/g) ?? []) {
+        routes.add(
+          `${method.toUpperCase()} ${normalizeExpressPath(resolveMountedPath(file, prefix, match[2]))}`,
+        );
+      }
+    }
+
     for (const match of source.matchAll(ROUTE_LITERAL_PATTERN)) {
       const method = match[1].toUpperCase();
       const routePath = match[2];
@@ -248,6 +269,37 @@ describe("openapi routes", () => {
     expect(dismiss.description).toContain("viewers may dismiss their own");
   });
 
+  it("documents event-source ingress as a public secret-authenticated operation and management as board-only", () => {
+    const { spec } = loadSpecRoutes();
+    const ingest = spec.paths["/api/event-sources/public/{publicId}/events"].post;
+    expect(ingest.security).toEqual([]);
+    expect(ingest["x-paperclip-authorization"]).toEqual({ actor: "public" });
+    for (const status of ["200", "202", "401", "404", "409", "413", "415", "422", "429", "503"]) {
+      expect(ingest.responses[status], `ingress response ${status}`).toBeDefined();
+    }
+    expect(ingest.requestBody.content["application/json"].schema.properties.dedupeKey).toBeDefined();
+
+    const create = spec.paths["/api/companies/{companyId}/event-sources"].post;
+    expect(create["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(create.responses["201"]).toBeDefined();
+    for (const [route, method] of [
+      ["/api/event-sources/{id}", "patch"],
+      ["/api/event-sources/{id}", "delete"],
+      ["/api/event-sources/{id}/rotate-secret", "post"],
+    ] as const) {
+      expect(spec.paths[route][method]["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    }
+    for (const [route, method] of [
+      ["/api/companies/{companyId}/event-sources", "get"],
+      ["/api/event-sources/{id}", "get"],
+      ["/api/event-sources/{id}/test", "post"],
+      ["/api/event-sources/{id}/deliveries", "get"],
+      ["/api/routines/{id}/event-groups", "get"],
+    ] as const) {
+      expect(spec.paths[route][method]["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    }
+  });
+
   it("documents exact failed-run selection and durable accepted retry responses", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
     const wake = res.body.paths["/api/agents/{id}/wakeup"].post;
@@ -289,6 +341,28 @@ describe("openapi routes", () => {
       in: "query",
       required: false,
       schema: { type: "string", enum: ["accessible"] },
+    });
+    const routineListParameters: Array<{ name: string; in: string; required: boolean }> =
+      res.body.paths["/api/companies/{companyId}/routines"].get.parameters;
+    expect(routineListParameters.filter((param) => param.in === "query").map((param) => [param.name, param.required])).toEqual([
+      ["q", false],
+      ["assigneeAgentId", false],
+      ["folderId", false],
+      ["projectId", false],
+      ["status", false],
+      ["trigger", false],
+    ]);
+    expect(routineListParameters).toContainEqual({
+      name: "status",
+      in: "query",
+      required: false,
+      schema: { type: "string", enum: ["active", "paused", "archived"] },
+    });
+    expect(routineListParameters).toContainEqual({
+      name: "trigger",
+      in: "query",
+      required: false,
+      schema: { type: "string", enum: ["schedule", "webhook", "api", "event", "manual"] },
     });
     expect(res.body.paths["/api/companies"].get.responses["403"]).toBeDefined();
     expect(res.body.paths["/api/companies"].get.responses["400"]).toBeDefined();
@@ -340,7 +414,7 @@ describe("openapi routes", () => {
           "/api/issues/{id}/work-products/{workProductId}/review-document"
         ].post.responses,
       ).sort(),
-    ).toEqual(["200", "201", "401", "403", "404", "409", "413", "415", "422"]);
+    ).toEqual(["200", "201", "400", "401", "403", "404", "409", "413", "415", "422"]);
     expect(
       res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"]
         .post.summary,
@@ -712,6 +786,125 @@ describe("openapi routes", () => {
     ).toBeUndefined();
   });
 
+  it("documents the Convex plugin action contracts without any credential field", () => {
+    const spec = buildOpenApiSpec() as {
+      paths: Record<string, Record<string, { description?: string; responses: Record<string, unknown> }>>;
+      components: { schemas: Record<string, unknown> };
+    };
+    const operation = spec.paths["/api/plugins/{pluginId}/actions/{key}"].post;
+    const description = operation.description ?? "";
+    const actions = ["status", "connection.connect", "connection.disconnect", "deployments.list", "deployments.delete-preview", "reaper.run", "reaper.report"];
+    expect([...CONVEX_PLUGIN_ACTIONS]).toEqual(actions);
+    for (const action of actions) {
+      expect(description).toContain(action);
+    }
+    const schemaNames = [
+      "ConvexStatus", "ConvexDeployment", "ConvexDeploymentSummary", "ConvexConnectResult", "ConvexDisconnectResult", "ConvexDeploymentsListParams",
+      "ConvexDeploymentsList", "ConvexDeletePreviewParams", "ConvexDeletePreviewResult", "ConvexReaperRunParams", "ConvexReaperReport", "PluginBridgeError",
+    ];
+    for (const name of schemaNames) {
+      expect(spec.components.schemas[name], name).toBeDefined();
+    }
+    const report = JSON.stringify(spec.components.schemas.ConvexReaperReport);
+    for (const field of ["dev", "executed", "listed", "ciMatched"]) expect(report, field).toContain(`"${field}"`);
+    // The route references the result schemas and the error shape, and every reference resolves.
+    const responses = JSON.stringify(operation.responses);
+    for (const name of ["ConvexStatus", "ConvexConnectResult", "ConvexDisconnectResult", "ConvexDeploymentsList", "ConvexDeletePreviewResult", "ConvexReaperReport", "PluginBridgeError"]) {
+      expect(responses, name).toContain(`#/components/schemas/${name}`);
+    }
+    for (const [, name] of responses.matchAll(/#\/components\/schemas\/([A-Za-z]+)/g)) {
+      expect(spec.components.schemas[name], name).toBeDefined();
+    }
+    expect(operation.responses["502"]).toBeDefined();
+    expect(description).toContain("{ data: T }");
+    expect(description).toContain("502");
+    expect(description).toMatch(/instance administrator/);
+    expect(description).toMatch(/omitted dryRun means plan only/);
+    expect(JSON.stringify(spec.components.schemas).toLowerCase()).not.toMatch(/"(token|secret|secretid|privatekey)"\s*:/);
+
+    const schemas = spec.components.schemas as Record<string, { required?: string[]; properties: Record<string, { nullable?: boolean }> }>;
+    const status = schemas.ConvexStatus;
+    for (const field of ["guards", "reaper", "lastReport", "configError", "teamId", "credentials", "grants"]) {
+      expect(status.properties[field], field).toBeDefined();
+      expect(status.required, field).not.toContain(field);
+    }
+    for (const field of ["guards", "reaper", "lastReport", "teamId", "credentials", "grants"]) {
+      expect(status.properties[field].nullable, field).toBe(true);
+    }
+    expect(schemas.ConvexReaperReport.properties.incomplete).toBeDefined();
+    expect(schemas.ConvexReaperReport.required).not.toContain("incomplete");
+    expect(schemas.ConvexDeploymentsList.required).toEqual(["deployments", "total", "nextCursor", "truncated"]);
+  });
+
+  it("accepts realistic Convex action results with the documented schemas", () => {
+    const quota = { count: 250, quota: 300, percent: 83.3, partial: false, alert: true, issueId: null };
+    const summary = { name: "happy-animal-123", environment: "preview", deploymentType: "preview", previewIdentifier: "feat-x", lastDeployTime: 1791367200000, expiresAt: null };
+    const report = {
+      at: "2026-10-09T12:00:00.000Z", trigger: "api", dryRun: true, quota, errors: [], incomplete: "Deletion limit of 20 reached for this run.",
+      projects: [{
+        convexProjectId: "100", name: "app", previews: 3, kept: 1,
+        delete: [{ name: "old-1", previewIdentifier: "feat-old", reason: "pull request #1 is merged" }],
+        setExpiry: [{ name: "old-2", from: null, to: 1791367200000 }], deleted: [], expirySet: [],
+        failed: [], skipped: [{ name: "old-3", previewIdentifier: null, reason: "an open pull request uses it" }],
+      }],
+    };
+    const S = CONVEX_PLUGIN_SCHEMAS;
+
+    expect(S.status.parse({
+      connection: "connected", teamId: "7", credentials: { teamToken: true, github: false }, grants: 2,
+      projects: [{ convexProjectId: "100", name: "app", repository: "vllnt/app", paperclipProjectId: null, reserved: true }],
+      guards: { activityHours: 24, maxDeletesPerRun: 20, callsPerMinute: 60, dryRunOnly: false },
+      reaper: { enabled: false, ttlHours: 36, quota: 300, alertPercent: 80 },
+      lastReport: { at: report.at, dryRun: true, quota },
+    }).guards?.maxDeletesPerRun).toBe(20);
+    // The config-error branch: only connection, configError and projects are set, the rest is null or absent.
+    expect(S.status.parse({ connection: "not-configured", configError: "teamToken is required", projects: [], lastReport: null }).configError).toBe("teamToken is required");
+    expect(S.status.parse({
+      connection: "not-configured", configError: "bad", projects: [], teamId: null, credentials: null, grants: null, guards: null, reaper: null, lastReport: null,
+    }).guards).toBeNull();
+    expect(S.status.safeParse({ connection: "weird", projects: [] }).success).toBe(false);
+
+    expect(S.connectResult.parse({ projects: ["100", "101"] }).projects).toHaveLength(2);
+    expect(S.disconnectResult.parse({ connection: "disconnected" }).connection).toBe("disconnected");
+    expect(S.disconnectResult.safeParse({ connection: "connected" }).success).toBe(false);
+
+    expect(S.deploymentsListParams.parse({ limit: 50, cursor: "c-50", deploymentType: "preview" }).limit).toBe(50);
+    expect(S.deploymentsListParams.safeParse({ limit: 0 }).success).toBe(false);
+    expect(S.deploymentsListParams.safeParse({ limit: 201 }).success).toBe(false);
+    expect(S.deploymentsList.parse({ deployments: [summary], total: 120, nextCursor: "c-50", truncated: true }).nextCursor).toBe("c-50");
+    expect(S.deploymentsList.parse({ deployments: [], total: 0, nextCursor: null, truncated: false }).nextCursor).toBeNull();
+    expect(S.deploymentsList.safeParse({ deployments: [{ ...summary, name: undefined }], total: 1, nextCursor: null, truncated: false }).success).toBe(false);
+
+    expect(S.deletePreviewParams.parse({ name: "feat-x" }).dryRun).toBeUndefined();
+    expect(S.deletePreviewResult.parse({
+      dryRun: true, wouldDelete: true, deleted: false, environment: "preview", reason: "pull request #1 is merged",
+      evidence: { prState: "merged", prNumber: 1, branchExists: false, lastCommitAt: null, idleMs: 90000000 },
+      deployment: {
+        name: "happy-animal-123", environment: "preview", deploymentType: "preview", reference: null, previewIdentifier: "feat-x", isDefault: false,
+        createTime: 1791300000000, lastDeployTime: 1791367200000, expiresAt: null, region: "aws-us-east-1", deploymentClass: null, creator: null, project: "100",
+      },
+    }).deleted).toBe(false);
+
+    // z.object drops keys it does not know, so a field missing from a schema shows as a lost value here.
+    const gated = S.deletePreviewResult.parse({
+      dryRun: true, wouldDelete: true, deleted: false, environment: "preview", reason: null, evidence: null, note: "Nothing was changed: dry-run-only.",
+      deployment: {
+        name: "happy-animal-123", environment: "preview", deploymentType: "preview", reference: null, previewIdentifier: "feat-x", isDefault: false,
+        createTime: 1791300000000, lastDeployTime: 1791367200000, expiresAt: null, region: null, deploymentClass: null, creator: null, project: "100",
+      },
+    });
+    expect(gated.note).toMatch(/dry-run-only/);
+
+    expect(S.reaperRunParams.parse({}).dryRun).toBeUndefined();
+    expect(S.reaperReport.parse(report).incomplete).toBe("Deletion limit of 20 reached for this run.");
+    const cut = S.reaperReport.parse({ ...report, quota: { ...quota, lowerBound: true }, projects: [{ ...report.projects[0], deferred: 30 }] });
+    expect(cut.quota?.lowerBound).toBe(true);
+    expect(cut.projects[0].deferred).toBe(30);
+    expect(S.reaperReport.parse({ ...report, incomplete: undefined, quota: null }).quota).toBeNull();
+    expect(S.reaperReport.safeParse({ ...report, trigger: "cron" }).success).toBe(false);
+    expect(S.bridgeError.parse({ code: "WORKER_ERROR", message: "Enable the reaper first.", details: { key: "reaper.run" } }).code).toBe("WORKER_ERROR");
+  });
+
   it("covers the mounted server routes exactly", () => {
     const {
       routes: actualRoutes,
@@ -741,6 +934,16 @@ describe("openapi routes", () => {
       extraInSpec: [],
       excludedRoutes: [...explicitOpenApiOperationCoverageExclusions].sort(),
     });
+  });
+
+  it("documents merge-patch updates for agent config", () => {
+    const { spec } = loadSpecRoutes();
+    const update = spec.paths["/api/agents/{id}"].patch;
+    expect(update.requestBody.content["application/json"].schema.properties.mergeConfig).toMatchObject({
+      type: "boolean",
+    });
+    expect(update.description).toContain("JSON merge patches (RFC 7396)");
+    expect(update.description).toContain("never have to be resent");
   });
 
   it("documents board-only repository discovery and selection", () => {
@@ -826,6 +1029,12 @@ describe("openapi routes", () => {
     expect(
       spec.paths["/api/routines/{id}/run"].post.responses["422"],
     ).toBeDefined();
+    // Skill create answers 201 (new), 200 (idempotent replay) and 409 (slug taken); import answers 201 only.
+    const skillCreate = spec.paths["/api/companies/{companyId}/skills"].post.responses;
+    expect(Object.keys(skillCreate)).toEqual(expect.arrayContaining(["200", "201", "409"]));
+    const skillImport = Object.keys(spec.paths["/api/companies/{companyId}/skills/import"].post.responses);
+    expect(skillImport).toContain("201");
+    expect(skillImport).not.toContain("200");
   });
 
   it("publishes the Claude browser-code grammar and strict setup-token response shapes", () => {
@@ -924,7 +1133,32 @@ describe("openapi routes", () => {
     // it. The idempotent cancel still returns 200 for an owner-scoped missing,
     // terminal, or foreign session id.
     const codes = Object.keys(cancel.responses).sort();
-    expect(codes).toEqual(["200", "401", "403", "404"]);
+    expect(codes).toEqual(["200", "400", "401", "403", "404"]);
+  });
+
+  it("documents 400 on every operation with a path parameter", () => {
+    // A malformed path value (e.g. not a UUID) returns 400 from the error
+    // handler, so any operation with a path parameter can answer 400.
+    const { spec } = loadSpecRoutes();
+    const missing: string[] = [];
+    let checked = 0;
+    for (const [routePath, pathItem] of Object.entries<
+      Record<string, { responses?: Record<string, unknown> }>
+    >(spec.paths ?? {})) {
+      if (!/\{[^}]+\}/.test(routePath)) continue;
+      for (const [method, operation] of Object.entries(pathItem)) {
+        if (!HTTP_METHODS.has(method)) continue;
+        checked++;
+        if (!operation.responses?.["400"]) missing.push(`${method.toUpperCase()} ${routePath}`);
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+    expect(missing).toEqual([]);
+    expect(
+      spec.paths["/api/routines/{id}"].patch.responses["400"].content[
+        "application/json"
+      ].schema,
+    ).toBeDefined();
   });
 });
 

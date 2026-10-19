@@ -393,4 +393,59 @@ describe("TaskChatQueuedMessages", () => {
       ),
     ).toBeNull();
   });
+  it("offers Steer next to Interrupt while a legacy run takes live input", async () => {
+    const steer = deferred<void>();
+    const onSteer = vi.fn().mockReturnValue(steer.promise);
+    render({
+      queue: { ...queue, protocol: "legacy", steeringDisposition: "available" },
+      onSteer,
+      onInterrupt: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(
+      container.querySelector('[data-testid="task-chat-queued-interrupt-comment-1"]'),
+    ).not.toBeNull();
+    const steerButton = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-queued-steer-comment-1"]',
+    );
+    expect(steerButton?.disabled).toBe(false);
+
+    await act(async () => {
+      steerButton?.click();
+    });
+
+    expect(onSteer).toHaveBeenCalledWith("comment-1", "rev-1");
+    // The run only takes the message at its next tool boundary, so the row stays.
+    expect(
+      container.querySelector('[data-testid="task-chat-queued-message-comment-1"]'),
+    ).not.toBeNull();
+    await act(async () => {
+      steer.resolve();
+      await steer.promise;
+    });
+    expect(container.textContent).toContain("It stays queued until the agent picks it up.");
+  });
+
+  it("shows a pending steer without offering Steer again", () => {
+    render({
+      queue: {
+        ...queue,
+        protocol: "legacy",
+        steeringDisposition: "available",
+        entries: queue.entries.map((entry, index) =>
+          index === 0 ? { ...entry, steering: "pending" as const, canEdit: false, canDiscard: false } : entry,
+        ),
+      },
+      onInterrupt: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(
+      container.querySelector('[data-testid="task-chat-queued-steer-pending-comment-1"]')?.textContent,
+    ).toContain("Steer pending");
+    expect(container.querySelector('[data-testid="task-chat-queued-steer-comment-1"]')).toBeNull();
+    expect(
+      container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.disabled,
+    ).toBe(true);
+    expect(container.querySelector('[data-testid="task-chat-queued-steer-comment-2"]')).not.toBeNull();
+  });
 });

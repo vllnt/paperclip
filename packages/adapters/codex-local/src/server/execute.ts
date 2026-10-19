@@ -31,6 +31,7 @@ import {
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
+import { resolveCodexHomeSeedSelection } from "@paperclipai/adapter-utils/codex-home-seed";
 import {
   asString,
   asNumber,
@@ -53,6 +54,7 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
+import { removePaperclipTempDir } from "@paperclipai/adapter-utils/paperclip-temp";
 import {
   parseLocalProcessFilesystemScope,
   parseLocalProcessSandboxExtraPaths,
@@ -699,6 +701,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (configuredCodexHome == null || (connectorSkillDigest && connectorSourceHome == null)) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
+      codexHomeSeed: config.codexHomeSeed,
     });
   }
   if (configuredHomeIsManaged && configuredCodexHome) {
@@ -707,6 +710,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } : process.env;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
+      codexHomeSeed: config.codexHomeSeed,
     });
   }
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
@@ -814,7 +818,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // the single-use `auth.json`) are dereferenced to bytes. This drops the
           // large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
-          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
+            extraEntries: resolveCodexHomeSeedSelection(config.codexHomeSeed, process.env).names,
+            onLog,
+          });
           return await prepareAdapterExecutionTargetRuntime({
             runId,
             target: executionTarget,
@@ -1474,11 +1481,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const providerQuota =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
-        isCodexProviderQuotaError({
-          stdout: attempt.proc.stdout,
-          stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
-        });
+        isCodexProviderQuotaError({ errorMessage: parsedError });
       const transientUpstream =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
@@ -1618,7 +1621,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // (teardown AND error), never only the happy path. Cleanup failure is
     // logged, not fatal — a leaked temp dir must not crash the run.
     if (stagedCodexHomeDir) {
-      await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(async (error) => {
+      await removePaperclipTempDir(stagedCodexHomeDir).catch(async (error) => {
         await onLog(
           "stderr",
           `[paperclip] Failed to remove staged Codex home "${stagedCodexHomeDir}": ${

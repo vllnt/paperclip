@@ -1,6 +1,7 @@
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { AiConnectionField, aiProviderForAdapter } from "./ai-connections/AiConnectionField";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import { RunContextPolicyEditor } from "./RunContextPolicyEditor";
+import { aiConnectionBindingSchema, runContextPolicySchema } from "@paperclipai/shared";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { bindingProblem, personalAiDefault } from "./ai-connections/model";
 import { testAgentSetup } from "@/lib/test-agent-setup";
@@ -108,6 +109,11 @@ import {
   paperclipRunnerTransitionConfig,
   type CreateConfigValues,
 } from "@paperclipai/adapter-utils";
+import {
+  AUTOMATION_WAKE_SETTINGS_HELP,
+  AutomationWakeSettingsFields,
+  readAutomationWakeSettings,
+} from "./AutomationWakeSettingsFields";
 import { Badge } from "@/components/ui/badge";
 
 /* ---- Props ---- */
@@ -1699,6 +1705,21 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             </Field>
           )}
 
+          {!isCreate && (
+            <Field
+              label="Run context"
+              hint="Per-agent override of how much issue history a run sees. Blank fields inherit the company setting."
+            >
+              <RunContextPolicyEditor
+                value={runContextPolicySchema.safeParse(
+                  "runContext" in overlay.runtime ? overlay.runtime.runContext : runtimeConfig.runContext,
+                ).data ?? null}
+                onChange={(next) => mark("runtime", "runContext", next)}
+                testId="agent-run-context"
+              />
+            </Field>
+          )}
+
           {!isCreate && selectedCompanyId && <AiConnectionField
             companyId={selectedCompanyId} agentId={props.agent.id} agentName={props.agent.name} adapterType={effectiveAiAdapter}
             value={effectiveAiBinding}
@@ -2083,6 +2104,27 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   onCommit={(v) => mark("heartbeat", "cooldownSec", v)}
                   immediate
                   className={inputClass}
+                />
+              </Field>
+              <Field label="Automation wake window" hint={AUTOMATION_WAKE_SETTINGS_HELP}>
+                <AutomationWakeSettingsFields
+                  idPrefix="agent"
+                  value={{
+                    minSecondsBetweenAutomationWakes: eff(
+                      "heartbeat",
+                      "minSecondsBetweenAutomationWakes",
+                      readAutomationWakeSettings(heartbeat).minSecondsBetweenAutomationWakes,
+                    ),
+                    byWakeReason: eff(
+                      "heartbeat",
+                      "byWakeReason",
+                      readAutomationWakeSettings(heartbeat).byWakeReason,
+                    ),
+                  }}
+                  onChange={(next) => {
+                    mark("heartbeat", "minSecondsBetweenAutomationWakes", next.minSecondsBetweenAutomationWakes);
+                    mark("heartbeat", "byWakeReason", next.byWakeReason);
+                  }}
                 />
               </Field>
               <Field label="Max concurrent runs" hint={help.maxConcurrentRuns}>

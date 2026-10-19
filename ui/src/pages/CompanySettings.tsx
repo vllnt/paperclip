@@ -2,7 +2,9 @@ import { ChangeEvent, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
+  type AutomationWakeSettings,
   type InteractionResolverGovernance,
+  type RunContextPolicy,
   type IssueThreadInteractionKind,
 } from "@paperclipai/shared";
 import { useCompany } from "../context/CompanyContext";
@@ -13,9 +15,15 @@ import { resolveCompanyArchiveDeparture } from "../lib/company-selection";
 import { cloudPortfolioManageUrl } from "../lib/cloudLinks";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { companiesApi } from "../api/companies";
+import type { CompanyListResult } from "../api/companies-query";
 import { assetsApi } from "../api/assets";
 import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
+import {
+  AUTOMATION_WAKE_SETTINGS_HELP,
+  AutomationWakeSettingsFields,
+  readAutomationWakeSettings,
+} from "../components/AutomationWakeSettingsFields";
 import { SlidersHorizontal } from "lucide-react";
 import {
   InteractionGovernancePanel,
@@ -29,6 +37,7 @@ import {
   Field,
   ToggleField,
 } from "../components/agent-config-primitives";
+import { RunContextPolicyEditor } from "../components/RunContextPolicyEditor";
 import { InstanceGeneralSettings } from "./InstanceGeneralSettings";
 
 export function CompanySettings() {
@@ -51,7 +60,14 @@ export function CompanySettings() {
   const [description, setDescription] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [logoUploadError, setLogoUploadError] = useState<string | null>(null);
+  const [runContextDraft, setRunContextDraft] = useState<RunContextPolicy | null | undefined>(undefined);
   const [governance, setGovernance] = useState<InteractionResolverGovernance>({});
+  const [wakeSettings, setWakeSettings] = useState<AutomationWakeSettings>({});
+
+  // A draft belongs to one company; refreshing that company must keep its edits.
+  useEffect(() => {
+    setRunContextDraft(undefined);
+  }, [selectedCompanyId]);
 
   // Sync local state from selected company
   useEffect(() => {
@@ -60,6 +76,7 @@ export function CompanySettings() {
     setDescription(selectedCompany.description ?? "");
     setLogoUrl(selectedCompany.logoUrl ?? "");
     setGovernance(selectedCompany.interactionResolverGovernance ?? {});
+    setWakeSettings(readAutomationWakeSettings(selectedCompany.automationWakeSettings));
   }, [selectedCompany]);
 
   const generalDirty =
@@ -87,6 +104,25 @@ export function CompanySettings() {
     }
   });
 
+  const runContextMutation = useMutation({
+    mutationFn: (next: RunContextPolicy | null) =>
+      companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
+    onSuccess: (saved) => {
+      // Adopt the saved company before the draft clears and the editor unlocks,
+      // so a slow or failed list refresh cannot show (or restore) the old policy.
+      queryClient.setQueriesData<CompanyListResult>(
+        { queryKey: ["companies", "list"] },
+        (current) =>
+          current && {
+            ...current,
+            companies: current.companies.map((company) => (company.id === saved.id ? saved : company)),
+          },
+      );
+      setRunContextDraft(undefined);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    }
+  });
+
   const governanceMutation = useMutation({
     mutationFn: (next: InteractionResolverGovernance) =>
       companiesApi.update(selectedCompanyId!, { interactionResolverGovernance: next }),
@@ -95,6 +131,20 @@ export function CompanySettings() {
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
+
+  const wakeSettingsMutation = useMutation({
+    mutationFn: (next: AutomationWakeSettings) =>
+      companiesApi.update(selectedCompanyId!, { automationWakeSettings: next }),
+    onSuccess: (company) => {
+      setWakeSettings(readAutomationWakeSettings(company.automationWakeSettings));
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    }
+  });
+
+  const wakeSettingsDirty =
+    !!selectedCompany &&
+    JSON.stringify(wakeSettings) !==
+      JSON.stringify(readAutomationWakeSettings(selectedCompany.automationWakeSettings));
 
   function handleGovernanceChange(
     kind: IssueThreadInteractionKind,
@@ -355,6 +405,41 @@ export function CompanySettings() {
         </div>
       </div>
 
+      {/* Run context */}
+      <div className="max-w-2xl space-y-4" data-testid="company-settings-run-context-section">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Run context
+        </div>
+        <div className="text-xs text-muted-foreground">
+          How much issue history a run sees. Blank fields keep the built-in behavior. Agents, routines
+          and wake types can override these.
+        </div>
+        {/* Locked while saving: an edit made mid-save would be dropped when the saved draft clears. */}
+        <fieldset disabled={runContextMutation.isPending} className="m-0 min-w-0 border-0 p-0">
+          <RunContextPolicyEditor
+            key={JSON.stringify([selectedCompany.id, selectedCompany.runContextPolicy ?? null])}
+            value={runContextDraft === undefined ? selectedCompany.runContextPolicy : runContextDraft}
+            onChange={setRunContextDraft}
+            testId="company-settings-run-context"
+          />
+        </fieldset>
+        {runContextDraft !== undefined && (
+          <Button
+            size="sm"
+            onClick={() => runContextMutation.mutate(runContextDraft)}
+            disabled={runContextMutation.isPending}
+            data-testid="company-settings-run-context-save"
+          >
+            {runContextMutation.isPending ? "Saving..." : "Save run context"}
+          </Button>
+        )}
+        {runContextMutation.isError && (
+          <span className="text-xs text-destructive">
+            {runContextMutation.error instanceof Error ? runContextMutation.error.message : "Failed to save"}
+          </span>
+        )}
+      </div>
+
       {/* Interaction governance */}
       <InteractionGovernancePanel
         governance={governance}
@@ -370,6 +455,35 @@ export function CompanySettings() {
       />
 
       {!isCloudManaged && <CompanyStorageDestinationsPanel companyId={selectedCompany.id} />}
+
+      {/* Automation wake window */}
+      <div className="max-w-2xl space-y-4" data-testid="company-settings-automation-wake-section">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Automation wakes
+        </div>
+        <p className="text-xs text-muted-foreground">{AUTOMATION_WAKE_SETTINGS_HELP}</p>
+        <AutomationWakeSettingsFields
+          idPrefix="company"
+          value={wakeSettings}
+          onChange={setWakeSettings}
+        />
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            disabled={!wakeSettingsDirty || wakeSettingsMutation.isPending}
+            onClick={() => wakeSettingsMutation.mutate(wakeSettings)}
+          >
+            {wakeSettingsMutation.isPending ? "Saving..." : "Save automation wakes"}
+          </Button>
+          {wakeSettingsMutation.isError && (
+            <span className="text-xs text-destructive">
+              {wakeSettingsMutation.error instanceof Error
+                ? wakeSettingsMutation.error.message
+                : "Failed to save automation wake settings"}
+            </span>
+          )}
+        </div>
+      </div>
 
       <InstanceGeneralSettings embedded />
 

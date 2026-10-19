@@ -17,6 +17,8 @@ export interface GitHubExternalObjectProviderOptions {
   fetch?: FetchLike;
   tokenProvider?: (companyId: string) => Promise<string | null> | string | null;
   secretNames?: readonly string[];
+  /** Transient matching input; leave off for stored external-object snapshots. */
+  includePullRequestBody?: boolean;
 }
 
 interface GitHubObjectIdentity {
@@ -29,6 +31,12 @@ interface GitHubObjectIdentity {
 }
 
 const GITHUB_OBJECT_TTL_SECONDS = 300;
+/**
+ * How long an object waits to be tried again when the company has no GitHub token. GitHub allows 60 unauthenticated requests an
+ * hour per IP address, and a host's whole egress shares them, so without a token GitHub is not asked at all. Checking again costs
+ * a local lookup, so a token that is added later is used within this time.
+ */
+const GITHUB_NO_TOKEN_RETRY_SECONDS = 3600;
 
 function isGitHubHost(host: string) {
   const h = host.toLowerCase();
@@ -54,6 +62,16 @@ function asNonNegativeInteger(value: unknown) {
 function asNestedString(record: Record<string, unknown>, key: string, nestedKey: string) {
   const nested = asRecord(record[key]);
   return nested ? asString(nested[nestedKey]) : null;
+}
+
+function asDeepString(record: Record<string, unknown>, ...path: string[]) {
+  let current: unknown = record;
+  for (const key of path) {
+    const next = asRecord(current);
+    if (!next) return null;
+    current = next[key];
+  }
+  return asString(current);
 }
 
 function parseGitHubCanonicalUrl(canonical: ExternalObjectCanonicalUrl): GitHubObjectIdentity | null {
@@ -192,7 +210,7 @@ function notFoundSnapshot(identity: GitHubObjectIdentity, etag: string | null): 
   };
 }
 
-function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null): ExternalObjectResolverSnapshot {
+function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null, includeBody = false): ExternalObjectResolverSnapshot {
   const title = asString(body.title);
   const state = asString(body.state) ?? "unknown";
   const draft = asBoolean(body.draft) ?? false;
@@ -201,6 +219,8 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const headRef = asNestedString(body, "head", "ref");
   const headSha = asNestedString(body, "head", "sha");
   const baseRef = asNestedString(body, "base", "ref");
+  const headRepository = asDeepString(body, "head", "repo", "full_name");
+  const defaultBranch = asDeepString(body, "base", "repo", "default_branch");
   const reviewDecision = asString(body.review_decision);
   const additions = asNonNegativeInteger(body.additions);
   const deletions = asNonNegativeInteger(body.deletions);
@@ -262,6 +282,10 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(headRef ? { headRef } : {}),
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),
+      ...(headRepository ? { headRepository } : {}),
+      ...(defaultBranch ? { defaultBranch } : {}),
+      ...(title ? { title } : {}),
+      ...(includeBody ? { body: (asString(body.body) ?? "").slice(0, 24_000) } : {}),
       ...(reviewDecision ? { reviewDecision } : {}),
       ...(additions !== null ? { additions } : {}),
       ...(deletions !== null ? { deletions } : {}),
@@ -389,12 +413,21 @@ export function createGitHubExternalObjectProvider(
           };
         }
         token = token?.trim() || null;
+        if (!token) {
+          return {
+            ok: false,
+            liveness: "auth_required",
+            errorCode: "github_token_missing",
+            errorMessage: "No GitHub token is configured for this company, so this object is not refreshed.",
+            retryAfterSeconds: GITHUB_NO_TOKEN_RETRY_SECONDS,
+          };
+        }
         const headers: Record<string, string> = {
           accept: "application/vnd.github+json",
           "user-agent": "paperclip-external-object-resolver",
           "x-github-api-version": "2022-11-28",
+          authorization: `Bearer ${token}`,
         };
-        if (token) headers.authorization = `Bearer ${token}`;
 
         const apiKind = objectType === "pull_request" ? "pulls" : "issues";
         const url = `${gitHubApiBase(identity.host)}/repos/${encodeURIComponent(identity.owner)}/${encodeURIComponent(identity.repo)}/${apiKind}/${identity.number}`;
@@ -443,7 +476,7 @@ export function createGitHubExternalObjectProvider(
         return {
           ok: true,
           snapshot: objectType === "pull_request"
-            ? pullRequestSnapshot(identity, body, etag)
+            ? pullRequestSnapshot(identity, body, etag, opts.includePullRequestBody)
             : issueSnapshot(identity, body, etag),
         };
       },

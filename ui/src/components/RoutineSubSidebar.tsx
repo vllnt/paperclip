@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import {
   Activity as ActivityIcon,
+  BellRing,
   Circle,
   Clock3,
   History as HistoryIcon,
@@ -38,6 +39,8 @@ type NavGroup = {
   items: NavItem[];
 };
 
+const EVENT_GROUPS_ITEM: NavItem = { key: "event-groups", label: "Event groups", icon: BellRing };
+
 const NAV_GROUPS: NavGroup[] = [
   {
     label: "Routine",
@@ -61,25 +64,42 @@ const NAV_GROUPS: NavGroup[] = [
 
 const ALL_ITEMS: NavItem[] = NAV_GROUPS.flatMap((group) => group.items);
 
+/** "Event groups" only appears for routines that have an Event trigger. */
+function navGroupsFor(showEventGroups: boolean): NavGroup[] {
+  if (!showEventGroups) return NAV_GROUPS;
+  return NAV_GROUPS.map((group) => {
+    if (group.label !== "Operate") return group;
+    const items = [...group.items];
+    const at = items.findIndex((item) => item.key === "history");
+    items.splice(at < 0 ? items.length : at, 0, EVENT_GROUPS_ITEM);
+    return { ...group, items };
+  });
+}
+
 export function RoutineSubSidebar({
   activeSection,
   hrefFor,
   isSectionDirty,
   hasLiveRun,
   onNavigate,
+  showEventGroups = false,
 }: {
   activeSection: RoutineSectionKey;
   hrefFor: (section: RoutineSectionKey) => string;
   isSectionDirty: (section: RoutineSectionKey) => boolean;
   hasLiveRun: boolean;
   onNavigate: (section: RoutineSectionKey) => void;
+  /** The routine has an Event trigger, so its event groups are worth a nav entry. */
+  showEventGroups?: boolean;
 }) {
   const itemRefs = useRef<Array<HTMLAnchorElement | null>>([]);
+  const navGroups = navGroupsFor(showEventGroups || activeSection === "event-groups");
+  const navItems = navGroups.flatMap((group) => group.items);
 
   const focusItem = (index: number) => {
-    const clamped = (index + ALL_ITEMS.length) % ALL_ITEMS.length;
+    const clamped = (index + navItems.length) % navItems.length;
     itemRefs.current[clamped]?.focus();
-    onNavigate(ALL_ITEMS[clamped].key);
+    onNavigate(navItems[clamped].key);
   };
 
   const handleKeyDown = (event: React.KeyboardEvent, index: number) => {
@@ -98,7 +118,7 @@ export function RoutineSubSidebar({
         break;
       case "End":
         event.preventDefault();
-        focusItem(ALL_ITEMS.length - 1);
+        focusItem(navItems.length - 1);
         break;
       default:
         break;
@@ -112,7 +132,7 @@ export function RoutineSubSidebar({
       aria-label="Routine sections"
       className="hidden h-full w-52 shrink-0 flex-col gap-4 overflow-y-auto border-r border-border bg-background px-3 py-4 md:flex"
     >
-      {NAV_GROUPS.map((group) => (
+      {navGroups.map((group) => (
         <div key={group.label} className="flex flex-col gap-0.5">
           <p className="mx-2 px-2 pb-1 text-(length:--text-nano) font-medium uppercase tracking-widest font-mono text-muted-foreground/60">
             {group.label}
@@ -170,10 +190,12 @@ export function RoutineSectionPicker({
   activeSection,
   onNavigate,
   isSectionDirty,
+  showEventGroups = false,
 }: {
   activeSection: RoutineSectionKey;
   onNavigate: (section: RoutineSectionKey) => void;
   isSectionDirty: (section: RoutineSectionKey) => boolean;
+  showEventGroups?: boolean;
 }) {
   return (
     <div className="sticky top-0 z-10 border-b border-border bg-background px-4 py-2 md:hidden">
@@ -189,7 +211,7 @@ export function RoutineSectionPicker({
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          {NAV_GROUPS.map((group) => (
+          {navGroupsFor(showEventGroups || activeSection === "event-groups").map((group) => (
             <SelectGroup key={group.label}>
               <SelectLabel className="uppercase tracking-(--tracking-eyebrow) text-(length:--text-micro)">
                 {group.label}

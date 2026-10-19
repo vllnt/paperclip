@@ -31,6 +31,7 @@ import {
 import { agentsApi } from "@/api/agents";
 import { ApiError } from "@/api/client";
 import { instanceSettingsApi } from "@/api/instanceSettings";
+import { resourceCapacityApi } from "@/api/resourceCapacity";
 import { secretsApi } from "@/api/secrets";
 import {
   AlertDialog,
@@ -48,6 +49,7 @@ import {
   type EnvironmentVariablesEditorHandle,
 } from "@/components/environment-variables-editor";
 import { JsonSchemaForm, getDefaultValues, validateJsonSchemaForm } from "@/components/JsonSchemaForm";
+import { ResourceCapacitySummary } from "@/components/ResourceCapacitySummary";
 import {
   SecretRefHintsContext,
   type SecretRefHint,
@@ -570,8 +572,8 @@ function EnvironmentCustomImageBrowserTerminal({
       scrollback: CUSTOM_IMAGE_TERMINAL_SCROLLBACK_ROWS,
       theme: {
         // token-extraction: allowlisted — xterm.js terminal theme config; functional third-party option object, not a rendered CSS value.
-        background: "#0a0a0a",
-        foreground: "#f5f5f5",
+        background: "#000000",
+        foreground: "#ffffff",
         cursor: "#22d3ee",
         cursorAccent: "#020617",
         selectionBackground: "#2563eb55",
@@ -757,7 +759,7 @@ function EnvironmentCustomImageBrowserTerminal({
           )}
         </div>
       </div>
-      <div className="bg-neutral-950 p-2 focus-within:ring-2 focus-within:ring-ring">
+      <div className="bg-black p-2 focus-within:ring-2 focus-within:ring-ring">
         <div
           ref={terminalElementRef}
           data-testid={`custom-image-terminal-screen-${sessionId}`}
@@ -766,7 +768,7 @@ function EnvironmentCustomImageBrowserTerminal({
           tabIndex={0}
           onFocus={() => xtermRef.current?.focus()}
           onClick={() => xtermRef.current?.focus()}
-          className="h-(--sz-18rem) w-full overflow-hidden bg-neutral-950 outline-none sm:h-(--sz-22rem) [&_.xterm-cursor-bar]:!border-l-2 [&_.xterm-cursor-bar]:!border-l-cyan-300 [&_.xterm-cursor-layer_.xterm-cursor]:!bg-cyan-300 [&_.xterm-helper-textarea]:!opacity-0 [&_.xterm-screen]:focus:outline-none [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
+          className="h-(--sz-18rem) w-full overflow-hidden bg-black outline-none sm:h-(--sz-22rem) [&_.xterm-cursor-bar]:!border-l-2 [&_.xterm-cursor-bar]:!border-l-cyan-300 [&_.xterm-cursor-layer_.xterm-cursor]:!bg-cyan-300 [&_.xterm-helper-textarea]:!opacity-0 [&_.xterm-screen]:focus:outline-none [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
         />
       </div>
       {errorMessage ? (
@@ -1350,6 +1352,20 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
     enabled: Boolean(selectedCompanyId) && environmentsEnabled,
   });
   const savedEnvironments = environments ?? [];
+  // CPU, memory and disk of the environments this company's agents run on;
+  // other environments have no line.
+  const resourceCapacityQuery = useQuery({
+    queryKey: selectedCompanyId
+      ? queryKeys.resourceCapacity.company(selectedCompanyId)
+      : ["resource-capacity", "company", "none"],
+    queryFn: () => resourceCapacityApi.company(selectedCompanyId!),
+    enabled: Boolean(selectedCompanyId) && environmentsEnabled,
+    refetchInterval: 60_000,
+    retry: false,
+  });
+  const resourceCapacityByEnvironmentId = new Map(
+    (resourceCapacityQuery.data?.environments ?? []).map((capacity) => [capacity.environmentId, capacity]),
+  );
   // Delete preflight: the blast radius names what still references the
   // environment, and the agent list identifies which of this company's agents
   // need reassignment. Both only load while the delete dialog is open.
@@ -2005,9 +2021,16 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
           </Button>
         </div>
 
+        {resourceCapacityQuery.error ? (
+          <div className="text-xs text-destructive">
+            Resource capacity is unavailable:{" "}
+            {resourceCapacityQuery.error instanceof Error ? resourceCapacityQuery.error.message : "request failed"}.
+          </div>
+        ) : null}
         <div className="space-y-1">
           {savedEnvironments.map((environment) => {
             const probe = probeResults[environment.id] ?? null;
+            const resourceCapacity = resourceCapacityByEnvironmentId.get(environment.id);
             const sandboxProvider = readEnvironmentSandboxProvider(environment);
             const sandboxProviderCapability = sandboxProvider
               ? environmentCapabilities?.sandboxProviders?.[sandboxProvider]
@@ -2060,6 +2083,9 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
                     ) : (
                       <div className="text-xs text-muted-foreground">Runs on this Paperclip host.</div>
                     )}
+                    {resourceCapacity && resourceCapacity.sampling === "sampled" ? (
+                      <ResourceCapacitySummary snapshot={resourceCapacity} />
+                    ) : null}
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     {environment.driver !== "local" ? (

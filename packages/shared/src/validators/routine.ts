@@ -1,4 +1,7 @@
+import { runContextPolicySchema } from "../run-context.js";
 import { z } from "zod";
+import { automationWakeSettingsSchema } from "../automation-wake.js";
+import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import {
   ISSUE_PRIORITIES,
   ROUTINE_ACTIVITY_GATE_POLICIES,
@@ -16,6 +19,7 @@ import {
 } from "./issue.js";
 import { envConfigSchema } from "./secret.js";
 import { isValidRoutineDateString } from "../routine-variables.js";
+import { eventGroupingSchema, eventMatchSchema } from "../event-sources.js";
 import { objectWithoutDefaults } from "./partial.js";
 
 const routineVariableValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
@@ -62,6 +66,47 @@ export const routineVariableSchema = z.object({
   }
 });
 
+/** Values of the routine list `trigger` filter: a trigger kind, or `manual` for a routine with no trigger. */
+export const ROUTINE_LIST_TRIGGER_FILTERS = [...ROUTINE_TRIGGER_KINDS, "manual"] as const;
+export type RoutineListTriggerFilter = (typeof ROUTINE_LIST_TRIGGER_FILTERS)[number];
+/** Longest text the routine list `q` filter accepts. */
+export const ROUTINE_LIST_QUERY_MAX_LENGTH = 200;
+
+/**
+ * Query of `GET /companies/:companyId/routines`. Every filter is optional and they combine with AND;
+ * with none set the list is unchanged. Parse request input with {@link parseListRoutinesQuery}.
+ */
+export const listRoutinesQuerySchema = z.object({
+  /** Case-insensitive text matched against the title and the description. */
+  q: z
+    .string()
+    .trim()
+    .min(1)
+    .max(ROUTINE_LIST_QUERY_MAX_LENGTH)
+    .refine((value) => !value.includes("\u0000"), "q must not contain a NUL character")
+    .optional(),
+  assigneeAgentId: z.string().guid().optional(),
+  /** A folder id, or `none` for routines in no folder. */
+  folderId: z.union([z.literal("none"), z.string().guid()]).optional(),
+  projectId: z.string().guid().optional(),
+  status: z.enum(ROUTINE_STATUSES).optional(),
+  /** A routine matches a trigger kind when it has a non-archived trigger of that kind; `manual` means it has none. */
+  trigger: z.enum(ROUTINE_LIST_TRIGGER_FILTERS).optional(),
+});
+export type ListRoutinesQuery = z.infer<typeof listRoutinesQuerySchema>;
+
+/**
+ * Parses the routine list query from raw URL parameters. A blank value (empty or only spaces) counts as
+ * not set, so `?q=` lists everything like no parameter. Unknown parameters are ignored.
+ * @throws ZodError when a value is invalid, including a repeated parameter.
+ */
+export function parseListRoutinesQuery(raw: Record<string, unknown>): ListRoutinesQuery {
+  const present = Object.fromEntries(
+    Object.entries(raw).filter(([, value]) => !(typeof value === "string" && value.trim() === "")),
+  );
+  return listRoutinesQuerySchema.parse(present);
+}
+
 export const createRoutineSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   folderId: z.string().guid().optional().nullable(),
@@ -78,12 +123,17 @@ export const createRoutineSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  automationWakeSettings: automationWakeSettingsSchema.optional(),
+  routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
+  runContextPolicy: runContextPolicySchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 
 export const updateRoutineSchema = objectWithoutDefaults(createRoutineSchema).partial().extend({
   baseRevisionId: z.string().guid().optional().nullable(),
+  /** The wake settings the edit started from; a differing stored value rejects the save as a conflict. */
+  baseAutomationWakeSettings: automationWakeSettingsSchema.optional(),
 });
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 
@@ -104,6 +154,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).default("always"),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).default("company"),
   variables: z.array(routineVariableSchema),
+  runContextPolicy: runContextPolicySchema.optional(),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
 }).strict();
@@ -119,6 +170,12 @@ export const routineRevisionSnapshotTriggerV1Schema = z.object({
   publicId: z.string().nullable(),
   signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).nullable(),
   replayWindowSec: z.number().int().min(30).max(86_400).nullable(),
+  // Present on `event` triggers only, so snapshots of every other trigger kind
+  // keep their exact stored shape.
+  eventSourceId: z.string().guid().nullable().optional(),
+  eventMatch: eventMatchSchema.nullable().optional(),
+  eventGrouping: eventGroupingSchema.nullable().optional(),
+  fallback: z.boolean().optional(),
 }).strict();
 
 export const routineRevisionSnapshotV1Schema = z.object({
@@ -151,6 +208,13 @@ export const createRoutineTriggerSchema = z.discriminatedUnion("kind", [
   baseTriggerSchema.extend({
     kind: z.literal("api"),
   }),
+  baseTriggerSchema.extend({
+    kind: z.literal("event"),
+    eventSourceId: z.string().guid(),
+    eventMatch: eventMatchSchema.optional().nullable(),
+    eventGrouping: eventGroupingSchema.optional(),
+    fallback: z.boolean().optional().default(false),
+  }),
 ]);
 
 export type CreateRoutineTrigger = z.infer<typeof createRoutineTriggerSchema>;
@@ -164,6 +228,10 @@ export const updateRoutineTriggerSchema = z.object({
   timezone: z.string().trim().min(1).optional().nullable(),
   signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).optional().nullable(),
   replayWindowSec: z.number().int().min(30).max(86_400).optional().nullable(),
+  eventSourceId: z.string().guid().optional(),
+  eventMatch: eventMatchSchema.optional().nullable(),
+  eventGrouping: eventGroupingSchema.optional(),
+  fallback: z.boolean().optional(),
 });
 
 export type UpdateRoutineTrigger = z.infer<typeof updateRoutineTriggerSchema>;

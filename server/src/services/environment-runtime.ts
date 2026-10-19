@@ -38,7 +38,8 @@ import {
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { environmentService } from "./environments.js";
-import { assertRunDirectoryNotBeingRemoved, sshRunDirectoryReaperService } from "./ssh-run-directory-reaper.js";
+import { assertRunDirectoryNotBeingRemoved, recordSshWorkspaceSeed, sshRunDirectoryReaperService } from "./ssh-run-directory-reaper.js";
+import { readSshWorkspaceSeed } from "@paperclipai/adapter-utils/ssh";
 import { instanceSettingsService } from "./instance-settings.js";
 import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
@@ -64,6 +65,7 @@ import {
   sandboxConfigFromLeaseMetadataLoose,
 } from "./sandbox-provider-runtime.js";
 import { pluginRegistryService } from "./plugin-registry.js";
+import { resourceCapacityService } from "./resource-capacity.js";
 import type {
   ExecuteLogSink,
   PluginWorkerManager,
@@ -80,7 +82,7 @@ import {
   resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
-import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import { redactProviderMetadata } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import {
   createSandboxOrphanCleanupSpool,
@@ -386,47 +388,7 @@ function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  const sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
-
-  for (const path of collectSecretRefPaths(input.schema)) {
-    const keys = path.split(".");
-    const parents: Array<{ container: Record<string, unknown>; key: string }> = [];
-    let cursor: Record<string, unknown> | null = sanitized;
-
-    for (let index = 0; index < keys.length - 1; index += 1) {
-      const key = keys[index]!;
-      const next = cursor?.[key];
-      if (!next || typeof next !== "object" || Array.isArray(next)) {
-        cursor = null;
-        break;
-      }
-      parents.push({ container: cursor, key });
-      cursor = next as Record<string, unknown>;
-    }
-
-    if (!cursor) continue;
-
-    const leafKey = keys[keys.length - 1]!;
-    if (!Object.prototype.hasOwnProperty.call(cursor, leafKey)) continue;
-    delete cursor[leafKey];
-
-    for (let index = parents.length - 1; index >= 0; index -= 1) {
-      const { container, key } = parents[index]!;
-      const value = container[key];
-      if (
-        value &&
-        typeof value === "object" &&
-        !Array.isArray(value) &&
-        Object.keys(value as Record<string, unknown>).length === 0
-      ) {
-        delete container[key];
-      } else {
-        break;
-      }
-    }
-  }
-
-  return sanitized;
+  return redactProviderMetadata(input.metadata, input.schema);
 }
 
 export interface EnvironmentDriverAcquireInput {
@@ -1179,6 +1141,7 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
 
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
+  const resourceCapacity = resourceCapacityService(db);
   const reaper = sshRunDirectoryReaperService(db);
 
   return {
@@ -1194,7 +1157,8 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
       }
 
-      const { remoteCwd } = await ensureSshWorkspaceReady(parsed.config);
+      const { remoteCwd, resourceProbe } = await ensureSshWorkspaceReady(parsed.config, { probeResources: true });
+      const probedAt = new Date();
       const lease = await environmentsSvc.acquireLease({
         companyId: input.companyId,
         environmentId: input.environment.id,
@@ -1223,6 +1187,8 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           throw error;
         });
       }
+      // Never awaited: it cannot throw, and recording must not delay the run.
+      void resourceCapacity.recordLeaseAcquireProbe(input.environment.id, resourceProbe ?? null, probedAt);
       return lease;
     },
 
@@ -1246,6 +1212,12 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async realizeWorkspace(input) {
+      // The commit the workspace upload starts from, recorded before the upload.
+      // The run reaper reads it to tell commits the host already has from the
+      // run's own. A workspace that is not a git repository has none, and its
+      // run directory is then kept if the worker made commits.
+      const seed = input.workspace.localPath ? await readSshWorkspaceSeed(input.workspace.localPath) : null;
+      if (seed) await recordSshWorkspaceSeed(db, input.lease.id, seed);
       const record = buildWorkspaceRealizationRecordFromDriverInput({
         environment: input.environment,
         lease: input.lease,
@@ -3627,7 +3599,10 @@ function createPluginEnvironmentDriver(
         expiresAt: providerAttestedLeaseExpiry(input.requestedExpiresAt, parseExpiresAt(providerLease.expiresAt)),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
-          providerMetadata: providerLease.metadata ?? {},
+          providerMetadata: stripSecretRefValuesFromPluginLeaseMetadata({
+            metadata: providerLease.metadata,
+            schema: driver.configSchema as Record<string, unknown> | null | undefined,
+          }),
           driver: input.environment.driver,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: plugin.id,

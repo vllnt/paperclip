@@ -1,5 +1,37 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  DEFAULT_RUN_TIER,
+  RUN_TARGET_SOURCES,
+  companyRunTiersSchema,
+  issueRunProfileFromOverrides,
+  resolveRunProfile,
+  runProfileSchema,
+  type CompanyRunTiers,
+  type ResolvedRunTarget,
+  type RunProfile,
+  type RunProfileResolution,
+  type RunTargetSource,
+} from "./run-profile.js";
+export {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  HARNESS_ALLOWED_MODEL_VENDORS,
+  MAX_AGENT_FALLBACKS,
+  MODEL_VENDORS,
+  agentFallbackTargetSchema,
+  agentFallbacksSchema,
+  checkHarnessModelCompatibility,
+  classifyModelVendor,
+  fallbackEffortConfigKey,
+  harnessTargetKey,
+  readModelOverridesFromArgs,
+  type AgentFallbackTarget,
+  type AgentHarnessFallbackState,
+  type HarnessFallbackAdapterType,
+  type HarnessModelCompatibilityInput,
+  type HarnessModelCompatibilityResult,
+  type ModelVendor,
+} from "./harness-fallback.js";
+export {
   RUNNER_GOAL_MAX_OBJECTIVE_CHARS,
   runnerGoalAvailabilitySchema,
   runnerGoalCapabilityActionSchema,
@@ -456,6 +488,7 @@ export {
   ISSUE_MONITOR_SCHEDULED_BY,
   ISSUE_EXECUTION_MONITOR_KINDS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME,
   ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES,
   ISSUE_EXECUTION_STATE_STATUSES,
   ISSUE_EXECUTION_MONITOR_STATE_STATUSES,
@@ -785,6 +818,7 @@ export type {
   EnvironmentDeleteReusableLeaseHolder,
   EnvironmentDeleteBlockedReason,
   EnvironmentLease,
+  CompanyEnvironmentLeaseListItem,
   EnvironmentProbeResult,
   FakeSandboxEnvironmentConfig,
   LocalEnvironmentConfig,
@@ -921,6 +955,7 @@ export type {
   ManagedSettingMetadata,
   BackupRetentionPolicy,
   Agent,
+  AgentWaitState,
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
@@ -1105,6 +1140,7 @@ export type {
   IssueWakeDiagnosticWakeRequest,
   IssueWakeDiagnosticsResponse,
   IssueSubtreeDiagnosticNode,
+  IssueSubtreeDiagnosticLastRun,
   IssueSubtreeDiagnosticEdge,
   IssueSubtreeDiagnosticsResponse,
   IssueBlockerAttention,
@@ -1129,6 +1165,7 @@ export type {
   IssueBlockedInboxSeverity,
   IssueBlockedInboxState,
   IssueRecoveryAction,
+  CompanyIssueRecoveryActionListItem,
   IssueWatchdog,
   IssueWatchdogStatus,
   IssueWatchdogSummary,
@@ -1281,6 +1318,7 @@ export type {
   AgentTaskSession,
   AgentWakeupRequest,
   DeferredWakeAgentStats,
+  DeferredWakeParkedBreakdown,
   DeferredWakeStats,
   DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
@@ -1861,6 +1899,8 @@ export {
   environmentDriverSchema,
   environmentStatusSchema,
   environmentLeaseStatusSchema,
+  listEnvironmentLeasesQuerySchema,
+  COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
   environmentLeaseCleanupStatusSchema,
   createEnvironmentSchema,
   updateEnvironmentSchema,
@@ -1884,6 +1924,12 @@ export {
   builtInAgentResetSchema,
   createAgentHireSchema,
   updateAgentSchema,
+  AGENT_CONFIG_FORBIDDEN_KEYS,
+  AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH,
+  AGENT_CONFIG_MERGE_PATCH_MAX_VALUES,
+  describeAgentConfigMergePatchViolation,
+  findAgentConfigMergePatchViolation,
+  updateAgentMergePatchSchema,
   agentInstructionsBundleModeSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
@@ -1905,6 +1951,8 @@ export {
   type BuiltInAgentReset,
   type CreateAgentHire,
   type UpdateAgent,
+  type AgentConfigMergePatchViolation,
+  type UpdateAgentMergePatch,
   type UpdateAgentInstructionsBundle,
   type UpsertAgentInstructionsFile,
   type UpdateAgentInstructionsPath,
@@ -1953,6 +2001,7 @@ export {
   type CompanySearchExtractQuery,
   type CompanySearchQuery,
   createIssueSchema,
+  isValidExistingBranchName,
   setIssueTitleSchema,
   type SetIssueTitle,
   createIssueInputSchema,
@@ -1970,8 +2019,14 @@ export {
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
+  issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT,
+  COMPANY_RECOVERY_ACTIONS_MAX_LIMIT,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -2077,6 +2132,7 @@ export {
   type UpdateIssue,
   type StalledReviewDecision,
   type ResolveIssueRecoveryAction,
+  type ListCompanyIssueRecoveryActionsQuery,
   type CheckoutIssue,
   type AddIssueComment,
   type CreateIssueThreadInteraction,
@@ -2252,6 +2308,10 @@ export {
   updateToolProfileWithEntriesSchema,
   upsertToolCatalogEntrySchema,
   createRoutineSchema,
+  listRoutinesQuerySchema,
+  parseListRoutinesQuery,
+  ROUTINE_LIST_QUERY_MAX_LENGTH,
+  ROUTINE_LIST_TRIGGER_FILTERS,
   updateRoutineSchema,
   createRoutineTriggerSchema,
   updateRoutineTriggerSchema,
@@ -2321,6 +2381,8 @@ export {
   type UnbindToolProfileBinding,
   type UpsertToolCatalogEntry,
   type CreateRoutine,
+  type ListRoutinesQuery,
+  type RoutineListTriggerFilter,
   type UpdateRoutine,
   type CreateRoutineTrigger,
   type UpdateRoutineTrigger,
@@ -2677,6 +2739,7 @@ export {
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
 export * from "./validators/provider-trace.js";
+export * from "./validators/heartbeat-run.js";
 export {
   FEATURE_TIERS,
   INSTANCE_FEATURE_CATALOG,
@@ -2780,6 +2843,9 @@ export type { ExecutionProjection, ExecutionReconciliation, ExecutionBlocker } f
 export { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "./types/execution-projection.js";
 
 export * from "./agent-appearance.js";
+export * from "./run-failure-cause.js";
+export * from "./run-usage-record.js";
+export * from "./observability-query.js";
 export * from "./ai-connections.js";
 export * from "./ai-connection-usage.js";
 export { questionSetToAskUserQuestionsPayload } from "./question-set.js";
@@ -2824,3 +2890,11 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./resource-capacity.js";
+export * from "./issue-wait.js";
+export * from "./duplicate-detection.js";
+export * from "./automation-wake.js";
+export * from "./routine-noop-skip.js";
+export * from "./event-sources.js";
+export * from "./run-context.js";
+export * from "./issue-git.js";

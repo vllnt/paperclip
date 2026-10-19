@@ -15,6 +15,7 @@ import type {
   TrustPreset,
 } from "../trust-policy.js";
 import type { AgentOrgChainHealth } from "../agent-eligibility.js";
+import type { AgentFallbackTarget, AgentHarnessFallbackState } from "../harness-fallback.js";
 import type { AgentApiKeyScope } from "../validators/agent.js";
 
 export interface AgentPermissions extends Record<string, unknown> {
@@ -79,6 +80,11 @@ export interface AgentChainOfCommandEntry {
   title: string | null;
 }
 
+export interface AgentWaitState {
+  activeWaitCount: number;
+  nextCheckAt: string | null;
+}
+
 export interface Agent {
   id: string;
   companyId: string;
@@ -95,6 +101,10 @@ export interface Agent {
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
   runtimeConfig: AgentRuntimeConfig;
+  /** Ordered harness/model targets tried when the primary hits a provider quota. */
+  fallbacks?: AgentFallbackTarget[];
+  /** Set while the primary is cooled down and runs use a fallback target. */
+  harnessFallback?: AgentHarnessFallbackState | null;
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
@@ -105,6 +115,11 @@ export interface Agent {
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;
   orgChainHealth?: AgentOrgChainHealth;
+  /**
+   * Derived, not stored: the agent's active waits (future issue monitors on
+   * its own open issues). With no live run the agent is shown as waiting.
+   */
+  waitState?: AgentWaitState | null;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -28,7 +28,7 @@ const VARIANT_STYLES: Record<BlockedReasonVariant, string> = {
   needs_attention:
     "border-amber-300/70 bg-amber-50 text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300",
   external_wait:
-    "border-slate-300 bg-slate-50 text-slate-700 dark:border-slate-500/30 dark:bg-slate-500/15 dark:text-slate-300",
+    "border-border bg-muted text-muted-foreground",
   owner_paused:
     "border-red-300/70 bg-red-50 text-red-800 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-300",
 };
