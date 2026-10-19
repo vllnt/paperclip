@@ -603,7 +603,12 @@ export function IssueFiltersPopover({
                       checked={state.hideRoutineExecutions}
                       onCheckedChange={(checked) => onChange({ hideRoutineExecutions: checked === true })}
                     />
-                    <span className="text-sm">Hide routine runs</span>
+                    <span className="flex flex-col">
+                      <span className="text-sm">Hide routine runs</span>
+                      <span className="text-xs text-muted-foreground">
+                        Also hides alert issues opened by event triggers.
+                      </span>
+                    </span>
                   </label>
                 ) : null}
               </div>

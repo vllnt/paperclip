@@ -454,6 +454,14 @@ export const queryKeys = {
       status: "open" | "resolved" | "all" = "all",
     ) => ["routines", "document-annotations", routineId, key, status] as const,
   },
+  eventSources: {
+    list: (companyId: string) => ["event-sources", companyId] as const,
+    detail: (id: string) => ["event-sources", "detail", id] as const,
+    deliveries: (id: string, status: string) =>
+      ["event-sources", "deliveries", id, status] as const,
+    routineGroups: (routineId: string, open: boolean) =>
+      ["event-sources", "routine-groups", routineId, open] as const,
+  },
   folders: {
     list: (companyId: string, kind: string) =>
       ["folders", companyId, kind] as const,
@@ -519,6 +527,10 @@ export const queryKeys = {
       ["environments", environmentId, "custom-image-template"] as const,
     customImageSetupSession: (sessionId: string) =>
       ["environment-custom-image-setup-sessions", sessionId] as const,
+  },
+  resourceCapacity: {
+    instance: ["resource-capacity", "instance"] as const,
+    company: (companyId: string) => ["resource-capacity", "company", companyId] as const,
   },
   projects: {
     all: (companyId: string) => ["projects", companyId] as const,

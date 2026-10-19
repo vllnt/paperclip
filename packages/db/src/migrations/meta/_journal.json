@@ -2101,6 +2101,27 @@
       "when": 1792235020109,
       "tag": "0301_spooky_firebird",
       "breakpoints": true
+    },
+    {
+      "idx": 302,
+      "version": "7",
+      "when": 1792371010802,
+      "tag": "0302_wise_professor_monster",
+      "breakpoints": true
+    },
+    {
+      "idx": 303,
+      "version": "7",
+      "when": 1792426125272,
+      "tag": "0303_friendly_arclight",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1792430009693,
+      "tag": "0304_third_spitfire",
+      "breakpoints": true
     }
   ]
 }

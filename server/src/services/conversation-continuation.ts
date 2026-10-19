@@ -25,6 +25,9 @@ export function claimedAdapterType(run: Pick<typeof heartbeatRuns.$inferSelect, 
   return typeof dispatch?.adapterType === "string" ? dispatch.adapterType : null;
 }
 
+/** Any conversation evidence at all. Deliberately broader than
+ * `usedConversationAdapterPredicate`: the ownership check stays conservative.
+ */
 function conversationRunPredicate() {
   return or(
     inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES]),
@@ -58,9 +61,57 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
   return adapterType !== null && isConversationAdapter(adapterType);
 }
 
+/** SQL form of `runUsedConversationAdapter`: the marker, else the claimed adapter, else the latest invocation. */
+function usedConversationAdapterPredicate() {
+  return or(
+    sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
+    inArray(sql`coalesce(
+      nullif(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->'adapterType') = 'string'
+        then ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' end, ''),
+      (select ${heartbeatRunEvents.payload}->>'adapterType' from ${heartbeatRunEvents}
+        where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
+          and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+          and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
+        order by ${heartbeatRunEvents.seq} desc limit 1)
+    )`, [...CONVERSATION_ADAPTER_TYPES]),
+  );
+}
+
+/** Error codes, besides any interrupted run, after which a conversation run continues as a new turn. */
+const CONVERSATION_CONTINUATION_ERROR_CODES = ["process_lost", "server_shutdown_interrupted", "execution_reconciliation_required"];
+
+/** Whether a terminal run ended in a way that continues a conversation as a new turn.
+ * The JS form of the ending clause in `conversationRecoveryActionPredicate`.
+ */
+function endedAsConversationContinuation(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "status" | "errorCode" | "resultJson">,
+): boolean {
+  const cancellation = run.resultJson?.executionCancellation as Record<string, unknown> | null | undefined;
+  return run.status === "interrupted" ||
+    CONVERSATION_CONTINUATION_ERROR_CODES.includes(run.errorCode ?? "") ||
+    (run.status === "cancelled" && cancellation?.state === "acknowledged");
+}
+
+/** Whether the stranded sweep adds the conversation continuation marker to
+ * this run: a terminal legacy conversation run, without the marker, that ended
+ * the way `conversationRecoveryActionPredicate` folds. Without the marker its
+ * reconciliation hold would be folded and opened again on every sweep.
+ */
+export async function needsConversationContinuationRepair(db: Db, run: typeof heartbeatRuns.$inferSelect): Promise<boolean> {
+  return run.runtimeMode === "legacy" &&
+    ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) &&
+    endedAsConversationContinuation(run) &&
+    run.resultJson?.conversationContinuation !== CONVERSATION_CONTINUATION_POLICY &&
+    run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
+    (await runUsedConversationAdapter(db, run));
+}
+
 /** Only immutable run evidence can retire a historical conversation hold.
  * An agent's current adapter can differ from the one that executed this run.
  * Missing evidence retains the hold; the current agent is never a fallback.
+ * The adapter evidence and endings are those of `runUsedConversationAdapter`
+ * and `needsConversationContinuationRepair`: a folded run either has the
+ * marker (and never needs a hold) or is one the stranded sweep repairs.
  */
 export function conversationRecoveryActionPredicate() {
   return and(
@@ -73,11 +124,11 @@ export function conversationRecoveryActionPredicate() {
         and ${heartbeatRuns.runtimeMode} = 'legacy'
         and coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
         and ${inArray(heartbeatRuns.status, ['failed', 'timed_out', 'interrupted', 'cancelled'])}
-        and ${conversationRunPredicate()}
+        and ${usedConversationAdapterPredicate()}
         and ${or(
           sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
           eq(heartbeatRuns.status, "interrupted"),
-          inArray(heartbeatRuns.errorCode, ["process_lost", "server_shutdown_interrupted", "execution_reconciliation_required"]),
+          inArray(heartbeatRuns.errorCode, CONVERSATION_CONTINUATION_ERROR_CODES),
           and(eq(heartbeatRuns.status, "cancelled"), sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'acknowledged'`),
         )}
     )`,

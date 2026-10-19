@@ -3,6 +3,7 @@ import { Check, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { orderItemsBySelectedAndRecent } from "../lib/recent-selections";
 import { cn } from "../lib/utils";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { useMobileEntityPickerViewportStyle } from "../hooks/useMobileEntityPickerViewportStyle";
 
 export interface InlineEntityOption {
@@ -42,25 +43,6 @@ interface InlineEntitySelectorProps {
 
 const EMPTY_RECENT_OPTION_IDS: string[] = [];
 
-function useMobileSelectorModal() {
-  const [mobile, setMobile] = useState(() =>
-    typeof window !== "undefined"
-      && typeof window.matchMedia === "function"
-      && window.matchMedia("(max-width: 40rem)").matches,
-  );
-
-  useEffect(() => {
-    if (typeof window.matchMedia !== "function") return;
-    const media = window.matchMedia("(max-width: 40rem)");
-    const update = () => setMobile(media.matches);
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, []);
-
-  return mobile;
-}
-
 export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySelectorProps>(
   function InlineEntitySelector(
     {
@@ -89,7 +71,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState("");
     const [highlightedIndex, setHighlightedIndex] = useState(0);
-    const mobileSelectorModal = useMobileSelectorModal();
+    const mobileSelectorModal = useMediaQuery("(max-width: 40rem)", false);
     const mobileViewportStyle = useMobileEntityPickerViewportStyle();
     const highlightedIndexRef = useRef(0);
     const inputRef = useRef<HTMLInputElement>(null);

@@ -3,7 +3,7 @@ import React, { useEffect, useState } from "react";
 import { useHostNavigation, usePluginAction } from "@paperclipai/plugin-sdk/ui";
 import { hostApi } from "./api.js";
 import type { AutomationRule, SyncSettings } from "../contracts.js";
-import type { SyncStatus } from "./task-list.js";
+import { SYNC_QUEUED_NOTICE, type SyncStatus } from "./task-list.js";
 
 function NativeGitHubPrerequisite({ companyId }: { companyId: string }) {
   const readiness = usePluginAction("native-github-readiness"), confirm = usePluginAction("confirm-native-github");
@@ -53,7 +53,7 @@ export function AutomationSettings({ companyId }: { companyId: string }) {
   return <>
     {state?.report?.warnings.length ? <details className="panel"><summary>Sync needs attention · {state.report.warnings.length}</summary><div className="details-content">
       {state.report.warnings.map((warning, i) => <p key={i} className="error">{warning}</p>)}
-      <button onClick={() => { void sync({ companyId }).then(() => setNotice("Sync started. Refresh to check the result.")).catch(error => setError(message(error))); }}>Retry sync</button>
+      <button onClick={() => { void sync({ companyId, refresh: true }).then(() => setNotice(SYNC_QUEUED_NOTICE)).catch(error => setError(message(error))); }}>Retry sync</button>
     </div></details> : null}
     <details className="panel" onToggle={event => setOpen(event.currentTarget.open)}><summary>Sync & automations{settings?.rules.length ? ` · ${settings.rules.length}` : ""}</summary>
       {open && <NativeGitHubPrerequisite companyId={companyId} />}

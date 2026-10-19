@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +13,7 @@ import { WriteThrottle } from "../src/write-identity.js";
 import { CONTROL_REPOSITORIES } from "../src/protected-paths.js";
 import { parseSshSigningKey } from "../src/ssh-signature.js";
 import { RepositoryManager } from "../src/management-repository.js";
+import { CLOCK_SKEW_ALERT_SECONDS, PAUSE_ALERT_AFTER_MS, WRITE_ALERT_ORIGIN, createWriteAlerts } from "../src/write-alerts.js";
 
 const APP = "5203754";
 const secretRef = (secretId: string) => ({ type: "secret_ref", secretId, version: "latest" });
@@ -84,6 +85,21 @@ describe("GitHub write identity: run user (VLL-477)", () => {
     expect(f.scoped).not.toHaveBeenCalled();
   });
 
+  it("never gives a company with no saved policy the App's credential, whatever write it asks for, workflow edits included", async () => {
+    const f = await fixture();
+    // No policy: the run's own user writes (GitHub decides what that user may do) and the App is not asked for a token.
+    for (const action of ["commit", "push", "pullRequest", "comment", "other", "project"]) {
+      for (const fallback of [false, true]) {
+        const decision = await f.decide({ repository: "vllnt/paperclip", action, privileged: ["editWorkflows", "workflowDispatch"], fallback });
+        expect(decision, `${action} ${fallback}`).not.toHaveProperty("credential");
+        expect(decision, `${action} ${fallback}`).toMatchObject(fallback ? { identity: "bot", unavailable: "Connect your GitHub account in Paperclip to write as yourself." } : { identity: "user", missingUserConnection: "fail" });
+      }
+    }
+    expect(f.scoped).not.toHaveBeenCalled();
+    // Nothing is recorded as allowed either: there is no policy, so the plugin allowed nothing.
+    expect(f.h.activity.filter(entry => /^github\.workflow_.*_allowed$/.test(entry.message))).toEqual([]);
+  });
+
   it("mints an App token for one repository with the installation's write permissions", async () => {
     const f = await fixture();
     await f.setPolicy({ default: allBot, overrides: [{ match: "vllnt/*", push: "user" }], missingUserConnection: "fail" });
@@ -106,6 +122,16 @@ describe("GitHub write identity: run user (VLL-477)", () => {
     expect(await f.decide({ repository: "vllnt/paperclip", action: "push", fallback: true })).toEqual({ identity: "bot", unavailable: "Connect your GitHub account in Paperclip to write as yourself." });
     await f.setPolicy({ default: userWrites, overrides: [], missingUserConnection: "use_bot" });
     expect(await f.decide({ repository: "vllnt/paperclip", action: "push", fallback: true })).toMatchObject({ identity: "bot", credential: { login: "vllnt-agents[bot]" } });
+  });
+
+  it("records a granted workflow push once when the App is asked again after a missing user connection", async () => {
+    const f = await fixture();
+    const agentId = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01";
+    await f.setPolicy({ default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, overrides: [], missingUserConnection: "use_bot", privileged: { editWorkflows: { agentIds: [agentId] } } });
+    const ask = (extra: Record<string, unknown>) => f.decide({ repository: "vllnt/paperclip", action: "push", privileged: ["editWorkflows"], agentId, ...extra });
+    expect(await ask({})).toEqual({ identity: "user", missingUserConnection: "use_bot" });
+    expect(await ask({ fallback: true })).toMatchObject({ identity: "bot", credential: { login: "vllnt-agents[bot]" } });
+    expect(f.h.activity.filter(entry => entry.message === "github.workflow_push_allowed")).toEqual([expect.objectContaining({ entityId: agentId })]);
   });
 
   it("applies the kill switch and privileged toggles to the run's user too", async () => {
@@ -1980,8 +2006,729 @@ describe("security review round 5 (attack regressions)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// A push may carry workflow changes without editWorkflows only when all the history it adds is the base branch's own.
+// ---------------------------------------------------------------------------
+
+describe("workflow changes that arrive by merging the base branch", () => {
+  const W = ".github/workflows";
+  type Entry = { mode: string; oid: string };
+  const blob = (text: string, mode = "100644"): Entry => ({ mode, oid: createHash("sha1").update(`blob ${Buffer.byteLength(text)}\0${text}`).digest("hex") });
+  const id = (n: number) => n.toString(16).padStart(40, "0");
+  const change = (file: string, entry: Entry | null) => ({ path: `${W}/${file}`, mode: entry?.mode ?? null, oid: entry?.oid ?? null });
+  const listed = (files: Record<string, Entry>) => Object.entries(files).map(([file, entry]) => ({ path: `${W}/${file}`, ...entry })).sort((a, b) => a.path < b.path ? -1 : 1);
+  // main moved on: it edited ci.yml, added deploy.yml and deleted release.yml, which feature/x still has.
+  const oldCi = blob("on: push # before\n"), ci = blob("on: push\n"), deploy = blob("on: workflow_dispatch\n"), release = blob("on: release\n"), releaseCi = blob("on: [push, release]\n");
+  const mainOld = id(900), featureOld = id(901), earlier = id(902), mergeSha = id(5000), evilSha = id(5001), restoreSha = id(5002), unknown = id(5003), localSha = id(5004);
+  const toggle = "editWorkflows";
+  const edit = blob("on: push\nenv:\n  EVIL: 1\n");
+
+  async function pushFixture() {
+    const f = await appFixture();
+    await f.authorize();
+    const repository = { ...repos[0]!, name: "app", fullName: "Example-Org/app", owner: "Example-Org", url: "https://github.com/Example-Org/app" };
+    const catalog = vi.mocked(f.client.catalog), readCatalog = catalog.getMockImplementation()!;
+    catalog.mockImplementation(async (...args) => {
+      const result = await readCatalog(...args);
+      return { ...result, repositories: [...result.repositories, repository] };
+    });
+    const stored = await f.policy();
+    f.github.installationRepos.push(repository.fullName);
+    await f.setPolicy({ ...stored, allowedRepositories: [...stored.allowedRepositories, repository.fullName], installationRepositories: [...stored.installationRepositories, repository.fullName] });
+    const state = {
+      /** The workflow files of each branch on GitHub, by name under .github/workflows; feature/x is the pushed branch. */
+      branches: {
+        main: { "ci.yml": ci, "deploy.yml": deploy },
+        "release/1": { "ci.yml": releaseCi },
+        wip: { "ci.yml": blob("on: unreviewed\n") },
+        "feature/x": { "ci.yml": oldCi, "release.yml": release },
+      } as Record<string, Record<string, Entry>>,
+      /** Branches with branch protection (the default branch, main, has none here). */
+      protectedBranches: new Set(["release/1"]),
+      /** Whether the pushed branch exists on GitHub yet. */
+      destination: true,
+      /** The open pull requests of the pushed branch feature/x (their base; a fork's head repository is another one; ref is their head branch). */
+      prs: [] as Array<{ base: string; fork?: boolean; ref?: string }>,
+      defaultBranch: "main",
+      /** Requests GitHub fails on. */
+      failing: [] as RegExp[],
+      truncated: false,
+      githubDirectory: "tree" as "tree" | "none" | "symlink",
+      /** The commits GitHub has, by their parents. */
+      graph: {} as Record<string, string[]>,
+      /** Every request the checks made. */
+      calls: [] as string[],
+    };
+    const names = () => Object.keys(state.branches);
+    const ids = (name: string) => { const first = 100 + names().indexOf(name) * 10; return { commit: id(first + 1), root: id(first + 2), github: id(first + 3), workflows: id(first + 4) }; };
+    const tip = (name: string) => ids(name).commit;
+    state.graph = { [tip("main")]: [mainOld], [mainOld]: [earlier], [earlier]: [], [tip("feature/x")]: [featureOld], [featureOld]: [earlier], [tip("release/1")]: [earlier], [tip("wip")]: [earlier] };
+    const ancestors = (sha: string) => {
+      const seen = new Set<string>();
+      const walk = (at: string) => { for (const parent of state.graph[at] ?? []) if (!seen.has(parent)) { seen.add(parent); walk(parent); } };
+      walk(sha);
+      return seen;
+    };
+    const repo = "/repos/example-org/app";
+    const original = f.request.getMockImplementation()!;
+    const answer = (data: unknown) => ({ data: data as any, next: false });
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      const mine = path === repo || path.startsWith(`${repo}/pulls?`) || path.startsWith(`${repo}/git/trees/`) || path.startsWith(`${repo}/compare/`)
+        || path.startsWith(`${repo}/branches/`) && names().some(name => path === `${repo}/branches/${encodeURIComponent(name)}`);
+      if (!mine) return (original as any)(path, ...rest);
+      state.calls.push(path);
+      if (state.failing.some(pattern => pattern.test(path))) throw new GitHubError(500);
+      if (path.startsWith(`${repo}/pulls?`)) {
+        return answer(state.prs.map(pr => ({ base: { ref: pr.base }, head: { ref: pr.ref ?? "feature/x", repo: { full_name: pr.fork ? "someone/app" : "Example-Org/app" } } })));
+      }
+      if (path === repo) return answer({ default_branch: state.defaultBranch });
+      const compared = /\/compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})\?per_page=1$/.exec(path);
+      if (compared) {
+        const [, a, b] = compared as unknown as [string, string, string];
+        if (!(a in state.graph) || !(b in state.graph)) throw new GitHubError(404);
+        return answer({ status: a === b ? "identical" : ancestors(b).has(a) ? "ahead" : ancestors(a).has(b) ? "behind" : "diverged" });
+      }
+      const branch = names().find(name => path === `${repo}/branches/${encodeURIComponent(name)}`);
+      if (branch) {
+        if (branch === "feature/x" && !state.destination) throw new GitHubError(404);
+        return answer({ name: branch, protected: state.protectedBranches.has(branch), commit: { sha: ids(branch).commit, commit: { tree: { sha: ids(branch).root } } } });
+      }
+      const [, sha, recursive] = /\/git\/trees\/([0-9a-f]{40})(\?recursive=1)?$/.exec(path) ?? [];
+      const entry = (name: string, mode: string, type: string, oid: string) => ({ path: name, mode, type, sha: oid });
+      for (const name of names()) {
+        const tree = ids(name);
+        if (sha === tree.root) {
+          const github = state.githubDirectory === "tree" ? [entry(".github", "040000", "tree", tree.github)] : state.githubDirectory === "symlink" ? [entry(".github", "120000", "blob", id(7))] : [];
+          return answer({ sha, truncated: false, tree: [entry("README.md", "100644", "blob", id(1)), ...github] });
+        }
+        if (sha === tree.github) return answer({ sha, truncated: false, tree: [entry("CODEOWNERS", "100644", "blob", id(2)), entry("workflows", "040000", "tree", tree.workflows)] });
+        if (sha === tree.workflows) {
+          if (!recursive) throw new Error("The workflow files are read recursively.");
+          const files = state.githubDirectory === "none" ? {} : state.branches[name]!;
+          return answer({ sha, truncated: state.truncated, tree: Object.entries(files).map(([file, found]) => entry(file, found.mode, "blob", found.oid)) });
+        }
+      }
+      throw new GitHubError(404);
+    });
+    /** The push of one commit to feature/x that merges `base` into it: the base's files, and the paths where they differ from the branch's. */
+    const mergeOf = (base = "main", extra: Record<string, unknown> = {}) => {
+      const files = state.branches[base]!, dest = state.branches["feature/x"]!;
+      const same = (a?: Entry, b?: Entry) => a?.mode === b?.mode && a?.oid === b?.oid;
+      const changes = [...new Set([...Object.keys(files), ...Object.keys(dest)])].sort().filter(file => !same(files[file], dest[file])).map(file => change(file, files[file] ?? null));
+      return {
+        branch: "feature/x", tip: mergeSha, files: listed(files),
+        commits: [{ sha: mergeSha, parents: [tip("feature/x"), tip(base)], changes }], entries: [tip("feature/x"), tip(base)], ...extra,
+      };
+    };
+    const push = (workflowPush: unknown, extra: Record<string, unknown> = {}) => f.write("example-org/app", { action: "push", privileged: [toggle], workflowPush, ...extra });
+    const refused = (decision: any, reason: string | RegExp) => {
+      expect(decision).toMatchObject({ identity: "user", unavailable: typeof reason === "string" ? expect.stringContaining(reason) : expect.stringMatching(reason) });
+      expect(decision).not.toHaveProperty("credential");
+      return decision;
+    };
+    return { ...f, state, ids, tip, push, mergeOf, refused };
+  }
+
+  it("allows a merge of the base branch with the toggle off, and reads the base fresh for every push", async () => {
+    const f = await pushFixture();
+    const granted = await f.push(f.mergeOf());
+    expect(granted).toMatchObject({ identity: "user", credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: {
+      branch: "feature/x", tip: mergeSha, base: "main", baseSha: f.tip("main"), destinationSha: f.tip("feature/x"), commits: [mergeSha],
+      paths: [`${W}/ci.yml`, `${W}/deploy.yml`, `${W}/release.yml`],
+    } } });
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+    // The pushed branch's pull requests, the base branch, the branch and their trees are read from GitHub for this push.
+    const lookup = new URLSearchParams(f.state.calls.find(call => call.includes("/pulls?"))!.split("?")[1]);
+    expect(lookup.get("state")).toBe("open");
+    expect(lookup.get("head")).toBe("Example-Org:feature/x");
+    expect(f.state.calls.filter(call => call.includes("/git/trees/"))).toHaveLength(6);
+    // A merge of an older commit of the base branch (main has not touched workflows since) is a merge of the base branch too.
+    f.state.calls.length = 0;
+    const older = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), mainOld] }], entries: [f.tip("feature/x"), mainOld] });
+    expect(await f.push(older)).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.state.calls.some(call => call.includes("/compare/"))).toBe(true);
+    // The next push reads the base again: main moved on its ci.yml after the checkout fetched it.
+    const fetched = f.mergeOf();
+    const reads = f.state.calls.length;
+    f.state.branches.main["ci.yml"] = blob("on: pull_request\n");
+    f.refused(await f.push(fetched), `${W}/ci.yml`);
+    expect(f.state.calls.length).toBeGreaterThan(reads);
+  });
+
+  it("refuses a clean tip that hides an earlier workflow edit in a commit the push adds (regression)", async () => {
+    const f = await pushFixture();
+    // A edits ci.yml and B puts main's file back: the tip alone is exactly the base branch's.
+    const laundered = {
+      branch: "feature/x", tip: restoreSha, files: listed({ "ci.yml": ci, "deploy.yml": deploy }),
+      commits: [
+        { sha: restoreSha, parents: [evilSha], changes: [change("ci.yml", ci)] },
+        { sha: evilSha, parents: [f.tip("feature/x")], changes: [change("ci.yml", edit)] },
+      ],
+      entries: [f.tip("feature/x")],
+    };
+    const decision = f.refused(await f.push(laundered), new RegExp(`Commit ${restoreSha.slice(0, 8)} changes workflow files.*is not a merge of main.*editWorkflows is turned off`, "s"));
+    expect(decision.evidence).toMatchObject({ base: "main", offendingCommits: [restoreSha, evilSha] });
+    // The same push with the earlier commit the only change is refused too.
+    f.refused(await f.push({ ...laundered, tip: evilSha, files: listed({ "ci.yml": edit, "deploy.yml": deploy }), commits: [laundered.commits[1]] }), new RegExp(`Commit ${evilSha.slice(0, 8)}`));
+  });
+
+  it("judges a new branch on an existing commit by where it joins GitHub: the base branch's own history passes, another branch's does not (regression)", async () => {
+    const f = await pushFixture();
+    f.state.destination = false;
+    // The launcher reports a ref created on a commit GitHub has (nothing is new) as a push whose history joins GitHub at that commit.
+    const onto = (commit: string, files: Record<string, Entry>) => ({ branch: "feature/x", tip: commit, files: listed(files), commits: [], entries: [commit] });
+    // The base branch's tip, and an older commit of it: its own workflow files, so the toggle can stay off.
+    expect(await f.push(onto(f.tip("main"), f.state.branches.main!))).toMatchObject({ credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: { base: "main", commits: [], paths: [] } } });
+    expect(await f.push(onto(mainOld, f.state.branches.main!))).toMatchObject({ credential: { login: "agent-owner" } });
+    // A commit that only another branch has (wip, never reviewed), whatever its files: refused, with the board's grant to ask for.
+    f.refused(await f.push(onto(f.tip("wip"), f.state.branches.wip!)), /builds on commit .*not part of main.*editWorkflows is turned off/s);
+    // A commit GitHub does not have at all.
+    f.refused(await f.push(onto(unknown, { "ci.yml": edit })), /builds on commit .*not part of main/);
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+  });
+
+  it("refuses moving the branch to a commit GitHub has when its workflow files differ from the branch's and are not the base branch's (regression)", async () => {
+    const f = await pushFixture();
+    // The branch is clean now; behind it is a commit with an edit, which GitHub has as part of the branch's history.
+    f.state.branches["feature/x"] = { "ci.yml": ci, "deploy.yml": deploy };
+    f.state.graph[evilSha] = [featureOld];
+    f.state.graph[f.tip("feature/x")] = [evilSha];
+    const rewind = { branch: "feature/x", tip: evilSha, files: listed({ "ci.yml": edit, "deploy.yml": deploy }), commits: [], entries: [evilSha] };
+    f.refused(await f.push(rewind), /differ from main \(\.github\/workflows\/ci\.yml\).*editWorkflows is turned off/s);
+    // Moving it to an older commit with the same files as the branch has changes no workflow file.
+    const harmless = await f.push({ ...rewind, tip: featureOld, files: listed({ "ci.yml": ci, "deploy.yml": deploy }), entries: [featureOld] });
+    expect(harmless).toMatchObject({ credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: { paths: [], commits: [] } } });
+  });
+
+  it("refuses a merge of more than two parents, whatever else is right about it", async () => {
+    const f = await pushFixture();
+    const octopus = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), f.tip("main"), f.tip("release/1")] }], entries: [f.tip("feature/x"), f.tip("main"), f.tip("release/1")] });
+    f.refused(await f.push(octopus), new RegExp(`Commit ${mergeSha.slice(0, 8)} merges more than two parents.*editWorkflows is turned off`, "s"));
+  });
+
+  it("refuses a merge whose second parent is not part of the base branch, on GitHub or not (regression)", async () => {
+    const f = await pushFixture();
+    // wip has the same ci.yml as main now in the merge, but wip is not part of main.
+    const crafted = (second: string) => f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), second] }], entries: [f.tip("feature/x"), second] });
+    f.refused(await f.push(crafted(f.tip("wip"))), new RegExp(`${f.tip("wip").slice(0, 8)}, which is not part of main.*editWorkflows is turned off`, "s"));
+    f.refused(await f.push(crafted(unknown)), new RegExp(`${unknown.slice(0, 8)}, which is not part of main`));
+  });
+
+  it("refuses new history that builds on a commit GitHub does not have, or one that is on neither the branch nor the base", async () => {
+    const f = await pushFixture();
+    // The first parent is where the new history joins what exists: it must be the branch (or part of it) or part of the base.
+    const built = (first: string) => f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [first, f.tip("main")] }], entries: [first, f.tip("main")] });
+    f.refused(await f.push(built(unknown)), new RegExp(`builds on commit ${unknown.slice(0, 8)}, which is neither on feature/x nor on main on GitHub.*editWorkflows is turned off`, "s"));
+    f.refused(await f.push(built(f.tip("wip"))), /neither on feature\/x nor on main/);
+    // Part of the branch's own history, or of main, is fine.
+    expect(await f.push(built(featureOld))).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await f.push(built(mainOld))).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("refuses an agent's own workflow edit, a merge that resolves to something else, a rename and a mode change", async () => {
+    const f = await pushFixture();
+    const dest = f.tip("feature/x");
+    // One commit editing ci.yml is not a merge of main.
+    f.refused(await f.push({ branch: "feature/x", tip: evilSha, files: listed({ "ci.yml": edit, "release.yml": release }), commits: [{ sha: evilSha, parents: [dest], changes: [change("ci.yml", edit)] }], entries: [dest] }), /is not a merge of main/);
+    // A merge of main that ends up with an edit of the agent's own in a workflow file.
+    const resolved = (changes: unknown[], files: Record<string, Entry>) => f.mergeOf("main", { files: listed(files), commits: [{ ...f.mergeOf().commits[0], changes }] });
+    f.refused(await f.push(resolved([change("ci.yml", edit), change("deploy.yml", deploy), change("release.yml", null)], { "ci.yml": edit, "deploy.yml": deploy })), /differ from main \(\.github\/workflows\/ci\.yml\)/);
+    // A rename of ci.yml: the old name gone, a new name main does not have.
+    f.refused(await f.push(resolved([change("ci.yml", null), change("build.yml", ci), change("deploy.yml", deploy), change("release.yml", null)], { "build.yml": ci, "deploy.yml": deploy })), /build\.yml/);
+    // A mode change keeps the blob and differs in the mode.
+    f.refused(await f.push(resolved([change("ci.yml", { ...ci, mode: "100755" }), change("deploy.yml", deploy), change("release.yml", null)], { "ci.yml": { ...ci, mode: "100755" }, "deploy.yml": deploy })), `${W}/ci.yml`);
+    // A deletion main does not share.
+    f.refused(await f.push(resolved([change("ci.yml", ci), change("deploy.yml", null), change("release.yml", null)], { "ci.yml": ci })), `${W}/deploy.yml`);
+    // The base branch with the same rename or mode passes.
+    f.state.branches.main = { "build.yml": ci, "deploy.yml": { ...deploy, mode: "100755" } };
+    expect(await f.push(f.mergeOf())).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("never lets a symlink, a submodule or a symlinked directory through, even when the base branch has the same", async () => {
+    const f = await pushFixture();
+    const link = { mode: "120000", oid: id(55) }, module = { mode: "160000", oid: id(56) };
+    f.state.branches.main = { "link.yml": link, "module.yml": module };
+    for (const [label, changes] of [
+      ["a symlink the base has", [change("link.yml", link)]],
+      ["a symlink the base lacks", [change("other.yml", link)]],
+      ["a submodule", [change("module.yml", module)]],
+      ["the directory replaced by a symlink", [{ path: W, mode: "120000", oid: id(57) }]],
+    ] as const) {
+      f.refused(await f.push(f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], changes }] })), /not regular files/);
+      expect(f.state.calls, label).toEqual([]);
+    }
+  });
+
+  it("refuses when it cannot read what it must compare: pull requests, branches, trees, ancestry, or a base that is no directory", async () => {
+    const f = await pushFixture();
+    const older = () => f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [f.tip("feature/x"), mainOld] }], entries: [f.tip("feature/x"), mainOld] });
+    for (const [label, pattern] of [["the pull request lookup", /\/pulls\?/], ["a branch", /\/branches\//], ["a tree", /\/git\/trees\//], ["an ancestry check", /\/compare\//]] as const) {
+      f.state.failing = [pattern];
+      f.refused(await f.push(older()), /cannot read the workflow files of .*editWorkflows is turned off/s);
+      expect(f.state.calls.length, label).toBeGreaterThan(0);
+      f.state.calls.length = 0;
+    }
+    // Without a pull request the default branch is read; failing that refuses too.
+    f.state.failing = [/^\/repos\/example-org\/app$/];
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files/);
+    f.state.failing = [];
+    // A branch GitHub does not know.
+    f.state.prs = [{ base: "ghost" }];
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files of ghost/);
+    f.state.prs = [];
+    // A tree GitHub cut short does not show every workflow file.
+    f.state.truncated = true;
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files/);
+    f.state.truncated = false;
+    // A branch whose .github is no directory cannot be compared.
+    f.state.githubDirectory = "symlink";
+    f.refused(await f.push(f.mergeOf()), /cannot read the workflow files/);
+    // Neither branch has workflow files: only what leaves them as they are passes.
+    f.state.githubDirectory = "none";
+    f.refused(await f.push(f.mergeOf()), `${W}/ci.yml`);
+    expect(await f.push({ ...f.mergeOf(), files: [], commits: [{ ...f.mergeOf().commits[0], changes: [change("ci.yml", null)] }] })).toMatchObject({ credential: { login: "agent-owner" } });
+    // Fixed, the same push passes.
+    f.state.githubDirectory = "tree";
+    expect(await f.push(f.mergeOf())).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("allows a new branch that merges the base branch, and refuses one that builds on anything else", async () => {
+    const f = await pushFixture();
+    f.state.destination = false;
+    // The agent's own commit on top of an older main (no workflow change in it), then a merge of main.
+    const fresh = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], parents: [localSha, f.tip("main")] }], entries: [mainOld, f.tip("main")] });
+    expect(await f.push(fresh)).toMatchObject({ credential: { login: "agent-owner" }, evidence: { workflowBaseMerge: { base: "main", destinationSha: null, commits: [mergeSha] } } });
+    f.refused(await f.push({ ...fresh, entries: [f.tip("wip"), f.tip("main")] }), /builds on commit .*not part of main/);
+    f.refused(await f.push({ ...fresh, entries: [unknown, f.tip("main")] }), /builds on commit .*not part of main/);
+  });
+
+  it("compares with the pull request's base, with the default branch when there is none, and refuses when the base is unclear", async () => {
+    const f = await pushFixture();
+    // The pull request into release/1 is compared with release/1, not with main.
+    f.state.prs = [{ base: "release/1" }];
+    f.refused(await f.push(f.mergeOf("main")), /differ from release\/1/);
+    expect(await f.push(f.mergeOf("release/1"))).toMatchObject({ evidence: { workflowBaseMerge: { base: "release/1", baseSha: f.tip("release/1") } } });
+    // Two pull requests into one base are one base; two bases are none.
+    f.state.prs = [{ base: "main" }, { base: "main" }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    f.state.prs = [{ base: "main" }, { base: "release/1" }];
+    f.refused(await f.push(f.mergeOf()), /more than one base branch \(main, release\/1\).*editWorkflows is turned off/s);
+    // A pull request from a fork, or from another branch, is not this branch's.
+    f.state.prs = [{ base: "release/1", fork: true }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    f.state.prs = [{ base: "release/1", ref: "other" }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    // No pull request: the repository's default branch.
+    f.state.prs = [];
+    f.state.defaultBranch = "release/1";
+    f.refused(await f.push(f.mergeOf("main")), /differ from release\/1/);
+    expect(await f.push(f.mergeOf("release/1"))).toMatchObject({ evidence: { workflowBaseMerge: { base: "release/1" } } });
+  });
+
+  it("takes a pull request's base only when it is the default branch or protected, since whoever opens the pull request chooses it", async () => {
+    const f = await pushFixture();
+    // An agent can open a pull request into any branch; workflow files on a branch nobody protects are not reviewed.
+    f.state.prs = [{ base: "wip" }];
+    f.refused(await f.push(f.mergeOf("wip")), /wip is neither the default branch nor protected.*editWorkflows is turned off/s);
+    f.state.protectedBranches.add("wip");
+    expect(await f.push(f.mergeOf("wip"))).toMatchObject({ evidence: { workflowBaseMerge: { base: "wip" } } });
+    f.state.prs = [{ base: "main" }];
+    expect(await f.push(f.mergeOf())).toMatchObject({ evidence: { workflowBaseMerge: { base: "main" } } });
+    // A default branch GitHub does not name cannot be told from any other unprotected branch.
+    f.state.protectedBranches.delete("wip");
+    f.state.prs = [{ base: "wip" }];
+    f.state.defaultBranch = "";
+    f.refused(await f.push(f.mergeOf("wip")), /neither the default branch nor protected/);
+  });
+
+  it("leaves the run identity as it was: the toggle decides and GitHub is not asked", async () => {
+    const f = await pushFixture();
+    await f.setPolicy({ ...await f.policy(), userSource: "run" });
+    f.refused(await f.push(f.mergeOf()), /privileged GitHub action \(editWorkflows\) and it is turned off/);
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("asks nothing of GitHub when the company allows workflow edits, and falls back to the toggle without a usable report", async () => {
+    const f = await pushFixture();
+    const good = f.mergeOf();
+    const commit = good.commits[0]!;
+    const file = good.files[0]!;
+    // The toggle decides when the report is missing or not exactly what the launcher sends.
+    for (const workflowPush of [undefined, null, "ci.yml", { branch: "feature/x" }, { ...good, branch: "" }, { ...good, tip: "xyz" }, { ...good, files: "x" }, { ...good, files: [{ ...file, oid: null }] },
+      { ...good, files: [{ ...file, path: "src/app.ts" }] }, { ...good, files: Array.from({ length: 101 }, () => file) }, { ...good, commits: "x" }, { ...good, commits: Array.from({ length: 101 }, () => commit) },
+      { ...good, commits: [{ ...commit, sha: "xyz" }] }, { ...good, commits: [{ ...commit, parents: ["xyz"] }] }, { ...good, commits: [{ ...commit, parents: Array.from({ length: 17 }, () => commit.sha) }] },
+      { ...good, commits: [{ ...commit, changes: [] }] }, { ...good, commits: [{ ...commit, changes: [{ path: "src/app.ts", mode: null, oid: null }] }] },
+      { ...good, commits: [{ ...commit, changes: [{ path: `${W}/ci.yml`, mode: "100644", oid: null }] }] }, { ...good, commits: [{ ...commit, changes: [{ path: `${W}/ci.yml`, mode: null, oid: ci.oid }] }] },
+      { ...good, commits: [{ ...commit, changes: [{ path: `${W}/${"x".repeat(300)}.yml`, mode: null, oid: null }] }] },
+      { ...good, entries: [] }, { ...good, entries: ["xyz"] }, { ...good, entries: Array.from({ length: 9 }, () => commit.sha) }]) {
+      const decision = await f.write("example-org/app", { action: "push", privileged: [toggle], ...(workflowPush === undefined ? {} : { workflowPush }) });
+      f.refused(decision, /privileged GitHub action \(editWorkflows\) and it is turned off/);
+    }
+    expect(f.state.calls).toEqual([]);
+    // With the toggle on, anything goes through without a comparison.
+    await f.setPolicy({ ...await f.policy(), privileged: { editWorkflows: true } });
+    expect(await f.push({ ...good, commits: [{ sha: evilSha, parents: [f.tip("feature/x")], changes: [change("ci.yml", edit)] }] })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await f.write("example-org/app", { action: "push", privileged: [toggle] })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.state.calls).toEqual([]);
+  });
+
+  it("does not unlock any other privileged action, and the kill switch still refuses", async () => {
+    const f = await pushFixture();
+    const decision = f.refused(await f.push(f.mergeOf(), { privileged: [toggle, "pushToMain"] }), /\(pushToMain\)/);
+    expect(decision.unavailable).not.toContain("editWorkflows");
+    f.refused(await f.push(f.mergeOf(), { privileged: [toggle, "tagPush"] }), /\(tagPush\)/);
+    expect(f.state.calls).toEqual([]);
+    // The kill switch flipped during the base read refuses the push.
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let waiting = false;
+    const inner = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+      if (path.includes("/git/trees/")) { waiting = true; await gate; }
+      return (inner as any)(path, ...rest);
+    });
+    const racing = f.push(f.mergeOf());
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    await f.setPolicy({ ...await f.policy(), enabled: false });
+    release();
+    f.refused(await racing, /kill switch/);
+  });
+
+  it("keeps a refusal within the server's 500 characters however many files and commits differ, and keeps them all in the evidence", async () => {
+    const f = await pushFixture();
+    const other = blob("on: other\n");
+    const files = Array.from({ length: 60 }, (_, index) => `agent-workflow-with-a-rather-long-name-number-${index}.yml`);
+    const many = f.mergeOf("main", { commits: [{ ...f.mergeOf().commits[0], changes: files.map(file => change(file, other)) }] });
+    const decision = f.refused(await f.push(many), /differ from main/);
+    expect(decision.unavailable.length).toBeLessThanOrEqual(500);
+    expect(decision.unavailable).toMatch(/and 5\d more/);
+    expect(decision.evidence.offending).toHaveLength(60);
+    f.state.prs = [{ base: "release/1" }];
+    const long = `${"x".repeat(250)}.yml`;
+    expect((await f.push(f.mergeOf("release/1", { commits: [{ ...f.mergeOf("release/1").commits[0], changes: [change(long, other)] }] }))).unavailable.length).toBeLessThanOrEqual(500);
+    for (const [label, push] of [
+      ["a clean tip", { ...f.mergeOf("release/1"), commits: [{ sha: restoreSha, parents: [evilSha], changes: [change(long, other)] }] }],
+      ["history on nothing GitHub has", { ...f.mergeOf("release/1"), entries: [unknown, f.tip("release/1")], commits: [{ ...f.mergeOf("release/1").commits[0], parents: [unknown, f.tip("release/1")] }] }],
+      ["an octopus", { ...f.mergeOf("release/1"), commits: [{ ...f.mergeOf("release/1").commits[0], parents: [f.tip("feature/x"), f.tip("release/1"), f.tip("wip")], changes: files.map(file => change(file, other)) }] }],
+    ] as const) {
+      expect((await f.push(push)).unavailable.length, label).toBeLessThanOrEqual(500);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// editWorkflows and workflowDispatch can be granted to chosen agents instead of the whole company.
+// ---------------------------------------------------------------------------
+
+describe("per-agent grants of editWorkflows and workflowDispatch", () => {
+  const DX = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01", OTHER = "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d", RUN = "7c2d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f", FOREIGN = "0a1b2c3d-4e5f-4a6b-8c7d-111122223333";
+  const tip = "a".repeat(40), parent = "b".repeat(40), oid = "c".repeat(40);
+  /** What the launcher reports for a push of one commit to feature/x that edits ci.yml and deletes old.yml. */
+  const report = {
+    branch: "feature/x", tip, files: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }],
+    commits: [{ sha: tip, parents: [parent], changes: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }, { path: ".github/workflows/old.yml", mode: null, oid: null }] }], entries: [parent],
+  };
+
+  async function grantFixture(privileged: Record<string, unknown> = { editWorkflows: { agentIds: [DX] } }) {
+    const f = await appFixture();
+    await f.authorize();
+    const companyId = String((await f.action("write-identity.get")).companyId);
+    const repository = { ...repos[0]!, name: "app", fullName: "Example-Org/app", owner: "Example-Org", url: "https://github.com/Example-Org/app" };
+    const catalog = vi.mocked(f.client.catalog), listed = catalog.getMockImplementation()!;
+    catalog.mockImplementation(async (...args) => {
+      const result = await listed(...args);
+      return { ...result, repositories: [...result.repositories, repository] };
+    });
+    const stored = await f.policy();
+    f.github.installationRepos.push(repository.fullName);
+    await f.setPolicy({ ...stored, privileged, allowedRepositories: [...stored.allowedRepositories, repository.fullName], installationRepositories: [...stored.installationRepositories, repository.fullName] });
+    /** A managed push that needs editWorkflows, sent for this agent by the host (undefined: the host named none). */
+    const push = (agentId?: string | null, extra: Record<string, unknown> = {}) =>
+      f.write("example-org/app", { action: "push", privileged: ["editWorkflows"], runId: RUN, ...(agentId === undefined ? {} : { agentId }), ...extra });
+    const logged = (message: string) => f.h.activity.filter(entry => entry.message === message);
+    return { ...f, companyId, push, logged };
+  }
+  const refused = (decision: any, reason: string | RegExp) => {
+    expect(decision).toMatchObject({ identity: "user", unavailable: typeof reason === "string" ? expect.stringContaining(reason) : expect.stringMatching(reason) });
+    expect(decision).not.toHaveProperty("credential");
+    expect(decision.unavailable.length).toBeLessThanOrEqual(500);
+    return decision;
+  };
+
+  it("lets the granted agent push a workflow change, and records the agent, run, repository, branch and workflow paths", async () => {
+    const f = await grantFixture();
+    expect(await f.push(DX, { workflowPush: report })).toMatchObject({ identity: "user", credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")).toEqual([expect.objectContaining({
+      companyId: f.companyId, entityType: "agent", entityId: DX,
+      metadata: { action: "editWorkflows", via: "agent-grant", agentId: DX, runId: RUN, repository: "example-org/app", branch: "feature/x", tip, paths: [".github/workflows/ci.yml", ".github/workflows/old.yml"] },
+    })]);
+    // The grant is the agent's only: the policy is the same afterwards.
+    expect((await f.policy()).privileged.editWorkflows).toEqual({ agentIds: [DX] });
+    // A push whose workflow history is not reported (several refs, say) is still recorded, with what is unknown said so.
+    expect(await f.push(DX)).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")[1]).toMatchObject({ metadata: { agentId: DX, branch: null, paths: null } });
+  });
+
+  it("names the board grant in the refusal of a push that is not the base branch's own, so the agent is told what to ask for", async () => {
+    // GitHub cannot be read in this test, so the push cannot be shown to be a merge of the base branch.
+    const scoped = await grantFixture();
+    const decision = refused(await scoped.push(OTHER, { workflowPush: report }), /cannot read the workflow files.*this agent has no board grant for editWorkflows \(granted to 1 agent\).*write-identity\.grant/s);
+    // A grant replaces the list, so the hint says to keep the agents already in it.
+    expect(decision.unavailable).toContain(`"agentIds":[…,"${OTHER}"]`);
+    expect(decision.unavailable).toMatch(/replaces the whole list \(keep the agents already granted\)/);
+    // With the company-wide switch off the refusal says that, and how to turn it on.
+    const off = await grantFixture({ editWorkflows: false });
+    refused(await off.push(DX, { workflowPush: report }), /cannot read the workflow files.*editWorkflows is turned off for this company.*write-identity\.grant/s);
+    // The agent that has the grant is not asked to prove anything about the base branch.
+    expect(await scoped.push(DX, { workflowPush: report })).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("refuses an agent of the same company that has no grant, one the host did not name, and tells the board how to grant it", async () => {
+    const f = await grantFixture();
+    for (const [label, agentId] of [["another agent", OTHER], ["no agent named", undefined], ["a null agent", null], ["an empty ID", ""], ["a made-up ID", "not-an-agent"]] as const) {
+      const decision = refused(await f.push(agentId), /no board grant for editWorkflows.*write-identity\.grant/s);
+      expect(decision.unavailable, label).toMatch(/granted to 1 agent/);
+      expect(decision.unavailable, label).not.toContain("turned off for this company");
+    }
+    // The refusal names the agent, so the board can paste the grant.
+    expect(refused(await f.push(OTHER), /"agentIds":\[…,"9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d"\]/).unavailable).toContain('"action":"editWorkflows"');
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    // One agent's grant is not another's for a different action.
+    const dispatch = await grantFixture({ editWorkflows: { agentIds: [DX] }, workflowDispatch: false });
+    refused(await dispatch.push(DX, { privileged: ["workflowDispatch"], action: "other" }), /\(workflowDispatch\).*turned off for this company/s);
+  });
+
+  it("keeps a refusal within 500 characters when every privileged action is refused, with the board hint whole", async () => {
+    const f = await grantFixture({ editWorkflows: { agentIds: [DX] }, workflowDispatch: { agentIds: [DX] }, adminMerge: false, deploymentApproval: false, release: false, tagPush: false, pushToMain: false, wiki: false });
+    const all = ["adminMerge", "deploymentApproval", "release", "tagPush", "workflowDispatch", "pushToMain", "editWorkflows", "wiki"];
+    const decision = refused(await f.push(OTHER, { privileged: all }), /write-identity\.grant, which replaces the whole list/);
+    expect(decision.unavailable).toContain(`"agentIds":[…,"${OTHER}"]`);
+  });
+
+  it("refuses an agent of another company, whatever this company grants, and grants nothing across companies", async () => {
+    const f = await grantFixture({ editWorkflows: { agentIds: [DX, FOREIGN] } });
+    // The other company writes as its run users and grants editWorkflows to one agent of its own.
+    const policy = { default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "run", allowedRepositories: ["example-org/app"], privileged: { editWorkflows: { agentIds: [OTHER] } } };
+    await f.h.performAction("write-identity.set", { companyId: "other", policy }, actors("other").admin);
+    const ask = (agentId: string) => f.h.performAction<any>("repository-write-identity", { companyId: "other", repository: "example-org/app", access: "write", action: "push", privileged: ["editWorkflows"], agentId, runId: RUN }, actors("other").server);
+    // DX and FOREIGN are granted by the first company; in the second they are nobody.
+    refused(await ask(DX), /no board grant for editWorkflows/);
+    refused(await ask(FOREIGN), /no board grant for editWorkflows/);
+    // Its own agent is granted there, and only there.
+    expect(await ask(OTHER)).not.toHaveProperty("unavailable");
+    refused(await f.push(OTHER), /no board grant for editWorkflows/);
+    // The company that writes as its run users records the allowed push too, under its own ID.
+    expect(f.logged("github.workflow_push_allowed")).toEqual([expect.objectContaining({
+      companyId: "other", entityId: OTHER, metadata: expect.objectContaining({ via: "agent-grant", agentId: OTHER, runId: RUN }),
+    })]);
+    // A company without a grant list at all refuses every agent.
+    await f.h.performAction("write-identity.set", { companyId: "other", policy: { ...policy, privileged: { editWorkflows: false } } }, actors("other").admin);
+    refused(await ask(OTHER), /\(editWorkflows\) and it is turned off for this company/);
+    refused(await ask(DX), /\(editWorkflows\) and it is turned off for this company/);
+  });
+
+  it("does not let an agent grant itself or anyone, by the grant, by saving the policy, or by listing agents", async () => {
+    const f = await grantFixture({ editWorkflows: false });
+    const agent = { ...actors(f.companyId).agent, actor: { ...actors(f.companyId).agent.actor, agentId: DX, runId: RUN } } as PluginPerformActionContext;
+    const spoofed = { ...agent, actor: { ...agent.actor, isInstanceAdmin: true } } as PluginPerformActionContext;
+    const before = await f.policy();
+    for (const [label, caller] of [["an agent", agent], ["an agent claiming to be an administrator", spoofed], ["a board member who is no administrator", actors(f.companyId).member]] as const) {
+      await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: { agentIds: [DX] } }, caller), label).rejects.toThrow(/board user|administrator|board-only/i);
+      await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: true }, caller), label).rejects.toThrow(/board user|administrator|board-only/i);
+      await expect(f.h.performAction("write-identity.set", { companyId: f.companyId, policy: { ...before, privileged: { ...before.privileged, editWorkflows: { agentIds: [DX] } } } }, caller), label).rejects.toThrow(/board user|administrator|board-only/i);
+    }
+    await expect(f.h.performAction("write-identity.agents", { companyId: f.companyId }, agent)).rejects.toThrow(/board user|board-only/i);
+    // Another company's administrator acts on their own company only (the host scopes every call to the caller's company): this one has no policy to grant in.
+    await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: true }, actors("other").admin)).rejects.toThrow(/Save a write identity first/);
+    expect(await f.policy()).toEqual(before);
+    refused(await f.push(DX), /\(editWorkflows\) and it is turned off for this company/);
+  });
+
+  it("keeps true and false as they were: company-wide values are the same for every agent", async () => {
+    const on = await grantFixture({ editWorkflows: true });
+    for (const agentId of [DX, OTHER, null, undefined]) expect(await on.push(agentId), String(agentId)).toMatchObject({ credential: { login: "agent-owner" } });
+    // Allowed for everyone is still recorded, and said to be company-wide.
+    expect(on.logged("github.workflow_push_allowed").map(entry => (entry.metadata as any).via)).toEqual(["company", "company", "company", "company"]);
+    const off = await grantFixture({ editWorkflows: false });
+    for (const agentId of [DX, OTHER, null, undefined]) {
+      const decision = refused(await off.push(agentId), /This is a privileged GitHub action \(editWorkflows\) and it is turned off for this company\./);
+      expect(decision.unavailable).toMatch(/write-identity\.grant/);
+    }
+    expect(off.logged("github.workflow_push_allowed")).toEqual([]);
+    // The default of a saved policy has editWorkflows off, workflowDispatch on, for everyone.
+    const fresh = await grantFixture({});
+    expect(await fresh.write("example-org/app", { action: "push", privileged: ["editWorkflows"], agentId: DX })).toHaveProperty("unavailable");
+    expect(await fresh.write("example-org/app", { action: "other", privileged: ["workflowDispatch"], agentId: OTHER, runId: RUN })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await fresh.write("example-org/app", { action: "other", privileged: ["workflowDispatch"] })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(fresh.h.activity.filter(entry => entry.message === "github.workflow_push_allowed")).toEqual([]);
+    // Every allowed dispatch is recorded, the default's too: the agent, the run, the company and the repository, and that it was company-wide.
+    expect(fresh.h.activity.filter(entry => entry.message === "github.workflow_dispatch_allowed")).toEqual([
+      expect.objectContaining({ companyId: fresh.companyId, entityType: "agent", entityId: OTHER, metadata: { action: "workflowDispatch", via: "company", agentId: OTHER, runId: RUN, repository: "example-org/app" } }),
+      expect.objectContaining({ companyId: fresh.companyId, metadata: { action: "workflowDispatch", via: "company", agentId: null, runId: null, repository: "example-org/app" } }),
+    ]);
+    // A dispatch that is refused is not recorded as allowed.
+    const dispatchOff = await grantFixture({ workflowDispatch: false });
+    refused(await dispatchOff.write("example-org/app", { action: "other", privileged: ["workflowDispatch"], agentId: DX, runId: RUN }), /\(workflowDispatch\) and it is turned off/);
+    expect(dispatchOff.logged("github.workflow_dispatch_allowed")).toEqual([]);
+  });
+
+  it("records a dispatch the run's own user makes, and one that cannot be recorded is refused", async () => {
+    const f = await grantFixture();
+    const policy = { default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "run", allowedRepositories: ["example-org/app"] };
+    await f.h.performAction("write-identity.set", { companyId: "other", policy }, actors("other").admin);
+    const ask = () => f.h.performAction<any>("repository-write-identity", { companyId: "other", repository: "example-org/app", access: "write", action: "other", privileged: ["workflowDispatch"], agentId: OTHER, runId: RUN }, actors("other").server);
+    expect(await ask()).toMatchObject({ identity: "user" });
+    expect(f.logged("github.workflow_dispatch_allowed")).toEqual([expect.objectContaining({ companyId: "other", metadata: expect.objectContaining({ via: "company", agentId: OTHER, runId: RUN }) })]);
+    const down = new Error("activity store is down");
+    const log = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(ask()).rejects.toThrow(down);
+    log.mockRestore();
+  });
+
+  it("holds the Git Data API sequence that builds a workflow file object by object: refused without the grant, allowed and recorded with it", async () => {
+    // What the server classifies for gh api blobs, trees (a file, a symlink), commits and the ref of a branch that is not the default one.
+    const sequence = [
+      { action: "commit", route: "git/blobs" }, { action: "commit", route: "git/trees" }, { action: "commit", route: "git/trees" },
+      { action: "commit", route: "git/commits" }, { action: "push", route: "git/refs/heads/feature" },
+    ];
+    const f = await grantFixture();
+    for (const agentId of [OTHER, null, undefined] as const) {
+      for (const call of sequence) refused(await f.push(agentId, call), /no board grant for editWorkflows.*write-identity\.grant/s);
+    }
+    // The route is a receipt, not a permission: a call that names a harmless one is held the same.
+    refused(await f.push(OTHER, { action: "commit", route: "contents/README.md" }), /no board grant for editWorkflows/);
+    refused(await f.push(OTHER, { action: "push" }), /no board grant for editWorkflows/);
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    // The granted agent builds it, and each call is recorded with the endpoint it used.
+    for (const call of sequence) expect(await f.push(DX, call), call.route).toMatchObject({ identity: "user", credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")).toEqual(sequence.map(call => expect.objectContaining({
+      companyId: f.companyId, entityType: "agent", entityId: DX,
+      metadata: { action: "editWorkflows", via: "agent-grant", agentId: DX, runId: RUN, repository: "example-org/app", branch: null, tip: null, paths: null, route: call.route },
+    })));
+    // A record that cannot be written stops the sequence before the credential is returned.
+    const down = new Error("activity store is down");
+    const log = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(f.push(DX, sequence[1])).rejects.toThrow(down);
+    log.mockRestore();
+  });
+
+  it("clips a long receipt and ignores one that is not text", async () => {
+    const f = await grantFixture();
+    const long = `git/refs/heads/${"x".repeat(500)}`;
+    expect(await f.push(DX, { action: "push", route: long })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(await f.push(DX, { action: "push", route: { path: "git/trees" } })).toMatchObject({ credential: { login: "agent-owner" } });
+    const [first, second] = f.logged("github.workflow_push_allowed").map(entry => (entry.metadata as any));
+    expect(first.route).toHaveLength(200);
+    expect(second).not.toHaveProperty("route");
+  });
+
+  it("refuses a workflow push whose record cannot be written, in either mode, and returns no credential", async () => {
+    const f = await grantFixture();
+    const down = new Error("activity store is down");
+    const log = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(f.push(DX, { workflowPush: report })).rejects.toThrow(down);
+    log.mockRestore();
+    // Nothing was recorded; once the record can be written the same push goes through.
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    expect(await f.push(DX, { workflowPush: report })).toMatchObject({ credential: { login: "agent-owner" } });
+    expect(f.logged("github.workflow_push_allowed")).toHaveLength(1);
+    // The company that writes as its run users is held to the same rule.
+    const policy = { default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "run", allowedRepositories: ["example-org/app"], privileged: { editWorkflows: { agentIds: [OTHER] } } };
+    await f.h.performAction("write-identity.set", { companyId: "other", policy }, actors("other").admin);
+    const ask = () => f.h.performAction<any>("repository-write-identity", { companyId: "other", repository: "example-org/app", access: "write", action: "push", privileged: ["editWorkflows"], agentId: OTHER, runId: RUN }, actors("other").server);
+    const failing = vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(down);
+    await expect(ask()).rejects.toThrow(down);
+    failing.mockRestore();
+    expect(await ask()).not.toHaveProperty("unavailable");
+    expect(f.logged("github.workflow_push_allowed")).toHaveLength(2);
+  });
+
+  it("grants workflowDispatch to chosen agents the same way, for the host's commands and the plugin's own tools", async () => {
+    const f = await grantFixture({ workflowDispatch: { agentIds: [DX] } });
+    const dispatch = (agentId?: string | null) => f.write("example-org/app", { action: "other", privileged: ["workflowDispatch"], ...(agentId === undefined ? {} : { agentId }), runId: RUN });
+    expect(await dispatch(DX)).toMatchObject({ credential: { login: "agent-owner" } });
+    refused(await dispatch(OTHER), /no board grant for workflowDispatch.*write-identity\.grant/s);
+    refused(await dispatch(), /no board grant for workflowDispatch/);
+    expect(f.logged("github.workflow_dispatch_allowed")).toEqual([expect.objectContaining({
+      entityType: "agent", entityId: DX, metadata: { action: "workflowDispatch", via: "agent-grant", agentId: DX, runId: RUN, repository: "example-org/app" },
+    })]);
+    expect(f.logged("github.workflow_push_allowed")).toEqual([]);
+    // The plugin's own tool takes the agent from the run it executes in, never from its input.
+    const original = f.request.getMockImplementation()!;
+    f.request.mockImplementation(async (path: string, auth?: string, body?: unknown, method?: string) =>
+      path === "/repos/Example-Org/app/check-runs/5/rerequest" && method === "POST" ? { data: {} as any, next: false } : (original as any)(path, auth, body, method));
+    const rerun = (agentId: string, input: Record<string, unknown> = {}) => f.h.executeTool<any>("github_rerun_checks",
+      { repository: "Example-Org/app", number: 7, checkRunId: 5, ...input }, { companyId: f.companyId, agentId, projectId: "p1", runId: RUN });
+    expect((await rerun(DX)).error).toBeUndefined();
+    expect((await rerun(OTHER)).error).toMatch(/no board grant for workflowDispatch/);
+    expect((await rerun(OTHER, { agentId: DX, agentIds: [DX] })).error).toMatch(/no board grant for workflowDispatch/);
+  });
+
+  it("lets a board administrator change the scope with the grant action, and records the change", async () => {
+    const f = await grantFixture({ editWorkflows: false });
+    f.h.seed({ agents: [DX, OTHER].map(id => ({ id, companyId: f.companyId, name: `Agent ${id.slice(0, 4)}`, status: "idle" })) as any });
+    const admin = actors(f.companyId).admin;
+    const before = await f.policy();
+    const grant = (scope: unknown, action = "editWorkflows") => f.h.performAction<any>("write-identity.grant", { companyId: f.companyId, action, scope }, admin);
+
+    expect(await grant({ agentIds: [DX.toUpperCase(), DX] })).toMatchObject({ companyId: f.companyId, action: "editWorkflows", scope: { agentIds: [DX] } });
+    // Only that value changed, and the grant works at once for the agent and for nobody else.
+    expect(await f.policy()).toEqual({ ...before, privileged: { ...before.privileged, editWorkflows: { agentIds: [DX] } } });
+    expect(await f.push(DX)).toMatchObject({ credential: { login: "agent-owner" } });
+    refused(await f.push(OTHER), /no board grant for editWorkflows/);
+    expect(f.logged("github.privileged_grant_changed")).toEqual([expect.objectContaining({ companyId: f.companyId, metadata: { action: "editWorkflows", previous: false, scope: { agentIds: [DX] }, by: "admin" } })]);
+    // Two agents, then every agent (the legacy value), then nobody.
+    expect((await grant({ agentIds: [DX, OTHER] })).scope).toEqual({ agentIds: [OTHER, DX].sort() });
+    expect(await f.push(OTHER)).toMatchObject({ credential: { login: "agent-owner" } });
+    await grant(true);
+    expect((await f.policy()).privileged.editWorkflows).toBe(true);
+    expect(await f.push(null)).toMatchObject({ credential: { login: "agent-owner" } });
+    await grant(false);
+    refused(await f.push(DX), /turned off for this company/);
+    await grant({ agentIds: [] });
+    expect((await f.policy()).privileged.editWorkflows).toBe(false);
+    // The other action keeps its own scope.
+    await grant({ agentIds: [OTHER] }, "workflowDispatch");
+    expect((await f.policy()).privileged).toMatchObject({ editWorkflows: false, workflowDispatch: { agentIds: [OTHER] } });
+    expect(f.logged("github.privileged_grant_changed")).toHaveLength(6);
+  });
+
+  it("refuses a grant that is not for editWorkflows or workflowDispatch, not a scope, not for an agent of this company, or without a saved policy", async () => {
+    const f = await grantFixture({ editWorkflows: false });
+    f.h.seed({ agents: [{ id: DX, companyId: f.companyId, name: "Workflow Editor", status: "idle" }, { id: FOREIGN, companyId: "elsewhere", name: "Not ours", status: "idle" }] as any });
+    const admin = actors(f.companyId).admin;
+    const before = await f.policy();
+    const attempt = (params: Record<string, unknown>, caller = admin, company = f.companyId) => f.h.performAction("write-identity.grant", { companyId: company, ...params }, caller);
+    await expect(attempt({ action: "adminMerge", scope: { agentIds: [DX] } })).rejects.toThrow(/editWorkflows or workflowDispatch/);
+    await expect(attempt({ action: "pushToMain", scope: true })).rejects.toThrow(/editWorkflows or workflowDispatch/);
+    await expect(attempt({ scope: true })).rejects.toThrow(/editWorkflows or workflowDispatch/);
+    for (const scope of ["all", null, 1, [DX], { agentIds: "x" }, { agentIds: ["Workflow Editor"] }, { agentIds: [DX], all: true }]) {
+      await expect(attempt({ action: "editWorkflows", scope }), JSON.stringify(scope)).rejects.toThrow(/editWorkflows/);
+    }
+    await expect(attempt({ action: "editWorkflows", scope: { agentIds: [FOREIGN] } })).rejects.toThrow(new RegExp(`${FOREIGN}.*not an agent of this company`));
+    await expect(attempt({ action: "editWorkflows", scope: { agentIds: [DX, "6b6b6b6b-1111-4111-8111-222222222222"] } })).rejects.toThrow(/not an agent of this company/);
+    // A company that never saved a write identity has nothing to grant in.
+    await expect(attempt({ action: "editWorkflows", scope: true }, actors("fresh").admin, "fresh")).rejects.toThrow(/Save a write identity first/);
+    expect(await f.policy()).toEqual(before);
+    expect(f.logged("github.privileged_grant_changed")).toEqual([]);
+  });
+
+  it("lists the company's agents for the board, and a saved policy keeps its grants when read back and saved again", async () => {
+    const f = await grantFixture({ editWorkflows: { agentIds: [DX] }, workflowDispatch: { agentIds: [OTHER, DX] } });
+    f.h.seed({ agents: [{ id: DX, companyId: f.companyId, name: "Workflow Editor", status: "idle" }, { id: OTHER, companyId: f.companyId, name: "Reviewer", status: "paused" }, { id: FOREIGN, companyId: "elsewhere", name: "Not ours", status: "idle" }] as any });
+    expect((await f.h.performAction<any>("write-identity.agents", { companyId: f.companyId }, actors(f.companyId).member)).agents)
+      .toEqual([{ id: DX, name: "Workflow Editor", status: "idle" }, { id: OTHER, name: "Reviewer", status: "paused" }].sort((a, b) => a.name.localeCompare(b.name)));
+    const saved = await f.policy();
+    expect(saved.privileged).toMatchObject({ editWorkflows: { agentIds: [DX] }, workflowDispatch: { agentIds: [OTHER, DX].sort() } });
+    // Saving what was read (the settings page does) changes nothing.
+    await f.setPolicy(saved);
+    expect(await f.policy()).toEqual(saved);
+    expect(await f.push(DX)).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // An instance admin's per-repository opt-in (`agentMergeablePaths` in the plugin config): agents may merge pull requests that
-// touch `.github/**`, except for the CODEOWNERS paths, control repositories, tiers paths and the admin's own exclusions.
+// touch `.github/**`, except for the CODEOWNERS paths, control paths, tiers paths, repositories with a tiers file and the admin's own exclusions.
 // ---------------------------------------------------------------------------
 
 describe("agentMergeablePaths: an instance admin releases some protected paths for agent merges", () => {
@@ -1997,8 +2744,8 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
   const synthetic = [ORDINARY, OTHER].map((fullName, index) => ({ id: 900 + index, name: fullName.split("/")[1]!, fullName, url: `https://github.com/${fullName}`, installationId: 101, owner: OWNER, ownerId: 1, private: true, permissions }));
   /** Extends the fixture's fake GitHub, catalog and installation so that they answer for the synthetic repositories as for their own. */
   function addSyntheticRepositories(f: Awaited<ReturnType<typeof appFixture>>) {
-    const catalog = vi.mocked(f.client.catalog), listed = catalog.getMockImplementation()!;
-    catalog.mockImplementation(async (...args) => { const result = await listed(...args); return { ...result, repositories: [...result.repositories, ...synthetic] }; });
+    const catalog = vi.mocked(f.client.catalog), readCatalog = catalog.getMockImplementation()!;
+    catalog.mockImplementation(async (...args) => { const result = await readCatalog(...args); return { ...result, repositories: [...result.repositories, ...synthetic] }; });
     const own = f.request.getMockImplementation()!;
     f.request.mockImplementation(async (path: string, ...rest: any[]) => {
       const mine = new RegExp(`^/repos/(${OWNER}/[a-z-]+)/(.+)$`).exec(path);
@@ -2143,11 +2890,37 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
     }
   });
 
-  it("never lets a control repository opt in, even when it is listed, and keeps its other protected paths", async () => {
+  it("lets a control repository without a tiers file opt in to .github/**, and keeps its control paths and CODEOWNERS refused", async () => {
     const f = await fixture(optIn({}, CONTROL));
-    for (const filename of [".github/workflows/ci.yml", "paperclip/gates.yaml", "scripts/build.sh"]) {
-      f.github.prFiles = [{ filename }];
-      expect(await merge(f, CONTROL), filename).toMatchObject(refused([filename]));
+    f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, CONTROL)).toMatchObject({
+      credential: { login: "agent-owner" },
+      evidence: { protectedPaths: { releasedProtectedFiles: [".github/workflows/ci.yml"], releasedBy: "config:agentMergeablePaths" } },
+    });
+    // These stay refused with the opt-in on, alone and next to a released file (which keeps the refusal for the whole pull request).
+    for (const filename of ["paperclip/gates.yaml", "scripts/build.sh", "ROADMAP.md", "data/company/strategy/plan.md", "CODEOWNERS", ".github/CODEOWNERS", ".github/../scripts/x"]) {
+      for (const prFiles of [[{ filename }], [{ filename: ".github/workflows/ci.yml" }, { filename }]]) {
+        f.github.prFiles = prFiles;
+        const decision = await merge(f, CONTROL);
+        expect(decision, `${filename} (${prFiles.length} files)`).toMatchObject(refused([filename]));
+        expect(decision).not.toHaveProperty("credential");
+      }
+    }
+  });
+
+  it("keeps a control repository refused without its own explicit opt-in, and when its base branch has a tiers file", async () => {
+    // No entry, or an entry for another repository: nothing is released.
+    for (const config of [undefined, optIn({}, ORDINARY)]) {
+      const f = await fixture(config);
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f, CONTROL), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    }
+    // A tiers file refuses the opt-in, and a tiers file with no opt-in refuses as before.
+    for (const config of [optIn({}, CONTROL), undefined]) {
+      const f = await fixture(config);
+      f.github.contents[`${CONTROL}/paperclip/tiers.yaml@${base}`] = tiersFile(["paperclip/**"]);
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f, CONTROL), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
     }
   });
 
@@ -2239,5 +3012,424 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
     const decision = await merge(f);
     expect(decision.evidence.protectedPaths.releasedProtectedFiles).toHaveLength(100);
     expect(decision.evidence.protectedPaths).toMatchObject({ releasedProtectedFilesCount: 150, releasedBy: "config:agentMergeablePaths" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A board-visible alert when writes stop on their own
+// ---------------------------------------------------------------------------
+
+describe("write alerts: the board hears at once when writes are switched off or paused", () => {
+  const minutes = (n: number) => n * 60_000;
+  async function alertFixture() {
+    const f = await appFixture();
+    const companyId = String((await f.action("write-identity.get")).companyId);
+    const repository = f.github.installationRepos[0]!;
+    f.h.seed({ companies: [{ id: companyId, name: "Acme" } as any] });
+    const alerts = async () => f.h.ctx.issues.list({ companyId, originKind: WRITE_ALERT_ORIGIN });
+    const open = async () => (await alerts()).filter(issue => issue.status !== "done" && issue.status !== "cancelled");
+    const advance = (ms: number) => vi.setSystemTime(Date.now() + ms);
+    const job = () => f.h.runJob("github-sync");
+    return { ...f, companyId, repository, alerts, open, advance, job };
+  }
+  /** GitHub refuses the refresh token: a revocation GitHub confirmed. */
+  async function revoked(f: Awaited<ReturnType<typeof alertFixture>>) {
+    await f.authorize();
+    f.github.revoked = true;
+    f.advance(8 * 3_600_000);
+    await f.job();
+  }
+  const status = async (f: Awaited<ReturnType<typeof alertFixture>>) =>
+    (await f.h.performAction<any>("user-authorization.status", { companyId: f.companyId }, actors(f.companyId).member)).authorization;
+  const userChecks = (f: Awaited<ReturnType<typeof alertFixture>>) => f.request.mock.calls.filter(([path]) => path === "/user").length;
+
+  it("raises one critical alert in the administrator's inbox the moment a revocation switches writes off, with the recovery steps", async () => {
+    const f = await alertFixture();
+    await revoked(f);
+    expect((await f.policy()).enabled).toBe(false);
+    const [alert, ...others] = await f.open();
+    expect(others).toEqual([]);
+    expect(alert).toMatchObject({ originKind: WRITE_ALERT_ORIGIN, originId: f.companyId, status: "todo", priority: "critical", assigneeUserId: "admin", title: "GitHub writes are switched OFF for Acme" });
+    const text = alert!.description!;
+    expect(text).toContain(`Acme (\`${f.companyId}\`)`);
+    expect(text).toContain("refused to refresh");
+    // Re-authorize first, because the reason is a revocation, then save the policy with enabled: true.
+    expect(text.indexOf("user-authorization.start")).toBeGreaterThan(-1);
+    expect(text).toContain(`-C ${f.companyId}`);
+    expect(text.indexOf("user-authorization.poll")).toBeLessThan(text.indexOf("write-identity.set"));
+    expect(text).toContain('"enabled": true');
+    expect(text).toContain("never turns writes back on by itself");
+    // The activity entry stays as it was.
+    expect(f.h.activity).toContainEqual(expect.objectContaining({ message: "github.fence_violation", metadata: expect.objectContaining({ writesDisabled: true }) }));
+  });
+
+  it("names drift without asking for a re-authorization", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    f.github.installationRepos.push("acme/unexpected");
+    f.advance(61 * 60_000);
+    await f.job();
+    const [alert] = await f.open();
+    expect(alert).toMatchObject({ priority: "critical", title: "GitHub writes are switched OFF for Acme" });
+    expect(alert!.description).toContain("extra: acme/unexpected");
+    expect(alert!.description).toContain("installationRepositories");
+    expect(alert!.description).not.toContain("user-authorization.start");
+    expect(alert!.description).toContain('"enabled": true');
+  });
+
+  it("updates the one alert on repeated checks and failed re-enables instead of opening another", async () => {
+    const f = await alertFixture();
+    await revoked(f);
+    const [first] = await f.open();
+    // Hourly checks and an administrator's check change nothing about the alert.
+    for (let n = 0; n < 3; n++) { f.advance(61 * 60_000); await f.job(); }
+    await f.action("user-authorization.check");
+    expect(await f.alerts()).toHaveLength(1);
+    const before = first!.updatedAt;
+    expect((await f.open())[0]!.updatedAt).toEqual(before);
+    // Re-enabling before re-authorizing fails the check again: the same issue carries the new reason.
+    const again = await f.setPolicy({ ...await f.policy(), enabled: true });
+    expect(again.policy.enabled).toBe(false);
+    const alerts = await f.alerts();
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.id).toBe(first!.id);
+    expect(alerts[0]!.description).toContain("Authorize the GitHub user again");
+    expect(alerts[0]!.description).not.toBe(first!.description);
+  });
+
+  it("closes the alert only once an administrator has turned writes back on and the check passed; the plugin never does", async () => {
+    const f = await alertFixture();
+    await revoked(f);
+    f.github.revoked = false;
+    await f.authorize();
+    // Re-authorized and the fence passes, but writes are still off, and so is the alert's reason to exist.
+    expect((await f.policy()).enabled).toBe(false);
+    f.advance(61 * 60_000);
+    await f.job();
+    expect((await f.policy()).enabled).toBe(false);
+    expect(await f.open()).toHaveLength(1);
+    expect(await f.write(f.repository)).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+    expect((await f.setPolicy({ ...await f.policy(), enabled: true })).fence).toMatchObject({ ok: true });
+    expect(await f.open()).toEqual([]);
+    const [closed] = await f.alerts();
+    expect(closed).toMatchObject({ status: "done", description: expect.stringMatching(/^\*\*Resolved .*\*\* the conditions below no longer hold\./) });
+    expect(await f.write(f.repository)).toHaveProperty("credential");
+  });
+
+  it("opens a new alert for a new incident, and leaves one the board closed alone while nothing changed", async () => {
+    const f = await alertFixture();
+    await revoked(f);
+    const [first] = await f.open();
+    // The board closes it by hand while writes are still off: later unchanged checks do not reopen or duplicate it.
+    await f.h.ctx.issues.update(first!.id, { status: "done" }, f.companyId);
+    for (let n = 0; n < 2; n++) { f.advance(61 * 60_000); await f.job(); }
+    expect(await f.alerts()).toHaveLength(1);
+    expect(await f.open()).toEqual([]);
+    // Recover (the administrator's first re-enable attempt, before the new authorization, is news and opens a fresh alert)...
+    f.github.revoked = false;
+    await f.authorize();
+    await f.setPolicy({ ...await f.policy(), enabled: true });
+    expect(await f.open()).toEqual([]);
+    const seen = (await f.alerts()).map(issue => issue.id);
+    // ...then a second drift is a new incident with its own issue.
+    f.github.installationRepos.push("acme/unexpected");
+    f.advance(61 * 60_000);
+    await f.job();
+    const open = await f.open();
+    expect(open).toHaveLength(1);
+    expect(seen).not.toContain(open[0]!.id);
+    expect(open[0]!.description).toContain("extra: acme/unexpected");
+  });
+
+  it("leaves an alert the board reassigned with its new owner", async () => {
+    const f = await alertFixture();
+    await revoked(f);
+    const [alert] = await f.open();
+    await f.h.ctx.issues.update(alert!.id, { assigneeUserId: "reviewer" }, f.companyId);
+    await f.setPolicy({ ...await f.policy(), enabled: true });
+    expect((await f.open())[0]).toMatchObject({ id: alert!.id, assigneeUserId: "reviewer", description: expect.stringContaining("Authorize the GitHub user again") });
+  });
+
+  it("goes unassigned when no administrator is known, and retries unassigned when the administrator cannot be assigned", async () => {
+    const f = await alertFixture();
+    await createWriteAlerts(f.h.ctx).writesOff(f.companyId, { reason: "drift", reauthorize: false });
+    expect(await f.open()).toEqual([expect.objectContaining({ assigneeUserId: null, priority: "critical" })]);
+    const g = await alertFixture();
+    await g.authorize();
+    const create = g.h.ctx.issues.create.bind(g.h.ctx.issues);
+    vi.spyOn(g.h.ctx.issues, "create").mockImplementation(async input => { if (input.assigneeUserId) throw new Error("not a member"); return create(input); });
+    await createWriteAlerts(g.h.ctx).writesOff(g.companyId, { reason: "drift", reauthorize: false });
+    expect(await g.open()).toEqual([expect.objectContaining({ assigneeUserId: null })]);
+  });
+
+  it("switches writes off even when the alert cannot be written, and writes it on a later minute", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    const create = f.h.ctx.issues.create.bind(f.h.ctx.issues);
+    const failing = vi.spyOn(f.h.ctx.issues, "create").mockRejectedValue(new Error("host is down"));
+    const missingRepository = f.github.installationRepos.pop()!;
+    f.advance(61 * 60_000);
+    await f.job();
+    expect((await f.policy()).enabled).toBe(false);
+    expect(await f.alerts()).toEqual([]);
+    expect(f.h.logs).toContainEqual(expect.objectContaining({ level: "warn", message: expect.stringContaining("could not write the alert issue") }));
+    // Not hammered every minute: the next attempt waits.
+    const attempts = failing.mock.calls.length;
+    f.advance(60_000);
+    await f.job();
+    expect(failing.mock.calls.length).toBe(attempts);
+    failing.mockImplementation(create);
+    f.advance(5 * 60_000);
+    await f.job();
+    expect(await f.open()).toEqual([expect.objectContaining({ priority: "critical", description: expect.stringContaining(`missing: ${missingRepository.toLowerCase()}`) })]);
+  });
+
+  it("alerts when a transient pause lasts 30 minutes, retrying the check every 5 minutes meanwhile, and closes it when the check passes", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    f.github.unreachable = true;
+    f.advance(61 * 60_000);
+    await f.job();
+    expect((await f.policy()).enabled).toBe(true);
+    const failed = userChecks(f);
+    // A transient failure is retried after 5 minutes, not after an hour.
+    f.advance(minutes(2));
+    await f.job();
+    expect(userChecks(f)).toBe(failed);
+    f.advance(minutes(3));
+    await f.job();
+    expect(userChecks(f)).toBe(failed + 1);
+    f.advance(minutes(20));
+    await f.job();
+    expect(await f.alerts()).toEqual([]);
+    f.advance(minutes(5));
+    await f.job();
+    expect(PAUSE_ALERT_AFTER_MS).toBe(minutes(30));
+    const [alert] = await f.open();
+    expect(alert).toMatchObject({ priority: "high", title: "GitHub writes are paused for Acme", assigneeUserId: "admin" });
+    expect(alert!.description).toContain("could not be reached");
+    expect(alert!.description).toContain("nothing was switched off");
+    expect(alert!.description).toContain("user-authorization.check");
+    // Nothing was switched off, and nothing is asked of the policy.
+    expect((await f.policy()).enabled).toBe(true);
+    expect(f.h.activity.map(entry => entry.message)).not.toContain("github.fence_violation");
+    f.advance(minutes(5));
+    await f.job();
+    expect(await f.alerts()).toHaveLength(1);
+    f.github.unreachable = false;
+    f.advance(minutes(5));
+    await f.job();
+    expect(await f.open()).toEqual([]);
+    expect((await f.alerts())[0]).toMatchObject({ status: "done" });
+    expect(await f.write(f.repository)).toHaveProperty("credential");
+  });
+
+  it("stays silent for a pause that ends before 30 minutes", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    f.github.unreachable = true;
+    f.advance(61 * 60_000);
+    await f.job();
+    f.advance(minutes(10));
+    await f.job();
+    f.github.unreachable = false;
+    f.advance(minutes(5));
+    await f.job();
+    f.advance(minutes(60));
+    await f.job();
+    expect(await f.alerts()).toEqual([]);
+    expect((await f.policy()).enabled).toBe(true);
+  });
+
+  /** Ways the fence check keeps failing for a reason that is not drift: the pause never clears on its own. */
+  const stuck: Array<[string, (f: Awaited<ReturnType<typeof alertFixture>>) => void, string]> = [
+    ["a 401 to the user token after every refresh", f => { f.github.rejectUser = true; }, "rejected the user token"],
+    ["incorrect_client_credentials on every refresh", f => { f.oauth.mockImplementation(async () => ({ error: "incorrect_client_credentials" })); }, "incorrect_client_credentials"],
+    ["a 401 to the App's own credentials (a bad or rotated private key)", f => { vi.mocked(f.client.catalog).mockRejectedValue(new GitHubError(401)); }, "App's credentials"],
+    ["a 403 on the user endpoints", f => {
+      const original = f.request.getMockImplementation()!;
+      f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+        if (path.startsWith("/user/installations?")) throw new GitHubError(403);
+        return (original as any)(path, ...rest);
+      });
+    }, "HTTP 403"],
+    ["a 404 on the user endpoints", f => {
+      const original = f.request.getMockImplementation()!;
+      f.request.mockImplementation(async (path: string, ...rest: any[]) => {
+        if (path.startsWith("/user/installations?")) throw new GitHubError(404);
+        return (original as any)(path, ...rest);
+      });
+    }, "HTTP 404"],
+  ];
+  const messagesOf = (f: Awaited<ReturnType<typeof alertFixture>>, message: string) => f.h.activity.filter(entry => entry.message === message);
+
+  it.each(stuck)("a pause that never clears (%s) alerts after 30 minutes, once, and keeps the policy as it is", async (_name, breakIt, reason) => {
+    const f = await alertFixture();
+    await f.authorize();
+    f.advance(8 * 3_600_000);
+    breakIt(f);
+    // Every 5 minutes (the first hour's retry cadence): silent until the pause is 30 minutes old.
+    await f.job();
+    for (let n = 0; n < 5; n++) { f.advance(minutes(5)); await f.job(); }
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true });
+    expect(await f.alerts()).toEqual([]);
+    expect(messagesOf(f, "github.fence_paused")).toEqual([]);
+    f.advance(minutes(5));
+    await f.job();
+    const [alert, ...others] = await f.open();
+    expect(others).toEqual([]);
+    expect(alert).toMatchObject({ priority: "high", title: "GitHub writes are paused for Acme", assigneeUserId: "admin" });
+    expect(alert!.description).toContain(reason);
+    expect(alert!.description).toContain("nothing was switched off");
+    expect(alert!.description).toContain("user-authorization.check");
+    expect(messagesOf(f, "github.fence_paused")).toEqual([expect.objectContaining({ metadata: expect.objectContaining({ reason: expect.stringContaining(reason), pausedMinutes: 30, writesDisabled: false }) })]);
+    // Hours later, still paused: the same issue, untouched, and no second entry. Nothing flipped the kill switch.
+    const updatedAt = alert!.updatedAt;
+    for (let n = 0; n < 8; n++) { f.advance(minutes(30)); await f.job(); }
+    expect(await f.alerts()).toHaveLength(1);
+    expect((await f.open())[0]!.updatedAt).toEqual(updatedAt);
+    expect(messagesOf(f, "github.fence_paused")).toHaveLength(1);
+    expect(messagesOf(f, "github.fence_violation")).toEqual([]);
+    expect((await f.policy()).enabled).toBe(true);
+    expect(await f.write(f.repository)).toMatchObject({ unavailable: expect.any(String) });
+  });
+
+  it("a second pause, after the first ended, is a new incident: its own issue and its own activity entry", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    f.github.unreachable = true;
+    f.advance(61 * 60_000);
+    await f.job();
+    f.advance(minutes(30));
+    await f.job();
+    const [first] = await f.open();
+    expect(messagesOf(f, "github.fence_paused")).toHaveLength(1);
+    f.github.unreachable = false;
+    f.advance(minutes(5));
+    await f.job();
+    expect(await f.open()).toEqual([]);
+    f.advance(61 * 60_000);
+    f.github.unreachable = true;
+    await f.job();
+    f.advance(minutes(30));
+    await f.job();
+    const [second] = await f.open();
+    expect(second!.id).not.toBe(first!.id);
+    expect(messagesOf(f, "github.fence_paused")).toHaveLength(2);
+  });
+
+  it("a failing activity log neither blocks the alert nor is lost: the entry is written once it works", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    f.github.unreachable = true;
+    f.advance(61 * 60_000);
+    await f.job();
+    const log = f.h.ctx.activity.log.bind(f.h.ctx.activity);
+    vi.spyOn(f.h.ctx.activity, "log").mockRejectedValue(new Error("activity is down"));
+    f.advance(minutes(30));
+    await f.job();
+    expect(await f.open()).toEqual([expect.objectContaining({ priority: "high" })]);
+    expect(messagesOf(f, "github.fence_paused")).toEqual([]);
+    vi.spyOn(f.h.ctx.activity, "log").mockImplementation(log);
+    f.advance(minutes(1));
+    await f.job();
+    f.advance(minutes(1));
+    await f.job();
+    expect(messagesOf(f, "github.fence_paused")).toHaveLength(1);
+  });
+
+  it("times a pause by GitHub's clock: a host clock 4.5 hours behind does not delay the alert", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    // The VM was paused: GitHub is 4.5 hours ahead of this host, and every answer says so.
+    f.github.offsetMs = 4.5 * 3_600_000;
+    f.github.rejectUser = true;
+    f.advance(61 * 60_000);
+    await f.job();
+    const { fence } = await status(f);
+    expect(fence).toMatchObject({ ok: false, transient: true });
+    expect(Math.abs(fence.clockSkewSeconds - 16_200)).toBeLessThan(5);
+    f.advance(minutes(25));
+    await f.job();
+    // 25 minutes by every clock: the skew alone is raised, the pause is not yet.
+    expect(await f.open()).toEqual([expect.objectContaining({ priority: "medium", title: "This host's clock is off from GitHub's (Acme)" })]);
+    expect(messagesOf(f, "github.fence_paused")).toEqual([]);
+    f.advance(minutes(5));
+    await f.job();
+    const [alert, ...others] = await f.open();
+    expect(others).toEqual([]);
+    expect(alert).toMatchObject({ priority: "high", title: "GitHub writes are paused for Acme" });
+    expect(alert!.description).toContain("4.5 hours behind GitHub's");
+    expect(messagesOf(f, "github.fence_paused")).toEqual([expect.objectContaining({ metadata: expect.objectContaining({ pausedMinutes: 30 }) })]);
+  });
+
+  it("shows a pause and a switch-off in the one issue, and a switch-off replaces a pause that ended in drift", async () => {
+    const f = await alertFixture();
+    await f.authorize();
+    f.github.unreachable = true;
+    f.advance(61 * 60_000);
+    await f.job();
+    f.advance(minutes(30));
+    await f.job();
+    expect((await f.open())[0]).toMatchObject({ priority: "high" });
+    // GitHub answers again, but the installation has drifted: writes are switched off, in the same issue.
+    f.github.unreachable = false;
+    f.github.installation.repository_selection = "all";
+    f.advance(minutes(5));
+    await f.job();
+    const open = await f.open();
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ priority: "critical", title: "GitHub writes are switched OFF for Acme" });
+    expect(open[0]!.description).toContain("all repositories");
+    expect(open[0]!.description).not.toContain("have been paused");
+  });
+
+  it("closes the alert when an administrator moves the company off the App user", async () => {
+    const f = await alertFixture();
+    await revoked(f);
+    expect(await f.open()).toHaveLength(1);
+    await f.setPolicy(null);
+    expect(await f.open()).toEqual([]);
+    expect((await f.alerts())[0]!.description).toContain("no longer writes as its GitHub App user");
+  });
+
+  it("alerts on a host clock more than a minute from GitHub's, once, and closes it when the clock is right", async () => {
+    const f = await alertFixture();
+    const alerts = createWriteAlerts(f.h.ctx);
+    const check = (clockSkewSeconds?: number) => ({ ok: true, checkedAt: new Date().toISOString(), ...(clockSkewSeconds === undefined ? {} : { clockSkewSeconds }) });
+    await alerts.observe(f.companyId, check(CLOCK_SKEW_ALERT_SECONDS), true);
+    expect(await f.alerts()).toEqual([]);
+    // GitHub is 4.5 hours ahead: this host is behind (the VM was paused).
+    await alerts.observe(f.companyId, check(16_200), true);
+    const [alert] = await f.open();
+    expect(alert).toMatchObject({ priority: "medium", title: "This host's clock is off from GitHub's (Acme)" });
+    expect(alert!.description).toContain("4.5 hours behind GitHub's");
+    expect(alert!.description).toContain("chrony");
+    // A clock that drifts a little more is not a new alert, nor a new write.
+    await alerts.observe(f.companyId, check(16_260), true);
+    expect(await f.alerts()).toHaveLength(1);
+    expect((await f.open())[0]!.updatedAt).toEqual(alert!.updatedAt);
+    // Ahead instead of behind: the same issue says so.
+    await alerts.observe(f.companyId, check(-7_200), true);
+    expect((await f.open())[0]!.description).toContain("2 hours ahead of GitHub's");
+    await alerts.observe(f.companyId, check(), true);
+    expect(await f.open()).toEqual([]);
+    expect(await f.alerts()).toHaveLength(1);
+  });
+
+  it("puts a switch-off and a clock skew in the same issue at the higher priority", async () => {
+    const f = await alertFixture();
+    const alerts = createWriteAlerts(f.h.ctx);
+    await alerts.observe(f.companyId, { ok: true, checkedAt: new Date().toISOString(), clockSkewSeconds: 16_200 }, true);
+    await alerts.writesOff(f.companyId, { reason: "the installation covers all repositories", reauthorize: false });
+    const open = await f.open();
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ priority: "critical", title: "GitHub writes are switched OFF for Acme" });
+    expect(open[0]!.description).toContain("switched off automatically");
+    expect(open[0]!.description).toContain("4.5 hours behind GitHub's");
+    // The clock is fixed but writes are still off: the alert stays, without the clock.
+    await alerts.observe(f.companyId, { ok: false, checkedAt: new Date().toISOString() }, false);
+    expect((await f.open())[0]!.description).not.toContain("behind GitHub's");
+    expect(await f.open()).toHaveLength(1);
   });
 });

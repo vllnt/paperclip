@@ -4,6 +4,7 @@ import { Navigate, useNavigate, useParams, useSearchParams } from "@/lib/router"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, History, Pencil, Repeat, Sparkles, X } from "lucide-react";
 import { ApiError } from "../api/client";
+import { isEventTrigger } from "../api/eventSources";
 import {
   routinesApi,
   type RoutineTriggerResponse,
@@ -64,6 +65,7 @@ import {
 } from "../components/routine-sections/editable-sections";
 import {
   ActivitySection,
+  EventGroupsSection,
   HistorySection,
   RunsSection,
 } from "../components/routine-sections/operate-sections";
@@ -93,6 +95,7 @@ const SECTION_TITLES: Record<RoutineSectionKey, string> = {
   delivery: "Delivery",
   runs: "Runs",
   activity: "Activity",
+  "event-groups": "Event groups",
   history: "Version history",
 };
 
@@ -156,6 +159,7 @@ export function RoutineDetail() {
     variables: [],
     env: null,
     automationWakeSettings: {},
+    runContextPolicy: null,
   });
 
   const legacyOperateSection = !streamlinedUiEnabled && (sectionParam === "runs" || sectionParam === "activity")
@@ -192,6 +196,7 @@ export function RoutineDetail() {
     refetchInterval: 3000,
   });
   const hasLiveRun = (liveRuns ?? []).length > 0;
+  const hasEventTrigger = Boolean(routine?.triggers?.some(isEventTrigger));
   const { data: routineRuns } = useQuery({
     queryKey: queryKeys.routines.runs(routineId!),
     queryFn: () => routinesApi.listRuns(routineId!),
@@ -261,6 +266,7 @@ export function RoutineDetail() {
             variables: routine.variables,
             env: routine.env ?? null,
             automationWakeSettings: readAutomationWakeSettings(routine.automationWakeSettings),
+            runContextPolicy: routine.runContextPolicy ?? null,
           }
         : null,
     [routine],
@@ -304,6 +310,9 @@ export function RoutineDetail() {
       JSON.stringify(editBaseWakeSettingsRef.current)
     ) {
       result.push({ key: "automationWakeSettings", label: "the automation wake window" });
+    }
+    if (JSON.stringify(editDraft.runContextPolicy ?? null) !== JSON.stringify(routineDefaults.runContextPolicy ?? null)) {
+      result.push({ key: "runContextPolicy", label: "the run context" });
     }
     return result;
   }, [editDraft, routineDefaults]);
@@ -681,6 +690,7 @@ export function RoutineDetail() {
         variables: response.routine.variables as RoutineVariable[],
         env: (response.routine.env ?? null) as RoutineEnvConfig | null,
         automationWakeSettings: readAutomationWakeSettings(response.routine.automationWakeSettings),
+        runContextPolicy: response.routine.runContextPolicy ?? null,
       });
       editBaseWakeSettingsRef.current = readAutomationWakeSettings(response.routine.automationWakeSettings);
       hydratedRoutineIdRef.current = response.routine.id;
@@ -826,6 +836,7 @@ export function RoutineDetail() {
             isSectionDirty={isSectionDirty}
             hasLiveRun={hasLiveRun}
             onNavigate={navigateToSection}
+            showEventGroups={hasEventTrigger}
           />
         ) : null}
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -834,6 +845,7 @@ export function RoutineDetail() {
             activeSection={section}
             onNavigate={navigateToSection}
             isSectionDirty={isSectionDirty}
+            showEventGroups={hasEventTrigger}
           />
         ) : null}
         <header className="flex min-h-14 shrink-0 flex-wrap items-center gap-3 border-b border-border bg-background px-4 py-2 md:px-6">
@@ -947,6 +959,7 @@ export function RoutineDetail() {
             {section === "delivery" && <DeliverySection />}
             {section === "runs" && <RunsSection />}
             {section === "activity" && <ActivitySection isLoading={activityLoading} error={activityError} />}
+            {section === "event-groups" && <EventGroupsSection />}
             {section === "history" && <HistorySection />}
 
             {isEditableSection && (section !== "overview" || overviewEditing) ? (
