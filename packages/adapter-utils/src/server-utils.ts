@@ -119,6 +119,8 @@ interface SpawnTarget {
   cwd?: string;
   env?: Record<string, string | undefined>;
   cleanup?: () => Promise<void>;
+  /** Written to stdin before the caller's input. */
+  stdinPrefix?: string;
 }
 
 type RemoteExecutionSpec = SshRemoteExecutionSpec;
@@ -3674,6 +3676,7 @@ async function resolveSpawnTarget(
     remoteExecution?: RemoteExecutionSpec | null;
     remoteEnv?: Record<string, string> | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
+    runId?: string | null;
   } = {},
 ): Promise<SpawnTarget> {
   const remote = options.remoteExecution ?? null;
@@ -3691,12 +3694,14 @@ async function resolveSpawnTarget(
           (entry): entry is [string, string] => typeof entry[1] === "string",
         ),
       ),
+      processRecord: options.runId ? { runId: options.runId } : null,
     });
     return {
       command: sshResolved,
       args: spawnTarget.args,
       cwd: process.cwd(),
       cleanup: spawnTarget.cleanup,
+      stdinPrefix: spawnTarget.stdinPrefix,
     };
   }
 
@@ -4786,8 +4791,14 @@ export async function runChildProcess(
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
+      runId,
     })
       .then((target) => {
+        // An SSH launch takes its run marker on stdin, ahead of the caller's input.
+        const stdinPayload =
+          target.stdinPrefix != null || opts.stdin != null
+            ? `${target.stdinPrefix ?? ""}${opts.stdin ?? ""}`
+            : null;
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -4799,7 +4810,7 @@ export async function runChildProcess(
             env: childEnv,
             detached: process.platform !== "win32",
             shell: false,
-            stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+            stdio: [stdinPayload != null ? "pipe" : "ignore", "pipe", "pipe"],
           }) as ChildProcessWithEvents;
         } catch (err) {
           // A synchronous spawn failure emits no "error" or "close" event, so
@@ -4968,7 +4979,7 @@ export async function runChildProcess(
         });
 
         const stdin = child.stdin;
-        if (opts.stdin != null && stdin) {
+        if (stdinPayload != null && stdin) {
           const onStdinReady = opts.onStdinReady;
           // A child that exits before reading its whole prompt (for example an
           // `ssh` whose connection drops) makes the pending write fail with
@@ -4979,7 +4990,7 @@ export async function runChildProcess(
           );
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
+            stdin.write(stdinPayload);
             if (!onStdinReady) {
               stdin.end();
               return;
