@@ -25,3 +25,5 @@ export const PORTABLE_ZIP_UPLOAD_LIMIT_BYTES =
   Number.isFinite(zipUploadLimitOverride) && zipUploadLimitOverride >= 1
     ? Math.min(zipUploadLimitOverride, MAX_ZIP_UPLOAD_LIMIT_OVERRIDE_BYTES)
     : 1024 * 1024 * 1024;
+
+export const EVENT_SOURCE_BODY_LIMIT = "64kb";

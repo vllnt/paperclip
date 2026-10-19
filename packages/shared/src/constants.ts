@@ -648,7 +648,7 @@ export type RoutineActivityGatePolicy = (typeof ROUTINE_ACTIVITY_GATE_POLICIES)[
 export const ROUTINE_ACTIVITY_GATE_SCOPES = ["company", "project"] as const;
 export type RoutineActivityGateScope = (typeof ROUTINE_ACTIVITY_GATE_SCOPES)[number];
 
-export const ROUTINE_TRIGGER_KINDS = ["schedule", "webhook", "api"] as const;
+export const ROUTINE_TRIGGER_KINDS = ["schedule", "webhook", "api", "event"] as const;
 export type RoutineTriggerKind = (typeof ROUTINE_TRIGGER_KINDS)[number];
 
 export const ROUTINE_TRIGGER_SIGNING_MODES = ["bearer", "app_webhook", "hmac_sha256", "github_hmac", "fireflies_hmac", "none"] as const;
@@ -662,12 +662,16 @@ export const ROUTINE_RUN_STATUSES = [
   "coalesced",
   "skipped",
   "issue_created",
+  // Event routing (`event` triggers): a repeat/severity increase that became a
+  // comment on the open group issue, and a recovery comment.
+  "grouped",
+  "recovered",
   "completed",
   "failed",
- ] as const;
+] as const;
 export type RoutineRunStatus = (typeof ROUTINE_RUN_STATUSES)[number];
 
-export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook"] as const;
+export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook", "event"] as const;
 export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 
 // "import" marks agents parked by a company import (safety default) so the UI
@@ -755,6 +759,7 @@ export const SECRET_BINDING_TARGET_TYPES = [
   "project",
   "environment",
   "routine",
+  "event_source",
   "plugin",
   "issue",
   "run",
