@@ -12,7 +12,7 @@ What is implemented here is slice 1. The tool catalog and the plan for slices 2 
 ## Surfaces
 
 The plugin has three surfaces: agent tools (`convex_*`), board actions (HTTP, contracts in OpenAPI), and the board UI and CLI that call
-those actions. They are not at parity yet. The gaps are listed here and tracked in VLL-1784.
+those actions. They are not at parity yet. The gaps are listed here and tracked in example-project.
 
 | Operation | Agent tool | Board action | Board UI (Convex page) | CLI (`paperclipai convex`) |
 | --- | --- | --- | --- | --- |
@@ -136,7 +136,7 @@ caller's company, is refused. The caller's company is the host-validated run con
   Full-width letters are normalised, and a name with letters outside plain ASCII is never deleted, because a look-alike letter could hide a word. No grant,
   preset or setting loosens it. **False positives are expected and are the safe side**: a branch called `fix-live-reload` or `release-notes` is never
   deleted or shortened by the plugin and lives until Convex expires it. An expiry may still move later, because that postpones a deletion. The guard lets
-  `dev` through; that allowance belongs to the dev-deployment work in PR #46, which shares these lines and is rebased by VLL-1511.
+  `dev` through; that allowance belongs to the dev-deployment work in PR #46, which shares these lines and is rebased by example-project.
 - **An expiry is a delayed delete.** An agent's expiry earlier than the largest of the preview's current deadline, the deadline the reaper would give it
   (`lastDeployTime + ttlHours`, or `now + ttlHours` for a stale preview) and `now + activityHours` (at most 168) follows the deletion guards and counts against
   the run's deletion cap. Extending a deadline (up to 7 days) is free. The result of `convex_set_preview_expiry` says `countsAsDeletion` and gives

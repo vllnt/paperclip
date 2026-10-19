@@ -143,7 +143,7 @@ describe("page structure", () => {
     render(<ConvexPage context={context} />);
     await ready();
     const css = document.querySelector("style")!.textContent!;
-    const rule = (selector: string) => new RegExp(`${selector.replace(/[.[\]()]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] ?? "";
+    const rule = (selector: string) => new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1] ?? "";
     expect(rule(".pcx button")).toMatch(/border:[^;]*solid[^;]*;/);
     expect(rule(".pcx button")).toMatch(/padding:/);
     expect(rule(".pcx button")).toMatch(/border-radius:/);
@@ -282,7 +282,7 @@ describe("what a dry run would do", () => {
   it("lists skipped and failed items and the names actually deleted after a live pass", async () => {
     action("reaper.report").mockResolvedValue({
       ...report, dryRun: false,
-      projects: [{ ...project, delete: [], setExpiry: [], deleted: ["happy-owl-123"], expirySet: ["calm-fox-456"], skipped: [{ name: "slow-ant-9", previewIdentifier: "feat/wip", reason: "Deletion limit of 10 reached for this run." }], failed: [{ name: "odd-cat-7", error: "Convex returned 500." }] }],
+      projects: [{ ...project, delete: [], setExpiry: [], deleted: ["happy-owl-123"], expirySet: ["calm-fox-456"], skipped: [{ name: "slow-example-project", previewIdentifier: "feat/wip", reason: "Deletion limit of 10 reached for this run." }], failed: [{ name: "odd-cat-7", error: "Convex returned 500." }] }],
     });
     render(<ConvexPage context={context} />);
     await ready();
@@ -290,7 +290,7 @@ describe("what a dry run would do", () => {
     expect(details.hasAttribute("open")).toBe(false);
     expect(details.textContent).toContain("happy-owl-123");
     expect(details.textContent).toContain("calm-fox-456");
-    expect(details.textContent).toContain("slow-ant-9 (preview feat/wip): Deletion limit of 10 reached for this run.");
+    expect(details.textContent).toContain("slow-example-project (preview feat/wip): Deletion limit of 10 reached for this run.");
     expect(details.textContent).toContain("odd-cat-7: Convex returned 500.");
     expect(screen.getByRole("columnheader", { name: "Deleted" })).toBeTruthy();
     expect(screen.getByRole("columnheader", { name: "Expiry set" })).toBeTruthy();
