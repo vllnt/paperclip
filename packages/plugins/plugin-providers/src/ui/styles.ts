@@ -51,6 +51,7 @@ export const heading: CSSProperties = {
 export const names = {
   openai: "OpenAI",
   anthropic: "Anthropic",
+  google: "Google",
   openrouter: "OpenRouter",
   xai: "Grok",
 };

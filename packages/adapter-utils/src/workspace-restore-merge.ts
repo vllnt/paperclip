@@ -745,7 +745,7 @@ export async function withDirectoryMergeLock<T>(
   // Canonicalize before we hash or lock: a retargeted symlink must not let the
   // lock protect one directory while the caller mutates another.
   const canonicalTargetDir = await fs.realpath(targetDir);
-  return withCanonicalDirectoryMergeLock(canonicalTargetDir, fn, env, diagnosticOperation, waitMs);
+  return withCanonicalDirectoryMergeLock(canonicalTargetDir, fn, env, diagnosticOperation, waitMs, onWait);
 }
 
 export async function withDirectoryPublicationLock<T>(
@@ -788,6 +788,7 @@ async function withCanonicalDirectoryMergeLock<T>(
   env: NodeJS.ProcessEnv,
   diagnosticOperation?: DirectoryMergeLockOperation,
   waitMs: number = LOCK_WAIT_MS,
+  onWait?: (wait: DirectoryMergeLockWait) => void | Promise<void>,
 ): Promise<T> {
   const lockRoot = await resolveDirectoryMergeLockRoot(env);
   const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");

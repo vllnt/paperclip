@@ -547,6 +547,7 @@ const CREDENTIAL_SOURCES: readonly PluginPerformActionCredentialSource[] = [
   "board_key",
   "agent_key",
   "agent_jwt",
+  "mcp_oauth",
   "cloud_tenant",
   "cloud_control",
   "none",
