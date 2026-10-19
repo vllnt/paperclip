@@ -1,7 +1,7 @@
 /**
  * Standalone fixture for UI tests that need the real company API: an embedded
- * Postgres, one company with a run-context policy, and the real company routes
- * behind a board actor. Prints one JSON line `{ origin, companyId }` once
+ * Postgres, two companies with run-context policies, and the real company routes
+ * behind a board actor. Prints one JSON line `{ origin, companyId, otherCompanyId }` once
  * listening and cleans up on SIGTERM/SIGINT.
  *
  * Run from `server/` with tsx; see ui/src/pages/CompanySettingsRunContext.test.tsx.
@@ -16,13 +16,20 @@ import { errorHandler } from "../../middleware/error-handler.js";
 const database = await startEmbeddedPostgresTestDatabase("company-api-fixture-");
 const db = createDb(database.connectionString);
 const companyId = randomUUID();
-await db.insert(companies).values({
+const otherCompanyId = randomUUID();
+await db.insert(companies).values([{
   id: companyId,
   name: "Fixture company",
   issuePrefix: "FXT",
   defaultResponsibleUserId: "board",
   runContextPolicy: { maxComments: 8 },
-});
+}, {
+  id: otherCompanyId,
+  name: "Other fixture company",
+  issuePrefix: "OTH",
+  defaultResponsibleUserId: "board",
+  runContextPolicy: { maxComments: 8 },
+}]);
 
 const app = express();
 app.use(express.json());
@@ -37,7 +44,7 @@ const server = app.listen(0, "127.0.0.1");
 await new Promise<void>((resolve) => server.once("listening", resolve));
 const address = server.address();
 if (!address || typeof address === "string") throw new Error("Expected a TCP address");
-console.log(JSON.stringify({ origin: `http://127.0.0.1:${address.port}`, companyId }));
+console.log(JSON.stringify({ origin: `http://127.0.0.1:${address.port}`, companyId, otherCompanyId }));
 
 async function cleanup() {
   await new Promise<void>((resolve) => server.close(() => resolve()));

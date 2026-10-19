@@ -576,7 +576,14 @@ export const resolveIssueRecoveryActionSchema = z
       .optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+    sourceIssueStatus: z.enum([
+      "todo",
+      "done",
+      "in_review",
+      "blocked",
+      "backlog",
+      "cancelled",
+    ]),
     resolutionNote: multilineTextSchema.optional().nullable(),
   })
   .strict()
@@ -612,12 +619,14 @@ export const resolveIssueRecoveryActionSchema = z
     if (value.outcome === "false_positive" || value.outcome === "cancelled") {
       if (
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "backlog" &&
+        value.sourceIssueStatus !== "cancelled"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "This recovery outcome requires sourceIssueStatus to be done or in_review",
+            "This recovery outcome requires sourceIssueStatus to be done, in_review, backlog, or cancelled",
           path: ["sourceIssueStatus"],
         });
       }
@@ -627,6 +636,20 @@ export const resolveIssueRecoveryActionSchema = z
 
 export type ResolveIssueRecoveryAction = z.infer<
   typeof resolveIssueRecoveryActionSchema
+>;
+
+/** Operator evidence that a stopped execution is safe to continue. */
+export const reconcileIssueExecutionSchema = z
+  .object({
+    outcome: z.enum(["done", "none", "mixed"]),
+    note: z.string().trim().min(20).max(12000),
+    expectedRunId: z.string().guid().optional(),
+    workspaceRepairNote: z.string().trim().min(20).max(12000).optional(),
+  })
+  .strict();
+
+export type ReconcileIssueExecution = z.infer<
+  typeof reconcileIssueExecutionSchema
 >;
 
 const issueRequestDepthInputSchema = z

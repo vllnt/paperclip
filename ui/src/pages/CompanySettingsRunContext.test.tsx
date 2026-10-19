@@ -11,7 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import type { Company } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { BreadcrumbProvider } from "../context/BreadcrumbContext";
-import { CompanyProvider } from "../context/CompanyContext";
+import { CompanyProvider, useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { CompanySettings } from "./CompanySettings";
 
@@ -32,6 +32,12 @@ const nativeFetch = globalThis.fetch;
 let fixtureProcess: ChildProcess;
 let origin = "";
 let companyId = "";
+let otherCompanyId = "";
+
+function CompanySwitcher() {
+  const { setSelectedCompanyId } = useCompany();
+  return <button data-testid="switch-company" onClick={() => setSelectedCompanyId(otherCompanyId)}>Switch company</button>;
+}
 
 function startFixture(): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -45,20 +51,20 @@ function startFixture(): Promise<void> {
       buffered += chunk.toString();
       const line = buffered.split("\n").find((entry) => entry.startsWith("{"));
       if (!line) return;
-      ({ origin, companyId } = JSON.parse(line) as { origin: string; companyId: string });
+      ({ origin, companyId, otherCompanyId } = JSON.parse(line) as { origin: string; companyId: string; otherCompanyId: string });
       resolve();
     });
     fixtureProcess.once("exit", (code) => reject(new Error(`fixture exited early (${code})`)));
   });
 }
 
-async function persistedPolicy(): Promise<Company["runContextPolicy"]> {
-  const response = await nativeFetch(`${origin}/api/companies/${companyId}`);
+async function persistedPolicy(id = companyId): Promise<Company["runContextPolicy"]> {
+  const response = await nativeFetch(`${origin}/api/companies/${id}`);
   return ((await response.json()) as Company).runContextPolicy;
 }
 
-async function resetPolicy() {
-  await nativeFetch(`${origin}/api/companies/${companyId}`, {
+async function resetPolicy(id: string) {
+  await nativeFetch(`${origin}/api/companies/${id}`, {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ runContextPolicy: { maxComments: 8 } }),
@@ -88,7 +94,8 @@ describe("CompanySettings run context against the real company API", () => {
   }, 30_000);
 
   beforeEach(async () => {
-    await resetPolicy();
+    await resetPolicy(companyId);
+    await resetPolicy(otherCompanyId);
     releaseSave = null;
     failNextSave = false;
     holdNextSave = false;
@@ -140,6 +147,7 @@ describe("CompanySettings run context against the real company API", () => {
             <CompanyProvider>
               <BreadcrumbProvider>
                 <TooltipProvider>
+                  <CompanySwitcher />
                   <CompanySettings />
                 </TooltipProvider>
               </BreadcrumbProvider>
@@ -198,6 +206,26 @@ describe("CompanySettings run context against the real company API", () => {
     await typeWithoutBlur("30");
     expect(maxComments()?.value).toBe("30");
     expect(saveButton()).toBeNull();
+    expect(await persistedPolicy()).toEqual({ maxComments: 8 });
+  });
+
+  it.each(["focused", "committed"])("drops a %s draft when switching companies with the same saved policy", async (draftState) => {
+    await typeWithoutBlur("30");
+    if (draftState === "committed") await blurInput();
+
+    await act(async () => byTestId<HTMLButtonElement>("switch-company")?.click());
+    // A stale Save button must never apply the first company's draft to the second.
+    await clickSave();
+    await waitFor(() => saveButton() === null);
+    expect(await persistedPolicy(otherCompanyId)).toEqual({ maxComments: 8 });
+    expect(await persistedPolicy()).toEqual({ maxComments: 8 });
+    expect(maxComments()?.value).toBe("8");
+
+    await typeWithoutBlur("40");
+    await blurInput();
+    await clickSave();
+    await waitFor(() => saveButton() === null);
+    expect(await persistedPolicy(otherCompanyId)).toEqual({ maxComments: 40 });
     expect(await persistedPolicy()).toEqual({ maxComments: 8 });
   });
 
