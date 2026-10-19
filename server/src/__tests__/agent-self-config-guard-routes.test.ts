@@ -343,6 +343,58 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     });
   });
 
+  describe("an agent unbinding its own managed AI connection", () => {
+    const AI_BINDING = { provider: "anthropic", method: "api_key", mode: "shared", connectionId: randomUUID(), grantId: randomUUID() };
+
+    async function seedBoundAgent() {
+      const seeded = await seedAgent(db);
+      await db
+        .update(agents)
+        .set({ adapterType: "claude_local", runtimeConfig: { ...STORED_RUNTIME_CONFIG, aiConnection: AI_BINDING } })
+        .where(eq(agents.id, seeded.agentId));
+      return seeded;
+    }
+
+    it("is denied without the consent grant, logged, and keeps the binding", async () => {
+      const { companyId, agentId } = await seedBoundAgent();
+      const before = await readAgent(db, agentId);
+
+      const res = await request(createApp(db, agentActor(companyId, agentId)))
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { ...STORED_RUNTIME_CONFIG, aiConnection: null } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields: ["runtimeConfig.aiConnection"] });
+      expect((await readAgent(db, agentId)).runtimeConfig).toEqual(before.runtimeConfig);
+      expect((await deniedActivity(db, agentId))[0]?.details).toMatchObject({ surface: "patch", fields: ["runtimeConfig.aiConnection"] });
+    });
+
+    it("is not a change when the request omits aiConnection", async () => {
+      const { companyId, agentId } = await seedBoundAgent();
+
+      const res = await request(createApp(db, agentActor(companyId, agentId)))
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: STORED_RUNTIME_CONFIG });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await readAgent(db, agentId)).runtimeConfig).toEqual({ ...STORED_RUNTIME_CONFIG, aiConnection: AI_BINDING });
+      expect(await deniedActivity(db, agentId)).toHaveLength(0);
+    });
+
+    it("goes through for an agent holding the agents:configure grant that names itself", async () => {
+      const { companyId, agentId } = await seedBoundAgent();
+      await grantAgentConfigure(db, companyId, agentId, { agentIds: [agentId] });
+
+      const res = await request(createApp(db, agentActor(companyId, agentId)))
+        .patch(`/api/agents/${agentId}`)
+        .send({ runtimeConfig: { ...STORED_RUNTIME_CONFIG, aiConnection: null } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect((await readAgent(db, agentId)).runtimeConfig).toEqual(STORED_RUNTIME_CONFIG);
+      expect(await deniedActivity(db, agentId)).toHaveLength(0);
+    });
+  });
+
   it("denies an agent changing its own default environment", async () => {
     const environmentId = await seedLocalEnvironment(db);
     const { companyId, agentId } = await seedAgent(db, { defaultEnvironmentId: environmentId });
