@@ -3,15 +3,16 @@ import { message } from "./errors.js";
 import React, { useEffect, useState } from "react";
 import { useHostNavigation, usePluginAction } from "@paperclipai/plugin-sdk/ui";
 import { PAGE_PATH } from "../contracts.js";
+import { SYNC_QUEUED_NOTICE } from "./task-list.js";
 type Detail = { link: { repositoryId?: number; number: number; url: string | null; conflicts?: string[] } | null; pending: boolean; repositories: { id: number; fullName: string; issuesWrite?: boolean }[] };
 export function TaskSyncDetail({ companyId, issueId }: { companyId: string; issueId: string }) {
   const detail = usePluginAction("task-sync-detail"), publish = usePluginAction("publish-task"), link = usePluginAction("link-task"), resolve = usePluginAction("resolve-task-sync"), sync = usePluginAction("sync-now"), nav = useHostNavigation();
   const [data, setData] = useState<Detail | null>(null), [repoId, setRepoId] = useState(""), [number, setNumber] = useState("");
-  const [busy, setBusy] = useState(false), [error, setError] = useState("");
+  const [busy, setBusy] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState("");
   const scope = { companyId, issueId };
   async function refresh() { const data = await detail(scope) as Detail; setData(data); setRepoId(id => data.repositories.some(r => String(r.id) === id) ? id : String(data.repositories[0]?.id ?? "")); }
   async function run(fn: () => Promise<unknown>) {
-    setBusy(true); setError("");
+    setBusy(true); setError(""); setNotice("");
     try { const result = await fn() as { warning?: string }; if (result?.warning) setError(result.warning); await refresh(); }
     catch (error) { setError(message(error)); }
     finally { setBusy(false); }
@@ -31,6 +32,7 @@ export function TaskSyncDetail({ companyId, issueId }: { companyId: string; issu
       </>}
     </>}
     {error && <p role="alert" className="error">{error}</p>}
-    <div className="footer"><a {...nav.linkProps(PAGE_PATH)}>GitHub settings</a><button disabled={busy} onClick={() => void run(async () => { await sync({ companyId }); return {}; })}>Sync now</button></div>
+    {notice && <p role="status" className="muted">{notice}</p>}
+    <div className="footer"><a {...nav.linkProps(PAGE_PATH)}>GitHub settings</a><button disabled={busy} onClick={() => void run(async () => { await sync({ companyId, refresh: true }); setNotice(SYNC_QUEUED_NOTICE); return {}; })}>Sync now</button></div>
   </section>;
 }

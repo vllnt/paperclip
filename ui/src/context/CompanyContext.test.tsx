@@ -60,6 +60,7 @@ function makeCompany(id: string): Company {
     automationWakeSettings: {},
     routineNoopSkipSettings: {},
     duplicateDetectionMode: "off",
+    runContextPolicy: null,
     feedbackDataSharingEnabled: false,
     feedbackDataSharingConsentAt: null,
     feedbackDataSharingConsentByUserId: null,
