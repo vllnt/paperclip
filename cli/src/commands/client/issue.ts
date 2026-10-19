@@ -24,6 +24,7 @@ import {
   releaseIssueTreeHoldSchema,
   respondIssueThreadInteractionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   restoreIssueDocumentRevisionSchema,
   updateIssueSchema,
   updateIssueWorkProductSchema,
@@ -72,6 +73,8 @@ interface IssueCreateOptions extends BaseClientOptions {
   parentId?: string;
   requestDepth?: string;
   billingCode?: string;
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
 }
 
 interface IssueUpdateOptions extends BaseClientOptions {
@@ -85,8 +88,41 @@ interface IssueUpdateOptions extends BaseClientOptions {
   parentId?: string;
   requestDepth?: string;
   billingCode?: string;
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
   comment?: string;
   hiddenAt?: string;
+}
+
+interface AdapterOverridesOptions {
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
+}
+
+/**
+ * Reads `--adapter-overrides-json` or `--adapter-overrides-file`: per-issue
+ * assignee adapter overrides, as `{ "adapterConfig": {...}, "useProjectWorkspace": true }`.
+ * The command's payload schema validates the shape strictly.
+ *
+ * @returns the overrides object, `null` to clear them, or `undefined` when neither option is given.
+ */
+export async function parseAdapterOverridesOption(
+  opts: AdapterOverridesOptions,
+): Promise<Record<string, unknown> | null | undefined> {
+  if (opts.adapterOverridesJson !== undefined && opts.adapterOverridesFile !== undefined) {
+    throw new Error("Use only one of --adapter-overrides-json or --adapter-overrides-file.");
+  }
+  const raw =
+    opts.adapterOverridesFile !== undefined
+      ? await readFile(opts.adapterOverridesFile, "utf8")
+      : opts.adapterOverridesJson;
+  if (raw === undefined) return undefined;
+  const value = parseJson(raw);
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error('Adapter overrides must be a JSON object, or null to clear them.');
+  }
+  return Object.fromEntries(Object.entries(value));
 }
 
 interface IssueCommentOptions extends BaseClientOptions {
@@ -157,6 +193,13 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+}
+
+interface IssueExecutionReconcileOptions extends BaseClientOptions {
+  outcome: string;
+  note: string;
+  expectedRunId?: string;
+  workspaceRepairNote?: string;
 }
 
 interface InteractionAcceptOptions extends BaseClientOptions {
@@ -299,9 +342,12 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option("--adapter-overrides-json <json>", "Per-issue assignee adapter overrides as JSON (see docs/cli)")
+      .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .action(async (opts: IssueCreateOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
           const payload = createIssueSchema.parse({
             title: opts.title,
             description: opts.description,
@@ -313,6 +359,7 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
+            assigneeAdapterOverrides,
           });
 
           const created = await ctx.api.post<Issue>(apiPath`/api/companies/${ctx.companyId}/issues`, payload);
@@ -408,11 +455,17 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option(
+        "--adapter-overrides-json <json>",
+        "Per-issue assignee adapter overrides as JSON; 'null' clears them (see docs/cli)",
+      )
+      .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
           const payload = updateIssueSchema.parse({
             title: opts.title,
             description: opts.description,
@@ -424,6 +477,7 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
+            assigneeAdapterOverrides,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
           });
@@ -616,6 +670,32 @@ export function registerIssueCommands(program: Command): void {
             resolutionNote: opts.resolutionNote,
           });
           const result = await ctx.api.post(apiPath`/api/issues/${issueId}/recovery-actions/resolve`, payload);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("reconcile")
+      .description("Record stopped execution outcomes and continue an issue")
+      .argument("<issueId>", "Issue ID")
+      .requiredOption("--outcome <outcome>", "done, none, or mixed")
+      .requiredOption("--note <text>", "Evidence for the observed execution outcome")
+      .option("--expected-run-id <id>", "Require this latest stopped run")
+      .option("--workspace-repair-note <text>", "Evidence that an unsafe workspace was repaired")
+      .action(async (issueId: string, opts: IssueExecutionReconcileOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = reconcileIssueExecutionSchema.parse({
+            outcome: opts.outcome,
+            note: opts.note,
+            expectedRunId: opts.expectedRunId,
+            workspaceRepairNote: opts.workspaceRepairNote,
+          });
+          const result = await ctx.api.post(apiPath`/api/issues/${issueId}/execution/reconcile`, payload);
           printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);

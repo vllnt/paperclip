@@ -184,6 +184,7 @@ import {
 } from "./http/body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
+import { precompressedStatic } from "./middleware/precompressed-static.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
 
@@ -991,10 +992,14 @@ export async function createApp(
     );
     if (uiDist) {
       // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>)
-      // never change once built, so they can be cached aggressively.
+      // never change once built, so they can be cached aggressively. The UI
+      // build writes .br and .gz siblings next to each script and stylesheet;
+      // serve those to clients that accept them instead of the plain file.
+      const assetsDir = path.join(uiDist, "assets");
       app.use(
         "/assets",
-        express.static(path.join(uiDist, "assets"), {
+        precompressedStatic(assetsDir, { maxAge: "1y", immutable: true }),
+        express.static(assetsDir, {
           maxAge: "1y",
           immutable: true,
         }),
