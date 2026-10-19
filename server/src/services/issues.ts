@@ -11501,18 +11501,15 @@ export function issueService(db: Db) {
     /**
      * Assigns the issue to the agent and moves it to `in_progress`.
      *
-     * An agent that acts through the API may not take an issue out of a block that the board or a
-     * person owns, the same rule as `update`. The rule is part of the `WHERE` of the write, so a
+     * Agents and automatic system checkouts may not take an issue out of a block that the board
+     * or a person owns, the same rule as `update`. The rule is part of the `WHERE` of the write, so a
      * descriptor that changes after the caller read the issue still stops it. The call fails with
      * a 403 and the issue stays blocked.
      *
      * The caller must say who it is, so no caller skips the rule by forgetting to. A board user
-     * may check the issue out. The one exemption is the named system actor
-     * `HEARTBEAT_CHECKOUT_ACTOR` (`routable-blocked.ts`), which the heartbeat passes for its own
-     * checkout of the issue that it wakes an agent for, so that checkout keeps its behavior. The
-     * test group "the system checkout" in `issue-human-owned-block.test.ts` pins this.
+     * may check the issue out; automatic heartbeat wakes do not carry that authority.
      *
-     * @param actor - Who asks for the checkout. An `agent` is held to the rule.
+     * @param actor - Who asks for the checkout. Only a `board` actor may lift a human-owned block.
      */
     checkout: async (
       id: string,

@@ -437,11 +437,11 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
       await expectUntouched(fixture, BOARD_BLOCK);
     });
 
-    it("decides the rule from the kind of actor: an agent is held to it, the board and the system are not", () => {
+    it("holds agents and the system to the rule while allowing the board", () => {
       expect(checkoutKeepsHumanOwnedBlock({ kind: "agent", agentId: "agent-1" })).toBe(true);
       expect(checkoutKeepsHumanOwnedBlock({ kind: "board", userId: "board-user" })).toBe(false);
       expect(checkoutKeepsHumanOwnedBlock({ kind: "board", userId: null })).toBe(false);
-      expect(checkoutKeepsHumanOwnedBlock(HEARTBEAT_CHECKOUT_ACTOR)).toBe(false);
+      expect(checkoutKeepsHumanOwnedBlock(HEARTBEAT_CHECKOUT_ACTOR)).toBe(true);
     });
 
     it("does not skip the rule when a JavaScript caller leaves the actor out: the call fails and writes nothing", async () => {
@@ -456,10 +456,9 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
       await expectUntouched(fixture, BOARD_BLOCK);
     });
 
-    // The one exemption: the named system actor. `issueService.checkout` documents it.
-    describe("the system checkout", () => {
-      it("lets a board user check out a block that the board owns", async () => {
-        const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
+    describe("board and automatic checkout", () => {
+      it.each([BOARD_BLOCK, USER_BLOCK])("lets a board user check out a human-owned block (%j)", async (descriptor) => {
+        const fixture = await seed({ descriptor, blockedTransitionAt: BLOCKED_AT });
 
         const res = await postCheckout(fixture, boardActor(fixture));
 
@@ -467,12 +466,24 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
         expect((await readIssue(fixture.issue.id)).status).toBe("in_progress");
       });
 
-      it("documents today's heartbeat path: it passes HEARTBEAT_CHECKOUT_ACTOR, so it still moves a board-owned block to in_progress", async () => {
-        const fixture = await seed({ descriptor: BOARD_BLOCK, blockedTransitionAt: BLOCKED_AT });
+      it.each([
+        ["the board", BOARD_BLOCK],
+        ["a company user", USER_BLOCK],
+      ] as const)("refuses automatic checkout of a block owned by %s after another agent comments", async (_label, descriptor) => {
+        const fixture = await seed({ descriptor, blockedTransitionAt: BLOCKED_AT });
+        const [commenter] = await db.insert(agents).values({
+          ...fixture.agent, id: randomUUID(), name: "Commenter",
+        }).returning();
+        const [comment] = await db.insert(issueComments).values({
+          companyId: fixture.company.id,
+          issueId: fixture.issue.id,
+          authorAgentId: commenter!.id,
+          body: "Any update on this blocker?",
+        }).returning();
 
         expect(
           shouldAutoCheckoutIssueForWake({
-            contextSnapshot: { wakeReason: "issue_assigned" },
+            contextSnapshot: { wakeReason: "issue_commented", wakeCommentId: comment!.id },
             issueStatus: "blocked",
             issueAssigneeAgentId: fixture.agent.id,
             issueExecutionState: null,
@@ -481,16 +492,37 @@ describeEmbeddedPostgres("blocks that wait for a human", () => {
           }),
         ).toBe(true);
 
+        const failure = await refusal(issueService(db).checkout(
+          fixture.issue.id,
+          fixture.agent.id,
+          CHECKOUT_STATUSES,
+          fixture.run.id,
+          HEARTBEAT_CHECKOUT_ACTOR,
+        ));
+
+        expect(failure).toMatchObject({ status: 403, message: HUMAN_OWNED_BLOCK_MESSAGE });
+        await expectUntouched(fixture, descriptor);
+        expect(await readIssue(fixture.issue.id)).toEqual(fixture.issue);
+      });
+
+      it.each(["agent-owned", "legacy"] as const)("still automatically checks out an %s block", async (kind) => {
+        const fixture = await seed({ descriptor: null, blockedTransitionAt: BLOCKED_AT });
+        if (kind === "agent-owned") {
+          await db.update(issues).set({
+            unblockDescriptor: { owner: { agentId: fixture.agent.id }, action: "Wait for the build" },
+          }).where(eq(issues.id, fixture.issue.id));
+        }
+
         const checkedOut = await issueService(db).checkout(
           fixture.issue.id,
           fixture.agent.id,
-          ["todo", "backlog", "blocked"],
+          CHECKOUT_STATUSES,
           fixture.run.id,
           HEARTBEAT_CHECKOUT_ACTOR,
         );
 
         expect(checkedOut.status).toBe("in_progress");
-        expect((await readIssue(fixture.issue.id)).status).toBe("in_progress");
+        expect((await readIssue(fixture.issue.id)).checkoutRunId).toBe(fixture.run.id);
       });
     });
 

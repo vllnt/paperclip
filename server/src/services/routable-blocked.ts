@@ -74,9 +74,8 @@ export function notHumanOwnedBlockCondition(columns: { status: SQLWrapper; unblo
  * - `agent`: an agent that acts through the API. It may not take an issue out of a block that the
  *   board or a person owns.
  * - `board`: a board user. It may, because it is the party that owns such a block.
- * - `system`: platform code that checks out an issue on its own account. It is the exemption from
- *   the rule, so every use is named by a `reason` and can be found by searching for `kind: "system"`.
- *   The only one today is the heartbeat, `HEARTBEAT_CHECKOUT_ACTOR`.
+ * - `system`: platform code, including heartbeat automation. It must preserve human-owned blocks.
+ *   Each use is named by a `reason` and can be found by searching for `kind: "system"`.
  */
 export type IssueCheckoutActor =
   | { kind: "agent"; agentId: string }
@@ -84,9 +83,8 @@ export type IssueCheckoutActor =
   | { kind: "system"; reason: "heartbeat" };
 
 /**
- * The system actor of the heartbeat's checkout of the issue that it wakes an agent for. It keeps
- * the heartbeat's behavior from before the rule: that checkout can still move a board-owned block
- * to `in_progress`. `issue-human-owned-block.test.ts` pins the result.
+ * The actor for automatic heartbeat checkout. A wake does not authorize lifting a human-owned
+ * block; a board user must explicitly unblock or check out the issue first.
  */
 export const HEARTBEAT_CHECKOUT_ACTOR: IssueCheckoutActor = { kind: "system", reason: "heartbeat" };
 
@@ -95,14 +93,14 @@ export const HEARTBEAT_CHECKOUT_ACTOR: IssueCheckoutActor = { kind: "system", re
  * default, so a new kind of actor does not compile until its case is decided here.
  *
  * @param actor - Who asks for the checkout.
- * @returns True for an agent, false for the board and for a named system caller.
+ * @returns True for agents and system callers; false only for the board.
  */
 export function checkoutKeepsHumanOwnedBlock(actor: IssueCheckoutActor): boolean {
   switch (actor.kind) {
     case "agent":
+    case "system":
       return true;
     case "board":
-    case "system":
       return false;
   }
 }
@@ -110,7 +108,7 @@ export function checkoutKeepsHumanOwnedBlock(actor: IssueCheckoutActor): boolean
 /**
  * The system caller of the native status projection, the write that carries the decision of a
  * native run onto its issue. It is named so that every use can be found by searching for
- * `kind: "system"`. Unlike the heartbeat's checkout, it is held to the human-owned block rule: an
+ * `kind: "system"`. Like automatic heartbeat checkout, it is held to the human-owned block rule: an
  * `issueService.update` that names it cannot take an issue out of a block that the board or a
  * person owns, and cannot rewrite its descriptor. The write does not match such a row, and the
  * call resolves with the row as it is.
