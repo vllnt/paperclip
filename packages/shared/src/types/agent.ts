@@ -79,6 +79,11 @@ export interface AgentChainOfCommandEntry {
   title: string | null;
 }
 
+export interface AgentWaitState {
+  activeWaitCount: number;
+  nextCheckAt: string | null;
+}
+
 export interface Agent {
   id: string;
   companyId: string;
@@ -105,6 +110,11 @@ export interface Agent {
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;
   orgChainHealth?: AgentOrgChainHealth;
+  /**
+   * Derived, not stored: the agent's active waits (future issue monitors on
+   * its own open issues). With no live run the agent is shown as waiting.
+   */
+  waitState?: AgentWaitState | null;
   createdAt: Date;
   updatedAt: Date;
 }

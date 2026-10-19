@@ -275,23 +275,70 @@ describeEmbeddedPostgres("deleting a company that other companies' rows depend o
     });
   });
 
-  it("refuses when another company's skill was forked from this company", async () => {
-    const deleted = await seedTenant("Deleted");
-    const other = await seedTenant("Other");
-    await db.insert(companySkills).values({
-      companyId: other.companyId,
-      key: `fork-${randomUUID()}`,
-      slug: "fork",
-      name: "Forked skill",
-      markdown: "# Fork",
-      forkedFromCompanyId: deleted.companyId,
+  describe("another company's skill that was forked from this company", () => {
+    async function seedFork(other: Tenant, deleted: Tenant) {
+      const [fork] = await db
+        .insert(companySkills)
+        .values({
+          companyId: other.companyId,
+          key: `fork-${randomUUID()}`,
+          slug: "fork",
+          name: "Forked skill",
+          markdown: "# Fork",
+          forkedFromCompanyId: deleted.companyId,
+        })
+        .returning();
+      return fork!;
+    }
+
+    /** The rows of one company that the fork test cares about, read in full. */
+    async function ownedRows(tenant: Tenant) {
+      return {
+        agents: await db.select().from(agents).where(eq(agents.companyId, tenant.companyId)),
+        issues: await db.select().from(issues).where(eq(issues.companyId, tenant.companyId)),
+        assets: await db.select().from(assets).where(eq(assets.companyId, tenant.companyId)),
+        skills: await db.select().from(companySkills).where(eq(companySkills.companyId, tenant.companyId)),
+      };
+    }
+
+    it("does not block the delete: the fork keeps its content and only loses its pointer", async () => {
+      const deleted = await seedTenant("Deleted");
+      const other = await seedTenant("Other");
+      const fork = await seedFork(other, deleted);
+      const beforeOther = await ownedRows(other);
+      const beforeOtherCounts = await snapshot(other.companyId);
+
+      const removed = await companyService(db).remove(deleted.companyId);
+
+      expect(removed?.id).toBe(deleted.companyId);
+      await expect(db.select().from(companies).where(eq(companies.id, deleted.companyId))).resolves.toHaveLength(0);
+      await expect(db.select().from(companies).where(eq(companies.id, other.companyId))).resolves.toHaveLength(1);
+      const [after] = await db.select().from(companySkills).where(eq(companySkills.id, fork.id));
+      expect(after, "the fork, with only the pointer cleared").toEqual({ ...fork, forkedFromCompanyId: null });
+      const afterOther = await ownedRows(other);
+      expect({ ...afterOther, skills: [] }, "every other row of the other company").toEqual({ ...beforeOther, skills: [] });
+      expect(afterOther.skills).toEqual([{ ...fork, forkedFromCompanyId: null }]);
+      expect(await snapshot(other.companyId), "row counts of the other company").toEqual(beforeOtherCounts);
     });
 
-    await expectRefusedAndUnchanged({
-      deleted,
-      other,
-      table: "company_skills",
-      ids: [deleted.companyId, other.companyId],
+    it("does not hide a real blocker: a fork and an attachment together still refuse, and name only the attachment", async () => {
+      const deleted = await seedTenant("Deleted");
+      const other = await seedTenant("Other");
+      const fork = await seedFork(other, deleted);
+      await db.insert(issueAttachments).values({
+        companyId: other.companyId,
+        issueId: other.issueId,
+        assetId: deleted.assetId,
+      });
+
+      await expectRefusedAndUnchanged({
+        deleted,
+        other,
+        table: "issue_attachments",
+        ids: [deleted.companyId, other.companyId, fork.id],
+      });
+      const [untouched] = await db.select().from(companySkills).where(eq(companySkills.id, fork.id));
+      expect(untouched?.forkedFromCompanyId, "a refused delete clears nothing").toBe(deleted.companyId);
     });
   });
 

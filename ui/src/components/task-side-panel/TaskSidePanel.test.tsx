@@ -27,7 +27,13 @@ class ResizeObserverStub {
 (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver;
 
 const browserFixture = vi.hoisted(() => ({ data: [] as import("@paperclipai/shared").TaskBrowser[], viewer: vi.fn(async () => ({ url: "https://live.browser-use.com/test-viewer" })), control: vi.fn(async () => ({})) }));
-vi.mock("@/hooks/useTaskBrowsers", () => ({ useTaskBrowsers: () => ({ data: browserFixture.data, isError: false }) }));
+const useTaskBrowsersMock = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useTaskBrowsers", () => ({
+  useTaskBrowsers: (...args: unknown[]) => {
+    useTaskBrowsersMock(...args);
+    return { data: browserFixture.data, isError: false };
+  },
+}));
 vi.mock("@/api/browser-use", () => ({ browserUseApi: { viewer: browserFixture.viewer, control: browserFixture.control, presence: vi.fn(async () => ({ accepted: true })) } }));
 const fixture = vi.hoisted(() => ({
   recordsLoading: false,
@@ -146,6 +152,7 @@ describe("TaskSidePanel", () => {
     fixture.records = [];
     browserFixture.data = [];
     browserFixture.control.mockClear();
+    useTaskBrowsersMock.mockClear();
     fixture.documents = [];
     fixture.plan = null;
     routeFixture.location.search = "";
@@ -390,6 +397,35 @@ describe("TaskSidePanel", () => {
     expect(container.textContent).not.toContain("Source record pull:2");
   });
 
+
+  describe("browser list polling", () => {
+    // The panel polls the browser list at the cadence its caller asks for, so an
+    // idle issue does not poll every 3 s. Reverting the argument fails these.
+    function lastRunExpectedArg() {
+      const calls = useTaskBrowsersMock.mock.calls;
+      return calls[calls.length - 1]?.[1];
+    }
+
+    it("passes the page's run-expected flag to the browser list", async () => {
+      await render(panel({ runExpected: true, hasActiveRun: false }));
+      expect(useTaskBrowsersMock).toHaveBeenCalledWith(issue().id, true);
+      expect(lastRunExpectedArg()).toBe(true);
+
+      useTaskBrowsersMock.mockClear();
+      await render(panel({ runExpected: false, hasActiveRun: true }));
+      expect(useTaskBrowsersMock).toHaveBeenCalledWith(issue().id, false);
+      expect(lastRunExpectedArg()).toBe(false);
+    });
+
+    it("falls back to the active-run flag when the page passes none", async () => {
+      await render(panel({ hasActiveRun: true }));
+      expect(lastRunExpectedArg()).toBe(true);
+
+      useTaskBrowsersMock.mockClear();
+      await render(panel({ hasActiveRun: false }));
+      expect(lastRunExpectedArg()).toBe(false);
+    });
+  });
 
   it("opens Properties on first visit", async () => {
     await render(panel());
