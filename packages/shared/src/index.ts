@@ -338,6 +338,7 @@ export * from "./connection-setup-state.js";
 export * from "./google-workspace-connectors.js";
 export * from "./asana-connectors.js";
 export * from "./github-connectors.js";
+export * from "./company-archive.js";
 export {
   BLOCKED_MCP_PROVIDERS,
   SELF_SERVE_MCP_CANDIDATES,
@@ -504,6 +505,7 @@ export {
   BUDGET_INCIDENT_RESOLUTION_ACTIONS,
   HEARTBEAT_INVOCATION_SOURCES,
   HEARTBEAT_RUN_STATUSES,
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
   RUN_LIVENESS_STATES,
   WAKEUP_TRIGGER_DETAILS,
   WAKEUP_REQUEST_STATUSES,
@@ -690,6 +692,7 @@ export {
   type BudgetIncidentResolutionAction,
   type HeartbeatInvocationSource,
   type HeartbeatRunStatus,
+  type HeartbeatRunTerminalStatus,
   type RunLivenessState,
   type WakeupTriggerDetail,
   type WakeupRequestStatus,
@@ -2835,6 +2838,7 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./resource-capacity.js";
 export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
 export * from "./automation-wake.js";

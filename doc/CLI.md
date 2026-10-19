@@ -621,6 +621,20 @@ npx paperclipai run workspace-log <operation-id> [--offset 0] [--limit-bytes 163
 npx paperclipai run watchdog-decision <run-id> --decision continue [--reason "..."]
 ```
 
+## Archive Commands
+
+Export a company's settled run history (runs, events, transcripts, costs and
+activity, redacted like the run API) as NDJSON. Board credentials only. The
+format is described in [company-archive.md](company-archive.md).
+
+```sh
+npx paperclipai archive export --company-id <company-id> [--since <iso>] [--until <iso>] \
+  [--include run,events,transcript,costs,activity] [--limit 50] [--out export.ndjson] [--resume]
+```
+
+`--resume` continues an interrupted export from the last complete run in
+`--out`. Without `--out` the stream goes to stdout.
+
 ## Routine Commands
 
 `paperclipai routines disable-all` remains the local maintenance command. The singular `routine` group maps to the REST API.
@@ -1076,6 +1090,18 @@ npx paperclipai environment update <environment-id> --payload-json '{...}'
 npx paperclipai environment delete <environment-id>
 npx paperclipai environment probe <environment-id>
 npx paperclipai environment probe-config --company-id <company-id> --payload-json '{...}'
+```
+
+Resource capacity: free disk, available memory and load per CPU core, with a
+level (`ok`, `low`, `critical`, or `unknown` when nothing was measured in the
+last 15 minutes). Members and agents of a company see the environments its
+agents run on; `--instance` (every server host and environment) is for instance
+admins.
+
+```sh
+npx paperclipai capacity --company-id <company-id>
+npx paperclipai capacity --instance
+npx paperclipai environment capacity <environment-id>
 ```
 
 ```sh

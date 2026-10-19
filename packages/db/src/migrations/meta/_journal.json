@@ -2110,9 +2110,23 @@
       "breakpoints": true
     },
     {
-      "idx": 305,
+      "idx": 303,
       "version": "7",
       "when": 1792371010803,
+      "tag": "0303_resource_capacity",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1792371010804,
+      "tag": "0304_illegal_rattler",
+      "breakpoints": true
+    },
+    {
+      "idx": 305,
+      "version": "7",
+      "when": 1792371010805,
       "tag": "0305_issue_run_lookup_indexes",
       "breakpoints": true
     }

@@ -1397,6 +1397,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/members/{memberId}/archive",
   "PATCH /api/companies/{companyId}/members/{memberId}/permissions",
   "GET /api/companies/{companyId}/user-directory",
+  "GET /api/companies/{companyId}/archive/export",
   "GET /api/companies/{companyId}/managed-agent-profiles",
   "POST /api/companies/{companyId}/managed-agent-profiles",
   "GET /api/companies/{companyId}/remote-agent-profiles",
@@ -1588,6 +1589,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
+  "GET /api/instance/resource-capacity",
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
@@ -6865,6 +6867,34 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/archive/export",
+  tags: ["companies"],
+  summary: "Stream a company's settled run history as NDJSON (company archive format v1)",
+  description: "Board only. Streams settled runs ordered by coalesce(finished_at, created_at) then id, each as run, run_event, transcript, cost_event and activity records followed by run.end with a resume cursor. The last line is export.end; a response without it was cut off and resumes from the last run.end cursor. Records are redacted like the run read endpoints. See doc/company-archive.md.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      cursor: z.string().optional(),
+      since: z.string().datetime({ offset: true }).optional(),
+      until: z.string().datetime({ offset: true }).optional(),
+      include: z.string().optional().describe("Comma list of run, events, transcript, costs, activity (default all)"),
+      limit: z.number().int().min(1).max(500).optional(),
+      follow: z.enum(["true", "false"]).optional().describe("true: follow next cursors server-side and stream the whole window in one response"),
+    }),
+  },
+  responses: {
+    200: {
+      description: "NDJSON stream of company archive records",
+      content: { "application/x-ndjson": { schema: z.string() } },
+    },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/managed-agent-profiles",
   tags: ["agents"],
   summary: "List Claude Managed Agent profiles for a company",
@@ -8478,6 +8508,32 @@ registry.registerPath({
   summary: "Get an environment",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get host CPU, memory and disk for every server host and environment (instance admins)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get CPU, memory and disk of the environments the company's agents run on",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/environments/{id}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get an environment's CPU, memory and disk (404 unless the caller's company runs on it)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({

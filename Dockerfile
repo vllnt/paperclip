@@ -150,12 +150,19 @@ ARG PAPERCLIP_BUILD_COMMIT=""
 RUN node --test scripts/ci/run-image-build-vitest.test.mjs
 RUN sh scripts/ci/run-image-build-vitest.sh
 RUN pnpm check:token-gates
+# The GitHub launcher's retry of a busy or slow Paperclip server (bounded backoff, a clear final error); no database.
+RUN pnpm exec vitest run packages/adapter-utils/src/github-launcher-backoff.test.ts
 RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
+# The GitHub credentials route: the short per-run cache of ordinary reads (what it keeps, for how long, for whom) and what the
+# route does when its caller has gone. No database: the embedded Postgres tests of the same change are skipped in this build
+# (it runs as root), so they gate on a host that does not.
+RUN pnpm exec vitest run server/src/__tests__/github-read-decision-cache.test.ts server/src/__tests__/github-credentials-route-caller.test.ts
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
 # after the SDK build, so build the SDK before typechecking the UI.
 RUN pnpm --filter @paperclipai/plugin-sdk build
-# Provider-quota classification of the Codex and Claude adapters (no database).
-RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts
+# Provider-quota classification of the Codex and Claude adapters, and the GitHub plugin's
+# refusal to send a request without credentials (it needs the SDK test export built above; no database).
+RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts packages/plugins/plugin-github/tests/no-unauthenticated-requests.spec.ts
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 # The GitHub plugin's merge guard and the instance admin's per-repository opt-in (agentMergeablePaths): the guard and path rules,
@@ -164,6 +171,9 @@ RUN pnpm exec vitest run packages/plugins/plugin-github/tests/protected-paths.sp
 RUN pnpm exec vitest run server/src/__tests__/plugin-routes-authz.test.ts -t agentMergeablePaths
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
+# The GitHub plugin syncs only in its scheduled job: these specs fail if an event handler or a button starts a sync again, if a
+# sync keeps calling the host after the host denied it, or if a button says "started" for a request that only waits.
+RUN pnpm exec vitest run packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts packages/plugins/plugin-github/tests/sync-job-context.spec.ts packages/plugins/plugin-github/tests/sync-queued-ui.spec.tsx
 # Build the remaining bundled local plugins here. The production root filesystem
 # is read-only and cannot run the server's install-time auto-build, so a bundled
 # plugin without its dist entrypoints cannot be installed from the UI.

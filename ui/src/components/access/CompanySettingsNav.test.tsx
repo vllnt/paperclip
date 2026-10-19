@@ -69,6 +69,9 @@ describe("CompanySettingsNav", () => {
     expect(getCompanySettingsTab("/company/settings")).toBe("general");
     expect(getCompanySettingsTab("/PAP/company/settings")).toBe("general");
     expect(getCompanySettingsTab("/company/settings/environments")).toBe("instance-environments");
+    expect(getCompanySettingsTab("/PAP/company/settings/instance/resource-capacity")).toBe(
+      "instance-resource-capacity",
+    );
     expect(getCompanySettingsTab("/company/export")).toBe("export");
     expect(getCompanySettingsTab("/PAP/company/export")).toBe("export");
     expect(getCompanySettingsTab("/company/import")).toBe("import");
@@ -127,6 +130,7 @@ describe("CompanySettingsNav", () => {
           { value: "secrets", label: "Secrets" },
           { value: "instance-profile", label: "Profile" },
           { value: "instance-environments", label: "Environments" },
+          { value: "instance-resource-capacity", label: "Resource capacity" },
           { value: "instance-access", label: "Access" },
           { value: "instance-experimental", label: "Experimental" },
           { value: "instance-plugins", label: "Plugins" },
@@ -168,6 +172,7 @@ describe("CompanySettingsNav", () => {
       "secrets",
       "instance-profile",
       "instance-environments",
+      "instance-resource-capacity",
       "instance-access",
       "instance-experimental",
       "instance-adapters",

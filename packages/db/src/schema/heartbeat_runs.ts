@@ -147,6 +147,12 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.createdAt.desc(),
     ),
+    // Keyset for the company archive and export: settle key, then id.
+    companySettledIdx: index("heartbeat_runs_company_settled_idx").on(
+      table.companyId,
+      sql`(coalesce(${table.finishedAt}, ${table.createdAt}))`,
+      table.id,
+    ),
     companyCtxIssueCreatedIdx: index("heartbeat_runs_company_ctx_issue_created_idx").on(
       table.companyId,
       sql`(${table.contextSnapshot} ->> 'issueId')`,
