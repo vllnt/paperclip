@@ -60,13 +60,14 @@ describeEmbeddedPostgres("malformed ids in request paths", () => {
     await tempDb?.cleanup();
   });
 
-  it("returns 400 with a safe message for PATCH /api/routines/not-a-uuid", async () => {
+  it("returns a safe not found for PATCH /api/routines/not-a-uuid", async () => {
     const res = await request(createApp(db, boardActor))
       .patch("/api/routines/not-a-uuid")
       .send({ title: "Renamed" });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(400);
-    expect(res.body).toEqual(SAFE_BODY);
+    // Upstream guards routine ids before any query and answers 404 (routines-e2e.test.ts pins it), so no driver error reaches the handler.
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body).toEqual({ error: "Routine not found" });
   });
 
   it("returns 400 with a safe message for GET /api/goals/not-a-uuid", async () => {
@@ -99,15 +100,16 @@ describeEmbeddedPostgres("malformed ids in request paths", () => {
     expect(res.body).toEqual(SAFE_BODY);
   });
 
-  it("returns the same 400 for a malformed id in a query value", async () => {
-    // Not a path parameter: the routine list filter forwards `projectId`
-    // unvalidated to a uuid column, so the same Postgres error applies.
+  it("returns a 400 that does not echo a malformed id in a query value", async () => {
+    // Not a path parameter. The routine list now validates its filters (routine search and filter), so
+    // `projectId` fails the query schema before it reaches the uuid column.
     const res = await request(createApp(db, boardActor))
       .get(`/api/companies/${randomUUID()}/routines`)
       .query({ projectId: "not-a-uuid" });
 
     expect(res.status, JSON.stringify(res.body)).toBe(400);
-    expect(res.body).toEqual(SAFE_BODY);
+    expect(res.body).toMatchObject({ error: "Validation error", details: [expect.objectContaining({ path: ["projectId"] })] });
+    expect(JSON.stringify(res.body)).not.toContain("not-a-uuid");
   });
 
   it("still returns 404 for a well-formed id that does not exist", async () => {
