@@ -112,6 +112,7 @@ export const companiesApi = {
         | "interactionResolverGovernance"
         | "automationWakeSettings"
         | "runContextPolicy"
+        | "transientRetryPolicy"
         | "feedbackDataSharingEnabled"
         | "logoAssetId"
       >

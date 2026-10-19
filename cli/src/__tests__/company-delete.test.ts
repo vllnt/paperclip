@@ -30,6 +30,7 @@ function makeCompany(overrides: Partial<Company>): Company {
     interactionResolverGovernance: overrides.interactionResolverGovernance ?? {},
     automationWakeSettings: overrides.automationWakeSettings ?? {},
     routineNoopSkipSettings: overrides.routineNoopSkipSettings ?? {},
+    transientRetryPolicy: overrides.transientRetryPolicy ?? {},
   };
 }
 

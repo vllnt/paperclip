@@ -55,6 +55,7 @@ interface CompanyJsonOptions extends BaseClientOptions {
 }
 interface CompanyUpdateOptions extends CompanyJsonOptions {
   runContextJson?: string;
+  transientRetryPolicyJson?: string;
 }
 interface AgentMeResponse {
   id: string;
@@ -1489,14 +1490,23 @@ export function registerCompanyCommands(program: Command): void {
         "--run-context-json <json>",
         "Company run-context policy as JSON (maxComments, maxCommentChars, maxTotalCommentChars, window, truncationMarker, byWakeReason), or null to clear",
       )
+      .option(
+        "--transient-retry-policy-json <json>",
+        'Company transient-retry policy, e.g. {"perIssuePerHour":2,"suppressWhenBlocked":true,"wakeTypes":{"transient_failure_retry":{"perIssuePerHour":1}}}. perIssuePerHour 0 = unlimited (default).',
+      )
       .action(async (companyId: string, opts: CompanyUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = {
             ...(opts.payloadJson ? (parseJson(opts.payloadJson) as Record<string, unknown>) : {}),
             ...(opts.runContextJson ? { runContextPolicy: parseJson(opts.runContextJson) } : {}),
+            ...(opts.transientRetryPolicyJson === undefined
+              ? {}
+              : { transientRetryPolicy: parseJson(opts.transientRetryPolicyJson) }),
           };
-          if (Object.keys(payload).length === 0) throw new Error("Provide --payload-json or --run-context-json.");
+          if (Object.keys(payload).length === 0) {
+            throw new Error("Provide --payload-json, --run-context-json or --transient-retry-policy-json.");
+          }
           printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, payload), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
