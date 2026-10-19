@@ -3465,9 +3465,11 @@ describe("host and GitHub calls of one write-identity decision", () => {
   it("keeps a push, a merge and an admin merge within their call budgets", async () => {
     const f = await appFixture();
     await f.authorize();
-    const push = () => f.write("anthm-fr/songtrivia");
-    const merge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head });
-    const adminMerge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: ["adminMerge"], pullRequest: 7, expectedHeadSha: head });
+    // The fixture's first repository, which its GitHub double serves pull request 7 for.
+    const repository = repos[0]!.fullName.toLowerCase();
+    const push = () => f.write(repository);
+    const merge = () => f.write(repository, { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head });
+    const adminMerge = () => f.write(repository, { action: "pullRequest", privileged: ["adminMerge"], pullRequest: 7, expectedHeadSha: head });
     // Every write reads the policy and the authorization once, then both again right before the token goes out (the
     // checks between can take a while, so the kill switch is read twice on purpose), and the signing key's config entry.
     const write = { "state.get": 4, "config.get": 1, "secrets.resolve": 0 };
