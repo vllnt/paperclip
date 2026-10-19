@@ -47,10 +47,25 @@ export function isRuntimeGitHubHttpRequest(method: string | undefined, url: stri
   return !!method && !!url && method.toUpperCase() === "POST" && /^\/runtime-tools\/github\/(?:credentials|sign)\/?$/.test(normalizePath(url));
 }
 
-/** Board keystrokes sent to a shared browser sign-in: the typed text can be a password or one-time code. */
-export function isBrowserSignInInputHttpRequest(method: string | undefined, url: string | undefined): boolean {
-  return !!method && !!url && method.toUpperCase() === "POST" &&
-    /^\/api\/companies\/[^/]+\/browser\/profiles\/[^/]+\/signin\/input\/?$/.test(normalizePath(url));
+const BROWSER_SIGN_IN_INPUT_PATH = /^\/api\/companies\/[^/]+\/browser\/profiles\/[^/]+\/signin\/input\/?$/i;
+
+/**
+ * Board keystrokes sent to a shared browser sign-in: the typed text can be a
+ * password or one-time code. Express routes case-insensitively and accepts
+ * absolute-form targets, and a rejected method still carries the body, so the
+ * match ignores the method and case and reads absolute-form paths too.
+ */
+export function isBrowserSignInInputHttpRequest(url: string | undefined): boolean {
+  if (!url) return false;
+  const pathname = normalizePath(url);
+  if (BROWSER_SIGN_IN_INPUT_PATH.test(pathname)) return true;
+  if (!/^https?:\/\//i.test(pathname)) return false;
+  if (BROWSER_SIGN_IN_INPUT_PATH.test(pathname.replace(/^https?:\/\/[^/]*/i, ""))) return true;
+  try {
+    return BROWSER_SIGN_IN_INPUT_PATH.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
 }
 
 /** Provider payloads are private even when a method/signature is rejected. */

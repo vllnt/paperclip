@@ -832,4 +832,50 @@ describe("browser sign-in input failure logs", () => {
     expect(log).toContain(`"statusCode":${status}`);
     expect(log).not.toContain("PASSWORD-CANARY");
   });
+
+  // Express matches routes case-insensitively and accepts absolute-form targets.
+  it.each([
+    ["an uppercase /API prefix", "POST", `/API/companies/${companyId}/browser/profiles/${profileId}/signin/input`, 409],
+    ["mixed-case segments", "POST", `/api/companies/${companyId}/Browser/Profiles/${profileId}/SignIn/Input`, 409],
+    ["an absolute-form target", "POST", `http://paperclip.invalid${route}`, 409],
+    ["a trailing slash", "POST", `${route}/`, 409],
+    ["another method with a body", "PUT", route, 404],
+  ])("keeps typed text out of the log for %s", async (_label, method, target, status) => {
+    const { app, output } = await failingSignInApp(async () => {
+      throw new HttpError(409, "Start a sign-in session first", { code: "signin_not_active" });
+    });
+    const server = createServer(app);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Fixture listener unavailable");
+      const body = JSON.stringify({ type: "type", text: "PASSWORD-CANARY-VARIANT" });
+      const received = await new Promise<number | undefined>((resolve, reject) => {
+        const client = httpRequest(
+          {
+            hostname: "127.0.0.1",
+            port: address.port,
+            method,
+            path: target,
+            headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode));
+          },
+        );
+        client.on("error", reject);
+        client.end(body);
+      });
+      expect(received).toBe(status);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+    const log = output();
+    expect(log).toContain(`"statusCode":${status}`);
+    expect(log).not.toContain("PASSWORD-CANARY");
+  });
 });

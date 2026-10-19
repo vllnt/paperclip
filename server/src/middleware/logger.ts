@@ -169,7 +169,7 @@ export function createHttpLogger(baseLogger: Logger) {
         const ctx = (res as any).__errorContext;
         if (
           isRuntimeGitHubHttpRequest(req.method, requestClassificationUrl(req)) ||
-          isBrowserSignInInputHttpRequest(req.method, requestClassificationUrl(req))
+          isBrowserSignInInputHttpRequest(requestClassificationUrl(req))
         ) {
           // Command arguments (message bodies), git objects and sign-in
           // keystrokes (passwords, one-time codes) stay out of logs.
