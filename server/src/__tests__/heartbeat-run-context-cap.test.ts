@@ -131,6 +131,18 @@ describe("resolveRunContextSettings", () => {
     await db.update(routines).set({ runContextPolicy: { maxComments: 15, byWakeReason: { issue_commented: { maxComments: 2 } } } }).where(eq(routines.id, routineId));
     expect((await wake(s, "issue_commented"))?.comments.map((c) => c.id)).toEqual(s.ids.slice(-2));
   });
+  it("ignores an agent or routine policy that belongs to another company", async () => {
+    const other = await seed({ comments: 1 });
+    await db.update(agents).set({ runtimeConfig: { runContext: { maxComments: 2 } } }).where(eq(agents.id, other.agentId));
+    const foreignRoutineId = randomUUID();
+    await db.insert(routines).values({ id: foreignRoutineId, companyId: other.companyId, title: "R", responsibleUserId: "board", runContextPolicy: { maxComments: 3 } });
+
+    const s = await seed({ comments: 12, origin: { routineId: foreignRoutineId } });
+    // The wake names the other company's agent, and the issue points at the other company's routine.
+    const payload = await wake({ ...s, agentId: other.agentId });
+    expect(payload?.comments.map((c) => c.id)).toEqual(s.ids.slice(0, 8));
+  });
+
   it("caps annotation-only wakes with the configured limit", async () => {
     const s = await seed({ comments: 1 });
     await companyService(db).update(s.companyId, { runContextPolicy: { maxCommentChars: 100 } });
