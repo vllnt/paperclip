@@ -307,6 +307,8 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     checkoutRunId: null,
     executionRunId: null,
     hiddenAt: null,
+    // Real issue rows always carry it; the fork's durable assignment wakes require it.
+    statusVersion: 0,
     ...overrides,
   };
 }

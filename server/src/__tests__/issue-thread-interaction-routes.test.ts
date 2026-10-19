@@ -443,6 +443,8 @@ describe("issue thread interaction routes", () => {
           id: "child-1",
           assigneeAgentId: CREATED_AGENT_ID,
           status: "todo",
+          // Real issue rows always carry it; the fork's durable assignment wakes require it.
+          statusVersion: 0,
         },
       ],
     });

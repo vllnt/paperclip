@@ -166,6 +166,8 @@ function makeIssue(input: {
     executionWorkspaceId: null,
     labels: [],
     labelIds: [],
+    // Real issue rows always carry it; the fork's durable assignment wakes require it.
+    statusVersion: 0,
   };
 }
 
