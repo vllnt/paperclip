@@ -43,7 +43,7 @@ Runtime exceptions to the matrix's "API key" column:
 |---|---|---|
 | `POST /api/plugins/{pluginId}/actions/{key}` and `/bridge/action` | board | Any authenticated actor reaches the plugin. Each plugin decides; the GitHub plugin's `boardScope` rejects agents and requires `companyId`. |
 | `/api/cli-auth/*`, `/api/auth/*` | board | Session or login-flow specific by design. |
-| Cloud-tenant deployments | — | Board keys never carry instance admin (rows are purged on each trusted-header login). The vllnt deployment uses `authenticated` mode, so this does not apply there. |
+| Cloud-tenant deployments | — | Board keys never carry instance admin (rows are purged on each trusted-header login). Self-hosted deployments in `authenticated` mode do not have this restriction. |
 
 ## Operator gaps, ranked by pain
 
