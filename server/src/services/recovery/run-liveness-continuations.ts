@@ -2,6 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { RunLivenessState } from "@paperclipai/shared";
+import { hasActiveIssueWait } from "../issue-waits.js";
 import { withRecoveryContext } from "./status-only-context.js";
 import { RECOVERY_REASON_KINDS } from "./origins.js";
 
@@ -18,7 +19,15 @@ const IDEMPOTENT_WAKE_STATUSES = ["queued", "deferred_issue_execution", "complet
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
-  "id" | "companyId" | "identifier" | "title" | "status" | "assigneeAgentId" | "executionState" | "projectId"
+  | "id"
+  | "companyId"
+  | "identifier"
+  | "title"
+  | "status"
+  | "assigneeAgentId"
+  | "executionState"
+  | "projectId"
+  | "monitorNextCheckAt"
 >;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 
@@ -118,6 +127,9 @@ export function decideRunLivenessContinuation(input: {
   }
   if (!CONTINUATION_ACTIVE_ISSUE_STATUSES.has(issue.status)) {
     return { kind: "skip", reason: `issue status ${issue.status} is not continuable` };
+  }
+  if (hasActiveIssueWait(issue)) {
+    return { kind: "skip", reason: "issue has an active wait" };
   }
   if (issue.executionState) {
     return { kind: "skip", reason: "issue is blocked by execution policy state" };

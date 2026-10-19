@@ -62,6 +62,32 @@ describe("issue subresource commands", () => {
     ]);
   });
 
+  it("waits on an issue with a bounded delay and a reason", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "wait", ISSUE_ID, "--in", "10m", "--reason", "CI on PR #4320 head abc123"]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect([init.method, url]).toEqual(["POST", `http://localhost:3100/api/issues/${ISSUE_ID}/wait`]);
+    expect(JSON.parse(String(init.body))).toEqual({ in: "10m", reason: "CI on PR #4320 head abc123" });
+  });
+
+  it("refuses an out-of-bounds wait before calling the API", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit ${code}`);
+    }) as never);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run(["issue", "wait", ISSUE_ID, "--in", "48h", "--reason", "CI"])).rejects.toThrow();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    exit.mockRestore();
+  });
+
   it("binds explicit uploaded attachments when adding a comment", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
@@ -125,6 +151,49 @@ describe("issue subresource commands", () => {
       ["POST", `http://localhost:3100/api/issues/${ISSUE_ID}/recovery-actions/resolve`],
       ["POST", `http://localhost:3100/api/issues/${ISSUE_ID}/execution/reconcile`],
     ]);
+  });
+
+  it("prints the issue tree with agent names and passes the raw response with --json", async () => {
+    const AGENT_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const tree = {
+      nodes: [
+        {
+          issue: { id: ISSUE_ID, identifier: "PC-1", title: "Root", status: "in_progress", assigneeAgentId: AGENT_ID, assigneeUserId: null },
+          parentId: null,
+          depth: 0,
+          lastRun: { status: "failed", errorCode: "timeout", createdAt: new Date(Date.now() - 120_000).toISOString(), startedAt: null, finishedAt: null },
+        },
+        {
+          issue: { id: COMMENT_ID, identifier: "PC-2", title: "Child", status: "todo", assigneeAgentId: null, assigneeUserId: "user-1" },
+          parentId: ISSUE_ID,
+          depth: 1,
+          lastRun: null,
+        },
+      ],
+      omittedUnauthorizedNodeCount: 0,
+      truncated: false,
+    };
+    const fetchMock = vi.fn().mockImplementation((url: string) =>
+      Promise.resolve(jsonResponse(url.endsWith("/agents") ? [{ id: AGENT_ID, name: "Builder" }] : tree)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run(["issue", "tree", ISSUE_ID, "--company-id", COMPANY_ID]);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `http://localhost:3100/api/issues/${ISSUE_ID}/diagnostics/subtree`,
+      `http://localhost:3100/api/companies/${COMPANY_ID}/agents`,
+    ]);
+    expect(log.mock.calls.map((call) => call[0])).toEqual([
+      "PC-1 [in_progress] assignee=Builder lastRun=failed(timeout) 2m ago  Root",
+      "  PC-2 [todo] assignee=user:user-1 lastRun=-  Child",
+    ]);
+
+    fetchMock.mockClear();
+    log.mockClear();
+    await run(["issue", "tree", ISSUE_ID, "--company-id", COMPANY_ID, "--json"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual(tree);
   });
 
   it("wraps document and work product endpoints", async () => {
@@ -280,6 +349,49 @@ describe("issue subresource commands", () => {
     expect(headers.authorization).toBe("Bearer board-token");
     const file = (init.body as FormData).get("file") as File;
     expect(file.type).toBe("text/html");
+  });
+});
+
+describe("issue update unblock owner", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.PAPERCLIP_API_KEY;
+    delete process.env.PAPERCLIP_API_URL;
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ["board", "board"],
+    [`agent:${ISSUE_ID}`, { agentId: ISSUE_ID }],
+    ["user:board-user", { userId: "board-user" }],
+  ])("sends --unblock-owner %s with its action", async (flag, owner) => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({ id: ISSUE_ID })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "update", ISSUE_ID, "--status", "blocked", "--unblock-owner", flag, "--unblock-action", "Click Update branch"]);
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      status: "blocked",
+      unblockDescriptor: { owner, action: "Click Update branch" },
+    });
+  });
+
+  it("rejects an unknown owner or a missing action before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+
+    await run(["issue", "update", ISSUE_ID, "--unblock-owner", "manager", "--unblock-action", "x"]);
+    await run(["issue", "update", ISSUE_ID, "--unblock-owner", "board"]);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledTimes(2);
   });
 });
 

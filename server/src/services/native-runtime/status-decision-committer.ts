@@ -39,6 +39,11 @@ import {
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
+import {
+  isHumanOwnedBlock,
+  NATIVE_STATUS_PROJECTION_ACTOR,
+  notHumanOwnedBlockCondition,
+} from "../routable-blocked.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
@@ -759,10 +764,33 @@ async function materializeDecisionEffect(input: {
         and(
           eq(issues.id, input.issue.id),
           eq(issues.companyId, input.companyId),
+          notHumanOwnedBlockCondition(issues),
         ),
       )
       .returning({ id: issues.id });
-    if (!bound) throw new Error("native_blocker_binding_not_persisted");
+    if (!bound) {
+      // A block that the board or a person owns keeps its descriptor, and nobody is woken for the
+      // owner that the run asked for. The effect row records why.
+      const [current] = await input.tx
+        .select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+        .from(issues)
+        .where(and(eq(issues.id, input.issue.id), eq(issues.companyId, input.companyId)))
+        .limit(1);
+      if (current && isHumanOwnedBlock(current)) {
+        return {
+          effectKind: effect.kind,
+          targetType: "issue_unblock_descriptor",
+          targetId: input.issue.id,
+          payload: {
+            owner: effect.owner,
+            action: effect.action,
+            wakeId: null,
+            heldReason: "human_owned_block",
+          },
+        };
+      }
+      throw new Error("native_blocker_binding_not_persisted");
+    }
     let wakeId: string | null = null;
     if (effect.owner !== "board") {
       wakeId = await enqueueWake({
@@ -1863,6 +1891,7 @@ export async function commitNativeStatusDecision(input: {
     }
 
     let updated: typeof issues.$inferSelect;
+    let projectionHeld = false;
     if (input.decision.statusAction === "preserve") {
       updated = (await tx
         .select()
@@ -1885,24 +1914,28 @@ export async function commitNativeStatusDecision(input: {
           statusVersion: input.priorStatusVersion + 1,
           lastStatusDecisionId: decisionRow.id,
           unblockDescriptor: input.decision.unblockDescriptor,
-          actorAgentId: null,
-          actorUserId: null,
+          systemActor: NATIVE_STATUS_PROJECTION_ACTOR,
         },
         tx,
         publications,
       );
       if (!projected) throw new NativeStatusRaceError();
       updated = projected;
-      materialized.unshift({
-        effectKind: "issue_status_projection",
-        targetType: "issue",
-        targetId: input.issueId,
-        payload: {
-          fromStatus: issue.status,
-          toStatus: input.decision.toStatus,
-          reasonCode,
-        },
-      });
+      // A block that the board or a person owns holds the projection: the write matched no row
+      // and the issue is as it was. The decision itself is still recorded and applied below.
+      projectionHeld = projected.lastStatusDecisionId !== decisionRow.id;
+      if (!projectionHeld) {
+        materialized.unshift({
+          effectKind: "issue_status_projection",
+          targetType: "issue",
+          targetId: input.issueId,
+          payload: {
+            fromStatus: issue.status,
+            toStatus: input.decision.toStatus,
+            reasonCode,
+          },
+        });
+      }
     }
 
     if (input.decision.statusAction === "done" && issue.status !== "done") {
@@ -2094,7 +2127,7 @@ export async function commitNativeStatusDecision(input: {
       actorType: "system",
       actorId: "native-status-committer",
       action:
-        input.decision.statusAction === "preserve"
+        input.decision.statusAction === "preserve" || projectionHeld
           ? "issue.status_decision_recorded"
           : "issue.updated",
       entityType: "issue",

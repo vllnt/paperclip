@@ -168,6 +168,52 @@ describe("admin, asset, and skill parity commands", () => {
       ["DELETE", `http://localhost:3100/api/companies/${COMPANY_ID}/skills/${SKILL_ID}`],
     ]);
   });
+
+  it("lists, gets, and diffs company skill versions", async () => {
+    const FROM_ID = "55555555-5555-4555-8555-555555555555";
+    const TO_ID = "66666666-6666-4666-8666-666666666666";
+    const versions: Record<string, unknown> = {
+      [FROM_ID]: { id: FROM_ID, revisionNumber: 1, fileInventory: [{ path: "SKILL.md", kind: "skill", content: "# S\nold\n" }] },
+      [TO_ID]: { id: TO_ID, revisionNumber: 2, fileInventory: [{ path: "SKILL.md", kind: "skill", content: "# S\nnew\n" }] },
+    };
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      const versionId = url.split("/versions/")[1];
+      return Promise.resolve(jsonResponse(versionId ? versions[versionId] : [versions[TO_ID], versions[FROM_ID]]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run(["skill", "versions", SKILL_ID, "--company-id", COMPANY_ID]);
+    await run(["skill", "version:get", SKILL_ID, FROM_ID, "--company-id", COMPANY_ID]);
+    log.mockClear();
+    await run(["skill", "version:diff", SKILL_ID, FROM_ID, TO_ID, "--company-id", COMPANY_ID]);
+
+    expect(fetchMock.mock.calls.map((call) => [call[1]?.method ?? "GET", call[0]])).toEqual([
+      ["GET", `http://localhost:3100/api/companies/${COMPANY_ID}/skills/${SKILL_ID}/versions`],
+      ["GET", `http://localhost:3100/api/companies/${COMPANY_ID}/skills/${SKILL_ID}/versions/${FROM_ID}`],
+      ["GET", `http://localhost:3100/api/companies/${COMPANY_ID}/skills/${SKILL_ID}/versions/${FROM_ID}`],
+      ["GET", `http://localhost:3100/api/companies/${COMPANY_ID}/skills/${SKILL_ID}/versions/${TO_ID}`],
+    ]);
+    expect(log.mock.calls.map((call) => call[0])).toEqual([
+      `revision 1 (${FROM_ID}) -> revision 2 (${TO_ID})`,
+      "--- a/SKILL.md",
+      "+++ b/SKILL.md",
+      "@@ -1,2 +1,2 @@",
+      " # S",
+      "-old",
+      "+new",
+    ]);
+
+    log.mockClear();
+    await run(["skill", "version:diff", SKILL_ID, FROM_ID, TO_ID, "--company-id", COMPANY_ID, "--json"]);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({
+      fromVersionId: FROM_ID,
+      toVersionId: TO_ID,
+      fromRevisionNumber: 1,
+      toRevisionNumber: 2,
+      files: [{ path: "SKILL.md", change: "modified", binary: false }],
+    });
+  });
 });
 
 function jsonResponse(body: unknown = { ok: true }, init: ResponseInit = { status: 200 }): Response {
