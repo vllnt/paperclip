@@ -189,6 +189,7 @@ export function RoutineDetail() {
     variables: [],
     env: null,
     automationWakeSettings: {},
+    runContextPolicy: null,
   });
 
   const section: RoutineSectionKey = isRoutineSection(sectionParam) ? sectionParam : "overview";
@@ -285,6 +286,7 @@ export function RoutineDetail() {
             variables: routine.variables,
             env: routine.env ?? null,
             automationWakeSettings: readAutomationWakeSettings(routine.automationWakeSettings),
+            runContextPolicy: routine.runContextPolicy ?? null,
           }
         : null,
     [routine],
@@ -328,6 +330,9 @@ export function RoutineDetail() {
       JSON.stringify(editBaseWakeSettingsRef.current)
     ) {
       result.push({ key: "automationWakeSettings", label: "the automation wake window" });
+    }
+    if (JSON.stringify(editDraft.runContextPolicy ?? null) !== JSON.stringify(routineDefaults.runContextPolicy ?? null)) {
+      result.push({ key: "runContextPolicy", label: "the run context" });
     }
     return result;
   }, [editDraft, routineDefaults]);
@@ -707,6 +712,7 @@ export function RoutineDetail() {
         variables: response.routine.variables as RoutineVariable[],
         env: (response.routine.env ?? null) as RoutineEnvConfig | null,
         automationWakeSettings: readAutomationWakeSettings(response.routine.automationWakeSettings),
+        runContextPolicy: response.routine.runContextPolicy ?? null,
       });
       editBaseWakeSettingsRef.current = readAutomationWakeSettings(response.routine.automationWakeSettings);
       hydratedRoutineIdRef.current = response.routine.id;

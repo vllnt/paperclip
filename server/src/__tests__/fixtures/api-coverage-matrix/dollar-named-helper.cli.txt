@@ -1,0 +1,10 @@
+export function registerNoteCommands(program: Command): void {
+  const note = program.command("note").description("Notes");
+  add$Get(note, "list", "notes");
+  add$Get(note, "archive", "notes/archive");
+}
+function add$Get(parent: Command, name: string, path: string): void {
+  parent.command(name).action(async () => {
+    await ctx.api.get(`/api/${path}`);
+  });
+}
