@@ -20,11 +20,6 @@ import {
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 
 export { hasAgentShortnameCollision, deduplicateAgentName } from "../lib/agent-records.js";
-/**
- * Maps a config revision snapshot to the exact patch a rollback applies.
- * Re-exported so the rollback route can check that same patch before applying it.
- */
-export { configPatchFromSnapshot } from "../lib/agent-records.js";
 
 export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
   const {
