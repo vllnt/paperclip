@@ -70,6 +70,20 @@ describe("agent lifecycle commands", () => {
     ]);
   });
 
+  it("targets one issue with heartbeat:invoke --issue and keeps the empty body without it", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const ISSUE_ID = "44444444-4444-4444-8444-444444444444";
+
+    await run(["agent", "heartbeat:invoke", AGENT_ID, "--issue", ISSUE_ID]);
+    await run(["agent", "heartbeat:invoke", AGENT_ID]);
+
+    expect(fetchMock.mock.calls.map((call) => [call[0], JSON.parse(call[1].body)])).toEqual([
+      [`http://localhost:3100/api/agents/${AGENT_ID}/heartbeat/invoke`, { payload: { issueId: ISSUE_ID } }],
+      [`http://localhost:3100/api/agents/${AGENT_ID}/heartbeat/invoke`, {}],
+    ]);
+  });
+
   it("wraps configuration, runtime, skills, and instructions endpoints", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
