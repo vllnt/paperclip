@@ -3460,11 +3460,20 @@ export function agentRoutes(
         entry.adapterType,
         applyCreateDefaultsByAdapterType(entry.adapterType, { ...(entry.adapterConfig ?? {}), ...(env ? { env } : {}) }),
       );
-      assertExternalInstructionsAdmin(input.req, {
+      const fallbackInstructionsAgent = {
         id: input.agentId,
         name: input.agentName,
         companyId: input.companyId,
         adapterConfig: { ...input.primaryAdapterConfig, ...withDefaults },
+      };
+      assertExternalInstructionsAdmin(input.req, fallbackInstructionsAgent);
+      // A carried managed root must not hide a fallback's external file path.
+      assertExternalInstructionsAdmin(input.req, {
+        ...fallbackInstructionsAgent,
+        adapterConfig: syncInstructionsBundleConfigFromFilePath(
+          fallbackInstructionsAgent,
+          fallbackInstructionsAgent.adapterConfig,
+        ),
       });
       const { env: isolatedEnv, ...adapterConfig } = withDefaults;
       const isolated = asRecord(isolatedEnv);

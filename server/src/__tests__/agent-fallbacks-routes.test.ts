@@ -20,6 +20,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { secretService } from "../services/secrets.js";
+import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -207,8 +208,19 @@ describeEmbeddedPostgres("agent fallbacks routes", () => {
     expect((await readAgent(agentId)).fallbacks).toEqual([]);
   });
 
-  it("requires instance admin access for external fallback instruction paths", async () => {
+  it.each([false, true])("requires instance admin access for external fallback instruction paths with managed primary %s", async (managedPrimary) => {
     const { companyId, agentId } = await seed();
+    if (managedPrimary) {
+      const primary = await readAgent(agentId);
+      const root = resolveManagedInstructionsRoot(primary);
+      await db.update(agents).set({ adapterConfig: {
+        ...primary.adapterConfig,
+        instructionsBundleMode: "managed",
+        instructionsRootPath: root,
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: `${root}/AGENTS.md`,
+      } }).where(eq(agents.id, agentId));
+    }
     await db.insert(companyMemberships).values({
       companyId, principalType: "user", principalId: "board-user", status: "active", membershipRole: "owner",
     });
