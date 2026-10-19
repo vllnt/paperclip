@@ -63,6 +63,11 @@ export function CompanySettings() {
   const [governance, setGovernance] = useState<InteractionResolverGovernance>({});
   const [wakeSettings, setWakeSettings] = useState<AutomationWakeSettings>({});
 
+  // A draft belongs to one company; refreshing that company must keep its edits.
+  useEffect(() => {
+    setRunContextDraft(undefined);
+  }, [selectedCompanyId]);
+
   // Sync local state from selected company
   useEffect(() => {
     if (!selectedCompany) return;
@@ -411,7 +416,7 @@ export function CompanySettings() {
         {/* Locked while saving: an edit made mid-save would be dropped when the saved draft clears. */}
         <fieldset disabled={runContextMutation.isPending} className="m-0 min-w-0 border-0 p-0">
           <RunContextPolicyEditor
-            key={JSON.stringify(selectedCompany.runContextPolicy ?? null)}
+            key={JSON.stringify([selectedCompany.id, selectedCompany.runContextPolicy ?? null])}
             value={runContextDraft === undefined ? selectedCompany.runContextPolicy : runContextDraft}
             onChange={setRunContextDraft}
             testId="company-settings-run-context"
