@@ -8,6 +8,7 @@ import {
   type ReactElement,
   type ReactNode,
 } from "react";
+import { matchesMedia, subscribeToMedia } from "../lib/safe-match-media";
 
 type Theme = "light" | "dark";
 
@@ -32,64 +33,17 @@ const DARK_THEME_COLOR = "#000000";
 const LIGHT_THEME_COLOR = "#ffffff";
 const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
 
-/**
- * What `system` resolves to when the OS preference cannot be read. It is the
- * value the boot script in `index.html` paints in the same situation, so a
- * reload and a live switch to `system` agree.
- */
-const UNREADABLE_SYSTEM_THEME: Theme = "light";
-
-/**
- * The OS color-scheme query, or null when `matchMedia` is missing or throws
- * (some embedded webviews). Every `matchMedia` call in this module goes
- * through here.
- */
-function systemMediaQuery(): MediaQueryList | null {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return null;
-  try {
-    return window.matchMedia(DARK_QUERY);
-  } catch {
-    return null;
-  }
+function themeFor(isDark: boolean): Theme {
+  return isDark ? "dark" : "light";
 }
 
+/**
+ * The OS theme. When the OS preference cannot be read this is light, the value
+ * the boot script in `index.html` paints in the same situation, so a reload and
+ * a live switch to `system` agree.
+ */
 function readSystemTheme(): Theme {
-  try {
-    const query = systemMediaQuery();
-    if (!query) return UNREADABLE_SYSTEM_THEME;
-    return query.matches ? "dark" : "light";
-  } catch {
-    return UNREADABLE_SYSTEM_THEME;
-  }
-}
-
-/**
- * Calls `onChange` when the OS theme changes and returns the unsubscribe.
- * Uses `addEventListener`, or `addListener` on older query lists. It does
- * nothing, and its unsubscribe does nothing, when the query cannot be read or
- * when subscribing or unsubscribing throws.
- */
-function subscribeToSystemTheme(onChange: (theme: Theme) => void): () => void {
-  const query = systemMediaQuery();
-  if (!query) return () => undefined;
-  const handleChange = (event: MediaQueryListEvent): void => {
-    onChange(event.matches ? "dark" : "light");
-  };
-  const modern = typeof query.addEventListener === "function";
-  try {
-    if (modern) query.addEventListener("change", handleChange);
-    else query.addListener(handleChange);
-  } catch {
-    return () => undefined;
-  }
-  return () => {
-    try {
-      if (modern) query.removeEventListener("change", handleChange);
-      else query.removeListener(handleChange);
-    } catch {
-      return;
-    }
-  };
+  return themeFor(matchesMedia(DARK_QUERY, false));
 }
 
 /**
@@ -164,7 +118,7 @@ export function ThemeProvider({ children }: { children: ReactNode }): ReactEleme
 
   useEffect(() => {
     if (preference !== "system") return;
-    return subscribeToSystemTheme(setSystemTheme);
+    return subscribeToMedia(DARK_QUERY, (isDark) => setSystemTheme(themeFor(isDark)));
   }, [preference]);
 
   useEffect(() => {

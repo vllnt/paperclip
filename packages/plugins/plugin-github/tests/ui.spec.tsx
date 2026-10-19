@@ -20,7 +20,7 @@ const repository = { id: 22, fullName: "acme/repo", name: "repo", url: "https://
 const action = (key: string) => { if (!mocks.actions.has(key)) mocks.actions.set(key, vi.fn()); return mocks.actions.get(key)!; };
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 beforeEach(() => { mocks.actions.clear(); mocks.navigate.mockReset(); sessionStorage.clear(); window.history.replaceState({}, "", "/ACME" + PAGE_PATH);
-  action("sync-now").mockResolvedValue({ started: true });
+  action("sync-now").mockResolvedValue({ queued: true, queuedAt: "2026-10-10T12:00:00.000Z", busy: false, lastRunAt: null });
   action("sync-status").mockResolvedValue({ configured: true, settings: { enabled: true, rules: [] }, busy: false, report: { at: "now", warnings: [] }, pendingCount: 0 });
   action("automation-options").mockResolvedValue({ agents: [], repositories: [] });
   action("task-sync-detail").mockResolvedValue({ link: null, pending: false, repositories: [] });
@@ -273,10 +273,10 @@ describe("sidebar navigation", () => {
 
 
 describe("native task sync status", () => {
-  it("starts background sync and shows status without a second issue listing", async () => {
+  it("shows the sync status without starting a sync or a second issue listing", async () => {
     render(<GitHubTaskList context={context} />);
     await screen.findByText("GitHub synced");
-    expect(action("sync-now")).toHaveBeenCalledWith({ companyId: "c1" });
+    expect(action("sync-now")).not.toHaveBeenCalled();
     expect(screen.queryByRole("list")).toBeNull();
     expect(action("task-issues")).not.toHaveBeenCalled();
   });
