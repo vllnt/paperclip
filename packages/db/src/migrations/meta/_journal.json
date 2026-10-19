@@ -2112,22 +2112,29 @@
     {
       "idx": 303,
       "version": "7",
-      "when": 1792371010803,
-      "tag": "0303_resource_capacity",
+      "when": 1792426125272,
+      "tag": "0303_friendly_arclight",
       "breakpoints": true
     },
     {
       "idx": 304,
       "version": "7",
-      "when": 1792371010804,
-      "tag": "0304_illegal_rattler",
+      "when": 1792430009693,
+      "tag": "0304_third_spitfire",
       "breakpoints": true
     },
     {
       "idx": 305,
       "version": "7",
-      "when": 1792371010805,
-      "tag": "0305_issue_run_lookup_indexes",
+      "when": 1792430009694,
+      "tag": "0305_illegal_rattler",
+      "breakpoints": true
+    },
+    {
+      "idx": 306,
+      "version": "7",
+      "when": 1792430009695,
+      "tag": "0306_issue_run_lookup_indexes",
       "breakpoints": true
     }
   ]

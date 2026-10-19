@@ -104,6 +104,8 @@ export async function lastRunLeftNothingChanged(
         eq(routineRuns.companyId, input.companyId),
         eq(routineRuns.routineId, input.routineId),
         sql`${routineRuns.status} not in ('skipped', 'coalesced', 'received')`,
+        // Event runs belong to external alerts; they must not decide whether a schedule run repeats.
+        sql`${routineRuns.source} <> 'event'`,
       ),
     )
     .orderBy(desc(routineRuns.triggeredAt), desc(routineRuns.id))

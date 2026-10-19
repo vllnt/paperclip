@@ -1454,6 +1454,11 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/routines/r-1/triggers" },
       { method: "PATCH", path: "/api/routine-triggers/t-1" },
       { method: "DELETE", path: "/api/routine-triggers/t-1" },
+      { method: "GET", path: "/api/routines/r-1/event-groups" },
+      { method: "GET", path: "/api/companies/co-1/event-sources" },
+      { method: "GET", path: "/api/event-sources/es-1" },
+      { method: "GET", path: "/api/event-sources/es-1/deliveries" },
+      { method: "POST", path: "/api/event-sources/es-1/test" },
     ];
     for (const request of allowed) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
@@ -1493,6 +1498,12 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/companies/co-1/logo" },
       { method: "GET", path: "/api/companies/co-1/secrets" },
       { method: "PATCH", path: "/api/secrets/secret-1" },
+      // Sources are board-managed; only reads and the dry run are reachable.
+      { method: "POST", path: "/api/companies/co-1/event-sources" },
+      { method: "PATCH", path: "/api/event-sources/es-1" },
+      { method: "DELETE", path: "/api/event-sources/es-1" },
+      { method: "POST", path: "/api/event-sources/es-1/rotate-secret" },
+      { method: "POST", path: "/api/event-sources/public/abc/events" },
     ];
     for (const request of denied) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(

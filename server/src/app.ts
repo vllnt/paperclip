@@ -75,6 +75,9 @@ import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
 import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
 import { routineRoutes } from "./routes/routines.js";
+import { eventSourcePublicRoutes, eventSourceRoutes } from "./routes/event-sources.js";
+import { eventSourceBodyParser } from "./middleware/event-source-body.js";
+import { eventSourceService } from "./services/event-sources/service.js";
 import { pipelineRoutes } from "./routes/pipelines.js";
 import { environmentRoutes } from "./routes/environments.js";
 import { resourceCapacityRoutes } from "./routes/resource-capacity.js";
@@ -543,6 +546,9 @@ export async function createApp(
     createChatWebhookDiagnostics(),
     chatWebhookBodyParser,
   );
+  // Event sources authenticate with their own secret over an unauthenticated
+  // route, so their body is capped at 64 KB before the 10 MB parser can run.
+  app.use("/api/event-sources/public", eventSourceBodyParser(captureRawBody));
   app.use(
     express.json({
       limit: DEFAULT_JSON_BODY_LIMIT,
@@ -611,6 +617,15 @@ export async function createApp(
   const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
   app.use(emailWebhookRoutes(emailChannels));
   app.use(chatWebhookRoutes(chatChannels));
+  // Signed event ingress: the source's own secret is the only credential, and
+  // it is verified before any shared budget is spent. One service instance
+  // owns the source cache, rate limiters and background timers.
+  const eventSources = eventSourceService(db, {
+    heartbeat: connectionIntentHeartbeat,
+    pluginWorkerManager: workerManager,
+  });
+  void eventSources.start();
+  app.use("/api", eventSourcePublicRoutes(eventSources));
   // The instance validates single-use registration state and its trusted
   // current origin. This exact GET is the only public setup return.
   app.get("/api/chat-github/manifest/callback", async (req, res) => {
@@ -767,6 +782,7 @@ export async function createApp(
   api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(eventSourceRoutes(db, eventSources));
   api.use(pipelineRoutes(db));
   api.use(resourceCapacityRoutes(db));
   api.use(
@@ -1364,6 +1380,7 @@ export async function createApp(
       hostServiceCleanup.teardown();
       await emailChannels.shutdown();
       await chatChannels.shutdown();
+      await eventSources.stop();
       // End the avatar worker pool, if a request ever started one, so no
       // render outlives the HTTP teardown.
       await agentAvatars.close();
