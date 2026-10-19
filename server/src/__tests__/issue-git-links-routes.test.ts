@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { activityLog, agents, companies, createDb, issueWorkProducts, issues } from "@paperclipai/db";
+import { activityLog, agents, companies, companyMemberships, createDb, issueWorkProducts, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -35,6 +35,7 @@ describeEmbeddedPostgres("issue git routes", () => {
     await db.delete(issueWorkProducts);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -77,6 +78,7 @@ describeEmbeddedPostgres("issue git routes", () => {
   async function seed(prefix = randomPrefix()) {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: `Co ${prefix}`, issuePrefix: prefix, requireBoardApprovalForNewAgents: false });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "user-1", membershipRole: "admin", status: "active" });
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId, companyId, title: "Fix the login redirect", status: "todo",
@@ -196,6 +198,27 @@ describeEmbeddedPostgres("issue git routes", () => {
 
     expect(res.status).toBe(404);
     expect(await db.select().from(issueWorkProducts)).toEqual([]);
+  });
+
+  it("enforces scoped-key read and mutation boundaries even for the assignee", async () => {
+    const { companyId, issueId } = await seed();
+    const agentId = randomUUID();
+    const otherIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Scoped agent", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.update(issues).set({ assigneeUserId: null, assigneeAgentId: agentId }).where(eq(issues.id, issueId));
+    await db.insert(issues).values({ id: otherIssueId, companyId, title: "Allowed task", status: "todo", assigneeAgentId: agentId });
+    const linked = await request(appFor(board([companyId]))).post(`/api/issues/${issueId}/git/pull-requests`).send({ repository: "acme/app", number: 7 });
+    const productId = linked.body.pullRequests[0].workProductId as string;
+    const before = await db.select().from(issueWorkProducts);
+    const app = appFor({ type: "agent", agentId, companyId, source: "agent_key", keyScope: { kind: "skill_test", issueId: otherIssueId } });
+    expect((await request(app).get(`/api/issues/${otherIssueId}/git`)).status).toBe(200);
+    expect.soft((await request(app).get(`/api/issues/${issueId}/git`)).status).toBe(403);
+    expect.soft((await request(app).post(`/api/issues/${issueId}/git/pull-requests`).send({ repository: "acme/app", number: 8 })).status).toBe(403);
+    expect((await request(app).delete(`/api/issues/${issueId}/git/pull-requests/${productId}`)).status).toBe(403);
+    expect(await db.select().from(issueWorkProducts)).toEqual(before);
   });
 
   it("unlinks a pull request and records it", async () => {

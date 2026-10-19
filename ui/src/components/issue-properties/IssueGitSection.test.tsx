@@ -197,6 +197,20 @@ describe("IssueGitSection", () => {
     expect(mockIssuesApi.unlinkPullRequest).toHaveBeenCalledWith(ISSUE_ID, PRODUCT_ID);
   });
 
+  it("shows an unlink failure and allows retry without losing the link", async () => {
+    mockIssuesApi.getGit.mockResolvedValue(makeView({ pullRequests: [openPr] }));
+    mockIssuesApi.unlinkPullRequest.mockRejectedValueOnce(new Error("Could not unlink the pull request"));
+    await render();
+    await act(async () => { byLabel("Unlink acme/app#7")!.click(); });
+    await settle();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not unlink");
+    expect(text()).toContain("acme/app#7");
+    mockIssuesApi.unlinkPullRequest.mockResolvedValueOnce(undefined);
+    await act(async () => { byLabel("Unlink acme/app#7")!.click(); });
+    await settle();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
   it("shows a retry when the git view cannot be loaded", async () => {
     mockIssuesApi.getGit.mockRejectedValueOnce(new Error("boom"));
     await render();

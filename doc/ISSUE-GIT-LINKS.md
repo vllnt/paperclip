@@ -97,7 +97,9 @@ not post a comment, so it does not wake an agent.
 | Paperclip Cloud relay events | The existing GitHub connection event poll | yes |
 
 A relay event carries the branch, state, and merge flag, but not the title or body. The service
-reads the rest from GitHub only when it needs it (head repository, default branch, draft flag).
+reads missing matching text and repository details from GitHub before matching tasks. PR body
+text is bounded and used only for matching; it is not stored in work products or the
+normal external-object snapshots.
 
 ## Safety
 
@@ -105,8 +107,9 @@ reads the rest from GitHub only when it needs it (head repository, default branc
 - Writes for one pull request run under a database advisory lock, so two deliveries at once leave
   one row. A stale event (older than the stored update time) changes nothing.
 - A failure while linking never fails the event delivery.
-- Agents can link and unlink only on tasks assigned to them. Board users with company access can
-  do it on any task. Reads follow normal company access, and another company's task answers `404`.
+- Agents can link and unlink only on tasks assigned to them. Each explicit link affects only
+  the chosen task. Reads and writes enforce the existing issue authorization boundary,
+  including scoped keys and low-trust agents. Another company's task answers `404`.
 
 ## Surfaces
 

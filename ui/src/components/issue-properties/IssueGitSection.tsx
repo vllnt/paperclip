@@ -184,6 +184,11 @@ export function IssueGitSection({ issueId, streamlined }: { issueId: string; str
           {data.pullRequests.length > 0 && !data.statusAutomation.enabled ? (
             <p className="py-1 text-xs text-muted-foreground">Status automation is off. Links still update.</p>
           ) : null}
+          {unlink.isError ? (
+            <p role="alert" className="text-xs text-destructive">
+              {unlink.error instanceof Error ? unlink.error.message : "Could not unlink the pull request"}
+            </p>
+          ) : null}
           {linking ? (
             <form className="flex min-w-0 flex-col gap-1 py-1" onSubmit={submit}>
               <div className="flex min-w-0 items-center gap-1.5">

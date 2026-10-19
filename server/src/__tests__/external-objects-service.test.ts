@@ -294,6 +294,26 @@ describe("GitHub external object provider", () => {
     });
   });
 
+  it("keeps pull request bodies out of snapshots unless transient matching requests them", async () => {
+    const body = `Fixes EXAMPLE-12 ${"x".repeat(25_000)}`;
+    const fetch = vi.fn(async () => response({
+      state: "open", title: "Example change", body,
+      head: { repo: { full_name: "acme/app" } },
+      base: { repo: { default_branch: "main" } },
+    }));
+    for (const includePullRequestBody of [false, true]) {
+      const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: null, includePullRequestBody });
+      const result = await provider.resolvers.find((entry) => entry.objectType === "pull_request")!.resolve({
+        companyId: "company-1", object: githubObject("pull/42", "pull_request"),
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("Expected snapshot");
+      expect(result.snapshot.data).toMatchObject({ title: "Example change", headRepository: "acme/app", defaultBranch: "main" });
+      if (includePullRequestBody) expect(result.snapshot.data).toHaveProperty("body", body.slice(0, 24_000));
+      else expect(result.snapshot.data).not.toHaveProperty("body");
+    }
+  });
+
   it("uses a configured token without storing it in the resolved snapshot", async () => {
     const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
       expect(init?.headers).toEqual(expect.objectContaining({ authorization: "Bearer ghp_secret" }));

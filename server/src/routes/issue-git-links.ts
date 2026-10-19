@@ -7,6 +7,7 @@ import { validate } from "../middleware/validate.js";
 import { logActivity } from "../services/activity-log.js";
 import { extractGitHubPullRequestReferences } from "../services/github-pull-request-merge.js";
 import { issueGitLinkService } from "../services/issue-git-links.js";
+import { accessService } from "../services/access.js";
 import { issueService } from "../services/issues.js";
 import { getAccessibleResource, getActorInfo } from "./authz.js";
 
@@ -19,6 +20,7 @@ import { getAccessibleResource, getActorInfo } from "./authz.js";
 export function issueGitLinkRoutes(db: Db, options: { git?: ReturnType<typeof issueGitLinkService> } = {}) {
   const router = Router();
   const issuesSvc = issueService(db);
+  const access = accessService(db);
   const git = options.git ?? issueGitLinkService(db);
 
   router.param("id", async (req, _res, next, rawId) => {
@@ -38,7 +40,26 @@ export function issueGitLinkRoutes(db: Db, options: { git?: ReturnType<typeof is
       res.status(404).json({ error: "Issue not found" });
       return null;
     }
-    return getAccessibleResource(req, res, issuesSvc.getById(id), "Issue not found");
+    const issue = await getAccessibleResource(req, res, issuesSvc.getById(id), "Issue not found");
+    if (!issue) return null;
+    const scope = {
+      issueId: issue.id,
+      projectId: issue.projectId,
+      parentIssueId: issue.parentId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+    };
+    const decision = await access.decide({
+      actor: req.actor,
+      action: req.method === "GET" || req.method === "HEAD" ? "issue:read" : "issue:mutate",
+      resource: { type: "issue", companyId: issue.companyId, status: issue.status, ...scope },
+      scope,
+    });
+    if (!decision.allowed) {
+      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      return null;
+    }
+    return issue;
   }
 
   function assertMayLink(req: Request, issue: { assigneeAgentId: string | null }) {

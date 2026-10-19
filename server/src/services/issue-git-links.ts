@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import {
   companies,
@@ -57,6 +58,7 @@ export interface PullRequestSignal {
 }
 
 export interface PullRequestEnrichment {
+  body?: string | null;
   headRepository?: string | null;
   defaultBranch?: string | null;
   title?: string | null;
@@ -76,6 +78,7 @@ export function pullRequestDetailsEnricher(resolve: PullRequestMergeDetailsResol
       headRepository: details.headRepository ?? null,
       defaultBranch: details.defaultBranch ?? null,
       title: details.title ?? null,
+      body: details.body ?? null,
       draft: details.draft ?? null,
     };
   };
@@ -245,6 +248,7 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
         .where(and(eq(issues.id, opts.manualIssueId), eq(issues.companyId, companyId)));
       if (!issue) throw notFound("Issue not found");
       addEvidence(issue.id, { linkedBy: "manual", closes: opts.closes ?? true });
+      return targets;
     }
 
     if (signal.headRef) {
@@ -558,13 +562,10 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
   ): Promise<RecordSignalResult> {
     const signal: PullRequestSignal = { ...rawSignal, repository: rawSignal.repository.toLowerCase() };
     const externalId = `${signal.repository}#pull/${signal.number}`;
-    const targets = await resolveTargets(companyId, signal, externalId, opts);
-    if (targets.size === 0) return { links: [], automation: [] };
-
     let effective = signal;
     const enrich = options.enrich;
     const draftUnknown = signal.draft === undefined && signal.state === "open";
-    if (enrich && (!signal.headRepository || draftUnknown)) {
+    if (enrich && (!signal.headRepository || draftUnknown || signal.title == null || signal.body == null)) {
       try {
         const extra = await enrich(companyId, signal);
         if (extra) {
@@ -573,6 +574,7 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
             headRepository: signal.headRepository ?? extra.headRepository ?? null,
             defaultBranch: signal.defaultBranch ?? extra.defaultBranch ?? null,
             title: signal.title ?? extra.title ?? null,
+            body: signal.body ?? extra.body ?? null,
             draft: signal.draft ?? extra.draft ?? false,
           };
         }
@@ -581,6 +583,8 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       }
     }
 
+    const targets = await resolveTargets(companyId, effective, externalId, opts);
+    if (targets.size === 0) return { links: [], automation: [] };
     const targetIds = [...targets.keys()].slice(0, MAX_TARGETS);
     const rows = await db
       .select({ id: issues.id, identifier: issues.identifier, projectId: issues.projectId })
@@ -653,7 +657,7 @@ export function issueGitLinkService(db: Db, options: IssueGitLinkServiceOptions 
       identifier: issue.identifier,
       branch: {
         name: branch.name,
-        command: branch.source === "existing_branch" ? `git switch ${branch.name}` : `git switch -c ${branch.name}`,
+        command: branch.source === "existing_branch" ? `git switch ${shellQuote(branch.name)}` : `git switch -c ${branch.name}`,
         template: branch.template,
         source: branch.source,
       },

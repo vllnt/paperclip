@@ -15,7 +15,7 @@ auto-assignment per project. The code reading says:
   status when a PR opens or merges.
 - The GitHub plugin only links PRs to tasks that were mirrored from a GitHub issue, and
   only through GitHub's own `closedByPullRequestsReferences`.
-- On a Tailnet-only deployment (anthm) GitHub webhooks are off and the plugin's one-minute
+- On a private-network-only deployment GitHub webhooks are off and the plugin's one-minute
   sync lists issues, not PRs. A webhook-only design would never fire there.
 - Project leads are stored but never used. No project default assignee exists.
 
@@ -52,7 +52,7 @@ Columns: Linear · GitHub Issues + Projects v2 · Jira · Shortcut · Plane · G
 |---|---|---|---|---|---|---|---|
 | Sub-issues | ● | ● 8 levels, 100 each | ● | ● | ● | ● | ● `parentId`; no depth cap |
 | Blocks / blocked-by | ● | ● | ● | ● | ● † | ◐ Premium | ● `blockedByIssueIds`, cycle checks |
-| Duplicate / related | ● † | ◐ "duplicate of" comment | ● | ○ | ◐ | ◐ relates | ○ (create-time dedup; #40 open) |
+| Duplicate / related | ● † | ◐ "duplicate of" comment | ● | ○ | ◐ | ◐ relates | ○ (create-time dedup; follow-up planned) |
 | Per-team or project workflows | ● per team, 5 categories + Triage | ◐ Projects Status field | ● | ● | ● | ◐ scoped labels | ○ fixed 7 statuses |
 | Priority | ● † | ◐ org issue field (preview) | ● | ? | ● | ◐ | ● 4 levels |
 | Estimates | ● † | ◐ Effort field | ● | ? | ● | ● | ○ |
@@ -144,12 +144,12 @@ as recurring agent work, and per-run audit.
 | Company fence in that path | Event → installation binding → `companyId`; per-company delivery receipts | `github-connection-events.ts:339-370,492-505` |
 | Plugin PR links | Only for tasks mirrored from a GitHub issue (`closedByPullRequestsReferences`) | `packages/plugins/plugin-github/src/task-links.ts:20,60-85` |
 | Plugin sync | Issues only (`row.pull_request` filtered out). PR handling is webhook-only or on demand | `plugin-github/src/github.ts:290`, `sync.ts:524-560` |
-| Deployment | anthm is Tailnet-only: webhooks off, scheduled sync is the event path | `plugin-github/README.md:35,314` |
+| Deployment | A private-network-only deployment: webhooks off, scheduled sync is the event path | `plugin-github/README.md:35,314` |
 | Status ownership | Mirrored GitHub tasks: sync maps open→todo, closed→done. `execution policy` and approval stages are row-locked and re-authorised | `plugin-github/src/sync.ts:30-32`, `server/src/services/issue-execution-policy.ts:1217` |
 | Merge-aware workflow | A pending `request_confirmation` that names a PR auto-accepts on merge and wakes the assignee | `server/src/services/issue-thread-interactions.ts:2840` |
 | Auto-assignment | None. `leadAgentId` is only exported/patched. Routines use a fixed assignee. Plugin rules cover GitHub-origin tasks | `packages/db/src/schema/projects.ts:15`, `plugin-github/src/sync.ts:46-95` |
 | Surfaces | REST (~90 issue routes), runtime OpenAPI, CLI `issue` group, MCP (create/update/checkout/documents) | `server/src/routes/openapi.ts:4100`, `cli/src/commands/client/issue.ts`, `packages/mcp-server/src/tools.ts` |
-| "Project 34" | Not in code. It is data: a GitHub Projects v2 board the plugin browses and edits; Project fields are not mirrored into tasks | `plugin-github/src/management-projects.ts`, README "Boundaries" |
+| "Example project" | Not in code. It is data: a GitHub Projects v2 board the plugin browses and edits; Project fields are not mirrored into tasks | `plugin-github/src/management-projects.ts`, README "Boundaries" |
 
 Invariants any design here must keep: single assignee, atomic checkout, company scoping on
 every row and route, activity logging on mutations, `statusVersion` bumps, review/approval
@@ -163,7 +163,7 @@ one open issue per origin kind.
 | No human-facing branch name | Humans guess names; agent and human branches differ | 1 |
 | PR never links to a native task by itself | Cannot leave GitHub Issues | 1 |
 | No status change on PR events | Tasks drift from reality | 1 |
-| Poll-only deployments get no PR events | anthm gets nothing from a webhook design | 1 |
+| Poll-only deployments get no PR events | A private deployment gets nothing from a webhook design | 1 |
 | Lead and capacity data unused | Every new task needs a hand-off | 3 |
 | No triage, templates, SLAs | Outside issues land in `todo` untouched | 4 |
 | GitHub Issues mirror is the only intake | GitHub stays the source of truth | 5 |
@@ -180,8 +180,7 @@ one open issue per origin kind.
    `issueService.update` and the execution-policy transition for status.
 3. One core service, many adapters. Adapters only normalise facts; they never decide.
 4. Ship dark: linking is on; status automation is off until an operator enables it.
-5. No schema change in slice 1 (the live database stays untouched; #40 already owns
-   migration 0296).
+5. No schema change in slice 1; the live database stays untouched.
 
 ### 6.2 Branch names
 
@@ -327,7 +326,7 @@ updates the inventory with the corpus at hand. Agent docs stay out of
 | 1 | Git links | Branch name; PR auto-link (explicit link and Cloud relay events; the plugin poll for Tailnet-only deployments follows as 1b); guarded status automation, off by default; API, OpenAPI, CLI, MCP, web | Leave GitHub Issues for PR tracking |
 | 2 | Git depth | Per-project automation config, target branches with regex and a "no action" override (Linear), draft handling; commit and trailer linking; checks and review state in the panel; "ready for merge" state; re-check when a run ends; optional "copy branch also assigns me and starts the task" (Linear's personal toggle); unique index on a new link table | Trust to turn automation on everywhere |
 | 3 | Auto-assignment | Project assignment settings; lead default; rules; capacity and model aware pools; override semantics | No manual hand-off |
-| 4 | Intake and triage | Triage queue, templates and forms, due dates and SLAs, duplicate detection (#40), GitHub issues into triage | Real intake |
+| 4 | Intake and triage | Triage queue, templates and forms, due dates and SLAs, duplicate detection, GitHub issues into triage | Real intake |
 | 5 | GitHub Issues bypass | Adopt and migrate mirrors, one-way publish, Projects field mapping | Retire GitHub Issues |
 | 6 | Planning | Estimates, due dates, cycles, milestones, related/duplicate relations, typed searchable fields (GitHub issue fields), status categories per project | Plan work |
 | 7 | Views and daily use | Shared views, query syntax, command palette, subscriptions, email and push | Human comfort |
@@ -362,14 +361,13 @@ RED first, then GREEN:
   slice 2 with per-project control.
 - On merge, should agent-owned tasks go straight to `done`, or wake the assignee for
   post-merge checks? Slice 1 keeps `done` guarded by 6.4 rules 4-6; revisit with data.
-- The plugin poll (anthm is Tailnet-only, so it is the only automatic source there) needs a
+- The plugin poll (the only automatic source on a private-network-only deployment) needs a
   new narrow host call in the plugin SDK. It ships as slice 1b so the core PR is not blocked.
   Until then, pull requests link there by hand, through an agent, or through the CLI.
 - Branch case: kept as the agent default. A lowercase option can come with templates.
 
-Coordination: #22 (API coverage matrix: add rows when it lands), #33-#38 (CLI/API parity:
-slice 1 adds its own CLI file), #40 (migration 0296: slice 1 adds none), #29 and #27
-(status and wait semantics: automation defers while a run or monitor holds the issue).
+Coordination: API coverage, CLI/API parity, and status/wait semantics work may overlap.
+This slice adds its own CLI file, adds no migrations, and preserves execution gates.
 
 ## Appendix: sources (fetched 2026-10-09)
 

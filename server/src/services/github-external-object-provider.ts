@@ -17,6 +17,8 @@ export interface GitHubExternalObjectProviderOptions {
   fetch?: FetchLike;
   tokenProvider?: (companyId: string) => Promise<string | null> | string | null;
   secretNames?: readonly string[];
+  /** Transient matching input; leave off for stored external-object snapshots. */
+  includePullRequestBody?: boolean;
 }
 
 interface GitHubObjectIdentity {
@@ -202,7 +204,7 @@ function notFoundSnapshot(identity: GitHubObjectIdentity, etag: string | null): 
   };
 }
 
-function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null): ExternalObjectResolverSnapshot {
+function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null, includeBody = false): ExternalObjectResolverSnapshot {
   const title = asString(body.title);
   const state = asString(body.state) ?? "unknown";
   const draft = asBoolean(body.draft) ?? false;
@@ -277,6 +279,7 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(headRepository ? { headRepository } : {}),
       ...(defaultBranch ? { defaultBranch } : {}),
       ...(title ? { title } : {}),
+      ...(includeBody ? { body: (asString(body.body) ?? "").slice(0, 24_000) } : {}),
       ...(reviewDecision ? { reviewDecision } : {}),
       ...(additions !== null ? { additions } : {}),
       ...(deletions !== null ? { deletions } : {}),
@@ -458,7 +461,7 @@ export function createGitHubExternalObjectProvider(
         return {
           ok: true,
           snapshot: objectType === "pull_request"
-            ? pullRequestSnapshot(identity, body, etag)
+            ? pullRequestSnapshot(identity, body, etag, opts.includePullRequestBody)
             : issueSnapshot(identity, body, etag),
         };
       },

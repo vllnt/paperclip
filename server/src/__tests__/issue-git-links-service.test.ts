@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -764,6 +765,69 @@ describeEmbeddedPostgres("issueGitLinkService", () => {
 
       await expect(svc.linkPullRequest(issueB, a.id, { repository: "acme/app", number: 7 }, "manual")).rejects.toThrow(/not found/i);
       expect(await db.select().from(issueWorkProducts)).toEqual([]);
+    });
+  });
+
+  describe("review regressions", () => {
+    it.each(["feature;false", "feature$(false)", "feature'quote"])("quotes pinned branch %s in the copied command", async (existingBranch) => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 12, {
+        executionWorkspaceSettings: { workspaceStrategy: { type: "git_worktree", existingBranch } },
+      });
+      const view = await service().getView(issueId, company.id);
+      expect(view.branch.name).toBe(existingBranch);
+      const args = execFileSync("sh", ["-c", `git() { printf '%s\\n' "$@"; }; ${view.branch.command}`], { encoding: "utf8" });
+      expect(args.trimEnd().split("\n")).toEqual(["switch", existingBranch]);
+    });
+
+    it("limits an explicit link to its authorized task, preserving other suppressed links", async () => {
+      const company = await seedCompany();
+      const chosen = await seedIssue(company, 4);
+      const suppressed = await seedIssue(company, 12);
+      const referenced = await seedIssue(company, 13);
+      automationOn = false;
+      const svc = service();
+      await svc.recordPullRequestSignal(company.id, signal(company.prefix));
+      const [product] = await productsFor(suppressed);
+      await svc.unlinkPullRequest(suppressed, company.id, product!.id);
+      const before = await productsFor(suppressed);
+      automationOn = true;
+      const result = await svc.recordPullRequestSignal(company.id, signal(company.prefix, {
+        source: "agent", headRef: `${company.prefix}-13-feature`,
+      }), { manualIssueId: chosen });
+      expect(result.links.map((link) => link.issueId)).toEqual([chosen]);
+      expect(await productsFor(suppressed)).toEqual(before);
+      expect(await productsFor(referenced)).toEqual([]);
+      expect((await issueRow(suppressed)).status).toBe("todo");
+      expect((await issueRow(referenced)).status).toBe("todo");
+    });
+
+    it.each(["title", "body"])("matches the enriched %s before choosing tasks", async (field) => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 12);
+      const svc = issueGitLinkService(db, {
+        statusAutomationEnabled: async () => true,
+        enrich: async () => ({ headRepository: "acme/app", defaultBranch: "main", [field]: `Fixes ${company.prefix}-12` }),
+      });
+      const result = await svc.recordPullRequestSignal(company.id, signal(company.prefix, {
+        headRef: "feature/unrelated", title: undefined, body: undefined, headRepository: undefined, source: "cloud_event",
+      }));
+      expect(result.links.map((link) => link.issueId)).toEqual([issueId]);
+      expect((await issueRow(issueId)).status).toBe("in_review");
+      expect((await productsFor(issueId))[0]!.metadata).not.toHaveProperty("body");
+    });
+
+    it("preserves an unverified branch link when enrichment fails", async () => {
+      const company = await seedCompany();
+      const issueId = await seedIssue(company, 12);
+      const svc = issueGitLinkService(db, {
+        statusAutomationEnabled: async () => true,
+        enrich: async () => { throw new Error("Provider unavailable"); },
+      });
+      const result = await svc.recordPullRequestSignal(company.id, signal(company.prefix, { headRepository: undefined }));
+      expect(result.links.map((link) => link.issueId)).toEqual([issueId]);
+      expect(result.automation[0]).toMatchObject({ deferred: "unverified" });
+      expect((await issueRow(issueId)).status).toBe("todo");
     });
   });
 

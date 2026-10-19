@@ -226,7 +226,7 @@ export function githubConnectionEventService(
 ) {
   const now = options.now ?? (() => new Date());
   const gitLinks = options.gitLinks ?? issueGitLinkService(db, {
-    enrich: pullRequestDetailsEnricher(createPullRequestMergeDetailsResolver(db)),
+    enrich: pullRequestDetailsEnricher(createPullRequestMergeDetailsResolver(db, { includeBody: true })),
   });
   let nextPollAt = 0;
   let emptyPolls = 0;
