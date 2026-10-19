@@ -247,7 +247,7 @@ describe.sequential("write-path membership checks (viewer / inactive)", () => {
       );
 
       expect(res.status).toBe(200);
-      expect(mockGoalService.update).toHaveBeenCalledWith(goalId, { title: "New title" });
+      expect(mockGoalService.update).toHaveBeenCalledWith(goalId, { title: "New title" }, "board");
     });
   });
 });

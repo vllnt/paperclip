@@ -1,4 +1,4 @@
-import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
+import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault, resolveTransientRetryPolicy, type ResolvedTransientRetryPolicy } from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
@@ -71,6 +71,7 @@ import {
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { selectInCommentBatches } from "./comment-id-batches.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
+import { isCanonicalUuidText } from "./uuid-text.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
@@ -9525,6 +9526,24 @@ function truncateDisplayId(value: string | null | undefined, max = 128) {
   return value.length > max ? value.slice(0, max) : value;
 }
 
+const ROUTINE_EXECUTION_SLOT_INDEX = "issues_open_routine_execution_uq";
+
+/** True when taking an issue's execution slot lost to another open copy of the same routine execution. */
+function isRoutineExecutionSlotConflict(error: unknown) {
+  return isUniqueViolation(error, ROUTINE_EXECUTION_SLOT_INDEX);
+}
+
+function logRoutineExecutionSlotConflict(
+  runId: string,
+  issueId: string | null,
+  site: "claimQueuedRun" | "enqueueWakeup" = "claimQueuedRun",
+) {
+  logger.warn(
+    { runId, issueId, index: ROUTINE_EXECUTION_SLOT_INDEX },
+    `${site}: another open copy of this routine execution holds the execution slot; this run cannot take it`,
+  );
+}
+
 function normalizeAgentNameKey(value: string | null | undefined) {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
@@ -13393,7 +13412,10 @@ export function heartbeatService(
     lastError: string | null;
   }) {
     return db.transaction(async (tx) => {
-      const [issue] = await tx.select().from(issues).where(and(issueIdEqualsText(sql`${input.taskKey}`), eq(issues.companyId, input.companyId))).for("update");
+      // A task key that is not an issue id locks nothing, as `id::text = taskKey` matched nothing.
+      const [issue] = isCanonicalUuidText(input.taskKey)
+        ? await tx.select().from(issues).where(and(eq(issues.id, input.taskKey), eq(issues.companyId, input.companyId))).for("update")
+        : [];
       if (isConversation(issue)) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
         if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
@@ -13477,7 +13499,9 @@ export function heartbeatService(
 
     return db.transaction(async (tx) => {
       if (opts?.taskKey && opts.expectedRunId) {
-        const [issue] = await tx.select().from(issues).where(issueIdEqualsText(sql`${opts.taskKey}`)).for("update");
+        const [issue] = isCanonicalUuidText(opts.taskKey)
+          ? await tx.select().from(issues).where(eq(issues.id, opts.taskKey)).for("update")
+          : [];
         if (isConversation(issue)) {
           const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, opts.expectedRunId));
           if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return 0;
@@ -16591,6 +16615,83 @@ export function heartbeatService(
     return true;
   }
 
+  /**
+   * Resolves the transient-retry tunables for a run: company < agent < routine,
+   * with wake-type overrides on top. With nothing configured this returns the
+   * pre-setting behavior (no rate limit, no blocked-issue suppression).
+   */
+  async function resolveTransientRetryPolicyForRun(input: {
+    companyId: string;
+    agent: typeof agents.$inferSelect;
+    issueId: string | null;
+    wakeReason: string | null;
+  }): Promise<ResolvedTransientRetryPolicy> {
+    const company = await db
+      .select({ policy: companies.transientRetryPolicy })
+      .from(companies)
+      .where(eq(companies.id, input.companyId))
+      .then((rows) => rows[0] ?? null);
+    const routinePolicy = input.issueId
+      ? await db
+          .select({ policy: routines.transientRetryPolicy })
+          .from(issues)
+          .innerJoin(
+            routines,
+            and(eq(routines.companyId, issues.companyId), sql`${routines.id}::text = ${issues.originId}`),
+          )
+          .where(
+            and(
+              eq(issues.id, input.issueId),
+              eq(issues.companyId, input.companyId),
+              eq(issues.originKind, "routine_execution"),
+            ),
+          )
+          .then((rows) => rows[0]?.policy ?? null)
+      : null;
+    return resolveTransientRetryPolicy(
+      {
+        company: company?.policy,
+        agent: parseObject(input.agent.runtimeConfig).transientRetryPolicy,
+        routine: routinePolicy,
+      },
+      input.wakeReason,
+    );
+  }
+
+  /**
+   * Defers (never drops) a transient retry so that at most `limit` retries are
+   * scheduled per (issue, agent) in any rolling hour.
+   */
+  async function resolveTransientRetryRateLimitedDueAt(reader: Pick<typeof db, "select">, input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    retryReason: string;
+    limit: number;
+    dueAt: Date;
+  }): Promise<Date> {
+    const { limit } = input;
+    const windowStart = new Date(input.dueAt.getTime() - 60 * 60 * 1000);
+    const slots = await reader
+      .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          eq(heartbeatRuns.scheduledRetryReason, input.retryReason),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+          gt(heartbeatRuns.scheduledRetryAt, windowStart),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.scheduledRetryAt))
+      .limit(limit);
+    const oldestSlot = slots[limit - 1]?.scheduledRetryAt;
+    if (!oldestSlot) return input.dueAt;
+    const nextSlot = new Date(oldestSlot.getTime() + 60 * 60 * 1000);
+    return nextSlot.getTime() > input.dueAt.getTime() ? nextSlot : input.dueAt;
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -16774,7 +16875,7 @@ export function heartbeatService(
     const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
       .filter((value): value is Date => value !== null)
       .reduce<Date | null>((latest, value) => (!latest || value > latest ? value : latest), null);
-    const schedule =
+    const notBeforeSchedule =
       notBefore && notBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
@@ -16782,6 +16883,15 @@ export function heartbeatService(
             delayMs: Math.max(0, notBefore.getTime() - now.getTime()),
           }
         : baseSchedule;
+    const isTransientRetryWake =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      wakeReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    const retryPolicy = isTransientRetryWake
+      ? await resolveTransientRetryPolicyForRun({ companyId: run.companyId, agent, issueId, wakeReason })
+      : null;
+    // The per-issue hourly slot is reserved inside the transaction, after the
+    // issue row lock, so concurrent predecessors cannot claim the same slot.
+    let schedule = notBeforeSchedule;
 
     const requiresIssueGate =
       isTransientSetupFailureCode(run.errorCode) ||
@@ -16936,6 +17046,7 @@ export function heartbeatService(
             | "issue_cancelled"
             | "issue_terminal_status"
             | "issue_not_in_progress"
+            | "issue_blocked"
             | "issue_execution_lock_changed";
           issueId: string | null;
           details: Record<string, unknown>;
@@ -17210,6 +17321,41 @@ export function heartbeatService(
               reason: "Subscription retry suppressed because the task execution lock changed",
               details: { issueId, expectedExecutionRunId: run.id, currentExecutionRunId: lockedIssue?.executionRunId ?? null },
             };
+          }
+        }
+
+        if (issueId && retryPolicy?.suppressWhenBlocked) {
+          const [blockedCheck] = await tx
+            .select({ status: issues.status })
+            .from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+          if (blockedCheck?.status === "blocked") {
+            return {
+              outcome: "not_scheduled",
+              reason: "Transient retry suppressed because the issue is blocked",
+              errorCode: "issue_blocked",
+              issueId,
+              details: { issueId, currentStatus: "blocked" },
+            };
+          }
+        }
+
+        if (issueId && retryPolicy && retryPolicy.perIssuePerHour > 0) {
+          const rateLimitedDueAt = await resolveTransientRetryRateLimitedDueAt(tx, {
+            companyId: run.companyId,
+            agentId: run.agentId,
+            issueId,
+            retryReason,
+            limit: retryPolicy.perIssuePerHour,
+            dueAt: notBeforeSchedule.dueAt,
+          });
+          if (rateLimitedDueAt.getTime() > notBeforeSchedule.dueAt.getTime()) {
+            schedule = {
+              ...notBeforeSchedule,
+              dueAt: rateLimitedDueAt,
+              delayMs: Math.max(0, rateLimitedDueAt.getTime() - now.getTime()),
+            };
+            retryContextSnapshot.scheduledRetryAt = rateLimitedDueAt.toISOString();
           }
         }
 
@@ -19389,6 +19535,7 @@ export function heartbeatService(
         issueId,
         stage: "claim",
       });
+    let routineSlotConflict = false;
     const queuedCommentClaim =
       !nativeReviewContext && issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
@@ -19665,6 +19812,11 @@ export function heartbeatService(
             .catch((error) => {
               if (isExternalChatWaitAuthorizationContention(error))
                 return { kind: "stale" as const, run: null };
+              if (isRoutineExecutionSlotConflict(error)) {
+                routineSlotConflict = true;
+                logRoutineExecutionSlotConflict(run.id, issueId);
+                return { kind: "stale" as const, run: null };
+              }
               throw error;
             })
         : null;
@@ -19720,17 +19872,47 @@ export function heartbeatService(
               agentNameKey: normalizeAgentNameKey(agent.name),
             });
           }
-          return tx.transaction(async (claimTx) => {
-            const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
-            if (issueClaim.blocked) return null;
-            const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
-              eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
-            )).returning().then((rows) => rows[0] ?? null);
-            await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
-            return claimedRun;
-          });
+          try {
+            return await tx.transaction(async (claimTx) => {
+              const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
+              if (issueClaim.blocked) return null;
+              const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
+                eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
+              )).returning().then((rows) => rows[0] ?? null);
+              await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
+              return claimedRun;
+            });
+          } catch (error) {
+            // The claim savepoint is rolled back, so the run is still queued. Taking
+            // the slot lost a race with another open copy of the same routine
+            // execution. The next pass cancels the run if that copy is live, or claims
+            // it once a stale lock is cleared. Never surface the index as an error.
+            if (!isRoutineExecutionSlotConflict(error)) throw error;
+            routineSlotConflict = true;
+            logRoutineExecutionSlotConflict(run.id, issueId);
+            return null;
+          }
         });
-    if (!claimed) return null;
+    if (!claimed) {
+      if (routineSlotConflict) {
+        // Re-decide now that the other copy holds the slot: the staleness check
+        // cancels this run if that copy is live, and leaves it queued if the
+        // holder is a stale lock that the sweep is about to clear.
+        const staleness = await runDispatch.cancelStaleQueuedRun({
+          runId: run.id,
+          companyId: run.companyId,
+          expectedStatus: "queued",
+        });
+        if (staleness.outcome === "cancelled") {
+          applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+          logger.info(
+            { runId: run.id, issueId, errorCode: staleness.errorCode },
+            "claimQueuedRun: cancelled queued run after losing the routine execution slot",
+          );
+        }
+      }
+      return null;
+    }
     if (harnessDispatch.target === "primary") {
       await harnessFallback.notePrimaryDispatched(agent, claimed.id).catch((err) => {
         logger.warn({ err, runId: claimed.id }, "failed to record the return to the primary harness");
@@ -22139,7 +22321,12 @@ export function heartbeatService(
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      // One agent's claim error must not stop the agents after it.
+      try {
+        await startNextQueuedRunForAgent(agentId);
+      } catch (err) {
+        logger.error({ err, agentId }, "failed to resume queued runs for an agent");
+      }
     }
   }
 
@@ -31079,23 +31266,37 @@ export function heartbeatService(
               if (await cancelStaleScheduledRetry(legacyRun)) {
                 activeExecutionRun = null;
               } else {
-                activeExecutionRun = legacyRun;
                 const legacyAgent = await tx
                   .select({ name: agents.name })
                   .from(agents)
                   .where(eq(agents.id, legacyRun.agentId))
                   .then((rows) => rows[0] ?? null);
-                await tx
-                  .update(issues)
-                  .set({
-                    executionRunId: legacyRun.id,
-                    executionAgentNameKey: normalizeAgentNameKey(
-                      legacyAgent?.name,
-                    ),
-                    executionLockedAt: new Date(),
-                    updatedAt: new Date(),
-                  })
-                  .where(eq(issues.id, issue.id));
+                try {
+                  // A savepoint, so a lost race on the routine execution slot rolls back
+                  // this update alone and not the whole wake.
+                  await tx.transaction(async (rebindTx) => {
+                    await rebindTx
+                      .update(issues)
+                      .set({
+                        executionRunId: legacyRun.id,
+                        executionAgentNameKey: normalizeAgentNameKey(
+                          legacyAgent?.name,
+                        ),
+                        executionLockedAt: new Date(),
+                        updatedAt: new Date(),
+                      })
+                      .where(eq(issues.id, issue.id));
+                  });
+                } catch (error) {
+                  // Another open copy of the same routine execution holds the slot, so this
+                  // issue cannot bind it. The legacy run is still live for this issue, so
+                  // the wake still joins it below, without the lock. Queueing a new run
+                  // instead would let it claim the slot once the holder's lock is cleared
+                  // and run next to the legacy run.
+                  if (!isRoutineExecutionSlotConflict(error)) throw error;
+                  logRoutineExecutionSlotConflict(legacyRun.id, issue.id, "enqueueWakeup");
+                }
+                activeExecutionRun = legacyRun;
               }
             }
           }
