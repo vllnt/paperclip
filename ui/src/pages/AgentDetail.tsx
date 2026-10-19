@@ -41,6 +41,7 @@ import { assetsApi } from "../api/assets";
 import { toolsApi } from "../api/tools";
 import { getUIAdapter, buildTranscript, onAdapterChange } from "../adapters";
 import { StatusBadge } from "../components/StatusBadge";
+import { AgentFallbacksSection, AgentHarnessFallbackBadge } from "../components/AgentHarnessFallback";
 import { MarkdownBody } from "../components/MarkdownBody";
 import { CopyText } from "../components/CopyText";
 import { IssueRow } from "../components/IssueRow";
@@ -1255,6 +1256,7 @@ export function AgentDetail() {
               <span>{getAdapterDisplay(agent.adapterType).label}</span><span>·</span>
               <span>{agent.title || roleLabels[agent.role] || agent.role}</span>
             </div>
+            <AgentHarnessFallbackBadge state={agent.harnessFallback} />
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -2112,6 +2114,8 @@ export function ConfigurationTab({
         canConfigureProviderTrace={canConfigureProviderTrace}
       /> : null}
 
+
+      {content === "runtime" && companyId ? <AgentFallbacksSection agent={agent} companyId={companyId} /> : null}
 
       {content === "permissions" ? <TrustPresetSection
         permissions={agent.permissions}
@@ -3689,15 +3693,20 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
             </div>
             {/* Adapter type · provider · model */}
             {(() => {
+              const runAdapterType = run.executedAdapterType ?? adapterType;
               const displayProvider = metrics.provider
-                ?? asNonEmptyString(adapterConfig?.provider);
+                ?? (run.executedAdapterType ? null : asNonEmptyString(adapterConfig?.provider));
               const displayModel = metrics.model
-                ?? asNonEmptyString(adapterConfig?.model);
-              if (!adapterType && !displayProvider && !displayModel) return null;
+                ?? run.executedModel
+                ?? (run.executedAdapterType ? null : asNonEmptyString(adapterConfig?.model));
+              if (!runAdapterType && !displayProvider && !displayModel) return null;
               return (
                 <div className="text-(length:--text-micro) text-muted-foreground font-mono flex items-center gap-1.5 flex-wrap">
-                  {adapterType && (
-                    <span className="bg-muted rounded px-1.5 py-0.5 text-(length:--text-nano) font-medium uppercase tracking-wide">{adapterType.replace(/_/g, " ")}</span>
+                  {runAdapterType && (
+                    <span className="bg-muted rounded px-1.5 py-0.5 text-(length:--text-nano) font-medium uppercase tracking-wide">{runAdapterType.replace(/_/g, " ")}</span>
+                  )}
+                  {run.fallbackReason && (
+                    <span data-testid="run-detail-fallback-reason">fallback · {run.fallbackReason.replace(/_/g, " ")}</span>
                   )}
                   {displayProvider && displayModel && (
                     <span>{displayProvider}/{displayModel}</span>

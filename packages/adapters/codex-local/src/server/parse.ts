@@ -4,6 +4,7 @@ import {
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isProviderQuotaMessage, parseProviderQuotaResetAt } from "@paperclipai/adapter-utils/provider-quota";
 
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
@@ -300,8 +301,8 @@ export function extractCodexRetryNotBefore(input: {
 }, now = new Date()): Date | null {
   const haystack = buildCodexErrorHaystack(input);
   const usageLimitMatch = haystack.match(CODEX_USAGE_LIMIT_RE);
-  if (!usageLimitMatch) return null;
-  return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+  if (usageLimitMatch) return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+  return isProviderQuotaMessage(haystack) ? parseProviderQuotaResetAt(haystack, now) : null;
 }
 
 export function isCodexTransientUpstreamError(input: {
@@ -331,5 +332,9 @@ export function isCodexProviderQuotaError(input: {
 }): boolean {
   const surface = { errorMessage: input.errorMessage };
   const haystack = buildCodexErrorHaystack(surface);
-  return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(surface) != null;
+  return (
+    CODEX_PROVIDER_QUOTA_RE.test(haystack) ||
+    isProviderQuotaMessage(haystack) ||
+    extractCodexRetryNotBefore(surface) != null
+  );
 }

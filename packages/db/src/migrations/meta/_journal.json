@@ -2122,6 +2122,13 @@
       "when": 1792430009693,
       "tag": "0304_third_spitfire",
       "breakpoints": true
+    },
+    {
+      "idx": 305,
+      "version": "7",
+      "when": 1792430335310,
+      "tag": "0305_absurd_power_pack",
+      "breakpoints": true
     }
   ]
 }

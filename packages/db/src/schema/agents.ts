@@ -29,6 +29,8 @@ export const agents = pgTable(
     adapterType: text("adapter_type").notNull().default("process"),
     adapterConfig: jsonb("adapter_config").$type<Record<string, unknown>>().notNull().default({}),
     runtimeConfig: jsonb("runtime_config").$type<Record<string, unknown>>().notNull().default({}),
+    /** Ordered harness/model fallback targets; see doc/plans/2026-10-08-agent-harness-fallback.md. */
+    fallbacks: jsonb("fallbacks").$type<Record<string, unknown>[]>().notNull().default([]),
     defaultEnvironmentId: uuid("default_environment_id").references(() => environments.id, { onDelete: "set null" }),
     budgetMonthlyCents: integer("budget_monthly_cents").notNull().default(0),
     spentMonthlyCents: integer("spent_monthly_cents").notNull().default(0),
