@@ -370,6 +370,7 @@ export * from "./connection-setup-state.js";
 export * from "./google-workspace-connectors.js";
 export * from "./asana-connectors.js";
 export * from "./github-connectors.js";
+export * from "./company-storage.js";
 export * from "./company-archive.js";
 export * from "./goal-text.js";
 export {

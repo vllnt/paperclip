@@ -287,3 +287,21 @@ export function buildActorSecretContext(
     responsibleUserId: req.actor.userId ?? req.actor.onBehalfOfUserId ?? null,
   };
 }
+
+/**
+ * Owner or admin of the company (or the local operator / an instance admin).
+ * Used where a board member could otherwise make Paperclip send a company
+ * secret somewhere: secret definitions and storage destinations.
+ */
+export function hasCompanyAdminAccess(req: Request, companyId: string) {
+  assertBoard(req);
+  assertCompanyAccess(req, companyId);
+  if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return true;
+  const membership = req.actor.memberships?.find((item) => item.companyId === companyId);
+  return membership?.status === "active" && ["owner", "admin"].includes(String(membership.membershipRole));
+}
+
+export function assertCompanyAdmin(req: Request, companyId: string) {
+  if (hasCompanyAdminAccess(req, companyId)) return;
+  throw forbidden("Company admin access required");
+}
