@@ -1,4 +1,4 @@
-import type { AutomationWakeSettings, DuplicateDetectionMode, InteractionResolverGovernance, RoutineNoopSkipSettings } from "@paperclipai/shared";
+import type { AutomationWakeSettings, DuplicateDetectionMode, InteractionResolverGovernance, RoutineNoopSkipSettings, RunContextPolicy } from "@paperclipai/shared";
 import { pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
@@ -34,6 +34,7 @@ export const companies = pgTable(
       .$type<RoutineNoopSkipSettings>()
       .notNull()
       .default({}),
+    runContextPolicy: jsonb("run_context_policy").$type<RunContextPolicy>(),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")
       .notNull()
       .default(false),
