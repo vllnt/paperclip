@@ -1,0 +1,13 @@
+-- Keyset index for the company archive export: (company_id, settle key, id),
+-- where the settle key is coalesce(finished_at, created_at). Without it every
+-- export page sorts all of a company's runs.
+--
+-- Lock: the build holds a SHARE lock on heartbeat_runs for one heap scan at
+-- boot. Reads continue; run inserts and updates (claims, status changes, event
+-- sequence bumps) wait until the build commits. The time is roughly linear in
+-- the heap size (about 3 s of blocked writes per GB of heap measured for a
+-- similar expression index in 0295). Measure before deploying and deploy at
+-- low write traffic:
+--   SELECT count(*) AS rows, pg_size_pretty(pg_relation_size('heartbeat_runs')) AS heap FROM heartbeat_runs
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: The migration runner applies every migration inside BEGIN/COMMIT, so CREATE INDEX CONCURRENTLY cannot run here. The index is additive and only read by the new archive export; the one-time build lock is described above.
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_company_settled_idx" ON "heartbeat_runs" USING btree ("company_id",(coalesce("finished_at", "created_at")),"id");

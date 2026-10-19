@@ -1,13 +1,15 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import type { Goal } from "@paperclipai/shared";
-import { GOAL_STATUSES, GOAL_LEVELS } from "@paperclipai/shared";
+import { GOAL_STATUSES, GOAL_LEVELS, GOAL_KINDS, GOAL_HORIZONS, GOAL_TEXT_MAX_LENGTH } from "@paperclipai/shared";
 import { agentsApi } from "../api/agents";
 import { goalsApi } from "../api/goals";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { StatusBadge } from "./StatusBadge";
+import { InlineEditor } from "./InlineEditor";
+import { GOAL_HORIZON_LABELS, formatTargetDate } from "../lib/goal-dates";
 import { formatDate, cn, agentUrl } from "../lib/utils";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -15,7 +17,8 @@ import { Button } from "@/components/ui/button";
 
 interface GoalPropertiesProps {
   goal: Goal;
-  onUpdate?: (data: Record<string, unknown>) => void;
+  /** May return a promise; a rejection puts the target date field back to the saved value. */
+  onUpdate?: (data: Record<string, unknown>) => void | Promise<unknown>;
 }
 
 function PropertyRow({ label, children }: { label: string; children: React.ReactNode }) {
@@ -31,16 +34,22 @@ function label(s: string): string {
   return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+function horizonLabel(value: string): string {
+  return value === "short" || value === "medium" || value === "long" ? GOAL_HORIZON_LABELS[value] : "No horizon";
+}
+
 function PickerButton({
   current,
   options,
   onChange,
   children,
+  optionLabel = label,
 }: {
   current: string;
   options: readonly string[];
   onChange: (value: string) => void;
   children: React.ReactNode;
+  optionLabel?: (value: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -62,7 +71,7 @@ function PickerButton({
               setOpen(false);
             }}
           >
-            {label(opt)}
+            {optionLabel(opt)}
           </Button>
         ))}
       </PopoverContent>
@@ -70,8 +79,59 @@ function PickerButton({
   );
 }
 
+/**
+ * Saves when the field is left or Enter is pressed. A browser date field changes on every
+ * keystroke (typing a year passes through 0002, 0020, ...), so saving on change would write
+ * wrong dates.
+ */
+function TargetDateInput({
+  value,
+  onCommit,
+}: {
+  value: string | null;
+  onCommit: (value: string | null) => void | Promise<unknown>;
+}) {
+  const [draft, setDraft] = useState(value ?? "");
+  const saved = useRef(value ?? "");
+  useEffect(() => {
+    setDraft(value ?? "");
+    saved.current = value ?? "";
+  }, [value]);
+  const commit = () => {
+    if (draft === saved.current) return;
+    const previous = saved.current;
+    // Browsers allow years longer than four digits; the server stores only YYYY-MM-DD.
+    if (draft && !/^\d{4}-\d{2}-\d{2}$/.test(draft)) {
+      setDraft(previous);
+      return;
+    }
+    saved.current = draft;
+    Promise.resolve(onCommit(draft || null)).catch(() => {
+      saved.current = previous;
+      setDraft(previous);
+    });
+  };
+  return (
+    <input
+      type="date"
+      aria-label="Target date"
+      className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") commit();
+      }}
+    />
+  );
+}
+
 export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
   const { selectedCompanyId } = useCompany();
+  /** The page reports a failed save; a picker has nothing to put back, so it only avoids an unhandled rejection. */
+  const save = (data: Record<string, unknown>): void => {
+    void Promise.resolve(onUpdate?.(data)).catch(() => undefined);
+  };
 
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId!),
@@ -84,6 +144,13 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
     queryFn: () => goalsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+
+  const { data: progressByGoal } = useQuery({
+    queryKey: queryKeys.goals.progress(selectedCompanyId!),
+    queryFn: () => goalsApi.progress(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+  const progress = progressByGoal?.[goal.id];
 
   const ownerAgent = goal.ownerAgentId
     ? agents?.find((a) => a.id === goal.ownerAgentId)
@@ -101,7 +168,7 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
             <PickerButton
               current={goal.status}
               options={GOAL_STATUSES}
-              onChange={(status) => onUpdate({ status })}
+              onChange={(status) => save({ status })}
             >
               <StatusBadge status={goal.status} />
             </PickerButton>
@@ -115,13 +182,67 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
             <PickerButton
               current={goal.level}
               options={GOAL_LEVELS}
-              onChange={(level) => onUpdate({ level })}
+              onChange={(level) => save({ level })}
             >
               <span className="text-sm capitalize">{goal.level}</span>
             </PickerButton>
           ) : (
             <span className="text-sm capitalize">{goal.level}</span>
           )}
+        </PropertyRow>
+
+        <PropertyRow label="Kind">
+          {onUpdate ? (
+            <PickerButton current={goal.kind} options={GOAL_KINDS} onChange={(kind) => save({ kind })}>
+              <span className="text-sm">{label(goal.kind)}</span>
+            </PickerButton>
+          ) : (
+            <span className="text-sm">{label(goal.kind)}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Horizon">
+          {onUpdate ? (
+            <PickerButton
+              current={goal.horizon ?? "none"}
+              options={[...GOAL_HORIZONS, "none"]}
+              optionLabel={horizonLabel}
+              onChange={(horizon) => save({ horizon: horizon === "none" ? null : horizon })}
+            >
+              <span className="text-sm">{horizonLabel(goal.horizon ?? "none")}</span>
+            </PickerButton>
+          ) : (
+            <span className="text-sm">{horizonLabel(goal.horizon ?? "none")}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Target date">
+          {onUpdate ? (
+            <TargetDateInput value={goal.targetDate} onCommit={(targetDate) => onUpdate({ targetDate })} />
+          ) : (
+            <span className="text-sm">{goal.targetDate ? formatTargetDate(goal.targetDate) : "None"}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Target">
+          {onUpdate ? (
+            <InlineEditor
+              value={goal.successCriteria ?? ""}
+              onSave={(successCriteria) => save({ successCriteria: successCriteria.trim() || null })}
+              maxLength={GOAL_TEXT_MAX_LENGTH}
+              className="text-sm"
+              placeholder="How you know it is done"
+              nullable
+            />
+          ) : (
+            <span className="text-sm">{goal.successCriteria ?? "None"}</span>
+          )}
+        </PropertyRow>
+
+        <PropertyRow label="Progress">
+          <span className="text-sm">
+            {progress ? `${progress.done}/${progress.total} done` : "No tasks yet"}
+          </span>
         </PropertyRow>
 
         <PropertyRow label="Owner">

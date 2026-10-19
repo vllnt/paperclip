@@ -215,6 +215,7 @@ export function companyService(db: Db) {
     automationWakeSettings: companies.automationWakeSettings,
     routineNoopSkipSettings: companies.routineNoopSkipSettings,
     runContextPolicy: companies.runContextPolicy,
+    transientRetryPolicy: companies.transientRetryPolicy,
     feedbackDataSharingEnabled: companies.feedbackDataSharingEnabled,
     feedbackDataSharingConsentAt: companies.feedbackDataSharingConsentAt,
     feedbackDataSharingConsentByUserId: companies.feedbackDataSharingConsentByUserId,

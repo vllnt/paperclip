@@ -1,3 +1,4 @@
+import { orderByFocus, readFocusIndex } from "../services/goal-focus.js";
 import { validateAiGatewayKey } from "../services/ai-gateway.js";
 import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { connectionIntentService } from "../services/connection-intents.js";
@@ -107,6 +108,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, tooManyRequests, 
 import { ISSUE_ASSIGNMENT_IDEMPOTENCY_PREFIX } from "../services/issue-assignment-wakeup.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { createRunReadRedaction } from "../services/run-read-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -788,6 +790,10 @@ export function agentRoutes(
   const companySkills = companySkillService(db);
   const workspaceOperations = workspaceOperationService(db);
   const instanceSettings = instanceSettingsService(db);
+  const runReadRedaction = createRunReadRedaction(db, {
+    registry: runRedactions,
+    currentUserOptions: getCurrentUserRedactionOptions,
+  });
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
   // The company-scoped adapter login-session service. It runs the device-login
@@ -4655,7 +4661,7 @@ export function agentRoutes(
     ]);
 
     res.json(
-      eligibleRows.map((issue) => ({
+      orderByFocus(eligibleRows.map((issue) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
@@ -4670,7 +4676,7 @@ export function agentRoutes(
         dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
         unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
         unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
-      })),
+      })), await readFocusIndex(db, req.actor.companyId)),
     );
   });
 
@@ -7691,13 +7697,9 @@ export function agentRoutes(
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
     const retryExhaustedReason = await heartbeat.getRetryExhaustedReason(runId);
     const decoratedRun = heartbeat.decorateActiveRunStatus(run);
-    res.json(await runRedactions.redactForRun(
-      run.companyId,
-      run.id,
-      redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
-        await getCurrentUserRedactionOptions(),
-      ),
+    const redactor = await runReadRedaction.forRun(run.companyId, run.id);
+    res.json(redactor.run(
+      { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
     ));
   });
 
@@ -8167,14 +8169,8 @@ export function agentRoutes(
     const afterSeq = Number(req.query.afterSeq ?? 0);
     const limit = Number(req.query.limit ?? 200);
     const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
-    const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
-    const redactedEvents = events.map((event) =>
-      redactCurrentUserValue({
-        ...event,
-        payload: redactEventPayload(event.payload),
-      }, currentUserRedactionOptions),
-    );
-    res.json(await runRedactions.redactForRun(run.companyId, run.id, redactedEvents));
+    const redactor = await runReadRedaction.forRun(run.companyId, run.id);
+    res.json(events.map((event) => redactor.event(event)));
   });
 
   router.get("/heartbeat-runs/:runId/log", async (req, res) => {
@@ -8191,7 +8187,8 @@ export function agentRoutes(
     });
 
     res.set("Cache-Control", "no-cache, no-store");
-    res.json(await runRedactions.redactForRun(run.companyId, run.id, result));
+    const redactor = await runReadRedaction.forRun(run.companyId, run.id);
+    res.json(redactor.logContent(result));
   });
 
   router.get("/heartbeat-runs/:runId/workspace-operations", async (req, res) => {
