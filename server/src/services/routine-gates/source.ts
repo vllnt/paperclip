@@ -63,7 +63,7 @@ function providerStatus(error: unknown): number | null {
  */
 export function createGateScriptSource(deps: GateScriptSourceDeps) {
   const fetchImpl = deps.fetchImpl ?? fetch;
-  // The content of a commit never changes, so a verified (repo, sha, path) is cached for the process.
+  // Cache verified content per company so another company cannot reuse repository authorization.
   const cache = new Map<string, GateScript>();
 
   async function github<T>(token: string, path: string): Promise<T> {
@@ -89,7 +89,7 @@ export function createGateScriptSource(deps: GateScriptSourceDeps) {
     if (!(await deps.allowedRepos()).includes(repoKey)) {
       throw refused("gate_repo_not_allowed", `Repository ${gate.repo} is not on the gate repository allowlist`);
     }
-    const cacheKey = `${repoKey}@${gate.commitSha}:${gate.path}`;
+    const cacheKey = `${companyId}:${repoKey}@${gate.commitSha}:${gate.path}`;
     const cached = cache.get(cacheKey);
     if (cached) return cached;
 

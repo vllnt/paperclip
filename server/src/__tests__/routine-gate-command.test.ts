@@ -260,8 +260,9 @@ describe("gateScriptSha", () => {
 
 describe("sampleGateText", () => {
   it("redacts secrets before sampling", () => {
-    const sample = sampleGateText("token ghp_abcdefghijklmnopqrstuvwxyz0123456789 end", 4096);
-    expect(sample).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+    const syntheticToken = ["ghp", "abcdefghijklmnopqrstuvwxyz0123456789"].join("_");
+    const sample = sampleGateText(`token ${syntheticToken} end`, 4096);
+    expect(sample).not.toContain(syntheticToken);
   });
 
   it("keeps the start of stdout and the end of stderr", () => {

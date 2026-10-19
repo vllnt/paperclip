@@ -163,6 +163,21 @@ describe("createGateScriptSource", () => {
     expect(await failure(transient.svc.load("c", gate))).toMatchObject({ kind: "unavailable" });
   });
 
+  it("does not reuse another company's repository authorization through the cache", async () => {
+    const { svc, mintToken } = source({}, {
+      mintToken: async (companyId) => {
+        if (companyId !== "company-1") throw new Error("Company has no repository access");
+        return "test-token";
+      },
+    });
+    await svc.load("company-1", gate);
+    expect(await failure(svc.load("company-2", gate))).toMatchObject({
+      kind: "refused",
+      code: "gate_github_not_connected",
+    });
+    expect(mintToken).toHaveBeenCalledWith("company-2", gate.repo);
+  });
+
   it("caches a verified (repo, sha, path) but still checks the allowlist on every load", async () => {
     let allowed = ["vllnt/paperclip-gates"];
     const github = fakeFetch();
