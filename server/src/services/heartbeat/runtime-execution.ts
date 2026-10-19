@@ -840,7 +840,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               },
               onProviderStopped: async () => {
                 input.effects.onRemoteProviderStopped(true);
-                await collectStoppedInstructions();
+                await collectStoppedInstructions?.();
               },
               onDispatch: markDispatchStarted,
               signal: executionControl.controller.signal,

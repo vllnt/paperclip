@@ -1453,6 +1453,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
           assigneeAgentId: issues.assigneeAgentId,
           executionState: issues.executionState,
           projectId: issues.projectId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
         })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))

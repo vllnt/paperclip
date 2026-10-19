@@ -4812,7 +4812,7 @@ export function recoveryService(
         if (repairRun && await escalateExhaustedIssueReviewPathRecovery(db, { run: repairRun, issueId: issue.id })) {
           result.escalated += 1;
           result.issueIds.push(issue.id);
-          continue;
+          return;
         }
       }
       // A native chat can finish between the earlier settlement read and this
@@ -4847,7 +4847,7 @@ export function recoveryService(
       const agent = await getAgent(agentId);
       if (agent?.companyId === issue.companyId && isAgentAwaitingSetup(agent)) {
         result.skipped += 1;
-        continue;
+        return;
       }
       const agentInvokable =
         agent && agent.companyId === issue.companyId
@@ -4872,7 +4872,7 @@ export function recoveryService(
         (latestRun.errorCode === "agent_paused" || isOperatorCancelledRun(latestRun, agentId))
       ) {
         result.skipped += 1;
-        continue;
+        return;
       }
       if (issue.status !== "in_review" && !agentInvokable) {
         const classification = classifyContinuationFailure(latestRun);
