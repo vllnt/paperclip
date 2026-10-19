@@ -1,0 +1,3 @@
+export function registerRunCommands(command: Command): void {
+  command.command("list").action(async () => { await ctx.api.get(apiPath`/api/companies/${id}/heartbeat-runs`); });
+}

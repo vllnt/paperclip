@@ -1,5 +1,5 @@
 import { lookup as dnsLookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { BlockList, isIP } from "node:net";
 
 const DEFAULT_DNS_TIMEOUT_MS = 5_000;
 
@@ -144,6 +144,15 @@ export function isPrivateOrReservedIp(address: string): boolean {
   return true;
 }
 
+function ipv6Ranges(ranges: ReadonlyArray<readonly [network: string, prefix: number]>): BlockList {
+  const list = new BlockList();
+  for (const [network, prefix] of ranges) list.addSubnet(network, prefix, "ipv6");
+  return list;
+}
+
+/** Link-local, also as a deprecated IPv4-compatible address (`::169.254.x.x`). */
+const IPV6_LINK_LOCAL = ipv6Ranges([["fe80::", 10], ["::a9fe:0", 112]]);
+
 /** Link-local egress is denied in every deployment mode. */
 export function isAlwaysDeniedLinkLocalIp(address: string): boolean {
   const normalized = normalizeIpAddress(address);
@@ -151,7 +160,7 @@ export function isAlwaysDeniedLinkLocalIp(address: string): boolean {
     const octets = parseIpv4Address(normalized);
     return octets !== null && octets[0] === 169 && octets[1] === 254;
   }
-  return isIP(normalized) === 6 && /^fe[89ab]/.test(normalized);
+  return isIP(normalized) === 6 && IPV6_LINK_LOCAL.check(normalized, "ipv6");
 }
 
 function isPrivateOrReservedIpv4(address: string): boolean {
@@ -195,17 +204,28 @@ function parseMappedIpv4Hex(address: string): string | null {
   return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
 }
 
+/**
+ * Only global unicast (2000::/3) is public. Everything outside it is private
+ * or reserved: ::/96 (unspecified, loopback, deprecated IPv4-compatible),
+ * fc00::/7, fe80::/10, fec0::/10, ff00::/8, 100::/64, 64:ff9b::/96 and the
+ * unassigned space. IPv4-mapped addresses are checked as IPv4 before this.
+ */
+const IPV6_GLOBAL_UNICAST = ipv6Ranges([["2000::", 3]]);
+
+/** Special-purpose blocks inside global unicast that are not public destinations. */
+const IPV6_RESERVED_GLOBAL = ipv6Ranges([
+  ["2001::", 23], // IETF protocol assignments: Teredo, benchmarking, ORCHIDv2 and others
+  ["2001:db8::", 32], // documentation
+  ["2002::", 16], // 6to4
+  ["3fff::", 20], // documentation
+]);
+
+/**
+ * Compares numerically, so expanded, zero-padded and embedded-IPv4 spellings
+ * meet the same rule as the canonical form. A zone id does not change the
+ * address; anything that does not parse is not public.
+ */
 function isPrivateOrReservedIpv6(address: string): boolean {
-  if (address === "::" || address === "::1") return true;
-  if (address.startsWith("fc") || address.startsWith("fd")) return true;
-  if (/^fe[89ab]/.test(address)) return true;
-  if (address.startsWith("ff")) return true;
-  if (address === "100::" || address.startsWith("100:")) return true;
-  if (/^2001:(?:0{0,4}:|:)/.test(address)) return true;
-  if (address.startsWith("2001:db8:") || address === "2001:db8::") return true;
-  if (address.startsWith("2001:2:") || address === "2001:2::") return true;
-  if (/^2001:0?2[0-9a-f]:/.test(address)) return true;
-  if (address.startsWith("2002:")) return true;
-  if (address.startsWith("64:ff9b:")) return true;
-  return false;
+  const bare = address.split("%")[0] ?? "";
+  return !IPV6_GLOBAL_UNICAST.check(bare, "ipv6") || IPV6_RESERVED_GLOBAL.check(bare, "ipv6");
 }
