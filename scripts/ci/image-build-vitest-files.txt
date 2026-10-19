@@ -10,6 +10,7 @@ packages/adapter-utils/src/log-value-redaction.test.ts
 packages/adapter-utils/src/paperclip-temp.test.ts
 packages/adapter-utils/src/redact-env-for-logs.test.ts
 packages/adapter-utils/src/remote-process-identity.test.ts
+packages/adapter-utils/src/remote-process-tree-stop.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-abort.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-idle-poll.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-lifecycle.test.ts
