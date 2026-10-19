@@ -228,6 +228,7 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
   cancelIssueThreadInteractionSchema,
   // Secret provider configs and remote import
@@ -311,7 +312,11 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  observabilityFailuresQuerySchema,
+  observabilityFailuresResponseSchema,
   observabilityHealthSchema,
+  observabilityUsageQuerySchema,
+  observabilityUsageResponseSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -5408,6 +5413,34 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/usage",
+  tags: ["observability"],
+  summary: "Tokens, cost and duration of runs, grouped by one dimension",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityUsageQuerySchema },
+  responses: {
+    200: r.ok(observabilityUsageResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/failures",
+  tags: ["observability"],
+  summary: "Failed runs by cause or other dimension, with the count of all runs for a rate",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityFailuresQuerySchema },
+  responses: {
+    200: r.ok(observabilityFailuresResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/finance-events",
   tags: ["costs"],
@@ -10313,6 +10346,15 @@ registerCurrentRoute({
   path: "/api/issues/{id}/recovery-actions",
   tags: ["issues"],
   summary: "List issue recovery actions",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/execution/reconcile",
+  tags: ["issues"],
+  summary: "Reconcile stopped issue executions and queue a continuation",
+  body: reconcileIssueExecutionSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registerCurrentRoute({
