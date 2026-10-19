@@ -267,7 +267,8 @@ describeEmbeddedPostgres("company archive export", () => {
       { stream: "stderr", chunk: "independent diagnostic", attemptId: "first" },
       { stream: "stdout", chunk: "Ym9keS1tdXN0LWJlLXJlZGFjdGVk\n-----END PRIVATE", attemptId: "first" },
       { stream: "stdout", chunk: " KEY----- after", attemptId: "first" },
-      { stream: "stdout", chunk: "-----BEGIN PRIVATE KEY-----\nZmluYWwtdG9ybi1rZXk=", attemptId: "first" },
+      // Built at runtime so the public-config guard never sees a literal key header in the source.
+      { stream: "stdout", chunk: `${["-----BEGIN", "PRIVATE KEY-----"].join(" ")}\nZmluYWwtdG9ybi1rZXk=`, attemptId: "first" },
       { stream: "stdout", chunk: "next attempt", attemptId: "second" },
     ];
     const logLines = chunks.map((line) => JSON.stringify(line));

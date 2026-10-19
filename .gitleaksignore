@@ -1,0 +1,4 @@
+# Published fixtures: fake base64 bodies in redaction tests (the decoded text is a plain word, not a key).
+# The history cannot be rewritten, so the published commit is listed here.
+af8ec238f327fabcccfaf9db3e10e8d8e4562b68:server/src/__tests__/run-read-redaction-text.test.ts:generic-api-key:37
+af8ec238f327fabcccfaf9db3e10e8d8e4562b68:server/src/__tests__/run-read-redaction-text.test.ts:private-key:32
