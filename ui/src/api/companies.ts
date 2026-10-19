@@ -108,6 +108,7 @@ export const companiesApi = {
         | "budgetMonthlyCents"
         | "requireBoardApprovalForNewAgents"
         | "interactionResolverGovernance"
+        | "automationWakeSettings"
         | "runContextPolicy"
         | "feedbackDataSharingEnabled"
         | "logoAssetId"

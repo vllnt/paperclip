@@ -1,5 +1,7 @@
 import { runContextPolicySchema } from "../run-context.js";
 import { z } from "zod";
+import { automationWakeSettingsSchema } from "../automation-wake.js";
+import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import {
   ISSUE_PRIORITIES,
   ROUTINE_ACTIVITY_GATE_POLICIES,
@@ -79,6 +81,8 @@ export const createRoutineSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  automationWakeSettings: automationWakeSettingsSchema.optional(),
+  routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
   runContextPolicy: runContextPolicySchema.optional().nullable(),
 });
 
@@ -86,6 +90,8 @@ export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 
 export const updateRoutineSchema = objectWithoutDefaults(createRoutineSchema).partial().extend({
   baseRevisionId: z.string().guid().optional().nullable(),
+  /** The wake settings the edit started from; a differing stored value rejects the save as a conflict. */
+  baseAutomationWakeSettings: automationWakeSettingsSchema.optional(),
 });
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 

@@ -256,6 +256,7 @@ function makeContext(
     activityGateScope: "company",
     variables: routineDetail.variables,
     env: routineDetail.env ?? null,
+    automationWakeSettings: {},
     runContextPolicy: null,
   };
   const editDraft: RoutineEditDraft = dirty
@@ -269,6 +270,7 @@ function makeContext(
     companyId: COMPANY_ID,
     editDraft,
     setEditDraft: () => {},
+    discardEdits: () => {},
     routineDefaults: defaults,
     dirtyFields,
     isEditDirty: dirty,

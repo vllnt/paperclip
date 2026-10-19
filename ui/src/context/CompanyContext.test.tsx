@@ -57,6 +57,8 @@ function makeCompany(id: string): Company {
     defaultResponsibleUserId: null,
     requireBoardApprovalForNewAgents: false,
     interactionResolverGovernance: {},
+    automationWakeSettings: {},
+    routineNoopSkipSettings: {},
     duplicateDetectionMode: "off",
     runContextPolicy: null,
     feedbackDataSharingEnabled: false,

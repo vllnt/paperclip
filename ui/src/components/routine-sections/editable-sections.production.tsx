@@ -1,4 +1,8 @@
 import { AgentAvatar } from "@/components/AgentAvatar";
+import {
+  AUTOMATION_WAKE_SETTINGS_HELP,
+  AutomationWakeSettingsFields,
+} from "../AutomationWakeSettingsFields";
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
@@ -728,6 +732,19 @@ export function DeliverySection() {
             setEditDraft((current) => ({ ...current, catchUpPolicy }))
           }
           options={catchUpPolicyOptions}
+        />
+      </div>
+      <div className="space-y-3">
+        <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
+          Automation wakes
+        </p>
+        <p className="text-xs text-muted-foreground">{AUTOMATION_WAKE_SETTINGS_HELP}</p>
+        <AutomationWakeSettingsFields
+          idPrefix="routine"
+          value={editDraft.automationWakeSettings}
+          onChange={(automationWakeSettings) =>
+            setEditDraft((current) => ({ ...current, automationWakeSettings }))
+          }
         />
       </div>
       <div className="space-y-3">

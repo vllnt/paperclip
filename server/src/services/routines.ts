@@ -1,5 +1,12 @@
 import { verifyAppWebhook } from "./app-webhook.js";
 import crypto from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import {
+  lastRunLeftNothingChanged,
+  loadRoutineNoopSkipLayers,
+  resolveRoutineNoopSkip,
+  ROUTINE_RUN_UNCHANGED_SKIP_REASON,
+} from "./routine-noop-skip.js";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -306,6 +313,7 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "coalesced") return "Coalesced into an existing live execution issue";
   if (status === "skipped_paused") return "Skipped because the project is paused";
   if (status === "skipped") return "Skipped because a live execution issue already exists";
+  if (status === "skipped_unchanged") return "Skipped because nothing changed since the last run";
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
   return status;
@@ -1284,7 +1292,11 @@ export function routineService(
     return { eligible: true };
   }
 
-  async function evaluateActivityGate(routine: typeof routines.$inferSelect, now: Date) {
+  async function evaluateActivityGate(
+    routine: typeof routines.$inferSelect,
+    now: Date,
+    options: { ignoreOwnDispatchAudits?: boolean } = {},
+  ) {
     const lastDispatchedRun = await db
       .select({ triggeredAt: routineRuns.triggeredAt })
       .from(routineRuns)
@@ -1369,6 +1381,12 @@ export function routineService(
               or (${activityLog.entityType} = 'routine' and ${activityLog.entityId} = ${routine.id})
             )
           )`,
+          options.ignoreOwnDispatchAudits
+            ? sql`not (
+              ${activityLog.action} = 'routine.run_triggered'
+              and (${activityLog.details} ->> 'routineId') = ${routine.id}
+            )`
+            : undefined,
           sql`not exists (
             select 1
             from ${heartbeatRuns} own_run
@@ -1710,6 +1728,30 @@ export function routineService(
       );
   }
 
+  // Opt-in: an automatic run is skipped when it would repeat the last run. The digest is
+  // the dispatch fingerprint; "unchanged" also needs the last issue to have closed
+  // without changes and the company (or project) to have been quiet since that run.
+  async function shouldSkipUnchangedRun(
+    routine: typeof routines.$inferSelect,
+    source: string,
+    assigneeAgentId: string,
+    dispatchFingerprint: string,
+  ) {
+    if (source === "manual") return false;
+    // A route-less project scope cannot be decided by the activity gate, so never skip.
+    if (routine.activityGateScope === "project" && !routine.projectId) return false;
+    const layers = await loadRoutineNoopSkipLayers(db, { companyId: routine.companyId, assigneeAgentId });
+    if (!resolveRoutineNoopSkip({ source, ...layers, routine: routine.routineNoopSkipSettings })) return false;
+    const unchanged = await lastRunLeftNothingChanged(db, {
+      companyId: routine.companyId,
+      routineId: routine.id,
+      assigneeAgentId,
+      dispatchFingerprint,
+    });
+    if (!unchanged) return false;
+    return !(await evaluateActivityGate(routine, new Date(), { ignoreOwnDispatchAudits: true })).fire;
+  }
+
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect | null;
@@ -1786,6 +1828,13 @@ export function routineService(
       title,
       description,
     });
+    // Decided before the transaction so its reads do not take a second pool connection
+    // while the routine lock is held; a failed check means "run".
+    const skipUnchanged = await shouldSkipUnchangedRun(input.routine, input.source, assigneeAgentId, dispatchFingerprint)
+      .catch((err) => {
+        logger.warn({ err, routineId: input.routine.id }, "unchanged-run check failed; dispatching");
+        return false;
+      });
     let reusedExistingRun = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -1899,6 +1948,22 @@ export function routineService(
             triggeredAt,
             status,
             issueId: activeIssue.id,
+            nextRunAt,
+          }, txDb);
+          return updated ?? createdRun;
+        }
+
+        if (skipUnchanged) {
+          const updated = await finalizeRun(createdRun.id, {
+            status: "skipped",
+            failureReason: ROUTINE_RUN_UNCHANGED_SKIP_REASON,
+            completedAt: triggeredAt,
+          }, txDb);
+          await updateRoutineTouchedState({
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            triggeredAt,
+            status: "skipped_unchanged",
             nextRunAt,
           }, txDb);
           return updated ?? createdRun;
@@ -2241,6 +2306,8 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            automationWakeSettings: input.automationWakeSettings ?? {},
+            routineNoopSkipSettings: input.routineNoopSkipSettings ?? {},
             runContextPolicy: input.runContextPolicy ?? null,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
@@ -2339,6 +2406,38 @@ export function routineService(
           throw conflict("Routine was updated by someone else", {
             currentRevisionId: locked.latestRevisionId,
           });
+        }
+
+        // Automation-wake settings are operational tuning, not routine content: they
+        // apply immediately and are not versioned in routine revisions.
+        if (
+          patch.automationWakeSettings !== undefined &&
+          !isDeepStrictEqual(patch.automationWakeSettings, locked.automationWakeSettings)
+        ) {
+          if (
+            patch.baseAutomationWakeSettings !== undefined &&
+            !isDeepStrictEqual(patch.baseAutomationWakeSettings, locked.automationWakeSettings)
+          ) {
+            throw conflict("Routine automation wake settings were updated by someone else", {
+              currentAutomationWakeSettings: locked.automationWakeSettings,
+            });
+          }
+          await txDb
+            .update(routines)
+            .set({ automationWakeSettings: patch.automationWakeSettings })
+            .where(eq(routines.id, id));
+          locked.automationWakeSettings = patch.automationWakeSettings;
+        }
+
+        if (
+          patch.routineNoopSkipSettings !== undefined &&
+          !isDeepStrictEqual(patch.routineNoopSkipSettings, locked.routineNoopSkipSettings)
+        ) {
+          await txDb
+            .update(routines)
+            .set({ routineNoopSkipSettings: patch.routineNoopSkipSettings })
+            .where(eq(routines.id, id));
+          locked.routineNoopSkipSettings = patch.routineNoopSkipSettings;
         }
 
         const candidate: RoutineRow = {

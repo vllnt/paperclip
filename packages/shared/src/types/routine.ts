@@ -1,3 +1,5 @@
+import type { AutomationWakeSettings } from "../automation-wake.js";
+import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
 import type { RunContextPolicy } from "../run-context.js";
 import type {
   IssueOriginKind,
@@ -90,6 +92,8 @@ export interface Routine {
   originId?: string | null;
   variables: RoutineVariable[];
   env?: RoutineEnvConfig | null;
+  automationWakeSettings?: AutomationWakeSettings;
+  routineNoopSkipSettings?: RoutineNoopSkipSettings;
   runContextPolicy?: RunContextPolicy | null;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
