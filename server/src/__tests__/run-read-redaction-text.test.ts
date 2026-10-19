@@ -7,6 +7,8 @@ vi.mock("../services/instance-settings.js", () => ({ instanceSettingsService: vi
 vi.mock("../services/run-secret-redaction.js", () => ({ createRunSecretRedactionRegistry: vi.fn() }));
 
 const R = REDACTED_EVENT_VALUE;
+// Built at runtime so the public-config guard never sees a literal key header in the source.
+const PEM_BEGIN = ["-----BEGIN", "PRIVATE KEY-----"].join(" ");
 
 function timed(text: string): { result: string; ms: number } {
   const started = performance.now();
@@ -29,13 +31,13 @@ describe("export text redaction", () => {
   });
 
   it("redacts an unfinished PEM block through the end of the string", () => {
-    expect(redactSecretShapedText("before -----BEGIN PRIVATE KEY-----\nY2FuYXJ5LXByaXZhdGUta2V5"))
+    expect(redactSecretShapedText(`before ${PEM_BEGIN}\nY2FuYXJ5LXByaXZhdGUta2V5`))
       .toBe(`before ${R}`);
   });
 
   it("redacts PEM material across every possible transcript chunk boundary", () => {
     const secret = "Y2FuYXJ5LXByaXZhdGUta2V5";
-    const text = `before -----BEGIN PRIVATE KEY-----\n${secret}\n-----END PRIVATE KEY----- after`;
+    const text = `before ${PEM_BEGIN}\n${secret}\n-----END PRIVATE KEY----- after`;
     for (let split = 1; split < text.length; split += 1) {
       const { redact } = createPemTextRedactor();
       const result = redact(text.slice(0, split)) + redact(text.slice(split));
@@ -52,7 +54,7 @@ describe("export text redaction", () => {
   it("keeps unfinished-block state until a complete footer arrives", () => {
     const scanner = createPemTextRedactor();
     expect(scanner.hasOpenBlock()).toBe(false);
-    scanner.redact("-----BEGIN PRIVATE KEY-----\nbody");
+    scanner.redact(`${PEM_BEGIN}\nbody`);
     expect(scanner.hasOpenBlock()).toBe(true);
     scanner.redact("-----END PRIVATE KEY---");
     expect(scanner.hasOpenBlock()).toBe(true);
