@@ -3,6 +3,7 @@ import {
   DEFAULT_QUOTA_BACKOFF_MAX_MINUTES,
   MAX_COOLDOWN_MS,
   buildHarnessTargetAgentView,
+  checkRunHarnessCompatibility,
   classifyQuotaFailure,
   isLlmHarnessAdapterType,
   listHarnessTargets,
@@ -279,5 +280,16 @@ describe("buildHarnessTargetAgentView", () => {
     const view = buildHarnessTargetAgentView(agent, grok);
     expect(view.adapterConfig).not.toHaveProperty("engine");
     expect(view.adapterConfig).toMatchObject({ model: "grok-4.7", env: {} });
+  });
+});
+
+describe("checkRunHarnessCompatibility", () => {
+  it("checks a Paperclip Runner agent against the harness its provider runs", () => {
+    const check = (config: Record<string, unknown>) =>
+      checkRunHarnessCompatibility({ adapterType: "paperclip_runner", config, fallback: false });
+    expect(check({ provider: "codex", model: "claude-opus-5-5" })).toMatchObject({ ok: false, code: "harness_model_incompatible" });
+    expect(check({ model: "claude-opus-5-5" })).toMatchObject({ ok: false, code: "harness_model_incompatible" });
+    expect(check({ provider: "codex", model: "gpt-5.6-sol" })).toEqual({ ok: true });
+    expect(check({ provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5" })).toEqual({ ok: true });
   });
 });
