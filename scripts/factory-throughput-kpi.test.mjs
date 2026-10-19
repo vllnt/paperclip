@@ -769,3 +769,102 @@ test("agent counts never trigger the gate", async () => {
   assert.equal(r.code, EXIT_OK);
   assert.equal(r.out, "");
 });
+
+// --- merges that did not land --------------------------------------------------------------------
+
+const GUARDLESS = ["--repos", "o/a", "--now", NOW, "--no-guard", "--no-support"];
+
+// 5 merges into main and 4 into other branches inside the last 24 h; only the 5 are the KPI.
+function mixedRepo(hostileBase = "feat/convex-integration") {
+  return {
+    "o/a": {
+      merged: [
+        ...[1, 2, 3, 4, 5].map((n) => mergedNode(n, END - n * HOUR, { head: n === 5 ? "feat/ci" : `feat/${n}` })),
+        ...[6, 7, 8].map((n) => mergedNode(n, END - n * HOUR, { base: hostileBase, head: `feat/${n}` })),
+        mergedNode(9, END - 9 * HOUR, { base: "feat/ci", head: "feat/ci-a" }),
+      ],
+      carriers: { [hostileBase]: [{ number: 42, state: "OPEN", baseRefName: "main", headRefOid: "t", isCrossRepository: false }] },
+    },
+  };
+}
+
+test("the headline counts only merges into the default branch; the others are shown next to it", async () => {
+  const r = await run(GUARDLESS, fakeGh(mixedRepo()));
+  assert.match(r.out, /merges\s+1h 0\s+\(0\.0\/h\)\s+6h 5\s+\(0\.8\/h\)\s+24h 5\s+\(0\.2\/h\)/);
+  assert.match(r.out, /raw merged 24h\s+9 = landed on the default branch 5 \(the KPI\) \+ merged into other branches 4 \(not counted\)/);
+  assert.match(r.out, /not landed 24h\s+4: carried by another PR 3 \(commit-verified 0\), no PR carries the branch 1, unknown 0/);
+  assert.match(r.out, /o\/a\s+merged into: feat\/convex-integration 3, feat\/ci 1/);
+  assert.match(r.out, /o\/a\s+landed with stacked PRs: #5 \+1/);
+});
+
+test("--json carries the landing section and the per-repo list stays out", async () => {
+  const json = JSON.parse((await run([...GUARDLESS, "--json"], fakeGh(mixedRepo()))).out);
+  assert.equal(json.throughput.rates[2].merged, 5);
+  assert.equal(json.landing.raw24h, 9);
+  assert.equal(json.landing.repos[0].byBase[0].base, "feat/convex-integration");
+  assert.equal(json.landing.repos[0].items, undefined);
+});
+
+test("--no-landing prints no landing lines and asks for no carriers", async () => {
+  const gh = fakeGh(mixedRepo());
+  const r = await run([...GUARDLESS, "--no-landing"], gh);
+  assert.doesNotMatch(r.out, /raw merged|not landed/);
+  assert.ok(!gh.calls.some((c) => c.variables?.h0 !== undefined));
+  assert.equal(JSON.parse((await run([...GUARDLESS, "--no-landing", "--json"], fakeGh(mixedRepo()))).out).landing, null);
+});
+
+test("a gate run asks for no carriers, and a different landing section never wakes the gate", async () => {
+  const file = await stateFile();
+  const base = ["--repos", "o/a", "--no-guard", "--no-support", "--gate", "--state-file", file];
+  await run([...base, "--now", NOW], fakeGh(mixedRepo()));
+  const different = mixedRepo();
+  different["o/a"].merged.push(...[20, 21, 22].map((n) => mergedNode(n, END + n * 1000, { base: "tmp/other", head: `feat/${n}` })));
+  const gh = fakeGh(different);
+  const r = await run([...base, "--now", minutesLater(30)], gh);
+  assert.equal(r.code, EXIT_OK);
+  assert.equal(r.out, "");
+  assert.ok(!gh.calls.some((c) => c.variables?.h0 !== undefined));
+});
+
+test("branch names from outside cannot add lines or smuggle control characters into the report", async () => {
+  const r = await run(GUARDLESS, fakeGh(mixedRepo("evil\nERROR      o/a: injected\u001b[31m")));
+  assert.doesNotMatch(r.out, /^ERROR\s+o\/a: injected/m);
+  assert.doesNotMatch(r.out, /\u001b/);
+  assert.match(r.out, /merged into: evil ERROR\s+o\/a: injected/);
+});
+
+test("an unreadable carrier lookup is shown in the landing section and changes neither the verdict nor the exit code", async () => {
+  const gh = fakeGh(mixedRepo());
+  const real = gh.graphql.bind(gh);
+  gh.graphql = async (query, vars) => {
+    if (vars.h0 !== undefined) throw new GhError("ratelimit", "API rate limit exceeded", 403);
+    return real(query, vars);
+  };
+  const r = await run(GUARDLESS, gh);
+  assert.equal(r.code, EXIT_OK);
+  assert.match(r.out, /o\/a\s+carrier lookup unavailable \(ratelimit: API rate limit exceeded\)/);
+  assert.match(r.out, /unknown 4/);
+  assert.doesNotMatch(r.out, /^ERROR/m);
+  assert.match(r.out, /24h 5\s/);
+});
+
+test("a cut-short merge list marks the landing numbers as lower bounds", async () => {
+  const snapshot = await collectSnapshot(parseOptions(GUARDLESS, {}), fakeGh(mixedRepo()));
+  assert.doesNotMatch(renderReport(snapshot), /lower bound/);
+  snapshot.landing.repos[0].complete = false;
+  assert.match(renderReport(snapshot), /o\/a\s+merged into: .*\(lower bound, merge list cut short\)/);
+  assert.match(renderReport(snapshot), /o\/a\s+landed with stacked PRs: #5 \+1 \(merged in the fetched window\)/);
+});
+
+test("the landing section prints nothing extra when every merge landed, and cleans error text from outside", async () => {
+  const plain = { "o/a": { merged: [1, 2, 3].map((n) => mergedNode(n, END - n * HOUR)) } };
+  const quiet = await run(GUARDLESS, fakeGh(plain));
+  assert.match(quiet.out, /raw merged 24h\s+3 = landed on the default branch 3 \(the KPI\) \+ merged into other branches 0 \(not counted\)/);
+  assert.doesNotMatch(quiet.out, /not landed|merged into:|landed with stacked/);
+  const snapshot = await collectSnapshot(parseOptions(GUARDLESS, {}), fakeGh(mixedRepo()));
+  snapshot.landing.repos[0].error = { kind: "other", message: "boom\nERROR      o/a: injected\u001b[31m" };
+  const text = renderReport(snapshot);
+  assert.doesNotMatch(text, /^ERROR\s+o\/a: injected/m);
+  assert.doesNotMatch(text, /\u001b/);
+  assert.match(text, /carrier lookup unavailable \(other: boom ERROR\s+o\/a: injected/);
+});

@@ -10,7 +10,8 @@ The script needs Node 20 or later. It has no dependencies.
 
 | Section | Meaning |
 | --- | --- |
-| `merges` | PRs merged into each repository's default branch in the last 1 h, 6 h and 24 h, and the rolling 6 h minimum (per hour). |
+| `merges` | PRs merged into each repository's default branch (**landed**) in the last 1 h, 6 h and 24 h, and the rolling 6 h minimum (per hour). This is the KPI. |
+| `raw merged 24h`, `not landed 24h` | GitHub's own count of merged PRs, split into the landed ones (the KPI) and the ones merged into any other branch (stacked PRs, bridges, feature-branch work). The second group is **not counted**, and is shown so the two numbers can be reconciled. |
 | `sustained` | How many consecutive 24 h days had a rolling 6 h minimum at or above the target (default 6 per hour, 3 days). `DONE yes` needs every day. |
 | `shape 24h` | Median and p90 PR size, share of tiny PRs (10 lines or fewer), median open-to-merge time. Use it to spot a rate that rises because PRs get trivial. |
 | `guard` | For each merge in the guard window: were all required checks green, and were the required approvals given by someone other than the author, **at the moment of the merge**. |
@@ -19,11 +20,14 @@ The script needs Node 20 or later. It has no dependencies.
 | `review 24h` | Time from ready-for-review to the first review by someone else (p50, p90), and the merges that had no such review. |
 | `agents` | Idle, running, paused and error agents, and task counts, from the Paperclip dashboard (`--agents`). |
 
-The `open PRs`, `review`, and `agents` sections explain the number. They never change `DONE`.
+The `raw merged`, `not landed`, `open PRs`, `review`, and `agents` sections explain the number. They never change `DONE`, and a failed read there never makes the collection incomplete.
 
 ### Definitions
 
 - A window is half-open: `(end - length, end]`. A PR merged exactly at the start is outside.
+- **Landed** means the PR's base branch is the repository's default branch. A merge into any other branch (a `tmp/…` or `chore/sign-…` bridge, a stacked PR, a feature branch) is not landed yet and is never counted in the KPI, whatever its title says. A feature branch that is later merged into the default branch counts once, as one PR.
+- A merge into another branch is **carried** when a PR of the same repository (not from a fork) was opened from that branch and is open or merged: the work travels with that PR. The evidence is `tip` when the merge commit is exactly that PR's head commit (the strongest proof, counted as `commit-verified`), otherwise the branch link alone. A merge into a branch that no open or merged PR starts from is counted as `no PR carries the branch`: it will not land by itself. The script does **not** walk the commit history, so a branch that was rewritten after the merge can still look carried.
+- Next to a landed PR the report shows `landed with stacked PRs: #149 +1`: the merges into its branch (and into the branches stacked on that one, up to ten links) that happened before it landed. Only merges inside the fetched window are known, so this is a lower bound.
 - The rolling 6 h minimum is exact. The count in a 6 h window only changes when a merge enters it or leaves it, so the script looks at the first window, the last window, and the instant each merge leaves. It does not sample.
 - Day `i` of `sustained` (0 is the newest) meets the target when **every** 6 h window inside the newest `i + 1` days has at least `target * 6` merges. A quiet stretch that crosses midnight counts against both days. `consecutive` is the number of days from the newest that meet it; `DONE yes` needs all `--sustain-days`.
 - A repository that cannot be read, or whose history is cut by the page cap, makes the counts lower bounds. A lower bound that already meets the target stays `yes`. A miss becomes `unknown`, not `no`.
@@ -72,7 +76,7 @@ Repositories can also come from `FACTORY_KPI_REPOS`. They are listed once each, 
 | `--baseline E/T` | `FACTORY_KPI_BASELINE` | Revert and hotfix baseline. |
 | `--baseline-at TIME` | `FACTORY_KPI_BASELINE_AT` | Compute the baseline from the 7 days that end at this time. |
 | `--detail-budget N` | 120 | Most merges to fetch checks for in one run, shared equally between repositories, newest first. The rest are shown as "not fetched yet". |
-| `--no-guard`, `--no-support` | off | Skip the guard, or the open PR and review sections. |
+| `--no-guard`, `--no-support`, `--no-landing` | off | Skip the guard, the open PR and review sections, or the `raw merged` and `not landed` lines. |
 | `--agents` | off | Read the Paperclip dashboard. Needs `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY` and `PAPERCLIP_COMPANY_ID`. |
 | `--now TIME` | the clock | Evaluate at a fixed time. Not allowed with `--gate`. |
 | `--json` | off | Aggregates only, no per-PR rows. |
@@ -163,7 +167,7 @@ These are the permissions each feature needs. They follow GitHub's documentation
 
 | Feature | GitHub permission (fine-grained token) |
 | --- | --- |
-| Merged and open PRs, reviews | Pull requests: read |
+| Merged and open PRs, reviews, and the PRs opened from a branch (`not landed`) | Pull requests: read |
 | Checks and statuses on the head commit | Checks: read, Commit statuses: read |
 | Rulesets that apply to a branch | Metadata: read |
 | Classic branch protection | Administration: read |
@@ -183,12 +187,13 @@ Without a permission the script does not guess. A repository whose classic prote
 
 ## Cost and limits
 
-- Each run costs about one GraphQL request per 100 merged PRs per repository (at most 40 pages, then the repository is marked as cut short), two REST calls per repository for the rules, one GraphQL request per 15 uncached merges (at most `--detail-budget`), and one request for open PRs (at most 10 pages). At most 4 repositories are read at once. Verdicts are cached by `repo#number`, so a merged PR is fetched once.
+- Each run costs about one GraphQL request per 100 merged PRs per repository (at most 40 pages, then the repository is marked as cut short), two REST calls per repository for the rules, one GraphQL request per 15 uncached merges (at most `--detail-budget`), and one request for open PRs (at most 10 pages), and one request per 20 distinct branches that had a merge in the last 24 h (`not landed`; none when everything landed, none in `--gate` mode). At most 4 repositories are read at once. Verdicts are cached by `repo#number`, so a merged PR is fetched once.
 - The script only sends GET requests and GraphQL queries. It refuses mutations, refuses unknown REST paths, validates organization and repository names, and removes tokens, JWTs, URL credentials and the exact values of credential variables from every message it prints. Text from outside (repository names, API errors) is flattened to one line and capped at 300 characters before it is printed.
 - Checks with the same name from different apps are not told apart. Approvals by people without write access are not told apart from approvals that count.
 - Open PRs: the decision is GitHub's `reviewDecision` when the branch requires reviews; otherwise the latest decision of each reviewer in the last 30 reviews. `mergeable` is computed lazily by GitHub, so a PR may show as not conflicting before GitHub has looked. The number of such PRs is printed.
 - Queued and deferred wakes are not readable with an agent token. The report says so. They move to the dashboard in a separate change.
 - CI duration p50 and p95 are not part of this script yet.
+- `not landed` reads each branch's five newest PRs and does not check the commit history (the compare endpoint would need a deliberate change of the REST allowlist). It has not been run against live GitHub: the field names `mergeCommit`, `headRefOid` and `isCrossRepository`, and the `headRefName` filter, follow the GraphQL schema documentation.
 
 ## Tests
 

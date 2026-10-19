@@ -9,6 +9,8 @@
  *   factory-throughput-kpi.mjs --repos owner/a,owner/b [--target 6] [--sustain-days 3]
  *                              [--discover-org owner] [--now ISO] [--json] [--line]
  *
+ * Only merges into a repository's default branch are counted; merges into other branches (stacked PRs,
+ * bridges, feature work) are reported on a separate line and never counted (--no-landing turns it off).
  * Repositories may also come from FACTORY_KPI_REPOS (comma separated).
  * Gate mode (for a routine that must stay silent when nothing changed):
  *
@@ -43,6 +45,7 @@ import { clean, isIncomplete, renderLine, renderReport } from "./lib/factory-kpi
 import { computeVerdict, parseBaseline } from "./lib/factory-kpi-guard.mjs";
 import { collectAgents } from "./lib/factory-kpi-agents.mjs";
 import { collectSupport } from "./lib/factory-kpi-support.mjs";
+import { collectLanding } from "./lib/factory-kpi-landing.mjs";
 import { DEFAULT_HEARTBEAT_MS, DEFAULT_RATE_STEP, configFingerprint, decideGate, gateSignature, renderGate } from "./lib/factory-kpi-gate.mjs";
 import { StateError, fileStore, issueDocumentStore } from "./lib/factory-kpi-state.mjs";
 import { DEFAULT_DETAIL_BUDGET, collectGuard, collectRegression } from "./lib/factory-kpi-guard-run.mjs";
@@ -62,6 +65,7 @@ const OPTIONS = {
   "guard-days": { type: "string" },
   "no-guard": { type: "boolean", default: false },
   "no-support": { type: "boolean", default: false },
+  "no-landing": { type: "boolean", default: false },
   agents: { type: "boolean", default: false },
   baseline: { type: "string" },
   "baseline-at": { type: "string" },
@@ -145,6 +149,7 @@ export function parseOptions(argv, env = process.env, clock = Date.now) {
     sustainDays,
     guard: !values["no-guard"],
     support: !values["no-support"],
+    landing: !values["no-landing"],
     paperclip: values.agents
       ? { apiUrl: env.PAPERCLIP_API_URL, apiKey: env.PAPERCLIP_API_KEY, companyId: env.PAPERCLIP_COMPANY_ID }
       : null,
@@ -236,6 +241,8 @@ export async function collectSnapshot(options, gh, { cache = {}, fetchImpl } = {
     ? await collectSupport(gh, { repos: results.filter((r) => !r.error).map((r) => r.repo), mergedPrs: prs, endMs })
     : null;
   const agents = options.paperclip && !options.gate ? await collectAgents({ ...options.paperclip, fetchImpl }) : null;
+  // Merges into other branches are context for the report, never part of the KPI or the gate.
+  const landing = options.landing && !options.gate ? await collectLanding(gh, results, { endMs }) : null;
   return {
     version: 1,
     generatedAt: new Date(endMs).toISOString(),
@@ -249,6 +256,7 @@ export async function collectSnapshot(options, gh, { cache = {}, fetchImpl } = {
     regression,
     support,
     agents,
+    landing,
     verdict: computeVerdict({ sustained: throughput.sustained, guard, regression, complete }),
   };
 }
@@ -348,7 +356,7 @@ export async function main(argv, deps = {}) {
   }
   if (options.help) {
     out(
-      "usage: factory-throughput-kpi.mjs --repos owner/a,owner/b [--target N] [--sustain-days N] [--discover-org ORG] [--baseline E/T | --baseline-at ISO] [--no-guard] [--no-support] [--agents] [--now ISO] [--json] [--line]\n" +
+      "usage: factory-throughput-kpi.mjs --repos owner/a,owner/b [--target N] [--sustain-days N] [--discover-org ORG] [--baseline E/T | --baseline-at ISO] [--no-guard] [--no-support] [--no-landing] [--agents] [--now ISO] [--json] [--line]\n" +
         "       factory-throughput-kpi.mjs --gate (--state-file FILE | --state-issue ID) [--heartbeat-hours N] [--rate-step N] ...",
     );
     return EXIT_OK;

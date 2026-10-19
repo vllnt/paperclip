@@ -76,6 +76,26 @@ function agentLines(agents) {
   ];
 }
 
+function landingLines(landing) {
+  const lines = [
+    `raw merged 24h   ${landing.raw24h} = landed on the default branch ${landing.landed24h} (the KPI) + merged into other branches ${landing.other24h} (not counted)`,
+  ];
+  if (landing.other24h) {
+    lines.push(
+      `not landed 24h   ${landing.other24h}: carried by another PR ${landing.carried} (commit-verified ${landing.tipVerified}), no PR carries the branch ${landing.unattached}, unknown ${landing.unknown}`,
+    );
+  }
+  for (const r of landing.repos) {
+    const note = r.complete ? "" : "   (lower bound, merge list cut short)";
+    if (r.error) lines.push(`  ${clean(r.repo)}   carrier lookup unavailable (${clean(r.error.kind)}: ${clean(r.error.message)})${note}`);
+    if (r.byBase.length) lines.push(`  ${clean(r.repo)}   merged into: ${r.byBase.map((b) => `${clean(b.base)} ${b.count}`).join(", ")}${note}`);
+    if (r.stacked.length) {
+      lines.push(`  ${clean(r.repo)}   landed with stacked PRs: ${r.stacked.map((s) => `#${s.number} +${s.stacked}`).join(", ")} (merged in the fetched window)`);
+    }
+  }
+  return lines;
+}
+
 export function renderLine(snapshot) {
   const { rates, rolling6hMin, sustained } = snapshot.throughput;
   const [h1, h6, h24] = rates;
@@ -111,6 +131,7 @@ export function renderReport(snapshot) {
     const [a, b, c] = r.rates;
     lines.push(`repo        ${clean(r.repo)}   1h ${a.merged}   6h ${b.merged}   24h ${c.merged}`);
   }
+  if (snapshot.landing) lines.push(...landingLines(snapshot.landing));
   if (snapshot.guard) {
     lines.push(...guardLines(snapshot.guard));
     lines.push(`revert+hotfix 7d   ${regressionText(snapshot.regression)}`);
