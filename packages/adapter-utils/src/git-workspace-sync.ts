@@ -767,6 +767,65 @@ export function isMissingGitPrerequisiteError(error: unknown): boolean {
   return GIT_MISSING_PREREQUISITE_MARKERS.some((marker) => message.includes(marker));
 }
 
+/** Prefix of the error a stream helper raises when its ssh child dies on a signal. */
+export const SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX = "ssh terminated by signal";
+
+/**
+ * Substrings of a failed bundle transfer that a fresh export can cure. Git
+ * emits the first four when the bundle file ends early or the pack stream is
+ * cut; the last one marks an ssh child that a signal ended mid-stream.
+ */
+const GIT_TRANSIENT_BUNDLE_TRANSFER_MARKERS = [
+  "early EOF",
+  "index-pack died",
+  "index-pack failed",
+  "unexpected disconnect",
+  SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX,
+];
+
+/**
+ * True when a bundle import failed because the bundle bytes were cut short in
+ * transit. The sandbox or SSH workspace is still live, so exporting again is
+ * safe and usually succeeds.
+ */
+export function isTransientGitBundleTransferError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return GIT_TRANSIENT_BUNDLE_TRANSFER_MARKERS.some((marker) => message.includes(marker));
+}
+
+const GIT_BUNDLE_TRANSFER_RETRY_DELAYS_MS: readonly number[] = [1_000, 3_000];
+
+/**
+ * Runs one export-transfer-import attempt and repeats it, with a short
+ * backoff, while it fails with a transient truncation error. Any other error,
+ * and the last transient one, is rethrown unchanged.
+ *
+ * @param operation One complete attempt. It must be safe to run again: it has
+ * to re-create the bundle rather than reuse a partial one.
+ * @param options.delaysMs Wait before retry N; its length is the retry budget.
+ * @param options.sleep Replaces the timer in tests.
+ * @returns The result of the first attempt that succeeds.
+ */
+export async function retryTransientGitBundleTransfer<T>(
+  operation: () => Promise<T>,
+  options: {
+    delaysMs?: readonly number[];
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<T> {
+  const delaysMs = options.delaysMs ?? GIT_BUNDLE_TRANSFER_RETRY_DELAYS_MS;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      const delayMs = delaysMs[attempt];
+      if (delayMs === undefined || !isTransientGitBundleTransferError(error)) throw error;
+      await sleep(delayMs);
+    }
+  }
+}
+
 export function buildRemoteGitDeltaBundleScript(input: {
   remoteDir: string;
   baseSha: string;

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObj
 import { resolveAgentAppearance, type CharacterState } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
 import { characterSlot } from "@/lib/agent-character-slot";
+import { matchesMedia, subscribeToMedia } from "@/lib/safe-match-media";
 import { AgentAvatar, avatarSizeClasses, type AgentAvatarProps } from "./AgentAvatar";
 import type { createCharacter } from "@paperclipai/shared/cliplab/runtime";
 
@@ -22,12 +23,13 @@ export function AgentCharacter({ agent, appearance, size = 256, state = "idle", 
   const [visible, setVisible] = useState(false), [reduced, setReduced] = useState(true), [failed, setFailed] = useState(false), [ready, setReady] = useState(false);
   const active = visible && !reduced && !failed && motion === "auto" && state !== "rest";
   useEffect(() => {
-    if (typeof matchMedia !== "function" || typeof IntersectionObserver !== "function") return;
-    const media = matchMedia("(prefers-reduced-motion: reduce)");
-    const change = () => setReduced(media.matches); change(); media.addEventListener("change", change);
+    if (typeof IntersectionObserver !== "function") return;
+    const query = "(prefers-reduced-motion: reduce)";
+    setReduced(matchesMedia(query, true));
+    const unsubscribe = subscribeToMedia(query, setReduced);
     const observer = new IntersectionObserver(entries => setVisible(entries[0]?.isIntersecting ?? false));
     if (root.current) observer.observe(root.current);
-    return () => { observer.disconnect(); media.removeEventListener("change", change); };
+    return () => { observer.disconnect(); unsubscribe(); };
   }, []);
   useEffect(() => {
     if (active && owner === null) characterSlot.acquire(slotId.current);
