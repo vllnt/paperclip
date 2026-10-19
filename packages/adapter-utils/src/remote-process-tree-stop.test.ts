@@ -465,6 +465,8 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     runId?: string;
     stdinPrefix?: string;
     beforeSpawn?: (remoteScript: string) => Promise<void>;
+    /** Changes the script the worker's shell runs, to stand in for a different worker. */
+    rewriteScript?: (remoteScript: string) => string;
   }) {
     const root = input.root ?? (await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-")));
     await mkdir(path.join(root, "ws"), { recursive: true });
@@ -485,7 +487,7 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
       processRecord: { runId: input.runId ?? randomUUID() },
     });
     await input.beforeSpawn?.(target.args.at(-1)!);
-    const child = spawn("sh", ["-c", target.args.at(-1)!], {
+    const child = spawn("sh", ["-c", input.rewriteScript?.(target.args.at(-1)!) ?? target.args.at(-1)!], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: root,
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: input.home ?? root },
@@ -503,6 +505,32 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     await target.cleanup();
     return { stdout, stderr, code, marker: target.stdinPrefix!.trim() };
   }
+
+  it("starts the command in the worker's own process group when the worker has no setsid, still recorded and fed", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
+    const runId = randomUUID();
+    const withoutSetsid = (script: string) => {
+      expect(script).toContain("trusted_tool setsid)");
+      return script.replace("trusted_tool setsid)", "trusted_tool paperclip-no-such-tool)");
+    };
+
+    const launch = await runLaunch({
+      root,
+      runId,
+      command: "cat; echo pid=$$; exit 7",
+      rewriteScript: withoutSetsid,
+    });
+
+    expect(launch.code).toBe(7);
+    expect(launch.stdout).toContain("hello\n");
+    const pid = Number(/pid=(\d+)/.exec(launch.stdout)?.[1]);
+    const run = runOf(root, runId);
+    const names = await recordNames(run);
+    expect(names).toHaveLength(1);
+    const record = await readFile(path.join(run.dir, names[0]!), "utf8");
+    expect(record).toContain(`"pid":${pid},`);
+    expect(record).toContain(`"group":0`);
+  }, 30_000);
 
   it("does not start a launch whose run was already stopped, so a stop cannot miss a late record", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-launch-"));
@@ -890,6 +918,55 @@ describe.skipIf(!isLinux)("SSH launch wrapper", () => {
     expect(target.args.at(-1)).not.toContain("read -r");
     expect(target.args.at(-1)).not.toContain(REMOTE_RUN_MARKER_ENV);
     await target.cleanup();
+  });
+});
+
+// One argument of a process is limited to 128 KiB on Linux (MAX_ARG_STRLEN),
+// and the remote command is one argument of `ssh`. Each quoting level multiplies
+// every apostrophe, so a launch must carry its command once.
+describe("SSH launch script size", () => {
+  const MAX_ARG_STRLEN = 131_072;
+  const ARGV_TOKEN = "PaperclipArgvToken";
+  // About 30 KB with 300 apostrophes: a prompt that an agent CLI takes in argv.
+  const prompt = `${ARGV_TOKEN}${`${"a".repeat(99)}'`.repeat(300)}`;
+  const spec = {
+    host: "ssh.example.test",
+    port: 22,
+    username: "ssh-user",
+    remoteCwd: "/srv/ws",
+    remoteWorkspacePath: "/srv",
+    privateKey: null,
+    knownHosts: null,
+    strictHostKeyChecking: true,
+  };
+
+  async function remoteCommand(processRecord: { runId: string } | null, argument = prompt) {
+    const target = await buildSshSpawnTarget({
+      spec,
+      command: "agent",
+      args: ["--prompt", argument],
+      env: { FOO: "bar" },
+      processRecord,
+    });
+    await target.cleanup();
+    return target.args.at(-1)!;
+  }
+
+  it("carries the command once", async () => {
+    const script = await remoteCommand({ runId: randomUUID() });
+    expect(script.split(ARGV_TOKEN)).toHaveLength(2);
+  });
+
+  it("grows with the command no faster than a launch without a record", async () => {
+    // The record's own script is a fixed cost; what a command adds is not.
+    const growth = async (processRecord: { runId: string } | null) =>
+      (await remoteCommand(processRecord)).length - (await remoteCommand(processRecord, "x")).length;
+    expect(await growth({ runId: randomUUID() })).toBeLessThan((await growth(null)) * 1.5);
+  });
+
+  it("leaves room in the argument for a large prompt", async () => {
+    const withRecord = (await remoteCommand({ runId: randomUUID() })).length;
+    expect(withRecord).toBeLessThan(MAX_ARG_STRLEN / 2);
   });
 });
 

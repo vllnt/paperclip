@@ -1618,8 +1618,16 @@ export async function buildSshSpawnTarget(input: {
     // run was already stopped, sources the profiles, then execs the command
     // with the same pid. The marker is in its environment from the start, so
     // a stop that comes meanwhile still proves its group.
-    const leaderScript = (group: boolean) => [
-      ...buildRemoteRunRecordLines({ remoteRoot, runId, launchId, markerSha256: marker.entrySha256, group }),
+    //
+    // The script carries the command once, and learns at run time, as its
+    // first argument, whether `setsid` made it a session leader. Each quoting
+    // level multiplies every apostrophe of the command, and the remote command
+    // is one argument of `ssh`, which Linux limits to 128 KiB: a second copy
+    // for the worker without `setsid` would fail a large prompt in argv.
+    const leaderScript = [
+      ...buildRemoteRunRecordLines({ remoteRoot, runId, launchId, markerSha256: marker.entrySha256, group: "${1:-0}" }),
+      // The flag is read; the profiles and the command get no arguments, as before.
+      "set --",
       ...prelude("</dev/null >/dev/null 2>&1"),
       `cd ${shellQuote(input.spec.remoteCwd)} || exit $?`,
       execLine,
@@ -1631,6 +1639,7 @@ export async function buildSshSpawnTarget(input: {
     // does. The subshell does not lead a process group, so `setsid`
     // starts the session without forking, and the status line after it keeps
     // the subshell from being run in place of this shell, which leads one.
+    // Without `setsid` the leader runs in the worker's own group (`0`).
     remoteScript = [
       "{ IFS= read -r paperclip_run_marker || :; }",
       // Without a valid marker the stop could not find the run's processes.
@@ -1640,9 +1649,8 @@ export async function buildSshSpawnTarget(input: {
       "unset paperclip_run_marker",
       ...buildTrustedToolLines(),
       "paperclip_setsid=\"$(PATH=/usr/bin:/bin; trusted_tool setsid)\" || paperclip_setsid=",
-      "if [ -n \"$paperclip_setsid\" ]; then "
-        + `( exec "$paperclip_setsid" /bin/sh -c ${shellQuote(leaderScript(true))} paperclip-run ); `
-        + `else ( exec /bin/sh -c ${shellQuote(leaderScript(false))} paperclip-run ); fi`,
+      "paperclip_group=1; [ -n \"$paperclip_setsid\" ] || paperclip_group=0",
+      `( exec \${paperclip_setsid:+"$paperclip_setsid"} /bin/sh -c ${shellQuote(leaderScript)} paperclip-run "$paperclip_group" )`,
       "exit $?",
     ].join("\n");
   }
