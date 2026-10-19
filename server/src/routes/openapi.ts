@@ -237,6 +237,9 @@ import {
   resolveIssueRecoveryActionSchema,
   reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  issueRecoveryActionReadModelSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  ISSUE_STATUSES,
   cancelIssueThreadInteractionSchema,
   issueWaitRequestSchema,
   // Secret provider configs and remote import
@@ -10519,6 +10522,33 @@ registerCurrentRoute({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["issues"],
+  summary:
+    "List issue recovery actions across a company, newest first, with their source issue. " +
+    "Read-only (no revalidation). Actors without company-scope read only see actions on issues they can read.",
+  query: listCompanyIssueRecoveryActionsQuerySchema,
+  responses: {
+    200: r.ok(
+      z.array(
+        issueRecoveryActionReadModelSchema.extend({
+          issue: z.object({
+            id: z.string(),
+            identifier: z.string().nullable(),
+            title: z.string(),
+            status: z.enum(ISSUE_STATUSES),
+          }),
+        }),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
   },
 });
 
