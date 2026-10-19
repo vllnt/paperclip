@@ -17,5 +17,10 @@ export type RoutineNoopSkipSource = (typeof ROUTINE_NOOP_SKIP_SOURCES)[number];
 export const routineNoopSkipSettingsSchema = z.object({
   skipUnchanged: z.boolean().optional(),
   bySource: z.partialRecord(z.enum(ROUTINE_NOOP_SKIP_SOURCES), z.boolean()).optional(),
+  /**
+   * Gated routines only: skip a run whose gate output matches the last issue-creating run on
+   * the same trigger. Unlike `skipUnchanged`, unset means on.
+   */
+  skipUnchangedGateResult: z.boolean().optional(),
 });
 export type RoutineNoopSkipSettings = z.infer<typeof routineNoopSkipSettingsSchema>;

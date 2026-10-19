@@ -2129,6 +2129,20 @@
       "when": 1792430335310,
       "tag": "0305_absurd_power_pack",
       "breakpoints": true
+    },
+    {
+      "idx": 306,
+      "version": "7",
+      "when": 1792439080431,
+      "tag": "0306_routine_gate_scripts",
+      "breakpoints": true
+    },
+    {
+      "idx": 307,
+      "version": "7",
+      "when": 1792439545255,
+      "tag": "0307_cold_warbound",
+      "breakpoints": true
     }
   ]
 }

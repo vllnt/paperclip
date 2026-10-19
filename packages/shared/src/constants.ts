@@ -673,6 +673,8 @@ export type RoutineVariableType = (typeof ROUTINE_VARIABLE_TYPES)[number];
 
 export const ROUTINE_RUN_STATUSES = [
   "received",
+  // The routine's gate script is queued or running on the worker; no issue exists yet.
+  "gating",
   "coalesced",
   "skipped",
   "issue_created",

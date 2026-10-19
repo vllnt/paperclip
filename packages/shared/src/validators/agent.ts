@@ -4,6 +4,7 @@ import { runContextPolicySchema } from "../run-context.js";
 import { agentAppearanceSchema } from "../agent-appearance.js";
 import { aiConnectionBindingSchema } from "../ai-connections.js";
 import { z } from "zod";
+import { transientRetryPolicySchema } from "../transient-retry-policy.js";
 import {
   AGENT_ICON_NAMES,
   AGENT_ROLES,
@@ -83,6 +84,7 @@ function agentRuntimeConfigSchemaWith<T extends z.ZodTypeAny>(aiConnection: T) {
   return z.object({
     aiConnection,
     runContext: runContextPolicySchema.optional(),
+    transientRetryPolicy: transientRetryPolicySchema.optional(),
     heartbeat: agentHeartbeatConfigSchema.optional(),
     debug: z.object({
       providerTrace: z.literal("raw").optional(),
