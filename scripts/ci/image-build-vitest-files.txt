@@ -44,6 +44,7 @@ packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
 packages/shared/src/company-environment-defaults.test.ts
+packages/shared/src/routine-gate.test.ts
 packages/shared/src/validators/routine-list-query.test.ts
 server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
@@ -55,6 +56,10 @@ server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
+server/src/__tests__/routine-gate-command.test.ts
+server/src/__tests__/routine-gate-outcome.test.ts
+server/src/__tests__/routine-gate-source.test.ts
+server/src/__tests__/routine-gate-worker.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
 server/src/__tests__/ssh-run-directory-reaper-settings.test.ts

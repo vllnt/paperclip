@@ -25,6 +25,8 @@ import type {
   EventGrouping,
   EventMatch,
   RoutineEnvConfig,
+  RoutineGate,
+  RoutineGateResult,
   RoutineNoopSkipSettings,
   RoutineRevisionSnapshotV1,
   RoutineVariable,
@@ -56,6 +58,8 @@ export const routines = pgTable(
     env: jsonb("env").$type<RoutineEnvConfig>(),
     automationWakeSettings: jsonb("automation_wake_settings").$type<AutomationWakeSettings>().notNull().default({}),
     routineNoopSkipSettings: jsonb("routine_noop_skip_settings").$type<RoutineNoopSkipSettings>().notNull().default({}),
+    // A deterministic pre-wake script pinned to a reviewed commit; written by the board only.
+    gate: jsonb("gate").$type<RoutineGate>(),
     runContextPolicy: jsonb("run_context_policy").$type<RunContextPolicy>(),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
@@ -184,11 +188,21 @@ export const routineRuns = pgTable(
     failureReason: text("failure_reason"),
     // `event` runs: the delivery that produced the run, so a re-claimed delivery can skip routines that already succeeded.
     eventDeliveryId: uuid("event_delivery_id").references(() => eventDeliveries.id, { onDelete: "set null" }),
+    // Gated runs: sha256 of the normalized gate stdout, compared under the routine lock to skip a repeat.
+    gateResultFingerprint: text("gate_result_fingerprint"),
+    gateResult: jsonb("gate_result").$type<RoutineGateResult>(),
+    // The full dispatch input of a `gating` run, so the gate worker can commit it after a restart.
+    gateDispatchInput: jsonb("gate_dispatch_input").$type<Record<string, unknown>>(),
+    gateClaimedAt: timestamp("gate_claimed_at", { withTimezone: true }),
+    gateAttempts: integer("gate_attempts").notNull().default(0),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    gatingIdx: index("routine_runs_gating_idx")
+      .on(table.routineId, table.triggerId)
+      .where(sql`${table.status} = 'gating'`),
     companyRoutineIdx: index("routine_runs_company_routine_idx").on(table.companyId, table.routineId, table.createdAt),
     routineRevisionIdx: index("routine_runs_revision_idx").on(table.routineRevisionId),
     companyResponsibleUserIdx: index("routine_runs_company_responsible_user_idx").on(
