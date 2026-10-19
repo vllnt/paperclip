@@ -90,7 +90,7 @@ describe("durable native provider capacity retry", () => {
     let runId: string = originalRunId;
     const unexpected = vi.fn(async () => { throw new Error("Unexpected recovery"); });
     const release = createReleaseIssueExecution({
-      issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: unexpected, getRoutineEnv: unexpected, resolveSessionBeforeForWakeup: unexpected }),
+      issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: unexpected, getRoutineEnv: unexpected, resolveSessionBeforeForWakeup: unexpected, admitAutomationWake: async () => ({ hold: false }) }),
       recovery: { escalateStrandedAssignedIssue: unexpected, escalateStrandedRecoveryIssueInPlace: unexpected },
     });
     for (let failure = 0; failure <= 2; failure++) {

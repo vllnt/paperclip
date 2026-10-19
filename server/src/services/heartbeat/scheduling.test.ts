@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { conflict } from "../../errors.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
+import { parseProviderQuotaRetryPolicy } from "./retries.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatScheduling, type HeartbeatSchedulingDependencies } from "./scheduling.js";
 import { readIdleSleepSafety } from "../idle-sleep-safety.js";
@@ -20,8 +21,9 @@ const now = new Date("2026-10-09T12:00:00.000Z");
 const dueAt = new Date(now.getTime() - 60_000);
 const admitted = { id: "admitted-run" } as Run;
 const timerPolicy = {
-  enabled: false, intervalSec: 60, wakeOnDemand: true, maxConcurrentRuns: 1,
+  enabled: false, intervalSec: 60, wakeOnDemand: true, maxConcurrentRuns: 1, automationWakeSettings: {},
   skipTimerWhenNoActionableWork: false, maxDailyRuns: null, maxDailyCostCents: null,
+  providerQuotaRetry: parseProviderQuotaRetryPolicy(undefined),
 };
 
 function callbacks(db: Db) {

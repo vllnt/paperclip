@@ -53,7 +53,8 @@ describePostgres("queued operator stop release", () => {
       status: "deferred_issue_execution", payload: { issueId }, requestedByActorType: "user", requestedByActorId: "operator" }).returning();
     const release = createReleaseIssueExecution({
       issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: async () => "operator",
-        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }), resolveSessionBeforeForWakeup: async () => null }),
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }), resolveSessionBeforeForWakeup: async () => null,
+        admitAutomationWake: async () => ({ hold: false }) }),
       recovery: { escalateStrandedAssignedIssue: async () => { throw Error("Unexpected recovery"); },
         escalateStrandedRecoveryIssueInPlace: async () => { throw Error("Unexpected recovery"); } },
     });

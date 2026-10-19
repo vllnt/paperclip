@@ -39,7 +39,7 @@ it("starts browser polling when a chat draft becomes a saved task and stops on t
   const list = vi.spyOn(browserUseApi, "list").mockResolvedValue([]);
   const client = new QueryClient();
   const taskId = "12345678-1234-4234-8234-123456789abc";
-  const { rerender, unmount } = renderHook(useTaskBrowsers, {
+  const { rerender, unmount } = renderHook((issueId: string | undefined) => useTaskBrowsers(issueId, true), {
     initialProps: undefined as string | undefined,
     client,
   });

@@ -187,6 +187,7 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
       resolveResponsibleUserId: async () => "responsible-user",
       getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
       resolveSessionBeforeForWakeup: async () => null,
+      admitAutomationWake: async () => ({ hold: false }),
     }), recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
     deps.releaseIssueExecutionAndPromote.mockImplementation(async (run, options) => {
       await release({ companyId: run.companyId, runId: run.id, now: new Date(), ...options });

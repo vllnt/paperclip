@@ -137,7 +137,6 @@ describe("IssueFiltersPopover", () => {
     const projects = Array.from({ length: 40 }, (_, index) => ({ id: `project-${index + 1}`, name: `Project ${index + 1}` }));
     const labels = Array.from({ length: 40 }, (_, index) => ({ id: `label-${index + 1}`, name: `Label ${index + 1}`, color: "#336699" }));
     const agents = Array.from({ length: 40 }, (_, index) => ({ id: `agent-${index + 1}`, name: `Agent ${index + 1}` }));
-    const workspaces = Array.from({ length: 40 }, (_, index) => ({ id: `workspace-${index + 1}`, name: `Workspace ${index + 1}` }));
     const renderPopover = (root: ReturnType<typeof createRoot>, presentation: "streamlined" | "legacy") =>
       root.render(
         <IssueFiltersPopover
@@ -149,7 +148,6 @@ describe("IssueFiltersPopover", () => {
           agents={agents}
           projects={projects}
           labels={labels}
-          workspaces={workspaces}
           enableExternalObjectFilters={false}
         />,
       );
@@ -182,10 +180,8 @@ describe("IssueFiltersPopover", () => {
         // First paint: the sections and their fixed rows are there, the long lists are empty.
         expect(container.querySelector('[data-filter-options="projects"]')).not.toBeNull();
         expect(container.querySelector('[data-filter-options="labels"]')).not.toBeNull();
-        expect(container.querySelector('[data-filter-options="workspaces"]')).not.toBeNull();
         expect(rows("projects")).toBe(0);
         expect(rows("labels")).toBe(0);
-        expect(rows("workspaces")).toBe(0);
         expect(rows("responsible")).toBe(2);
         expect(container.textContent).toContain("No responsible");
         expect(container.textContent).toContain("Me");
@@ -195,7 +191,6 @@ describe("IssueFiltersPopover", () => {
       // Deferred pass: every option is there, with the same markup as before.
       expect(rows("projects")).toBe(40);
       expect(rows("labels")).toBe(40);
-      expect(rows("workspaces")).toBe(40);
       expect(rows("responsible")).toBe(2 + 40);
       expect(container.querySelector('[data-filter-options="projects"]')?.textContent).toContain("Project 40");
       expect(container.querySelector('[data-filter-options="labels"] span[style]')).not.toBeNull();

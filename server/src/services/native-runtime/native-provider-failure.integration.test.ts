@@ -230,7 +230,7 @@ describe("native completed failure diagnostics", () => {
           // assuming that absence of a finalizer wake prevents later retries.
           const unexpected = vi.fn(async () => { throw new Error("Unexpected automatic recovery"); });
           const release = createReleaseIssueExecution({
-            issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: unexpected, getRoutineEnv: unexpected, resolveSessionBeforeForWakeup: unexpected }),
+            issueLock: createPostgresWakeQueueAdapter(db, { resolveResponsibleUserId: unexpected, getRoutineEnv: unexpected, resolveSessionBeforeForWakeup: unexpected, admitAutomationWake: async () => ({ hold: false }) }),
             recovery: { escalateStrandedAssignedIssue: unexpected, escalateStrandedRecoveryIssueInPlace: unexpected },
           });
           expect((await release({ companyId, runId, now: new Date() })).outcome.kind).toBe("released");

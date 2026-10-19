@@ -88,7 +88,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       },
       config: { runtimeConfig: {}, resolvedConfig: {}, managedAiRuntime: undefined,
         resolvedInstanceSettings: { experimental: { enableWorkspaceBranchReconcileForward: false, enableWorkspaceDirtyQuarantineRepair: false } },
-        configuredTaskEnvironment: {}, adapterEnv: {}, agentIdentity: undefined, runtimeEnv: {}, useHostGitHub: false, githubSelection: { configured: false },
+        configuredTaskEnvironment: {}, adapterEnv: {}, agentIdentity: undefined, runtimeEnv: {}, useHostGitHub: false, githubSelection: { configured: false }, githubConfigured: false,
       },
       session: { runtimeSessionParamsForAdapter: null, configuredModel: null,
         sessionConfigMetadata: await buildEffectiveRunSessionConfigMetadata({ adapterType: agent.adapterType, effectiveAdapterConfig: {}, agentRuntimeConfig: {}, issueOverrides: null, workspaceConfig: null, environment: null, environmentEnv: null, projectEnv: null, routineEnv: null, runtimeSkills: [] }), goalCheckpointSession: { current: null },
