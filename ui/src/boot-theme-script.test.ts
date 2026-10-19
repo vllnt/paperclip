@@ -33,8 +33,8 @@ function boot(storage: Storage, os: Os): Painted {
   return run(storage, os).painted;
 }
 
-/** As {@link boot}, and also returns the stand-in window's `matchMedia` as the script left it. */
-function run(storage: Storage, os: Os): { painted: Painted; matchMedia: unknown } {
+/** As {@link boot}, and also returns the stand-in window's `matchMedia` as the script left it, and whether the property is still there. */
+function run(storage: Storage, os: Os): { painted: Painted; matchMedia: unknown; present: boolean } {
   const classes = new Set<string>();
   const meta = { content: "" };
   const root = {
@@ -80,6 +80,7 @@ function run(storage: Storage, os: Os): { painted: Painted; matchMedia: unknown 
   return {
     painted: { dark: classes.has("dark"), colorScheme: root.style.colorScheme, themeColor: meta.content },
     matchMedia: Reflect.get(fakeWindow, "matchMedia"),
+    present: Reflect.has(fakeWindow, "matchMedia"),
   };
 }
 
@@ -118,6 +119,10 @@ describe("theme boot script in index.html", () => {
 
     it("is removed when it throws, so libraries that feature-detect it skip it instead of failing to load", () => {
       expect(run("unset", "matchMedia-throws").matchMedia).toBeUndefined();
+    });
+
+    it("is no longer a property of window when it throws, so `\"matchMedia\" in window` is false too", () => {
+      expect(run("unset", "matchMedia-throws").present).toBe(false);
     });
 
     it("is not invented when the browser has none", () => {

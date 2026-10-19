@@ -54,6 +54,11 @@ it("tracks only its region, ignores touch, and removes listeners for coarse poin
   Object.assign(coarse, { matches: true }); coarse.dispatchEvent(new Event("change"));
   expect(remove.mock.calls.some(([event]) => event === "pointermove")).toBe(true);
 });
+it("throws before building a renderer or canvas when matchMedia throws", () => {
+  vi.stubGlobal("matchMedia", () => { throw new Error("matchMedia failed"); });
+  expect(() => create()).toThrow("matchMedia failed");
+  expect(target.querySelector("canvas")).toBeNull(); expect(players).toHaveLength(0);
+});
 it("disposes the canvas and subscriptions when the first render fails", () => {
   renderer.render.mockImplementationOnce(() => { throw new Error("lost context"); });
   expect(() => create()).toThrow("lost context");

@@ -39,7 +39,7 @@ describe("isChromelessDisplayMode", () => {
     expect(isChromelessDisplayMode(undefined, false)).toBe(false);
   });
 
-  it("still detects an iOS home-screen launch when matchMedia throws", () => {
+  it("pins that an iOS home-screen launch is detected before matchMedia is read", () => {
     vi.stubGlobal("window", {
       matchMedia: () => {
         throw new Error("matchMedia failed");

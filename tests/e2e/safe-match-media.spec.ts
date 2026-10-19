@@ -55,6 +55,15 @@ function collectBrowserErrors(page: Page): string[] {
   return errors;
 }
 
+/**
+ * Drops the browser's own "Failed to load resource" console lines (a 404 for an issue with no plan
+ * document, demo data that does not exist). They come with or without a working `matchMedia`; a
+ * `pageerror` and any other console error stay strict.
+ */
+function unexpectedErrors(errors: string[]): string[] {
+  return errors.filter((error) => !error.startsWith("console: Failed to load resource"));
+}
+
 async function expectAppRendered(page: Page, route: string): Promise<void> {
   await expect(page.locator("main, [role=main]").first(), `${route} renders its main region`).toBeVisible();
   await expect(page.getByTestId("onboarding-wizard")).toHaveCount(0);
@@ -83,7 +92,7 @@ for (const viewport of VIEWPORTS) {
       await page.getByRole("button", { name: "New Task" }).first().click();
       await expect(page.getByRole("dialog")).toBeVisible();
 
-      expect(errors, "page and console errors").toEqual([]);
+      expect(unexpectedErrors(errors), "page and console errors").toEqual([]);
     });
 
     test("the signed-out sign-in page still renders", async ({ page }) => {
@@ -98,7 +107,7 @@ for (const viewport of VIEWPORTS) {
       await page.goto("/auth");
       await expect(page.getByRole("heading", { name: "Sign in to Paperclip" })).toBeVisible();
       await expect(page.getByRole("radiogroup", { name: "Appearance" })).toBeVisible();
-      expect(errors, "page and console errors").toEqual([]);
+      expect(unexpectedErrors(errors), "page and console errors").toEqual([]);
     });
 
     test("the design guide, which mounts the media-query components, still renders", async ({ page }) => {
@@ -108,9 +117,7 @@ for (const viewport of VIEWPORTS) {
       await page.goto(`/${fixture.prefix}/design-guide`);
       await expect(page.getByText("StatusBadge (all statuses)").first()).toBeVisible();
 
-      // The page's demo data logs a 404 and two 500s for resources that do not exist; those are not under test.
-      const unexpected = errors.filter((error) => !error.startsWith("console: Failed to load resource"));
-      expect(unexpected, "page and console errors").toEqual([]);
+      expect(unexpectedErrors(errors), "page and console errors").toEqual([]);
     });
   });
 }

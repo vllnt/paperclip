@@ -31,6 +31,11 @@
             try {
               window.matchMedia = undefined;
             } catch {}
+            // Leave no property behind: a library that tests \`"matchMedia" in window\`
+            // would otherwise still call it.
+            try {
+              delete window.matchMedia;
+            } catch {}
           }
         }
         // Each read has its own guard: blocked storage must still follow the OS,

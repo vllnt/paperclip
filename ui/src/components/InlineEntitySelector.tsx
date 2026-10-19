@@ -43,10 +43,6 @@ interface InlineEntitySelectorProps {
 
 const EMPTY_RECENT_OPTION_IDS: string[] = [];
 
-function useMobileSelectorModal() {
-  return useMediaQuery("(max-width: 40rem)", false);
-}
-
 export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySelectorProps>(
   function InlineEntitySelector(
     {
@@ -75,7 +71,7 @@ export const InlineEntitySelector = forwardRef<HTMLButtonElement, InlineEntitySe
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState("");
     const [highlightedIndex, setHighlightedIndex] = useState(0);
-    const mobileSelectorModal = useMobileSelectorModal();
+    const mobileSelectorModal = useMediaQuery("(max-width: 40rem)", false);
     const mobileViewportStyle = useMobileEntityPickerViewportStyle();
     const highlightedIndexRef = useRef(0);
     const inputRef = useRef<HTMLInputElement>(null);
