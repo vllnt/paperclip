@@ -53,6 +53,9 @@ interface CompanyJsonOptions extends BaseClientOptions {
   companyId?: string;
   payloadJson?: string;
 }
+interface CompanyUpdateOptions extends CompanyJsonOptions {
+  runContextJson?: string;
+}
 interface AgentMeResponse {
   id: string;
   companyId: string;
@@ -1481,11 +1484,20 @@ export function registerCompanyCommands(program: Command): void {
       .command("update")
       .description("Update a company")
       .argument("<companyId>", "Company ID")
-      .requiredOption("--payload-json <json>", "UpdateCompany JSON payload")
-      .action(async (companyId: string, opts: CompanyJsonOptions) => {
+      .option("--payload-json <json>", "UpdateCompany JSON payload")
+      .option(
+        "--run-context-json <json>",
+        "Company run-context policy as JSON (maxComments, maxCommentChars, maxTotalCommentChars, window, truncationMarker, byWakeReason), or null to clear",
+      )
+      .action(async (companyId: string, opts: CompanyUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, parseJson(opts.payloadJson ?? "{}")), { json: ctx.json });
+          const payload = {
+            ...(opts.payloadJson ? (parseJson(opts.payloadJson) as Record<string, unknown>) : {}),
+            ...(opts.runContextJson ? { runContextPolicy: parseJson(opts.runContextJson) } : {}),
+          };
+          if (Object.keys(payload).length === 0) throw new Error("Provide --payload-json or --run-context-json.");
+          printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, payload), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

@@ -173,4 +173,25 @@ describe("buildAgentUpdatePatch", () => {
       desiredSkills: ["research", "code-review"],
     });
   });
+
+  it("keeps pending heartbeat and debug edits when the run context changes", () => {
+    const runContext = { maxComments: 10 };
+    const patch = buildAgentUpdatePatch(makeAgent(), makeOverlay({
+      heartbeat: { intervalSec: 600 },
+      debug: { providerTrace: "raw" },
+      runtime: { runContext },
+    }));
+    expect(patch.runtimeConfig).toEqual({
+      heartbeat: { enabled: true, intervalSec: 600 },
+      debug: { providerTrace: "raw" },
+      runContext,
+    });
+  });
+
+  it("removes the run context when it is cleared", () => {
+    const agent = makeAgent();
+    agent.runtimeConfig = { heartbeat: { enabled: true }, runContext: { maxComments: 3 } };
+    const patch = buildAgentUpdatePatch(agent, makeOverlay({ runtime: { runContext: null } }));
+    expect(patch.runtimeConfig).toEqual({ heartbeat: { enabled: true } });
+  });
 });

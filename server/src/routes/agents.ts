@@ -3420,6 +3420,7 @@ export function agentRoutes(
     req: Request;
     companyId: string;
     agentId: string;
+    agentName: string;
     primaryAdapterType: string;
     primaryAdapterConfig: Record<string, unknown>;
     requested: AgentFallbackTarget[];
@@ -3459,6 +3460,12 @@ export function agentRoutes(
         entry.adapterType,
         applyCreateDefaultsByAdapterType(entry.adapterType, { ...(entry.adapterConfig ?? {}), ...(env ? { env } : {}) }),
       );
+      assertExternalInstructionsAdmin(input.req, {
+        id: input.agentId,
+        name: input.agentName,
+        companyId: input.companyId,
+        adapterConfig: { ...input.primaryAdapterConfig, ...withDefaults },
+      });
       const { env: isolatedEnv, ...adapterConfig } = withDefaults;
       const isolated = asRecord(isolatedEnv);
       normalized.push({
@@ -5316,6 +5323,7 @@ export function agentRoutes(
       req,
       companyId,
       agentId,
+      agentName: createInput.name,
       primaryAdapterType: createInput.adapterType,
       primaryAdapterConfig: normalizedAdapterConfig,
       requested: createInput.fallbacks ?? [],
@@ -6066,6 +6074,7 @@ export function agentRoutes(
         req,
         companyId: existing.companyId,
         agentId: existing.id,
+        agentName: existing.name,
         primaryAdapterType: requestedAdapterType,
         primaryAdapterConfig: nextPrimaryAdapterConfig,
         requested: hasOwn(patchData, "fallbacks")
