@@ -144,6 +144,8 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 # Both the browser bundle and server stamp need the source commit. Declare it
 # after the stable dependency layers, before either application build.
 ARG PAPERCLIP_BUILD_COMMIT=""
+# Plugin tests and the UI use the SDK exports, so build them before the test manifest.
+RUN pnpm --filter @paperclipai/plugin-sdk build
 # Tests that gate the production image build. The list lives in
 # scripts/ci/image-build-vitest-files.txt, one path per line, so that concurrent pull requests that
 # add a test touch different lines instead of rewriting this one. An empty list or a path that does not exist fails the build;
@@ -151,22 +153,23 @@ ARG PAPERCLIP_BUILD_COMMIT=""
 RUN node --test scripts/ci/run-image-build-vitest.test.mjs
 RUN sh scripts/ci/run-image-build-vitest.sh
 RUN pnpm check:token-gates
+# The GitHub launcher's retry of a busy or slow Paperclip server (bounded backoff, a clear final error); no database.
+RUN pnpm exec vitest run packages/adapter-utils/src/github-launcher-backoff.test.ts
 RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
-# The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
-# after the SDK build, so build the SDK before typechecking the UI.
-RUN pnpm --filter @paperclipai/plugin-sdk build
-# Provider-quota classification of the Codex and Claude adapters (no database).
-RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts
+# The GitHub credentials route: the short per-run cache of ordinary reads (what it keeps, for how long, for whom) and what the
+# route does when its caller has gone. No database: the embedded Postgres tests of the same change are skipped in this build
+# (it runs as root), so they gate on a host that does not.
+RUN pnpm exec vitest run server/src/__tests__/github-read-decision-cache.test.ts server/src/__tests__/github-credentials-route-caller.test.ts
+# Provider-quota classification of the Codex and Claude adapters, and the GitHub plugin's
+# refusal to send a request without credentials (it needs the SDK test export built above; no database).
+RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts packages/plugins/plugin-github/tests/no-unauthenticated-requests.spec.ts
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 # The GitHub plugin's merge guard and the instance admin's per-repository opt-in (agentMergeablePaths): the guard and path rules,
 # the config schema as the host validates it when it is saved, and the save route's admin check. No database. After the plugin SDK build.
 RUN pnpm exec vitest run packages/plugins/plugin-github/tests/protected-paths.spec.ts packages/plugins/plugin-github/tests/write-identity.spec.ts server/src/__tests__/plugin-github-merge-opt-in-config.test.ts
 RUN pnpm exec vitest run server/src/__tests__/plugin-routes-authz.test.ts -t agentMergeablePaths
-# The Convex plugin's guards (environment classification, per-environment grants, preview and delete guards, the reaper's dry run and its
-# page), the bundled-plugin install list that auto-installs it and the CLI that drives it, then the plugin's typecheck (tests included). The OpenAPI route
-# test above covers the Convex action schemas. No database, no network. After the plugin SDK build.
-RUN pnpm exec vitest run packages/plugins/plugin-convex cli/src/__tests__/convex.test.ts server/src/__tests__/bundled-plugins.test.ts
+# The manifest includes the Convex guard, page, CLI and bundled-plugin tests.
 RUN pnpm --filter @vllnt/paperclip-convex typecheck
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build

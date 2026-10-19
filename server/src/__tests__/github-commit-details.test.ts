@@ -55,7 +55,7 @@ describe("GitHub commit details", () => {
   it("returns null for unavailable or malformed commit details", async () => {
     const resolve = createGitHubCommitDiffDetailsResolver({} as any, {
       fetch: async () => new Response(JSON.stringify({ files: [] }), { status: 200 }),
-      tokenProvider: null,
+      tokenProvider: async () => "secret-token",
     });
     await expect(resolve("company-1", {
       host: "github.com",
@@ -63,5 +63,23 @@ describe("GitHub commit details", () => {
       repo: "app",
       sha: "abc1234",
     })).resolves.toBeNull();
+  });
+
+  // GitHub allows 60 unauthenticated requests an hour per IP, shared by a host's whole egress, and one commit can take up to 30
+  // pages: without a token this resolver sends nothing.
+  it.each([
+    ["no token provider", null],
+    ["a provider that returns null", async () => null],
+    ["a provider that returns a blank string", async () => "  "],
+    ["a provider that cannot read the token", async () => { throw new Error("secret store unavailable"); }],
+  ])("does not call GitHub without a token (%s)", async (_name, tokenProvider) => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({
+      stats: { additions: 1, deletions: 1 },
+      files: [{ filename: "a.ts" }],
+    }), { status: 200 }));
+    const resolve = createGitHubCommitDiffDetailsResolver({} as any, { fetch, tokenProvider: tokenProvider as any });
+
+    await expect(resolve("company-1", { host: "github.com", owner: "acme", repo: "app", sha: "abc1234" })).resolves.toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
