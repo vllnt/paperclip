@@ -182,6 +182,8 @@ pnpm build
 
 If anything cannot be run, explicitly report what was not run and why.
 
+Tests that must gate the production image build go in `scripts/ci/image-build-vitest-files.txt` (one path per line, keep it sorted; blank lines and `#` comments are ignored, a listed path that does not exist fails the build), not on a `Dockerfile` line: concurrent pull requests that rewrite the same line conflict, while additions at different positions of the manifest merge cleanly. If two pull requests do conflict on the manifest, rebase locally and keep both lines; GitHub's web "Update branch" button and merge button ignore the `merge=union` rule in `.gitattributes`, which applies only to local `git merge` and `git rebase`.
+
 ## 8. API and Auth Expectations
 
 - Base path: `/api`
