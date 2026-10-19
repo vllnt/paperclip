@@ -68,6 +68,7 @@ function redactBuiltInAgentListState(state: BuiltInAgentState): BuiltInAgentStat
       ...state.agent,
       adapterConfig: {},
       runtimeConfig: {},
+      fallbacks: [],
     },
   };
 }
