@@ -13,6 +13,10 @@ import { GitHubError, type GitHubClient } from "./github.js";
  * - Every change to the authorization (device-flow completion, refresh with
  *   refresh-token rotation, revocation, fence results) runs under one lock per
  *   company, so a refresh can never overwrite a revocation.
+ * - A 401 alone never marks it revoked (VLL-1192). What does: GitHub refusing
+ *   a refresh (`bad_refresh_token`), a stored or issued token Paperclip cannot
+ *   use, or an administrator's revoke. Expiry follows GitHub's clock (`now` is
+ *   corrected by the `Date` of its answers).
  * - GitHub must issue access tokens that expire within 8 hours and a refresh
  *   token that expires too; anything else is refused.
  */
@@ -20,8 +24,12 @@ export interface FenceStatus {
   ok: boolean;
   checkedAt: string;
   reason?: string;
-  /** GitHub could not be reached; not drift. */
+  /** Not drift (GitHub could not be reached, or a 401 no refresh confirmed): writes resume after the next good check. */
   transient?: boolean;
+  /** GitHub's clock minus this host's, when more than a minute apart. */
+  clockSkewSeconds?: number;
+  /** When writes first paused on a transient failure, while they still do. */
+  pausedSince?: string;
   installationId?: number;
   repositories?: string[];
   permissions?: Record<string, string>;
@@ -64,6 +72,14 @@ export const MAX_ACCESS_TOKEN_SECONDS = 8 * 3600 + 300;
 export const MAX_REFRESH_TOKEN_SECONDS = 184 * 24 * 3600;
 const lifetime = (seconds: unknown, max: number) => Number.isSafeInteger(seconds) && Number(seconds) > 0 && Number(seconds) <= max;
 const NO_USER_TOKEN = "GitHub did not return a user token.";
+const REFUSED = "GitHub refused to refresh the user authorization (revoked or expired). Authorize the GitHub user again.";
+/**
+ * What the fence check recorded for any 401 before VLL-1192: a suspicion, not
+ * a revocation (a token GitHub expired while this host's clock was hours
+ * behind looked the same). The next refresh confirms it or clears it.
+ */
+const SUSPECTED_REVOCATION = "GitHub rejected the user token (authorization revoked). Authorize the GitHub user again.";
+const unauthorized = (error: unknown) => error instanceof GitHubError && error.status === 401;
 /** Null when GitHub's token answer has the expected shape and expiring lifetimes; otherwise why not. */
 function tokenProblem(data: Record<string, unknown>): string | null {
   if (typeof data.access_token !== "string" || !USER_TOKEN.test(data.access_token)) return NO_USER_TOKEN;
@@ -76,7 +92,10 @@ function tokenProblem(data: Record<string, unknown>): string | null {
   return null;
 }
 
-export class UserAuthorizationError extends Error {}
+export class UserAuthorizationError extends Error {
+  /** True when the authorization was kept and may still work: writes pause and resume after the next good check. */
+  constructor(message: string, readonly transient = false) { super(message); }
+}
 
 export class UserAuthorization {
   private tokens = new Map<string, { token: string; expires: number }>();
@@ -180,15 +199,17 @@ export class UserAuthorization {
       throw new UserAuthorizationError(`Authorize as GitHub user ${expectedLogin}; GitHub reported another account.`);
     }
     const login = user.login, userId = String(user.id);
+    // After GitHub's answers, whose Date set the clock: the token's lifetime starts about now on GitHub's clock.
+    const issued = this.now();
     await this.serialize(companyId, async () => {
       if ((this.generations.get(companyId) ?? 0) !== generation) {
         throw new UserAuthorizationError("The GitHub user authorization was revoked while it was being completed. Start the authorization again.");
       }
       await this.ctx.secrets.storeOwn(refreshToken, { companyId, configPath: "userRefreshToken" });
-      this.tokens.set(companyId, { token: accessToken, expires: now + Number(data.expires_in) * 1000 });
+      this.tokens.set(companyId, { token: accessToken, expires: issued + Number(data.expires_in) * 1000 });
       await this.writeState(companyId, {
-        login, userId, authorizedAt: new Date(now).toISOString(),
-        accessTokenExpiresAt: expiry(now, data.expires_in), refreshTokenExpiresAt: expiry(now, data.refresh_token_expires_in),
+        login, userId, authorizedAt: new Date(issued).toISOString(),
+        accessTokenExpiresAt: expiry(issued, data.expires_in), refreshTokenExpiresAt: expiry(issued, data.refresh_token_expires_in),
       });
     });
     return { status: "authorized", login, userId };
@@ -206,6 +227,35 @@ export class UserAuthorization {
     return refresh;
   }
 
+  /**
+   * Calls GitHub with the user token. A 401 alone never means the authorization
+   * was revoked: GitHub expires access tokens by its own clock, and a host clock
+   * hours off (a VM paused and resumed) still calls an expired token fresh. The
+   * token is dropped, refreshed with the stored refresh token and the call is
+   * retried once. Only the refresh can confirm a revocation (bad_refresh_token);
+   * a 401 right after a good refresh pauses writes without marking anything.
+   */
+  async withToken<T>(companyId: string, use: (token: string) => Promise<T>): Promise<T> {
+    const cached = this.tokens.get(companyId)?.token;
+    let token = await this.accessToken(companyId);
+    // At most one refresh per call: a token refreshed just now is not refreshed again.
+    let refreshed = token !== cached;
+    for (;;) {
+      try { return await use(token); } catch (error) {
+        if (!unauthorized(error)) throw error;
+        this.drop(companyId, token);
+        if (refreshed) throw new UserAuthorizationError("GitHub rejected the user token right after a refresh; the authorization is kept and writes resume after the next good check.", true);
+      }
+      token = await this.accessToken(companyId);
+      refreshed = true;
+    }
+  }
+
+  /** Forgets a cached access token GitHub refused, unless a newer one replaced it meanwhile. */
+  private drop(companyId: string, token: string): void {
+    if (this.tokens.get(companyId)?.token === token) this.tokens.delete(companyId);
+  }
+
   /** Runs under the company's lock. `generation` is the revocation count when the token was asked for. */
   private async refresh(companyId: string, generation: number): Promise<string> {
     const revokedMeanwhile = () => (this.generations.get(companyId) ?? 0) !== generation;
@@ -215,21 +265,34 @@ export class UserAuthorization {
     if (fresh && fresh.expires - REFRESH_MARGIN_MS > this.now()) return fresh.token;
     const state = await this.state(companyId);
     if (!state) throw new UserAuthorizationError("Authorize the GitHub user for this company first.");
-    if (state.needsReauthorization) throw new UserAuthorizationError(state.needsReauthorization);
+    // A suspected revocation is not refused: this refresh confirms it or clears it.
+    if (state.needsReauthorization && state.needsReauthorization !== SUSPECTED_REVOCATION) throw new UserAuthorizationError(state.needsReauthorization);
     const config = await this.config(companyId);
-    const refreshToken = await this.ctx.secrets.resolve(config.refreshToken, { companyId, configPath: "userRefreshToken" });
-    if (!USER_TOKEN.test(refreshToken.trim())) return this.reauthorize(companyId, "Authorize the GitHub user for this company again.");
-    const clientSecret = await this.ctx.secrets.resolve(config.clientSecret, { companyId, configPath: "userClientSecret" });
-    const now = this.now();
-    const data = await this.github.oauth("/login/oauth/access_token", {
-      client_id: config.clientId, client_secret: clientSecret.trim(), grant_type: "refresh_token", refresh_token: refreshToken.trim(),
-    });
+    const storedRefreshToken = async () => (await this.ctx.secrets.resolve(config.refreshToken, { companyId, configPath: "userRefreshToken" })).trim();
+    let refreshToken = await storedRefreshToken();
+    if (!USER_TOKEN.test(refreshToken)) return this.reauthorize(companyId, "Authorize the GitHub user for this company again.");
+    const clientSecret = (await this.ctx.secrets.resolve(config.clientSecret, { companyId, configPath: "userClientSecret" })).trim();
+    const exchange = async (token: string) => {
+      try { return await this.github.oauth("/login/oauth/access_token", { client_id: config.clientId, client_secret: clientSecret, grant_type: "refresh_token", refresh_token: token }); }
+      catch { throw new UserAuthorizationError("GitHub could not be reached to refresh the user token; the authorization is kept and writes resume after the next good check.", true); }
+    };
+    let data = await exchange(refreshToken);
+    if (data.error === "bad_refresh_token") {
+      // Confirmed only when the stored token is still the one GitHub refused: another worker may have rotated it meanwhile.
+      const stored = await storedRefreshToken();
+      if (stored !== refreshToken && USER_TOKEN.test(stored)) { refreshToken = stored; data = await exchange(stored); }
+      // A revocation, or 6 months without use: GitHub's answer about this authorization.
+      if (data.error === "bad_refresh_token") return this.reauthorize(companyId, REFUSED);
+    }
     if (data.error !== undefined || typeof data.access_token !== "string") {
-      // bad_refresh_token after a revocation or 6 months without use.
-      return this.reauthorize(companyId, "GitHub refused to refresh the user authorization (revoked or expired). Authorize the GitHub user again.");
+      // Not an answer about the authorization (for example incorrect_client_credentials): keep it and pause writes.
+      const code = typeof data.error === "string" && /^[a-z_]{1,64}$/.test(data.error) ? ` (${data.error})` : "";
+      throw new UserAuthorizationError(`GitHub did not refresh the user token${code}; the authorization is kept and writes resume after the next good check. If this persists, check the App's client secret (userClientSecret).`, true);
     }
     const problem = tokenProblem(data);
     if (problem) return this.reauthorize(companyId, `${problem} Authorize the GitHub user again.`);
+    // After GitHub's answer, whose Date set the clock: the token's lifetime starts about now on GitHub's clock.
+    const now = this.now();
     // Revoked while the refresh was in flight: keep nothing it returned. GitHub already
     // rotated the refresh token, so the old one is dead too.
     if (revokedMeanwhile()) throw new UserAuthorizationError("The GitHub user authorization was revoked. Authorize the GitHub user again.");
@@ -240,8 +303,10 @@ export class UserAuthorization {
       // works for 8 hours; after that a new authorization is needed.
       this.ctx.logger.error("Could not store the rotated GitHub refresh token", { companyId, error: error instanceof Error ? error.name : "unknown" });
     }
-    const latest = await this.state(companyId);
-    await this.writeState(companyId, { ...(latest ?? state), accessTokenExpiresAt: expiry(now, data.expires_in), refreshTokenExpiresAt: expiry(now, data.refresh_token_expires_in) });
+    const { needsReauthorization, ...latest } = await this.state(companyId) ?? state;
+    // GitHub refreshed it, so a suspected revocation was not one; any other reason stays.
+    await this.writeState(companyId, { ...latest, ...(needsReauthorization && needsReauthorization !== SUSPECTED_REVOCATION ? { needsReauthorization } : {}),
+      accessTokenExpiresAt: expiry(now, data.expires_in), refreshTokenExpiresAt: expiry(now, data.refresh_token_expires_in) });
     // A revocation requested meanwhile waits for this lock and then overwrites the stored token; hand out nothing.
     if (revokedMeanwhile()) throw new UserAuthorizationError("The GitHub user authorization was revoked. Authorize the GitHub user again.");
     const accessToken = data.access_token as string;
@@ -263,15 +328,11 @@ export class UserAuthorization {
     if (state && state.needsReauthorization !== reason) await this.writeState(companyId, { ...state, needsReauthorization: reason });
   }
 
-  /** Called when GitHub rejects the user token: stop using it until someone authorizes again. */
-  async revoked(companyId: string, reason: string): Promise<void> {
-    // Counted at once, so a refresh already waiting or in flight hands out nothing.
-    this.generations.set(companyId, (this.generations.get(companyId) ?? 0) + 1);
-    this.tokens.delete(companyId);
-    await this.serialize(companyId, () => this.markRevoked(companyId, reason));
-  }
-
-  /** Forgets every token held for the company and overwrites the stored refresh token, after any refresh in flight. */
+  /**
+   * An administrator's revoke: forgets every token held for the company and
+   * overwrites the stored refresh token, after any refresh in flight. Nothing
+   * else overwrites it: a refresh token is kept until a revocation is confirmed.
+   */
   async forget(companyId: string, reason: string): Promise<void> {
     this.generations.set(companyId, (this.generations.get(companyId) ?? 0) + 1);
     this.tokens.delete(companyId);
@@ -281,10 +342,5 @@ export class UserAuthorization {
       try { await this.ctx.secrets.storeOwn("revoked", { companyId, configPath: "userRefreshToken" }); }
       catch { /* No bound secret: nothing to overwrite. */ }
     });
-  }
-
-  /** True when GitHub's error means the user token no longer works. */
-  static rejected(error: unknown): boolean {
-    return error instanceof GitHubError && error.status === 401;
   }
 }
