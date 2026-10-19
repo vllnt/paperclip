@@ -2474,7 +2474,7 @@ export function routineService(
             actorUserId: input.actor?.userId ?? null,
             actorAgentId: input.actor?.agentId ?? null,
           };
-          const gating = await finalizeRun(createdRun.id, { status: "gating", gateDispatchInput: parked }, txDb);
+          const gating = await finalizeRun(createdRun.id, { status: "gating", gateDispatchInput: { ...parked } }, txDb);
           await updateRoutineTouchedState({
             routineId: input.routine.id,
             triggerId: input.trigger?.id ?? null,
@@ -2488,7 +2488,6 @@ export function routineService(
           gated &&
           gated.decision.action === "wake" &&
           !gated.decision.note &&
-          input.source !== "event" &&
           input.routine.routineNoopSkipSettings?.skipUnchangedGateResult !== false &&
           gated.gateResult?.resultFingerprint &&
           (await lastGateResultFingerprint(txDb, input.routine, input.trigger?.id ?? null, createdRun.id)) ===

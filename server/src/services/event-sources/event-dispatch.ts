@@ -477,7 +477,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         }
         const [run] = await txDb
           .insert(routineRuns)
-          .values(parkAs ? { ...values, status: "gating", gateDispatchInput: parkAs } : { ...values, status: "received" })
+          .values(parkAs ? { ...values, status: "gating", gateDispatchInput: { ...parkAs } } : { ...values, status: "received" })
           .returning();
         return run!;
       };
