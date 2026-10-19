@@ -84,6 +84,18 @@ const SEARCHABLE_FILTER_THRESHOLD = 6;
 const NO_OPTIONS: readonly never[] = [];
 
 /**
+ * Returns the previous array while a new one holds the same options. Callers
+ * build the lists with `.map(...)` on every render, so the reference changes on
+ * every parent render even when no option does, and each new reference would
+ * queue another deferred pass over the whole list.
+ */
+function useStableOptions<T>(options: readonly T[]): readonly T[] {
+  const signature = JSON.stringify(options);
+  // The signature stands in for the content, so the memo is rebuilt only when an option changes.
+  return useMemo(() => options, [signature]);
+}
+
+/**
  * Renders a checkbox list one low-priority pass after the rest of the popover.
  * Opening the popover mounts every row, and each row is a Radix checkbox of about
  * a dozen components, so a long list holds up the first paint of the popover.
@@ -97,7 +109,7 @@ function DeferredOptions<T>({
   options: readonly T[];
   renderOption: (option: T) => ReactNode;
 }) {
-  const deferredOptions = useDeferredValue(options, NO_OPTIONS);
+  const deferredOptions = useDeferredValue(useStableOptions(options), NO_OPTIONS);
   return <>{deferredOptions.map((option) => renderOption(option))}</>;
 }
 
