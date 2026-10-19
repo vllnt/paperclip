@@ -388,7 +388,7 @@ export async function reapSshRunDirectory(input: {
     // exists nowhere else, as far as a remote ref can tell: a remote ref is a hint
     // that the work was pushed, never proof. Any doubt keeps it. Nothing is
     // bundled: a folder that passes holds nothing to save.
-    '    rd status "git status" G status --porcelain',
+    '    rd status "git status" G status --porcelain --untracked-files=all',
     '    if [ -s "$list.status.body" ]; then keep dirty; fi',
     '    rd stash "git stash list" G stash list --format=%H',
     '    if [ -s "$list.stash.body" ]; then keep stash; fi',
@@ -463,7 +463,7 @@ export async function reapSshRunDirectory(input: {
     '      "")',
     '        if [ -n "$tree" ] && [ "$main" = 0 ] && [ -z "$prunable" ]; then',
     '          neutralize_filters "$tree"',
-    '          rdkey=$index; rd wtstatus "git status (extra worktree)" gitx "$tree" status --porcelain; rdkey=""',
+    '          rdkey=$index; rd wtstatus "git status (extra worktree)" gitx "$tree" status --porcelain --untracked-files=all; rdkey=""',
     '          neutralize_filters "$ws"',
     '          if [ -s "$list.wtstatus.$index.body" ]; then keep worktree_dirty; fi',
     '          if [ -n "$detached" ] && [ -n "$treehead" ]; then',
@@ -477,7 +477,7 @@ export async function reapSshRunDirectory(input: {
     '  done < "$list.trees.body"',
     // Uncommitted work: a snapshot commit of what git tracks or would track.
     // The index file is named relative to the repository, which is `-C workspace`.
-    '  rd status "git status" G status --porcelain',
+    '  rd status "git status" G status --porcelain --untracked-files=all',
     '  if [ -s "$list.status.body" ]; then',
     '    idx="../$sdir/index"; rm -f -- "$scratch/index"',
     '    if [ -n "$head" ]; then GIT_INDEX_FILE="$idx" G read-tree HEAD || fail "git read-tree"; fi',
@@ -505,12 +505,21 @@ export async function reapSshRunDirectory(input: {
     '      if [ -e "./$id.bundle" ]; then if [ -f "./$id.bundle" ]; then exit 4; fi; exit 2; fi',
     '      exit 0 ); pub=$?',
     '    if [ "$pub" != 0 ] && [ "$pub" != 4 ]; then rm -f -- "$scratch/bundle"; keep preserve_failed; fi',
-    // An existing bundle is reused, untouched, only when its refs are exactly the
-    // computed ones. Otherwise the new bundle is moved into the preserved
-    // directory under a unique temporary name, verified, flushed to disk, the old
+    // An existing bundle is reused only when its refs are exactly the computed
+    // ones, after refreshing retention. Otherwise the new bundle is moved into
+    // the preserved directory under a unique temporary name, verified, flushed
+    // to disk, the old
     // bundle is kept as <id>.superseded.bundle (a hard link, so nothing is
     // copied), and the new one is renamed into place.
     '    if [ "$pub" = 4 ] && matches "$bundle"; then',
+    // Renew retention before cleanup can expire the only preserved copy. Confine
+    // the touch, never create a missing file or follow a symlink, and flush the
+    // timestamp before allowing workspace removal. Any failure keeps the run.
+    '      ( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',
+    '        [ -f "./$id.bundle" ] && [ ! -L "./$id.bundle" ] || exit 2',
+    '        touch -c -h -- "./$id.bundle" || exit 2',
+    '        fsync_path "./$id.bundle" || exit 2',
+    '      ) || fail "bundle retention"',
     '      rm -f -- "$scratch/bundle"',
     "    else",
     '      staged=$( cd "$preserved" 2>/dev/null && [ "$(pwd -P)" = "$canon/.paperclip-runtime/preserved" ] || exit 2',

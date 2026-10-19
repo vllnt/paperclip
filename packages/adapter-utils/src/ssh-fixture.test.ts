@@ -1844,6 +1844,32 @@ describe("SSH run directory reaper", () => {
     await expect(git(clone, ["show", `refs/paperclip/preserved/${run.runId}/worktree:ignored.log`])).rejects.toThrow();
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it.each(["legacy", "primary", "extra worktree"] as const)("protects untracked files hidden by status.showUntrackedFiles=no in the %s workspace", async (kind) => {
+    const host = await startHost("SSH reaper hidden untracked test");
+    if (!host) return;
+    const run = await host.gitRun();
+    const clone = kind === "primary" ? await host.hostClone(run.workspace) : null;
+    await git(run.workspace, ["config", "status.showUntrackedFiles", "no"]);
+    if (kind === "legacy") await git(run.workspace, ["update-ref", "refs/remotes/origin/main", run.seed]);
+    const workspace = kind === "extra worktree" ? path.join(run.runDir, "extra-tree") : run.workspace;
+    if (kind === "extra worktree") await git(run.workspace, ["worktree", "add", "-q", "-b", "side", workspace]);
+    await writeFile(path.join(workspace, "only-copy.txt"), "never committed\n");
+    expect(await git(workspace, ["status", "--porcelain"])).toBe("");
+
+    const result = kind === "legacy" ? await host.reapLegacy(run.runId) : await host.reap(run.runId);
+
+    if (clone) {
+      const ref = `refs/paperclip/preserved/${run.runId}/worktree`;
+      expect(result).toMatchObject({ outcome: "removed", preserved: [ref] });
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${ref}:${ref}`]);
+      expect(await git(clone, ["show", `${ref}:only-copy.txt`])).toBe("never committed");
+      await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      expect(result).toMatchObject({ outcome: "kept", reason: kind === "legacy" ? "dirty" : "worktree_dirty" });
+      await expect(readFile(path.join(workspace, "only-copy.txt"), "utf8")).resolves.toBe("never committed\n");
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("preserves the branch of a clean extra worktree and keeps the directory when an extra worktree has uncommitted work", async () => {
     const host = await startHost("SSH reaper worktree test");
     if (!host) return;
@@ -1907,7 +1933,7 @@ describe("SSH run directory reaper", () => {
     return { ...run, ns, headRef: `${ns}/head`, bundlePath: host.preservedBundle(run.runId) };
   }
 
-  it("reuses a published bundle that holds exactly the computed refs, without rewriting it", async () => {
+  it("refreshes retention when reusing an expired matching bundle without rewriting it", async () => {
     const host = await startHost("SSH reaper existing bundle test");
     if (!host) return;
     const run = await runWithAgentCommit(host);
@@ -1915,13 +1941,39 @@ describe("SSH run directory reaper", () => {
     await git(run.workspace, ["update-ref", run.headRef, "HEAD"]);
     await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef]);
     const published = await readFile(run.bundlePath);
+    const expired = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    await utimes(run.bundlePath, expired, expired);
+    const refreshStartedAt = Math.floor(Date.now() / 1000) * 1000;
 
     const result = await host.reap(run.runId);
 
     expect(result).toMatchObject({ outcome: "removed", preserved: [run.headRef] });
     expect((await readFile(run.bundlePath)).equals(published)).toBe(true);
+    expect((await stat(run.bundlePath)).mtimeMs).toBeGreaterThanOrEqual(refreshStartedAt);
     await expect(stat(path.join(path.dirname(run.bundlePath), `${run.runId}.superseded.bundle`))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it.each(["touch", "sync"])("keeps the workspace when reused bundle retention refresh fails at %s", async (command) => {
+    const host = await startHost("SSH reaper retention refresh failure test");
+    if (!host) return;
+    const run = await runWithAgentCommit(host);
+    await mkdir(path.dirname(run.bundlePath), { recursive: true });
+    await git(run.workspace, ["update-ref", run.headRef, "HEAD"]);
+    await git(run.workspace, ["bundle", "create", run.bundlePath, run.headRef]);
+    const published = await readFile(run.bundlePath);
+    const expired = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    await utimes(run.bundlePath, expired, expired);
+
+    const result = await reapSshRunDirectory({
+      spec: host.spec, remoteRoot: host.root, runId: run.runId, seed: run.seed,
+      testHooks: { afterConfine: `${command}() { return 42; }` },
+    });
+
+    expect(result).toMatchObject({ outcome: "kept", reason: "preserve_failed", detail: "bundle retention" });
+    await expect(readFile(path.join(run.workspace, "agent.txt"), "utf8")).resolves.toBe("agent commit\n");
+    expect((await readFile(run.bundlePath)).equals(published)).toBe(true);
+    await expect(stat(path.join(run.runDir, SSH_RUN_RESTORED_MARKER))).rejects.toMatchObject({ code: "ENOENT" });
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("rebuilds the bundle when it holds a ref this pass did not compute, so the final bundle holds exactly the computed refs", async () => {
