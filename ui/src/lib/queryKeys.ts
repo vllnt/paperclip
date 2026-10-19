@@ -453,6 +453,14 @@ export const queryKeys = {
       status: "open" | "resolved" | "all" = "all",
     ) => ["routines", "document-annotations", routineId, key, status] as const,
   },
+  eventSources: {
+    list: (companyId: string) => ["event-sources", companyId] as const,
+    detail: (id: string) => ["event-sources", "detail", id] as const,
+    deliveries: (id: string, status: string) =>
+      ["event-sources", "deliveries", id, status] as const,
+    routineGroups: (routineId: string, open: boolean) =>
+      ["event-sources", "routine-groups", routineId, open] as const,
+  },
   folders: {
     list: (companyId: string, kind: string) =>
       ["folders", companyId, kind] as const,

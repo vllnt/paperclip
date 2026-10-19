@@ -1,0 +1,135 @@
+name: CI
+# One workflow and one required check: "CI gate". There are no `paths` filters on
+# purpose. A path-filtered check that never starts leaves a required check on
+# "Expected" forever, so which jobs run is decided inside the workflow (the
+# `changes` job) and the gate always reports. `pull_request` has no base-branch
+# filter so a PR retargeted to main (stacked PRs) already has a result;
+# `merge_group` is listed so the same checks report if a merge queue is turned on.
+#
+# Adding a job: add it under `jobs:`, to `needs:` of `gate`, and to ALWAYS (or
+# CONDITIONAL plus a classifier output) in scripts/ci/gate-verdict.mjs.
+# ci-workflow.test.mjs fails if they disagree. Require only "CI gate".
+#
+# Runners: `changes`, `scripts`, `secrets` and `gate` are short and always use
+# GitHub-hosted ubuntu-latest (the Node it ships is enough; the scripts have no
+# dependencies), so a broken or empty self-hosted pool cannot stop the gate from
+# reporting. Heavy jobs use the repository variable CI_RUNS_ON, a single runner
+# label (default ubuntu-latest); use ephemeral runners only.
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # An empty PR number must not collapse every push into one cancelling group.
+  group: ci-pr-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: CI changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+      need_sentry: ${{ steps.classify.outputs.need_sentry }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Classify the change
+        id: classify
+        run: |
+          set -euo pipefail
+          paths="$RUNNER_TEMP/changed-paths.bin"
+          : > "$paths"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The checkout is the PR merge commit: HEAD^1 is the base, so this is exactly the PR's change.
+            # Anything unexpected leaves the list empty, which the classifier treats as "run everything".
+            if ! git rev-parse --verify --quiet HEAD^2 > /dev/null; then
+              echo "::warning::HEAD is not a merge commit; running everything"
+            elif ! git diff --no-renames -z --name-only HEAD^1 HEAD > "$paths"; then
+              echo "::warning::git diff failed; running everything"
+              : > "$paths"
+            fi
+          fi
+          node scripts/ci/classify-changes.mjs --event "$GITHUB_EVENT_NAME" < "$paths"
+
+  scripts:
+    name: CI script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: |
+            scripts/ci
+            .github/workflows
+          persist-credentials: false
+      - run: node --test scripts/ci/*.test.mjs
+
+  secrets:
+    name: Secrets
+    uses: ./.github/workflows/security.yml
+
+  sentry:
+    name: Real Sentry SDK isolation
+    needs: changes
+    if: needs.changes.outputs.need_sentry == 'true'
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9.15.4
+      - name: Install workspace dependencies
+        # This narrow contract needs no dependency or workspace lifecycle scripts.
+        run: |
+          if ! pnpm install --frozen-lockfile --ignore-scripts; then
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile --ignore-scripts
+          fi
+      - name: Install the audited optional SDK outside the workspace
+        run: |
+          sentry_version=$(node -p 'require("./server/package.json").peerDependencies["@sentry/node"]')
+          npm install --prefix "$RUNNER_TEMP/sentry-contract-sdk" --ignore-scripts --no-audit --no-fund --package-lock=false "@sentry/node@$sentry_version"
+      - name: Verify run failure isolation with the real SDK
+        env:
+          NODE_PATH: ${{ runner.temp }}/sentry-contract-sdk/node_modules
+          PAPERCLIP_REQUIRE_SENTRY_TEST_SDK: "1"
+        run: pnpm --filter @paperclipai/server exec vitest run src/__tests__/run-failure-sentry-real-sdk.test.ts
+
+  gate:
+    name: CI gate
+    # Never skipped: a skipped required check counts as passing.
+    if: ${{ always() }}
+    needs: [changes, scripts, secrets, sentry]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Evaluate the gate
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/ci/evaluate-gate.mjs

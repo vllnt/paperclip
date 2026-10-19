@@ -99,6 +99,13 @@ import {
   updateRoutineTriggerSchema,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
+  // Event sources
+  createEventSourceSchema,
+  updateEventSourceSchema,
+  testEventSourceSchema,
+  rotateEventSourceSecretSchema,
+  listEventDeliveriesQuerySchema,
+  genericV1EventSchema,
   // Folders
   createFolderSchema,
   ensureMySkillFolderSchema,
@@ -230,6 +237,9 @@ import {
   resolveIssueRecoveryActionSchema,
   reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  issueRecoveryActionReadModelSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  ISSUE_STATUSES,
   cancelIssueThreadInteractionSchema,
   issueWaitRequestSchema,
   // Secret provider configs and remote import
@@ -1314,6 +1324,7 @@ const RUNTIME_TOOLS_OPERATIONS = new Set([
 ]);
 
 const PUBLIC_OPERATIONS = new Set([
+  "POST /api/event-sources/public/{publicId}/events",
   "GET /api/agent-avatars/{version}/{palette}/{file}",
   "GET /api/health",
   "GET /api/openapi.json",
@@ -1357,6 +1368,10 @@ const browserUseOperations = [
 ] as const;
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/event-sources",
+  "PATCH /api/event-sources/{id}",
+  "DELETE /api/event-sources/{id}",
+  "POST /api/event-sources/{id}/rotate-secret",
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
@@ -1598,6 +1613,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
 ]);
 
 const CREATED_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/event-sources",
   "POST /api/adapters/install",
   "POST /api/chat-endpoints/{endpointId}/setup-secret",
   "POST /api/companies/{companyId}/agent-hires",
@@ -3485,6 +3501,21 @@ registry.registerPath({
   path: "/api/agents/{id}",
   tags: ["agents"],
   summary: "Update an agent",
+  description:
+    "By default `adapterConfig` merges at the top level and `runtimeConfig` is replaced. Set " +
+    "`replaceAdapterConfig: true` to replace `adapterConfig`. Set `mergeConfig: true` to apply `adapterConfig` and " +
+    "`runtimeConfig` as JSON merge patches (RFC 7396) over the stored config: only the named keys change, `null` " +
+    "removes a key, arrays replace, and each `adapterConfig.env` entry and `adapterConfig.workspaceStrategy` is " +
+    "replaced whole. Keys you do not name keep their stored values, including secrets, so they never have to be " +
+    "resent. An env value read back from GET as a redacted plain binding restores the stored value. The merged " +
+    "configs are validated like a full update. A config that changed while the patch was applied returns 409. " +
+    "`mergeConfig` cannot be combined with `replaceAdapterConfig` or an `adapterType` change, and cannot remove " +
+    "`runtimeConfig.aiConnection` (422). A merge patch is refused with 400, the path of the offending value in " +
+    "`details[].path`, and nothing stored, when a key anywhere in it (arrays included) is `__proto__`, " +
+    "`constructor` or `prototype`, when it is nested deeper than 32 levels, or when it holds more than 10,000 values. " +
+    "An agent key gets 403 when the merged `adapterConfig` would add, change or remove a host-executed " +
+    "`workspaceStrategy` command (`provisionCommand`, `runtimeProvisionCommand` or `teardownCommand`), also when " +
+    "the patch replaces or removes the whole strategy; a board user with `agents:configure` may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateAgentSchema.omit({ permissions: true })),
@@ -3493,7 +3524,10 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -4916,6 +4950,148 @@ registry.registerPath({
   tags: ["routines"],
   summary: "Fire a public routine trigger",
   request: { params: z.object({ publicId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+// ─── Event sources ───────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/public/{publicId}/events",
+  tags: ["event-sources"],
+  summary: "Deliver a signed external event",
+  description:
+    "Sender-facing ingress. Authenticated by the source's own secret, not by a Paperclip credential: " +
+    "send `Authorization: Bearer <secret>` for bearer sources, or `X-Paperclip-Timestamp` plus " +
+    "`X-Paperclip-Signature` (HMAC-SHA256 over `<timestamp>.<raw body>`) for HMAC sources. " +
+    "The body is capped at 64 KB. 202 means accepted; 200 `{duplicate:true}` means the delivery was already " +
+    "processed; 409 `{inProgress:true}` with `Retry-After` means another attempt holds the delivery; " +
+    "503 with `Retry-After` is a transient failure the sender should retry.",
+  request: {
+    params: z.object({ publicId: z.string() }),
+    body: jsonBody(genericV1EventSchema),
+  },
+  responses: {
+    200: r.ok(),
+    202: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+    413: r.payloadTooLarge,
+    415: r.unsupportedMediaType,
+    422: r.unprocessable,
+    429: { description: "Rate limited", content: { "application/json": { schema: ErrorSchema } } },
+    503: { description: "Transient failure; retry", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/event-sources",
+  tags: ["event-sources"],
+  summary: "List event sources in a company",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ includeArchived: z.enum(["true", "false", "1", "0"]).optional() }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/event-sources",
+  tags: ["event-sources"],
+  summary: "Create an event source",
+  description: "The response carries the ingress URL and signing secret. The secret is shown only here and on rotation.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(createEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Get an event source",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Update an event source",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(updateEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Archive an event source",
+  description: "Soft delete: the source stops accepting events and its trigger subscriptions stay for audit.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/{id}/rotate-secret",
+  tags: ["event-sources"],
+  summary: "Rotate an event source secret",
+  description: "Returns the new secret once. The previous secret stops working immediately.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(rotateEventSourceSecretSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/{id}/test",
+  tags: ["event-sources"],
+  summary: "Dry-run an event payload against a source",
+  description: "Reports what each stage would do for the payload. Writes no issues, comments, or wakeups.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(testEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/event-sources/{id}/deliveries",
+  tags: ["event-sources"],
+  summary: "List recent deliveries for an event source",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: listEventDeliveriesQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/routines/{id}/event-groups",
+  tags: ["event-sources"],
+  summary: "List event groups (alert issues) of a routine",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({
+      open: z.enum(["true", "false", "1", "0"]).optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
@@ -10373,6 +10549,33 @@ registerCurrentRoute({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["issues"],
+  summary:
+    "List issue recovery actions across a company, newest first, with their source issue. " +
+    "Read-only (no revalidation). Actors without company-scope read only see actions on issues they can read.",
+  query: listCompanyIssueRecoveryActionsQuerySchema,
+  responses: {
+    200: r.ok(
+      z.array(
+        issueRecoveryActionReadModelSchema.extend({
+          issue: z.object({
+            id: z.string(),
+            identifier: z.string().nullable(),
+            title: z.string(),
+            status: z.enum(ISSUE_STATUSES),
+          }),
+        }),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
   },
 });
 
