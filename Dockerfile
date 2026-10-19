@@ -151,6 +151,10 @@ RUN node --test scripts/ci/run-image-build-vitest.test.mjs
 RUN sh scripts/ci/run-image-build-vitest.sh
 RUN pnpm check:token-gates
 RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
+# The GitHub credentials route: the short per-run cache of ordinary reads (what it keeps, for how long, for whom) and what the
+# route does when its caller has gone. No database: the embedded Postgres tests of the same change are skipped in this build
+# (it runs as root), so they gate on a host that does not.
+RUN pnpm exec vitest run server/src/__tests__/github-read-decision-cache.test.ts server/src/__tests__/github-credentials-route-caller.test.ts
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
 # after the SDK build, so build the SDK before typechecking the UI.
 RUN pnpm --filter @paperclipai/plugin-sdk build
