@@ -368,7 +368,7 @@ export function registerWriteIdentity(
       if (latest?.enabled) {
         await savePolicy(companyId, { ...latest, enabled: false });
         await ctx.activity.log({ companyId, message: "github.fence_violation", metadata: { reason: status.reason ?? "unknown", writesDisabled: true } });
-        // Tell the board at once: an activity entry alone went unseen for hours (VLL-1197).
+        // Tell the board at once: an activity entry alone can go unnoticed for hours.
         await alerts.writesOff(companyId, { reason: status.reason ?? "unknown", reauthorize: Boolean((await users.state(companyId))?.needsReauthorization) });
       }
     }
