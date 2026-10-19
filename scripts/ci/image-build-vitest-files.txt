@@ -1,3 +1,4 @@
+cli/src/__tests__/agent-lifecycle.test.ts
 # Vitest files required before building the production image.
 # One path per line; blank lines and comments are ignored.
 cli/src/__tests__/agent-config.test.ts
