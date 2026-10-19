@@ -39,7 +39,7 @@ function deepEqual(left: unknown, right: unknown): boolean {
   if (isPlainObject(left) && isPlainObject(right)) {
     const leftKeys = Object.keys(left);
     if (leftKeys.length !== Object.keys(right).length) return false;
-    return leftKeys.every((key) => key in right && deepEqual(left[key], right[key]));
+    return leftKeys.every((key) => Object.hasOwn(right, key) && deepEqual(left[key], right[key]));
   }
   return false;
 }
@@ -55,7 +55,7 @@ export function diffConfigLeaves(before: unknown, after: unknown): ConfigLeafCha
     if (hasLeft && hasRight && isPlainObject(left) && isPlainObject(right)) {
       const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
       for (const key of keys) {
-        walk(joinPath(path, key), left[key], right[key], key in left, key in right);
+        walk(joinPath(path, key), left[key], right[key], Object.hasOwn(left, key), Object.hasOwn(right, key));
       }
       return;
     }

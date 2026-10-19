@@ -211,7 +211,7 @@ export function diffFileSets(from: DiffableFile[], to: DiffableFile[]): FileSetD
       change: "modified",
       binary,
       diff: binary
-        ? [...(contentChanged ? [`Binary file ${path} differs`] : []), ...modeLine]
+        ? [`Binary file ${path} differs`, ...modeLine]
         : [`--- a/${path}`, `+++ b/${path}`, ...modeLine, ...unifiedLineDiff(before.content, after.content)],
     });
   }

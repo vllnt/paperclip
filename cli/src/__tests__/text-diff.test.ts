@@ -91,6 +91,32 @@ describe("diffFileSets", () => {
     expect(result[3]?.diff).toEqual(["--- a/scripts/run.sh", "+++ /dev/null", "@@ -1,1 +0,0 @@", "-echo hi"]);
   });
 
+  it.each([[false, true], [true, false]])(
+    "includes the filename for a binary executable-bit change from %s to %s",
+    (beforeExecutable, afterExecutable) => {
+      const file = { path: "scripts/tool", content: "AA==", encoding: "base64" as const };
+      const result = diffFileSets(
+        [{ ...file, executable: beforeExecutable }],
+        [{ ...file, executable: afterExecutable }],
+      );
+
+      expect(result).toEqual([
+        {
+          path: file.path,
+          change: "modified",
+          binary: true,
+          diff: ["Binary file scripts/tool differs", `executable: ${beforeExecutable} -> ${afterExecutable}`],
+        },
+      ]);
+      // The CLI prints these lines directly, without a separate filename header.
+      expect(result.flatMap((entry) => entry.diff)).toEqual([
+        "Binary file scripts/tool differs",
+        `executable: ${beforeExecutable} -> ${afterExecutable}`,
+      ]);
+      expect(diffFileSets([file], [file])).toEqual([]);
+    },
+  );
+
   it("reports an executable-bit change on otherwise equal content", () => {
     const result = diffFileSets(
       [{ path: "run.sh", content: "x\n" }],

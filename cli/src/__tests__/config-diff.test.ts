@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { diffConfigRevision, diffConfigLeaves } from "../commands/client/config-diff.js";
+import { diffConfigRevision, diffConfigLeaves, formatConfigRevisionDiff } from "../commands/client/config-diff.js";
 
 describe("diffConfigLeaves", () => {
   it("reports changed, added, and removed leaves with dotted paths", () => {
@@ -31,6 +31,15 @@ describe("diffConfigLeaves", () => {
     ]);
   });
 
+  it("compares own object keys inside arrays", () => {
+    const before = JSON.parse('{"tags":[{"__proto__":{}}]}');
+    const after = { tags: [{ label: "custom" }] };
+
+    expect(diffConfigLeaves(before, after)).toEqual([
+      { path: "tags", kind: "changed", before: before.tags, after: after.tags },
+    ]);
+  });
+
   it("treats a type change between object and scalar as one leaf change", () => {
     expect(diffConfigLeaves({ metadata: null }, { metadata: { owner: "ops" } })).toEqual([
       { path: "metadata", kind: "changed", before: null, after: { owner: "ops" } },
@@ -49,6 +58,42 @@ describe("diffConfigLeaves", () => {
 });
 
 describe("diffConfigRevision", () => {
+  it.each(["toString", "constructor", "__proto__", "hasOwnProperty"])(
+    "treats %s as an own JSON key when added or removed",
+    (key) => {
+      const empty = { metadata: {} };
+      const populated = JSON.parse(JSON.stringify({ metadata: { [key]: "custom" } }));
+      const added = diffConfigRevision({
+        changedKeys: ["metadata"],
+        beforeConfig: empty,
+        afterConfig: populated,
+      });
+      const removed = diffConfigRevision({
+        changedKeys: ["metadata"],
+        beforeConfig: populated,
+        afterConfig: empty,
+      });
+      const expectedAdded = {
+        changedKeys: ["metadata"],
+        changes: [{ path: `metadata.${key}`, kind: "added", before: null, after: "custom" }],
+        redactedOnlyKeys: [],
+      };
+      const expectedRemoved = {
+        changedKeys: ["metadata"],
+        changes: [{ path: `metadata.${key}`, kind: "removed", before: "custom", after: null }],
+        redactedOnlyKeys: [],
+      };
+
+      expect(added).toEqual(expectedAdded);
+      expect(removed).toEqual(expectedRemoved);
+      expect(JSON.parse(JSON.stringify(added))).toEqual(expectedAdded);
+      expect(JSON.parse(JSON.stringify(removed))).toEqual(expectedRemoved);
+      expect(formatConfigRevisionDiff(added)).toEqual([`metadata.${key}: (unset) -> "custom"`]);
+      expect(formatConfigRevisionDiff(removed)).toEqual([`metadata.${key}: "custom" -> (unset)`]);
+      expect(diffConfigRevision({ beforeConfig: populated, afterConfig: populated }).changes).toEqual([]);
+    },
+  );
+
   it("keeps the server changedKeys and lists keys whose change is hidden by redaction", () => {
     const diff = diffConfigRevision({
       changedKeys: ["adapterConfig", "name"],
