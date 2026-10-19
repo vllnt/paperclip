@@ -11,13 +11,23 @@ const SUPERSEDED_CHECK_CHUNK = 500;
 const runIssueOrTask = sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId')`;
 
 /**
+ * A run without an issue (readRunIssueId reads an empty issue as none), as the
+ * predicate of heartbeat_runs_company_agent_no_issue_created_idx states it. Keep
+ * this exact expression: the planner uses a partial index only when the query
+ * implies its predicate.
+ */
+const runHasNoIssue = sql`(${runIssueOrTask} is null or ${runIssueOrTask} = '')`;
+
+/**
  * The exhausted runs that a newer run of the same agent on the same issue
  * supersedes. `issueId` is the run's issue as `readRunIssueId` reads it (null
- * when it has none). For an exhausted run on an issue, later runs are found
- * through the issue index, so no run context is loaded (detoasted). For the
- * rare exhausted run without an issue, the planner may read the agent's later
- * runs instead, and their context, up to the first match.
- * "Newer" compares milliseconds, as the JavaScript dates the feed compares.
+ * when it has none). Later runs are found through an index on the run's issue,
+ * or, for an exhausted run without an issue, on the agent's runs without one, so
+ * no run context is loaded (detoasted).
+ * "Newer" compares milliseconds, as the JavaScript dates the feed compares: a
+ * run is newer when it was created at least a millisecond after the candidate's
+ * millisecond, which equals date_trunc('milliseconds', created_at) > candidate
+ * and lets the index range over created_at.
  */
 export async function listSupersededExhaustedRunIds(
   db: Db,
@@ -36,7 +46,7 @@ export async function listSupersededExhaustedRunIds(
         select 1 from ${heartbeatRuns}
         where ${heartbeatRuns.companyId} = ${companyId}
           and ${heartbeatRuns.agentId} = candidate.agent_id
-          and date_trunc('milliseconds', ${heartbeatRuns.createdAt}) > candidate.created_at
+          and ${heartbeatRuns.createdAt} >= date_trunc('milliseconds', candidate.created_at) + interval '1 millisecond'
           and ${sameIssue}
       )`);
     for (const row of rows) superseded.add(row.id);
@@ -44,8 +54,7 @@ export async function listSupersededExhaustedRunIds(
   for (let start = 0; start < runs.length; start += SUPERSEDED_CHECK_CHUNK) {
     const chunk = runs.slice(start, start + SUPERSEDED_CHECK_CHUNK);
     await check(chunk.filter((run) => run.issueId !== null), sql`${runIssueOrTask} = candidate.issue_id`);
-    // readRunIssueId reads an empty issue as none.
-    await check(chunk.filter((run) => run.issueId === null), sql`(${runIssueOrTask} is null or ${runIssueOrTask} = '')`);
+    await check(chunk.filter((run) => run.issueId === null), runHasNoIssue);
   }
   return superseded;
 }
