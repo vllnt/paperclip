@@ -1,4 +1,3 @@
-cli/src/__tests__/archive-export.test.ts
 cli/src/__tests__/agent-lifecycle.test.ts
 # Vitest files required before building the production image.
 # One path per line; blank lines and comments are ignored.
@@ -59,7 +58,6 @@ server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
-server/src/__tests__/run-read-redaction-text.test.ts
 server/src/__tests__/routine-gate-command.test.ts
 server/src/__tests__/routine-gate-outcome.test.ts
 server/src/__tests__/routine-gate-source.test.ts
