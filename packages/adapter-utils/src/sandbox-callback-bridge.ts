@@ -281,6 +281,14 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/routines\/[^/]+\/triggers$/ },
   { method: "PATCH", path: /^\/api\/routine-triggers\/[^/]+$/ },
   { method: "DELETE", path: /^\/api\/routine-triggers\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/routines\/[^/]+\/event-groups$/ },
+
+  // Event sources: agents read sources (never secrets) and dry-run a payload against them. Creating, editing,
+  // rotating and archiving a source is board-only on the server, so it is not reachable through this bridge.
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/event-sources$/ },
+  { method: "GET", path: /^\/api\/event-sources\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/event-sources\/[^/]+\/deliveries$/ },
+  { method: "POST", path: /^\/api\/event-sources\/[^/]+\/test$/ },
 ] as const;
 
 // Keep the public alias for callers selecting the HTTP/2 transport.
@@ -328,6 +336,10 @@ export interface SandboxCallbackBridgeDirectories {
   hostLeaseFile: string;
 }
 
+export interface SandboxCallbackBridgeReadOptions {
+  signal?: AbortSignal;
+}
+
 export interface SandboxCallbackBridgeQueueClient {
   makeDir(remotePath: string): Promise<void>;
   // Optional batched directory create. The built-in clients create every
@@ -335,9 +347,13 @@ export interface SandboxCallbackBridgeQueueClient {
   // omits it; the worker falls back to sequential `makeDir` calls, so an
   // external implementation stays compatible without a change.
   makeDirs?(remotePaths: string[]): Promise<void>;
-  listJsonFiles(remotePath: string): Promise<string[]>;
-  fileSize?(remotePath: string): Promise<number>;
-  readTextFile(remotePath: string, maxBytes?: number): Promise<string>;
+  // The worker passes `signal` to the reads whose result it discards when it
+  // gives up on them (the queue listings and the recovery path's read). A
+  // client that can stop a remote command in flight stops it when the signal
+  // aborts; others ignore it.
+  listJsonFiles(remotePath: string, options?: SandboxCallbackBridgeReadOptions): Promise<string[]>;
+  fileSize?(remotePath: string, options?: SandboxCallbackBridgeReadOptions): Promise<number>;
+  readTextFile(remotePath: string, maxBytes?: number, options?: SandboxCallbackBridgeReadOptions): Promise<string>;
   writeTextFile(remotePath: string, body: string): Promise<void>;
   writeResponseFile?(
     responsePath: string,
@@ -416,6 +432,23 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
+/**
+ * {@link withTimeout} for a read the caller may give up on: on timeout it also
+ * aborts the signal it handed to `work`, so a client that can stop the remote
+ * command (the SSH runner) stops it instead of letting it run on.
+ */
+function withAbortingTimeout<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  const controller = new AbortController();
+  return withTimeout(work(controller.signal), timeoutMs, label).catch((error: unknown) => {
+    controller.abort(error);
+    throw error;
+  });
+}
+
 function toBuffer(bytes: Buffer | Uint8Array | ArrayBuffer): Buffer {
   if (Buffer.isBuffer(bytes)) return bytes;
   if (bytes instanceof ArrayBuffer) return Buffer.from(bytes);
@@ -455,6 +488,7 @@ async function runShell(
   timeoutMs: number,
   shellCommand: "bash" | "sh" = "sh",
   stdin?: string,
+  signal?: AbortSignal,
 ): Promise<RunProcessResult> {
   return await runSandboxBridgeControlCommand(runner, {
     command: shellCommand,
@@ -465,6 +499,7 @@ async function runShell(
     },
     timeoutMs,
     stdin,
+    signal,
     // Every command that rides this helper is bridge control-plane plumbing:
     // input delivery, output read, callback relay, and queue/setup bookkeeping.
     // It must run concurrently with the agent, so force it off the persistent
@@ -758,8 +793,11 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
   const defaultMaxReadBytes = input.maxReadBytes ?? sandboxBridgeEnvelopeLimit(DEFAULT_BRIDGE_MAX_BODY_BYTES);
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
-  const runChecked = async (action: string, script: string) =>
-    requireSuccessfulResult(action, await runShell(input.runner, input.remoteCwd, script, timeoutMs, shellCommand));
+  const runChecked = async (action: string, script: string, signal?: AbortSignal) =>
+    requireSuccessfulResult(
+      action,
+      await runShell(input.runner, input.remoteCwd, script, timeoutMs, shellCommand, undefined, signal),
+    );
 
   return {
     makeDir: async (remotePath) => {
@@ -772,7 +810,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const quoted = remotePaths.map((remotePath) => shellQuote(remotePath));
       await runChecked(`mkdir ${remotePaths.join(" ")}`, `mkdir -p ${quoted.join(" ")}`);
     },
-    listJsonFiles: async (remotePath) => {
+    listJsonFiles: async (remotePath, options) => {
       const result = await runShell(
         input.runner,
         input.remoteCwd,
@@ -786,6 +824,8 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         ].join("\n"),
         timeoutMs,
         shellCommand,
+        undefined,
+        options?.signal,
       );
       requireSuccessfulResult(`list ${remotePath}`, result);
       return result.stdout
@@ -794,11 +834,11 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         .filter((line) => line.length > 0)
         .sort((left, right) => left.localeCompare(right));
     },
-    fileSize: async (remotePath) => {
-      const result = await runChecked(`size ${remotePath}`, `wc -c < ${shellQuote(remotePath)}`);
+    fileSize: async (remotePath, options) => {
+      const result = await runChecked(`size ${remotePath}`, `wc -c < ${shellQuote(remotePath)}`, options?.signal);
       return Number(result.stdout.trim());
     },
-    readTextFile: async (remotePath, requestedMaxBytes) => {
+    readTextFile: async (remotePath, requestedMaxBytes, options) => {
       // Never read an unbounded remote file into host memory.
       const maxBytes = requestedMaxBytes ?? defaultMaxReadBytes;
       // Read in slices. Each command prints one base64 slice and then the
@@ -809,9 +849,11 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const slices: Buffer[] = [];
       let offset = 0;
       for (;;) {
+        options?.signal?.throwIfAborted();
         const result = await runChecked(
           `read ${remotePath}`,
           `tail -c +${offset + 1} ${quoted} | head -c ${REMOTE_READ_CHUNK_BYTES} | base64; printf '\\n%s\\n' "$(wc -c < ${quoted})"`,
+          options?.signal,
         );
         const lines = result.stdout.trim().split(/\r?\n/);
         const totalBytes = Number((lines.pop() ?? "").trim());
@@ -1515,8 +1557,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
     // channel is unresponsive, a client call hangs with no reject. The timeout
     // keeps this recovery path fail-fast, so it never re-hangs on the same dead
     // channel that triggered the recovery.
-    const fileNames = await withTimeout(
-      input.client.listJsonFiles(directories.requestsDir),
+    const fileNames = await withAbortingTimeout(
+      (signal) => input.client.listJsonFiles(directories.requestsDir, { signal }),
       iterationTimeoutMs,
       "Sandbox callback bridge list pending requests",
     ).catch(() => [] as string[]);
@@ -1549,8 +1591,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
       let responseStatus = 503;
       let responseError = message;
       try {
-        const raw = await withTimeout(
-          input.client.readTextFile(requestPath, maxEnvelopeBytes),
+        const raw = await withAbortingTimeout(
+          (signal) => input.client.readTextFile(requestPath, maxEnvelopeBytes, { signal }),
           iterationTimeoutMs,
           `Sandbox callback bridge read pending request ${requestId}`,
         );
@@ -1738,8 +1780,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
         let fileNames: string[];
         const listingStartedAt = Date.now();
         try {
-          fileNames = await withTimeout(
-            input.client.listJsonFiles(directories.requestsDir),
+          fileNames = await withAbortingTimeout(
+            (signal) => input.client.listJsonFiles(directories.requestsDir, { signal }),
             iterationTimeoutMs,
             "Sandbox callback bridge list requests",
           );

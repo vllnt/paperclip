@@ -92,6 +92,20 @@ The vite dev server serves an unbundled module graph. This is fast to reload on 
 
 The preview server binds `0.0.0.0` and accepts any Host, so a tailnet or LAN address (e.g. `http://<host>.ts.net:3101/`) works out of the box. The `/api` proxy sets `x-forwarded-host` and `x-forwarded-proto`, which the server's board mutation guard uses to trust the browser's Origin — mutations from `:3101` succeed against the API on `:3100` without further configuration. An HTTPS tunnel in front of the preview server (ngrok, tailscale funnel) is also supported: the tunnel's `x-forwarded-proto` header is preserved when set.
 
+### Lazy routes and the initial JS budget
+
+`ui/src/App.tsx` loads every page with `lazy(() => import("./pages/X").then((m) => ({ default: m.X })))`. Each page is its own chunk, fetched when its route first renders, under a `Suspense` boundary in each layout (`RouteSuspense`), so the sidebar and header stay on screen while the page loads. Add new pages the same way. Only the shell, the route gates and small redirects stay in the entry bundle.
+
+`vite build` fails when the entry chunk plus the chunks it imports statically (the JavaScript needed before the first route renders) grow past the limits in `ui/bundle-budget.json` (raw and gzip bytes). If it fails, find which new import pulled the code into the entry bundle (an eager `import` of a page or of a heavy library) and load it with `lazy()` or a dynamic `import()`. If the growth is intended, raise the limit in the same pull request and say why. `PAPERCLIP_UI_BUNDLE_BUDGET=off` skips the check while you investigate.
+
+The first visit to a lazy page in a session waits for its chunk, so the page area stays empty for about one round trip (most page chunks are 5 to 25 KB brotli; issue detail is about 90 KB). Do not hide this by importing chunks early: importing a chunk also runs its code. Measured in a real browser, starting the open page's chunk at boot made first paint about 250 ms later, and prefetching chunks while idle made TTI about 2 s worse, so both were removed.
+
+A tab left open across a deploy asks for chunk names that no longer exist. `installStaleChunkReload` (`ui/src/lib/stale-chunk-reload.ts`) reloads the page once, at most every 30 seconds, when Vite reports that a chunk failed to load. It does not reload while the browser is offline or for a failed background prefetch.
+
+### Precompressed UI assets
+
+`vite build` writes a `.br` (Brotli) and a `.gz` (gzip) file next to every script, stylesheet, SVG and JSON file in `assets/` that is at least 1 KB and compresses smaller. The server (`server/src/middleware/precompressed-static.ts`) sends the Brotli file to clients that accept it, the gzip file to the rest of the clients that accept gzip, and the plain file otherwise, with `Vary: Accept-Encoding`. The app therefore does not depend on a reverse proxy to compress its own bundle. Range requests and files without a sibling get the plain file. The server reads the list of precompressed files when it starts, so restart it after rebuilding the UI to serve the new copies; until then new files go out uncompressed. `index.html` and the service worker are not precompressed. Compression time depends on the emitted assets.
+
 ## Storybook
 
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.
@@ -320,6 +334,39 @@ When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eage
 `SIGINT`/`SIGTERM` cleanup hooks. Paperclip owns signal ordering so the heartbeat
 snapshot and any required drain complete while the database is still available;
 the coordinated shutdown path stops embedded PostgreSQL afterward.
+
+**Shutdown budget.** On `SIGTERM` or `SIGINT` the server finishes inside one
+budget, so it exits before the stop timeout instead of being killed. Set
+`PAPERCLIP_STOP_TIMEOUT_MS` to the stop timeout of whatever stops the process (for
+example `stop_grace_period`, or the `--time` of `docker stop`); the deploy compose
+files set both to 60 seconds. The default is 60000, and the server logs a warning at
+boot when the variable is unset or invalid. The budget is that timeout minus 10
+seconds (half of it when the timeout is under 20 seconds). In order:
+
+1. New work is refused at once: `POST` to an agent's `wakeup` or `heartbeat/invoke`,
+   a routine's `run` and a public routine trigger answer `503` with
+   `Retry-After: 30`, and run admission is held, so a wake created by any other
+   request (a comment, for example) waits in the queue for the next process. Every
+   other request is still served: the runs being drained keep their callbacks.
+2. The scheduler quiesces (at most 10 seconds). If it outlives that, it is aborted;
+   a hot-restart preparation that has started writing finishes first, so the drain
+   never runs alongside it.
+3. Running runs are ended in parallel, each run's grace cut so that it ends with 30 %
+   of the budget (at most 15 seconds) still left. At that deadline no new per-run
+   drain starts: a run not yet reached stays `running`, and the next start reaps it.
+   A run's status and a `shutdownDrain` marker are written together; the follow-up
+   writes (wakeup, leases, retry or issue release, event, agent status) finish the
+   marker. If the process dies in between, the next start finishes them.
+4. The finalizers and the per-run drains still in flight finish (at most 5
+   seconds), then the run-log flush.
+5. The HTTP listener closes (in-flight requests get 5 seconds), then the teardown.
+
+Each step logs `shutdown step started` and `shutdown step finished` with its
+duration and its outcome (`done`, `timed_out` or `failed`), and each run logs
+`shutdown run outcome`. A run whose process cannot be stopped is reported as
+`terminate_failed` and left `running` for the reaper. A complete shutdown exits 0. If
+a step hangs, a hard deadline at the end of the budget logs the step and exits
+**70**. A programmatic shutdown that keeps the process alive arms no hard deadline.
 
 The request command records the preflight set of running heartbeat IDs and writes
 an instance-scoped marker plus a PID-targeted legacy home-root handoff marker.
@@ -1423,6 +1470,22 @@ short commit SHA below the user's email. Hover over it for the full SHA,
 or follow the link to inspect the commit on GitHub.
 Opening the menu refreshes `/api/health` so the label reflects recent deploys.
 The label is hidden on other hosts and when commit metadata is unavailable.
+
+## Resource Capacity
+
+Every server process samples its own host (free disk of the instance data,
+run-log and workspace roots, available memory, load per CPU core) and, for
+SSH environments, reads the worker during lease acquire and a slow sweep. No
+daemon runs on workers; a failed read is skipped. Read it on the
+"Resource capacity" instance settings page (instance admins), on the
+environments page, with `paperclipai capacity`, or through
+`GET /api/companies/:companyId/resource-capacity`. For instance admins,
+`/api/health` also returns `resourceCapacity: { level, sampledAt }`.
+
+- `PAPERCLIP_RESOURCE_CAPACITY_SAMPLE_INTERVAL_MS=<ms>` (default `60000`, minimum `15000`)
+- `PAPERCLIP_RESOURCE_CAPACITY_RETENTION_DAYS=<days>` (default `30`, minimum `1`)
+
+The plan and level rules are in `doc/plans/2026-10-09-resource-capacity.md`.
 
 ## Reset Local Dev Database
 

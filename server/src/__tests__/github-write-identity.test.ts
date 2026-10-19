@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { withProtectedBranchFacts } from "../services/github-protected-branches.js";
 import {
+  attachGitHubCaller,
   classifyGitHubOperation,
   parseGitHubOperation,
   readGitHubOperation,
+  registerGitHubWriteIdentityWorkers,
+  resolveGitHubWriteIdentityDecision,
 } from "../services/github-write-identity.js";
 
 // Destination parsing itself (URLs, scp, local paths, other hosts) is tested with parseGitHubDestination in @paperclipai/shared.
@@ -235,7 +239,7 @@ describe("security review round 2c (attack regressions)", () => {
   it("N4: refuses git network options it cannot read, and a push never becomes a local command", () => {
     for (const args of [["push", "--push-o", "x", "https://github.com/o/r2", "HEAD:refs/heads/main"], ["push", "--rep=https://github.com/o/r2"], ["push", "-fx", "origin", "main"]]) {
       expect(classifyGitHubOperation({ program: "git", args, remote: origin, currentBranch: "main", touchesWorkflows: false }), args.join(" "))
-        .toMatchObject({ access: "write", denied: expect.stringContaining("does not know the git push option") });
+        .toMatchObject({ access: "write", denied: expect.stringContaining("does not know the git push option") }); // paperclip:allow-git-push: test input: the classifier must reject this push option
     }
     expect(classifyGitHubOperation({ program: "git", args: ["push", "-fo", "ci.skip", "origin", "HEAD:refs/heads/main"], remote: null, pushUrls: [origin], touchesWorkflows: false }))
       .toMatchObject({ access: "write", privileged: ["pushToMain"], repository: "anthm-fr/songtrivia" });
@@ -362,6 +366,151 @@ describe("security review round 5 (attack regressions)", () => {
     }
     expect(classifyGitHubOperation({ program: "gh", args: ["api", "graphql", "-f", 'query=mutation{updatePullRequest(input:{pullRequestId:"x",baseRefName:"main"}){clientMutationId}}'], remote: origin }).denied)
       .toMatch(/cannot check the GraphQL mutation updatePullRequest/);
+  });
+
+  describe("the run that sent an operation", () => {
+    const origin = "https://github.com/Acme/Site.git";
+    const agentId = "5f0f6f1c-0c63-4a52-9a2d-3f4a8a1d7c01", runId = "7c2d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f", other = "00000000-0000-4000-8000-000000000000";
+    const body = { program: "git", args: ["push", "origin", "feature/x"], remote: origin, pushUrls: [origin], currentBranch: "feature/x", shas: ["a".repeat(40)], touchesWorkflows: true };
+    const run = { companyId: "company-1", agentId, runId, issueId: "issue-1" };
+
+    it("never reads the agent or the run from the launcher's report, whatever the report says", () => {
+      const parsed = parseGitHubOperation({ operation: { ...body, caller: { agentId: other, runId: other }, agentId: other, runId: other } })!;
+      expect(parsed).not.toHaveProperty("caller");
+      expect(parsed).not.toHaveProperty("agentId");
+      expect(parsed).not.toHaveProperty("runId");
+      expect(classifyGitHubOperation(parsed)).not.toHaveProperty("caller");
+    });
+
+    it("takes them from the run the server authenticated, and nothing else of the run", () => {
+      const reported = attachGitHubCaller(parseGitHubOperation({ operation: body }), run) as Exclude<ReturnType<typeof attachGitHubCaller>, string | null>;
+      expect(reported.caller).toEqual({ agentId, runId });
+      expect(classifyGitHubOperation(reported)).toMatchObject({ caller: { agentId, runId } });
+      // A report the server could not read, or none, has nothing to attach to.
+      expect(attachGitHubCaller(null, run)).toBeNull();
+      expect(attachGitHubCaller(readGitHubOperation({ operation: { args: 1 } }), run)).toBe("unreadable");
+    });
+
+    it("sends them to the plugin with the other write-identity parameters, and only when the server set them", async () => {
+      const calls: Array<Record<string, any>> = [];
+      registerGitHubWriteIdentityWorkers({ call: async (_plugin: string, _method: string, input: any) => { calls.push(input.params); return { identity: "user", unavailable: "stop here" }; } } as any);
+      try {
+        const record = { pluginId: "plugin-github", ready: true, policy: "invalid", manifest: { projectRepositories: { writeIdentityAction: "repository-write-identity" } } } as any;
+        const operation = parseGitHubOperation({ operation: { ...body, caller: { agentId: other, runId: other } } })!;
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: classifyGitHubOperation(attachGitHubCaller(operation, run) as typeof operation) }, record);
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: classifyGitHubOperation(operation) }, record);
+        expect(calls[0]).toMatchObject({ companyId: "company-1", repository: "acme/site", privileged: ["editWorkflows"], agentId, runId });
+        expect(calls[1]).not.toHaveProperty("agentId");
+        expect(calls[1]).not.toHaveProperty("runId");
+      } finally { registerGitHubWriteIdentityWorkers(null); }
+    });
+  });
+
+  describe("workflow changes of a push", () => {
+    const origin = "https://github.com/Acme/Site.git";
+    const sha = "a".repeat(40), parent = "b".repeat(40), side = "c".repeat(40);
+    const oid = "d".repeat(40);
+    const workflowFiles = [{ path: ".github/workflows/ci.yml", mode: "100644", oid }];
+    const workflowCommits = [{ sha, parents: [parent, side], changes: [{ path: ".github/workflows/ci.yml", mode: "100644", oid }, { path: ".github/workflows/old.yml", mode: null, oid: null }] }];
+    const workflowEntries = [parent, side];
+    const report = { workflowFiles, workflowCommits, workflowEntries };
+    const push = (args: string[], extra: Record<string, unknown> = {}) => classifyGitHubOperation({
+      program: "git", args, remote: origin, pushUrls: [origin], currentBranch: "feature/x", refs: { "feature/x": "refs/heads/feature/x" },
+      shas: [sha], touchesWorkflows: true, ...report, ...extra,
+    });
+    const expected = { branch: "feature/x", tip: sha, files: workflowFiles, commits: workflowCommits, entries: workflowEntries };
+
+    const githubSaysFeatureXIsNeitherDefaultNorProtected = { repository: "acme/site", defaultBranch: "main", protection: new Map([["feature/x", false]]) };
+
+    it("keeps editWorkflows on the push and hands the plugin its one branch, the commits and the files", async () => {
+      await withProtectedBranchFacts(githubSaysFeatureXIsNeitherDefaultNorProtected, async () => {
+        for (const args of [["push", "origin", "feature/x"], ["push"], ["push", "origin", "HEAD"], ["push", "-u", "origin", "HEAD:refs/heads/feature/x"], ["push", "origin", "refs/heads/feature/x"],
+          ["push", "--force-with-lease", "origin", "+feature/x"], ["push", "origin", "heads/feature/x"]]) {
+          const classified = push(args);
+          expect(classified, args.join(" ")).toMatchObject({ access: "write", privileged: ["editWorkflows"], workflowPush: expected });
+          expect(classified.denied, args.join(" ")).toBeUndefined();
+        }
+      });
+      // A push to another branch name is that branch.
+      expect(push(["push", "origin", "HEAD:refs/heads/release/1.2"])).toMatchObject({ workflowPush: { ...expected, branch: "release/1.2" } });
+      // A push that only moves the branch to an existing commit has no new commit to list.
+      expect(push(["push", "--force", "origin", "feature/x"], { workflowCommits: [], workflowEntries: [sha] })).toMatchObject({ workflowPush: { ...expected, commits: [], entries: [sha] } });
+    });
+
+    it("keeps the workflow branch of a forced push, which is refused until GitHub's answer on that branch is read", async () => {
+      const args = ["push", "--force-with-lease", "origin", "+feature/x"];
+      const unread = push(args);
+      expect(unread).toMatchObject({ privileged: ["editWorkflows"], workflowPush: expected, branchRewrites: ["feature/x"] });
+      expect(unread.denied).toMatch(/could not read from GitHub whether feature\/x is the default or a protected branch of acme\/site/);
+      const protectedOne = { ...githubSaysFeatureXIsNeitherDefaultNorProtected, protection: new Map([["feature/x", true]]) };
+      const protectedPush = await withProtectedBranchFacts(protectedOne, async () => push(args));
+      expect(protectedPush.denied).toMatch(/feature\/x is a protected branch of acme\/site/);
+    });
+
+    it("offers nothing the plugin could check when the push is not exactly one commit to one named branch, or the report is partial", () => {
+      const cases: Array<[string, ReturnType<typeof push>]> = [
+        ["two commits", push(["push", "origin", "feature/x"], { shas: [sha, "e".repeat(40)] })],
+        ["two branches", push(["push", "origin", "feature/x", "other"], { refs: { "feature/x": "refs/heads/feature/x", other: "refs/heads/other" } })],
+        ["a tag", push(["push", "origin", "HEAD:refs/tags/v1"])],
+        ["every branch", push(["push", "--all", "origin"])],
+        ["a pattern", push(["push", "origin", "HEAD:refs/heads/*"])],
+        ["config that can push more", push(["push"], { implicitPush: true })],
+        ["a deletion", push(["push", "origin", "--delete", "feature/x"])],
+        ["a detached HEAD (no branch name)", push(["push", "origin", "HEAD"], { currentBranch: null })],
+        ["no files", push(["push", "origin", "feature/x"], { workflowFiles: undefined })],
+        ["no commits", push(["push", "origin", "feature/x"], { workflowCommits: undefined })],
+        ["no entries", push(["push", "origin", "feature/x"], { workflowEntries: undefined })],
+        ["an empty list of entries", push(["push", "origin", "feature/x"], { workflowEntries: [] })],
+        ["a push the launcher says has no workflow changes", push(["push", "origin", "feature/x"], { touchesWorkflows: false })],
+      ];
+      for (const [label, classified] of cases) expect(classified, label).not.toHaveProperty("workflowPush");
+      // Without the report the toggle alone decides, as before.
+      expect(push(["push", "origin", "feature/x"], { workflowFiles: undefined })).toMatchObject({ privileged: ["editWorkflows"] });
+    });
+
+    it("still refuses what the toggles never allow, whatever the push reports", () => {
+      const tag = push(["push", "origin", "refs/tags/engine@1.0.0"]);
+      expect(tag.denied).toMatch(/Release tags/);
+      expect(tag).not.toHaveProperty("workflowPush");
+      expect(push(["push", "origin", "feature/x"], { urlRewrites: true }).denied).toMatch(/url\.\*\.insteadOf/);
+    });
+
+    it("accepts the report only in the launcher's exact shape and within its bounds", () => {
+      const operation = { program: "git", args: ["push", "origin", "feature/x"], remote: origin, shas: [sha], touchesWorkflows: true };
+      expect(parseGitHubOperation({ operation: { ...operation, ...report } })).toMatchObject(report);
+      const file = workflowFiles[0]!, commit = workflowCommits[0]!;
+      for (const [label, bad] of [
+        ["a file without a blob", { workflowFiles: [{ path: file.path, mode: "100644" }] }],
+        ["a gone file among the files", { workflowFiles: [{ path: file.path, mode: null, oid: null }] }],
+        ["a short mode", { workflowFiles: [{ path: file.path, mode: "644", oid }] }],
+        ["a bad blob", { workflowFiles: [{ path: file.path, mode: "100644", oid: "xyz" }] }],
+        ["a long path", { workflowFiles: [{ path: `.github/workflows/${"x".repeat(300)}.yml`, mode: "100644", oid }] }],
+        ["more than 100 files", { workflowFiles: Array.from({ length: 101 }, () => file) }],
+        ["a commit without changes", { workflowCommits: [{ ...commit, changes: [] }] }],
+        ["a commit with a bad parent", { workflowCommits: [{ ...commit, parents: ["xyz"] }] }],
+        ["a commit with too many parents", { workflowCommits: [{ ...commit, parents: Array.from({ length: 17 }, () => parent) }] }],
+        ["a commit that is not a hash", { workflowCommits: [{ ...commit, sha: "xyz" }] }],
+        ["more than 100 commits", { workflowCommits: Array.from({ length: 101 }, () => commit) }],
+        ["more than 400 changes", { workflowCommits: Array.from({ length: 5 }, () => ({ ...commit, changes: Array.from({ length: 100 }, () => commit.changes[0]!) })) }],
+        ["more than 8 entries", { workflowEntries: Array.from({ length: 9 }, () => parent) }],
+        ["an entry that is not a hash", { workflowEntries: ["xyz"] }],
+        ["commits that are not a list", { workflowCommits: "x" }],
+      ] as const) {
+        expect(readGitHubOperation({ operation: { ...operation, ...report, ...bad } }), label).toBe("unreadable");
+      }
+    });
+
+    it("sends the plugin the branch, the commit, the files and the entries with the other write-identity parameters", async () => {
+      const calls: Array<Record<string, any>> = [];
+      registerGitHubWriteIdentityWorkers({ call: async (_plugin: string, _method: string, input: any) => { calls.push(input.params); return { identity: "user", unavailable: "stop here" }; } } as any);
+      try {
+        const record = { pluginId: "plugin-github", ready: true, policy: "invalid", manifest: { projectRepositories: { writeIdentityAction: "repository-write-identity" } } } as any;
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: push(["push", "origin", "feature/x"]) }, record);
+        await resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: push(["push", "origin", "feature/x"], { workflowFiles: undefined }) }, record);
+        expect(calls[0]).toMatchObject({ companyId: "company-1", repository: "acme/site", privileged: ["editWorkflows"], workflowPush: expected });
+        expect(calls[1]).not.toHaveProperty("workflowPush");
+      } finally { registerGitHubWriteIdentityWorkers(null); }
+    });
   });
 });
 

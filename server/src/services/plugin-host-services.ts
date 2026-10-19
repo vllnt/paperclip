@@ -1056,7 +1056,13 @@ export function buildHostServices(
 
   const pluginActivityDetails = (
     details: Record<string, unknown> | null | undefined,
-    actor?: { actorAgentId?: string | null; actorUserId?: string | null; actorRunId?: string | null },
+    actor?: {
+      actorAgentId?: string | null;
+      actorUserId?: string | null;
+      actorRunId?: string | null;
+      actorKeyId?: string | null;
+      actorSource?: string | null;
+    },
   ) => {
     const initiatingActorType = actor?.actorAgentId ? "agent" : actor?.actorUserId ? "user" : null;
     const initiatingActorId = actor?.actorAgentId ?? actor?.actorUserId ?? null;
@@ -1069,8 +1075,30 @@ export function buildHostServices(
       initiatingAgentId: actor?.actorAgentId ?? null,
       initiatingUserId: actor?.actorUserId ?? null,
       initiatingRunId: actor?.actorRunId ?? null,
+      initiatingKeyId: actor?.actorKeyId ?? null,
+      initiatingSource: actor?.actorSource ?? null,
       pluginId,
       pluginKey,
+    };
+  };
+
+  /**
+   * Names who started the plugin action that the worker is serving, from the host's
+   * own invocation record. The record holds the key id and the kind of credential,
+   * never the credential itself.
+   *
+   * @param context - The context of the worker-to-host call.
+   * @returns The initiating actor for the audit row, or undefined for a call outside an action.
+   */
+  const initiatorOfCall = (context: WorkerHostCallContext | undefined) => {
+    const initiator = context?.initiator;
+    if (!initiator) return undefined;
+    return {
+      actorAgentId: initiator.agentId,
+      actorUserId: initiator.userId,
+      actorRunId: initiator.runId,
+      actorKeyId: initiator.keyId ?? null,
+      actorSource: initiator.source ?? null,
     };
   };
 
@@ -1164,6 +1192,22 @@ export function buildHostServices(
     }));
   };
 
+  /**
+   * The actor of an issue write that a plugin makes. When the host knows the agent behind the call
+   * (`currentPluginHostCallAgent`), that agent is the actor, with its run, and nothing the worker
+   * sends can remove it or put a user in its place. Otherwise the fields that the worker sent are used.
+   * A write with no actor at all cannot lift a block that the board or a person owns.
+   */
+  function issueWriteActor(requested: { actorAgentId?: unknown; actorUserId?: unknown; actorRunId?: unknown }) {
+    const caller = currentPluginHostCallAgent();
+    if (caller) return { actorAgentId: caller.agentId, actorUserId: null, actorRunId: caller.runId };
+    return {
+      actorAgentId: typeof requested.actorAgentId === "string" ? requested.actorAgentId : null,
+      actorUserId: typeof requested.actorUserId === "string" ? requested.actorUserId : null,
+      actorRunId: typeof requested.actorRunId === "string" ? requested.actorRunId : null,
+    };
+  }
+
   const setBlockedByWithActivity = async (params: {
     issueId: string;
     companyId: string;
@@ -1175,10 +1219,11 @@ export function buildHostServices(
   }) => {
     const existing = requireInCompany("Issue", await issues.getById(params.issueId), params.companyId);
     const previous = await issues.getRelationSummaries(params.issueId);
+    const writer = issueWriteActor(params);
     await issues.update(params.issueId, {
       blockedByIssueIds: params.blockedByIssueIds,
-      actorAgentId: params.actorAgentId ?? null,
-      actorUserId: params.actorUserId ?? null,
+      actorAgentId: writer.actorAgentId,
+      actorUserId: writer.actorUserId,
     } as any);
     const relations = await issues.getRelationSummaries(params.issueId);
     await logPluginActivity({
@@ -1187,9 +1232,9 @@ export function buildHostServices(
       entityType: "issue",
       entityId: params.issueId,
       actor: {
-        actorAgentId: params.actorAgentId,
-        actorUserId: params.actorUserId,
-        actorRunId: params.actorRunId,
+        actorAgentId: writer.actorAgentId,
+        actorUserId: writer.actorUserId,
+        actorRunId: writer.actorRunId,
       },
       details: {
         identifier: existing.identifier,
@@ -1650,7 +1695,7 @@ export function buildHostServices(
     },
 
     activity: {
-      async log(params) {
+      async log(params, context) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         await logActivity(db, {
@@ -1660,7 +1705,7 @@ export function buildHostServices(
           action: params.message,
           entityType: params.entityType ?? "plugin",
           entityId: params.entityId ?? pluginId,
-          details: pluginActivityDetails(params.metadata),
+          details: pluginActivityDetails(params.metadata, initiatorOfCall(context)),
         });
       },
     },
@@ -2051,9 +2096,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const patch = { ...(params.patch as Record<string, unknown>) };
-        const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
-        const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;
-        const actorRunId = typeof patch.actorRunId === "string" ? patch.actorRunId : null;
+        const { actorAgentId, actorUserId, actorRunId } = issueWriteActor(patch);
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;

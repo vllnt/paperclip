@@ -32,6 +32,8 @@ export { executionWorkspaces } from "./execution_workspaces.js";
 export { executionWorkspaceRuntimeLeases } from "./execution_workspace_runtime_leases.js";
 export { environments } from "./environments.js";
 export { environmentLeases } from "./environment_leases.js";
+export { resourceCapacityTargets } from "./resource_capacity_targets.js";
+export { resourceCapacitySamples } from "./resource_capacity_samples.js";
 export { environmentCustomImageTemplates } from "./environment_custom_image_templates.js";
 export { environmentCustomImageSetupSessions } from "./environment_custom_image_setup_sessions.js";
 export { adapterAuthSessions, ADAPTER_AUTH_SESSION_ACTIVE_STATES } from "./adapter_auth_sessions.js";
@@ -63,7 +65,8 @@ export {
   chatSdkState,
 } from "./chat_channels.js";
 export { issueRelations } from "./issue_relations.js";
-export { routines, routineRevisions, routineTriggers, routineWebhookTestReceipts, routineRuns } from "./routines.js";
+export { routines, routineRevisions, routineTriggers, routineWebhookTestReceipts, routineRuns, routineEventGroups } from "./routines.js";
+export { eventSources, eventDeliveries } from "./event_sources.js";
 export { pipelines, pipelineStages, pipelineTransitions } from "./pipelines.js";
 export {
   cases,

@@ -1,18 +1,21 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerPluginCommands } from "../commands/client/plugin.js";
+import { registerEventSourceApiCommands } from "../commands/client/event-source-api.js";
 import { registerRoutineApiCommands } from "../commands/client/routine-api.js";
 
 const COMPANY_ID = "22222222-2222-4222-8222-222222222222";
 const ROUTINE_ID = "33333333-3333-4333-8333-333333333333";
 const REVISION_ID = "44444444-4444-4444-8444-444444444444";
 const TRIGGER_ID = "55555555-5555-4555-8555-555555555555";
+const SOURCE_ID = "66666666-6666-4666-8666-666666666666";
 
 function createProgram(): Command {
   const program = new Command();
   program.exitOverride();
   program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
   registerRoutineApiCommands(program);
+  registerEventSourceApiCommands(program);
   registerPluginCommands(program);
   return program;
 }
@@ -67,6 +70,55 @@ describe("routine and plugin parity commands", () => {
       ["POST", `http://localhost:3100/api/routine-triggers/${TRIGGER_ID}/rotate-secret`],
       ["POST", "http://localhost:3100/api/routine-triggers/public/public-id/fire"],
     ]);
+  });
+
+  it("wraps event source endpoints", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["event-sources", "list", "--company-id", COMPANY_ID, "--include-archived"]);
+    await run([
+      "event-sources", "create", "--company-id", COMPANY_ID, "--name", "Gatus", "--signing-mode", "bearer",
+      "--normalizer", "gatus", "--normalizer-config-json", "{\"endpointMap\":{}}", "--max-new-issues-per-hour", "5",
+    ]);
+    await run(["event-sources", "create", "--company-id", COMPANY_ID, "--payload-json", "{\"name\":\"Raw\"}"]);
+    await run(["event-sources", "rotate", SOURCE_ID]);
+    await run(["event-sources", "test", SOURCE_ID, "--payload-json", "{\"type\":\"uptime.down\"}"]);
+    await run(["event-sources", "deliveries", SOURCE_ID, "--status", "failed", "--limit", "10"]);
+
+    expect(fetchMock.mock.calls.map((call) => [call[1]?.method ?? "GET", call[0]])).toEqual([
+      ["GET", `http://localhost:3100/api/companies/${COMPANY_ID}/event-sources?includeArchived=true`],
+      ["POST", `http://localhost:3100/api/companies/${COMPANY_ID}/event-sources`],
+      ["POST", `http://localhost:3100/api/companies/${COMPANY_ID}/event-sources`],
+      ["POST", `http://localhost:3100/api/event-sources/${SOURCE_ID}/rotate-secret`],
+      ["POST", `http://localhost:3100/api/event-sources/${SOURCE_ID}/test`],
+      ["GET", `http://localhost:3100/api/event-sources/${SOURCE_ID}/deliveries?status=failed&limit=10`],
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      name: "Gatus",
+      signingMode: "bearer",
+      normalizer: "gatus",
+      normalizerConfig: { endpointMap: {} },
+      maxNewIssuesPerHour: 5,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body))).toEqual({ name: "Raw" });
+    expect(JSON.parse(String(fetchMock.mock.calls[4]?.[1]?.body))).toEqual({ payload: { type: "uptime.down" } });
+  });
+
+  it("rejects malformed event source CLI input before calling the API", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+      throw new Error("exit");
+    }) as never);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run(["event-sources", "create", "--company-id", COMPANY_ID])).rejects.toThrow();
+    await expect(run(["event-sources", "create", "--company-id", COMPANY_ID, "--name", "x", "--retention-days", "soon"])).rejects.toThrow();
+    await expect(run(["event-sources", "test", SOURCE_ID])).rejects.toThrow();
+    await expect(run(["event-sources", "test", SOURCE_ID, "--payload-json", "{nope"])).rejects.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+    exit.mockRestore();
   });
 
   it("wraps deeper plugin endpoints", async () => {

@@ -10,6 +10,7 @@ import { SetupService, boardScope, requireInstanceAdmin as requireAdmin } from "
 import { registerAgentBots } from "./agent-bots.js";
 import { registerAgentTools } from "./agent-tools.js";
 import { registerWriteIdentity } from "./write-identity.js";
+import { CLOCK_SKEW_ALERT_MS } from "./clock.js";
 import { registerNativeGitHub } from "./native-github.js";
 import type { AllowedOwner, AppIdentity, ConnectionState, Status } from "./contracts.js";
 import { header, verifyGitHubSignature } from "./github-webhooks.js";
@@ -201,6 +202,10 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
   // is reserved for one company; an unreadable policy throws, which the client
   // treats as an App-user company with an empty fence. Other companies keep
   // their App's write tokens.
+  // GitHub tokens follow GitHub's clock; a host clock this far off needs an operator (VLL-1192).
+  github.clock.onSkewChange = skewMs => Math.abs(skewMs) > CLOCK_SKEW_ALERT_MS
+    ? ctx.logger.warn("This host's clock differs from GitHub's by more than a minute; GitHub tokens follow GitHub's clock", { skewSeconds: Math.round(skewMs / 1000) })
+    : ctx.logger.info("This host's clock agrees with GitHub's again", {});
   github.appUserFence = async appId => {
     const companyId = (await appRegistry())[appId];
     return companyId === undefined ? null : identity.appUserFence(companyId);
@@ -211,7 +216,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
     { writeToken: identity.writeToken, maintain: identity.maintain });
   registerTaskLinks(ctx, github, credentials, cache, sync.linkForTask);
   registerRecordTasks(ctx, github, credentials, cache, sync.ensureTasks);
-  registerManagement(ctx, github, credentials, sync.sync, cache, sync.ensureTasks, identity.writeToken, identity.appUser);
+  registerManagement(ctx, github, credentials, sync.requestSync, cache, sync.ensureTasks, identity.writeToken, identity.appUser);
   // Native Paperclip owns Agent Channels and GitHub bot identity. The legacy
   // mapping actions remain registered for state migration, but are not used by
   // reviewer or agent-facing actions.
@@ -310,13 +315,7 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
   ctx.actions.register("sync.trigger", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
     if (!await connection(companyId)) throw new Error("Connect a GitHub App for this company first.");
-    if (params.refresh === true) cache.invalidate(companyId);
-    else {
-      const report = await ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: "report" }) as import("./contracts.js").SyncReport | null;
-      if (report && Date.now() - Date.parse(report.at) < 60_000) return { started: false, companyId };
-    }
-    void sync.sync(companyId).catch(error => ctx.logger.error("GitHub sync trigger failed", { companyId, error: error instanceof Error ? error.message : "unknown" }));
-    return { started: true, companyId };
+    return { ...await sync.queueSync(companyId, params.refresh === true), companyId };
   });
 
   ctx.actions.register("install-github-workflow-skill", async (params, actor) => {

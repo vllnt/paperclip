@@ -36,6 +36,7 @@ import {
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
+import { commaSeparatedEnumQuerySchema } from "./query.js";
 import {
   lowTrustReviewPresetPolicySchema,
   trustAuthorizationPolicySchema,
@@ -556,6 +557,27 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "cancelled",
 ] as const;
 
+export const COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES = ["active", "escalated"] as const;
+export const COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT = 50;
+export const COMPANY_RECOVERY_ACTIONS_MAX_LIMIT = 200;
+
+export const listCompanyIssueRecoveryActionsQuerySchema = z.object({
+  status: commaSeparatedEnumQuerySchema(ISSUE_RECOVERY_ACTION_STATUSES).describe(
+    "Comma-separated recovery action statuses. Defaults to active,escalated (open actions).",
+  ),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(COMPANY_RECOVERY_ACTIONS_MAX_LIMIT)
+    .optional()
+    .describe("Maximum rows, 1-200. Defaults to 50."),
+});
+
+export type ListCompanyIssueRecoveryActionsQuery = z.infer<
+  typeof listCompanyIssueRecoveryActionsQuerySchema
+>;
+
 export const retryWorkspaceExportSchema = z.object({
   actionId: z.string().guid(),
   runId: z.string().guid(),
@@ -576,7 +598,14 @@ export const resolveIssueRecoveryActionSchema = z
       .optional(),
     actionId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-    sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+    sourceIssueStatus: z.enum([
+      "todo",
+      "done",
+      "in_review",
+      "blocked",
+      "backlog",
+      "cancelled",
+    ]),
     resolutionNote: multilineTextSchema.optional().nullable(),
   })
   .strict()
@@ -612,12 +641,14 @@ export const resolveIssueRecoveryActionSchema = z
     if (value.outcome === "false_positive" || value.outcome === "cancelled") {
       if (
         value.sourceIssueStatus !== "done" &&
-        value.sourceIssueStatus !== "in_review"
+        value.sourceIssueStatus !== "in_review" &&
+        value.sourceIssueStatus !== "backlog" &&
+        value.sourceIssueStatus !== "cancelled"
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "This recovery outcome requires sourceIssueStatus to be done or in_review",
+            "This recovery outcome requires sourceIssueStatus to be done, in_review, backlog, or cancelled",
           path: ["sourceIssueStatus"],
         });
       }
@@ -627,6 +658,20 @@ export const resolveIssueRecoveryActionSchema = z
 
 export type ResolveIssueRecoveryAction = z.infer<
   typeof resolveIssueRecoveryActionSchema
+>;
+
+/** Operator evidence that a stopped execution is safe to continue. */
+export const reconcileIssueExecutionSchema = z
+  .object({
+    outcome: z.enum(["done", "none", "mixed"]),
+    note: z.string().trim().min(20).max(12000),
+    expectedRunId: z.string().guid().optional(),
+    workspaceRepairNote: z.string().trim().min(20).max(12000).optional(),
+  })
+  .strict();
+
+export type ReconcileIssueExecution = z.infer<
+  typeof reconcileIssueExecutionSchema
 >;
 
 const issueRequestDepthInputSchema = z

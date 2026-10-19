@@ -1,6 +1,7 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { isDeepStrictEqual } from "node:util";
+import { and, desc, eq, gt, gte, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -129,6 +130,12 @@ interface UpdateAgentOptions {
    */
   verifyLockedRow?: (locked: typeof agents.$inferSelect) => Promise<void>;
   recordRevision?: RevisionMetadata;
+  /**
+   * The configs a merge patch was applied to. The update locks the agent row
+   * and fails with 409 when the stored configs changed since they were read,
+   * so a concurrent change is never overwritten with a stale merge base.
+   */
+  expectedConfig?: { adapterConfig: unknown; runtimeConfig: unknown };
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
@@ -444,6 +451,45 @@ export function agentService(db: Db) {
     }));
   }
 
+  // Derived for display: an agent with no live run but at least one active
+  // wait (a future issue monitor on its own open issue) is "waiting", not idle.
+  // The stored status is unchanged so invocation rules stay the same.
+  async function getAgentWaitStates(companyId: string, agentIds: string[]) {
+    const rows = await db
+      .select({
+        agentId: issues.assigneeAgentId,
+        activeWaitCount: sql<number>`count(*)::int`,
+        nextCheckAt: sql<string>`min(${issues.monitorNextCheckAt})`,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.assigneeAgentId, agentIds),
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, ["in_progress", "in_review"]),
+          gt(issues.monitorNextCheckAt, new Date()),
+        ),
+      )
+      .groupBy(issues.assigneeAgentId);
+    return new Map(
+      rows.map((row) => [
+        row.agentId,
+        {
+          activeWaitCount: Number(row.activeWaitCount),
+          nextCheckAt: row.nextCheckAt ? new Date(row.nextCheckAt).toISOString() : null,
+        },
+      ]),
+    );
+  }
+
+  async function withAgentWaitState<T extends { id: string; companyId: string }>(rows: T[]) {
+    const companyId = rows[0]?.companyId;
+    if (!companyId) return rows.map((row) => ({ ...row, waitState: null }));
+    const waitStates = await getAgentWaitStates(companyId, rows.map((row) => row.id));
+    return rows.map((row) => ({ ...row, waitState: waitStates.get(row.id) ?? null }));
+  }
+
   async function getById(id: string) {
     const row = await db
       .select()
@@ -455,7 +501,8 @@ export function agentService(db: Db) {
       listCompanyAgentRows(row.companyId),
       hydrateAgentSpend([row]).then((rows) => rows[0]!),
     ]);
-    return normalizeAgentRow(hydrated, companyRows);
+    const [withWaitState] = await withAgentWaitState([normalizeAgentRow(hydrated, companyRows)]);
+    return withWaitState!;
   }
 
   async function requireGetById(id: string) {
@@ -801,7 +848,7 @@ export function agentService(db: Db) {
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
     const applyUpdate = async (txDb: Db): Promise<AgentUpdateResult> => {
-      if (options?.verifyLockedRow) {
+      if (options?.verifyLockedRow || options?.expectedConfig) {
         const locked = await txDb
           .select()
           .from(agents)
@@ -809,7 +856,17 @@ export function agentService(db: Db) {
           .for("no key update")
           .then((rows) => rows[0] ?? null);
         if (!locked) return null;
-        await options.verifyLockedRow(locked);
+        if (options.expectedConfig) {
+          const current = await agentService(txDb).getById(id);
+          if (
+            !current
+            || !isDeepStrictEqual(current.adapterConfig, options.expectedConfig.adapterConfig)
+            || !isDeepStrictEqual(current.runtimeConfig, options.expectedConfig.runtimeConfig)
+          ) {
+            throw conflict("The agent config changed while this merge patch was applied. Read it again and retry.");
+          }
+        }
+        await options.verifyLockedRow?.(locked);
       }
       const updated = await txDb
         .update(agents)
@@ -893,7 +950,7 @@ export function agentService(db: Db) {
         listCompanyAgentRows(companyId),
       ]);
       const hydrated = await hydrateAgentSpend(rows);
-      return normalizeAgentRows(hydrated, allCompanyRows);
+      return withAgentWaitState(normalizeAgentRows(hydrated, allCompanyRows));
     },
 
     getById,
