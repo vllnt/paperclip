@@ -81,6 +81,11 @@ export interface CommandManagedRuntimeRunner {
     env?: Record<string, string>;
     stdin?: string;
     timeoutMs?: number;
+    /**
+     * Stops the command when it aborts. A runner that cannot stop a command in
+     * flight ignores it. The SSH runner stops its local `ssh` process.
+     */
+    signal?: AbortSignal;
     onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
     /**

@@ -196,6 +196,20 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+/**
+ * Outcome of handing a board message to a running adapter process. `pending`
+ * means the message reached the process's live input; it is delivered only
+ * once the adapter reports a steering acknowledgement through `onEvent`.
+ */
+export type AdapterSteerResult =
+  | { status: "pending" }
+  | { status: "unavailable"; reason: string };
+
+/** Live-input steering for one adapter run. */
+export interface AdapterSteeringHandle {
+  steer(input: { text: string; correlationId: string }): AdapterSteerResult;
+}
+
 export interface AdapterExecutionContext {
   /** Synchronous, content-free diagnostic scope; never stop or collection authority. */
   onExecutionPhase?: AdapterExecutionPhaseSink;
@@ -232,6 +246,12 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  /**
+   * Called with a handle once the running process can take a message mid-run,
+   * and with null once it no longer can. Adapters without live input never
+   * call it, so the host reports steering as unsupported.
+   */
+  onSteeringReady?: (handle: AdapterSteeringHandle | null) => void;
   onRuntimeProgress?: RuntimeStatusSink;
   /**
    * Reports that execution has crossed the adapter's dispatch boundary.

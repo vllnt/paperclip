@@ -46,6 +46,10 @@ export function parseClaudeStdoutLine(line: string, ts: string): TranscriptEntry
     return parseAcpxStdoutLine(line, ts);
   }
 
+  // Delivery receipts for messages written to live stdin; the steering run
+  // event already records the one that matters.
+  if (type === "command_lifecycle") return [];
+
   if (type === "system" && parsed.subtype === "init") {
     return [
       {
