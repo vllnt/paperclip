@@ -10,6 +10,7 @@ import {
   buildSshSpawnTarget,
   createSshCommandManagedRuntimeRunner,
   buildSshEnvLabFixtureConfig,
+  ensureSshWorkspaceReady,
   getSshEnvLabSupport,
   prepareWorkspaceForSshExecution,
   readSshEnvLabFixtureStatus,
@@ -282,6 +283,38 @@ describe("ssh env-lab fixture", () => {
 
     const stopped = await readSshEnvLabFixtureStatus(statePath);
     expect(stopped.running).toBe(false);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("reads worker resources in the workspace-ready command without changing remoteCwd", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH resource probe test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+
+    const plain = await ensureSshWorkspaceReady(config);
+    const probed = await ensureSshWorkspaceReady(config, { probeResources: true });
+    expect(probed.remoteCwd).toBe(plain.remoteCwd);
+    expect(plain.resourceProbe).toBeNull();
+    expect(probed.resourceProbe?.cpuCount).toBeGreaterThan(0);
+    expect(probed.resourceProbe?.disk?.totalBytes).toBeGreaterThan(0);
+
+    const markerConfig = { ...config, remoteWorkspacePath: path.join(rootDir, "ws\n__paperclip_rc__\nnested") };
+    const plainMarker = await ensureSshWorkspaceReady(markerConfig);
+    const probedMarker = await ensureSshWorkspaceReady(markerConfig, { probeResources: true });
+    expect(plainMarker.remoteCwd).toContain("\n__paperclip_rc__\nnested");
+    expect(probedMarker.remoteCwd).toBe(plainMarker.remoteCwd);
+    expect(probedMarker.resourceProbe?.cpuCount).toBeGreaterThan(0);
+
+    const blocker = path.join(rootDir, "not-a-directory");
+    await writeFile(blocker, "file");
+    await expect(
+      ensureSshWorkspaceReady(
+        { ...config, remoteWorkspacePath: path.join(blocker, "workspace") },
+        { probeResources: true },
+      ),
+    ).rejects.toThrow();
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("resolves a relative statePath to the same absolute state across start, status, and stop", async () => {
