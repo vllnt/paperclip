@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import { logger } from "../middleware/logger.js";
 import { withProtectedBranchFacts } from "../services/github-protected-branches.js";
 import {
   attachGitHubCaller,
@@ -6,6 +8,7 @@ import {
   parseGitHubOperation,
   readGitHubOperation,
   registerGitHubWriteIdentityWorkers,
+  resolveGitHubSignature,
   resolveGitHubWriteIdentityDecision,
 } from "../services/github-write-identity.js";
 
@@ -548,5 +551,90 @@ describe("destructive branch operations with an incomplete report (review round 
     expect(classifyGitHubOperation({ program: "git", args: ["push", "origin", "feature"], ...clean }).denied).toBeUndefined();
     expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "--force-with-lease", "release"], remote: null, ...clean }).denied).toMatch(refused);
     expect(classifyGitHubOperation({ program: "git", args: ["push", "../mirror.git", "release"], remote: null, ...clean }).denied).toBeUndefined();
+  });
+});
+
+describe("a GitHub plugin call that gives no usable answer", () => {
+  // A credential-shaped string the provider error carries; it must never reach the log.
+  const leaked = `ghp_${"Z".repeat(36)}`;
+  const manifest = { projectRepositories: { writeIdentityAction: "repository-write-identity", signCommitAction: "repository-sign-commit" } };
+  const record = { pluginId: "plugin-github", ready: true, policy: "invalid", manifest } as any;
+  const merge = classifyGitHubOperation({ program: "gh", args: ["pr", "merge", "7", "-R", "acme/site", "--match-head-commit", "a".repeat(40)] });
+  const unavailable = { identity: "bot", unavailable: "GitHub write identity is temporarily unavailable" };
+  const failing = () => Object.assign(new Error(`GitHub said: bad credentials ${leaked}`), { code: leaked, data: { token: leaked } });
+  const workers = (answer: () => Promise<unknown>) => {
+    const call = vi.fn(answer);
+    registerGitHubWriteIdentityWorkers({ call } as any);
+    return call;
+  };
+  const warnings = () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    return { warn, text: () => JSON.stringify(warn.mock.calls) };
+  };
+  afterEach(() => {
+    registerGitHubWriteIdentityWorkers(null);
+    vi.restoreAllMocks();
+  });
+
+  it("logs a timed-out decision once, with its outcome and elapsed time, and keeps the refusal", async () => {
+    const { warn } = warnings();
+    workers(async () => { throw new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT, message: 'RPC call "performAction" timed out after 15000ms' }); });
+    await expect(resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: merge }, record)).resolves.toEqual(unavailable);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toEqual({
+      companyId: "company-1", pluginId: "plugin-github", actionKey: "repository-write-identity", outcome: "timeout",
+      elapsedMs: expect.any(Number), errorName: "JsonRpcCallError", errorCode: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+    });
+  });
+
+  it("logs a worker error by outcome only: no message, stack, data or credential-shaped code", async () => {
+    const { warn, text } = warnings();
+    workers(async () => { throw failing(); });
+    await expect(resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: merge }, record)).resolves.toEqual(unavailable);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toEqual({
+      companyId: "company-1", pluginId: "plugin-github", actionKey: "repository-write-identity", outcome: "worker_error",
+      elapsedMs: expect.any(Number), errorName: "Error",
+    });
+    expect(text()).not.toContain(leaked);
+    expect(text()).not.toContain("bad credentials");
+  });
+
+  it("logs an answer that does not parse without logging the answer", async () => {
+    const { warn, text } = warnings();
+    workers(async () => ({ identity: "user", credential: { login: "not a login!", userId: "1", token: leaked } }));
+    await expect(resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: merge }, record)).resolves.toEqual(unavailable);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toMatchObject({ outcome: "invalid_response" });
+    expect(text()).not.toContain(leaked);
+  });
+
+  it("logs a plugin that is not ready or not the only owner, without calling it", async () => {
+    const { warn } = warnings();
+    const call = workers(async () => ({ identity: "user", unavailable: "never asked" }));
+    await expect(resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: merge }, { ...record, ready: false })).resolves.toEqual(unavailable);
+    await expect(resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: merge }, { ...record, ready: false, ambiguous: true })).resolves.toEqual(unavailable);
+    expect(call).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map(([fields]) => (fields as { outcome: string }).outcome)).toEqual(["not_ready", "ambiguous"]);
+  });
+
+  it("logs nothing when the plugin answers, a refusal included", async () => {
+    const { warn } = warnings();
+    workers(async () => ({ identity: "user", unavailable: "Pull request #7 is not open." }));
+    await expect(resolveGitHubWriteIdentityDecision({} as any, { companyId: "company-1", operation: merge }, record))
+      .resolves.toEqual({ identity: "user", unavailable: "Pull request #7 is not open." });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("logs a failed signing request the same way and keeps its refusal", async () => {
+    const { warn, text } = warnings();
+    workers(async () => { throw failing(); });
+    // loadGitHubIdentityPolicy reads the installed plugins, then the company's saved policy.
+    const results: unknown[][] = [[{ id: "plugin-github", status: "ready", manifest }], [{ pluginId: "plugin-github", value: {} }]];
+    const db = { select: () => { const rows = results.shift()!; return { from: () => Object.assign(Promise.resolve(rows), { where: async () => rows }) }; } } as any;
+    await expect(resolveGitHubSignature(db, "company-1", "cGF5bG9hZA==")).resolves.toEqual({ unavailable: "Commit signing is temporarily unavailable." });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toMatchObject({ companyId: "company-1", pluginId: "plugin-github", actionKey: "repository-sign-commit", outcome: "worker_error" });
+    expect(text()).not.toContain(leaked);
   });
 });
