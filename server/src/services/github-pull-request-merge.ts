@@ -17,6 +17,11 @@ export type PullRequestMergeDetails = {
   workProductState?: "open" | "draft" | "merged" | "closed";
   draft?: boolean;
   baseRef?: string | null;
+  /** `owner/name` of the head branch's repository; differs from the target for forks. */
+  headRepository?: string | null;
+  defaultBranch?: string | null;
+  title?: string | null;
+  body?: string | null;
   additions?: number | null;
   deletions?: number | null;
   changedFiles?: number | null;
@@ -86,8 +91,8 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeDetailsResolver {
-  const resolver = createGitHubExternalObjectProvider(db).resolvers
+export function createPullRequestMergeDetailsResolver(db: Db, options: { includeBody?: boolean } = {}): PullRequestMergeDetailsResolver {
+  const resolver = createGitHubExternalObjectProvider(db, { includePullRequestBody: options.includeBody }).resolvers
     .find((candidate) => candidate.objectType === "pull_request") ?? null;
 
   return async (companyId, reference) => {
@@ -116,6 +121,10 @@ export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeD
       ...(workProductState ? { workProductState } : {}),
       draft: data?.draft === true,
       baseRef: typeof data?.baseRef === "string" ? data.baseRef : null,
+      headRepository: typeof data?.headRepository === "string" ? data.headRepository : null,
+      defaultBranch: typeof data?.defaultBranch === "string" ? data.defaultBranch : null,
+      title: typeof data?.title === "string" ? data.title : null,
+      ...(options.includeBody ? { body: typeof data?.body === "string" ? data.body : null } : {}),
       additions: typeof data?.additions === "number" ? data.additions : null,
       deletions: typeof data?.deletions === "number" ? data.deletions : null,
       changedFiles: typeof data?.changedFiles === "number" ? data.changedFiles : null,

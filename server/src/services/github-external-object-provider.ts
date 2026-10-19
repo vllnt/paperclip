@@ -17,6 +17,8 @@ export interface GitHubExternalObjectProviderOptions {
   fetch?: FetchLike;
   tokenProvider?: (companyId: string) => Promise<string | null> | string | null;
   secretNames?: readonly string[];
+  /** Transient matching input; leave off for stored external-object snapshots. */
+  includePullRequestBody?: boolean;
 }
 
 interface GitHubObjectIdentity {
@@ -60,6 +62,16 @@ function asNonNegativeInteger(value: unknown) {
 function asNestedString(record: Record<string, unknown>, key: string, nestedKey: string) {
   const nested = asRecord(record[key]);
   return nested ? asString(nested[nestedKey]) : null;
+}
+
+function asDeepString(record: Record<string, unknown>, ...path: string[]) {
+  let current: unknown = record;
+  for (const key of path) {
+    const next = asRecord(current);
+    if (!next) return null;
+    current = next[key];
+  }
+  return asString(current);
 }
 
 function parseGitHubCanonicalUrl(canonical: ExternalObjectCanonicalUrl): GitHubObjectIdentity | null {
@@ -198,7 +210,7 @@ function notFoundSnapshot(identity: GitHubObjectIdentity, etag: string | null): 
   };
 }
 
-function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null): ExternalObjectResolverSnapshot {
+function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string, unknown>, etag: string | null, includeBody = false): ExternalObjectResolverSnapshot {
   const title = asString(body.title);
   const state = asString(body.state) ?? "unknown";
   const draft = asBoolean(body.draft) ?? false;
@@ -207,6 +219,8 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const headRef = asNestedString(body, "head", "ref");
   const headSha = asNestedString(body, "head", "sha");
   const baseRef = asNestedString(body, "base", "ref");
+  const headRepository = asDeepString(body, "head", "repo", "full_name");
+  const defaultBranch = asDeepString(body, "base", "repo", "default_branch");
   const reviewDecision = asString(body.review_decision);
   const additions = asNonNegativeInteger(body.additions);
   const deletions = asNonNegativeInteger(body.deletions);
@@ -268,6 +282,10 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(headRef ? { headRef } : {}),
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),
+      ...(headRepository ? { headRepository } : {}),
+      ...(defaultBranch ? { defaultBranch } : {}),
+      ...(title ? { title } : {}),
+      ...(includeBody ? { body: (asString(body.body) ?? "").slice(0, 24_000) } : {}),
       ...(reviewDecision ? { reviewDecision } : {}),
       ...(additions !== null ? { additions } : {}),
       ...(deletions !== null ? { deletions } : {}),
@@ -458,7 +476,7 @@ export function createGitHubExternalObjectProvider(
         return {
           ok: true,
           snapshot: objectType === "pull_request"
-            ? pullRequestSnapshot(identity, body, etag)
+            ? pullRequestSnapshot(identity, body, etag, opts.includePullRequestBody)
             : issueSnapshot(identity, body, etag),
         };
       },

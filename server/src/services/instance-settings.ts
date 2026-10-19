@@ -210,6 +210,8 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
       ...(parsed.data.companyEnvironmentDefaults ? { companyEnvironmentDefaults: parsed.data.companyEnvironmentDefaults } : {}),
       ...(parsed.data.companyRunTiers ? { companyRunTiers: parsed.data.companyRunTiers } : {}),
+      // Absent => off; only carry through an explicit choice.
+      ...(parsed.data.gitStatusAutomation !== undefined ? { gitStatusAutomation: parsed.data.gitStatusAutomation } : {}),
     };
   }
   return {
