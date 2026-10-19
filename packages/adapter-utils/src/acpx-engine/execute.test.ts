@@ -1649,6 +1649,57 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(path.resolve(path.dirname(managedAuth), await fs.readlink(managedAuth))).toBe(sourceAuth);
   });
 
+  describe("worker Codex file seeding (codexHomeSeed)", () => {
+    async function runWithWorkerHome(extraConfig: Record<string, unknown>) {
+      const root = await makeTempRoot();
+      const sourceCodexHome = path.join(root, "worker-codex-home");
+      const paperclipHome = path.join(root, "paperclip-home");
+      const managedHome = path.join(paperclipHome, "instances", "test-instance", "companies", "company-1", "codex-home");
+      await fs.mkdir(sourceCodexHome, { recursive: true });
+      await fs.mkdir(managedHome, { recursive: true });
+      await fs.writeFile(path.join(sourceCodexHome, "AGENTS.md"), "# Worker tooling\n@RTK.md\n");
+      await fs.writeFile(path.join(sourceCodexHome, "RTK.md"), "# RTK\n");
+      await fs.writeFile(path.join(sourceCodexHome, "hooks.json"), '{"hooks":{}}\n');
+      await fs.writeFile(path.join(managedHome, "AGENTS.md"), "# Agent instructions\n");
+      vi.stubEnv("CODEX_HOME", sourceCodexHome);
+      vi.stubEnv("PAPERCLIP_HOME", paperclipHome);
+      vi.stubEnv("PAPERCLIP_INSTANCE_ID", "test-instance");
+      vi.stubEnv("OPENAI_API_KEY", "");
+      vi.stubEnv("CODEX_API_KEY", "");
+      vi.stubEnv("PAPERCLIP_CODEX_HOME_SEED", "");
+      try {
+        await runExecutor({
+          agent: "codex",
+          stateDir: path.join(root, "state"),
+          paperclipRuntimeSkills: [],
+          paperclipSkillSync: { desiredSkills: [] },
+          ...extraConfig,
+        });
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      return managedHome;
+    }
+
+    it("seeds the configured files and keeps agent AGENTS.md first", async () => {
+      const managedHome = await runWithWorkerHome({ codexHomeSeed: ["AGENTS.md", "RTK.md", "hooks.json"] });
+
+      const merged = await fs.readFile(path.join(managedHome, "AGENTS.md"), "utf8");
+      expect(merged.startsWith("# Agent instructions\n")).toBe(true);
+      expect(merged.indexOf("# Worker tooling")).toBeGreaterThan(merged.indexOf("# Agent instructions"));
+      expect(await fs.readFile(path.join(managedHome, "RTK.md"), "utf8")).toBe("# RTK\n");
+      expect(await fs.readFile(path.join(managedHome, "hooks.json"), "utf8")).toBe('{"hooks":{}}\n');
+    });
+
+    it("changes nothing when codexHomeSeed is not configured", async () => {
+      const managedHome = await runWithWorkerHome({});
+
+      expect(await fs.readFile(path.join(managedHome, "AGENTS.md"), "utf8")).toBe("# Agent instructions\n");
+      expect(await pathExists(path.join(managedHome, "RTK.md"))).toBe(false);
+      expect(await pathExists(path.join(managedHome, "hooks.json"))).toBe(false);
+    });
+  });
+
   it.each(["OPENAI_API_KEY", "CODEX_API_KEY"] as const)(
     "uses isolated API-key auth instead of the host ChatGPT login for %s",
     async (keyName) => {

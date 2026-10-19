@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
+  BellRing,
   Braces,
   CalendarClock,
   KeyRound,
@@ -10,6 +11,7 @@ import {
   Send,
   type LucideIcon,
 } from "lucide-react";
+import { isEventTrigger } from "@/api/eventSources";
 import { routinesApi } from "@/api/routines";
 import { queryKeys } from "@/lib/queryKeys";
 import { useParams } from "@/lib/router";
@@ -25,6 +27,7 @@ export const ROUTINE_DETAIL_VIEWS = [
   "history",
   "runs",
   "activity",
+  "event-groups",
 ] as const;
 
 export type RoutineDetailView = (typeof ROUTINE_DETAIL_VIEWS)[number];
@@ -77,6 +80,7 @@ export function RoutineContextualSidebar({
     enabled: Boolean(routineId && !title),
   });
   const frameTitle = title ?? routine?.title ?? "Routine";
+  const hasEventTrigger = Boolean(routine?.triggers?.some(isEventTrigger));
 
   return (
     <ContextualSidebarFrame
@@ -114,6 +118,13 @@ export function RoutineContextualSidebar({
             label="Activity"
             icon={Activity}
           />
+          {hasEventTrigger ? (
+            <SidebarNavItem
+              to={routineDetailHref(routineId, "event-groups")}
+              label="Event groups"
+              icon={BellRing}
+            />
+          ) : null}
         </div>
       </nav>
     </ContextualSidebarFrame>

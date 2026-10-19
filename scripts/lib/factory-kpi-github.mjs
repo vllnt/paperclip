@@ -176,8 +176,8 @@ const MERGED_QUERY = `query($owner:String!,$name:String!,$first:Int!,$cursor:Str
     defaultBranchRef{name}
     pullRequests(states:MERGED,first:$first,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){
       pageInfo{hasNextPage endCursor}
-      nodes{number title createdAt mergedAt updatedAt additions deletions baseRefName headRefName
-        author{login} labels(first:20){nodes{name}}
+      nodes{number title createdAt mergedAt updatedAt additions deletions baseRefName headRefName headRefOid isCrossRepository
+        mergeCommit{oid} author{login} labels(first:20){nodes{name}}
         reviews(first:20){nodes{state submittedAt author{login}}}
         timelineItems(itemTypes:[READY_FOR_REVIEW_EVENT],last:1){nodes{... on ReadyForReviewEvent{createdAt}}}}
     }
@@ -223,6 +223,9 @@ export function normalizeMergedPr(repo, node) {
     lines: (node.additions ?? 0) + (node.deletions ?? 0),
     baseRef: node.baseRefName,
     headRef: node.headRefName ?? "",
+    headOid: node.headRefOid ?? null,
+    mergeOid: node.mergeCommit?.oid ?? null,
+    crossRepo: Boolean(node.isCrossRepository),
     author: node.author?.login ?? null,
     labels: (node.labels?.nodes ?? []).map((l) => l.name),
     readyAtMs: readyAtMs(node),
@@ -254,7 +257,8 @@ export async function fetchMergedPrs(gh, repo, { sinceMs, maxPages = 40, pageSiz
   }
   const merged = [...seen.values()].map((node) => normalizeMergedPr(repo, node)).filter((pr) => pr.mergedAtMs >= sinceMs);
   const prs = merged.filter((pr) => pr.baseRef === defaultBranch);
-  return { repo, defaultBranch, prs, otherBaseMerged: merged.length - prs.length, complete };
+  const otherMerged = merged.filter((pr) => pr.baseRef !== defaultBranch);
+  return { repo, defaultBranch, prs, otherMerged, otherBaseMerged: otherMerged.length, complete };
 }
 
 const OPEN_QUERY = `query($owner:String!,$name:String!,$first:Int!,$cursor:String){
