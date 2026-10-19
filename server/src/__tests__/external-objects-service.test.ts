@@ -126,6 +126,9 @@ describe("external object registries", () => {
 });
 
 describe("GitHub external object provider", () => {
+  /** A made-up token of low entropy, so that secret scanners leave it alone. */
+  const TEST_TOKEN = "fake-token-fake-token-fake-token";
+
   function githubObject(path: string, objectType: "pull_request" | "issue") {
     const canonical = canonicalizeExternalObjectUrl(`https://github.com/acme/app/${path}`);
     if (!canonical) throw new Error("expected canonical url");
@@ -222,7 +225,7 @@ describe("GitHub external object provider", () => {
     ],
   ])("resolves a %s pull request snapshot", async (_name, body, expected) => {
     const fetch = vi.fn(async () => response(body));
-    const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: null });
+    const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: async () => TEST_TOKEN });
     const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
 
     const result = await resolver.resolve({
@@ -233,7 +236,7 @@ describe("GitHub external object provider", () => {
     expect(fetch).toHaveBeenCalledWith(
       "https://api.github.com/repos/acme/app/pulls/42",
       expect.objectContaining({
-        headers: expect.not.objectContaining({ authorization: expect.any(String) }),
+        headers: expect.objectContaining({ authorization: `Bearer ${TEST_TOKEN}` }),
       }),
     );
     expect(result).toEqual({
@@ -254,6 +257,7 @@ describe("GitHub external object provider", () => {
       }),
     });
     expect(JSON.stringify(result)).not.toContain("authorization");
+    expect(JSON.stringify(result)).not.toContain(TEST_TOKEN);
   });
 
   it.each([
@@ -269,7 +273,7 @@ describe("GitHub external object provider", () => {
     ],
   ])("resolves a %s issue snapshot", async (_name, body, expected) => {
     const fetch = vi.fn(async () => response(body));
-    const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: null });
+    const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: async () => TEST_TOKEN });
     const resolver = provider.resolvers.find((entry) => entry.objectType === "issue")!;
 
     const result = await resolver.resolve({
@@ -292,6 +296,45 @@ describe("GitHub external object provider", () => {
         }),
       }),
     });
+  });
+
+  // GitHub allows 60 unauthenticated requests an hour per IP, and a host's whole egress shares them: this resolver
+  // never sends a request without a token.
+  it.each([
+    ["no token provider", null],
+    ["a provider that returns null", async () => null],
+    ["a provider that returns a blank string", async () => "   "],
+    ["a provider that returns an empty string", () => ""],
+  ])("does not call GitHub without a token (%s), and asks to be retried in an hour", async (_name, tokenProvider) => {
+    const fetch = vi.fn(async () => response({ state: "open", draft: false, merged: false, title: "Public PR" }));
+    const provider = createGitHubExternalObjectProvider({} as any, { fetch, tokenProvider: tokenProvider as any });
+
+    for (const [path, objectType] of [["pull/42", "pull_request"], ["issues/42", "issue"]] as const) {
+      const resolver = provider.resolvers.find((entry) => entry.objectType === objectType)!;
+      const result = await resolver.resolve({ companyId: "company-1", object: githubObject(path, objectType) });
+      expect(result).toEqual({
+        ok: false,
+        liveness: "auth_required",
+        errorCode: "github_token_missing",
+        errorMessage: expect.stringContaining("token"),
+        retryAfterSeconds: 3600,
+      });
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not call GitHub when the token cannot be read", async () => {
+    const fetch = vi.fn(async () => response({ state: "open", title: "x" }));
+    const provider = createGitHubExternalObjectProvider({} as any, {
+      fetch,
+      tokenProvider: async () => { throw new Error("secret store unavailable"); },
+    });
+    const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
+
+    const result = await resolver.resolve({ companyId: "company-1", object: githubObject("pull/42", "pull_request") });
+
+    expect(result).toMatchObject({ ok: false, liveness: "auth_required", errorCode: "github_token_unavailable" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("uses a configured token without storing it in the resolved snapshot", async () => {
@@ -336,7 +379,7 @@ describe("GitHub external object provider", () => {
   ])("maps %s responses to provider-safe results", async (_name, githubResponse, expected) => {
     const provider = createGitHubExternalObjectProvider({} as any, {
       fetch: async () => githubResponse,
-      tokenProvider: null,
+      tokenProvider: async () => TEST_TOKEN,
     });
     const resolver = provider.resolvers.find((entry) => entry.objectType === "pull_request")!;
 
@@ -691,6 +734,32 @@ describeEmbeddedPostgres("externalObjectService", () => {
     expect(finalObject.refreshToken).toBeNull();
     expect(slowResolve).toHaveBeenCalledTimes(1);
     expect(replacementResolve).toHaveBeenCalledTimes(1);
+  });
+
+  // Every way the service resolves an object (the scheduler tick, a manual refresh, a forced one) ends in the resolver, so none
+  // of them reaches GitHub for a company that has no token.
+  it("sends nothing to GitHub for a company with no token, on the tick or on a refresh, and tries again in an hour", async () => {
+    const { companyId, issueId } = await createIssue();
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ state: "open", draft: false, merged: false, title: "Public PR" }), { status: 200 }));
+    const svc = externalObjectService(db, { github: { fetch, tokenProvider: null } });
+    await svc.syncIssue(issueId);
+    const start = Date.now();
+
+    const tick = await svc.refreshDueObjectsForActiveCompanies(50, new Date(start + 1_000));
+
+    expect(tick).toEqual({ companies: 1, checked: 1, refreshed: 1 });
+    const [object] = await db.select().from(externalObjects);
+    expect(object).toMatchObject({ liveness: "auth_required", lastErrorCode: "github_token_missing" });
+    expect(object!.nextRefreshAt!.getTime()).toBeGreaterThanOrEqual(start + 1_000 + 3_600_000);
+    // Inside the hour nothing is due; a manual refresh respects that; a forced one reaches the resolver and still sends nothing.
+    expect(await svc.refreshDueObjectsForActiveCompanies(50, new Date(start + 10 * 60_000))).toEqual({ companies: 1, checked: 0, refreshed: 0 });
+    const manual = await svc.refreshIssueObjects(issueId, { companyId });
+    expect(manual.map((entry) => entry.reason)).toEqual(["backoff"]);
+    const forced = await svc.refreshObject(object!.id, { companyId, force: true });
+    expect(forced.reason).toBe("auth_required");
+    // After the hour it is due again, and still sends nothing.
+    expect(await svc.refreshDueObjectsForActiveCompanies(50, new Date(start + 2 * 3_600_000))).toEqual({ companies: 1, checked: 1, refreshed: 1 });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("refreshes due objects for active companies only", async () => {

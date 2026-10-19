@@ -160,8 +160,9 @@ RUN pnpm exec vitest run server/src/__tests__/github-read-decision-cache.test.ts
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
 # after the SDK build, so build the SDK before typechecking the UI.
 RUN pnpm --filter @paperclipai/plugin-sdk build
-# Provider-quota classification of the Codex and Claude adapters (no database).
-RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts
+# Provider-quota classification of the Codex and Claude adapters, and the GitHub plugin's
+# refusal to send a request without credentials (it needs the SDK test export built above; no database).
+RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts packages/plugins/plugin-github/tests/no-unauthenticated-requests.spec.ts
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
 # The GitHub plugin's merge guard and the instance admin's per-repository opt-in (agentMergeablePaths): the guard and path rules,
