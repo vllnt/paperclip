@@ -34,6 +34,7 @@ import { INSTANCE_FEATURE_KEYS, type InstanceFeatureKey } from "./feature-catalo
 export const HIDEABLE_INSTANCE_PAGES = [
   "instance.profile",
   "instance.environments",
+  "instance.resource-capacity",
   "instance.access",
   "instance.experimental",
   "instance.plugins",

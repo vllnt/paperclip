@@ -18,6 +18,13 @@ import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { MERGE_STAGING_TAR_EXCLUDE, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
+  appendResourceProbe,
+  createResourceProbeMarker,
+  parseResourceProbeOutput,
+  splitResourceProbeOutput,
+  type ResourceProbeReading,
+} from "./resource-probe.js";
+import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
   type RuntimeProgressPhase,
@@ -1950,15 +1957,28 @@ export async function restoreWorkspaceFromSshExecution(input: {
   });
 }
 
+/**
+ * Creates and enters the remote workspace root and returns its path. With
+ * `probeResources`, the same SSH command also reads the worker's CPU count,
+ * load, memory and the root's free disk; a probe failure never fails the
+ * command, and `resourceProbe` is null when the probe printed nothing.
+ */
 export async function ensureSshWorkspaceReady(
   config: SshConnectionConfig,
-): Promise<{ remoteCwd: string }> {
-  const result = await runSshCommand(
-    config,
-    `mkdir -p ${shellQuote(config.remoteWorkspacePath)} && cd ${shellQuote(config.remoteWorkspacePath)} && pwd`,
-  );
+  options: { probeResources?: boolean } = {},
+): Promise<{ remoteCwd: string; resourceProbe: ResourceProbeReading | null }> {
+  const root = shellQuote(config.remoteWorkspacePath);
+  const command = `mkdir -p ${root} && cd ${root} && pwd`;
+  if (!options.probeResources) {
+    const result = await runSshCommand(config, command);
+    return { remoteCwd: result.stdout.trim(), resourceProbe: null };
+  }
+  const marker = createResourceProbeMarker();
+  const result = await runSshCommand(config, appendResourceProbe(command, marker));
+  const { head, probe } = splitResourceProbeOutput(result.stdout, marker);
   return {
-    remoteCwd: result.stdout.trim(),
+    remoteCwd: head.trim(),
+    resourceProbe: probe === null ? null : parseResourceProbeOutput(probe),
   };
 }
 

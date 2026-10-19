@@ -22,6 +22,9 @@ describe("normalizeRememberedInstanceSettingsPath", () => {
     expect(normalizeRememberedInstanceSettingsPath("/instance/settings/plugins/example?tab=config#logs")).toBe(
       "/company/settings/instance/plugins/example?tab=config#logs",
     );
+    expect(normalizeRememberedInstanceSettingsPath("/PAP/company/settings/instance/resource-capacity")).toBe(
+      "/company/settings/instance/resource-capacity",
+    );
     expect(normalizeRememberedInstanceSettingsPath("/PAP/company/settings/instance/adapters")).toBe(
       "/company/settings/instance/adapters",
     );
@@ -63,6 +66,12 @@ describe("filterHiddenInstanceSettingsPath", () => {
     ).toBe(DEFAULT_INSTANCE_SETTINGS_PATH);
     expect(
       filterHiddenInstanceSettingsPath("/company/settings/instance/environments", hidden),
+    ).toBe(DEFAULT_INSTANCE_SETTINGS_PATH);
+    expect(
+      filterHiddenInstanceSettingsPath(
+        "/company/settings/instance/resource-capacity",
+        new Set(["instance.resource-capacity"]),
+      ),
     ).toBe(DEFAULT_INSTANCE_SETTINGS_PATH);
   });
 
