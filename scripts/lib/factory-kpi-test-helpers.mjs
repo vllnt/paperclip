@@ -30,6 +30,9 @@ export function mergedNode(number, mergedAtMs, over = {}) {
     deletions: over.deletions ?? 5,
     baseRefName: over.base ?? "main",
     headRefName: over.head ?? `feat/${number}`,
+    headRefOid: over.headOid ?? null,
+    isCrossRepository: over.crossRepo ?? false,
+    mergeCommit: over.mergeOid ? { oid: over.mergeOid } : null,
     author: { login: over.author ?? "agent" },
     labels: { nodes: (over.labels ?? []).map((name) => ({ name })) },
     reviews: { nodes: (over.reviews ?? []).map(reviewNode) },
@@ -92,6 +95,11 @@ export function fakeGh(repos, { pageSize = 100 } = {}) {
       const repo = repos[`${variables.owner}/${variables.name}`];
       if (repo instanceof Error) throw repo;
       if (!repo) return { repository: null };
+      if (variables.h0 !== undefined) {
+        // carrier lookup: one aliased connection per base branch, answered from repo.carriers[branch]
+        const aliases = Object.keys(variables).filter((key) => /^h\d+$/.test(key));
+        return { repository: Object.fromEntries(aliases.map((key) => [`c${key.slice(1)}`, { nodes: repo.carriers?.[variables[key]] ?? [] }])) };
+      }
       if (variables.first === undefined) {
         const wanted = [..._query.matchAll(/p(\d+):pullRequest/g)].map((m) => Number(m[1]));
         return { repository: Object.fromEntries(wanted.map((n) => [`p${n}`, repo.details?.[n] ?? null])) };
