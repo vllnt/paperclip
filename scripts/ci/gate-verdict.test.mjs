@@ -6,9 +6,11 @@ import { ALWAYS, CONDITIONAL, commandData, evaluate, failedSteps, render } from 
 
 const entry = fileURLToPath(new URL("./evaluate-gate.mjs", import.meta.url));
 
+// Every classifier output of a conditional job, set to one value.
+const conditionalOutputs = (value) => Object.fromEntries(Object.values(CONDITIONAL).map((output) => [output, value]));
 // A passing `needs` built from the verdict's own job lists, so a new job needs no fixture edit.
 const green = (overrides = {}) => {
-  const outputs = { mode: "full", ...Object.fromEntries(Object.values(CONDITIONAL).map((output) => [output, "true"])) };
+  const outputs = { mode: "full", ...conditionalOutputs("true") };
   return {
     changes: { result: "success", outputs },
     ...Object.fromEntries([...ALWAYS, ...Object.keys(CONDITIONAL)].map((job) => [job, { result: "success" }])),
@@ -20,11 +22,11 @@ const [[conditional, output]] = Object.entries(CONDITIONAL);
 
 test("passes when everything the classifier asked for succeeded", () => {
   assert.equal(evaluate(green()).ok, true);
-  assert.equal(evaluate(green({ changes: { result: "success", outputs: { mode: "affected", [output]: "true" } } })).ok, true);
+  assert.equal(evaluate(green({ changes: { result: "success", outputs: { mode: "affected", ...conditionalOutputs("true") } } })).ok, true);
 });
 
 test("a conditional job the classifier did not ask for must be skipped", () => {
-  const needs = green({ changes: { result: "success", outputs: { mode: "none", [output]: "false" } }, [conditional]: { result: "skipped" } });
+  const needs = green({ changes: { result: "success", outputs: { mode: "none", ...conditionalOutputs("true"), [output]: "false" } }, [conditional]: { result: "skipped" } });
   assert.equal(evaluate(needs).ok, true);
   assert.equal(evaluate({ ...needs, [conditional]: { result: "success" } }).ok, false);
 });
