@@ -394,7 +394,7 @@ export function registerAgentCommands(program: Command): void {
   addCommonClientOptions(
     agent
       .command("update")
-      .description("Update an agent from a JSON payload")
+      .description("Update an agent from a JSON payload (runtimeConfig.runContext sets the run-context policy)")
       .argument("<agentId>", "Agent ID")
       .requiredOption("--payload-json <json>", "UpdateAgent JSON payload")
       .action(async (agentId: string, opts: AgentJsonPayloadOptions) => {

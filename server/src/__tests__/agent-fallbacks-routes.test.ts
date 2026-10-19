@@ -207,6 +207,29 @@ describeEmbeddedPostgres("agent fallbacks routes", () => {
     expect((await readAgent(agentId)).fallbacks).toEqual([]);
   });
 
+  it("requires instance admin access for external fallback instruction paths", async () => {
+    const { companyId, agentId } = await seed();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "board-user", status: "active", membershipRole: "owner",
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "user", principalId: "board-user", permissionKey: "agents:configure", scope: null, grantedByUserId: null,
+    });
+    const actor = { ...boardActor(companyId), source: "session" as const, isInstanceAdmin: false };
+    const ordinary = await request(createApp(db, actor)).patch(`/api/agents/${agentId}`)
+      .send({ fallbacks: [{ adapterType: "codex_local", model: "gpt-5.5" }] });
+    expect(ordinary.status, JSON.stringify(ordinary.body)).toBe(200);
+    await db.update(agents).set({ fallbacks: [] }).where(eq(agents.id, agentId));
+    const fallback = { adapterType: "codex_local", model: "gpt-5.5", adapterConfig: { instructionsFilePath: "/tmp/external-instructions.md" } };
+    const denied = await request(createApp(db, actor))
+      .patch(`/api/agents/${agentId}`).send({ fallbacks: [fallback] });
+    expect(denied.status, JSON.stringify(denied.body)).toBe(403);
+    expect((await readAgent(agentId)).fallbacks).toEqual([]);
+    const allowed = await request(createApp(db, boardActor(companyId)))
+      .patch(`/api/agents/${agentId}`).send({ fallbacks: [fallback] });
+    expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+  });
+
   it("refuses plaintext credentials in fallback env", async () => {
     const { companyId, agentId } = await seed();
     const res = await request(createApp(db, boardActor(companyId)))

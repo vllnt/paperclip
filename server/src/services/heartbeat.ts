@@ -1,5 +1,6 @@
-import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
+import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
+import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import {
@@ -861,10 +862,7 @@ function pendingCleanupCapWarnedSql() {
 }
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_ATTACHMENTS = 20;
-const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
-const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 /** Backs one live receipt per `issue-assignment:<issue>:<assignee>:<generation>` key. */
@@ -8175,10 +8173,22 @@ export async function buildPaperclipWakePayload(input: {
   )
     return null;
 
+  const runContext =
+    commentIds.length === 0 && !annotationCommentId
+      ? RUN_CONTEXT_DEFAULTS
+      : await loadRunContextSettings({
+          db: input.db,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          issueId,
+          wakeReason: readNonEmptyString(input.contextSnapshot.wakeReason),
+        });
+  const windowCommentIds =
+    runContext.window === "newest" ? commentIds.slice(-runContext.maxComments) : commentIds;
   const commentRows =
-    commentIds.length === 0
+    windowCommentIds.length === 0
       ? []
-      : await selectInCommentBatches(commentIds, (batch) =>
+      : await selectInCommentBatches(windowCommentIds, (batch) =>
           input.db
             .select({
               id: issueComments.id,
@@ -8218,22 +8228,22 @@ export async function buildPaperclipWakePayload(input: {
     ? issueDescription.slice(0, MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS)
     : issueDescription;
   const comments: Array<Record<string, unknown>> = [];
-  let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
-  let truncated = false;
+  let remainingBodyChars = runContext.maxTotalCommentChars;
+  let truncated = windowCommentIds.length < commentIds.length;
   let missingCommentCount = 0;
   const safeContinuationSummary =
     continuationSummary && !input.exposeLowTrustRaw
       ? redactQuarantinedBodyForHigherTrust(continuationSummary)
       : continuationSummary;
 
-  for (const commentId of commentIds) {
+  for (const commentId of windowCommentIds) {
     const row = commentsById.get(commentId);
     if (!row) {
       truncated = true;
       missingCommentCount += 1;
       continue;
     }
-    if (comments.length >= MAX_INLINE_WAKE_COMMENTS) {
+    if (comments.length >= runContext.maxComments) {
       truncated = true;
       break;
     }
@@ -8245,7 +8255,7 @@ export async function buildPaperclipWakePayload(input: {
         : sanitizeQuarantinedCommentForHigherTrust(row);
     const fullBody = deletedAt ? "" : safeRow.body;
     const allowedBodyChars = Math.min(
-      MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+      runContext.maxCommentChars,
       remainingBodyChars,
     );
     if (allowedBodyChars <= 0) {
@@ -8253,13 +8263,17 @@ export async function buildPaperclipWakePayload(input: {
       break;
     }
 
-    const body =
+    const cutBody =
       fullBody.length > allowedBodyChars
         ? fullBody.slice(0, allowedBodyChars)
         : fullBody;
-    const bodyTruncated = body.length < fullBody.length;
+    const bodyTruncated = cutBody.length < fullBody.length;
+    const body =
+      bodyTruncated && runContext.truncationMarker
+        ? `${cutBody}\n[truncated: ${fullBody.length - cutBody.length} more characters]`
+        : cutBody;
     if (bodyTruncated) truncated = true;
-    remainingBodyChars -= body.length;
+    remainingBodyChars -= cutBody.length;
 
     comments.push({
       id: row.id,
@@ -8408,11 +8422,11 @@ export async function buildPaperclipWakePayload(input: {
               anchorState: row.anchorState,
               anchorConfidence: row.anchorConfidence,
               body:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS
-                  ? row.body.slice(0, MAX_INLINE_WAKE_COMMENT_BODY_CHARS)
+                row.body.length > runContext.maxCommentChars
+                  ? row.body.slice(0, runContext.maxCommentChars)
                   : row.body,
               bodyTruncated:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+                row.body.length > runContext.maxCommentChars,
               createdAt: row.createdAt.toISOString(),
               author: row.authorAgentId
                 ? { type: "agent", id: row.authorAgentId }

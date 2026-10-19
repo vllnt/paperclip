@@ -18,6 +18,12 @@ it("uses the CSS defaults before styles load and honors runtime token overrides"
   expect(motionNumber("--onboarding-motion-hero-stiffness")).toBe(190);
   expect(motionEase("--motion-ease-out-expo")).toEqual([0.1, 0.2, 0.3, 1]);
 });
+it("plays full motion, instead of throwing, when matchMedia throws", () => {
+  vi.stubGlobal("matchMedia", () => {
+    throw new Error("matchMedia failed");
+  });
+  expect(motionSeconds("--onboarding-motion-step")).toBe(0.28);
+});
 it("removes animation durations under reduced motion without removing the connection status hold", () => {
   vi.stubGlobal("matchMedia", () => ({ matches: true }));
   expect(motionSeconds("--onboarding-motion-step")).toBe(0);
