@@ -42,10 +42,14 @@ import { runPeriodicHeartbeatRecovery } from "../services/periodic-heartbeat-rec
 const adapterGate = vi.hoisted(() => {
   let release: () => void = () => {};
   let gate = new Promise<void>((resolve) => { release = resolve; });
+  let entered = 0;
   return {
-    wait: () => gate,
+    /** Called by the adapter when a run reaches it, then the run waits on the gate. */
+    wait: () => { entered += 1; return gate; },
+    /** How many runs reached the adapter since the last reset. */
+    enteredCount: () => entered,
     open: () => { release(); },
-    reset: () => { gate = new Promise<void>((resolve) => { release = resolve; }); },
+    reset: () => { entered = 0; gate = new Promise<void>((resolve) => { release = resolve; }); },
   };
 });
 
@@ -383,7 +387,9 @@ describeEmbeddedPostgres("a wake of an older routine copy while a newer copy hol
    * a wake of copy 2 reaches the "legacy run" rebind in the enqueue transaction, which sets
    * `execution_run_id` on copy 2 before any claim runs.
    */
-  async function seedLiveHolderAndQueuedSibling() {
+  async function seedLiveHolderAndQueuedSibling(
+    options: { siblingIssue?: Record<string, unknown>; siblingRunContext?: Record<string, unknown> } = {},
+  ) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const originId = randomUUID();
@@ -410,7 +416,8 @@ describeEmbeddedPostgres("a wake of an older routine copy while a newer copy hol
       },
       {
         id: siblingRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
-        status: "queued", contextSnapshot: { issueId: siblingIssueId, wakeReason: "issue_assigned" },
+        status: "queued",
+        contextSnapshot: { issueId: siblingIssueId, wakeReason: "issue_assigned", ...options.siblingRunContext },
       },
     ]);
     const copy = (id: string, n: number, extra: Record<string, unknown>) => ({
@@ -420,7 +427,7 @@ describeEmbeddedPostgres("a wake of an older routine copy while a newer copy hol
     });
     await db.insert(issues).values([
       copy(holderIssueId, 1, { executionRunId: holderRunId, executionLockedAt: new Date() }),
-      copy(siblingIssueId, 2, {}),
+      copy(siblingIssueId, 2, options.siblingIssue ?? {}),
     ]);
     return { companyId, agentId, holderIssueId, holderRunId, siblingIssueId, siblingRunId };
   }
@@ -444,6 +451,120 @@ describeEmbeddedPostgres("a wake of an older routine copy while a newer copy hol
     const [siblingRun] = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
       .from(heartbeatRuns).where(eq(heartbeatRuns.id, siblingRunId));
     expect(siblingRun).toMatchObject({ status: "cancelled", errorCode: "routine_execution_superseded" });
+  });
+
+  /**
+   * The unique index only covers open, visible issues, so a copy that is done, cancelled or
+   * hidden can take the execution slot next to a live sibling without a conflict. Its queued
+   * run must be claimed, not cancelled as superseded. A done or cancelled copy only gets this
+   * far when the wake carries resume intent, which bypasses the terminal-status cancel.
+   */
+  it.each([
+    ["done", { status: "done" }, { resumeIntent: true }],
+    ["cancelled", { status: "cancelled" }, { resumeIntent: true }],
+    ["hidden", { hiddenAt: new Date() }, {}],
+  ])("a %s copy does not conflict with a live sibling: its queued run is claimed, not cancelled as superseded", async (_name, siblingIssue, siblingRunContext) => {
+    const { holderIssueId, holderRunId, siblingIssueId, siblingRunId } = await seedLiveHolderAndQueuedSibling({
+      siblingIssue, siblingRunContext,
+    });
+
+    await expect(heartbeatService(db).resumeQueuedRuns()).resolves.not.toThrow();
+
+    const [siblingRun] = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, siblingRunId));
+    expect(siblingRun?.errorCode).not.toBe("routine_execution_superseded");
+    expect(siblingRun?.status).not.toBe("queued");
+    expect(siblingRun?.status).not.toBe("cancelled");
+    const [sibling] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, siblingIssueId));
+    expect(sibling?.executionRunId).toBe(siblingRunId);
+    const [holder] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, holderIssueId));
+    expect(holder?.executionRunId).toBe(holderRunId);
+  });
+
+  /**
+   * Copy 2 has a genuinely live run: a wake started it and it is tracked in this process
+   * (the adapter is gated). Its issue lock is then cleared, which is the legacy shape: the run
+   * names the issue only in its context. Copy 1 holds the slot through a run that already
+   * ended (a stale lock the sweep has not cleared). A wake of copy 2 now reaches the legacy
+   * rebind in the enqueue transaction, which meets the unique index.
+   */
+  async function seedStaleHolderAndLiveLegacyRun() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const originId = randomUUID();
+    const holderIssueId = randomUUID();
+    const siblingIssueId = randomUUID();
+    const holderRunId = randomUUID();
+    const prefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const longAgo = new Date(Date.now() - 30 * 60_000);
+    await db.insert(companies).values({
+      id: companyId, name: "Paperclip", issuePrefix: prefix, requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Waiter", role: "engineer", status: "idle",
+      adapterType: "claude_local", adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 3 } },
+      permissions: {},
+    });
+    const copy = (id: string, n: number, extra: Record<string, unknown>) => ({
+      id, companyId, title: `Copy ${n}`, status: "in_progress" as const, priority: "medium" as const,
+      assigneeAgentId: agentId, issueNumber: n, identifier: `${prefix}-${n}`,
+      originKind: "routine_execution", originId, createdAt: longAgo, updatedAt: longAgo, ...extra,
+    });
+    await db.insert(issues).values(copy(siblingIssueId, 2, {}));
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: siblingIssueId, mutation: "update" },
+      contextSnapshot: { issueId: siblingIssueId, source: "test.seed" },
+    });
+    const [legacyRun] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${siblingIssueId}`));
+    expect(legacyRun?.status).toBe("running");
+    // Wait until the run is parked on the gated adapter. Its own setup takes the issue lock
+    // asynchronously, and must be over before the stale holder is written.
+    for (let attempt = 0; attempt < 200 && adapterGate.enteredCount() === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(adapterGate.enteredCount()).toBe(1);
+
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, siblingIssueId));
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system",
+      status: "cancelled", errorCode: "cancelled", startedAt: longAgo, finishedAt: new Date(Date.now() - 5 * 60_000),
+      contextSnapshot: { issueId: holderIssueId },
+    });
+    await db.insert(issues).values(copy(holderIssueId, 1, { executionRunId: holderRunId, executionLockedAt: longAgo }));
+    return { companyId, agentId, holderIssueId, siblingIssueId, legacyRunId: legacyRun!.id };
+  }
+
+  it("a wake of a copy that has a live legacy run joins that run when the slot is taken, so no second run can start on the issue", async () => {
+    const { companyId, agentId, siblingIssueId, legacyRunId } = await seedStaleHolderAndLiveLegacyRun();
+    const heartbeat = heartbeatService(db);
+    const liveRunsOfSibling = () => db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${siblingIssueId}`,
+        sql`${heartbeatRuns.status} in ('queued', 'running')`,
+      ));
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: siblingIssueId, mutation: "update" },
+      contextSnapshot: { issueId: siblingIssueId, source: "test.conveyor" },
+    })).resolves.not.toThrow();
+
+    // The wake joined the running run: it did not queue a second run next to it.
+    expect(await liveRunsOfSibling()).toEqual([{ id: legacyRunId, status: "running" }]);
+
+    // Once the stale lock is swept, nothing is left waiting that could take the slot.
+    await heartbeat.sweepStaleIssueLocks();
+    await expect(heartbeat.resumeQueuedRuns()).resolves.not.toThrow();
+    expect(await liveRunsOfSibling()).toEqual([{ id: legacyRunId, status: "running" }]);
+    const [sibling] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, siblingIssueId));
+    expect([null, legacyRunId]).toContain(sibling?.executionRunId);
   });
 
   it("the queued-comment claim yields on a stale holder's slot: the run stays queued, then starts once the lock is cleared", async () => {

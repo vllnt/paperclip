@@ -9538,7 +9538,7 @@ function logRoutineExecutionSlotConflict(
 ) {
   logger.warn(
     { runId, issueId, index: ROUTINE_EXECUTION_SLOT_INDEX },
-    `${site}: another open copy of this routine execution holds the execution slot; the run stays queued`,
+    `${site}: another open copy of this routine execution holds the execution slot; this run cannot take it`,
   );
 }
 
@@ -31135,15 +31135,16 @@ export function heartbeatService(
                       })
                       .where(eq(issues.id, issue.id));
                   });
-                  activeExecutionRun = legacyRun;
                 } catch (error) {
-                  // Another open copy of the same routine execution holds the slot. This
-                  // issue cannot take it, so treat it as having no lock: the wake goes on
-                  // as a new queued run, and the claim cancels or defers it like any
-                  // other run of this copy.
+                  // Another open copy of the same routine execution holds the slot, so this
+                  // issue cannot bind it. The legacy run is still live for this issue, so
+                  // the wake still joins it below, without the lock. Queueing a new run
+                  // instead would let it claim the slot once the holder's lock is cleared
+                  // and run next to the legacy run.
                   if (!isRoutineExecutionSlotConflict(error)) throw error;
                   logRoutineExecutionSlotConflict(legacyRun.id, issue.id, "enqueueWakeup");
                 }
+                activeExecutionRun = legacyRun;
               }
             }
           }

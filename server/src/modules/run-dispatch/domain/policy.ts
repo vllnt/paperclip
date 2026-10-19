@@ -134,8 +134,9 @@ export type QueuedRunFacts = {
    * Another open copy of the same routine execution (same origin and dispatch
    * fingerprint) that already holds the execution slot. The index
    * `issues_open_routine_execution_uq` allows one such holder, so a run that
-   * would also take the slot cannot start. Null when none, or when this issue is
-   * not a routine execution.
+   * would also take the slot cannot start. Null when none, when this issue is not
+   * a routine execution, or when this issue is itself done, cancelled or hidden:
+   * the index does not cover it, so it cannot lose the slot.
    */
   routineCopyHoldingExecution?: { issueId: string; runId: string; runLive: boolean } | null;
   /** Rechecked for automatic native replacements immediately before dispatch. */

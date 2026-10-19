@@ -67,6 +67,9 @@ import type {
 } from "../application/types.js";
 import { RunDispatchApplicationError } from "../application/types.js";
 
+/** The statuses of the partial unique index issues_open_routine_execution_uq. */
+const OPEN_ISSUE_STATUSES: string[] = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type LoadGateFactsInput = {
   conversationContinuation: boolean;
@@ -521,6 +524,7 @@ export function createPostgresRunDispatchAdapter(
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
         executionState: issues.executionState,
+        hiddenAt: issues.hiddenAt,
         originKind: issues.originKind,
         originId: issues.originId,
         originFingerprint: issues.originFingerprint,
@@ -587,9 +591,14 @@ export function createPostgresRunDispatchAdapter(
 
     // The same predicate as the partial unique index issues_open_routine_execution_uq:
     // another visible, open copy with this origin and fingerprint that holds the slot.
+    // The index covers a row only while it is itself open and visible, so only such an
+    // issue can lose the slot to a sibling. A done, cancelled or hidden one takes it
+    // without a conflict, so it gets no holder here.
     const routineCopyHoldingExecution =
       issue &&
       issue.executionRunId === null &&
+      issue.hiddenAt === null &&
+      OPEN_ISSUE_STATUSES.includes(issue.status) &&
       issue.originKind === "routine_execution" &&
       issue.originId !== null
         ? await dbOrTx
@@ -604,7 +613,7 @@ export function createPostgresRunDispatchAdapter(
                 eq(issues.originFingerprint, issue.originFingerprint),
                 sql`${issues.id} <> ${issue.id}`,
                 sql`${issues.hiddenAt} is null`,
-                inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+                inArray(issues.status, OPEN_ISSUE_STATUSES),
               ),
             )
             .limit(1)
