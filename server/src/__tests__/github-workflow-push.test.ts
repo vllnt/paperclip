@@ -5,6 +5,7 @@ import { GITHUB_WRITE_IDENTITY_STATE, parseGitHubWriteIdentityPolicy } from "@pa
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { withProtectedBranchFacts } from "../services/github-protected-branches.js";
 import { attachGitHubCaller, readGitHubOperation, registerGitHubWriteIdentityWorkers } from "../services/github-write-identity.js";
 
 // The broker runs for real on real rows; only the credential store behind it and the GitHub plugin worker are doubles.
@@ -132,7 +133,8 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(asked[0]).not.toHaveProperty("route");
     // Deleting a ref and reading objects never ask for editWorkflows.
     asked.length = 0;
-    await resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: api("-X", "DELETE", "repos/Acme/Site/git/refs/heads/feature") }), run));
+    await withProtectedBranchFacts({ repository: "acme/site", defaultBranch: "main", protection: new Map([["feature", false]]) }, () =>
+      resolveGitHubOperationCredentials(db, run, attachGitHubCaller(readGitHubOperation({ operation: api("-X", "DELETE", "repos/Acme/Site/git/refs/heads/feature") }), run)));
     expect(asked[0]).toMatchObject({ action: "push", privileged: [] });
   });
 

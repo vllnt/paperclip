@@ -876,7 +876,7 @@ describe("git data API writes need editWorkflows (a workflow edit without git pu
   });
 
   it("lets a ref be deleted and the objects be read: neither adds content", () => {
-    expect(api("-X", "DELETE", "repos/o/r/git/refs/heads/feature")).toEqual({ access: "write", action: "push", privileged: [] });
+    expect(api("-X", "DELETE", "repos/o/r/git/refs/heads/feature")).toEqual({ access: "write", action: "push", privileged: [], branchRewrites: ["feature"] });
     for (const path of ["repos/o/r/git/trees/abc?recursive=1", "repos/o/r/git/blobs/abc", "repos/o/r/git/commits/abc", "repos/o/r/git/refs/heads/feature", "repos/o/r/git/matching-refs/heads"]) {
       expect(api(path), path).toEqual({ access: "read", action: null, privileged: [] });
     }
@@ -1142,10 +1142,10 @@ describe("operations agents never perform", () => {
     expect(gh("api", "-X", "POST", "repos/o/r/actions/runs/77/pending_deployments", "-F", "environment_ids[]=1", "-f", "state=approved")).toEqual(write("other", "deploymentApproval"));
     // Feature branches: deleted, renamed or force-updated through the API; the default branch updated without force.
     expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/feature/x")).toEqual({ ...write("push"), branchRewrites: ["feature/x"] });
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", `sha=${sha}`, "-F", "force=true")).toEqual({ ...write("push"), branchRewrites: ["feature"] });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", `sha=${sha}`, "-F", "force=true")).toEqual({ ...{ ...write("push"), branchRewrites: ["feature"] }, privileged: ["editWorkflows"], route: "git/refs/heads/feature" });
     expect(gh("api", "-X", "POST", "repos/o/r/branches/feature/rename", "-f", "new_name=feature-2")).toEqual({ ...write("other"), branchRewrites: ["feature"] });
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`)).toEqual(write("push", "pushToMain"));
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force=false")).toEqual(write("push", "pushToMain"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`)).toEqual({ ...write("push", "pushToMain"), privileged: ["pushToMain", "editWorkflows"], route: "git/refs/heads/main" });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force=false")).toEqual({ ...write("push", "pushToMain"), privileged: ["pushToMain", "editWorkflows"], route: "git/refs/heads/main" });
     // git push: feature branches pushed, force-pushed (lease or not) and deleted; the default branch pushed without force.
     const git = (args: string[], context: Record<string, unknown> = {}) => classifyGitHubCommand("git", args, { ...clean, ...context });
     expect(git(["push", "-u", "origin", "feature/x"])).toEqual(write("push"));
@@ -1213,16 +1213,16 @@ describe("security review of the agents-never deny (round 2)", () => {
     expect(git(["push", "origin", "--delete", "protected"])).toEqual({ ...write("push"), branchRewrites: ["protected"] });
     expect(git(["push", "origin", "+HEAD:develop", ":release/1", "feature"], { currentBranch: "feature" })).toEqual({ ...write("push"), branchRewrites: ["develop", "release/1"] });
     expect(git(["push", "--force-with-lease=develop:" + sha, "origin", "develop"])).toEqual({ ...write("push"), branchRewrites: ["develop"] });
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-f", "force=true")).toEqual({ ...write("push"), branchRewrites: ["develop"] });
-    expect(gh("api", "repos/o/r/git/refs/heads/develop", "-X", "PATCH", "--input", "ref.json")).toEqual({ ...write("push"), branchRewrites: ["develop"] });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-f", "force=true")).toEqual({ ...{ ...write("push"), branchRewrites: ["develop"] }, privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
+    expect(gh("api", "repos/o/r/git/refs/heads/develop", "-X", "PATCH", "--input", "ref.json")).toEqual({ ...{ ...write("push"), branchRewrites: ["develop"] }, privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
     expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/release%2F1")).toEqual({ ...write("push"), branchRewrites: ["release/1"] });
     expect(gh("api", "-X", "POST", "repos/o/r/branches/develop/rename", "-f", "new_name=dev")).toEqual({ ...write("other"), branchRewrites: ["develop"] });
     expect(gh("repo", "sync", "--force", "--branch", "develop")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["develop"] });
     expect(gh("repo", "sync", "o/fork", "--force", "-bdevelop")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["develop"] });
     // Plain updates of a branch rewrite nothing: GitHub's own protection applies to them.
     expect(git(["push", "origin", "develop"])).toEqual(write("push"));
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`)).toEqual(write("push"));
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-F", "force=false")).toEqual(write("push"));
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`)).toEqual({ ...write("push"), privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-F", "force=false")).toEqual({ ...write("push"), privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
     expect(gh("repo", "sync", "--branch", "develop")).toEqual(write("push", "pushToMain"));
     // Refused writes carry nothing to check.
     expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/main")).not.toHaveProperty("branchRewrites");

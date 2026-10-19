@@ -384,58 +384,6 @@ token, and not against the checkout alone:
   as touching workflow files when the files differ from the branch tip it last
   saw, so it is not skipped for having no new commit.
 
-The base is the base of the same-repository open pull request whose head is the
-pushed branch, else the repository's default branch. Whoever opens a pull
-request chooses its base, so the base counts only when it is the default branch
-or a protected branch; workflow files on any other branch are not taken as
-reviewed. The push must be one commit to one named branch, with at most 100
-new commits and 100 workflow files and no path longer than 300 characters;
-otherwise the checkout reports no history and the toggle decides. Anything that
-cannot be read in full (a pull request lookup, a branch, a tree, a comparison),
-two open pull requests into different bases, and every symlink or submodule among
-the changed paths (whether or not the base branch has the same) refuse. The
-refusal names the commit or the paths that differ; the audit record lists all of
-them, and the base branch and its commit when the check passed. An agent's own
-edit, a rename, a mode change, or a deletion the base branch does not share is
-refused as before. This applies to the App user identity only (with
-`userSource: "run"` the toggle decides as before), and it unlocks no other
-toggle: `pushToMain`, `tagPush` and the rest still apply.
-
-This lifts Paperclip's refusal only. GitHub has its own: it refuses a push that
-changes workflow files from an App without the Workflows write permission, which
-is why the hard limit below is to keep that permission off. Whether GitHub counts
-a merge of the base branch's own workflow files as such a change was not
-verified. If it does, these pushes still fail at GitHub until a human grants the
-permission, and then the checkout's report of the pushed paths is the only gate
-that remains.
-
-**Workflow files and the base branch.** A push whose new commits change
-`.github/workflows/**` needs `editWorkflows`, with one exception: an agent keeps
-a pull request current by merging its base branch, and the base branch's own
-workflow changes come in with that merge. With `editWorkflows` off, the plugin
-lets such a push through only when all the history it adds is the base branch's
-own. It checks that against GitHub at that moment, with the App's read-only
-token, and not against the checkout alone:
-
-- Every new commit that changes a workflow file (the checkout reports them with
-  their parents) must be a merge of exactly two parents. The files it changes
-  must be byte for byte what the base branch has now (same git mode and blob),
-  or gone from both, and its second parent must be part of the base branch.
-  A commit of one parent that changes a workflow file, an octopus merge, and a
-  second parent that is not on the base branch are refused. So a clean tip
-  cannot hide an earlier edit: the commit that made the edit is refused too.
-- Every parent where the new history joins commits that already exist (the
-  checkout reports these) must be on the pushed branch or on the base branch on
-  GitHub. A remote ref that only the checkout has hides nothing: the commit
-  behind it is not on GitHub, so the push is refused.
-- The pushed commit's workflow files, wherever they differ from the branch it
-  replaces on GitHub (the branch's actual tip, not what the checkout last
-  fetched), must be the base branch's. Moving a branch to an older commit that
-  GitHub already has, or onto a commit from another branch, is a change to its
-  workflow files and is judged the same way. The checkout also marks such a push
-  as touching workflow files when the files differ from the branch tip it last
-  saw, so it is not skipped for having no new commit.
-
 **What counts as already on GitHub.** The launcher works out which commits a
 push adds, and whether any of them changes a workflow file, as the commits that
 the refs of the destination do not reach. The remote-tracking refs of a checkout

@@ -113,18 +113,6 @@ function parseWorkflowPush(value: unknown): GitHubWorkflowPush | undefined {
   return { branch, tip, files: parsedFiles, commits: parsedCommits, entries };
 }
 
-const WORKFLOWS = ".github/workflows";
-/** The most the launcher reports of a push's workflow history (it reports none of it beyond these). */
-const MAX_WORKFLOW_FILES = 100, MAX_WORKFLOW_COMMITS = 100, MAX_WORKFLOW_ENTRIES = 8, MAX_WORKFLOW_CHANGES = 400, MAX_WORKFLOW_PARENTS = 16, MAX_WORKFLOW_PATH = 300;
-/** A git object ID (SHA-1 or SHA-256 repositories). */
-const GIT_OID = /^[0-9a-f]{40,64}$/;
-/** The modes of regular files in git. Symlinks (120000) and submodules (160000) are never accepted as the base branch's own. */
-const REGULAR_FILE_MODES = ["100644", "100755"];
-const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 1)}…` : text;
-const short = (sha: string) => sha.slice(0, 8);
-/** The paths for a refusal message: a few, shortened, and how many more there are. */
-const listPaths = (paths: string[]) => paths.slice(0, 3).map(path => clip(path, 70)).join(", ") + (paths.length > 3 ? `, and ${paths.length - 3} more` : "");
-
 /**
  * Why privileged actions were refused to this caller. An action that is off for the company says so; a scopable
  * action that is granted to other agents says this agent has no board grant. For those two, the message names the
@@ -160,49 +148,6 @@ function grantHint(toggles: GitHubPrivilegedToggles, action: GitHubPrivilegedAct
 function withHint(message: string, hint: string): string {
   const room = 500 - hint.length - 1;
   return `${message.length > room ? `${message.slice(0, room - 1)}…` : message} ${hint}`;
-}
-
-const workflowPath = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_WORKFLOW_PATH && (value === WORKFLOWS || value.startsWith(`${WORKFLOWS}/`));
-const gitOid = (value: unknown): value is string => typeof value === "string" && GIT_OID.test(value);
-
-/**
- * A push's workflow history in exactly the shape the server forwards from the
- * launcher; anything else is undefined, so the `editWorkflows` toggle decides.
- */
-function parseWorkflowPush(value: unknown): GitHubWorkflowPush | undefined {
-  if (!value || typeof value !== "object" || !("branch" in value) || !("tip" in value) || !("files" in value) || !("commits" in value) || !("entries" in value)) return undefined;
-  const { branch, tip, files, commits, entries } = value;
-  if (typeof branch !== "string" || !branch || branch.length > 250 || /[\x00-\x20\x7f]/.test(branch) || !gitOid(tip)) return undefined;
-  if (!Array.isArray(files) || files.length > MAX_WORKFLOW_FILES || !Array.isArray(commits) || commits.length > MAX_WORKFLOW_COMMITS) return undefined;
-  if (!Array.isArray(entries) || !entries.length || entries.length > MAX_WORKFLOW_ENTRIES || !entries.every(gitOid)) return undefined;
-  const parsedFiles: GitHubWorkflowPush["files"] = [];
-  for (const file of files) {
-    if (!file || typeof file !== "object" || !("path" in file) || !("mode" in file) || !("oid" in file)) return undefined;
-    const { path, mode, oid } = file;
-    if (!workflowPath(path) || typeof mode !== "string" || !/^\d{6}$/.test(mode) || !gitOid(oid)) return undefined;
-    parsedFiles.push({ path, mode, oid });
-  }
-  const parsedCommits: GitHubWorkflowCommit[] = [];
-  let total = 0;
-  for (const commit of commits) {
-    if (!commit || typeof commit !== "object" || !("sha" in commit) || !("parents" in commit) || !("changes" in commit)) return undefined;
-    const { sha, parents, changes } = commit;
-    if (!gitOid(sha) || !Array.isArray(parents) || parents.length > MAX_WORKFLOW_PARENTS || !parents.every(gitOid)) return undefined;
-    if (!Array.isArray(changes) || !changes.length || changes.length > MAX_WORKFLOW_FILES) return undefined;
-    total += changes.length;
-    if (total > MAX_WORKFLOW_CHANGES) return undefined;
-    const parsedChanges: GitHubWorkflowChange[] = [];
-    for (const change of changes) {
-      if (!change || typeof change !== "object" || !("path" in change) || !("mode" in change) || !("oid" in change)) return undefined;
-      const { path, mode, oid } = change;
-      if (!workflowPath(path)) return undefined;
-      if (mode === null && oid === null) parsedChanges.push({ path, mode, oid });
-      else if (typeof mode === "string" && /^\d{6}$/.test(mode) && gitOid(oid)) parsedChanges.push({ path, mode, oid });
-      else return undefined;
-    }
-    parsedCommits.push({ sha, parents, changes: parsedChanges });
-  }
-  return { branch, tip, files: parsedFiles, commits: parsedCommits, entries };
 }
 
 /** Reads every page of a paginated GitHub list, or throws when it has more than {@link MAX_PAGES} pages. */
