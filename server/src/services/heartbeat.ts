@@ -444,6 +444,7 @@ import {
   issueService,
   type IssuePostCommitAction,
 } from "./issues.js";
+import { HEARTBEAT_CHECKOUT_ACTOR } from "./routable-blocked.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -22498,6 +22499,7 @@ export function heartbeatService(
             agent.id,
             [...resolvedInteractionCheckoutExpectedStatuses()],
             run.id,
+            HEARTBEAT_CHECKOUT_ACTOR,
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
         } catch (error) {
@@ -22535,6 +22537,7 @@ export function heartbeatService(
             agent.id,
             ["todo", "backlog", "blocked"],
             run.id,
+            HEARTBEAT_CHECKOUT_ACTOR,
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
         } catch (error) {
