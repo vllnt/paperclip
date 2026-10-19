@@ -49,50 +49,70 @@ const URL_USERINFO = /(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/
 
 const PEM_BEGIN = "-----BEGIN ";
 const PEM_END = "-----END ";
-const PEM_DASHES = "-----";
-
-/** A PEM label: one or more characters, no dash and no newline. */
-function pemLabelEnd(text: string, from: number): number {
-  const end = text.indexOf(PEM_DASHES, from);
-  if (end <= from) return -1;
-  for (let index = from; index < end; index += 1) {
-    if (text[index] === "-" || text[index] === "\n") return -1;
-  }
-  return end;
-}
-
 /**
- * Replaces each `-----BEGIN <label>----- … -----END <label>-----` block, the
- * shortest one from each start, in one forward scan: a lazy regex retries the
- * rest of the text from every start, which is quadratic on many headers.
+ * One PEM scanner per text stream. Marker tails are bounded, so arbitrarily
+ * split headers/footers work without retaining the log or a whole key. Once a
+ * BEGIN marker appears, fail closed until a complete END marker (or EOF).
+ * A marker prefix already emitted by an earlier chunk contains no key material.
  */
-function redactPemBlocks(text: string): string {
-  let output = "";
-  let position = 0;
-  for (let begin = text.indexOf(PEM_BEGIN); begin >= 0; begin = text.indexOf(PEM_BEGIN, begin + 1)) {
-    if (begin < position) continue;
-    const headerEnd = pemLabelEnd(text, begin + PEM_BEGIN.length);
-    if (headerEnd < 0) continue;
-    let blockEnd = -1;
-    for (let end = text.indexOf(PEM_END, headerEnd + PEM_DASHES.length); end >= 0; end = text.indexOf(PEM_END, end + 1)) {
-      const labelEnd = pemLabelEnd(text, end + PEM_END.length);
-      if (labelEnd >= 0) {
-        blockEnd = labelEnd + PEM_DASHES.length;
-        break;
+export function createPemTextRedactor() {
+  let inside = false;
+  let beginTail = "";
+  let endTail = "";
+  let endLabel = false;
+  let hasLabel = false;
+  let endDashes = 0;
+
+  function redact(text: string): string {
+    if (!text) return text;
+    const parts: string[] = inside ? [REDACTED_EVENT_VALUE] : [];
+    let visibleStart = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index]!;
+      if (!inside) {
+        beginTail = (beginTail + char).slice(-PEM_BEGIN.length);
+        if (beginTail === PEM_BEGIN) {
+          const markerStart = Math.max(visibleStart, index + 1 - PEM_BEGIN.length);
+          parts.push(text.slice(visibleStart, markerStart), REDACTED_EVENT_VALUE);
+          inside = true;
+          beginTail = "";
+          endTail = "";
+          endLabel = false;
+        }
+        continue;
+      }
+
+      endTail = (endTail + char).slice(-PEM_END.length);
+      if (endTail === PEM_END) {
+        endLabel = true;
+        hasLabel = false;
+        endDashes = 0;
+        continue;
+      }
+      if (!endLabel) continue;
+      if (char === "-" && hasLabel) {
+        endDashes += 1;
+        if (endDashes === 5) {
+          inside = false;
+          endLabel = false;
+          endTail = "";
+          visibleStart = index + 1;
+        }
+      } else if (char === "-" || char === "\r" || char === "\n" || endDashes > 0) {
+        endLabel = false;
+      } else {
+        hasLabel = true;
       }
     }
-    // No end line after this header means none after any later header either.
-    if (blockEnd < 0) break;
-    output += text.slice(position, begin) + REDACTED_EVENT_VALUE;
-    position = blockEnd;
-    begin = blockEnd - 1;
+    if (!inside) parts.push(text.slice(visibleStart));
+    return parts.join("");
   }
-  return position === 0 ? text : output + text.slice(position);
+  return { redact, hasOpenBlock: () => inside };
 }
 
 /** PEM blocks and URL userinfo in one string, in time linear in its length. */
 export function redactSecretShapedText(text: string): string {
-  return redactPemBlocks(text).replace(URL_USERINFO, `$1${REDACTED_EVENT_VALUE}@`);
+  return createPemTextRedactor().redact(text).replace(URL_USERINFO, `$1${REDACTED_EVENT_VALUE}@`);
 }
 
 /**

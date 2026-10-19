@@ -1,6 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
-import { redactSecretShapedText } from "../services/run-read-redaction.js";
+import { createPemTextRedactor, redactSecretShapedText } from "../services/run-read-redaction.js";
+
+// Text scanning does not read instance settings or encrypted secret material.
+vi.mock("../services/instance-settings.js", () => ({ instanceSettingsService: vi.fn() }));
+vi.mock("../services/run-secret-redaction.js", () => ({ createRunSecretRedactionRegistry: vi.fn() }));
 
 const R = REDACTED_EVENT_VALUE;
 
@@ -17,11 +21,43 @@ describe("export text redaction", () => {
     expect(redactSecretShapedText("see https://example.com/a@b")).toBe("see https://example.com/a@b");
     const pem = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----";
     expect(redactSecretShapedText(`a ${pem} b ${pem} c`)).toBe(`a ${R} b ${R} c`);
-    // A header with a dash in its label, or a block with no end line, is left as it was.
-    expect(redactSecretShapedText("-----BEGIN RSA-PSS KEY-----\nx\n-----END RSA-PSS KEY-----")).toBe("-----BEGIN RSA-PSS KEY-----\nx\n-----END RSA-PSS KEY-----");
-    expect(redactSecretShapedText("-----BEGIN CERTIFICATE-----\nno end")).toBe("-----BEGIN CERTIFICATE-----\nno end");
+    // Malformed or unfinished blocks fail closed through the end of the text.
+    expect(redactSecretShapedText("-----BEGIN RSA-PSS KEY-----\nx\n-----END RSA-PSS KEY-----")).toBe(R);
+    expect(redactSecretShapedText("-----BEGIN CERTIFICATE-----\nno end")).toBe(R);
     // An end line whose label has a dash does not close the block; the next valid one does.
     expect(redactSecretShapedText("-----BEGIN A----- -----END bad-label----- x -----END B----- tail")).toBe(`${R} tail`);
+  });
+
+  it("redacts an unfinished PEM block through the end of the string", () => {
+    expect(redactSecretShapedText("before -----BEGIN PRIVATE KEY-----\nY2FuYXJ5LXByaXZhdGUta2V5"))
+      .toBe(`before ${R}`);
+  });
+
+  it("redacts PEM material across every possible transcript chunk boundary", () => {
+    const secret = "Y2FuYXJ5LXByaXZhdGUta2V5";
+    const text = `before -----BEGIN PRIVATE KEY-----\n${secret}\n-----END PRIVATE KEY----- after`;
+    for (let split = 1; split < text.length; split += 1) {
+      const { redact } = createPemTextRedactor();
+      const result = redact(text.slice(0, split)) + redact(text.slice(split));
+      expect(result).not.toContain(secret);
+      expect(result).toContain("before ");
+      expect(result).toContain(" after");
+    }
+    const { redact } = createPemTextRedactor();
+    const result = [...text].map(redact).join("");
+    expect(result).not.toContain(secret);
+    expect(result).toContain(" after");
+  });
+
+  it("keeps unfinished-block state until a complete footer arrives", () => {
+    const scanner = createPemTextRedactor();
+    expect(scanner.hasOpenBlock()).toBe(false);
+    scanner.redact("-----BEGIN PRIVATE KEY-----\nbody");
+    expect(scanner.hasOpenBlock()).toBe(true);
+    scanner.redact("-----END PRIVATE KEY---");
+    expect(scanner.hasOpenBlock()).toBe(true);
+    expect(scanner.redact("-- diagnostic")).toBe(`${R} diagnostic`);
+    expect(scanner.hasOpenBlock()).toBe(false);
   });
 
   it("stays linear on long strings with many scheme or PEM starts", () => {
@@ -30,7 +66,7 @@ describe("export text redaction", () => {
     expect(schemeLike.ms).toBeLessThan(250);
 
     const headers = timed("-----BEGIN A-----".repeat(10_000));
-    expect(headers.result).toBe("-----BEGIN A-----".repeat(10_000));
+    expect(headers.result).toBe(R);
     expect(headers.ms).toBeLessThan(250);
   });
 });
