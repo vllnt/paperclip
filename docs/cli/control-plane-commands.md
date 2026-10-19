@@ -21,6 +21,9 @@ npx paperclipai issue similar --title "..." [--description "..."] [--parent-id <
 # Update issue
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]
 
+# Block an issue on a human step; the board sees it in its inbox and must unblock it
+npx paperclipai issue update <issue-id> --status blocked --unblock-owner board --unblock-action "Click Update branch on PR #123"
+
 # Add comment
 npx paperclipai issue comment <issue-id> --body "..." [--reopen]
 
@@ -41,6 +44,19 @@ npx paperclipai issue create -C <company-id> --title "..." --adapter-overrides-j
 object: `adapterConfig` (keys that override the agent's adapter config for runs on this issue) and
 `useProjectWorkspace` (boolean). Unknown keys are rejected before the request is sent. Use only one of the
 two options.
+
+### Issue Tree
+
+```sh
+npx paperclipai issue tree <issue-id> [-C <company-id>] [--json]
+```
+
+Prints the issue and its sub-issues as an indented tree, one line per issue:
+`identifier [status] assignee=<agent name | user:<id> | -> lastRun=<status(errorCode) age | ->  title`.
+Agent names are looked up with the company ID (`-C`, context, or
+`PAPERCLIP_COMPANY_ID`); without one, agent IDs are shown. Nodes you cannot read
+are omitted and counted in a footer line. `--json` prints the raw
+`GET /api/issues/{issueId}/diagnostics/subtree` response.
 
 ## Company Commands
 
@@ -85,7 +101,20 @@ command.
 ```sh
 npx paperclipai agent list
 npx paperclipai agent get <agent-id>
+
+# Config history
+npx paperclipai agent config-revisions <agent-id>
+npx paperclipai agent config-revision:get <agent-id> <revision-id>
+npx paperclipai agent config-revision:diff <agent-id> <revision-id> [--json]
+npx paperclipai agent config-revision:rollback <agent-id> <revision-id>
 ```
+
+`config-revision:diff` prints one line per changed leaf as
+`path: before -> after` (`(unset)` marks an added or removed key). Arrays are
+compared as whole values. Secret values are redacted by the server, so a key the
+server recorded as changed with no visible difference prints as
+`<key>: changed (values redacted)`. `--json` prints
+`{ changedKeys, changes: [{ path, kind, before, after }], redactedOnlyKeys }`.
 
 ## Skills Commands
 
@@ -109,6 +138,26 @@ npx paperclipai skills import owner/repo/path/to/skill --company-id <company-id>
 # Attach desired company skills to an agent after install/import
 npx paperclipai skills agent sync <agent-id> --skill github-pr-workflow --mode add --company-id <company-id>
 ```
+
+### Company Skill Versions
+
+```sh
+# List saved versions of a company skill, newest revision first
+npx paperclipai skill versions <skill-id> [-C <company-id>]
+
+# Get one version, including the content of every file
+npx paperclipai skill version:get <skill-id> <version-id> [-C <company-id>]
+
+# Unified line diff of the files between two versions
+npx paperclipai skill version:diff <skill-id> <from-version-id> <to-version-id> [-C <company-id>] [--json]
+```
+
+`version:diff` fetches both versions and diffs their files client-side: one
+`--- a/<path>` / `+++ b/<path>` block with `@@` hunks (3 lines of context) per
+added, removed, or modified file. Base64 (binary) files print
+`Binary file <path> differs`; an executable-bit change prints
+`executable: false -> true`. `--json` prints
+`{ fromVersionId, toVersionId, fromRevisionNumber, toRevisionNumber, files: [{ path, change, binary, diff }] }`.
 
 ## Environment Lease Commands
 
@@ -199,3 +248,14 @@ are not queued or waiting to retry, less the provider quota failures that the ca
 ```sh
 npx paperclipai heartbeat run --agent-id <agent-id> [--api-base http://localhost:3100]
 ```
+
+### Continue a stopped issue execution
+
+```sh
+paperclipai issue reconcile <issue-id> \
+  --outcome none \
+  --note "The provider stopped before any external write was made." \
+  --expected-run-id <latest-stopped-run-id>
+```
+
+Use `done`, `none`, or `mixed` for `--outcome`. This records board evidence for all stacked stopped-run holds and queues one fresh continuation. Add `--workspace-repair-note` when the recovery record reports an unsafe workspace restore.

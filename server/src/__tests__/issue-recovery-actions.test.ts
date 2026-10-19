@@ -2142,6 +2142,69 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     );
   });
 
+  it.each(["backlog", "cancelled"] as const)(
+    "clears a stale recovery action on a %s source without changing its status",
+    async (status) => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status, assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId, sourceIssueId, kind: "stranded_assigned_issue", ownerType: "board",
+        previousOwnerAgentId: coderId, returnOwnerAgentId: coderId, cause: "stranded_assigned_issue",
+        fingerprint: `stale-flag:${status}`, nextAction: "Board operator: inspect the evidence.",
+        wakePolicy: { type: "board_escalation", reason: "stranded_assigned_issue" },
+      });
+      const wake = vi.fn(async () => null);
+      const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "false_positive",
+          sourceIssueStatus: status,
+          resolutionNote: "Stale flag on a parked task.",
+        })
+        .expect(200);
+
+      expect(resolved.body.issue).toMatchObject({ id: sourceIssueId, status, activeRecoveryAction: null });
+      expect(resolved.body.recoveryAction).toMatchObject({ id: action.id, status: "resolved", outcome: "false_positive" });
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+      expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toMatchObject({ status, assigneeAgentId: coderId });
+      expect(wake).not.toHaveBeenCalled();
+      const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+      expect(detail.body.activeRecoveryAction).toBeNull();
+      expect(detail.body.status).toBe(status);
+      await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({ actionId: action.id, outcome: "false_positive", sourceIssueStatus: status })
+        .expect(200);
+      expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    },
+  );
+
+  it("refuses to use a backlog clear to move an active task into backlog", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "todo", assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId, sourceIssueId, kind: "stranded_assigned_issue", ownerType: "board",
+      previousOwnerAgentId: coderId, returnOwnerAgentId: coderId, cause: "stranded_assigned_issue",
+      fingerprint: "stale-flag:guard", nextAction: "Board operator: inspect the evidence.",
+      wakePolicy: { type: "board_escalation", reason: "stranded_assigned_issue" },
+    });
+    const app = createApp();
+
+    const denied = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "false_positive", sourceIssueStatus: "backlog" })
+      .expect(409);
+
+    expect(denied.body.details?.code).toBe("recovery_clear_requires_current_status");
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({ id: action.id });
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toMatchObject({ status: "todo" });
+  });
+
   it.each(["ask_user_questions", "request_confirmation"] as const)("does not retry past a new pending %s", async (kind) => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.update(issues).set({ status: "blocked", assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));

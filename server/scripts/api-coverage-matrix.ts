@@ -3,7 +3,8 @@
  * authentication level, the board UI client calls that reach it, and the
  * `paperclipai` CLI commands that reach it.
  *
- * Run: `pnpm --filter @paperclipai/server api:coverage`
+ * Run: `pnpm --filter @paperclipai/server api:coverage`. The matrix is generated
+ * on demand and ignored by git; do not commit it.
  * Create the parity baseline, or drop baselined gaps that now have a CLI command (it never adds a gap):
  * `pnpm --filter @paperclipai/server api:coverage -- --write-baseline`
  *

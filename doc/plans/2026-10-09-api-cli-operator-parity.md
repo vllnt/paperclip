@@ -1,14 +1,14 @@
 # API / CLI operator parity
 
-Goal (bntvllnt, 2026-10-08): everything a human does in the board UI can be done
+Goal (2026-10-08): everything a human does in the board UI can be done
 with an API key (no browser session), a `paperclipai` CLI command, and the
 OpenAPI document, so that one Paperclip instance can drive another. The work is
-generic and suitable for any company.
+generic; no company-specific behavior is planned.
 
-The per-operation matrix is generated: [`doc/api-coverage-matrix.md`](../api-coverage-matrix.md).
-Regenerate it with `pnpm --filter @paperclipai/server api:coverage`.
+The per-operation matrix is generated on demand and is not committed. Generate it with
+`pnpm --filter @paperclipai/server api:coverage`; it writes `doc/api-coverage-matrix.md`, which git ignores.
 
-## Where things stand (generated 2026-10-09)
+## Where things stand (snapshot of 2026-10-09)
 
 | Measure | Count |
 |---|---|
@@ -18,7 +18,7 @@ Regenerate it with `pnpm --filter @paperclipai/server api:coverage`.
 | Called by a CLI command | 367 |
 | **Called by the UI but with no CLI command** | **400** |
 
-These are a snapshot; the matrix's own summary is authoritative after regeneration.
+This is a snapshot from before #25, #26, #28 and #38 merged. The matrix's own summary is authoritative after regeneration.
 
 Coverage guards:
 - `server/src/__tests__/openapi-routes.test.ts` fails when a mounted route is missing from the document.
@@ -43,7 +43,7 @@ Runtime exceptions to the matrix's "API key" column:
 |---|---|---|
 | `POST /api/plugins/{pluginId}/actions/{key}` and `/bridge/action` | board | Any authenticated actor reaches the plugin. Each plugin decides; the GitHub plugin's `boardScope` rejects agents and requires `companyId`. |
 | `/api/cli-auth/*`, `/api/auth/*` | board | Session or login-flow specific by design. |
-| Cloud-tenant deployments | — | Board keys never carry instance admin (rows are purged on each trusted-header login). This does not apply to standalone `authenticated` deployments. |
+| Cloud-tenant deployments | — | Board keys never carry instance admin (rows are purged on each trusted-header login). Self-hosted deployments in `authenticated` mode do not have this restriction. |
 
 ## Operator gaps, ranked by pain
 
@@ -71,7 +71,8 @@ with docs in `docs/api` and `docs/cli` and spec entries.
 | 17 | **The other ~400 UI operations without a CLI command.** | Raw HTTP. | **(h)** generic `paperclipai api <METHOD> <path>` (auth, company context, path params, JSON body) and `paperclipai api ops [--tag]` listing operations from `/api/openapi.json`. This makes every documented operation reachable from the CLI. |
 | 18 | **Board API keys have no scopes.** A key is as powerful as its user, so handing one to another instance hands over the user. | Use a dedicated low-privilege user. | Proposal only (needs a decision): optional company and read-only scopes on board keys, enforced in `authz.ts`. Not started. |
 
-Open PRs so far: #22 (this matrix), #24 (a), #25 (i), #26 (e), #28 (b), #29 (k), #30 (c), #33 (m), #34 (overrides CLI), #35 to #38 (read views).
+Merged: #20 (agent self-config deny), #25 (i), #26 (e), #28 (b), #38 (lease filter and company-wide leases).
+Open: #24 (a, API part; the CLI part is #159), #29 (k), #30 (c), #33 (m), #34 (overrides CLI), #35, #36 and #37 (read views), #163 and #168 (the chat routes and the generator from the first version of #22).
 
 ## Board Git actions
 
@@ -114,8 +115,7 @@ large files:
      payload" (`sandbox-callback-bridge.ts:1117-1129`).
    - 4,194,304 × 76/77 × 3/4 × 3/4 ≈ **2.33 MB** of raw file, which matches the symptom. SSH targets have a
      1 MiB command buffer (`execution-target.ts:680`), so they would fail from about 0.58 MB.
-   - Not verified: which execution environment production uses. That is not recorded in the repo, and I
-     have not touched production.
+   - Not verified: which execution environment production uses. That is not recorded in the repo.
 2. **The server accepts at most 10 MiB per attachment** (`PAPERCLIP_ATTACHMENT_MAX_BYTES`, default
    `10 * 1024 * 1024`, `server/src/attachment-types.ts:164`). The bridge allows the same plus 64 KiB of
    multipart framing. Any file type is accepted on issue attachments. The 33 MB archive fails here even
@@ -139,15 +139,15 @@ Options:
 
 One theme per PR, each against `main`, reviewed and merged by the operator one at a time:
 
-0. This coverage matrix and its tests (#22).
-1. (a) agent config merge-PATCH + `agent config set` (#24).
+0. The coverage matrix generator and its tests (#168), with the chat routes it found undocumented (#163). The parity ratchet that fails the build for a new API operation with no CLI command follows the route-adding PRs below.
+1. (a) agent config merge-PATCH (#24), then `agent config get|set` (#159).
 2. (m) board-only reconcile-and-continue, and deferred wakes that show their reason (#33).
 3. (k) agents may hand a block to the board (#29).
-4. (i) bridge: chunked envelope read-back, loud truncation errors (#25).
-5. (b) runs list filters, stats, caps usage + `run list|stats` (#28).
-6. (e) 400 on invalid UUID path params (#26).
+4. (i) bridge: chunked envelope read-back, loud truncation errors (#25, merged).
+5. (b) runs list filters, stats, caps usage + `run list|stats` (#28, merged).
+6. (e) 400 on invalid UUID path params (#26, merged).
 7. (c) plugin actions with a board key, end to end + CLI (#30).
-8. (d) read views, split into four PRs: #35 config-revision diff and skill versions (CLI only), #36 company-wide recovery actions, #37 issue tree with each node's last run, #38 lease status filter and company-wide leases.
+8. (d) read views, split into four PRs: #35 config-revision diff and skill versions (CLI only), #36 company-wide recovery actions, #37 issue tree with each node's last run, #38 lease status filter and company-wide leases (merged).
 9. (l) board Git actions, after the credential decision above.
 10. (f) `routine apply`.
 11. (j) chunked, resumable attachment uploads (after a decision on size and retention limits).

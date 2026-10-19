@@ -11,7 +11,11 @@ import {
   heartbeatRuns,
   runUsageRecords,
 } from "@paperclipai/db";
-import { RUN_USAGE_RECORD_SCHEMA_VERSION } from "@paperclipai/shared";
+import {
+  RUN_USAGE_RECORD_SCHEMA_VERSION,
+  observabilityFailuresResponseSchema,
+  observabilityUsageResponseSchema,
+} from "@paperclipai/shared";
 import { errorHandler } from "../middleware/error-handler.js";
 import { observabilityRoutes } from "../routes/observability.js";
 import { runUsageRecordService } from "../services/run-usage-records.js";
@@ -172,5 +176,74 @@ describeEmbeddedPostgres.sequential("observability routes", () => {
     const response = await request(appFor({ type: "none", source: "none" })).get(`/api/companies/${mine.companyId}/observability/health`);
 
     expect(response.status).toBe(401);
+  });
+
+  describe.each(["usage", "failures"])("GET %s", (report) => {
+    const pathFor = (companyId: string) => `/api/companies/${companyId}/observability/${report}`;
+
+    it("refuses an agent of another company and a board user who is not a member", async () => {
+      const mine = await seedCompany(1);
+      const other = await seedCompany(1);
+
+      const asAgent = await request(appFor({ type: "agent", agentId: other.agentId, companyId: other.companyId, source: "agent_key" }))
+        .get(pathFor(mine.companyId));
+      const asBoard = await request(appFor(boardOf(other.companyId))).get(pathFor(mine.companyId));
+
+      expect(asAgent.status).toBe(403);
+      expect(asBoard.status).toBe(403);
+      expect(JSON.stringify(asAgent.body) + JSON.stringify(asBoard.body)).not.toContain("totals");
+    });
+
+    it("refuses an unauthenticated caller", async () => {
+      const mine = await seedCompany(1);
+
+      const response = await request(appFor({ type: "none", source: "none" })).get(pathFor(mine.companyId));
+
+      expect(response.status).toBe(401);
+    });
+
+    it("lets an agent of the same company read it", async () => {
+      const mine = await seedCompany(1);
+
+      const response = await request(appFor({ type: "agent", agentId: mine.agentId, companyId: mine.companyId, source: "agent_key" }))
+        .get(pathFor(mine.companyId));
+
+      expect(response.status).toBe(200);
+    });
+
+    it("rejects an unknown query key, a bad group, a bad date and a bad window with 400", async () => {
+      const mine = await seedCompany(1);
+      const app = appFor(boardOf(mine.companyId));
+
+      expect((await request(app).get(`${pathFor(mine.companyId)}?agentID=x`)).status).toBe(400);
+      expect((await request(app).get(`${pathFor(mine.companyId)}?groupBy=nonsense`)).status).toBe(400);
+      expect((await request(app).get(`${pathFor(mine.companyId)}?since=yesterday`)).status).toBe(400);
+      expect((await request(app).get(`${pathFor(mine.companyId)}?since=2026-10-05&until=2026-10-01`)).status).toBe(400);
+    });
+  });
+
+  it("returns a usage report that matches the shared response schema and counts only this company", async () => {
+    const mine = await seedCompany(2);
+    await seedCompany(5);
+
+    const response = await request(appFor(boardOf(mine.companyId)))
+      .get(`/api/companies/${mine.companyId}/observability/usage?groupBy=agent`);
+
+    expect(response.status).toBe(200);
+    const parsed = observabilityUsageResponseSchema.parse(response.body);
+    expect(parsed.rows.map((row) => [row.key, row.label, row.runs])).toEqual([[mine.agentId, "Agent", 2]]);
+    expect(parsed.totals.runs).toBe(2);
+  });
+
+  it("returns a failures report with the count of all runs in the window", async () => {
+    const mine = await seedCompany(2);
+
+    const response = await request(appFor(boardOf(mine.companyId)))
+      .get(`/api/companies/${mine.companyId}/observability/failures?groupBy=agent`);
+
+    expect(response.status).toBe(200);
+    const parsed = observabilityFailuresResponseSchema.parse(response.body);
+    expect(parsed.rows).toEqual([]);
+    expect(parsed.totals).toMatchObject({ runs: 0, allRuns: 2 });
   });
 });
