@@ -4,6 +4,7 @@ packages/adapter-utils/src/paperclip-temp.test.ts
 packages/adapter-utils/src/remote-process-identity.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-idle-poll.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-lifecycle.test.ts
+packages/adapter-utils/src/test-support/process-liveness.test.ts
 packages/adapter-utils/src/workspace-restore-merge.test.ts
 packages/adapters/claude-local/src/current-model-catalog.test.ts
 packages/adapters/codex-local/src/company-model-catalog.test.ts
@@ -18,6 +19,7 @@ server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
+ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/CommandPalette.real.test.tsx
 ui/src/components/CommandPalette.test.tsx
 ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
@@ -32,6 +34,7 @@ ui/src/lib/command-action-usage.test.ts
 ui/src/lib/issue-list-invalidation.test.ts
 ui/src/lib/keyboardShortcuts.test.ts
 ui/src/lib/live-run-polling.test.tsx
+ui/src/lib/live-run-card-count.test.ts
 ui/src/lib/main-content-focus.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
