@@ -170,7 +170,7 @@ describeEmbeddedPostgres("stranded in_progress issue recovery", () => {
     const heartbeat = heartbeatService(db);
     mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
       const { runId } = input as { runId: string };
-      await issueService(db).checkout(fixture.issueId, fixture.agentId, ["todo"], runId);
+      await issueService(db).checkout(fixture.issueId, fixture.agentId, ["todo"], runId, { kind: "agent", agentId: fixture.agentId });
       return SUCCESS;
     });
     const run = await heartbeat.wakeup(fixture.agentId, {
