@@ -112,10 +112,16 @@ describeEmbeddedPostgres("statements per board request", () => {
     const db = createDb(tempDb.connectionString);
     // postgres.js calls `options.debug` for each statement it sends, on every
     // connection of the pool.
+    let driverTypeFetches = 0;
     db.$client.options.debug = (_connection, statement) => {
-      if (statement.replace(/\s+/g, " ").trim() !== DRIVER_TYPE_FETCH) recording?.push(statement);
+      if (statement.replace(/\s+/g, " ").trim() === DRIVER_TYPE_FETCH) driverTypeFetches += 1;
+      else recording?.push(statement);
     };
     seeded = await seed(db);
+    // The seed opened a connection, so the driver sent its type fetch. If none
+    // matched, the driver changed that statement's text, and the counts would
+    // vary with the connections a request opens.
+    expect(driverTypeFetches, "no statement matched DRIVER_TYPE_FETCH").toBeGreaterThan(0);
     apps = {
       operator: createApp(db, {
         type: "board",
