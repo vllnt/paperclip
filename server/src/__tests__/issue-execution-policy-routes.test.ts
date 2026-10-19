@@ -74,6 +74,11 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  // issue-waits imports logActivity directly; mock it here because the modules are now preloaded once in beforeAll.
+  vi.doMock("../services/activity-log.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/activity-log.js")>("../services/activity-log.js")),
+    logActivity: mockLogActivity,
+  }));
   vi.doMock("../services/queued-interaction-response.js", () => ({
     hasQueuedInteractionResponse: vi.fn(async () => false),
   }));
@@ -1281,19 +1286,11 @@ describe("issue execution policy routes", () => {
       }) as any);
     }
 
-    async function waitApp(actor?: TestActor) {
-      vi.doMock("../services/activity-log.js", async () => ({
-        ...(await vi.importActual<typeof import("../services/activity-log.js")>("../services/activity-log.js")),
-        logActivity: mockLogActivity,
-      }));
-      return createApp(actor);
-    }
-
     it("lets the assignee agent wait on its own issue without changing its status", async () => {
       useIssue(waitingIssue());
       const before = Date.now();
 
-      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+      const res = await request(await createApp(agentActor(assigneeAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: "10m", reason: "CI on PR #4320 head abc123" });
 
@@ -1324,7 +1321,7 @@ describe("issue execution policy routes", () => {
     it("refuses an agent waiting on an issue assigned to someone else", async () => {
       useIssue(waitingIssue());
 
-      const res = await request(await waitApp(agentActor(otherAgentId)))
+      const res = await request(await createApp(agentActor(otherAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: "10m", reason: "CI" });
 
@@ -1335,7 +1332,7 @@ describe("issue execution policy routes", () => {
     it.each([["30s"], ["25h"], ["later"]])("rejects the out-of-bounds delay %s", async (delay) => {
       useIssue(waitingIssue());
 
-      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+      const res = await request(await createApp(agentActor(assigneeAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: delay, reason: "CI" });
 
@@ -1346,7 +1343,7 @@ describe("issue execution policy routes", () => {
     it.each([["todo"], ["blocked"], ["done"]])("rejects a wait on a %s issue", async (status) => {
       useIssue(waitingIssue({ status }));
 
-      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+      const res = await request(await createApp(agentActor(assigneeAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: "10m", reason: "CI" });
 
@@ -1357,7 +1354,7 @@ describe("issue execution policy routes", () => {
     it("lets a board user schedule the wait for the assignee", async () => {
       useIssue(waitingIssue({ status: "in_review" }));
 
-      const res = await request(await waitApp())
+      const res = await request(await createApp())
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: 900, reason: "Preview deploy" });
 
