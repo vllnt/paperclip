@@ -23,6 +23,9 @@ ui/src/components/CommandPalette.test.tsx
 ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
 ui/src/components/ui/command.test.tsx
 ui/src/context/CommandActionsContext.test.tsx
+ui/src/context/LiveUpdatesProvider.hook.test.tsx
+ui/src/context/LiveUpdatesProvider.recovery.test.tsx
+ui/src/context/LiveUpdatesProvider.test.ts
 ui/src/hooks/useKeyboardShortcuts.test.tsx
 ui/src/lib/agent-setup-fields.test.ts
 ui/src/lib/command-action-usage.test.ts
