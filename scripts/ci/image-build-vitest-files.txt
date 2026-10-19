@@ -22,6 +22,7 @@ server/src/__tests__/paperclip-temp-sweeper.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/CommandPalette.real.test.tsx
 ui/src/components/CommandPalette.test.tsx
+ui/src/components/IssueFiltersPopover.test.tsx
 ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
 ui/src/components/ui/command.test.tsx
 ui/src/context/CommandActionsContext.test.tsx
