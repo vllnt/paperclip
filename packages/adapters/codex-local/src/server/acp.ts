@@ -40,6 +40,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { removePaperclipTempDir } from "@paperclipai/adapter-utils/paperclip-temp";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
+import { resolveCodexHomeSeedSelection } from "@paperclipai/adapter-utils/codex-home-seed";
 import { normalizeCodexModel } from "../index.js";
 import { classifyCodexAuthRefreshFailure, extractCodexRetryNotBefore } from "./parse.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
@@ -196,7 +197,10 @@ async function prepareCodexRemoteManagedHome(
     || process.env.OPENAI_API_KEY?.trim() || process.env.CODEX_API_KEY?.trim(),
   );
   // Curated allowlist temp dir (auth/config/skills only); caller owns cleanup.
-  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome);
+  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
+    extraEntries: resolveCodexHomeSeedSelection(input.config.codexHomeSeed, process.env).names,
+    onLog,
+  });
   let stagedRuntime;
   try {
     stagedRuntime = await input.stage([

@@ -58,7 +58,7 @@ export function isPrivateWebhookHttpRequest(
     // Do not let URL dot-segment normalization erase an explicitly supplied
     // ingress namespace on a malformed absolute-form callback.
     const rawPath = pathname.replace(/^https?:\/\/[^/]*/i, "");
-    if (/^\/api\/(?:chat-webhooks|routine-triggers\/public)(?:\/|$)/i.test(rawPath)) return true;
+    if (/^\/api\/(?:chat-webhooks|routine-triggers\/public|event-sources\/public)(?:\/|$)/i.test(rawPath)) return true;
     try {
       pathname = new URL(url).pathname;
     } catch {
@@ -67,7 +67,7 @@ export function isPrivateWebhookHttpRequest(
   }
   // This namespace is reserved for provider ingress, including malformed or
   // unknown callback paths. Rejecting a route must not make its payload public.
-  return /^\/api\/(?:chat-webhooks|routine-triggers\/public)(?:\/|$)/i.test(pathname);
+  return /^\/api\/(?:chat-webhooks|routine-triggers\/public|event-sources\/public)(?:\/|$)/i.test(pathname);
 }
 
 /**

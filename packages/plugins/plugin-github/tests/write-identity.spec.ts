@@ -2728,7 +2728,7 @@ describe("per-agent grants of editWorkflows and workflowDispatch", () => {
 
 // ---------------------------------------------------------------------------
 // An instance admin's per-repository opt-in (`agentMergeablePaths` in the plugin config): agents may merge pull requests that
-// touch `.github/**`, except for the CODEOWNERS paths, control repositories, tiers paths and the admin's own exclusions.
+// touch `.github/**`, except for the CODEOWNERS paths, control paths, tiers paths, repositories with a tiers file and the admin's own exclusions.
 // ---------------------------------------------------------------------------
 
 describe("agentMergeablePaths: an instance admin releases some protected paths for agent merges", () => {
@@ -2890,11 +2890,37 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
     }
   });
 
-  it("never lets a control repository opt in, even when it is listed, and keeps its other protected paths", async () => {
+  it("lets a control repository without a tiers file opt in to .github/**, and keeps its control paths and CODEOWNERS refused", async () => {
     const f = await fixture(optIn({}, CONTROL));
-    for (const filename of [".github/workflows/ci.yml", "paperclip/gates.yaml", "scripts/build.sh"]) {
-      f.github.prFiles = [{ filename }];
-      expect(await merge(f, CONTROL), filename).toMatchObject(refused([filename]));
+    f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }];
+    expect(await merge(f, CONTROL)).toMatchObject({
+      credential: { login: "agent-owner" },
+      evidence: { protectedPaths: { releasedProtectedFiles: [".github/workflows/ci.yml"], releasedBy: "config:agentMergeablePaths" } },
+    });
+    // These stay refused with the opt-in on, alone and next to a released file (which keeps the refusal for the whole pull request).
+    for (const filename of ["paperclip/gates.yaml", "scripts/build.sh", "ROADMAP.md", "data/company/strategy/plan.md", "CODEOWNERS", ".github/CODEOWNERS", ".github/../scripts/x"]) {
+      for (const prFiles of [[{ filename }], [{ filename: ".github/workflows/ci.yml" }, { filename }]]) {
+        f.github.prFiles = prFiles;
+        const decision = await merge(f, CONTROL);
+        expect(decision, `${filename} (${prFiles.length} files)`).toMatchObject(refused([filename]));
+        expect(decision).not.toHaveProperty("credential");
+      }
+    }
+  });
+
+  it("keeps a control repository refused without its own explicit opt-in, and when its base branch has a tiers file", async () => {
+    // No entry, or an entry for another repository: nothing is released.
+    for (const config of [undefined, optIn({}, ORDINARY)]) {
+      const f = await fixture(config);
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f, CONTROL), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    }
+    // A tiers file refuses the opt-in, and a tiers file with no opt-in refuses as before.
+    for (const config of [optIn({}, CONTROL), undefined]) {
+      const f = await fixture(config);
+      f.github.contents[`${CONTROL}/paperclip/tiers.yaml@${base}`] = tiersFile(["paperclip/**"]);
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await merge(f, CONTROL), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
     }
   });
 

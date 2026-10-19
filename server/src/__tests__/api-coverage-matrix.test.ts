@@ -4,15 +4,25 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { buildOpenApiSpec } from "../routes/openapi.js";
 import {
+  type ClientCall,
+  type CoverageResult,
+  type SpecOperation,
+  PARITY_BASELINE_FILE,
+  PARITY_EXEMPTIONS_FILE,
   collectCoverage,
   escapeCell,
   extractCliCalls,
   extractUiCalls,
+  findCliGaps,
   findCliRegistrationPrefixes,
   loadSharedConstants,
   loadSpecOperations,
   matchOperation,
+  operationId,
+  readParityBaseline,
+  readParityExemptions,
   renderCoverageMarkdown,
+  unreviewedCliGaps,
 } from "../../scripts/api-coverage-matrix.js";
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -225,5 +235,91 @@ describe("api coverage matrix against the repository", () => {
     expect(rows.find((row) => row.startsWith("| `GET /api/companies/{companyId}/costs/by-agent` |"))).toContain(
       "`paperclipai cost by-agent`",
     );
+  });
+
+  it("has a paperclipai command for every API operation unless it is baselined or exempted", () => {
+    const unreviewed = unreviewedCliGaps(
+      findCliGaps(result),
+      new Set(readParityBaseline(REPO_ROOT)),
+      readParityExemptions(REPO_ROOT),
+    );
+    expect(
+      unreviewed,
+      `These API operations have no paperclipai command. Add one (AGENTS.md rule 8), or add an entry with a reason to ` +
+        `${PARITY_EXEMPTIONS_FILE}. Do not add them to ${PARITY_BASELINE_FILE}.`,
+    ).toEqual([]);
+  });
+
+  it("keeps the baseline sorted and unique so diffs show only real changes", () => {
+    const baseline = readParityBaseline(REPO_ROOT);
+    expect(baseline.length).toBeGreaterThan(100);
+    expect(baseline).toEqual([...new Set(baseline)].sort());
+  });
+
+  it("lists only documented operations in the exemptions, each with a reason", () => {
+    const known = new Set(operations.map(operationId));
+    const exemptions = readParityExemptions(REPO_ROOT);
+    expect(Object.keys(exemptions).filter((id) => !known.has(id))).toEqual([]);
+    expect(
+      Object.entries(exemptions)
+        .filter(([, reason]) => reason.trim().length < 10)
+        .map(([id]) => id),
+    ).toEqual([]);
+  });
+});
+
+describe("web/API/CLI parity ratchet", () => {
+  const operation = (method: string, route: string): SpecOperation => ({
+    method,
+    path: route,
+    summary: route,
+    tag: "Tests",
+    access: "board-key",
+  });
+  const cliCall = (route: string, label: string): ClientCall => ({
+    method: "GET",
+    path: route,
+    raw: route,
+    file: "cli/src/commands/client/sample.ts",
+    line: 1,
+    label,
+  });
+  const resultFor = (operations: SpecOperation[], cliCalls: ClientCall[]): CoverageResult => {
+    const cliByOperation = new Map<string, ClientCall[]>();
+    for (const call of cliCalls) {
+      const key = `${call.method} ${call.path}`;
+      cliByOperation.set(key, [...(cliByOperation.get(key) ?? []), call]);
+    }
+    return {
+      operations,
+      uiCalls: [],
+      cliCalls,
+      uiByOperation: new Map(),
+      cliByOperation,
+      uiUndocumented: [],
+      cliUndocumented: [],
+      dynamicCalls: [],
+    };
+  };
+
+  it("counts only a command as covering an operation, not shared helper code", () => {
+    const gaps = findCliGaps(
+      resultFor(
+        [operation("GET", "/api/a"), operation("GET", "/api/b"), operation("GET", "/api/c")],
+        [cliCall("/api/a", "paperclipai sample list"), cliCall("/api/b", "fetchB")],
+      ),
+    );
+    expect(gaps).toEqual(["GET /api/b", "GET /api/c"]);
+  });
+
+  it("reports a new operation that is neither baselined nor exempted", () => {
+    const gaps = ["GET /api/a", "GET /api/b", "POST /api/c"];
+    expect(unreviewedCliGaps(gaps, new Set(["GET /api/a"]), { "POST /api/c": "Agent runtime only." })).toEqual([
+      "GET /api/b",
+    ]);
+  });
+
+  it("reports nothing when every gap is baselined, and ignores baseline entries that are no longer gaps", () => {
+    expect(unreviewedCliGaps(["GET /api/a"], new Set(["GET /api/a", "GET /api/gone"]), {})).toEqual([]);
   });
 });

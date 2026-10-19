@@ -543,7 +543,7 @@ export function registerWriteIdentity(
     // An instance admin may release some protected files for this repository (the plugin config, read now, never from the head).
     // A file the opt-in does not release keeps the refusal for the whole pull request.
     const optIn = touched.length ? await agentMergeableRule(companyId, repository) : { rule: null, problems: [] as string[] };
-    const { released, kept } = splitReleased(touched, optIn.rule, repository, tiers);
+    const { released, kept } = splitReleased(touched, optIn.rule, tiers);
     const releaseEvidence = released.length ? { releasedProtectedFiles: released.slice(0, MAX_RELEASED_LISTED), releasedProtectedFilesCount: released.length, releasedBy: "config:agentMergeablePaths" } : {};
     if (!kept.length) return { ...evidence, files: files.length, protectedPaths: patterns.length, ...releaseEvidence };
     if (kept.length === 1 && kept[0] === SKILLS_LOCK_FILE) {
