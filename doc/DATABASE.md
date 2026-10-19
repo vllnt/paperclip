@@ -229,25 +229,32 @@ When authoring migrations or one-time backfills:
 - The repo keeps only the newest 5 snapshots. `generate` runs `prune:snapshots` afterwards to delete older ones. Drizzle only reads the newest snapshot, and each snapshot is a full copy of the schema (over 1 MB each). Older snapshots are still in git history.
 - `packages/db/src/migration-snapshot-drift.test.ts` is the enforcement backstop. It repeats the diff that `generate` performs and fails when the newest snapshot no longer matches `packages/db/src/schema/`.
 
-## Run issue index (migration 0313)
+## Run issue indexes (migrations 0313 and 0314)
 
-Migration `0313_lowly_phil_sheldon.sql` builds `heartbeat_runs_company_issue_or_task_idx` inside the startup migration transaction. While it builds, inserts and updates of `heartbeat_runs` wait. The build reads every run's `context_snapshot`, so its time grows with that table's size:
+Two migrations build indexes on `heartbeat_runs` inside the startup migration transaction:
+
+- `0313_lowly_phil_sheldon.sql` builds `heartbeat_runs_company_issue_or_task_idx`: the runs of an issue.
+- `0314_clear_manta.sql` builds `heartbeat_runs_company_agent_no_issue_created_idx`: an agent's runs without an issue.
+
+While an index builds, inserts and updates of `heartbeat_runs` wait. Each build reads every run's `context_snapshot`, so its time grows with that table's size:
 
 ```sql
 SELECT pg_size_pretty(pg_total_relation_size('heartbeat_runs'));
 ```
 
-On a large instance, build the index before you deploy, without blocking writes, and check that the build succeeded:
+On a large instance, build the indexes before you deploy, without blocking writes, and check that each build succeeded:
 
 ```sql
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_company_issue_or_task_idx" ON "heartbeat_runs" USING btree ("company_id", (coalesce("context_snapshot"->>'issueId', "context_snapshot"->>'taskId')));
-SELECT indisvalid FROM pg_index WHERE indexrelid = 'heartbeat_runs_company_issue_or_task_idx'::regclass;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_company_agent_no_issue_created_idx" ON "heartbeat_runs" USING btree ("company_id","agent_id","created_at") WHERE (coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId') is null or coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId') = '');
+SELECT indexrelid::regclass, indisvalid FROM pg_index
+WHERE indexrelid IN ('heartbeat_runs_company_issue_or_task_idx'::regclass, 'heartbeat_runs_company_agent_no_issue_created_idx'::regclass);
 ```
 
 - `true`: the migration keeps this index and builds nothing.
-- `false`: the concurrent build failed or was cancelled. The planner does not use an invalid index. The migration drops it and builds it again, and then the drop's exclusive lock also blocks reads of `heartbeat_runs` until the build commits. To avoid that, run `DROP INDEX CONCURRENTLY "heartbeat_runs_company_issue_or_task_idx";` and build it again before you deploy.
+- `false`: the concurrent build failed or was cancelled. The planner does not use an invalid index. The migration drops it and builds it again, and then the drop's exclusive lock also blocks reads of `heartbeat_runs` until the build commits. To avoid that, drop the index with `DROP INDEX CONCURRENTLY` and build it again before you deploy.
 
-Never run the concurrent build while the server starts. The migration can then wait for the build while the build waits for the migration, and PostgreSQL cancels one of them as a deadlock.
+Never run a concurrent build while the server starts. The migration can then wait for the build while the build waits for the migration, and PostgreSQL cancels one of them as a deadlock.
 
 ## Cloud runtime identity singleton
 
