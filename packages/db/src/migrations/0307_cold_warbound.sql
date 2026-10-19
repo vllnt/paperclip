@@ -1,0 +1,2 @@
+ALTER TABLE "companies" ADD COLUMN "transient_retry_policy" jsonb DEFAULT '{}'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "routines" ADD COLUMN "transient_retry_policy" jsonb DEFAULT '{}'::jsonb NOT NULL;
