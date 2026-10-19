@@ -323,7 +323,7 @@ updates the inventory with the corpus at hand. Agent docs stay out of
 
 | # | Slice | Contents | Unlocks |
 |---|---|---|---|
-| 1 | Git links | Branch name; PR auto-link (explicit link and Cloud relay events; the plugin poll for Tailnet-only deployments follows as 1b); guarded status automation, off by default; API, OpenAPI, CLI, MCP, web | Leave GitHub Issues for PR tracking |
+| 1 | Git links | Branch name; PR auto-link (explicit link and Cloud relay events; the plugin poll for private-network-only deployments follows as 1b); guarded status automation, off by default; API, OpenAPI, CLI, MCP, web | Leave GitHub Issues for PR tracking |
 | 2 | Git depth | Per-project automation config, target branches with regex and a "no action" override (Linear), draft handling; commit and trailer linking; checks and review state in the panel; "ready for merge" state; re-check when a run ends; optional "copy branch also assigns me and starts the task" (Linear's personal toggle); unique index on a new link table | Trust to turn automation on everywhere |
 | 3 | Auto-assignment | Project assignment settings; lead default; rules; capacity and model aware pools; override semantics | No manual hand-off |
 | 4 | Intake and triage | Triage queue, templates and forms, due dates and SLAs, duplicate detection, GitHub issues into triage | Real intake |
