@@ -39,21 +39,27 @@ export const gitHubOperationSchema = z.object({
   ghRepo: z.string().max(1000).nullable().optional(),
   /** gh without -R or GH_REPO: the checkout's saved default repositories (remote.<name>.gh-resolved); "base" marks a remote. */
   ghResolved: z.array(z.string().max(1000)).max(16).optional(),
+  // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push: the checked-out branch. */
   currentBranch: z.string().max(1000).nullable().optional(),
+  // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push: full ref names of bare refspec names, resolved in the checkout. */
   refs: z.record(z.string().max(300), z.string().max(300)).optional()
     .refine(value => !value || Object.keys(value).length <= 64, "Too many refs"),
+  // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push: whether the new commits change `.github/workflows/**`; null when unknown. */
   touchesWorkflows: z.boolean().nullable().optional(),
+  // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push: the commit SHAs being pushed (for the audit record). */
   shas: z.array(z.string().regex(/^[0-9a-f]{40,64}$/)).max(64).optional(),
+  // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push: every push URL of the remote (git pushes to all of them). */
   pushUrls: z.array(z.string().max(1000)).max(16).optional(),
   /** gh without -R or GH_REPO: the checkout's remote URLs, since gh may pick any of them. */
   remotes: z.array(z.string().max(1000)).max(16).optional(),
   /** git: url.*.insteadOf / pushInsteadOf config beyond Paperclip's own, so the destination is uncertain. */
   urlRewrites: z.boolean().optional(),
+  // paperclip:allow-git-push: documents classifier input; nothing here runs git push
   /** git push without refspecs: config that can push more than the current branch. */
   implicitPush: z.boolean().optional(),
   followTags: z.boolean().optional(),
