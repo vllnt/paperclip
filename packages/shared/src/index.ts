@@ -455,6 +455,7 @@ export {
   ISSUE_MONITOR_SCHEDULED_BY,
   ISSUE_EXECUTION_MONITOR_KINDS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME,
   ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES,
   ISSUE_EXECUTION_STATE_STATUSES,
   ISSUE_EXECUTION_MONITOR_STATE_STATUSES,
@@ -921,6 +922,7 @@ export type {
   ManagedSettingMetadata,
   BackupRetentionPolicy,
   Agent,
+  AgentWaitState,
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
@@ -1105,6 +1107,7 @@ export type {
   IssueWakeDiagnosticWakeRequest,
   IssueWakeDiagnosticsResponse,
   IssueSubtreeDiagnosticNode,
+  IssueSubtreeDiagnosticLastRun,
   IssueSubtreeDiagnosticEdge,
   IssueSubtreeDiagnosticsResponse,
   IssueBlockerAttention,
@@ -1281,6 +1284,7 @@ export type {
   AgentTaskSession,
   AgentWakeupRequest,
   DeferredWakeAgentStats,
+  DeferredWakeParkedBreakdown,
   DeferredWakeStats,
   DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
@@ -1973,6 +1977,7 @@ export {
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
@@ -2785,6 +2790,7 @@ export { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from
 export * from "./agent-appearance.js";
 export * from "./run-failure-cause.js";
 export * from "./run-usage-record.js";
+export * from "./observability-query.js";
 export * from "./ai-connections.js";
 export * from "./ai-connection-usage.js";
 export { questionSetToAskUserQuestionsPayload } from "./question-set.js";
@@ -2829,6 +2835,8 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
 export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
+export * from "./run-context.js";

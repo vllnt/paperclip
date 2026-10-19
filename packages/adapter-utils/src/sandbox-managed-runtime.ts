@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 import {
   buildRemoteGitDeltaBundleScript,
   isMissingGitPrerequisiteError,
+  retryTransientGitBundleTransfer,
   createImportedGitRef,
   createRemoteGitExportRef,
   deleteLocalGitRef,
@@ -1847,11 +1848,13 @@ export async function prepareSandboxManagedRuntime(input: {
                     });
                   };
 
+                  // A bundle cut short in transit ("early EOF", "index-pack died")
+                  // is exported again from the live sandbox, in both modes.
                   try {
-                    importedHead = await exportAndImport(false);
+                    importedHead = await retryTransientGitBundleTransfer(() => exportAndImport(false));
                   } catch (error) {
                     if (!isMissingGitPrerequisiteError(error)) throw error;
-                    importedHead = await exportAndImport(true);
+                    importedHead = await retryTransientGitBundleTransfer(() => exportAndImport(true));
                   }
                 }
 

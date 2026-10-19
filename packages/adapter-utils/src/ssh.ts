@@ -11,6 +11,8 @@ import {
   createUnrelatedHistoryGraftCommit,
   commitTreeWithSyncIdentity,
   readSanitizedOriginRemoteUrl,
+  retryTransientGitBundleTransfer,
+  SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
@@ -711,6 +713,21 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
   }
 }
 
+/**
+ * The error for an ssh child whose stream did not end cleanly, or null when it
+ * did. A child that a signal ended reports a null exit code, which a plain
+ * `code ?? 0` check read as success and so accepted a truncated stream.
+ */
+function sshStreamFailure(code: number | null, signal: NodeJS.Signals | null, stderr: string): Error | null {
+  if (signal) {
+    return new Error(`${SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX} ${signal}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
+  }
+  if ((code ?? 0) !== 0) {
+    return new Error(stderr.trim() || `ssh exited with code ${code ?? -1}`);
+  }
+  return null;
+}
+
 async function streamLocalFileToSsh(input: {
   spec: SshConnectionConfig;
   localFile: string;
@@ -759,14 +776,15 @@ async function streamLocalFileToSsh(input: {
     } else {
       source.pipe(ssh.stdin ?? null);
     }
-    ssh.on("close", (code) => {
+    ssh.on("close", (code, signal) => {
       // Nothing reads the file after ssh exits; release it even when an
       // early exit stalled the pipe without a write error.
       source.destroy();
       if (settled) return;
       settled = true;
-      if ((code ?? 0) !== 0) {
-        reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+      const failure = sshStreamFailure(code, signal, sshStderr);
+      if (failure) {
+        reject(failure);
         return;
       }
       resolve();
@@ -817,12 +835,13 @@ async function streamSshToLocalFile(input: {
     });
     ssh.on("error", fail);
     sink.on("error", fail);
-    ssh.on("close", (code) => {
+    ssh.on("close", (code, signal) => {
       sink.end(() => {
         if (settled) return;
         settled = true;
-        if ((code ?? 0) !== 0) {
-          reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+        const failure = sshStreamFailure(code, signal, sshStderr);
+        if (failure) {
+          reject(failure);
           return;
         }
         resolve();
@@ -881,31 +900,36 @@ async function importGitWorkspaceToSsh(input: {
       `git -C ${shellQuote(input.remoteDir)} update-ref -d ${shellQuote(tempRef)} >/dev/null 2>&1 || true`,
     ].join("\n");
 
-    // The git bundle is a real local file of known size, so report an exact
-    // percentage. No `workspace` label: the "Importing git history" phase is
-    // already self-describing in the log line.
-    const progress = input.onProgress
-      ? createTransferProgress({
-        onProgress: input.onProgress,
-        phase: "Importing git history",
-        direction: "to",
-        totalBytes: (await fs.stat(bundlePath)).size,
-        estimated: false,
-      })
-      : null;
+    const bundleBytes = (await fs.stat(bundlePath)).size;
+    // The remote script is idempotent (fresh temp file, guarded init, forced
+    // fetch), so a truncated upload is cured by sending the bundle again.
+    await retryTransientGitBundleTransfer(async () => {
+      // The git bundle is a real local file of known size, so report an exact
+      // percentage. No `workspace` label: the "Importing git history" phase is
+      // already self-describing in the log line.
+      const progress = input.onProgress
+        ? createTransferProgress({
+          onProgress: input.onProgress,
+          phase: "Importing git history",
+          direction: "to",
+          totalBytes: bundleBytes,
+          estimated: false,
+        })
+        : null;
 
-    try {
-      await streamLocalFileToSsh({
-        spec: input.spec,
-        localFile: bundlePath,
-        remoteScript: remoteSetupScript,
-        progress: progress ?? undefined,
-      });
-      await progress?.finish();
-    } catch (error) {
-      await progress?.fail();
-      throw error;
-    }
+      try {
+        await streamLocalFileToSsh({
+          spec: input.spec,
+          localFile: bundlePath,
+          remoteScript: remoteSetupScript,
+          progress: progress ?? undefined,
+        });
+        await progress?.finish();
+      } catch (error) {
+        await progress?.fail();
+        throw error;
+      }
+    });
   } finally {
     await runLocalGit(input.localDir, ["update-ref", "-d", tempRef], {
       timeout: 10_000,
@@ -939,34 +963,39 @@ async function exportGitWorkspaceFromSsh(input: {
       'cat "$tmp_bundle"',
     ].join("\n");
 
-    // The remote bundle size isn't known before streaming, so report bytes
-    // received (MB mode) with a terminal completion line.
-    const progress = input.onProgress
-      ? createTransferProgress({
-        onProgress: input.onProgress,
-        phase: "Exporting git history",
-        direction: "from",
-        totalBytes: null,
-        estimated: false,
-      })
-      : null;
+    // A cut stream surfaces as git's "early EOF" or a signal-ended ssh. The
+    // remote workspace is still live and the script re-creates its own ref and
+    // bundle, so a fresh export-and-fetch is a complete retry.
+    await retryTransientGitBundleTransfer(async () => {
+      // The remote bundle size isn't known before streaming, so report bytes
+      // received (MB mode) with a terminal completion line.
+      const progress = input.onProgress
+        ? createTransferProgress({
+          onProgress: input.onProgress,
+          phase: "Exporting git history",
+          direction: "from",
+          totalBytes: null,
+          estimated: false,
+        })
+        : null;
 
-    try {
-      await streamSshToLocalFile({
-        spec: input.spec,
-        remoteScript: exportScript,
-        localFile: bundlePath,
-        progress: progress ?? undefined,
+      try {
+        await streamSshToLocalFile({
+          spec: input.spec,
+          remoteScript: exportScript,
+          localFile: bundlePath,
+          progress: progress ?? undefined,
+        });
+        await progress?.finish();
+      } catch (error) {
+        await progress?.fail();
+        throw error;
+      }
+
+      await runLocalGit(input.localDir, ["fetch", "--force", bundlePath, `refs/paperclip/ssh-sync/export:${importedRef}`], {
+        timeout: 60_000,
+        maxBuffer: 1024 * 1024,
       });
-      await progress?.finish();
-    } catch (error) {
-      await progress?.fail();
-      throw error;
-    }
-
-    await runLocalGit(input.localDir, ["fetch", "--force", bundlePath, `refs/paperclip/ssh-sync/export:${importedRef}`], {
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
     });
     if (input.resetLocalWorkspace !== false) {
       await runLocalGit(input.localDir, ["reset", "--hard", importedRef], {

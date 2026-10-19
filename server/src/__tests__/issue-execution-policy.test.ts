@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, monitorClearedByReassignment, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -1760,6 +1760,72 @@ describe("issue execution policy transitions", () => {
       ).toThrow("Monitor can only be scheduled");
     });
 
+    describe("reassignment", () => {
+      const otherAgentId = "99999999-9999-4999-8999-999999999999";
+      const scheduled = () => normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          notes: "Waiting: CI on PR #4320",
+          scheduledBy: "assignee",
+        },
+      })!;
+      const issueWith = (policy: ReturnType<typeof scheduled>) => ({
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+        monitorLastTriggeredAt: null,
+        monitorNotes: "Waiting: CI on PR #4320",
+        monitorScheduledBy: "assignee",
+      });
+
+      it("clears the previous assignee's wait when the issue moves to another agent", () => {
+        const policy = scheduled();
+        const result = applyIssueExecutionPolicyTransition({
+          issue: issueWith(policy),
+          policy,
+          previousPolicy: policy,
+          requestedAssigneePatch: { assigneeAgentId: otherAgentId },
+          actor: { userId: boardUserId },
+        });
+
+        expect(result.patch.executionPolicy).toBeNull();
+        expect(result.patch.monitorNextCheckAt).toBeNull();
+        expect(result.patch.executionState).toMatchObject({ monitor: { status: "cleared", clearReason: "invalid_assignee" } });
+      });
+
+      it("keeps the wait when the same agent stays assigned", () => {
+        const policy = scheduled();
+        const result = applyIssueExecutionPolicyTransition({
+          issue: issueWith(policy),
+          policy,
+          previousPolicy: policy,
+          requestedAssigneePatch: { assigneeAgentId: coderAgentId },
+          actor: { userId: boardUserId },
+        });
+
+        expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
+      });
+
+      it("lets the same request reassign and schedule a monitor for the new assignee", () => {
+        const policy = scheduled();
+        const result = applyIssueExecutionPolicyTransition({
+          issue: issueWith(policy),
+          policy,
+          previousPolicy: policy,
+          requestedAssigneePatch: { assigneeAgentId: otherAgentId },
+          actor: { userId: boardUserId },
+          monitorExplicitlyUpdated: true,
+        });
+
+        expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
+      });
+    });
+
     it("rejects explicitly re-arming a monitor after max attempts are exhausted", () => {
       const policy = normalizeIssueExecutionPolicy({
         stages: [],
@@ -2083,5 +2149,20 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
     });
+  });
+});
+
+describe("monitorClearedByReassignment", () => {
+  const armed = new Date("2026-04-11T12:30:00.000Z");
+
+  it.each([
+    ["moved to another agent", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: qaAgentId, monitorNextCheckAt: null }, true],
+    ["released", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: null, monitorNextCheckAt: null }, true],
+    ["same agent keeps the wait", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, false],
+    ["no wait was armed", { assigneeAgentId: coderAgentId, monitorNextCheckAt: null }, { assigneeAgentId: qaAgentId, monitorNextCheckAt: null }, false],
+    ["wait cleared without a reassignment", { assigneeAgentId: coderAgentId, monitorNextCheckAt: armed }, { assigneeAgentId: coderAgentId, monitorNextCheckAt: null }, false],
+    ["first assignment of an unassigned issue", { assigneeAgentId: null, monitorNextCheckAt: armed }, { assigneeAgentId: qaAgentId, monitorNextCheckAt: null }, false],
+  ])("%s", (_label, before, after, expected) => {
+    expect(monitorClearedByReassignment(before, after)).toBe(expected);
   });
 });
