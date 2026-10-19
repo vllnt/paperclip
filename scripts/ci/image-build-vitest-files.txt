@@ -16,10 +16,13 @@ packages/adapters/codex-local/src/company-model-catalog.test.ts
 packages/adapters/codex-local/src/server/execute.remote.test.ts
 packages/adapters/codex-local/src/server/runtime-config.test.ts
 packages/adapters/codex-local/src/server/test.remote.test.ts
+packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
 packages/shared/src/company-environment-defaults.test.ts
+server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
+server/src/__tests__/decision-wakeup.test.ts
 server/src/__tests__/external-objects-service.test.ts
 server/src/__tests__/github-commit-details.test.ts
 server/src/__tests__/instance-settings-routes.test.ts

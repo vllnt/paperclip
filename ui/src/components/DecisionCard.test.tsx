@@ -313,6 +313,24 @@ describe("DecisionCard", () => {
     expect(dismissed.textContent).toContain("no effects were run");
   });
 
+  it("shows a normally chosen option named dismissed as decided, and only a real dismissal as dismissed", () => {
+    const options = [{ id: "dismissed", label: "Close the alert", effects: [] }];
+    const chosen = render({
+      decision: mkDecision({ status: "decided", executionStatus: "succeeded", chosenOptionId: "dismissed", options, metadata: {} }),
+      executions: [],
+    });
+    expect(chosen.textContent).toContain("Decided");
+    expect(chosen.textContent).not.toContain("Dismissed");
+    act(() => root?.unmount());
+    container?.remove();
+
+    const real = render({
+      decision: mkDecision({ status: "decided", executionStatus: "succeeded", chosenOptionId: "dismissed", options, metadata: { dismissed: true } }),
+      executions: [],
+    });
+    expect(real.textContent).toContain("Dismissed");
+  });
+
   it("explains when a decision expires because its targets completed", () => {
     const expired = render({
       decision: mkDecision({ status: "expired", metadata: { expiredReason: "target_completed" } }),
