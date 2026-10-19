@@ -622,6 +622,40 @@ npx paperclipai run workspace-log <operation-id> [--offset 0] [--limit-bytes 163
 npx paperclipai run watchdog-decision <run-id> --decision continue [--reason "..."]
 ```
 
+## Storage Commands
+
+Company storage destinations: the organization's own S3-compatible buckets,
+with keys stored as company secrets. Board credentials only. See
+[company-storage.md](company-storage.md).
+
+```sh
+npx paperclipai storage destinations list --company-id <company-id>
+npx paperclipai storage destinations create --company-id <company-id> --label "Archive" \
+  --endpoint https://s3.eu-west-1.amazonaws.com --region eu-west-1 --bucket <bucket> [--prefix paperclip] \
+  [--path-style] [--encryption s3_managed|kms|bucket_default] [--kms-key-id <id>] \
+  --access-key-secret <secret-id> --secret-key-secret <secret-id> [--id <uuid>]
+npx paperclipai storage destinations probe <destination-id> --company-id <company-id>
+npx paperclipai storage destinations rotate-credentials <destination-id> --company-id <company-id> \
+  --access-key-secret <secret-id> --secret-key-secret <secret-id> --expected-credential-revision <n>
+npx paperclipai storage destinations retire <destination-id> --company-id <company-id> --expected-revision <n>
+```
+
+`probe` exits with code 1 when the probe fails.
+
+## Archive Commands
+
+Export a company's settled run history (runs, events, transcripts, costs and
+activity, redacted like the run API) as NDJSON. Board credentials only. The
+format is described in [company-archive.md](company-archive.md).
+
+```sh
+npx paperclipai archive export --company-id <company-id> [--since <iso>] [--until <iso>] \
+  [--include run,events,transcript,costs,activity] [--limit 50] [--out export.ndjson] [--resume]
+```
+
+`--resume` continues an interrupted export from the last complete run in
+`--out`. Without `--out` the stream goes to stdout.
+
 ## Routine Commands
 
 `paperclipai routines disable-all` remains the local maintenance command. The singular `routine` group maps to the REST API.
