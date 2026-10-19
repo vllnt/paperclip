@@ -2000,6 +2000,7 @@ export {
   type CompanySearchExtractQuery,
   type CompanySearchQuery,
   createIssueSchema,
+  isValidExistingBranchName,
   setIssueTitleSchema,
   type SetIssueTitle,
   createIssueInputSchema,
@@ -2895,3 +2896,4 @@ export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
 export * from "./event-sources.js";
 export * from "./run-context.js";
+export * from "./issue-git.js";
