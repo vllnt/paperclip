@@ -1274,7 +1274,9 @@ function buildRoutineManifestFromLiveRoutine(routine: RoutineLike): CompanyPorta
     concurrencyPolicy: routine.concurrencyPolicy,
     catchUpPolicy: routine.catchUpPolicy,
     variables: routine.variables,
-    triggers: routine.triggers.map((trigger) => ({
+    // Event triggers reference an instance-specific event source and its secret, so they are
+    // never exported; the importing company subscribes its routines to its own sources.
+    triggers: routine.triggers.filter((trigger) => trigger.kind !== "event").map((trigger) => ({
       kind: trigger.kind,
       label: trigger.label ?? null,
       enabled: Boolean(trigger.enabled),
@@ -1819,6 +1821,10 @@ function resolvePortableRoutineDefinition(
   }
 
   for (const trigger of routine.triggers) {
+    if (trigger.kind === "event") {
+      errors.push(`Recurring task ${issue.slug} has an event trigger; event triggers are tied to a company's event sources and are not portable.`);
+      continue;
+    }
     if (!ROUTINE_TRIGGER_KINDS.includes(trigger.kind as any)) {
       errors.push(`Recurring task ${issue.slug} uses unsupported trigger kind "${trigger.kind}".`);
       continue;
@@ -4579,7 +4585,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         concurrencyPolicy: routine.concurrencyPolicy !== "coalesce_if_active" ? routine.concurrencyPolicy : undefined,
         catchUpPolicy: routine.catchUpPolicy !== "skip_missed" ? routine.catchUpPolicy : undefined,
         variables: (routine.variables ?? []).length > 0 ? routine.variables : undefined,
-        triggers: routine.triggers.map((trigger) => stripEmptyValues({
+        triggers: routine.triggers.filter((trigger) => trigger.kind !== "event").map((trigger) => stripEmptyValues({
           kind: trigger.kind,
           label: trigger.label ?? null,
           enabled: trigger.enabled ? undefined : false,

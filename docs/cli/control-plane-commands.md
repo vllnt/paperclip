@@ -204,6 +204,25 @@ npx paperclipai approval resubmit <approval-id> [--payload '{"..."}']
 npx paperclipai approval comment <approval-id> --body "..."
 ```
 
+## Event Source Commands
+
+External signed events that wake routines. See `docs/api/event-sources.md`.
+
+```sh
+npx paperclipai event-sources list --company-id <id> [--include-archived]
+
+# Board only. The ingress URL and signing secret are shown once.
+npx paperclipai event-sources create --company-id <id> --name "Gatus" [--signing-mode hmac_sha256|bearer] [--normalizer generic_v1|gatus]
+
+# Board only. The previous secret stops working immediately.
+npx paperclipai event-sources rotate <source-id>
+
+# Dry run: shows each stage and writes nothing
+npx paperclipai event-sources test <source-id> --file event.json
+
+npx paperclipai event-sources deliveries <source-id> [--status failed] [--limit 50] [--cursor <cursor>]
+```
+
 ## Activity Commands
 
 ```sh
