@@ -119,11 +119,20 @@ describe("claude steering session", () => {
   });
 
   it("does not write the same steered message twice", async () => {
-    const { stdin, handles, emit } = setup();
+    const { stdin, handles, emit, acknowledged } = setup();
     await emit(INIT_WITH_LIFECYCLE);
     handles[0]!.steer({ text: "Skip step 2.", correlationId: "comment-1" });
     expect(handles[0]!.steer({ text: "Skip step 2.", correlationId: "comment-1" })).toEqual({ status: "pending" });
+    const uuid = claudeSteerMessageUuid(RUN_ID, "comment-1");
+    await emit({ type: "command_lifecycle", command_uuid: uuid, state: "started" });
+    expect(handles[0]!.steer({ text: "Retry after acknowledgement.", correlationId: "comment-1" }))
+      .toEqual({ status: "pending" });
+    await emit({ type: "command_lifecycle", command_uuid: uuid, state: "started" });
     expect(stdin.written).toHaveLength(1);
+    expect(acknowledged()).toEqual(["comment-1"]);
+
+    handles[0]!.steer({ text: "Skip step 2.", correlationId: "comment-2" });
+    expect(stdin.written).toHaveLength(2);
   });
 
   it("takes no live input when Claude does not report message lifecycle", async () => {
@@ -152,11 +161,32 @@ describe("claude steering session", () => {
 });
 
 describe("claudeSteerMessageUuid", () => {
-  it("derives a stable RFC 4122 version 5 uuid per run and message", () => {
+  it("derives a stable SHA-256-based UUIDv8 for retries", () => {
     const uuid = claudeSteerMessageUuid(RUN_ID, "comment-1");
-    expect(uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(uuid).toBe("34597dc2-6ae4-8d59-8341-d68e9aeea1e0");
     expect(claudeSteerMessageUuid(RUN_ID, "comment-1")).toBe(uuid);
+  });
+
+  it("uses the UUIDv8 version and RFC 9562 variant in stream-json", () => {
+    const uuid = claudeSteerMessageUuid(RUN_ID, "comment-1");
+    expect(uuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    const message = JSON.parse(claudeStreamJsonUserMessage("Follow up.", uuid));
+    expect(message).toMatchObject({ type: "user", uuid });
+  });
+
+  it("scopes IDs independently to the run and correlation ID", () => {
+    const uuid = claudeSteerMessageUuid(RUN_ID, "comment-1");
     expect(claudeSteerMessageUuid(RUN_ID, "comment-2")).not.toBe(uuid);
     expect(claudeSteerMessageUuid("99999999-2222-4333-8444-555555555555", "comment-1")).not.toBe(uuid);
+    expect(claudeSteerMessageUuid("comment-1", RUN_ID)).not.toBe(uuid);
+  });
+
+  it.each([
+    ["run:part", "message", "run", "part:message"],
+    ["ab", "c", "a", "bc"],
+    ["run\u0000part", "message", "run", "part\u0000message"],
+  ])("keeps pair boundaries distinct for %j and %j", (runId, correlationId, otherRunId, otherCorrelationId) => {
+    expect(claudeSteerMessageUuid(runId, correlationId))
+      .not.toBe(claudeSteerMessageUuid(otherRunId, otherCorrelationId));
   });
 });

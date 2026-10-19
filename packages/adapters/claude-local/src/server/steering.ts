@@ -15,10 +15,11 @@ export const CLAUDE_STEERING_INIT_TIMEOUT_MS = 30_000;
 
 const STEER_MESSAGE_UUID_NAMESPACE = "5b0f3a52-7d1e-4c8a-9f63-2e4d8c1a7b90";
 
-function uuidV5(name: string, namespace: string): string {
+/** SHA-256-derived custom UUIDv8 (RFC 9562). */
+function uuidV8(name: string, namespace: string): string {
   const namespaceBytes = Buffer.from(namespace.replace(/-/g, ""), "hex");
-  const hash = createHash("sha1").update(namespaceBytes).update(name, "utf8").digest();
-  hash[6] = (hash[6]! & 0x0f) | 0x50;
+  const hash = createHash("sha256").update(namespaceBytes).update(name, "utf8").digest();
+  hash[6] = (hash[6]! & 0x0f) | 0x80;
   hash[8] = (hash[8]! & 0x3f) | 0x80;
   const hex = hash.subarray(0, 16).toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
@@ -26,7 +27,8 @@ function uuidV5(name: string, namespace: string): string {
 
 /** Stable stream-json message uuid, so a repeated steer is recognised. */
 export function claudeSteerMessageUuid(runId: string, correlationId: string): string {
-  return uuidV5(`${runId}:${correlationId}`, STEER_MESSAGE_UUID_NAMESPACE);
+  // A JSON tuple preserves pair boundaries even when either ID contains separators.
+  return uuidV8(JSON.stringify([runId, correlationId]), STEER_MESSAGE_UUID_NAMESPACE);
 }
 
 export function claudeStreamJsonUserMessage(text: string, uuid?: string): string {
