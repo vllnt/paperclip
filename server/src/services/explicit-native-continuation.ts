@@ -12,7 +12,8 @@ import {
   environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
-import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { consumedWakeCommentIds, executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
@@ -36,33 +37,20 @@ export async function undeliveredLegacyUserCommentIds(
   db: Db, companyId: string, issueId: string, agentId: string, commentIds: string[],
 ): Promise<string[]> {
   if (!commentIds.length) return [];
-  const comments = await db.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-    inArray(issueComments.id, commentIds), eq(issueComments.authorType, "user"),
-    isNull(issueComments.createdByRunId), isNull(issueComments.deletedAt),
-    sql`nullif(trim(${issueComments.body}), '') is not null`,
-    sql`nullif(trim(${issueComments.authorUserId}), '') is not null`,
-  ));
+  // A long issue can save thousands of comments: bounded lookups, and consumed
+  // ids read from the issue's runs. Admission separately verifies process
+  // termination before a new turn.
+  const consumed = await consumedWakeCommentIds(db, companyId, issueId, agentId);
+  const comments = await selectInCommentBatches(commentIds.filter(id => !consumed.has(id)), batch => db.select({ id: issueComments.id })
+    .from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+      inArray(issueComments.id, batch),
+      eq(issueComments.authorType, "user"),
+      isNull(issueComments.createdByRunId), isNull(issueComments.deletedAt),
+      sql`nullif(trim(${issueComments.body}), '') is not null`,
+      sql`nullif(trim(${issueComments.authorUserId}), '') is not null`,
+    )));
   const valid = new Set(comments.map(comment => comment.id));
-  const previous = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
-    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
-    // A queued turn cancelled before dispatch has not consumed input, whatever
-    // cancelled it (pause, stale assignment, or rejected admission). Reserved
-    // native identity/process metadata is not proof that its prompt was sent.
-    // Admission separately verifies process termination before a new turn.
-    sql`not (${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null)`,
-    or(...commentIds.map(id => or(
-      sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${id}`,
-      sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> ${JSON.stringify([id])}::jsonb`,
-    ))),
-  ));
-  for (const { context } of previous) {
-    if (typeof context?.wakeCommentId === "string") valid.delete(context.wakeCommentId);
-    if (Array.isArray(context?.wakeCommentIds)) {
-      for (const id of context.wakeCommentIds) if (typeof id === "string") valid.delete(id);
-    }
-  }
   return commentIds.filter(id => valid.has(id));
 }
 

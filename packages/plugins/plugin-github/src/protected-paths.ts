@@ -10,8 +10,10 @@
  * read at the base commit.
  */
 
+/** The CODEOWNERS paths decide who may approve a change: no opt-in ever releases them. */
+export const CODEOWNERS_PATHS: readonly string[] = ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"];
 /** Protected in every repository. */
-export const MINIMUM_PROTECTED_PATHS: readonly string[] = [".github/**", "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"];
+export const MINIMUM_PROTECTED_PATHS: readonly string[] = [".github/**", ...CODEOWNERS_PATHS];
 /** Also protected in a company's control repository (and in any repository with a `paperclip/tiers.yaml`). */
 export const CONTROL_PROTECTED_PATHS: readonly string[] = ["paperclip/**", "scripts/**", "ROADMAP.md", "data/company/strategy/**"];
 /** Control repositories (lowercase `owner/name`): the full minimum list applies even without a tiers file. */
@@ -87,7 +89,7 @@ export function matchesProtectedPath(pattern: string, path: string): boolean {
 
 /** The protected patterns of a repository, from the minimum list and its base branch's tiers file (null when it has none). */
 export function protectedPatterns(repository: string, tiers: string[] | null): string[] {
-  const control = tiers !== null || CONTROL_REPOSITORIES.includes(repository.toLowerCase());
+  const control = isControlRepository(repository, tiers);
   return [...new Set([...MINIMUM_PROTECTED_PATHS, ...(control ? CONTROL_PROTECTED_PATHS : []), ...(tiers ?? [])])];
 }
 
@@ -97,6 +99,94 @@ export interface ChangedFile { filename: string; previousFilename?: string | nul
 export function protectedFiles(files: readonly ChangedFile[], patterns: readonly string[]): string[] {
   const touched = files.flatMap(file => [file.filename, ...(file.previousFilename ? [file.previousFilename] : [])]);
   return [...new Set(touched.filter(path => patterns.some(pattern => matchesProtectedPath(pattern, path))))].sort();
+}
+
+/** Whether a repository is a control repository: the full list applies, and no opt-in can release anything of it. */
+export function isControlRepository(repository: string, tiers: string[] | null): boolean {
+  return tiers !== null || CONTROL_REPOSITORIES.includes(repository.toLowerCase());
+}
+
+/**
+ * An instance admin's opt-in for one repository (the `agentMergeablePaths` plugin config): agents may merge a pull request
+ * whose protected files `allow` covers, minus `exclude`. Never read from a pull request head or a repository file.
+ */
+export interface AgentMergeableRule { repository: string; allow: string[]; exclude: string[] }
+
+/** The only paths an opt-in may release: under `.github/`. */
+const RELEASABLE_PREFIX = ".github/";
+const MAX_RULES = 50, MAX_PATTERNS = 50, MAX_EXCLUDES = 100, MAX_PATTERN_LENGTH = 200;
+const GLOB_TEXT = /^[A-Za-z0-9._\-/*?]+$/;
+const REPOSITORY_NAME = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+
+/** A pattern the admin may write: plain path characters and globs, inside the repository, short. */
+function patternProblem(pattern: unknown): string | null {
+  if (typeof pattern !== "string" || !pattern.length || pattern.length > MAX_PATTERN_LENGTH || !GLOB_TEXT.test(pattern)) return "a path pattern must be plain text of letters, digits and . _ - / * ?";
+  if (pattern.startsWith("/") || pattern.includes("..") || pattern.includes("//")) return `the path pattern ${pattern} leaves the repository`;
+  return null;
+}
+
+/**
+ * Reads the `agentMergeablePaths` config. An entry that is not valid is dropped whole (it releases nothing), and so is a
+ * repository listed twice: a doubt never releases a path. Whatever the config holds, a CODEOWNERS path is never released
+ * (see `releasedByOptIn`); an `allow` entry that names one, or reaches outside `.github/`, makes its entry invalid.
+ */
+export function parseAgentMergeablePaths(value: unknown): { rules: AgentMergeableRule[]; problems: string[] } {
+  if (value === undefined || value === null) return { rules: [], problems: [] };
+  if (!Array.isArray(value)) return { rules: [], problems: ["agentMergeablePaths must be a list"] };
+  // A list longer than the host accepts was not saved through the host: release nothing rather than read part of it.
+  if (value.length > MAX_RULES) return { rules: [], problems: [`agentMergeablePaths lists more than ${MAX_RULES} repositories`] };
+  const problems: string[] = [];
+  const seen = new Map<string, AgentMergeableRule | null>();
+  value.forEach((entry, index) => {
+    const at = `agentMergeablePaths[${index}]`;
+    const fail = (reason: string) => { problems.push(`${at}: ${reason}`); };
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return fail("must be an object");
+    const record = entry as Record<string, unknown>;
+    const unknown = Object.keys(record).filter(key => !["repository", "allow", "exclude"].includes(key));
+    if (unknown.length) return fail(`unknown key ${unknown[0]}`);
+    if (typeof record.repository !== "string" || !REPOSITORY_NAME.test(record.repository)) return fail("repository must be owner/name");
+    const repository = record.repository.toLowerCase();
+    const allow = record.allow, exclude = record.exclude ?? [];
+    if (!Array.isArray(allow) || !allow.length || allow.length > MAX_PATTERNS) return fail(`allow must list 1 to ${MAX_PATTERNS} paths`);
+    if (!Array.isArray(exclude) || exclude.length > MAX_EXCLUDES) return fail(`exclude must list at most ${MAX_EXCLUDES} paths`);
+    for (const pattern of allow) {
+      const problem = patternProblem(pattern);
+      if (problem) return fail(problem);
+      if (!(pattern as string).startsWith(RELEASABLE_PREFIX) || (pattern as string).length === RELEASABLE_PREFIX.length) return fail(`allow can only release paths under ${RELEASABLE_PREFIX}`);
+      if ((pattern as string).toLowerCase().includes("codeowners")) return fail("allow cannot name CODEOWNERS: CODEOWNERS paths are never released");
+    }
+    for (const pattern of exclude) { const problem = patternProblem(pattern); if (problem) return fail(problem); }
+    // A repository listed twice is ambiguous: neither entry releases anything.
+    if (seen.has(repository)) { problems.push(`${at}: ${repository} is listed more than once`); seen.set(repository, null); return; }
+    seen.set(repository, { repository, allow: allow as string[], exclude: exclude as string[] });
+  });
+  return { rules: [...seen.values()].filter((rule): rule is AgentMergeableRule => rule !== null), problems };
+}
+
+/** Whether a path is one of the three CODEOWNERS paths (at any depth, as the protected list reads them). */
+export function isCodeownersPath(path: string): boolean {
+  return CODEOWNERS_PATHS.some(pattern => matchesProtectedPath(pattern, path));
+}
+
+/**
+ * Whether the opt-in releases one protected file: `allow` covers it, no `exclude` does, and it is not a CODEOWNERS, control
+ * or tiers path. Those last three win over any config, so no change of the config can release them.
+ */
+export function releasedByOptIn(rule: AgentMergeableRule, path: string, tiers: string[] | null): boolean {
+  if (!rule.allow.some(pattern => matchesProtectedPath(pattern, path))) return false;
+  if (rule.exclude.some(pattern => matchesProtectedPath(pattern, path))) return false;
+  if (isCodeownersPath(path)) return false;
+  return ![...CONTROL_PROTECTED_PATHS, ...(tiers ?? [])].some(pattern => matchesProtectedPath(pattern, path));
+}
+
+/**
+ * Splits the protected files of a pull request into those the opt-in releases and those it does not. A control repository
+ * (or one with a tiers file) is never released. One unreleased file keeps the refusal for the whole pull request.
+ */
+export function splitReleased(touched: readonly string[], rule: AgentMergeableRule | null, repository: string, tiers: string[] | null): { released: string[]; kept: string[] } {
+  if (!rule || isControlRepository(repository, tiers)) return { released: [], kept: [...touched] };
+  const released = touched.filter(path => releasedByOptIn(rule, path, tiers));
+  return { released, kept: touched.filter(path => !released.includes(path)) };
 }
 
 /**

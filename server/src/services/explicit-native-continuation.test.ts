@@ -1488,6 +1488,7 @@ const support = await getEmbeddedPostgresTestSupport();
           resolveResponsibleUserId: async () => "board",
           getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
           resolveSessionBeforeForWakeup: async () => null,
+          admitAutomationWake: async () => ({ hold: false }),
         }),
         recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} },
       });
