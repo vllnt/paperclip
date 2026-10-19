@@ -32,6 +32,8 @@ export { executionWorkspaces } from "./execution_workspaces.js";
 export { executionWorkspaceRuntimeLeases } from "./execution_workspace_runtime_leases.js";
 export { environments } from "./environments.js";
 export { environmentLeases } from "./environment_leases.js";
+export { resourceCapacityTargets } from "./resource_capacity_targets.js";
+export { resourceCapacitySamples } from "./resource_capacity_samples.js";
 export { environmentCustomImageTemplates } from "./environment_custom_image_templates.js";
 export { environmentCustomImageSetupSessions } from "./environment_custom_image_setup_sessions.js";
 export { adapterAuthSessions, ADAPTER_AUTH_SESSION_ACTIVE_STATES } from "./adapter_auth_sessions.js";
