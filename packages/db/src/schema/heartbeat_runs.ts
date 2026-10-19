@@ -171,6 +171,13 @@ export const heartbeatRuns = pgTable(
     companyCtxPaperclipIssueRedactionIdx: index("heartbeat_runs_company_ctx_pcissue_redaction_idx")
       .on(table.companyId, sql`(${table.contextSnapshot} -> 'paperclipIssue' ->> 'id')`)
       .where(sql`${table.contextSnapshot} ? 'paperclipSecretRedactions'`),
+    // A run's issue as recovery and the attention feed read it: issueId, else taskId.
+    // Queries must use this exact expression, or the planner cannot use the index and
+    // reads (detoasts) every run's context instead.
+    companyIssueOrTaskIdx: index("heartbeat_runs_company_issue_or_task_idx").on(
+      table.companyId,
+      sql`(coalesce(${table.contextSnapshot}->>'issueId', ${table.contextSnapshot}->>'taskId'))`,
+    ),
     companyCtxTaskCreatedIdx: index("heartbeat_runs_company_ctx_task_created_idx").on(
       table.companyId,
       sql`(${table.contextSnapshot} ->> 'taskId')`,
