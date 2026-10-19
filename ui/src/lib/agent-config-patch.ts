@@ -47,13 +47,18 @@ export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay)
     patch.replaceAdapterConfig = true;
   }
 
+  const { runContext, ...runtimeFields } = overlay.runtime;
+  Object.assign(patch, runtimeFields);
+
   if (
     Object.keys(overlay.heartbeat).length > 0
     || Object.keys(overlay.debug).length > 0
+    || "runContext" in overlay.runtime
   ) {
     const existingRc = (agent.runtimeConfig ?? {}) as Record<string, unknown>;
-    const nextRuntimeConfig: Record<string, unknown> = (patch.runtimeConfig as Record<string, unknown> | undefined)
-      ?? { ...existingRc };
+    const nextRuntimeConfig: Record<string, unknown> = {
+      ...((patch.runtimeConfig as Record<string, unknown> | undefined) ?? existingRc),
+    };
 
     if (Object.keys(overlay.heartbeat).length > 0) {
       const existingHb = (existingRc.heartbeat ?? {}) as Record<string, unknown>;
@@ -70,11 +75,12 @@ export function buildAgentUpdatePatch(agent: Agent, overlay: AgentConfigOverlay)
       }
     }
 
-    patch.runtimeConfig = nextRuntimeConfig;
-  }
+    if ("runContext" in overlay.runtime) {
+      if (runContext) nextRuntimeConfig.runContext = runContext;
+      else delete nextRuntimeConfig.runContext;
+    }
 
-  if (Object.keys(overlay.runtime).length > 0) {
-    Object.assign(patch, overlay.runtime);
+    patch.runtimeConfig = nextRuntimeConfig;
   }
 
   return patch;

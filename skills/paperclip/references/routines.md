@@ -280,4 +280,4 @@ GET /api/routines/{routineId}/runs?limit=50
 GET /api/routines/{routineId}/event-groups?open=true
 ```
 
-Use the generic API endpoint tables in `skills/paperclip/references/api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.
+Use the generic API endpoint tables in `api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.

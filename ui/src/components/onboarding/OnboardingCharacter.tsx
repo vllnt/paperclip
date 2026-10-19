@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { AgentAvatar } from "../AgentAvatar";
 import type { createCharacter } from "@paperclipai/shared/cliplab/runtime";
 import type { Definition } from "@paperclipai/shared/cliplab/model";
+import { matchesMedia } from "@/lib/safe-match-media";
 import { colorOnboardingDefinition, resolveOnboardingSequences, sequenceDuration, sequenceLeadIn, type OnboardingSequences } from "./onboarding-character";
 
 type Player = ReturnType<typeof createCharacter>;
@@ -59,7 +60,7 @@ export function OnboardingCharacter({ appearance, awake, className }: Onboarding
   // otherwise stay allocated behind the fallback until the wizard unmounts.
   const fail = () => { clearTimers(); destroy("overlay"); destroy("base"); setReady(false); setFailed(true); };
   // Note: after a wake the live player sits in the overlay span; `mount` clears both spans.
-  const reducedMotion = () => typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const reducedMotion = () => matchesMedia("(prefers-reduced-motion: reduce)", false);
 
   // Body-following, page-scoped: the engine turns the body toward the
   // pointer only while eye-following is off. Framing is the engine's

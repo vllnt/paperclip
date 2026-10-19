@@ -1,3 +1,4 @@
+import { runContextPolicySchema } from "../run-context.js";
 import { z } from "zod";
 import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
@@ -86,6 +87,7 @@ export const createRoutineSchema = z.object({
   routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
   /** Board only: the route rejects it from any other actor. */
   gate: routineGateSchema.optional().nullable(),
+  runContextPolicy: runContextPolicySchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -114,6 +116,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).default("always"),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).default("company"),
   variables: z.array(routineVariableSchema),
+  runContextPolicy: runContextPolicySchema.optional(),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
   // Present only on gated routines, so snapshots of every other routine keep their exact stored shape.

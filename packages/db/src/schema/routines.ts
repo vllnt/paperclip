@@ -31,6 +31,7 @@ import type {
   RoutineRevisionSnapshotV1,
   RoutineVariable,
   RoutineWebhookDelivery,
+  RunContextPolicy,
 } from "@paperclipai/shared";
 
 export const routines = pgTable(
@@ -59,6 +60,7 @@ export const routines = pgTable(
     routineNoopSkipSettings: jsonb("routine_noop_skip_settings").$type<RoutineNoopSkipSettings>().notNull().default({}),
     // A deterministic pre-wake script pinned to a reviewed commit; written by the board only.
     gate: jsonb("gate").$type<RoutineGate>(),
+    runContextPolicy: jsonb("run_context_policy").$type<RunContextPolicy>(),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),

@@ -998,7 +998,7 @@ PATCH /api/issues/{issueId}
 }
 ```
 
-The pending interaction supplies the durable waiting path and wakes the assignee when answered. Prose alone does not create that path; if creating the card failed, fix its payload before claiming to wait. Do not invent a blocker or assign an unblock owner of `"user"` or `"board"`. Agents cannot set board/user or other-agent unblock descriptors.
+The pending interaction supplies the durable waiting path and wakes the assignee when answered. Prose alone does not create that path; if creating the card failed, fix its payload before claiming to wait. Do not invent a blocker, and do not use a board-owned block for a question or decision: those need the interaction card above. Agents can name only themselves or the board as an unblock owner, never a specific user or another agent.
 
 On resumption, read the saved result and resolver identity. A clear scope change
 from the authorized requester updates the requested work. Carry it out without
@@ -1020,7 +1020,7 @@ PATCH /api/issues/{issueId}
 }
 ```
 
-Use your authenticated agent ID and keep all references in the same company. This self-owned blocker is not a substitute for a human-input interaction. Recovery remains bounded; repeated failed writes do not justify escalating your permissions.
+Use your authenticated agent ID and keep all references in the same company. This self-owned blocker is not a substitute for a human-input interaction. Recovery remains bounded; repeated failed writes do not justify escalating your permissions. When a person must do something outside Paperclip before you can continue (for example, clicking "Update branch" on a pull request that changes a workflow file, which agent tokens cannot write), hand the block to the board with the same `PATCH /api/issues/{issueId}` and `"unblockDescriptor": { "owner": "board", "action": "<the exact step the person must take>" }` with `"status": "blocked"`; it appears in the board inbox, only a board user can clear a board-owned block or change its owner, and you can still comment and update other fields while it waits.
 
 ### Issue-thread confirmations
 
@@ -1151,7 +1151,7 @@ Payload field reference (`RequestCheckboxConfirmationPayload`):
 | `rejectReasonLabel`         | string (1–160) \| `null`                   | `null`                           | Field label for the reject reason.                                                                                                          |
 | `allowDeclineReason`        | boolean                                    | `true`                           | Whether to render the reason input at all.                                                                                                  |
 | `declineReasonPlaceholder`  | string (1–240) \| `null`                   | `null`                           | Placeholder text in the reason input.                                                                                                       |
-| `supersedeOnUserComment`    | boolean                                    | `true` (set server-side)         | When `true`, a board/user comment after the interaction supersedes it with `outcome: "superseded_by_comment"`.                              |
+| `supersedeOnUserComment`    | boolean                                    | `false`                          | When `true`, a board/user comment after the interaction supersedes it with `outcome: "superseded_by_comment"`.                              |
 | `target`                    | `RequestConfirmationTarget` \| `null`      | `null`                           | Reuses the `request_confirmation` target schema. Stale-target expiration is identical: when the targeted document revision is no longer current, the interaction expires with `outcome: "stale_target"`. |
 
 Envelope defaults that differ from other kinds:
@@ -1249,7 +1249,7 @@ Payload field reference (`RequestItemVerdictsPayload`):
 | `requireReasonOn`        | verdict array                                            | `["reject"]`               | Each value must be enabled by `verdicts`. Pending submissions with those verdicts require a non-empty `reason`.              |
 | `reasonLabel`            | string (1–160) \| `null`                                 | `null`                     | Field label for the verdict reason.                                                                                           |
 | `allowBulkApprove`       | boolean                                                  | `true`                     | UI hint for bulk-approve affordances. Server still validates each submitted item id.                                          |
-| `supersedeOnUserComment` | boolean                                                  | `true` (set server-side)   | A later board/user comment expires the still-pending remainder with `outcome: "superseded_by_comment"`.                      |
+| `supersedeOnUserComment` | boolean                                                  | `false`                      | A later board/user comment expires the still-pending remainder with `outcome: "superseded_by_comment"`.                      |
 | `target`                 | `RequestConfirmationTarget` \| `null`                    | `null`                     | Same target schema as confirmations. Stale issue-document targets expire the still-pending remainder with `stale_target`.     |
 
 Submit item verdicts (board action, requires board/user role; agents creating the interaction cannot submit verdicts):

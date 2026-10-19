@@ -302,8 +302,43 @@ paperclipai plugin action "$PLUGIN" user-authorization.poll -C "$ANTHM" --params
 `user-authorization.check` re-runs the fence check; `user-authorization.status`
 shows the person, token expiry and the last check (never a token). Any drift
 turns writes off; fix it, then save the policy with `"enabled": true` again.
+A 401 alone never does: the plugin refreshes the user token with the stored
+refresh token and retries once, and only GitHub refusing that refresh
+(`bad_refresh_token`) confirms a revocation. A network failure, a 401 no refresh
+confirmed or a refused App JWT pauses writes until the next good check. Token
+expiry and App JWTs follow GitHub's clock (the `Date` of its answers): a host
+clock more than a minute off is logged, shown as `fence.clockSkewSeconds` and
+recorded as `github.clock_skew` in the company activity.
 The kill switch is the same save with `"enabled": false`: writes stop at the
 next command, reads continue.
+
+**The board hears when writes stop on their own.** The moment the plugin
+switches a company's writes off (drift, or an authorization GitHub no longer
+honors) it opens one Paperclip issue, `origin plugin:vllnt.paperclip-github:write-alert`,
+named after the company. It gives the reason and the exact recovery commands:
+re-authorize first when the reason is a revocation, then save the policy with
+`"enabled": true`. It is assigned to the instance administrator who last
+changed the company's write identity (unassigned when none is known). There is at most one
+open alert per company: later checks update it, they never add another. Two
+softer conditions use the same issue and raise its priority only as far as they
+need:
+
+- **A pause that lasts 30 minutes.** The fence check keeps failing for a reason
+  that is not drift, so writes are refused but nothing was switched off. This
+  covers a pause that never clears on its own: a 401 after every refresh,
+  `incorrect_client_credentials`, a revoked or rotated App private key, or a
+  403 or 404 on the user endpoints. The pause is timed from its first failure
+  (`fence.pausedSince`) by GitHub's clock, so a host clock that lags does not
+  delay the alert. At 30 minutes the plugin opens (or escalates) the issue with
+  the reason, and writes `github.fence_paused` to the company activity once for
+  that pause, however long it lasts. The plugin keeps re-checking, every 5
+  minutes for the pause's first hour and hourly after, and the issue closes
+  when a check passes.
+- **A host clock more than 60 seconds from GitHub's** (`fence.clockSkewSeconds`).
+
+The issue closes itself when an administrator has turned writes back on and the
+check passes, when the pause or the skew ends, or when the company stops using
+the App user. The plugin never re-enables writes itself.
 
 ### Releasing protected paths for agent merges
 

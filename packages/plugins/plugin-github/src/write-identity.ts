@@ -1,4 +1,4 @@
-import type { EnvSecretRefBinding, PluginContext } from "@paperclipai/plugin-sdk";
+import type { EnvSecretRefBinding, PluginContext, PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import {
   GITHUB_PRIVILEGED_ACTIONS,
   GITHUB_WRITE_ACTIONS,
@@ -23,7 +23,9 @@ import { GitHubError, type GitHubClient } from "./github.js";
 import { SKILLS_LOCK_FILE, TIERS_FILE, parseAgentMergeablePaths, parseProtectedPaths, protectedFiles, protectedPatterns, skillsLockException, splitReleased, type AgentMergeableRule, type ChangedFile } from "./protected-paths.js";
 import type { Catalog, Repository } from "./contracts.js";
 import { UserAuthorization, UserAuthorizationError, type FenceStatus } from "./user-authorization.js";
+import { CLOCK_SKEW_ALERT_MS } from "./clock.js";
 import { checkGitObjectForSigning, parseSshSigningKey, sshSign, type SshSigningKey } from "./ssh-signature.js";
+import { createWriteAlerts } from "./write-alerts.js";
 
 const policyKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, ...GITHUB_WRITE_IDENTITY_STATE });
 const BOT_PERMISSIONS = ["contents", "pull_requests", "issues"] as const;
@@ -34,6 +36,8 @@ const SIGNING_KEY_TTL_MS = 5 * 60_000;
 /** Writes stop when the last successful fence check is older than this. */
 const FENCE_MAX_AGE_MS = 3 * 60 * 60_000;
 const FENCE_CHECK_INTERVAL_MS = 60 * 60_000;
+/** While writes pause on a transient fence failure, the check is retried this often during the pause's first hour. */
+const FENCE_RETRY_INTERVAL_MS = 5 * 60_000;
 const MAX_SIGN_PAYLOAD_BYTES = 1024 * 1024;
 /** A full commit SHA (SHA-1 or SHA-256 repositories), lowercase as GitHub reports it. */
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -126,7 +130,14 @@ export function registerWriteIdentity(
   const readTokens = new Map<string, { token: string; expires: number }>();
   const signingKeys = new Map<string, { secretId: string; key: SshSigningKey; expires: number }>();
   const throttle = new WriteThrottle();
-  const users = new UserAuthorization(ctx, github, now);
+  /**
+   * GitHub's clock, for what GitHub times: token expiry, the fence check's age.
+   * This host's clock (`now`) stays for what the host times: the throttle, the
+   * signing check of a commit written here, local caches.
+   */
+  const githubNow = () => now() + github.clock.skewMs();
+  const users = new UserAuthorization(ctx, github, githubNow);
+  const alerts = createWriteAlerts(ctx, now, githubNow);
 
   async function stored(companyId: string): Promise<StoredPolicy> {
     const value = await ctx.state.get(policyKey(companyId));
@@ -220,7 +231,7 @@ export function registerWriteIdentity(
     const version = policyVersion(companyId);
     const key = `${version}:${companyId}:${installationId}:${repository ? ids[0] : "*"}`;
     const cached = readTokens.get(key);
-    if (cached && cached.expires > now()) return cached.token;
+    if (cached && cached.expires > githubNow()) return cached.token;
     const granted = catalog.installations.find(installation => installation.id === installationId)?.permissions ?? targets[0]!.permissions ?? {};
     const permissions: Record<string, string> = { metadata: "read" };
     for (const name of READ_PERMISSIONS) if (granted[name]) permissions[name] = "read";
@@ -233,7 +244,7 @@ export function registerWriteIdentity(
       await github.revokeInstallationToken(token);
       throw new Denied("The company's GitHub write identity changed while this command was checked; run it again.");
     }
-    readTokens.set(key, { token, expires: now() + READ_TOKEN_TTL_MS });
+    readTokens.set(key, { token, expires: githubNow() + READ_TOKEN_TTL_MS });
     return token;
   }
 
@@ -254,7 +265,9 @@ export function registerWriteIdentity(
     if (state.needsReauthorization) throw new Denied(state.needsReauthorization);
     const fence = state.fence;
     if (!fence?.ok) throw new Denied(`The GitHub fence check has not passed${fence?.reason ? `: ${fence.reason}` : ""}.`);
-    if (now() - Date.parse(fence.checkedAt) > FENCE_MAX_AGE_MS) throw new Denied("The GitHub fence check is out of date; writes resume after the next successful check.");
+    // A check dated in the future was stamped under another clock offset: it proves no recent check either.
+    const age = githubNow() - Date.parse(fence.checkedAt);
+    if (!(age <= FENCE_MAX_AGE_MS && age >= -CLOCK_SKEW_ALERT_MS)) throw new Denied("The GitHub fence check is out of date; writes resume after the next successful check.");
     return { login: state.login, userId: state.userId };
   }
 
@@ -266,21 +279,23 @@ export function registerWriteIdentity(
   /**
    * Compares what the user token can reach at GitHub with the policy:
    * the user, the one installation, its repository selection, repositories and
-   * permissions. Any difference turns writes off (fail closed).
+   * permissions. Any difference turns writes off (fail closed). So does a
+   * revocation GitHub confirmed; a 401 alone is not one (VLL-1192).
    */
   async function checkFence(companyId: string): Promise<FenceStatus> {
     const current = await policy(companyId);
     if (!current || current.userSource !== "app") throw new Error("Choose the App user identity (userSource app) first.");
     const state = await users.state(companyId);
     if (!state) throw new Error("Authorize the GitHub user for this company first.");
-    const checkedAt = new Date(now()).toISOString();
+    const checkedAt = new Date(githubNow()).toISOString();
     let status: FenceStatus;
     try {
-      const token = await users.accessToken(companyId);
-      const { data: user } = await github.request<{ login?: unknown; id?: unknown }>("/user", token);
+      // A 401 to the user token refreshes it and retries once; App calls (the catalog) stay outside, so their 401 is never the user's.
+      const asUser = <T>(path: string) => users.withToken(companyId, token => github.request<T>(path, token));
+      const { data: user } = await asUser<{ login?: unknown; id?: unknown }>("/user");
       const login = typeof user.login === "string" ? user.login : "";
       const installations = await allPages(async page => {
-        const response = await github.request<{ installations?: Array<Record<string, any>> }>(`/user/installations?per_page=100&page=${page}`, token);
+        const response = await asUser<{ installations?: Array<Record<string, any>> }>(`/user/installations?per_page=100&page=${page}`);
         return { items: response.data.installations ?? [], next: response.next };
       }, "App installations");
       const catalog = await loadCatalog(companyId);
@@ -304,7 +319,7 @@ export function registerWriteIdentity(
           .filter(name => appPermissions[name] !== approved[name]).map(name => `${name}: ${appPermissions[name] ?? "none"} (approved ${approved[name] ?? "none"})`);
         if (appDifferences.length) problems.push(`App permissions differ: ${appDifferences.join(", ")}`);
         const listed = await allPages(async page => {
-          const response = await github.request<{ repositories?: Array<{ full_name?: unknown; id?: unknown }> }>(`/user/installations/${installation.id}/repositories?per_page=100&page=${page}`, token);
+          const response = await asUser<{ repositories?: Array<{ full_name?: unknown; id?: unknown }> }>(`/user/installations/${installation.id}/repositories?per_page=100&page=${page}`);
           return { items: (response.data.repositories ?? []).map(repo => ({ name: typeof repo.full_name === "string" ? repo.full_name.toLowerCase() : "(unnamed)", id: Number.isSafeInteger(repo.id) ? Number(repo.id) : null })), next: response.next };
         }, "installation repositories");
         const repositories = listed.map(repo => repo.name);
@@ -326,14 +341,25 @@ export function registerWriteIdentity(
       }
       status ??= { ok: false, checkedAt, reason: problems.join("; ") };
     } catch (error) {
-      if (UserAuthorization.rejected(error)) await users.revoked(companyId, "GitHub rejected the user token (authorization revoked). Authorize the GitHub user again.");
+      // A list too long to read whole is drift, and a revocation GitHub confirmed (it refused the refresh) ends
+      // the authorization: writes stop until an administrator re-enables them. Anything else is not drift:
+      // a network failure, a 401 no refresh confirmed, an App JWT dated by a skewed clock. Writes pause
+      // (the check is not ok) and resume after the next good check.
+      const definitive = error instanceof PagesExceeded || (error instanceof UserAuthorizationError && !error.transient);
       const reason = error instanceof UserAuthorizationError || error instanceof PagesExceeded ? error.message
-        : UserAuthorization.rejected(error) ? "GitHub rejected the user token (authorization revoked)."
+        : error instanceof GitHubError && error.status === 401 ? "GitHub rejected the App's credentials during the fence check: this host's clock may be off, or the App's private key was revoked or rotated."
+        : error instanceof GitHubError ? `GitHub answered HTTP ${error.status} to a fence check request: ${error.message}`
         : "GitHub could not be reached to check the fence.";
-      // A network failure is not drift: writes pause (the check is not ok) and resume after the next good check.
-      // A list too long to read whole is drift: writes stop until an administrator re-enables them.
-      status = { ok: false, checkedAt, reason, ...(error instanceof UserAuthorizationError || error instanceof PagesExceeded || UserAuthorization.rejected(error) ? {} : { transient: true }) };
+      status = { ok: false, checkedAt, reason, ...(definitive ? {} : { transient: true }) };
     }
+    // Stamped by GitHub's clock once GitHub has answered: the check's own answers may just have corrected it.
+    const stamped = new Date(githubNow()).toISOString();
+    const skew = github.clock.skewMs();
+    const skewSeconds = Math.abs(skew) > CLOCK_SKEW_ALERT_MS ? Math.round(skew / 1000) : undefined;
+    const previous = state.fence;
+    status = { ...status, checkedAt: stamped, ...(skewSeconds === undefined ? {} : { clockSkewSeconds: skewSeconds }),
+      // A pause is dated from its first transient failure, so its retries back off.
+      ...(status.transient ? { pausedSince: previous?.transient && previous.pausedSince ? previous.pausedSince : stamped } : {}) };
     // A failed check keeps the pinned repository IDs: only an administrator saving the policy re-pins them.
     await users.updateState(companyId, latest => ({ ...latest, fence: { ...status, repositoryIds: status.repositoryIds ?? latest.fence?.repositoryIds } }));
     if (!status.ok && !status.transient) {
@@ -342,8 +368,17 @@ export function registerWriteIdentity(
       if (latest?.enabled) {
         await savePolicy(companyId, { ...latest, enabled: false });
         await ctx.activity.log({ companyId, message: "github.fence_violation", metadata: { reason: status.reason ?? "unknown", writesDisabled: true } });
+        // Tell the board at once: an activity entry alone can go unnoticed for hours.
+        await alerts.writesOff(companyId, { reason: status.reason ?? "unknown", reauthorize: Boolean((await users.state(companyId))?.needsReauthorization) });
       }
     }
+    // Reported after the result is saved, so a failing log never holds back the kill switch; again only when the skew moves.
+    if (skewSeconds !== undefined && (previous?.clockSkewSeconds === undefined || Math.abs(previous.clockSkewSeconds - skewSeconds) * 1000 > CLOCK_SKEW_ALERT_MS)) {
+      try { await ctx.activity.log({ companyId, message: "github.clock_skew", metadata: { skewSeconds, fenceOk: status.ok } }); }
+      catch { ctx.logger.warn("Could not record the GitHub clock skew in the activity log", { companyId, skewSeconds }); }
+    }
+    const after = await stored(companyId);
+    await alerts.observe(companyId, status, !!after && "policy" in after && after.policy.enabled);
     return status;
   }
 
@@ -629,12 +664,22 @@ export function registerWriteIdentity(
     return { companyId, policy: current && "policy" in current ? current.policy : null, invalid: !!current && "invalid" in current };
   });
 
-  ctx.actions.register("write-identity.set", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
+  /** A board action only an instance administrator may take; the administrator is who an alert about this company goes to. */
+  function adminScope(params: Record<string, unknown>, actor: PluginPerformActionContext) {
+    const scope = boardScope(params, actor);
     requireInstanceAdmin(actor);
+    // Not awaited: the action does not wait on it (it never rejects), and the alert queue keeps it ahead of any alert this action raises.
+    void alerts.contact(scope.companyId, scope.userId);
+    return scope;
+  }
+
+  ctx.actions.register("write-identity.set", async (params, actor) => {
+    const { companyId } = adminScope(params, actor);
     const next = params.policy === null ? null : parseGitHubWriteIdentityPolicy(params.policy);
     if (next) await savePolicy(companyId, next);
     else { await ctx.state.delete(policyKey(companyId)); policyChanged(companyId); }
+    // An alert about writes switched off or paused applies only while the company writes as its App user.
+    if (next?.userSource !== "app") await alerts.clear(companyId);
     await ctx.activity.log({ companyId, message: next ? "GitHub write identity updated" : "GitHub write identity reset to default", metadata: next ? {
       ...Object.fromEntries(GITHUB_WRITE_ACTIONS.map(action => [action, next.default[action]])),
       overrideCount: next.overrides.length, missingUserConnection: next.missingUserConnection, userSource: next.userSource, enabled: next.enabled,
@@ -655,15 +700,13 @@ export function registerWriteIdentity(
     return { companyId, authorization: await users.state(companyId) };
   });
   ctx.actions.register("user-authorization.start", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     const current = await policy(companyId);
     if (current?.userSource !== "app" || !current.userLogin) throw new Error("Save a write identity with userSource app and userLogin first.");
     return { companyId, ...(await users.start(companyId)), login: current.userLogin };
   });
   ctx.actions.register("user-authorization.poll", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     const current = await policy(companyId);
     if (current?.userSource !== "app" || !current.userLogin) throw new Error("Save a write identity with userSource app and userLogin first.");
     const result = await users.poll(companyId, current.userLogin);
@@ -672,13 +715,11 @@ export function registerWriteIdentity(
     return { companyId, ...result, fence: await checkFence(companyId) };
   });
   ctx.actions.register("user-authorization.check", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     return { companyId, fence: await checkFence(companyId) };
   });
   ctx.actions.register("user-authorization.revoke", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     await users.forget(companyId, "An administrator revoked the GitHub user authorization. Authorize the GitHub user again.");
     // Writes stay off after a new authorization until an administrator turns them back on.
     const current = await stored(companyId);
@@ -788,10 +829,20 @@ export function registerWriteIdentity(
     },
     /** Hourly fence check from the sync job, for companies using the App user identity. */
     async maintain(companyId: string): Promise<void> {
+      // Every minute: a pause that has lasted long enough alerts, and an alert issue that failed to write is tried again.
+      await alerts.reconcile(companyId);
       const current = await stored(companyId);
       if (!current || !("policy" in current) || current.policy.userSource !== "app") return;
       const state = await users.state(companyId);
-      if (!state || (state.fence && now() - Date.parse(state.fence.checkedAt) < FENCE_CHECK_INTERVAL_MS)) return;
+      if (!state) return;
+      const fence = state.fence;
+      if (fence) {
+        // A transient pause is retried every few minutes at first, so writes resume on their own; then hourly.
+        const paused = fence.transient && fence.pausedSince ? githubNow() - Date.parse(fence.pausedSince) : Infinity;
+        const age = githubNow() - Date.parse(fence.checkedAt);
+        // A check dated in the future was stamped under another clock offset: it is due now.
+        if (age >= -CLOCK_SKEW_ALERT_MS && age < (paused < FENCE_CHECK_INTERVAL_MS ? FENCE_RETRY_INTERVAL_MS : FENCE_CHECK_INTERVAL_MS)) return;
+      }
       await checkFence(companyId);
     },
   };

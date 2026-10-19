@@ -22,6 +22,8 @@ import {
 } from "@/components/agent-config-primitives";
 import { AgentIcon, AgentIconPicker } from "@/components/AgentIconPicker";
 import { AgentProperties } from "@/components/AgentProperties";
+import { AgentStatusBadge } from "@/components/StatusBadge";
+import { agentDisplayStatus, agentWaitTitle } from "@/lib/agent-display-status";
 import { RunButton, PauseResumeButton } from "@/components/AgentActionButtons";
 import type { LiveRunForIssue } from "@/api/heartbeats";
 import type { AdapterInfo } from "@/api/adapters";
@@ -836,6 +838,50 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const ManagementMatrix: Story = {};
+
+/* ---- Waiting agent: no live run, at least one active issue wait ---- */
+
+const waitingAgent: Agent = {
+  ...agentManagementAgents[0]!,
+  id: "agent-waiting",
+  name: "Release PM",
+  status: "idle",
+  waitState: { activeWaitCount: 2, nextCheckAt: "2026-10-09T01:20:00.000Z" },
+};
+
+function WaitingAgentStory() {
+  const variants: Agent[] = [
+    { ...waitingAgent, id: "agent-idle", status: "idle", waitState: null },
+    waitingAgent,
+    { ...waitingAgent, id: "agent-running", status: "running" },
+  ];
+  return (
+    <StorybookQueryFixtures>
+      <main className="space-y-5 p-6" data-testid="waiting-agent-story">
+        <div className="flex flex-wrap items-center gap-3">
+          {variants.map((agent) => (
+            <span key={agent.id} data-testid={`badge-${agent.id}`}>
+              <AgentStatusBadge status={agentDisplayStatus(agent)} title={agentWaitTitle(agent)} />
+            </span>
+          ))}
+        </div>
+        <Card className="max-w-md shadow-none">
+          <CardHeader>
+            <CardTitle>{waitingAgent.name}</CardTitle>
+            <CardDescription>Idle in storage, waiting on two issue re-checks.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <AgentProperties agent={waitingAgent} runtimeState={runtimeState} />
+          </CardContent>
+        </Card>
+      </main>
+    </StorybookQueryFixtures>
+  );
+}
+
+export const WaitingAgent: Story = {
+  render: () => <WaitingAgentStory />,
+};
 
 /* ---- Forced Kubernetes execution (instance executionMode=kubernetes) ---- */
 

@@ -2105,15 +2105,22 @@
     {
       "idx": 302,
       "version": "7",
-      "when": 1792326244638,
-      "tag": "0302_event_sources",
+      "when": 1792371010802,
+      "tag": "0302_wise_professor_monster",
       "breakpoints": true
     },
     {
       "idx": 303,
       "version": "7",
-      "when": 1792346681095,
-      "tag": "0303_routine_gate_scripts",
+      "when": 1792426125272,
+      "tag": "0303_friendly_arclight",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1792427243744,
+      "tag": "0304_routine_gate_scripts",
       "breakpoints": true
     }
   ]
