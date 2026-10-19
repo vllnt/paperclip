@@ -1,6 +1,6 @@
 {
-  "id": "f6d84e5d-afce-4e39-b2c7-8af7b6a0de4f",
-  "prevId": "8e337670-4ae8-480a-a0d6-ab7daad2f6d6",
+  "id": "7e0d1c2a-c9ae-45d0-b02a-a05699df6b16",
+  "prevId": "a883c3b2-bc4f-4f50-9f9a-8fbbb7b20c92",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10770,6 +10770,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'{}'::jsonb"
+        },
+        "run_context_policy": {
+          "name": "run_context_policy",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
         },
         "feedback_data_sharing_enabled": {
           "name": "feedback_data_sharing_enabled",
@@ -40640,6 +40646,12 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'{}'::jsonb"
+        },
+        "run_context_policy": {
+          "name": "run_context_policy",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
         },
         "latest_revision_id": {
           "name": "latest_revision_id",

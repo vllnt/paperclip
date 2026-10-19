@@ -109,6 +109,7 @@ export const companiesApi = {
         | "requireBoardApprovalForNewAgents"
         | "interactionResolverGovernance"
         | "automationWakeSettings"
+        | "runContextPolicy"
         | "feedbackDataSharingEnabled"
         | "logoAssetId"
       >
