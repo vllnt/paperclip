@@ -158,6 +158,21 @@ remove obsolete Cloud bindings. Activity records contain event identifiers and
 outcomes but no webhook content. GitHub webhook content is never first-party
 telemetry.
 
+## Live status of linked pull requests and issues
+
+When a task links to a GitHub pull request or issue, Paperclip can show its live
+state (the experimental external objects setting). Paperclip reads that state from
+GitHub with the company's GitHub token. A company with no token gets no live state.
+Its linked objects show `auth_required` and keep their last known state, and
+Paperclip does not call GitHub for them. GitHub allows 60 requests an hour per IP
+address without a token, and everything behind one IP shares them. A request
+without a token can therefore block other tools on the same host, for example a
+release check.
+
+Paperclip checks again after one hour, so a token that you add is used within one
+hour. The same rule applies to the diff statistics of commit work products: without
+a token Paperclip leaves them out.
+
 ## Run projection
 
 The resolved token is leased at run start as an audited class-3 secret and is

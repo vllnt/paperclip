@@ -15,6 +15,8 @@ packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
 packages/shared/src/company-environment-defaults.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
+server/src/__tests__/external-objects-service.test.ts
+server/src/__tests__/github-commit-details.test.ts
 server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
