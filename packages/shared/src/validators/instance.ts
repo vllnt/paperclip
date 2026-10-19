@@ -1,3 +1,4 @@
+import { companyRunTiersSchema } from "../run-profile.js";
 import { z } from "zod";
 import { DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE } from "../types/feedback.js";
 import {
@@ -34,6 +35,8 @@ export const instanceGeneralSettingsSchema = z.object({
   companyEnvironmentDefaults: z.record(z.string().guid(), z.string().guid()).optional(),
   // `owner/name` repositories routine gate scripts may be pinned in; `PAPERCLIP_ROUTINE_GATE_REPOS` adds to it.
   routineGateRepos: z.array(z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)).max(20).optional(),
+  /** Named run tiers and the agent allowlist, keyed by company ID. */
+  companyRunTiers: z.record(z.string().guid(), companyRunTiersSchema).optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

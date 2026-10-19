@@ -41,6 +41,8 @@ export interface InstanceGeneralSettings {
   companyEnvironmentDefaults?: Record<string, string>;
   /** `owner/name` repositories routine gate scripts may be pinned in (plus `PAPERCLIP_ROUTINE_GATE_REPOS`). */
   routineGateRepos?: string[];
+  /** Named run tiers and the agent allowlist, keyed by company ID. */
+  companyRunTiers?: Record<string, import("../run-profile.js").CompanyRunTiers>;
 }
 
 export interface InstanceExperimentalSettings {

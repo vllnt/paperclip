@@ -210,6 +210,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
       ...(parsed.data.companyEnvironmentDefaults ? { companyEnvironmentDefaults: parsed.data.companyEnvironmentDefaults } : {}),
       ...(parsed.data.routineGateRepos ? { routineGateRepos: parsed.data.routineGateRepos } : {}),
+      ...(parsed.data.companyRunTiers ? { companyRunTiers: parsed.data.companyRunTiers } : {}),
     };
   }
   return {

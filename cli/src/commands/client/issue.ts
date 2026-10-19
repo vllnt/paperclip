@@ -1,3 +1,4 @@
+import { buildRunProfileOverrides, hasRunProfileOptions, type RunProfileOptions } from "./run-profile-options.js";
 import { Command } from "commander";
 import { readFile, writeFile } from "node:fs/promises";
 import {
@@ -65,7 +66,7 @@ interface IssueSimilarOptions extends BaseClientOptions {
   parentId?: string;
 }
 
-interface IssueCreateOptions extends BaseClientOptions {
+interface IssueCreateOptions extends BaseClientOptions, RunProfileOptions {
   title: string;
   description?: string;
   status?: string;
@@ -80,7 +81,7 @@ interface IssueCreateOptions extends BaseClientOptions {
   adapterOverridesFile?: string;
 }
 
-interface IssueUpdateOptions extends BaseClientOptions {
+interface IssueUpdateOptions extends BaseClientOptions, RunProfileOptions {
   title?: string;
   description?: string;
   status?: string;
@@ -384,6 +385,10 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option("--run-profile <tier>", "Run this issue on a company tier (for example fast, standard or deep)")
+      .option("--adapter-type <type>", "Run this issue on another harness: claude_local, codex_local or grok_local")
+      .option("--model <model>", "Run this issue on this model")
+      .option("--effort <effort>", "Reasoning effort for the run")
       .option("--adapter-overrides-json <json>", "Per-issue assignee adapter overrides as JSON (see docs/cli)")
       .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .action(async (opts: IssueCreateOptions) => {
@@ -401,7 +406,9 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
-            assigneeAdapterOverrides,
+            assigneeAdapterOverrides: hasRunProfileOptions(opts)
+              ? buildRunProfileOverrides(opts, assigneeAdapterOverrides)
+              : assigneeAdapterOverrides,
           });
 
           const created = await ctx.api.post<Issue>(apiPath`/api/companies/${ctx.companyId}/issues`, payload);
@@ -504,6 +511,11 @@ export function registerIssueCommands(program: Command): void {
       .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
+      .option("--run-profile <tier>", "Run this issue on a company tier (for example fast, standard or deep)")
+      .option("--adapter-type <type>", "Run this issue on another harness: claude_local, codex_local or grok_local")
+      .option("--model <model>", "Run this issue on this model")
+      .option("--effort <effort>", "Reasoning effort for the run")
+      .option("--clear-run-profile", "Remove the run profile so the issue runs on the agent's default")
       .option(
         "--unblock-owner <owner>",
         "Who must act on a blocked issue: board, agent:<id> or user:<id> (agents may name only board or themselves)",
@@ -512,7 +524,18 @@ export function registerIssueCommands(program: Command): void {
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
+          const parsedAdapterOverrides = await parseAdapterOverridesOption(opts);
+          const current = hasRunProfileOptions(opts) && parsedAdapterOverrides === undefined
+            ? await ctx.api.get<Issue>(apiPath`/api/issues/${issueId}`)
+            : null;
+          const assigneeAdapterOverrides = hasRunProfileOptions(opts)
+            ? buildRunProfileOverrides(
+                opts,
+                parsedAdapterOverrides !== undefined
+                  ? parsedAdapterOverrides
+                  : current?.assigneeAdapterOverrides as Record<string, unknown> | null | undefined,
+              )
+            : parsedAdapterOverrides;
           const payload = updateIssueSchema.parse({
             unblockDescriptor: unblockDescriptorFromOptions(opts),
             title: opts.title,
@@ -528,6 +551,7 @@ export function registerIssueCommands(program: Command): void {
             assigneeAdapterOverrides,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
+            ...(assigneeAdapterOverrides !== undefined ? { assigneeAdapterOverrides } : {}),
           });
 
           const updated = await ctx.api.patch<Issue & { comment?: IssueComment | null }>(apiPath`/api/issues/${issueId}`, payload);

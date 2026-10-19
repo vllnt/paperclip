@@ -52,7 +52,12 @@ The company's plugin config is written by an instance administrator. Every secre
   "github": { "token": { "type": "secret_ref", "secretId": "<id>" } },
   "grants": [{ "agentId": "<agent uuid>", "preset": "janitor", "environments": ["preview"] }],
   "guards": { "activityHours": 24, "maxDeletesPerRun": 20, "callsPerMinute": 60, "dryRunOnly": false },
-  "reaper": { "enabled": false, "ttlHours": 36, "quota": 300, "alertPercent": 80 }
+  "reaper": {
+    "enabled": false, "ttlHours": 36, "quota": 300, "alertPercent": 80,
+    "dev": { "enabled": false, "maxAgeDays": 7, "protect": ["dev/pinned-*"], "onlyPatterns": ["dev/ship-*", "dev/issue-*"], "maxDeletes": 20 },
+    "ciPreviewTemplate": "pr{pr}-run{run}-s{shard}-a{attempt}",
+    "supersededMinAgeMinutes": 60
+  }
 }
 ```
 
@@ -166,6 +171,28 @@ An hourly job `convex-reaper` (also `reaper.run` and `convex_reap_previews`). Fo
 4. counts all team deployments against `reaper.quota` and raises one issue each time usage reaches a new 5% level at or above `alertPercent` (not one a day) and
    an activity entry, with a new entry after a day at the same level.
 
+5. **superseded previews of open pull requests.** CI makes one preview per run, shard and attempt, so one pull request can hold dozens. With `reaper.ciPreviewTemplate` (text with `{pr}` once, and optionally `{run}`,
+   `{shard}`, `{attempt}` and one flat optional `[ ... ]` part, for example `pr{pr}[-run{run}]-s{shard}-a{attempt}`) the reaper reads the pull request, run, shard and attempt from each preview name. A template must have a letter in its literal text and must not put two numbers next to each other (`pr{pr}{run}` could not be read reliably; use `pr{pr}-run{run}`). A template is not a regular
+   expression: it compiles to literals and bounded digit groups and matches the whole name, so a hostile branch name cannot make the worker spin. For an open pull request it deletes a preview that a newer preview of the **same
+   shard** replaced (a later run, or a later attempt of the same run; without run numbers, a later attempt), if it has been idle for `supersededMinAgeMinutes` (default 60) and the newer preview still exists at the moment of deletion.
+   A shard that was not re-run keeps its newest preview, and numbered and unnumbered previews are never compared. The order and the idle time are checked again on the fresh records at delete time. Without a template, nothing
+   about open pull requests is deleted. The template's pull request number is authoritative: a closed pull request is only evidence for a preview when its number matches. The report shows how many previews the template matched
+   (`ciMatched`), so a template that never matches is visible. An agent deleting one preview by hand never gets this exception;
+6. **dev policy** (below).
+
+### Dev policy
+
+Dev deployments whose `lastDeployTime` (or `createTime` if never deployed) is older than `reaper.dev.maxAgeDays` (default 7, 1 to 90) are deleted by the reaper, **if they match the company's allow list
+`reaper.dev.onlyPatterns`**. Convex does not say who made a dev deployment, so the plugin never guesses: with no allow list it deletes nothing and lists the candidates in the report
+(for example `["dev/ship-*", "dev/issue-*"]` for agent-made names). The allow list must be narrow: a pattern ending in `*` needs a `/` and at least three characters after it (`dev/ship-*`; `*`, `dev*` and `dev/*` are rejected). It never deletes a default deployment (each member's own `dev/<member>`), a deployment the hard guard blocks, the shared pools
+`dev/paperclip-agents`, `dev/local-*` and `dev/qa-*`, anything matching `reaper.dev.protect` (which wins over the allow list), or one of unknown age. Patterns are exact names, or a prefix ending in a
+single `*` (a `*` anywhere else is rejected), matched without case. It is **plan only** until `reaper.enabled` and `reaper.dev.enabled` are both true; a dry run, `guards.dryRunOnly`, or a pass an agent started
+(`convex_reap_previews`) never delete dev deployments. At most `reaper.dev.maxDeletes` (default 20) per run across all projects, apart from the preview cap. Each deletion is re-fetched first, checked again, audited
+with its before-state, and confirmed with a follow-up read (an unreadable follow-up is recorded as `deleted-unverified`). Listing and deleting dev deployments needs a Team Access Token (a project token that can
+list also works); a preview deploy key cannot, so the plugin never uses one for dev deployments, not even for the first read.
+The plan appears in the report even while the policy is off, so read it before enabling.
+
+
 `ttlHours` is 3 to 168. It is a dry run until `reaper.enabled` is true. When GitHub cannot be read for a project, the reaper changes nothing in that project.
 
 A pass is bounded. It stops starting work after 4 minutes (the host stops a job after 5), plans up to six previews at a time, changes at most 100 expiries
@@ -176,7 +203,7 @@ reaper off, disconnecting the company or shutting the worker down stops it. Comp
 A pass that is already running is **joined, not repeated**: one pass runs and at most one waits behind it. Concurrent requests (a manual run during the
 hourly job, two agents) share the result of the pass they joined. A plan and a real run are kept apart.
 
-Reports keep every entry on the Convex page; the `convex_reap_previews` tool returns counts and the first 25 entries of each list, with `truncated`.
+Reports keep every entry on the Convex page; the `convex_reap_previews` tool returns counts and the first 25 entries of each preview and dev list, with `truncated`.
 
 ## Known limits
 

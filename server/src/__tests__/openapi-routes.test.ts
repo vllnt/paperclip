@@ -803,6 +803,8 @@ describe("openapi routes", () => {
     for (const name of schemaNames) {
       expect(spec.components.schemas[name], name).toBeDefined();
     }
+    const report = JSON.stringify(spec.components.schemas.ConvexReaperReport);
+    for (const field of ["dev", "executed", "listed", "ciMatched"]) expect(report, field).toContain(`"${field}"`);
     // The route references the result schemas and the error shape, and every reference resolves.
     const responses = JSON.stringify(operation.responses);
     for (const name of ["ConvexStatus", "ConvexConnectResult", "ConvexDisconnectResult", "ConvexDeploymentsList", "ConvexDeletePreviewResult", "ConvexReaperReport", "PluginBridgeError"]) {
