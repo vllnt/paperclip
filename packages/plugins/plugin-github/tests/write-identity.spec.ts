@@ -3433,3 +3433,66 @@ describe("write alerts: the board hears at once when writes are switched off or 
     expect(await f.open()).toHaveLength(1);
   });
 });
+
+describe("host and GitHub calls of one write-identity decision", () => {
+  /**
+   * The server gives a decision 15 s, and the plugin makes its host calls (each a database read on the host) and its GitHub
+   * calls one after another. When the host's database is slow, every extra call can push a merge past that budget: the merge
+   * then fails closed while a push still passes. These budgets are today's counts, so a change that adds a call to a
+   * decision must raise them on purpose. A GitHub catalog read counts as one call here; it is several GitHub requests.
+   *
+   * Warm: the decision runs right after the same decision, so the catalog, the App key, the read token, the user token and
+   * the signing key are cached. Cold: two hours later, when those caches have expired (the fence check is still recent).
+   */
+  const head = "a".repeat(40);
+  async function counted(f: Awaited<ReturnType<typeof appFixture>>, decide: () => Promise<any>) {
+    const stateGet = vi.spyOn(f.h.ctx.state, "get");
+    const configGet = vi.mocked(f.h.ctx.config.get);
+    const catalog = vi.mocked(f.client.catalog);
+    for (const spy of [stateGet, configGet, f.resolve, f.request, f.scoped, f.oauth, catalog]) spy.mockClear();
+    const decision = await decide();
+    return {
+      decision,
+      calls: {
+        "state.get": stateGet.mock.calls.length,
+        "config.get": configGet.mock.calls.length,
+        "secrets.resolve": f.resolve.mock.calls.length,
+        github: f.request.mock.calls.length + f.scoped.mock.calls.length + f.oauth.mock.calls.length + catalog.mock.calls.length,
+      },
+    };
+  }
+
+  it("keeps a push, a merge and an admin merge within their call budgets", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    const push = () => f.write("anthm-fr/songtrivia");
+    const merge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head });
+    const adminMerge = () => f.write("anthm-fr/songtrivia", { action: "pullRequest", privileged: ["adminMerge"], pullRequest: 7, expectedHeadSha: head });
+    // Every write reads the policy and the authorization once, then both again right before the token goes out (the
+    // checks between can take a while, so the kill switch is read twice on purpose), and the signing key's config entry.
+    const write = { "state.get": 4, "config.get": 1, "secrets.resolve": 0 };
+    const budgets = {
+      push: { warm: { ...write, github: 0 } },
+      merge: {
+        // The pull request (before and after the file list), the base branch's tiers file, one page of changed files.
+        warm: { ...write, github: 4 },
+        // Also the App connection, its key and allowed owners, the signing key secret, the catalog and a new read token.
+        cold: { "state.get": 7, "config.get": 2, "secrets.resolve": 2, github: 6 },
+      },
+      // A merge, plus the pull request again, the base branch, its rules, and the head's check runs and statuses.
+      adminMerge: { warm: { ...write, github: 9 } },
+    };
+    const measured: Record<string, Record<string, unknown>> = {};
+    for (const [name, decide] of [["push", push], ["merge", merge], ["adminMerge", adminMerge]] as const) {
+      await decide();
+      const { decision, calls } = await counted(f, decide);
+      expect(decision, name).toHaveProperty("credential.login", "agent-owner");
+      measured[name] = { warm: calls };
+    }
+    vi.setSystemTime(Date.now() + 2 * 60 * 60_000);
+    const cold = await counted(f, merge);
+    expect(cold.decision).toHaveProperty("credential.login", "agent-owner");
+    measured.merge!.cold = cold.calls;
+    expect(measured).toEqual(budgets);
+  });
+});
