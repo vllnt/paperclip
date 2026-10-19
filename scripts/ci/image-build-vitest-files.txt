@@ -28,9 +28,10 @@ server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
 server/src/__tests__/periodic-heartbeat-recovery.test.ts
-server/src/modules/run-dispatch/domain/policy.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
+server/src/modules/run-dispatch/domain/policy.test.ts
+server/src/shutdown-budget.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/AgentCharacterRuntime.test.ts
 ui/src/components/CommandPalette.real.test.tsx
@@ -62,4 +63,3 @@ ui/src/lib/safe-match-media.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
 ui/src/pages/IssueDetail.test.tsx
-server/src/shutdown-budget.test.ts
