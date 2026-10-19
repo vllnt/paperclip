@@ -30,16 +30,30 @@ const KNOWN_DIRECT_ISSUE_INSERTS: Record<string, { count: number; reason: string
       "keeping their ids and timestamps. It runs in the CLI process, where no listener exists. Exempt.",
     docMention: "worktree:merge-history",
   },
-  "server/src/routes/pipelines.ts": {
-    count: 1,
-    reason:
-      "open-conversation creates the single discussion thread of a pipeline case (one active per case, " +
-      "a conversation, not a work item). Checking it would flag each reopened thread against its predecessor. Exempt.",
-    docMention: "open-conversation",
-  },
-  "packages/db/src/seed.ts": {
+  // Upstream removed the Pipelines experiment (open-conversation) and moved the seed to server/scripts.
+  "server/scripts/seed.ts": {
     count: 1,
     reason: "Development seed data, not a production path.",
+    docMention: null,
+  },
+  "server/scripts/benchmark-workspace-admission.ts": {
+    count: 1,
+    reason: "Local workspace-admission benchmark on a throw-away database, not a production path.",
+    docMention: null,
+  },
+  "server/scripts/dot-runner-demo.ts": {
+    count: 1,
+    reason: "Synthetic local Dot runner lab on its own database, not a production path.",
+    docMention: null,
+  },
+  "server/scripts/dot-runner-live.ts": {
+    count: 1,
+    reason: "Disposable Dot transport lab on its own database, not a production path.",
+    docMention: null,
+  },
+  "server/scripts/smoke-native-task-monitor.ts": {
+    count: 1,
+    reason: "Opt-in live smoke test on an isolated database, not a production path.",
     docMention: null,
   },
 };
