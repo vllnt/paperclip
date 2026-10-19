@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Issue, PluginContext } from "@paperclipai/plugin-sdk";
+import { PLUGIN_RPC_ERROR_CODES, type Issue, type PluginContext } from "@paperclipai/plugin-sdk";
 import { GitHubClient, GitHubError } from "./github.js";
 import { boardScope } from "./setup.js";
 import type { PluginWriteRequest } from "./write-identity.js";
@@ -31,6 +31,11 @@ const localSnapshot = (issue: Issue): Snapshot => ({ title: issue.title, body: i
 const remoteSnapshot = (issue: GitHubIssue): Snapshot => ({ title: issue.title, body: cleanBody(issue.body ?? ""), state: issue.state === "closed" ? issue.stateReason === "not_planned" ? "not_planned" : "completed" : "open" });
 const statusFor = (state: string) => state === "open" ? "todo" as const : state === "not_planned" ? "cancelled" as const : "done" as const;
 const errorText = (error: unknown) => error instanceof Error ? error.message : "Sync failed. Try again.";
+/**
+ * The host denies a worker's call with this code when the invocation that the call belongs to is gone (missing, expired or
+ * unknown). Every later call of the same run is denied too, so a run that sees it has nothing left to do.
+ */
+const isScopeLoss = (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED;
 
 /** Three-way comparison preserves edits on either side and exposes competing edits. */
 export function mergeSnapshots(base: Snapshot, local: Snapshot, remote: Snapshot) {
@@ -111,6 +116,13 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
   // per company; host idempotency also covers crashes between create and receipt.
   const queues = new Map<string, Promise<unknown>>();
   const running = new Map<string, Promise<SyncReport | null>>();
+  // Only the scheduled job runs a sync. A person, a settings change or a write through the management actions asks for one
+  // here, and the job does it on its next run. A run that a handler starts and leaves running keeps the identity of that
+  // handler's invocation, which the host drops when the handler returns (an event's after 15 minutes), and every later host call
+  // of the run is then denied. The job has no invocation, so its run cannot lose one.
+  // company -> when the oldest request that no run has taken yet was made (milliseconds)
+  const requested = new Map<string, number>();
+  function requestSync(companyId: string) { if (!requested.has(companyId)) requested.set(companyId, Date.now()); }
   function exclusive<T>(companyId: string, operation: () => Promise<T>): Promise<T> {
     const pending = (queues.get(companyId) ?? Promise.resolve()).catch(() => {}).then(operation);
     queues.set(companyId, pending);
@@ -239,6 +251,10 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     const pair = await ensureNative(companyId, repo, remote, projectIds, report);
     if (!pair) return;
     let { native, link } = pair;
+    // A link is written only when it differs from what is stored: an issue that did not change costs no write on a run that
+    // happens every minute (it used to cost two).
+    let stored = digest(link);
+    const persist = async () => { const next = digest(link); if (next === stored) return; await saveLink(companyId, link); stored = next; };
     if (link.projectless && !native.projectId && projectIds.length) {
       if (native.checkoutRunId || native.executionRunId) throw new Error("An agent is working on this task. Project linking will retry after the run.");
       native = await ctx.issues.update(native.id, { projectId: [...projectIds].sort()[0] }, companyId);
@@ -253,7 +269,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     const incoming = remoteSnapshot(remote);
     const merged = mergeSnapshots(force === "paperclip" ? incoming : force === "github" ? local : link.base, local, incoming);
     link.conflicts = merged.conflicts;
-    await saveLink(companyId, link);
+    await persist();
     if (merged.conflicts.length) throw new Error(`Conflicting ${merged.conflicts.join(", ")} edits. Open the task’s GitHub panel to choose which version to keep.`);
     if (Object.keys(merged.toLocal).length) {
       if (native.checkoutRunId || native.executionRunId) throw new Error("An agent is working on this task. Incoming edits will retry after the run.");
@@ -282,7 +298,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     }
     link.base = remoteSnapshot(remote);
     link.conflicts = [];
-    await saveLink(companyId, link);
+    await persist();
     await applyRule(companyId, native, remote, link, config);
   }
   async function attach(companyId: string, native: Issue, repo: Repository, remote: GitHubIssue, base?: Snapshot) {
@@ -327,6 +343,10 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     const connected = async () => await companies.state(companyId) === "connected";
     if (!await connected()) return null;
     const report: SyncReport = { at: new Date().toISOString(), imported: 0, updated: 0, warnings: [] };
+    // When the host denies a call because the run's invocation scope is gone, the run stops: every call after it would be denied
+    // too (one failed call per remaining issue, and a report that cannot be written). The error goes to the caller; the next
+    // scheduled run starts over.
+    let scopeLost = false;
     try {
       const config = await settings(companyId);
       if (!config.enabled) return null;
@@ -349,15 +369,15 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
             try {
               const remote = await publishPending(companyId, item, repo, auth, remoteIssues);
               if (!remoteIssues.some(issue => issue.id === remote.id)) remoteIssues.push(remote);
-            } catch (error) { unresolved.add(item.issueId); report.warnings.push(`${repo.fullName}: ${errorText(error)}`); }
+            } catch (error) { if (isScopeLoss(error)) throw error; unresolved.add(item.issueId); report.warnings.push(`${repo.fullName}: ${errorText(error)}`); }
           }
           for (const remote of new Map(remoteIssues.map(issue => [issue.id, issue])).values()) {
             // A partially attached publication is never imported as a second task.
             if ([...unresolved].some(id => remote.body?.includes(marker(companyId, id)))) continue;
             try { await reconcile(companyId, repo, remote, repo.projects.map(p => p.id), auth, config, report); }
-            catch (error) { report.warnings.push(`${repo.fullName} #${remote.number}: ${errorText(error)}`); }
+            catch (error) { if (isScopeLoss(error)) throw error; report.warnings.push(`${repo.fullName} #${remote.number}: ${errorText(error)}`); }
           }
-        } catch (error) { report.warnings.push(`${repo.fullName}: ${errorText(error)}`); }
+        } catch (error) { if (isScopeLoss(error)) throw error; report.warnings.push(`${repo.fullName}: ${errorText(error)}`); }
       }
       const tracked = (await ctx.state.get(key(companyId, "standalone")) as Record<string, { repositoryId: number; number: number }> | null) ?? {};
       for (const [githubId, item] of Object.entries(tracked)) {
@@ -369,15 +389,20 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
           const remote = await github.getIssue(auth.id, auth.pem, repo, item.number);
           if (String(remote.id) !== githubId) throw new Error("Issue moved. Open it in its destination repository to reconnect.");
           await reconcile(companyId, repo, remote, repo.projects.map(p => p.id), auth, config, report);
-        } catch (error) { report.warnings.push(`GitHub issue #${item.number}: ${errorText(error)}`); }
+        } catch (error) { if (isScopeLoss(error)) throw error; report.warnings.push(`GitHub issue #${item.number}: ${errorText(error)}`); }
       }
-    } catch (error) { report.warnings.push(errorText(error)); }
-    finally { if (report.updated) invalidate(companyId); await ctx.state.set(key(companyId, "report"), report); }
+    } catch (error) {
+      if (isScopeLoss(error)) { scopeLost = true; throw error; }
+      report.warnings.push(errorText(error));
+    }
+    finally { if (!scopeLost) { if (report.updated) invalidate(companyId); await ctx.state.set(key(companyId, "report"), report); } }
     return report;
   }
+  /** Runs one sync now; only the scheduled job calls this (tests too). Anything else uses requestSync or queueSync. */
   function sync(companyId: string) {
     const existing = running.get(companyId); if (existing) return existing;
-    const promise = exclusive(companyId, () => run(companyId));
+    // The run takes the requests made so far; one that arrives while it runs stays for the next run.
+    const promise = exclusive(companyId, () => { requested.delete(companyId); return run(companyId); });
     running.set(companyId, promise);
     void promise.finally(() => { if (running.get(companyId) === promise) running.delete(companyId); }).catch(() => {});
     return promise;
@@ -389,33 +414,41 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     // without a config replay keeps syncing.
     for (const companyId of await companies.connected()) {
       try { await sync(companyId); }
-      catch (error) { ctx.logger.error("GitHub scheduled sync failed", { companyId, error: errorText(error) }); }
+      catch (error) {
+        ctx.logger.error("GitHub scheduled sync failed", { companyId, error: errorText(error) });
+        // The host no longer admits this worker's calls, so the rest of the job would only be denied. The next run starts over.
+        if (isScopeLoss(error)) return;
+      }
       try { await identity.maintain?.(companyId); }
       catch (error) { ctx.logger.error("GitHub write identity check failed", { companyId, error: errorText(error) }); }
     }
   });
-  for (const event of ["issue.updated", "project.created", "project.updated"] as const) {
-    ctx.events.on(event, async event => {
-      if (event.actorType === "plugin") return;
-      // Event delivery is only an accelerator; scheduled reconciliation repairs missed events.
-      void sync(event.companyId).catch(() => {});
-    });
+  // Events (issue and project changes) do not ask for a sync: the job syncs every connected company on every run, so an event
+  // could not make one happen sooner, and a sync that an event handler started would lose its scope (see requestSync).
+  /**
+   * The answer to "Sync now": the request is queued for the scheduled job, which takes it on its next run (after the run in
+   * progress, if there is one). It says when the request was queued and when a sync last finished, so that no surface
+   * presents a queued request as a finished sync. A call without `refresh` that follows a report of the last minute queues nothing.
+   */
+  async function queueSync(companyId: string, refresh: boolean) {
+    const report = await ctx.state.get(key(companyId, "report")) as SyncReport | null;
+    if (refresh) { invalidate(companyId); requestSync(companyId); }
+    else if (!(report && Date.now() - Date.parse(report.at) < 60_000)) requestSync(companyId);
+    return { ...queueState(companyId), lastRunAt: report?.at ?? null };
+  }
+  function queueState(companyId: string) {
+    const at = requested.get(companyId);
+    return { queued: at !== undefined, queuedAt: at === undefined ? null : new Date(at).toISOString(), busy: running.has(companyId) };
   }
   ctx.actions.register("sync-now", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
-    if (params.refresh === true) invalidate(companyId);
-    else {
-      const report = await ctx.state.get(key(companyId, "report")) as SyncReport | null;
-      if (report && Date.now() - Date.parse(report.at) < 60_000) return { started: false };
-    }
-    void sync(companyId).catch(() => {});
-    return { started: true };
+    return queueSync(companyId, params.refresh === true);
   });
   ctx.actions.register("sync-status", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
     // Reports the connection without loading the private key.
     const connection = await companies.state(companyId);
-    return { configured: connection === "connected", connection, settings: await settings(companyId), busy: running.has(companyId),
+    return { configured: connection === "connected", connection, settings: await settings(companyId), ...queueState(companyId),
       report: await ctx.state.get(key(companyId, "report")), pendingCount: Object.keys(await pendingFor(companyId)).length };
   });
   ctx.actions.register("automation-options", async (params, actor) => {
@@ -439,7 +472,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       await ctx.state.set(key(companyId, "settings"), value);
       await ctx.activity.log({ companyId, message: "GitHub sync and automation settings updated", metadata: { enabled: value.enabled, ruleCount: value.rules.length } });
     });
-    void sync(companyId).catch(() => {});
+    requestSync(companyId);
     return value;
   });
   ctx.actions.register("task-destinations", async (params, actor) => {
@@ -563,7 +596,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     return result;
   }
 
-  return { sync, ensureTasks, handleWebhook, linkForTask: async (companyId: string, issue: Issue) => {
+  return { sync, requestSync, queueSync, ensureTasks, handleWebhook, linkForTask: async (companyId: string, issue: Issue) => {
     if (issue.originKind !== ORIGIN || !issue.originId) return null;
     const link = await loadLink(companyId, Number(issue.originId));
     return link?.issueId === issue.id ? link : null;

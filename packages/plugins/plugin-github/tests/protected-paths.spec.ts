@@ -112,19 +112,42 @@ describe("the opt-in that releases some protected paths for agent merges", () =>
     expect(releasedByOptIn(r, "src/ok.ts", null)).toBe(false);
   });
 
-  it("splits the protected files of a pull request, and releases nothing for a control repository", () => {
+  it("splits the protected files of a pull request, and releases nothing for a repository with a tiers file", () => {
     const r = rule({ exclude: [".github/workflows/release.yml"] });
     const touched = [".github/CODEOWNERS", ".github/dependabot.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml"];
-    expect(splitReleased(touched, r, "owner/repo", null)).toEqual({ released: [".github/dependabot.yml", ".github/workflows/ci.yml"], kept: [".github/CODEOWNERS", ".github/workflows/release.yml"] });
-    expect(splitReleased(touched, null, "owner/repo", null)).toEqual({ released: [], kept: touched });
-    expect(splitReleased(touched, r, CONTROL_REPOSITORIES[0]!, null)).toEqual({ released: [], kept: touched });
-    expect(splitReleased(touched, r, "owner/repo", ["paperclip/**"])).toEqual({ released: [], kept: touched });
-    expect(splitReleased([], r, "owner/repo", null)).toEqual({ released: [], kept: [] });
+    expect(splitReleased(touched, r, null)).toEqual({ released: [".github/dependabot.yml", ".github/workflows/ci.yml"], kept: [".github/CODEOWNERS", ".github/workflows/release.yml"] });
+    expect(splitReleased(touched, null, null)).toEqual({ released: [], kept: touched });
+    expect(splitReleased(touched, r, [])).toEqual({ released: [], kept: touched });
+    expect(splitReleased(touched, r, ["paperclip/**"])).toEqual({ released: [], kept: touched });
+    // A tiers value that is not exactly null (a caller's `undefined`) releases nothing.
+    expect(splitReleased(touched, r, undefined as unknown as null)).toEqual({ released: [], kept: touched });
+    expect(splitReleased([], r, null)).toEqual({ released: [], kept: [] });
+  });
+
+  it("lets the control repository opt in when it has no tiers file, and keeps its control paths and CODEOWNERS refused", () => {
+    const control = CONTROL_REPOSITORIES[0]!;
+    const files = [".github/workflows/ci.yml", ".github/CODEOWNERS", "paperclip/gates.yaml", "scripts/build.sh"].map(filename => ({ filename }));
+    const touched = protectedFiles(files, protectedPatterns(control, null));
+    expect(touched).toEqual([".github/CODEOWNERS", ".github/workflows/ci.yml", "paperclip/gates.yaml", "scripts/build.sh"]);
+    expect(splitReleased(touched, rule({ repository: control }), null)).toEqual({ released: [".github/workflows/ci.yml"], kept: [".github/CODEOWNERS", "paperclip/gates.yaml", "scripts/build.sh"] });
+    // With a tiers file on its base branch the same repository cannot opt in.
+    expect(splitReleased(touched, rule({ repository: control }), ["paperclip/**"])).toEqual({ released: [], kept: touched });
+  });
+
+  it("never releases a control path, a CODEOWNERS path or a path outside its normal form, in any repository and whatever the rule allows", () => {
+    // `splitReleased` takes no repository: no repository name can change the answer. The second rule is wider than the config
+    // accepts (see parseAgentMergeablePaths), to show that these refusals hold without the validation.
+    const refusedPaths = ["paperclip/gates.yaml", "scripts/build.sh", "ROADMAP.md", "data/company/strategy/plan.md", "CODEOWNERS", ".github/CODEOWNERS", ".github/../scripts/x", ".github/./CODEOWNERS", ".github//workflows/ci.yml"];
+    for (const r of [rule(), rule({ allow: ["**"] })]) {
+      for (const path of refusedPaths) expect(splitReleased([path], r, null), `${r.allow} ${path}`).toEqual({ released: [], kept: [path] });
+      // Next to a released file they keep the refusal for the whole pull request.
+      expect(splitReleased([".github/workflows/ci.yml", ...refusedPaths], r, null), `${r.allow}`).toEqual({ released: [".github/workflows/ci.yml"], kept: refusedPaths });
+    }
   });
 
   it("covers a rename by both of its names", () => {
     const files = [{ filename: ".github/workflows/ci.yml", previousFilename: ".github/workflows/release.yml" }];
     const touched = protectedFiles(files, protectedPatterns("owner/repo", null));
-    expect(splitReleased(touched, rule({ exclude: [".github/workflows/release.yml"] }), "owner/repo", null).kept).toEqual([".github/workflows/release.yml"]);
+    expect(splitReleased(touched, rule({ exclude: [".github/workflows/release.yml"] }), null).kept).toEqual([".github/workflows/release.yml"]);
   });
 });
