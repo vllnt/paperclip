@@ -786,6 +786,17 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
 }
 
 /**
+ * The commit a run's workspace upload starts from: the local HEAD, read the same
+ * way the upload reads it. The server records it before the upload, so the
+ * reaper knows which commits already exist on the host without asking the
+ * worker. Null when the workspace is not a git repository with a commit.
+ */
+export async function readSshWorkspaceSeed(localDir: string): Promise<string | null> {
+  const snapshot = await readLocalGitWorkspaceSnapshot(localDir);
+  return snapshot && /^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(snapshot.headCommit) ? snapshot.headCommit.toLowerCase() : null;
+}
+
+/**
  * The error for an ssh child whose stream did not end cleanly, or null when it
  * did. A child that a signal ended reports a null exit code, which a plain
  * `code ?? 0` check read as success and so accepted a truncated stream.

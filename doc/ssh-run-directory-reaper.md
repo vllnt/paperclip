@@ -21,10 +21,54 @@ status.
   `PAPERCLIP_SSH_RUN_REAPER_DISK_PRESSURE_PERCENT` disk use on the worker
   (default 80) the threshold is
   `PAPERCLIP_SSH_RUN_REAPER_PRESSURE_MAX_AGE_MINUTES` (default 15).
-- **Not on release:** the last run of an agent task session. The sweep removes
-  it once it is old enough. Resume itself does not read `runs/<runId>`: session
-  state holds the worker's identity and the provider's session id, and every run
-  uploads its own directory.
+- **Never while the run is live.** One predicate, for the release and the sweep
+  alike: a run is live while it is not terminal, while another lease of it is
+  `active`, `retained` or `pending_cleanup`, or while it is the last run of a task
+  session whose issue is still open (not `done` or `cancelled`). A session whose
+  task key is not an issue does not hold a run. A session resumes from its last
+  run, but resume itself does not read `runs/<runId>`: session state holds the
+  worker's identity and the provider's session id, and every run uploads its own
+  directory. The folder of a run held by an open issue stays for as long as the
+  issue is open.
+
+- **A run with no seed record.** A lease from before the seed record existed, or
+  of a workspace that was not a git repository with a commit, has no commit to
+  measure the run's own work from. The sweep removes its directory only under a
+  stricter rule, and only when all of these hold; otherwise it keeps it:
+  1. The run is not live, by the predicate above.
+  2. The run finished more than `PAPERCLIP_SSH_RUN_REAPER_LEGACY_MIN_AGE_MINUTES`
+     ago (default 1440, a server setting). A run with no finish time is kept as
+     `finish_unknown` on the sweep; a release waits for the sweep.
+  3. The worker's git shows no local-only state, by the same sentinel-checked
+     reads as above: no uncommitted or untracked file (ignored files do not
+     count), no stash, no linked worktree (which includes an agent worktree that
+     points into it), and every local ref in the repository reaching only commits
+     that a remote ref also reaches. "Every local ref" means branches, tags (an
+     annotated tag counts as the commit it points at), notes, the stash and HEAD;
+     remote refs are the hint, not a ref that is checked. A ref that does not lead
+     to a commit keeps the folder as `unpushed`. A folder with a submodule is kept
+     as `submodule`: a `.gitmodules` file, a gitlink in the index, or a
+     `.git/modules` directory. A read that fails keeps it as `git_unreadable`.
+     Nothing is bundled, because a folder that passes has nothing to save. A
+     remote ref is a hint that work was pushed, not proof of it.
+  4. One sweep sends at most 100 such folders to workers (the sweep's own batch)
+     and spends at most 30 seconds on them, oldest first. The rest wait for the
+     next sweep. Each reap is cut at the time the pass has left, and never runs
+     longer than 30 seconds; a folder that is due when the pass has no room is not
+     started. Every call to a worker for a folder with no seed record is bounded
+     by those 30 seconds. A reap that is cut keeps its claim, so nobody records a
+     verdict for it, and the folder is tried again once the claim goes stale (15
+     minutes). Before it deletes anything, the script marks the folder as holding no
+     unsynced work, so a removal that is cut half way is finished by the next pass
+     without the checks. The removal is the one every directory gets: a direct
+     child of the real root, no links, no device crossing, the claim that
+     serializes reapers, and a device and inode recheck right before the final
+     `rmdir`.
+
+  A folder the restore marked is not subject to this: it holds no unsynced work and
+  goes at once, whatever its run's age or finish time. For that reason the server
+  still asks the worker about a folder with no seed record that is not old enough
+  yet; an unmarked one answers "not yet", which the server does not record.
 
 A directory with the `.paperclip-restored` marker holds no unsynced work and is
 removed at once. Without the marker the worker may hold the only copy of the
@@ -41,6 +85,7 @@ small. Bundles older than 30 days are removed.
 | --- | --- |
 | Commits on HEAD after the start commit | `head` |
 | A branch tip that HEAD does not contain | the branch name |
+| A tag, a note or any other local ref outside `refs/remotes` (a tag as the commit it points at) | `ref/<name without refs/>` |
 | Each stash entry | `stash-<n>` |
 | The detached HEAD of an extra worktree | `worktree-head-<n>` |
 | Uncommitted work: tracked and untracked files git does not ignore, as a snapshot commit | `worktree` |
@@ -63,8 +108,25 @@ The directory stays, with a reason in the activity entry and in the lease's
 - `not_git_backed`: no marker and not a git repository, so nothing can be saved.
 - `worktree_dirty`: an extra worktree has uncommitted work.
 - `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
-  verify; or `.git` is a link or a file; or the start commit is unknown.
-- `rm_failed`: the removal failed. It is retried up to 5 times.
+  verify; or `.git` is a link or a file; or a git
+  read failed (the `detail` field names the command); or a
+  bundle already at the published path is a link or not a regular file, or the
+  bundle could not be replaced or still does not match this pass's refs exactly.
+- `seed_unknown`: the server has no record of the commit the run's workspace was
+  uploaded from and the caller did not ask for the rule for folders with no
+  record. The server always asks once the run is dead and old enough, so this is
+  what a direct caller of the worker script sees.
+- For a folder with no seed record: `dirty`, `unpushed`, `stash` and
+  `linked_worktree` (the git state that rule 3 names), `submodule` (the folder has a
+  submodule; this holds for a run with a seed record too), `git_unreadable` (a git
+  read failed or lost its end; the `detail` field names it), and `finish_unknown`
+  (the run has no finish time).
+- `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
+  point (a bind mount on the same device included). Nothing in it is touched.
+- `rm_failed`: the removal failed. It is retried up to 5 times. A mount below the
+  run directory ends here too: the delete stays on the run directory's own
+  filesystem (`find -xdev`), so the mounted contents are left and the mount point
+  itself cannot be removed.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
 - `root_mismatch`: the root recorded on the lease is not the root the environment
   is configured with now (or the lease did not record that root), or it is too
@@ -127,11 +189,149 @@ instead of the run.
   other.
 - **Crash.** A claim not renewed for 15 minutes (a server died mid-removal) is
   reclaimed by the next sweep.
+- **Time limit.** The worker script runs under `timeout` with the same limit as
+  the SSH call (10 minutes, plus a 30 second kill grace). A dropped connection
+  or a frozen server therefore cannot leave a script running once its claim is
+  stale (15 minutes after the last renewal). A worker without `timeout` is not
+  reaped: the script reports `unbounded` before it changes anything, the server
+  gives the claim back, records nothing, and logs one warning per environment.
+  The directory is tried again on a later sweep, so installing `timeout` on the
+  worker (GNU coreutils or busybox) is enough to resume reaping.
+- **Threat model.** The worker's `git` is trusted. A git that exits 0 and prints
+  false output is out of scope, as is the server's own user. In scope: output that
+  is lost or cut short (a killed shell, a full disk, a swallowed error), and real git
+  states that the logic could misread.
+- **The starting point comes from the server.** The commit a run's workspace was
+  uploaded from (the local HEAD, read the way the upload reads it) is written to
+  the lease (`metadata.sshWorkspaceSeed.head`) when the SSH driver realizes the
+  workspace, before the upload. The reaper passes it to the worker script. The
+  script never infers it from the worker's reflog, which `git gc`, `git reflog
+  expire` or `core.logAllRefUpdates=false` can shorten. A commit is the run's own
+  when it is reachable from a ref, HEAD or a stash and not from that commit. The
+  reflog's length changes nothing. A run with no record (a workspace that was not a
+  git repository with a commit, or a lease from before this record existed) is
+  not bundled at all: its directory is removed only under the bounded rule in
+  "When a directory is removed", and kept otherwise. A directory that the restore
+  marked needs no seed.
+- **Names the worker controls.** The worker user can write in a run directory, so
+  it can plant a link at any name the script knows in advance, and a plain
+  redirection (`>`, `>>`, `: >`) follows a link and writes or truncates its target.
+  The script therefore writes no fixed name in the run directory:
+  - Its scratch files (the git read outputs, the temporary index, the bundle under
+    construction) are in a directory that `mktemp -d` creates fresh for each call,
+    with an unpredictable name and mode 700, and that is removed on every way out,
+    including a kill by the time limit. A call that cannot create it keeps the
+    folder as `preserve_failed` (`detail` is `scratch directory`).
+  - The `.paperclip-restored` marker keeps its name. The script removes whatever is
+    at that name first (`rm` unlinks a link and never follows it), then creates the
+    file exclusively (`O_EXCL`, through the shell's noclobber), which fails on any
+    existing name, including a link planted in between, and then checks that the
+    result is a plain file. This is used both when a clean folder with no seed
+    record is marked before its removal and when a marker is put back after a
+    failed removal. If the marker cannot be created, the folder is kept as
+    `rm_failed` (`detail` is `marker`) and nothing is deleted.
+  - Noclobber (`set -C`) is on for the whole script, so a plain `>` fails on any
+    name that already exists, a symlink or a hard link included, instead of
+    writing through it. Each scratch file is created once, under a name used once:
+    a read writes its output to `<name>.out`, then writes the final file (its
+    output and the closing count line) in one redirection, and a repeated read (the
+    status of each extra worktree) gets its own name. The list of refs to save is
+    collected in a shell variable and written once. A write that fails keeps the
+    folder as `preserve_failed`, with the read's name as `detail`, and the
+    scratch directory is removed. A name found already taken inside the fresh
+    scratch directory is tampering, and the reap stops. Two files are written by
+    git itself, not by a shell redirection, so noclobber does not cover them: the
+    temporary index and the bundle under construction. Git follows a link at the
+    name it writes (its lock-file step resolves it; checked with git 2.51 for both
+    `bundle create` and the index), so for these two the only protection is that
+    the scratch directory is new and that nothing outside the run can reach it. A
+    process of the same user that races the script could redirect them; that is the
+    accepted residual below.
+  - **Invariant: the scratch directory is a direct child of `runs/<runId>/`.** It
+    is never inside `workspace/` (the agent's working folder, which the agent also
+    controls) and never in `/tmp` or `$TMPDIR` (a shared place, where another
+    user's names live and where a sandboxed agent may have a different view). A
+    test fails if it moves.
+- **Git filters and other config that starts a program.** The agent controls the
+  repository config. Git starts a program for `core.fsmonitor`, for hooks, and for
+  a filter driver (`filter.<name>.clean`, `.smudge`, `.process`) when it hashes a
+  file whose attributes name that driver. That happens on `git add -A`, which the
+  script runs to capture uncommitted work, and on `git status` for a file whose
+  size and time do not settle whether it changed. The script switches off the
+  first two (`core.fsmonitor=false`, `core.hooksPath=/dev/null`) and neutralizes
+  every filter: it lists the driver names with `git config --name-only
+  --get-regexp '^filter[.]'` (reading config runs nothing; this covers the
+  repository's config and the worker user's and the system's), then runs every git
+  command with `filter.<name>.clean=cat`, `.smudge=cat`, `.process=` and
+  `.required=false` for each one. The work is therefore captured as it is on disk,
+  not as the filter would transform it (a Git LFS repository is saved with its real
+  content, not the pointer; a bundle over 1 GiB keeps the folder). Each extra
+  worktree gets the same, from its own config. A config read that fails keeps the
+  folder (`detail` is `git config`). The other keys that start a program were
+  checked against the git commands the script runs (on git 2.51; the canary test
+  keeps checking it): `core.pager`, `pager.<cmd>`, `core.editor`, `sequence.editor`,
+  `core.askPass`, `credential.helper`, `core.sshCommand`, `core.gitProxy`,
+  `remote.<name>.vcs`, `gpg.program`, `gpg.ssh.program`, `commit.gpgsign`,
+  `tag.gpgsign`, `diff.external`, `diff.<name>.command`, `diff.<name>.textconv`,
+  `diff.tool`, `interactive.diffFilter`, `merge.<name>.driver`,
+  `core.alternateRefsCommand`, `uploadpack.packObjectsHook` and
+  `trailer.<token>.command` are not reached: they belong to the network, editing,
+  signing, diff, merge and pager commands, and the script runs none of those.
+  `gc.auto=0` and `maintenance.auto=false` stop an automatic gc or maintenance, and
+  `commit.gpgsign=false` is set although `commit-tree` does not read it.
+- **Threat model.** The reaper defends against names that are already there when
+  it starts (repository content, leftovers of earlier runs, anything a finished
+  run planted) and against a sandboxed agent, one with less access than the SSH
+  user, so that the reaper does not do for it what it cannot do itself (the
+  scratch location and the git filters above). It does not defend against a
+  concurrent process that has the same user's full rights and is running while the
+  reaper works: such a process can plant a link inside the scratch directory, or
+  swap the directory for another one, but it could do the same damage directly,
+  and the reaper gives it nothing extra, since the reaper logs in as the same SSH
+  user on the same host and does not use `sudo` or `su`. That race is an accepted,
+  documented residual. Nothing guarantees that no such process exists: the server
+  records the run as finished (terminal status, a released lease, the minimum age,
+  and no open issue holding it), and an SSH command has no terminal, so a
+  background job started with `nohup`, or a dev server, can outlive the run.
+- **Git reads fail closed.** Every read of the repository before a delete (HEAD,
+  the preserved refs, the branches, the stash, the worktree list, and `git status`
+  of the workspace and of each extra worktree) must exit 0. Each one is written to
+  a file that ends with a line naming the read and counting the lines before it,
+  and the script checks that line before it uses the output. A read that failed,
+  lost its last line, or lost any other line keeps the directory as
+  `preserve_failed`. Empty output means "nothing to save" only when that line says
+  `OK 0`. An ancestry test (`git merge-base --is-ancestor`) is read by its exit
+  status: 0 is yes, 1 is no, and any other status keeps the directory. The failing
+  read goes in the `detail` field of the lease record and of the activity entry
+  (for example `git status`). A repository whose HEAD has no commit yet still
+  works: that is exit 1 with HEAD a symbolic ref.
+- **Published bundle.** `preserved/<runId>.bundle` is saved before any deletion
+  starts. A pass that finds one never trusts it by name. It is a regular file
+  (never a link), it verifies, and its refs are exactly the ones this pass
+  computed: the same number, each at the commit it has now, so none is missing,
+  moved or extra. If so, the bundle is reused untouched. If not (a ref moved on or
+  was deleted since the earlier pass, or the bundle is unrelated), the pass moves
+  the new bundle into the preserved directory under a unique temporary name
+  (`mktemp`), verifies it, flushes the file to disk, keeps the old one as
+  `<runId>.superseded.bundle` (a hard link, no copy), renames the new one into
+  place, and flushes the preserved directory. (`sync` takes the path where the
+  worker's `sync` accepts one, and flushes everything where it does not.) It then
+  checks the same exact match again. A link or a non-regular file at the path, a
+  new bundle that does not verify, a rename that fails, or a final mismatch keeps
+  the directory (`preserve_failed`) and never deletes it. The 30-day cleanup
+  removes old bundles, superseded ones included. A crash between the flush and the
+  rename leaves only a temporary file, which the cleanup also removes. A real crash
+  is not tested, only the order of the two flushes.
+- **Mounts.** Before it changes anything, the script compares the device of
+  `runs/<runId>` with the device of `runs`, and asks `mountpoint` where the worker
+  has it, so a bind mount on the same device is caught too. A mismatch keeps the
+  directory as `mount_point`. A worker where `stat` gives no device id is
+  treated the same way. The delete itself never crosses a filesystem boundary.
 - **Residual.** A server frozen for more than 15 minutes after it sent the delete
-  can lose its claim while the command still runs on the worker. Then two reapers
-  may delete one directory of a finished run. The run id is never prepared again
-  (a retry gets a new id), so nothing live is under it; closing this fully means
-  renaming the directory on the worker before deleting it.
+  cannot leave a script running, because the worker stops it at its time limit.
+  The run id is never prepared again (a retry gets a new id), so nothing live is
+  under the directory. Renaming it on the worker before deleting it would still
+  close the last gap fully.
 
 On the worker, the script resolves the root once, then enters `runs/<runId>`
 and compares the physical path (`pwd -P`) with the expected one. Everything after
@@ -148,6 +348,10 @@ against `workspace/` inside the run directory, which the agent controls.
   the bundle path.
 - Activity `environment.ssh_run_directory_kept`, once, with the reason.
 - A log line per removal with `bytesFreed`, and one per sweep with the totals.
+  The totals include `keptByReason`, the number of folders kept in that sweep for
+  each reason, and `legacyRemoved`, the number removed under the rule for folders
+  with no seed record. A removal under that rule has `unseeded: true` in its
+  activity entry and lease record.
 
 The server has no metrics backend. Sum `details.bytesFreed` over the activity
 entries to chart freed bytes.
