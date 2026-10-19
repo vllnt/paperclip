@@ -240,6 +240,31 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
     await expectScheduledDispatchFailsWithoutIssue(fixture, "Agent cannot start because its budget hard-stop is still exceeded.");
   });
 
+  // The wake skips its budget and invokability checks, and keeps the issue, for an inactive
+  // company or while scheduling is suppressed. The dispatch must keep that outcome.
+  it.each([
+    ["the company is paused", "idle"],
+    ["the company is paused and the assignee is paused", "paused"],
+    ["scheduling is suppressed and the assignee is paused", "paused"],
+  ] as const)("keeps the created issue, as the wake does, when %s", async (situation, agentStatus) => {
+    const { companyId, routine, svc, wakeAttempts } = await seed(agentStatus);
+    const suppressed = situation.startsWith("scheduling");
+    if (suppressed) process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
+    else await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
+
+    let run: Awaited<ReturnType<typeof svc.runRoutine>>;
+    try {
+      run = await svc.runRoutine(routine.id, { source: "manual" });
+    } finally {
+      delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
+    }
+
+    expect(run).toMatchObject({ status: "issue_created", failureReason: null });
+    expect(wakeAttempts).toHaveLength(1);
+    expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.companyId, companyId)))
+      .toEqual([{ id: run.linkedIssueId }]);
+  });
+
   it("a failed wake leaves no orphan issue and no FK error in a recovery sweep that read the issue", async () => {
     const { companyId, agentId, heartbeat, routine, svc, wakeAttempts, setBeforeWake } = await seed("idle");
     let sweep: Promise<Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>>> | null = null;
