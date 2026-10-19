@@ -370,6 +370,7 @@ export * from "./connection-setup-state.js";
 export * from "./google-workspace-connectors.js";
 export * from "./asana-connectors.js";
 export * from "./github-connectors.js";
+export * from "./company-archive.js";
 export * from "./goal-text.js";
 export {
   BLOCKED_MCP_PROVIDERS,
@@ -540,6 +541,7 @@ export {
   BUDGET_INCIDENT_RESOLUTION_ACTIONS,
   HEARTBEAT_INVOCATION_SOURCES,
   HEARTBEAT_RUN_STATUSES,
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
   RUN_LIVENESS_STATES,
   WAKEUP_TRIGGER_DETAILS,
   WAKEUP_REQUEST_STATUSES,
@@ -728,6 +730,7 @@ export {
   type BudgetIncidentResolutionAction,
   type HeartbeatInvocationSource,
   type HeartbeatRunStatus,
+  type HeartbeatRunTerminalStatus,
   type RunLivenessState,
   type WakeupTriggerDetail,
   type WakeupRequestStatus,
