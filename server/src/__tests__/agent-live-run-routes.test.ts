@@ -282,14 +282,16 @@ async function requestApp(
 }
 
 describe("agent live run routes", () => {
+  // The fork's run list filters require agentId to be a UUID.
+  const historyAgentId = "11111111-1111-4111-8111-111111111111";
   it.each([
-    ["", 200], ["?limit=10&agentId=agent-1&summary=true", 10],
+    ["", 200], [`?limit=10&agentId=${historyAgentId}&summary=true`, 10],
     ["?limit=99999", 1000], ["?limit=invalid", 200], ["?limit=-10", 1],
   ])("bounds company history reads for %s", async (query, limit) => {
     const app = await createApp({});
     const response = await requestApp(app, baseUrl => request(baseUrl).get(`/api/companies/company-1/heartbeat-runs${query}`));
     expect(response.status).toBe(200);
-    expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", query.includes("agentId") ? "agent-1" : undefined,
+    expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", query.includes("agentId") ? historyAgentId : undefined,
       limit, { summary: query.includes("summary=true") });
     expect(mockRunSecretRedactionRegistry.redactForRuns).toHaveBeenCalled();
   });
