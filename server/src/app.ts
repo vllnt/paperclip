@@ -80,6 +80,7 @@ import { eventSourceBodyParser } from "./middleware/event-source-body.js";
 import { eventSourceService } from "./services/event-sources/service.js";
 import { pipelineRoutes } from "./routes/pipelines.js";
 import { environmentRoutes } from "./routes/environments.js";
+import { resourceCapacityRoutes } from "./routes/resource-capacity.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { goalRoutes } from "./routes/goals.js";
 import { onboardingSeedRoutes } from "./routes/onboarding-seed.js";
@@ -782,6 +783,7 @@ export async function createApp(
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(eventSourceRoutes(db, eventSources));
   api.use(pipelineRoutes(db));
+  api.use(resourceCapacityRoutes(db));
   api.use(
     environmentRoutes(db, {
       pluginWorkerManager: workerManager,
