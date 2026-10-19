@@ -3,8 +3,8 @@
 Plan for `vllnt.paperclip-convex` (`packages/plugins/plugin-convex`). What slice 1 does today, how it is configured and which guards it applies is in the
 operator reference, [doc/convex-plugin.md](../convex-plugin.md). This file is the catalog of what Convex offers, which of it is built, and the order of the rest.
 
-Status: slice 1 is in [PR #42](https://github.com/vllnt/paperclip/pull/42) ([VLL-1505](/VLL/issues/VLL-1505)). Slices 2 and 3 are specified here and ship as separate PRs.
-Gaps between the agent tools, the board UI and the CLI are in [VLL-1784](/VLL/issues/VLL-1784).
+Status: slice 1 is in [PR #42](https://github.com/vllnt/paperclip/pull/42) (VLL-1505). Slices 2 and 3 are specified here and ship as separate PRs.
+Gaps between the agent tools, the board UI and the CLI are in VLL-1784.
 
 ## 1. Sources and how each endpoint was verified
 
@@ -140,7 +140,7 @@ the rule that production writes need a per-call board approval. Until then a con
 
 1. **Slice 1 ([#42](https://github.com/vllnt/paperclip/pull/42))**: connection and company registry, classification, grants and presets (`observer`, `janitor`), audit, rate limit,
    inventory and health/usage read tools (documented APIs only), preview lifecycle (`set_preview_expiry`, `delete_preview`), the hourly reaper (dry run by default) with
-   quota alert, board actions, CLI `paperclipai convex`, minimal UI. Surface gaps: [VLL-1784](/VLL/issues/VLL-1784).
+   quota alert, board actions, CLI `paperclipai convex`, minimal UI. Surface gaps: VLL-1784.
 2. **Slice 2**: logs, tables/schema, paginated reads, function spec, `run_query`, scheduled functions, env names then values, log stream reads, metrics and insights
    behind an `allowUnstable` flag with contract tests against recorded fixtures. Adds per-deployment deploy keys, the `triager` preset and the capabilities its tools need.
 3. **Slice 3**: writes and admin: env write, `run_function`, `deploy_preview`, create/pause deployments, export/import, log stream writes, keys and domains,
