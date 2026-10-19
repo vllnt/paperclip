@@ -9067,7 +9067,9 @@ registry.registerPath({
 // ─── Convex plugin action contracts ───────────────────────────────────────────
 // The bundled Convex plugin (vllnt.paperclip-convex) serves these board actions
 // through the URL-keyed action route below. Agents use the plugin's tools
-// (GET /api/plugins/tools) instead; the grants and guards apply to both.
+// (GET /api/plugins/tools) instead. The guards (activity window, delete cap,
+// call rate, dry-run-only) apply to both; the grants apply to agent tools only,
+// because a board action and the reaper are not subject to them.
 const convexEnvironment = z.enum(["production", "staging", "preview", "dev", "custom"]);
 const convexDeploymentSchema = z.object({
   name: z.string(),
@@ -9085,28 +9087,63 @@ const convexDeploymentSchema = z.object({
   creator: z.string().nullable(),
   project: z.string().nullable(),
 });
-registry.register("ConvexDeployment", convexDeploymentSchema);
-registry.register("ConvexStatus", z.object({
+// The compact row of deployments.list; the detail above is the plugin's get tool and the delete-preview result.
+const convexDeploymentSummarySchema = z.object({
+  name: z.string(),
+  environment: convexEnvironment,
+  deploymentType: z.string().nullable(),
+  previewIdentifier: z.string().nullable(),
+  lastDeployTime: z.number().nullable().describe("Milliseconds since epoch"),
+  expiresAt: z.number().nullable().describe("Milliseconds since epoch"),
+});
+const convexQuotaSchema = z.object({
+  count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional(),
+});
+const convexStatusSchema = z.object({
   connection: z.enum(["connected", "disconnected", "not-configured", "not-connected"]),
-  configError: z.string().optional(),
-  teamId: z.string().nullable(),
+  configError: z.string().optional().describe("Set when the company's Convex config is invalid; connection is then not-configured and projects is empty"),
+  // The config-error branch omits or nulls everything below.
+  teamId: z.string().nullable().optional(),
   projects: z.array(z.object({ convexProjectId: z.string(), name: z.string(), repository: z.string().nullable(), paperclipProjectId: z.string().nullable(), reserved: z.boolean() })),
-  credentials: z.object({ teamToken: z.boolean(), github: z.boolean() }).describe("Whether a credential is configured; values are never returned"),
-  grants: z.number(),
-}));
-registry.register("ConvexDeploymentsListParams", z.object({
+  credentials: z.object({ teamToken: z.boolean(), github: z.boolean() }).nullable().optional().describe("Whether a credential is configured; values are never returned"),
+  grants: z.number().nullable().optional().describe("Number of agent grants; grants apply to agent tools only"),
+  guards: z.object({ activityHours: z.number(), maxDeletesPerRun: z.number(), callsPerMinute: z.number(), dryRunOnly: z.boolean() }).nullable().optional(),
+  reaper: z.object({ enabled: z.boolean(), ttlHours: z.number(), quota: z.number(), alertPercent: z.number() }).nullable().optional(),
+  lastReport: z.object({ at: z.string(), dryRun: z.boolean(), quota: convexQuotaSchema.nullable() }).nullable().optional().describe("Summary of the last reaper report"),
+});
+const convexConnectResultSchema = z.object({ projects: z.array(z.string()).describe("Convex project ids now reserved for the company") });
+const convexDisconnectResultSchema = z.object({ connection: z.literal("disconnected") });
+const convexDeploymentsListParamsSchema = z.object({
   convexProjectId: z.string().optional(),
   deploymentType: z.enum(["preview", "dev", "prod", "custom"]).optional(),
-}));
-registry.register("ConvexDeploymentsList", z.object({ deployments: z.array(convexDeploymentSchema), truncated: z.boolean() }));
-registry.register("ConvexDeletePreviewParams", z.object({
+  limit: z.number().int().min(1).max(200).optional().describe("Rows per page, 1 to 200; default 50"),
+  cursor: z.string().optional().describe("Opaque; the nextCursor of the previous page"),
+});
+const convexDeploymentsListSchema = z.object({
+  deployments: z.array(convexDeploymentSummarySchema),
+  total: z.number().int().describe("Rows in the whole listing, not only this page"),
+  nextCursor: z.string().nullable().describe("Pass as cursor to get the next page; null on the last page"),
+  truncated: z.boolean(),
+});
+const convexDeletePreviewParamsSchema = z.object({
   name: z.string(),
-  dryRun: z.boolean().optional().describe("Run every guard and delete nothing"),
-}));
-registry.register("ConvexReaperRunParams", z.object({
+  dryRun: z.boolean().optional().describe("Absent or true runs every guard and deletes nothing. Only false deletes"),
+});
+const convexDeletePreviewResultSchema = z.object({
+  dryRun: z.boolean().describe("True also when the plugin's dryRunOnly guard turned a real request into a plan"),
+  wouldDelete: z.boolean(),
+  deleted: z.boolean(),
+  environment: convexEnvironment,
+  deployment: convexDeploymentSchema,
+  evidence: z.object({
+    prState: z.enum(["none", "closed", "merged"]), prNumber: z.number().nullable(), branchExists: z.boolean(), lastCommitAt: z.number().nullable(), idleMs: z.number(),
+  }).nullable(),
+  reason: z.string().nullable(),
+});
+const convexReaperRunParamsSchema = z.object({
   dryRun: z.boolean().optional().describe("Absent or true only plans. false runs for real and needs reaper.enabled and an instance administrator"),
-}));
-registry.register("ConvexReaperReport", z.object({
+});
+const convexReaperReportSchema = z.object({
   at: z.string(),
   trigger: z.enum(["schedule", "manual", "retry", "api"]),
   dryRun: z.boolean(),
@@ -9119,12 +9156,46 @@ registry.register("ConvexReaperReport", z.object({
     skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
     error: z.string().optional(),
   })),
-  quota: z.object({ count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional() }).nullable(),
+  quota: convexQuotaSchema.nullable(),
   errors: z.array(z.string()),
-}));
+  incomplete: z.string().optional().describe("Why the pass stopped early, when it did"),
+});
+// The body of every failure of a plugin bridge call; a permission refusal or a plugin error is code WORKER_ERROR.
+const pluginBridgeErrorSchema = z.object({
+  code: z.enum(["WORKER_UNAVAILABLE", "CAPABILITY_DENIED", "INVOCATION_SCOPE_DENIED", "WORKER_ERROR", "TIMEOUT", "UNKNOWN"]),
+  message: z.string(),
+  details: z.unknown().optional(),
+});
+const convexSchemaRefs = {
+  deployment: registry.register("ConvexDeployment", convexDeploymentSchema),
+  deploymentSummary: registry.register("ConvexDeploymentSummary", convexDeploymentSummarySchema),
+  status: registry.register("ConvexStatus", convexStatusSchema),
+  connectResult: registry.register("ConvexConnectResult", convexConnectResultSchema),
+  disconnectResult: registry.register("ConvexDisconnectResult", convexDisconnectResultSchema),
+  deploymentsListParams: registry.register("ConvexDeploymentsListParams", convexDeploymentsListParamsSchema),
+  deploymentsList: registry.register("ConvexDeploymentsList", convexDeploymentsListSchema),
+  deletePreviewParams: registry.register("ConvexDeletePreviewParams", convexDeletePreviewParamsSchema),
+  deletePreviewResult: registry.register("ConvexDeletePreviewResult", convexDeletePreviewResultSchema),
+  reaperRunParams: registry.register("ConvexReaperRunParams", convexReaperRunParamsSchema),
+  reaperReport: registry.register("ConvexReaperReport", convexReaperReportSchema),
+  bridgeError: registry.register("PluginBridgeError", pluginBridgeErrorSchema),
+};
 export const CONVEX_PLUGIN_ACTIONS = [
   "status", "connection.connect", "connection.disconnect", "deployments.list", "deployments.delete-preview", "reaper.run", "reaper.report",
 ] as const;
+/** The result and params schemas of the Convex actions, for tests and typed callers. */
+export const CONVEX_PLUGIN_SCHEMAS = {
+  status: convexStatusSchema,
+  connectResult: convexConnectResultSchema,
+  disconnectResult: convexDisconnectResultSchema,
+  deploymentsListParams: convexDeploymentsListParamsSchema,
+  deploymentsList: convexDeploymentsListSchema,
+  deletePreviewParams: convexDeletePreviewParamsSchema,
+  deletePreviewResult: convexDeletePreviewResultSchema,
+  reaperRunParams: convexReaperRunParamsSchema,
+  reaperReport: convexReaperReportSchema,
+  bridgeError: pluginBridgeErrorSchema,
+} as const;
 
 registry.registerPath({
   method: "post",
@@ -9149,10 +9220,18 @@ registry.registerPath({
   tags: ["plugins"],
   summary: "Invoke a plugin action (URL-keyed bridge)",
   description:
-    "Board-authorised actions of a plugin. The bundled Convex plugin (pluginId vllnt.paperclip-convex) serves: " +
-    `${CONVEX_PLUGIN_ACTIONS.join(", ")}. Their params and results are the ConvexStatus, ConvexDeploymentsListParams, ConvexDeploymentsList, ` +
-    "ConvexDeletePreviewParams, ConvexReaperRunParams and ConvexReaperReport components. Mutating Convex actions need an instance administrator " +
-    "and run the same server-side guards as the agent tools; no action returns a credential.",
+    "Board-authorised actions of a plugin. The body is { companyId, params }. A success is wrapped in the host envelope { data: T }; " +
+    "a failure of the plugin, of its guards or of a permission check is HTTP 502 with the PluginBridgeError body { code, message, details } " +
+    "(a refusal is code WORKER_ERROR; the host does not answer 403 for it). " +
+    "The bundled Convex plugin (pluginId vllnt.paperclip-convex) serves: " +
+    `${CONVEX_PLUGIN_ACTIONS.join(", ")}. ` +
+    "Results: status is ConvexStatus; connection.connect is ConvexConnectResult; connection.disconnect is ConvexDisconnectResult; " +
+    "deployments.list (ConvexDeploymentsListParams, paged by limit and cursor) is ConvexDeploymentsList; " +
+    "deployments.delete-preview (ConvexDeletePreviewParams) is ConvexDeletePreviewResult; " +
+    "reaper.run (ConvexReaperRunParams) is ConvexReaperReport; reaper.report is ConvexReaperReport or null. " +
+    "Mutating Convex actions (connection.connect, connection.disconnect, deployments.delete-preview and a real reaper.run) need an instance administrator; " +
+    "a real reaper.run also needs reaper.enabled. An omitted dryRun means plan only: only dryRun false deletes. " +
+    "The plugin's guards apply to board actions as they do to agent tools; the grants apply to agents only. No action returns a credential.",
   request: {
     params: z.object({ pluginId: z.string(), key: z.string() }),
     body: jsonBody(
@@ -9162,7 +9241,39 @@ registry.registerPath({
       }),
     ),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: {
+      description: "Success. The body is { data: T }; for the Convex plugin T is the result of the action as listed in the description.",
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            required: ["data"],
+            properties: {
+              data: {
+                nullable: true,
+                anyOf: [
+                  convexSchemaRefs.status,
+                  convexSchemaRefs.connectResult,
+                  convexSchemaRefs.disconnectResult,
+                  convexSchemaRefs.deploymentsList,
+                  convexSchemaRefs.deletePreviewResult,
+                  convexSchemaRefs.reaperReport,
+                  { type: "object", additionalProperties: true, description: "The result of an action of another plugin" },
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+    401: r.unauthorized,
+    404: r.notFound,
+    502: {
+      description: "The plugin worker is unavailable or the action failed. This includes a refusal by a guard or a missing instance administrator (code WORKER_ERROR).",
+      content: { "application/json": { schema: convexSchemaRefs.bridgeError } },
+    },
+  },
 });
 
 // ─── Instance database backups ────────────────────────────────────────────────
