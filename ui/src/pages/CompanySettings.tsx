@@ -60,7 +60,8 @@ export function CompanySettings() {
   const [description, setDescription] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [logoUploadError, setLogoUploadError] = useState<string | null>(null);
-  const [runContextDraft, setRunContextDraft] = useState<RunContextPolicy | null | undefined>(undefined);
+  const [runContextDrafts, setRunContextDrafts] = useState<Record<string, RunContextPolicy | null>>({});
+  const runContextDraft = selectedCompanyId ? runContextDrafts[selectedCompanyId] : undefined;
   const [governance, setGovernance] = useState<InteractionResolverGovernance>({});
   const [wakeSettings, setWakeSettings] = useState<AutomationWakeSettings>({});
 
@@ -170,9 +171,9 @@ export function CompanySettings() {
   };
 
   const runContextMutation = useMutation({
-    mutationFn: (next: RunContextPolicy | null) =>
-      companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
-    onSuccess: (saved) => {
+    mutationFn: ({ companyId, policy }: { companyId: string; policy: RunContextPolicy | null }) =>
+      companiesApi.update(companyId, { runContextPolicy: policy }),
+    onSuccess: (saved, { companyId }) => {
       // Adopt the saved company before the draft clears and the editor unlocks,
       // so a slow or failed list refresh cannot show (or restore) the old policy.
       queryClient.setQueriesData<CompanyListResult>(
@@ -183,7 +184,7 @@ export function CompanySettings() {
             companies: current.companies.map((company) => (company.id === saved.id ? saved : company)),
           },
       );
-      setRunContextDraft(undefined);
+      setCompanyEntry(setRunContextDrafts, companyId, null);
       void queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
@@ -531,23 +532,25 @@ export function CompanySettings() {
         {/* Locked while saving: an edit made mid-save would be dropped when the saved draft clears. */}
         <fieldset disabled={runContextMutation.isPending} className="m-0 min-w-0 border-0 p-0">
           <RunContextPolicyEditor
-            key={JSON.stringify(selectedCompany.runContextPolicy ?? null)}
+            key={`${selectedCompany.id}:${JSON.stringify(selectedCompany.runContextPolicy ?? null)}`}
             value={runContextDraft === undefined ? selectedCompany.runContextPolicy : runContextDraft}
-            onChange={setRunContextDraft}
+            onChange={(policy) =>
+              setRunContextDrafts((current) => ({ ...current, [selectedCompany.id]: policy }))
+            }
             testId="company-settings-run-context"
           />
         </fieldset>
         {runContextDraft !== undefined && (
           <Button
             size="sm"
-            onClick={() => runContextMutation.mutate(runContextDraft)}
+            onClick={() => runContextMutation.mutate({ companyId: selectedCompany.id, policy: runContextDraft })}
             disabled={runContextMutation.isPending}
             data-testid="company-settings-run-context-save"
           >
             {runContextMutation.isPending ? "Saving..." : "Save run context"}
           </Button>
         )}
-        {runContextMutation.isError && (
+        {runContextMutation.isError && runContextMutation.variables.companyId === selectedCompany.id && (
           <span className="text-xs text-destructive">
             {runContextMutation.error instanceof Error ? runContextMutation.error.message : "Failed to save"}
           </span>
