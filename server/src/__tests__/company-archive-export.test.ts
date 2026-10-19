@@ -259,6 +259,33 @@ describeEmbeddedPostgres("company archive export", () => {
     });
   });
 
+  it("redacts PEM material split across transcript chunks while keeping other streams readable", async () => {
+    const company = await seedCompany("split-pem");
+    const chunks = [
+      { stream: "stdout", chunk: "before -----BE", attemptId: "first" },
+      { stream: "stdout", chunk: "GIN PRIVATE KEY-----\nY2FuYXJ5LXByaXZhdGUta2V5", attemptId: "first" },
+      { stream: "stderr", chunk: "independent diagnostic", attemptId: "first" },
+      { stream: "stdout", chunk: "Ym9keS1tdXN0LWJlLXJlZGFjdGVk\n-----END PRIVATE", attemptId: "first" },
+      { stream: "stdout", chunk: " KEY----- after", attemptId: "first" },
+      { stream: "stdout", chunk: "-----BEGIN PRIVATE KEY-----\nZmluYWwtdG9ybi1rZXk=", attemptId: "first" },
+      { stream: "stdout", chunk: "next attempt", attemptId: "second" },
+    ];
+    const logLines = chunks.map((line) => JSON.stringify(line));
+    logLines.splice(6, 0, '{"stream":"stdout","chunk":"dG9ybi1jb250aW51YXRpb24=');
+    await seedRun(company, { finishedAt: minutesAgo(30), logLines });
+    const records = await collect({ companyId: company.companyId, include: ["transcript"] });
+    const transcript = records.filter((record) => record.kind === "transcript");
+    const text = JSON.stringify(transcript);
+    expect(text).not.toContain("Y2FuYXJ5LXByaXZhdGUta2V5");
+    expect(text).not.toContain("Ym9keS1tdXN0LWJlLXJlZGFjdGVk");
+    expect(text).not.toContain("ZmluYWwtdG9ybi1rZXk=");
+    expect(text).not.toContain("dG9ybi1jb250aW51YXRpb24=");
+    expect(text).toContain("independent diagnostic");
+    expect(text).toContain("next attempt");
+    expect(text).toContain(" after");
+    expect(transcript).toHaveLength(logLines.length);
+  });
+
   it("pages by microsecond settle keys without skipping or repeating runs", async () => {
     const company = await seedCompany("keyset");
     const base = new Date(Date.now() - 60 * 60_000).toISOString().slice(0, 23);

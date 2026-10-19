@@ -109,6 +109,10 @@ redacted at write time (some event writers skip it):
   (`redactEnvForLogs`: key names containing key, token, secret, password,
   passwd, authorization or cookie);
 - PEM blocks and URL userinfo (`scheme://user:pass@host`) in every string.
+  PEM redaction continues across transcript chunks within each stream and run
+  attempt. An unfinished or malformed PEM block stays redacted through the end
+  of that stream. Undecodable transcript lines are also redacted while a block
+  remains open.
 
 `adapter.invoke` events carry the adapter `env` and the full `prompt`. The
 prompt is the company's own content and is exported like the run events API
