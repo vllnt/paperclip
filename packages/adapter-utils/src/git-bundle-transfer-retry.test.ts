@@ -14,7 +14,7 @@ import {
 import { restoreWorkspaceFromSshExecution, type SshRemoteExecutionSpec } from "./ssh.js";
 
 // A workspace restore whose bundle stream is cut short fails in git with
-// "fatal: early EOF / error: index-pack died" (VLL-1270, Edith on 2026-10-18).
+// "fatal: early EOF / error: index-pack died".
 // The sandbox is still live, so exporting again cures it. These tests cut a
 // real bundle, check that git's own message is classified as transient, and
 // drive the SSH restore with an `ssh` shim that truncates or kills the stream.
