@@ -587,6 +587,16 @@ export interface IssueRecoveryAction {
   updatedAt: Date | string;
 }
 
+/** One row of `GET /api/companies/:companyId/recovery-actions`. */
+export interface CompanyIssueRecoveryActionListItem extends IssueRecoveryAction {
+  issue: {
+    id: string;
+    identifier: string | null;
+    title: string;
+    status: IssueStatus;
+  };
+}
+
 export type SuccessfulRunHandoffStateKind = "required" | "resolved" | "escalated";
 
 export interface SuccessfulRunHandoffState {
@@ -1011,6 +1021,12 @@ export interface IssueQueuedCommentEntry {
   position: number;
   canEdit: boolean;
   canDiscard: boolean;
+  /**
+   * `pending`: handed to the running process's live input, which takes it at
+   * its next tool boundary. It stays queued until the run acknowledges it, and
+   * goes back to plain queued if the run ends first.
+   */
+  steering?: "pending";
 }
 
 /**

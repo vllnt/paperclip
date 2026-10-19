@@ -104,7 +104,7 @@ export async function prepareHeartbeatRunScratch(input: {
 
 export function buildHeartbeatRunScratchEnv(
   existingEnv: Record<string, unknown>,
-  scratch: HeartbeatRunScratch,
+  scratch: Pick<HeartbeatRunScratch, "dir">,
 ): HeartbeatRunScratchEnvResult {
   const env: Record<string, string> = {
     PAPERCLIP_RUN_SCRATCH_DIR: scratch.dir,

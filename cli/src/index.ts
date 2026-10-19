@@ -44,6 +44,7 @@ import { registerObservabilityCommands } from "./commands/client/observability.j
 import { registerWorkspaceCommands } from "./commands/client/workspace.js";
 import { registerAccessCommands } from "./commands/client/access.js";
 import { registerRoutineApiCommands } from "./commands/client/routine-api.js";
+import { registerEventSourceApiCommands } from "./commands/client/event-source-api.js";
 import { registerAdapterCommands } from "./commands/client/adapter.js";
 import { registerManagedAgentCommands } from "./commands/managed-agent.js";
 import { registerAssetCommands } from "./commands/client/asset.js";
@@ -254,6 +255,7 @@ registerObservabilityCommands(program);
 registerWorkspaceCommands(program);
 registerAccessCommands(program);
 registerRoutineApiCommands(program);
+registerEventSourceApiCommands(program);
 registerAdapterCommands(program);
 registerManagedAgentCommands(program);
 registerAssetCommands(program);

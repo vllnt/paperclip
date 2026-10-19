@@ -222,6 +222,11 @@ interface ActorMiddlewareOptions {
 
 const publicRoutineWebhookPath = /^\/api\/routine-triggers\/public\/[a-f0-9]{24}\/fire\/?$/i;
 
+// Event-source ingress verifies its own bearer/HMAC against the source secret.
+// The id segment is deliberately loose so a malformed id gets the route's
+// uniform 404 instead of being parsed as an agent key.
+const publicEventSourcePath = /^\/api\/event-sources\/public\/[A-Za-z0-9_-]{1,64}\/events\/?$/i;
+
 const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
@@ -241,7 +246,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     // Routine ingress authenticates its own bearer/signature. Never interpret
     // webhook credentials as agent keys or attach an ambient browser session.
-    if (req.method === "POST" && publicRoutineWebhookPath.test(req.path)) {
+    if (req.method === "POST" && (publicRoutineWebhookPath.test(req.path) || publicEventSourcePath.test(req.path))) {
       req.actor = { type: "none", source: "none" };
       next();
       return;
