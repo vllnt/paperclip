@@ -103,6 +103,12 @@ describe("issue subresource commands", () => {
       "--source-issue-status", "todo",
       "--action-id", APPROVAL_ID,
     ]);
+    await run([
+      "issue", "reconcile", ISSUE_ID,
+      "--outcome", "none",
+      "--note", "The stopped provider made no external writes.",
+      "--expected-run-id", HOLD_ID,
+    ]);
 
     expect(fetchMock.mock.calls.map((call) => [call[1]?.method ?? "GET", call[0]])).toEqual([
       ["GET", `http://localhost:3100/api/issues/${ISSUE_ID}/comments?limit=10`],
@@ -117,6 +123,7 @@ describe("issue subresource commands", () => {
       ["DELETE", `http://localhost:3100/api/issues/${ISSUE_ID}/inbox-archive`],
       ["GET", `http://localhost:3100/api/issues/${ISSUE_ID}/recovery-actions`],
       ["POST", `http://localhost:3100/api/issues/${ISSUE_ID}/recovery-actions/resolve`],
+      ["POST", `http://localhost:3100/api/issues/${ISSUE_ID}/execution/reconcile`],
     ]);
   });
 

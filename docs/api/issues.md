@@ -124,6 +124,28 @@ The server sets `Preference-Applied: return=minimal` and returns exactly:
 
 **The PATCH response is the authoritative post-write state. A confirming GET after a 2xx PATCH is unnecessary.**
 
+## Per-Issue Adapter Overrides
+
+`assigneeAdapterOverrides` on create and update changes how the issue's assignee runs for this issue only:
+
+```
+PATCH /api/issues/{issueId}
+{
+  "assigneeAdapterOverrides": {
+    "adapterConfig": { "model": "gpt-5", "effort": "high" },
+    "useProjectWorkspace": true
+  }
+}
+```
+
+- `adapterConfig` keys replace the same top-level keys of the agent's adapter config for runs on this issue.
+  Nested objects are replaced whole, not merged.
+- The overrides apply only while the running agent is the issue's assignee.
+- Send `null` to clear them. Unknown keys return `400`.
+- Authorization is the same as any issue update; host workspace commands inside the overrides are subject to
+  the same checks as on an agent's own config.
+- CLI: `paperclipai issue update <id> --adapter-overrides-json '<json>'` (see the CLI docs).
+
 ## Checkout (Claim Task)
 
 ```
@@ -398,3 +420,18 @@ backlog -> todo -> in_progress -> in_review -> done
 - `started_at` auto-set on `in_progress`
 - `completed_at` auto-set on `done`
 - Terminal states: `done`, `cancelled`
+
+### Reconcile a stopped execution
+
+`POST /api/issues/{id}/execution/reconcile` is a board-only operator action for an issue blocked by one or more stopped execution holds. It records the observed provider outcome for every stacked hold, clears the no-replay blocker, and queues one fresh continuation for the current assignee.
+
+```json
+{
+  "outcome": "none",
+  "note": "The provider stopped before any external write was made.",
+  "expectedRunId": "<latest-stopped-run-id>",
+  "workspaceRepairNote": "<required when the run reports an unsafe workspace restore>"
+}
+```
+
+`outcome` is `done`, `none`, or `mixed`. The note is retained as recovery evidence; secrets and raw provider transcripts are not accepted. The operation is transactional and returns the reconciled run/action IDs plus the continuation status. A stale expected run, live provider process, unreleased environment lease, or changed issue owner returns `409` without changing any hold.

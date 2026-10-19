@@ -437,6 +437,7 @@ export {
   issueExecutionStateSchema,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
   listCompanyIssueRecoveryActionsQuerySchema,
   COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES,
