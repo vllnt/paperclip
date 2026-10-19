@@ -64,6 +64,7 @@ import {
   sandboxConfigFromLeaseMetadataLoose,
 } from "./sandbox-provider-runtime.js";
 import { pluginRegistryService } from "./plugin-registry.js";
+import { resourceCapacityService } from "./resource-capacity.js";
 import type {
   ExecuteLogSink,
   PluginWorkerManager,
@@ -1139,6 +1140,7 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
 
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
+  const resourceCapacity = resourceCapacityService(db);
   const reaper = sshRunDirectoryReaperService(db);
 
   return {
@@ -1154,7 +1156,8 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
       }
 
-      const { remoteCwd } = await ensureSshWorkspaceReady(parsed.config);
+      const { remoteCwd, resourceProbe } = await ensureSshWorkspaceReady(parsed.config, { probeResources: true });
+      const probedAt = new Date();
       const lease = await environmentsSvc.acquireLease({
         companyId: input.companyId,
         environmentId: input.environment.id,
@@ -1183,6 +1186,8 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           throw error;
         });
       }
+      // Never awaited: it cannot throw, and recording must not delay the run.
+      void resourceCapacity.recordLeaseAcquireProbe(input.environment.id, resourceProbe ?? null, probedAt);
       return lease;
     },
 

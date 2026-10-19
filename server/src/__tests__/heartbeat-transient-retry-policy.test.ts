@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   agentRuntimeState,
+  agentHarnessCooldowns,
   agentWakeupRequests,
   companies,
   createDb,
@@ -45,6 +46,7 @@ describeEmbeddedPostgres("transient retry policy layers", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
+    await db.delete(agentHarnessCooldowns);
     await db.delete(routines);
     await db.delete(agents);
     await db.delete(companies);
@@ -217,6 +219,22 @@ describeEmbeddedPostgres("transient retry policy layers", () => {
       expect(await scheduledDelayMs(runId)).toBe(BASE_DELAY_MS);
     });
   });
+
+  it.each([HOUR_MS / 2, HOUR_MS * 2])(
+    "honors both the hourly policy and a harness cooldown of %i ms",
+    async (cooldownMs) => {
+      const { runId, companyId, agentId } = await seed({ company: { perIssuePerHour: 1 } });
+      await db.insert(agentHarnessCooldowns).values({
+        companyId,
+        agentId,
+        targetKey: "codex_local:",
+        adapterType: "codex_local",
+        reason: "provider_usage_limit",
+        cooldownUntil: new Date(NOW.getTime() + cooldownMs),
+      });
+      expect(await scheduledDelayMs(runId)).toBe(Math.max(HOUR_MS, cooldownMs));
+    },
+  );
 
   it("ignores a malformed stored policy instead of failing the retry", async () => {
     const { runId, agentId } = await seed({});
