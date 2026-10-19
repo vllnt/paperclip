@@ -12,6 +12,7 @@ import {
   isSelectionDebugEnabled,
   recordAnnotationCommit,
 } from "@/lib/document-annotation-debug";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { DocumentAnnotationLayer, type AnnotationAnchorRect, type PendingAnchor } from "./DocumentAnnotationLayer";
 import { DocumentAnnotationPanel } from "./DocumentAnnotationPanel";
 import { DocumentAnnotationPopover } from "./DocumentAnnotationPopover";
@@ -84,23 +85,11 @@ export function IssueDocumentAnnotations({
   const [selectionAnchor, setSelectionAnchor] = useState<PendingAnchor | null>(null);
   const [composerAnchor, setComposerAnchor] = useState<PendingAnchor | null>(null);
   const [popoverAnchorRect, setPopoverAnchorRect] = useState<AnnotationAnchorRect | null>(null);
-  const [isMobile, setIsMobile] = useState(false);
+  const isMobile = useMediaQuery("(max-width: 1023px)", false);
   const hashHandledRef = useRef<string | null>(null);
   // Bus token to ask the body layer to capture the current selection into a pendingAnchor.
   const [captureSelectionRequestId, setCaptureSelectionRequestId] = useState(0);
   const consumedInitialAnchorRef = useRef<PendingAnchor | null>(null);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mediaQuery = window.matchMedia("(max-width: 1023px)");
-    const handler = () => setIsMobile(mediaQuery.matches);
-    handler();
-    if (typeof mediaQuery.addEventListener === "function") {
-      mediaQuery.addEventListener("change", handler);
-      return () => mediaQuery.removeEventListener("change", handler);
-    }
-    return undefined;
-  }, []);
 
   const annotationsQuery = useQuery({
     queryKey: target?.kind === "routine"

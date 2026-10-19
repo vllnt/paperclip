@@ -1,4 +1,5 @@
 import { motionEase, motionMilliseconds, motionNumber, motionSeconds } from "@/lib/onboarding-motion-tokens";
+import { matchesMedia } from "@/lib/safe-match-media";
 
 // Shared motion constants for the onboarding wizard's agent arc (steps 3–5).
 // Ported from the onboarding prototype so the capsule choreography reads the
@@ -342,8 +343,7 @@ export const COPIED_REVEAL_DELAY_MS =
  * never elapse.
  */
 export function beatDelay(ms: number): number {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return 0;
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : ms;
+  return matchesMedia("(prefers-reduced-motion: reduce)", true) ? 0 : ms;
 }
 
 /**
