@@ -209,6 +209,13 @@ describe("CompanySettingsSidebar", () => {
     );
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
       expect.objectContaining({
+        to: "/company/settings/instance/resource-capacity",
+        label: "Resource capacity",
+        end: true,
+      }),
+    );
+    expect(sidebarNavItemMock).toHaveBeenCalledWith(
+      expect.objectContaining({
         to: "/company/settings/instance/access",
         label: "Access",
         end: true,

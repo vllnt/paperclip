@@ -1,5 +1,9 @@
+# Vitest files required before building the production image.
+# One path per line; blank lines and comments are ignored.
+cli/src/__tests__/agent-config.test.ts
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
+packages/adapter-utils/src/execution-target-run-temp.test.ts
 packages/adapter-utils/src/log-value-redaction.test.ts
 packages/adapter-utils/src/paperclip-temp.test.ts
 packages/adapter-utils/src/redact-env-for-logs.test.ts
@@ -35,6 +39,8 @@ server/src/__tests__/routine-gate-source.test.ts
 server/src/__tests__/routine-gate-worker.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
+server/src/services/heartbeat-remote-run-temp.test.ts
+server/src/shutdown-budget.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/AgentCharacterRuntime.test.ts
 ui/src/components/CommandPalette.real.test.tsx
@@ -66,4 +72,3 @@ ui/src/lib/safe-match-media.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
 ui/src/pages/IssueDetail.test.tsx
-server/src/shutdown-budget.test.ts
