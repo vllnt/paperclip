@@ -2838,6 +2838,7 @@ export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export * from "./github-write-identity.js";
 export * from "./github-installation-token.js";
+export * from "./resource-capacity.js";
 export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
 export * from "./automation-wake.js";
