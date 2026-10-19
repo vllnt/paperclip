@@ -351,7 +351,7 @@ export async function main(argv, deps = {}) {
     options = parseOptions(argv, deps.env ?? process.env, deps.clock ?? Date.now);
   } catch (error) {
     if (!(error instanceof UsageError)) throw error;
-    err(`factory-throughput-kpi: ${error.message}`);
+    err(`factory-throughput-kpi: ${clean(error.message)}`);
     return EXIT_USAGE;
   }
   if (options.help) {

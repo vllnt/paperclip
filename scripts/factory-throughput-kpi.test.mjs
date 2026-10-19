@@ -145,6 +145,39 @@ test("usage errors exit 2 and name the problem on stderr", async () => {
   assert.match(r.err, /name the repositories/);
 });
 
+for (const source of ["repository argument", "repository environment", "unknown option", "positional argument"]) {
+  test(`usage errors redact a registered secret from the ${source}`, async () => {
+    const secret = "synthetic-usage-credential-0042";
+    const env = { PAPERCLIP_API_KEY: secret };
+    const argv = source === "repository argument" ? ["--repos", secret]
+      : source === "repository environment" ? []
+        : source === "unknown option" ? [`--${secret}`] : [secret];
+    if (source === "repository environment") env.FACTORY_KPI_REPOS = secret;
+    const gh = fakeGh({});
+    const r = await run(argv, gh, env);
+    assert.equal(r.code, EXIT_USAGE);
+    assert.equal(r.out, "");
+    assert.ok(!r.err.includes(secret));
+    assert.match(r.err, /factory-throughput-kpi: .*\[redacted\]/);
+    assert.equal(gh.calls.length, 0, "invalid input must not issue GitHub requests");
+  });
+}
+
+test("the real entry point sanitizes usage errors before writing stderr", () => {
+  const script = fileURLToPath(new URL("./factory-throughput-kpi.mjs", import.meta.url));
+  const token = "ghp_" + "Zz9Yy8Xx7Ww6Vv5Uu4Tt";
+  const res = spawnSync(process.execPath, [script, "--repos", `${token}\nINJECTED\u001b[31m`], {
+    env: { PATH: "/nonexistent" },
+    encoding: "utf8",
+  });
+  assert.equal(res.status, EXIT_USAGE);
+  assert.equal(res.stdout, "");
+  assert.ok(!res.stderr.includes(token));
+  assert.match(res.stderr, /invalid repository.*\[redacted\].*expected owner\/name/);
+  assert.equal(res.stderr.trimEnd().split("\n").length, 1);
+  assert.doesNotMatch(res.stderr, /\u001b/);
+});
+
 test("a token in an API error never reaches the output", async () => {
   const token = "ghp_" + "Zz9Yy8Xx7Ww6Vv5Uu4Tt";
   const gh = fakeGh({ "o/a": new GhError("other", `request failed for token ${token}`) });
