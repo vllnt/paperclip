@@ -32,6 +32,12 @@ import { remoteTerminationReceipt } from "../services/remote-execution-terminati
 import { initializeRunIdentity, reconcileSteeredIdentity } from "../services/run-identity.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import {
+  acknowledgeAdapterSteering,
+  clearAdapterSteering,
+  setAdapterSteeringHandle,
+} from "../services/adapter-steering.js";
+import { adapterSteeringAcknowledgementEvent } from "@paperclipai/adapter-utils";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -1743,5 +1749,144 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     const after = await request(app(seeded.companyId))
       .get(`/api/issues/${seeded.issueId}/queued-comments`);
     expect(after.body.entries.map((entry: any) => entry.comment.id)).toEqual(seeded.commentIds);
+  });
+  describe("live-input steering for legacy adapters", () => {
+    const writes: Array<{ text: string; correlationId: string }> = [];
+    let liveRunId: string | null = null;
+
+    afterEach(() => {
+      writes.length = 0;
+      if (liveRunId) clearAdapterSteering(liveRunId);
+      liveRunId = null;
+    });
+
+    async function seedLiveInputQueue(options: { takesLiveInput?: boolean } = {}) {
+      const seeded = await seedQueue();
+      await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, seeded.agentId));
+      await db.update(heartbeatRuns)
+        .set({ runtimeMode: "legacy", runtimeModeResolvedAt: new Date("2026-08-22T15:00:00.000Z") })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      await seedDispatchIdentity(seeded);
+      if (options.takesLiveInput !== false) {
+        liveRunId = seeded.runId;
+        setAdapterSteeringHandle(seeded.runId, {
+          steer: (input) => {
+            writes.push(input);
+            return { status: "pending" };
+          },
+        });
+      }
+      return seeded;
+    }
+
+    async function steer(seeded: Awaited<ReturnType<typeof seedQueue>>, commentId: string) {
+      const initial = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      return request(app(seeded.companyId))
+        .post(`/api/issues/${seeded.issueId}/queued-comments/${commentId}/steer`)
+        .send({ queueId: seeded.wakeId, targetRunId: seeded.runId, revision: initial.body.revision });
+    }
+
+    async function wakeCommentIds(seeded: Awaited<ReturnType<typeof seedQueue>>) {
+      const wake = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, seeded.wakeId)).then((rows) => rows[0]);
+      return (wake?.payload as any)?._paperclipWakeContext?.wakeCommentIds;
+    }
+
+    async function actions() {
+      return db.select({ action: activityLog.action }).from(activityLog).then((rows) => rows.map((row) => row.action));
+    }
+
+    it("keeps the comment queued as steer pending until the agent starts it", async () => {
+      const seeded = await seedLiveInputQueue();
+      const before = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      expect(before.body).toMatchObject({ protocol: "legacy", steeringDisposition: "available" });
+
+      const steered = await steer(seeded, seeded.commentIds[0]!);
+      expect(steered.status, JSON.stringify(steered.body)).toBe(200);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]!.correlationId).toBe(seeded.commentIds[0]);
+      expect(writes[0]!.text).toContain("First queued message");
+      expect(writes[0]!.text).toContain("QUE-1");
+      expect(writes[0]!.text).not.toMatch(/steer/i);
+      expect(steered.body.entries[0]).toMatchObject({
+        comment: { id: seeded.commentIds[0] },
+        steering: "pending",
+        canEdit: false,
+        canDiscard: false,
+      });
+      // Phase one changes nothing durable: the comment stays queued.
+      expect(await wakeCommentIds(seeded)).toEqual(seeded.commentIds);
+      expect(await actions()).toEqual(["issue.queued_comment_steer_requested"]);
+      expect(await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.status, "pending"))).toEqual([]);
+
+      const pendingRevision = steered.body.revision;
+      await request(app(seeded.companyId))
+        .delete(`/api/issues/${seeded.issueId}/queued-comments/${seeded.commentIds[0]}`)
+        .send({ queueId: seeded.wakeId, revision: pendingRevision })
+        .expect(409);
+
+      // The agent reached its next tool boundary.
+      expect(await acknowledgeAdapterSteering(
+        seeded.runId,
+        adapterSteeringAcknowledgementEvent({ runId: seeded.runId, correlationId: seeded.commentIds[0]! }),
+      )).toBe(true);
+
+      expect(await wakeCommentIds(seeded)).toEqual([seeded.commentIds[1]]);
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]);
+      expect((run?.resultJson as any)?.queuedSteeringAcknowledgements?.[seeded.commentIds[0]!]).toMatchObject({
+        status: "acknowledged",
+        queueId: seeded.wakeId,
+      });
+      const identity = await db.select().from(runIdentityContexts)
+        .where(eq(runIdentityContexts.messageId, seeded.commentIds[0]!)).then((rows) => rows[0]);
+      expect(identity).toMatchObject({ status: "accepted", cause: "steering", responsibleUserId: "queue-owner" });
+      expect(run?.activeIdentityContextId).toBe(identity!.id);
+      const steeredActivity = await db.select({ details: activityLog.details }).from(activityLog)
+        .where(eq(activityLog.action, "issue.queued_comment_steered")).then((rows) => rows[0]);
+      expect(steeredActivity?.details).toMatchObject({
+        commentId: seeded.commentIds[0],
+        targetRunId: seeded.runId,
+        duplicate: false,
+      });
+
+      const after = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      expect(after.body.entries.map((entry: any) => entry.comment.id)).toEqual([seeded.commentIds[1]]);
+      expect(after.body.entries[0]).not.toHaveProperty("steering");
+    });
+
+    it("leaves the comment queued when the run ends before the agent starts it", async () => {
+      const seeded = await seedLiveInputQueue();
+      const steered = await steer(seeded, seeded.commentIds[0]!);
+      expect(steered.status, JSON.stringify(steered.body)).toBe(200);
+      expect(steered.body.entries[0]).toMatchObject({ steering: "pending" });
+
+      // The process is killed while the message is only queued in the CLI.
+      setAdapterSteeringHandle(seeded.runId, null);
+      expect(await acknowledgeAdapterSteering(
+        seeded.runId,
+        adapterSteeringAcknowledgementEvent({ runId: seeded.runId, correlationId: seeded.commentIds[0]! }),
+      )).toBe(false);
+
+      expect(await wakeCommentIds(seeded)).toEqual(seeded.commentIds);
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)).then((rows) => rows[0]);
+      expect((run?.resultJson as any)?.queuedSteeringAcknowledgements).toBeUndefined();
+      expect(await actions()).not.toContain("issue.queued_comment_steered");
+      const after = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      expect(after.body).toMatchObject({ protocol: "legacy", steeringDisposition: "unsupported" });
+      expect(after.body.entries.map((entry: any) => entry.comment.id)).toEqual(seeded.commentIds);
+      expect(after.body.entries[0]).not.toHaveProperty("steering");
+      expect(after.body.entries[0]).toMatchObject({ canEdit: true, canDiscard: true });
+    });
+
+    it("keeps steering unsupported for a legacy run without live input", async () => {
+      const seeded = await seedLiveInputQueue({ takesLiveInput: false });
+      const queue = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      expect(queue.body).toMatchObject({ protocol: "legacy", steeringDisposition: "unsupported" });
+
+      const steered = await steer(seeded, seeded.commentIds[0]!);
+      expect(steered.status).toBe(409);
+      expect(steered.body).toMatchObject({ details: { code: "steering_unsupported" } });
+      expect(await wakeCommentIds(seeded)).toEqual(seeded.commentIds);
+    });
   });
 });
