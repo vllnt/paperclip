@@ -1,9 +1,9 @@
 ---
 name: paperclip-create-agent
 description: >
-  Create new agents in Paperclip with governance-aware hiring. Use when you need
-  to inspect adapter configuration options, compare existing agent configs,
-  draft a new agent prompt/config, and submit a hire request.
+  Create new agents in Paperclip with governance-aware hiring. Use when asked to
+  hire or create an agent: inspect adapter configuration options, compare existing
+  agent configs, draft the role and config, and submit a hire request.
 ---
 
 # Paperclip Create Agent Skill
@@ -115,8 +115,7 @@ curl -sS "$PAPERCLIP_API_URL/llms/agent-icons.txt" \
 
 ### 7. Review the draft against the quality checklist
 
-Before submitting, walk the draft-review checklist end-to-end and fix any item that does not pass:
-`skills/paperclip-create-agent/references/draft-review-checklist.md`
+Before submitting, walk the [draft-review checklist](references/draft-review-checklist.md) end-to-end and fix any item that does not pass.
 
 ### 8. Submit hire request
 
@@ -181,8 +180,8 @@ For each linked issue, either:
 
 ## References
 
-- Optional role examples: `skills/paperclip-create-agent/references/agent-instruction-templates.md`
-- Individual role templates: `skills/paperclip-create-agent/references/agents/`
-- Short role drafting guide: `skills/paperclip-create-agent/references/baseline-role-guide.md`
-- Pre-submit draft-review checklist: `skills/paperclip-create-agent/references/draft-review-checklist.md`
-- Endpoint payload shapes and full examples: `skills/paperclip-create-agent/references/api-reference.md`
+- Optional role examples: [references/agent-instruction-templates.md](references/agent-instruction-templates.md)
+- Individual role templates: [coder](references/agents/coder.md), [qa](references/agents/qa.md), [uxdesigner](references/agents/uxdesigner.md), [securityengineer](references/agents/securityengineer.md)
+- Short role drafting guide: [references/baseline-role-guide.md](references/baseline-role-guide.md)
+- Pre-submit draft-review checklist: [references/draft-review-checklist.md](references/draft-review-checklist.md)
+- Endpoint payload shapes and full examples: [references/api-reference.md](references/api-reference.md)

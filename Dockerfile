@@ -2,13 +2,14 @@
 # No image here comes from Docker Hub: its anonymous pull limit returned 429 on
 # GitHub-hosted runners, and a failed release build cuts no release. Each
 # reference names a mirror and pins the index digest docker.io serves for the
-# same tag, so the bytes are identical. Docker library images come from
-# Docker's ECR Public mirror; other Docker Hub images come from mirror.gcr.io,
-# which serves only what it has cached. The BuildKit image is pinned the same
-# way in the workflows' setup-buildx-action steps. To bump a pin, read the new
-# digest with `docker buildx imagetools inspect docker.io/<image>:<tag>`,
-# confirm the mirror returns the same digest, and replace the @sha256 part.
-FROM public.ecr.aws/docker/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
+# same tag, so the bytes are identical. Images come from mirror.gcr.io, which
+# serves only what it has cached. Docker's ECR Public mirror is not used: its
+# anonymous data limit also returned 429 on GitHub-hosted runners. The BuildKit
+# image is pinned the same way in the workflows' setup-buildx-action steps. To
+# bump a pin, read the new digest with
+# `docker buildx imagetools inspect docker.io/<image>:<tag>`, confirm the
+# mirror returns the same digest, and replace the @sha256 part.
+FROM mirror.gcr.io/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
@@ -142,7 +143,12 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 # Both the browser bundle and server stamp need the source commit. Declare it
 # after the stable dependency layers, before either application build.
 ARG PAPERCLIP_BUILD_COMMIT=""
-RUN pnpm exec vitest run packages/shared/src/company-environment-defaults.test.ts server/src/__tests__/instance-settings-service.test.ts server/src/__tests__/instance-settings-routes.test.ts packages/adapters/codex-local/src/company-model-catalog.test.ts packages/adapters/claude-local/src/current-model-catalog.test.ts ui/src/lib/agent-setup-fields.test.ts ui/src/lib/test-agent-setup.test.ts ui/src/lib/saved-provider-credentials.test.ts packages/adapters/codex-local/src/server/test.remote.test.ts packages/adapters/codex-local/src/server/runtime-config.test.ts packages/adapters/codex-local/src/server/execute.remote.test.ts packages/adapter-utils/src/workspace-restore-merge.test.ts packages/adapter-utils/src/directory-merge-lock.test.ts server/src/__tests__/openapi-routes.test.ts ui/src/lib/issue-list-invalidation.test.ts server/src/__tests__/authz-existence-oracle-guard.test.ts packages/adapter-utils/src/sandbox-callback-bridge-lifecycle.test.ts packages/adapter-utils/src/remote-process-identity.test.ts packages/adapter-utils/src/paperclip-temp.test.ts server/src/__tests__/paperclip-temp-sweeper.test.ts packages/shared/src/command-actions.test.ts packages/shared/src/command-action-rank.test.ts ui/src/lib/command-action-usage.test.ts ui/src/lib/keyboardShortcuts.test.ts ui/src/hooks/useKeyboardShortcuts.test.tsx ui/src/components/ui/command.test.tsx ui/src/components/CommandPalette.test.tsx ui/src/context/CommandActionsContext.test.tsx ui/src/lib/main-content-focus.test.ts ui/src/components/KeyboardShortcutsCheatsheet.test.tsx cli/src/__tests__/search-parity.test.ts ui/src/components/CommandPalette.real.test.tsx server/src/shutdown-budget.test.ts
+# Tests that gate the production image build. The list lives in
+# scripts/ci/image-build-vitest-files.txt, one path per line, so that concurrent pull requests that
+# add a test touch different lines instead of rewriting this one. An empty list or a path that does not exist fails the build;
+# blank lines and # comments are ignored. The script that reads the list has its own test, run first.
+RUN node --test scripts/ci/run-image-build-vitest.test.mjs
+RUN sh scripts/ci/run-image-build-vitest.sh
 RUN pnpm check:token-gates
 RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
 # The UI type-imports @paperclipai/plugin-sdk/ui, whose declarations exist only
@@ -152,6 +158,10 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 RUN pnpm exec vitest run packages/adapters/codex-local/src/server/parse.test.ts packages/adapters/codex-local/src/server/acp.quota.test.ts packages/adapters/claude-local/src/server/parse.test.ts
 RUN pnpm --filter @paperclipai/ui typecheck
 RUN pnpm --filter @paperclipai/ui build
+# The GitHub plugin's merge guard and the instance admin's per-repository opt-in (agentMergeablePaths): the guard and path rules,
+# the config schema as the host validates it when it is saved, and the save route's admin check. No database. After the plugin SDK build.
+RUN pnpm exec vitest run packages/plugins/plugin-github/tests/protected-paths.spec.ts packages/plugins/plugin-github/tests/write-identity.spec.ts server/src/__tests__/plugin-github-merge-opt-in-config.test.ts
+RUN pnpm exec vitest run server/src/__tests__/plugin-routes-authz.test.ts -t agentMergeablePaths
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
 # Build the remaining bundled local plugins here. The production root filesystem
