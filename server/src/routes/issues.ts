@@ -2321,7 +2321,12 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
   requestAddsExplicitBlockers?: boolean;
+  reopenRequested?: boolean;
 }) {
+  // An explicit `reopen: false` opts out of the implicit move, so a board
+  // comment on a cancelled issue stays a comment. Omitting `reopen` keeps the
+  // conversational default.
+  if (input.reopenRequested === false) return false;
   // A request that wires a non-empty blockedByIssueIds list is declaring that
   // the issue is waiting on other work. The implicit reopen exists for plain
   // conversational comments ("please continue"), not structured dependency
@@ -9351,6 +9356,19 @@ export function issueRoutes(
           { source: "recovery_action_resolution" },
         );
 
+        // backlog and cancelled only clear a stale flag on a task that is
+        // already parked or stopped; they never move the task there.
+        if (
+          (sourceIssueStatus === "backlog" ||
+            sourceIssueStatus === "cancelled") &&
+          sourceIssueStatus !== lockedIssue.status
+        ) {
+          throw conflict(
+            `Clearing a recovery action with sourceIssueStatus ${sourceIssueStatus} requires the task to already be ${sourceIssueStatus}. Move the task with a normal update first.`,
+            { code: "recovery_clear_requires_current_status" },
+          );
+        }
+
         if (outcome === "restored" && activeRecoveryAction.cause === "native_workspace_sync_out_unsafe_archive") {
           throw conflict("Unsafe workspace export recovers automatically without another provider turn.", { code: "workspace_export_automatic_recovery" });
         }
@@ -13169,6 +13187,7 @@ export function issueRoutes(
               requestAddsExplicitBlockers:
                 Array.isArray(req.body.blockedByIssueIds) &&
                 req.body.blockedByIssueIds.length > 0,
+              reopenRequested,
             })) ||
           shouldResumeInProgressScheduledRetry);
       const updateReferenceSummaryBefore = titleOrDescriptionChanged
@@ -17629,6 +17648,7 @@ export function issueRoutes(
             actorRunId: actor.runId,
             checkoutRunId: issue.checkoutRunId,
             executionRunId: issue.executionRunId,
+            reopenRequested: req.body.reopen,
           }) ||
           shouldResumeInProgressScheduledRetry);
       const hasUnresolvedFirstClassBlockers =
