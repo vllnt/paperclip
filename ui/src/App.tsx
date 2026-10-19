@@ -106,6 +106,7 @@ const CompanySkills = lazy(() => import("./pages/CompanySkills").then((m) => ({ 
 const SkillSources = lazy(() => import("./pages/SkillSources").then((m) => ({ default: m.SkillSources })));
 const SkillStudio = lazy(() => import("./pages/SkillStudio").then((m) => ({ default: m.SkillStudio })));
 const Secrets = lazy(() => import("./pages/Secrets").then((m) => ({ default: m.Secrets })));
+const CompanyEventSources = lazy(() => import("./pages/CompanyEventSources").then((m) => ({ default: m.CompanyEventSources })));
 const CompanyImport = lazy(() => import("./pages/CompanyImport").then((m) => ({ default: m.CompanyImport })));
 const DesignGuide = lazy(() => import("./pages/DesignGuide").then((m) => ({ default: m.DesignGuide })));
 const InstanceExperimentalSettings = lazy(() => import("./pages/InstanceExperimentalSettings").then((m) => ({ default: m.InstanceExperimentalSettings })));
@@ -201,6 +202,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route element={<HiddenSettingsPageGate pageKey="company.secrets" />}>
         <Route path="company/settings/secrets" element={<Secrets />} />
       </Route>
+      <Route path="company/settings/event-sources" element={<CompanyEventSources />} />
       <Route path="company/settings/tools" element={<LegacyToolsSettingsRedirect />} />
       <Route path="company/settings/tools/:tab" element={<LegacyToolsSettingsRedirect />} />
       <Route path="tools" element={<LegacyToolsRedirect />} />
