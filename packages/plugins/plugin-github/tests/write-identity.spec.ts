@@ -2001,9 +2001,9 @@ describe("workflow changes that arrive by merging the base branch", () => {
     const f = await appFixture();
     await f.authorize();
     const repository = { ...repos[0]!, name: "app", fullName: "Example-Org/app", owner: "Example-Org", url: "https://github.com/Example-Org/app" };
-    const catalog = vi.mocked(f.client.catalog), listed = catalog.getMockImplementation()!;
+    const catalog = vi.mocked(f.client.catalog), readCatalog = catalog.getMockImplementation()!;
     catalog.mockImplementation(async (...args) => {
-      const result = await listed(...args);
+      const result = await readCatalog(...args);
       return { ...result, repositories: [...result.repositories, repository] };
     });
     const stored = await f.policy();
@@ -2408,8 +2408,8 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
   const synthetic = [ORDINARY, OTHER].map((fullName, index) => ({ id: 900 + index, name: fullName.split("/")[1]!, fullName, url: `https://github.com/${fullName}`, installationId: 101, owner: OWNER, ownerId: 1, private: true, permissions }));
   /** Extends the fixture's fake GitHub, catalog and installation so that they answer for the synthetic repositories as for their own. */
   function addSyntheticRepositories(f: Awaited<ReturnType<typeof appFixture>>) {
-    const catalog = vi.mocked(f.client.catalog), listed = catalog.getMockImplementation()!;
-    catalog.mockImplementation(async (...args) => { const result = await listed(...args); return { ...result, repositories: [...result.repositories, ...synthetic] }; });
+    const catalog = vi.mocked(f.client.catalog), readCatalog = catalog.getMockImplementation()!;
+    catalog.mockImplementation(async (...args) => { const result = await readCatalog(...args); return { ...result, repositories: [...result.repositories, ...synthetic] }; });
     const own = f.request.getMockImplementation()!;
     f.request.mockImplementation(async (path: string, ...rest: any[]) => {
       const mine = new RegExp(`^/repos/(${OWNER}/[a-z-]+)/(.+)$`).exec(path);
