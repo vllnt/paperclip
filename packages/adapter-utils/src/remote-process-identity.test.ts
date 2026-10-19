@@ -10,6 +10,7 @@ import {
   parseRemoteProcessIdentity,
   type RemoteProcessIdentity,
 } from "./remote-process-identity.js";
+import { isProcessAlive as isAlive } from "./test-support/process-liveness.js";
 
 const HAS_PROC = existsSync("/proc/self/stat");
 // The production image has no `ps`; its Linux workers use /proc.
@@ -28,15 +29,6 @@ const roots: string[] = [];
 // where the host has what it needs.
 type Mode = "proc" | "ps";
 const MODES: Mode[] = [...(HAS_PROC ? ["proc" as const] : []), ...(REAL_PS ? ["ps" as const] : [])];
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 // Runs a script in /bin/sh in its own process group, as a worker would.
 async function runScript(script: string, cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<{ stdout: string; stderr: string }> {
