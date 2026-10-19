@@ -19,6 +19,7 @@ import {
   type CreateBrowserProfile,
   type UpdateBrowserProfile,
 } from "@paperclipai/shared";
+import { isUniqueViolation } from "../db-errors.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -50,6 +51,7 @@ const DEFAULT_IDLE_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_LIVE = 3;
 const SAVE_INTERVAL_MS = 2 * 60 * 1000;
 const VIEWPORT = { width: 1280, height: 800 } as const;
+const NAME_INDEX = "browser_profiles_company_name_idx";
 
 type ProfileRow = typeof browserProfiles.$inferSelect;
 
@@ -60,7 +62,8 @@ export interface BrowserAgentActor {
 
 interface LiveProfile {
   runtime: BrowserRuntime;
-  agentTabs: Set<string>;
+  /** Open agent tabs, keyed by tab key, with the allowlist each tab was opened with. */
+  agentTabs: Map<string, string>;
   signIn: { userId: string; expiresAt: number } | null;
   idleTimer: NodeJS.Timeout | null;
   saveTimer: NodeJS.Timeout | null;
@@ -263,7 +266,7 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
       }
       const entry: LiveProfile = {
         runtime: await executor.launch(session),
-        agentTabs: new Set(),
+        agentTabs: new Map(),
         signIn: null,
         idleTimer: null,
         saveTimer: null,
@@ -287,6 +290,39 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
       return await started;
     } finally {
       opening.delete(profile.id);
+    }
+  }
+
+  async function closeAgentTabs(entry: LiveProfile): Promise<void> {
+    for (const key of entry.agentTabs.keys()) await entry.runtime.closeTab(key);
+    entry.agentTabs.clear();
+  }
+
+  /** Denies (and audits) an agent without a grant, or a navigation outside the profile's allowlist. */
+  async function assertAgentMayAct(
+    profile: ProfileRow,
+    agentActor: { type: "agent"; id: string; agentId: string; runId: string | null },
+    action: BrowserAgentAction,
+  ): Promise<void> {
+    const [grant] = await db
+      .select({ agentId: browserProfileAgents.agentId })
+      .from(browserProfileAgents)
+      .where(
+        and(
+          eq(browserProfileAgents.profileId, profile.id),
+          eq(browserProfileAgents.companyId, profile.companyId),
+          eq(browserProfileAgents.agentId, agentActor.agentId),
+        ),
+      )
+      .limit(1);
+    if (!grant) {
+      await audit(profile.companyId, agentActor, "access_denied", profile.id, { reason: "agent_not_allowed", action: action.action });
+      throw forbidden("This agent is not allowed to use this browser profile");
+    }
+    if (profile.status !== "active") throw forbidden("Profile is suspended");
+    if (action.action === "navigate" && !isAgentNavigationAllowed(action.url, profile.allowedDomains)) {
+      await audit(profile.companyId, agentActor, "navigation_denied", profile.id, { target: auditUrl(action.url) });
+      throw forbidden("That address is not in this profile's allowed domains", { code: "navigation_blocked" });
     }
   }
 
@@ -382,9 +418,7 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
         return toProfile(row, []);
       } catch (error) {
         await secrets.remove(secret.id).catch(() => undefined);
-        if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
-          throw conflict("A browser profile with that name already exists");
-        }
+        if (isUniqueViolation(error, NAME_INDEX)) throw conflict("A browser profile with that name already exists");
         throw error;
       }
     },
@@ -402,26 +436,42 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
         if (found.length !== new Set(patch.allowedAgentIds).size) {
           throw unprocessable("Every allowed agent must belong to this company");
         }
-        await db.transaction(async (tx) => {
-          await tx
-            .delete(browserProfileAgents)
-            .where(and(eq(browserProfileAgents.profileId, profileId), eq(browserProfileAgents.companyId, companyId)));
-          if (patch.allowedAgentIds && patch.allowedAgentIds.length > 0) {
-            await tx.insert(browserProfileAgents).values(
-              [...new Set(patch.allowedAgentIds)].map((agentId) => ({ profileId, agentId, companyId, createdByUserId: userId })),
-            );
+      }
+      // Grants and the profile row change together: a refused rename leaves the grants as they were.
+      const row = await db
+        .transaction(async (tx) => {
+          if (patch.allowedAgentIds) {
+            await tx
+              .delete(browserProfileAgents)
+              .where(and(eq(browserProfileAgents.profileId, profileId), eq(browserProfileAgents.companyId, companyId)));
+            if (patch.allowedAgentIds.length > 0) {
+              await tx.insert(browserProfileAgents).values(
+                [...new Set(patch.allowedAgentIds)].map((agentId) => ({ profileId, agentId, companyId, createdByUserId: userId })),
+              );
+            }
           }
+          const [updated] = await tx
+            .update(browserProfiles)
+            .set({
+              ...(patch.name !== undefined ? { name: patch.name } : {}),
+              ...(patch.allowedDomains !== undefined ? { allowedDomains: patch.allowedDomains } : {}),
+              updatedAt: new Date(now()),
+            })
+            .where(and(eq(browserProfiles.id, profile.id), eq(browserProfiles.companyId, companyId)))
+            .returning();
+          return updated;
+        })
+        .catch((error: unknown) => {
+          if (isUniqueViolation(error, NAME_INDEX)) throw conflict("A browser profile with that name already exists");
+          throw error;
+        });
+      // A live agent tab keeps the allowlist it was opened with; close agent tabs so the next action uses the new policy.
+      const entry = live.get(profileId);
+      if (entry && (patch.allowedDomains !== undefined || patch.allowedAgentIds !== undefined)) {
+        await enqueue(entry, () => closeAgentTabs(entry)).catch((error) => {
+          logger.warn({ profileId, errorName: error instanceof Error ? error.name : typeof error }, "closing agent tabs after a policy change failed");
         });
       }
-      const [row] = await db
-        .update(browserProfiles)
-        .set({
-          ...(patch.name !== undefined ? { name: patch.name } : {}),
-          ...(patch.allowedDomains !== undefined ? { allowedDomains: patch.allowedDomains } : {}),
-          updatedAt: new Date(now()),
-        })
-        .where(and(eq(browserProfiles.id, profile.id), eq(browserProfiles.companyId, companyId)))
-        .returning();
       await audit(companyId, { type: "user", id: userId }, "profile_updated", profileId, {
         fields: Object.keys(patch),
         ...(patch.allowedAgentIds ? { allowedAgentIds: patch.allowedAgentIds } : {}),
@@ -461,8 +511,7 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
       return enqueue(entry, async () => {
         const lease = activeLease(entry);
         if (lease && lease.userId !== userId) throw conflict("Another board user is signing in to this profile");
-        for (const key of entry.agentTabs) await entry.runtime.closeTab(key);
-        entry.agentTabs.clear();
+        await closeAgentTabs(entry);
         entry.signIn = { userId, expiresAt: now() + BROWSER_SIGNIN_LEASE_MS };
         armIdle(profileId, entry);
         const tab = await entry.runtime.openTab(SIGN_IN_TAB, { agentAllowedDomains: null });
@@ -543,31 +592,13 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
       await assertEnabled(companyId);
       const profile = await getOwned(companyId, profileId);
       const agentActor = { type: "agent" as const, id: actor.agentId, agentId: actor.agentId, runId: actor.runId };
-      const [grant] = await db
-        .select({ agentId: browserProfileAgents.agentId })
-        .from(browserProfileAgents)
-        .where(
-          and(
-            eq(browserProfileAgents.profileId, profileId),
-            eq(browserProfileAgents.companyId, companyId),
-            eq(browserProfileAgents.agentId, actor.agentId),
-          ),
-        )
-        .limit(1);
-      if (!grant) {
-        await audit(companyId, agentActor, "access_denied", profileId, { reason: "agent_not_allowed", action: action.action });
-        throw forbidden("This agent is not allowed to use this browser profile");
-      }
-      if (profile.status !== "active") throw forbidden("Profile is suspended");
-      if (action.action === "navigate" && !isAgentNavigationAllowed(action.url, profile.allowedDomains)) {
-        await audit(companyId, agentActor, "navigation_denied", profileId, { target: auditUrl(action.url) });
-        throw forbidden("That address is not in this profile's allowed domains", { code: "navigation_blocked" });
-      }
+      await assertAgentMayAct(profile, agentActor, action);
       const entry = await ensureLive(profile);
       const tabKey = actor.runId ?? actor.agentId;
       return enqueue(entry, async () => {
+        // The grant or the allowlist may have changed while this action waited in the queue.
         const fresh = await getOwned(companyId, profileId);
-        if (fresh.status !== "active") throw forbidden("Profile is suspended");
+        await assertAgentMayAct(fresh, agentActor, action);
         if (activeLease(entry)) throw conflict("A board user is signing in to this profile", { code: "profile_busy" });
         armIdle(profileId, entry);
         try {
@@ -577,8 +608,14 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
             await saveSession(fresh, entry);
             return { ok: true as const, url: "", title: "", snapshot: null, note: "Tab closed" };
           }
+          const allowlist = JSON.stringify(fresh.allowedDomains);
+          const openedWith = entry.agentTabs.get(tabKey);
+          if (openedWith !== undefined && openedWith !== allowlist) {
+            await entry.runtime.closeTab(tabKey);
+            entry.agentTabs.delete(tabKey);
+          }
           const tab = await entry.runtime.openTab(tabKey, { agentAllowedDomains: fresh.allowedDomains });
-          entry.agentTabs.add(tabKey);
+          entry.agentTabs.set(tabKey, allowlist);
           let snapshot: string | null = null;
           let note: string | null = null;
           if (action.action === "navigate") {

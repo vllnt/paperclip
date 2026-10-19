@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, browserProfiles, companies, createDb } from "@paperclipai/db";
+import { activityLog, agents, browserProfileAgents, browserProfiles, companies, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -30,6 +30,9 @@ interface FakeLaunch {
 
 function createFakeExecutor() {
   const launches: FakeLaunch[] = [];
+  const openedTabs: Array<{ key: string; agentAllowedDomains: readonly string[] | null }> = [];
+  const closedTabs: string[] = [];
+  const waitHold = { held: false, entered: false, release: () => {} };
   let sessionCounter = 0;
 
   function makeTab(key: string) {
@@ -54,7 +57,13 @@ function createFakeExecutor() {
       },
       async press() {},
       async scroll() {},
-      async wait() {},
+      async wait() {
+        if (!waitHold.held) return;
+        waitHold.entered = true;
+        await new Promise<void>((resolve) => {
+          waitHold.release = resolve;
+        });
+      },
       async pointerClick() {},
       async typeText() {},
       async screenshot() {
@@ -72,15 +81,16 @@ function createFakeExecutor() {
       launches.push(launch);
       const tabs = new Map<string, ReturnType<typeof makeTab>>();
       return {
-        async openTab(key: string) {
+        async openTab(key: string, policy: { agentAllowedDomains: readonly string[] | null }) {
           const existing = tabs.get(key);
           if (existing) return existing;
           const created = makeTab(key);
           tabs.set(key, created);
+          openedTabs.push({ key, agentAllowedDomains: policy.agentAllowedDomains });
           return created;
         },
         async closeTab(key: string) {
-          tabs.delete(key);
+          if (tabs.delete(key)) closedTabs.push(key);
         },
         tabCount: () => tabs.size,
         async exportSession() {
@@ -93,7 +103,7 @@ function createFakeExecutor() {
       };
     },
   };
-  return { executor, launches };
+  return { executor, launches, openedTabs, closedTabs, waitHold };
 }
 
 type Actor =
@@ -353,6 +363,80 @@ describeEmbeddedPostgres("browser profile routes", () => {
       }
       const sensitive = await agent(agentId).post(`${base}/actions`).send({ action: "fill", ref: "e99", value: "hunter2" }).expect(403);
       expect(sensitive.body.error).toContain("password");
+    });
+
+    it("refuses a duplicate name with 409 and leaves the grants of a failed rename unchanged", async () => {
+      const { companyId, board, profile } = await setup();
+      await profile("alpha");
+      const { id, base } = await profile("beta");
+      const kept = await newAgent(companyId);
+      const added = await newAgent(companyId);
+      await board().patch(base).send({ allowedAgentIds: [kept] }).expect(200);
+
+      await board().post(`/api/companies/${companyId}/browser/profiles`).send({ name: "alpha" }).expect(409);
+      await board().patch(base).send({ name: "alpha", allowedAgentIds: [added] }).expect(409);
+      const grants = await db
+        .select({ agentId: browserProfileAgents.agentId })
+        .from(browserProfileAgents)
+        .where(eq(browserProfileAgents.profileId, id));
+      expect(grants.map((grant) => grant.agentId)).toEqual([kept]);
+      const [row] = await db.select().from(browserProfiles).where(eq(browserProfiles.id, id));
+      expect(row?.name).toBe("beta");
+    });
+
+    it("closes live agent tabs when the board changes the allowlist or the grants", async () => {
+      const { companyId, board, agent, fake, profile } = await setup();
+      const { base } = await profile("posthog", ["app.posthog.com", "old.example.test"]);
+      const agentId = await newAgent(companyId);
+      const other = await newAgent(companyId);
+      await board().patch(base).send({ allowedAgentIds: [agentId, other] }).expect(200);
+      await agent(agentId).post(`${base}/actions`).send({ action: "snapshot" }).expect(200);
+      expect(fake.openedTabs.at(-1)).toEqual({ key: agentId, agentAllowedDomains: ["app.posthog.com", "old.example.test"] });
+
+      await board().patch(base).send({ allowedDomains: ["app.posthog.com"] }).expect(200);
+      expect(fake.closedTabs).toContain(agentId);
+      await agent(agentId).post(`${base}/actions`).send({ action: "snapshot" }).expect(200);
+      expect(fake.openedTabs.at(-1)).toEqual({ key: agentId, agentAllowedDomains: ["app.posthog.com"] });
+
+      await agent(other).post(`${base}/actions`).send({ action: "snapshot" }).expect(200);
+      const closedBefore = fake.closedTabs.length;
+      await board().patch(base).send({ allowedAgentIds: [agentId] }).expect(200);
+      expect(fake.closedTabs.slice(closedBefore)).toContain(other);
+    });
+
+    it("rechecks the grant and the allowlist for an action that was queued before the change", async () => {
+      const { companyId, board, agent, fake, harness, profile } = await setup();
+      const { id, base } = await profile("posthog", ["app.posthog.com", "old.example.test"]);
+      const holder = await newAgent(companyId);
+      const revoked = await newAgent(companyId);
+      await board().patch(base).send({ allowedAgentIds: [holder, revoked] }).expect(200);
+      await agent(holder).post(`${base}/actions`).send({ action: "snapshot" }).expect(200);
+
+      fake.waitHold.held = true;
+      const blocking = harness.service.agentAction(companyId, id, { agentId: holder, runId: null }, { action: "wait", ms: 100 });
+      await vi.waitFor(() => expect(fake.waitHold.entered).toBe(true));
+      const queuedSnapshot = harness.service.agentAction(companyId, id, { agentId: revoked, runId: null }, { action: "snapshot" });
+      const queuedNavigate = harness.service.agentAction(
+        companyId,
+        id,
+        { agentId: holder, runId: null },
+        { action: "navigate", url: "https://old.example.test/" },
+      );
+      const settled = Promise.allSettled([queuedSnapshot, queuedNavigate]);
+      // Both calls pass their first checks and wait behind the held action.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await db.delete(browserProfileAgents).where(and(eq(browserProfileAgents.profileId, id), eq(browserProfileAgents.agentId, revoked)));
+      await db.update(browserProfiles).set({ allowedDomains: ["app.posthog.com"] }).where(eq(browserProfiles.id, id));
+      fake.waitHold.held = false;
+      fake.waitHold.release();
+      await blocking;
+
+      const [snapshot, navigate] = await settled;
+      expect(snapshot).toMatchObject({ status: "rejected", reason: { status: 403 } });
+      expect(navigate).toMatchObject({ status: "rejected", reason: { status: 403 } });
+      // The holder's tab was opened under the old allowlist; its next action gets a tab under the new one.
+      await agent(holder).post(`${base}/actions`).send({ action: "snapshot" }).expect(200);
+      expect(fake.openedTabs.at(-1)).toEqual({ key: holder, agentAllowedDomains: ["app.posthog.com"] });
     });
   });
 
