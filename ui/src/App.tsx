@@ -6,7 +6,6 @@ import { useTranslation } from "@/i18n";
 import { Layout } from "./components/Layout";
 import { Layout as ProductionLayout } from "./components/Layout.production";
 import { ConferenceRoomChatGate } from "./components/ConferenceRoomChatGate";
-import { TaskChatLab } from "./pages/TaskChatLab";
 import { PipelinesExperimentalGate } from "./components/PipelinesExperimentalGate";
 import { CasesExperimentalGate } from "./components/CasesExperimentalGate";
 import { StatusCardsExperimentalGate } from "./components/StatusCardsExperimentalGate";
@@ -18,90 +17,13 @@ import {
   UnprefixedExecutionWorkspaceRedirect,
 } from "./components/UnprefixedExecutionWorkspaceRedirect";
 import { useHiddenSettings } from "./hooks/useHiddenSettings";
-import { Cases } from "./pages/Cases";
-import { CaseDetail } from "./pages/CaseDetail";
-import { OnboardingWizardVariant } from "./components/OnboardingWizardVariant";
 import { CloudAccessGate } from "./components/CloudAccessGate";
 import { PaperclipLoading } from "./components/AnimatedPaperclipIcon";
-import { Dashboard } from "./pages/Dashboard";
-import { DashboardLive } from "./pages/DashboardLive";
-import { Timeline } from "./pages/Timeline";
-import { Companies } from "./pages/Companies";
-import { AGENT_FILTER_TABS, Agents } from "./pages/Agents";
-import { AgentDetail } from "./pages/AgentDetail";
-import { Projects } from "./pages/Projects";
-import { ProjectDetail } from "./pages/ProjectDetail";
-import { ProjectWorkspaceDetail } from "./pages/ProjectWorkspaceDetail";
-import { Workspaces } from "./pages/Workspaces";
-import { Issues } from "./pages/Issues";
-import { Search } from "./pages/Search";
-import { IssueDetail } from "./pages/IssueDetail";
-import { AgentChats } from "./pages/AgentChats";
-import { AgentChat } from "./pages/AgentChat";
-import { IssueChatLongThreadPerf } from "./pages/IssueChatLongThreadPerf";
-import { Routines } from "./pages/Routines";
-import { Learnings, PipelineItemDetail, PipelineItemLegacyRedirect, Pipelines, ReviewQueue } from "./pages/Pipelines";
-import { PipelineSettings } from "./pages/PipelineSettings";
-import { StatusCards } from "./pages/StatusCards";
-import { RoutineDetail } from "./pages/RoutineDetail";
-import { UserProfile } from "./pages/UserProfile";
-import { ExecutionWorkspaceDetail } from "./pages/ExecutionWorkspaceDetail";
-import { Goals } from "./pages/Goals";
-import { Artifacts } from "./pages/Artifacts";
-import { GoalDetail } from "./pages/GoalDetail";
-import { Approvals } from "./pages/Approvals";
-import { ApprovalDetail } from "./pages/ApprovalDetail";
-import { CompanyActivity } from "./pages/audit/CompanyActivity";
-import { AuditHub } from "./pages/audit/AuditHub";
-import { Inbox } from "./pages/Inbox";
+import { AGENT_FILTER_TABS } from "@/lib/agent-filter-tabs";
 import { useCombinedInboxTasksEnabled } from "./hooks/useCombinedInboxTasksEnabled";
-import { WhatNeedsMe } from "./pages/WhatNeedsMe";
-import { DecisionQueuePage } from "./pages/DecisionQueuePage";
-import { BoardChat } from "./pages/BoardChat";
-import { CompanySettings } from "./pages/CompanySettings";
-import { CompanyEnvironments } from "./pages/CompanyEnvironments";
-import { BootstrapSetupUxLab } from "./pages/BootstrapSetupUxLab";
-import { ResponsibleUserDenialUxLab } from "./pages/ResponsibleUserDenialUxLab";
-import { CrossIssueCollaborationUxLab } from "./pages/CrossIssueCollaborationUxLab";
-import { CompanySettingsPluginPage } from "./pages/CompanySettingsPluginPage";
-import { CompanyAccess, CompanyAccessLegacyRoute } from "./pages/CompanyAccess";
-import { AdvancedToolsRoute } from "./pages/tools/AdvancedToolsRoute";
-import { ProfileWizardRoute } from "./pages/tools/profiles/ProfileWizardRoute";
-import { ProfileDetailRoute } from "./pages/tools/profiles/ProfileDetailRoute";
-import { Browse } from "./pages/apps/Browse";
-import { AppsConnect } from "./pages/apps/AppsConnect";
-import { ChatEndpointSetup } from "./pages/apps/chat/ChatEndpointSetup";
-import { ChatEndpointDetail } from "./pages/apps/chat/ChatEndpointDetail";
-import { ChatIdentityConfirm } from "./pages/apps/chat/ChatIdentityConfirm";
 import { ChatConnectorsExperimentalGate } from "./components/ChatConnectorsExperimentalGate";
 import { useChatConnectorsEnabled } from "./hooks/useChatConnectorsEnabled";
 import { canEnterAppsConnect } from "./pages/apps/app-connect-policy";
-import { AppsReview } from "./pages/apps/AppsReview";
-import { AppDetail } from "./pages/apps/AppDetail";
-import { AppNotConnected } from "./pages/apps/AppNotConnected";
-import { PaperclipCloudOAuthHandoffPage } from "./pages/apps/PaperclipCloudOAuthHandoff";
-import { GatewaysList } from "./pages/apps/gateways/GatewaysList";
-import { GatewayDetail } from "./pages/apps/gateways/GatewayDetail";
-import { CompanySkills } from "./pages/CompanySkills";
-import { SkillSources } from "./pages/SkillSources";
-import { SkillStudio } from "./pages/SkillStudio";
-import { Secrets } from "./pages/Secrets";
-import { CompanyImport } from "./pages/CompanyImport";
-import { DesignGuide } from "./pages/DesignGuide";
-import { InstanceExperimentalSettings } from "./pages/InstanceExperimentalSettings";
-import { InstanceAccess } from "./pages/InstanceAccess";
-import { ProfileSettings } from "./pages/ProfileSettings";
-import { PluginManager } from "./pages/PluginManager";
-import { PluginSettings } from "./pages/PluginSettings";
-import { AdapterManager } from "./pages/AdapterManager";
-import { PluginPage } from "./pages/PluginPage";
-import { NewAgent } from "./pages/NewAgent";
-import { AuthPage } from "./pages/Auth";
-import { BoardClaimPage } from "./pages/BoardClaim";
-import { CliAuthPage } from "./pages/CliAuth";
-import { InviteLandingPage } from "./pages/InviteLanding";
-import { JoinRequestQueue } from "./pages/JoinRequestQueue";
-import { NotFoundPage } from "./pages/NotFound";
 import { useCompany } from "./context/CompanyContext";
 import { useDialogActions, useDialogState } from "./context/DialogContext";
 import { loadLastInboxTab } from "./lib/inbox";
@@ -116,6 +38,91 @@ import { useCloudInstance } from "./hooks/useCloudInstance";
 import { useStreamlinedUiEnabled } from "./hooks/useStreamlinedUiEnabled";
 import { cloudStackCreateUrl } from "./lib/cloudLinks";
 import { navigateTopLevel } from "@/lib/browserNavigation";
+
+const TaskChatLab = lazy(() => import("./pages/TaskChatLab").then((m) => ({ default: m.TaskChatLab })));
+const Cases = lazy(() => import("./pages/Cases").then((m) => ({ default: m.Cases })));
+const CaseDetail = lazy(() => import("./pages/CaseDetail").then((m) => ({ default: m.CaseDetail })));
+const OnboardingWizardVariant = lazy(() => import("./components/OnboardingWizardVariant").then((m) => ({ default: m.OnboardingWizardVariant })));
+const Dashboard = lazy(() => import("./pages/Dashboard").then((m) => ({ default: m.Dashboard })));
+const DashboardLive = lazy(() => import("./pages/DashboardLive").then((m) => ({ default: m.DashboardLive })));
+const Timeline = lazy(() => import("./pages/Timeline").then((m) => ({ default: m.Timeline })));
+const Companies = lazy(() => import("./pages/Companies").then((m) => ({ default: m.Companies })));
+const AgentDetail = lazy(() => import("./pages/AgentDetail").then((m) => ({ default: m.AgentDetail })));
+const Projects = lazy(() => import("./pages/Projects").then((m) => ({ default: m.Projects })));
+const ProjectDetail = lazy(() => import("./pages/ProjectDetail").then((m) => ({ default: m.ProjectDetail })));
+const ProjectWorkspaceDetail = lazy(() => import("./pages/ProjectWorkspaceDetail").then((m) => ({ default: m.ProjectWorkspaceDetail })));
+const Workspaces = lazy(() => import("./pages/Workspaces").then((m) => ({ default: m.Workspaces })));
+const Issues = lazy(() => import("./pages/Issues").then((m) => ({ default: m.Issues })));
+const Search = lazy(() => import("./pages/Search").then((m) => ({ default: m.Search })));
+const IssueDetail = lazy(() => import("./pages/IssueDetail").then((m) => ({ default: m.IssueDetail })));
+const AgentChats = lazy(() => import("./pages/AgentChats").then((m) => ({ default: m.AgentChats })));
+const AgentChat = lazy(() => import("./pages/AgentChat").then((m) => ({ default: m.AgentChat })));
+const IssueChatLongThreadPerf = lazy(() => import("./pages/IssueChatLongThreadPerf").then((m) => ({ default: m.IssueChatLongThreadPerf })));
+const Routines = lazy(() => import("./pages/Routines").then((m) => ({ default: m.Routines })));
+const Learnings = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.Learnings })));
+const PipelineItemDetail = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.PipelineItemDetail })));
+const PipelineItemLegacyRedirect = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.PipelineItemLegacyRedirect })));
+const Pipelines = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.Pipelines })));
+const ReviewQueue = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.ReviewQueue })));
+const PipelineSettings = lazy(() => import("./pages/PipelineSettings").then((m) => ({ default: m.PipelineSettings })));
+const StatusCards = lazy(() => import("./pages/StatusCards").then((m) => ({ default: m.StatusCards })));
+const RoutineDetail = lazy(() => import("./pages/RoutineDetail").then((m) => ({ default: m.RoutineDetail })));
+const UserProfile = lazy(() => import("./pages/UserProfile").then((m) => ({ default: m.UserProfile })));
+const ExecutionWorkspaceDetail = lazy(() => import("./pages/ExecutionWorkspaceDetail").then((m) => ({ default: m.ExecutionWorkspaceDetail })));
+const Goals = lazy(() => import("./pages/Goals").then((m) => ({ default: m.Goals })));
+const Artifacts = lazy(() => import("./pages/Artifacts").then((m) => ({ default: m.Artifacts })));
+const GoalDetail = lazy(() => import("./pages/GoalDetail").then((m) => ({ default: m.GoalDetail })));
+const Approvals = lazy(() => import("./pages/Approvals").then((m) => ({ default: m.Approvals })));
+const ApprovalDetail = lazy(() => import("./pages/ApprovalDetail").then((m) => ({ default: m.ApprovalDetail })));
+const CompanyActivity = lazy(() => import("./pages/audit/CompanyActivity").then((m) => ({ default: m.CompanyActivity })));
+const AuditHub = lazy(() => import("./pages/audit/AuditHub").then((m) => ({ default: m.AuditHub })));
+const Inbox = lazy(() => import("./pages/Inbox").then((m) => ({ default: m.Inbox })));
+const WhatNeedsMe = lazy(() => import("./pages/WhatNeedsMe").then((m) => ({ default: m.WhatNeedsMe })));
+const DecisionQueuePage = lazy(() => import("./pages/DecisionQueuePage").then((m) => ({ default: m.DecisionQueuePage })));
+const BoardChat = lazy(() => import("./pages/BoardChat").then((m) => ({ default: m.BoardChat })));
+const CompanySettings = lazy(() => import("./pages/CompanySettings").then((m) => ({ default: m.CompanySettings })));
+const CompanyEnvironments = lazy(() => import("./pages/CompanyEnvironments").then((m) => ({ default: m.CompanyEnvironments })));
+const BootstrapSetupUxLab = lazy(() => import("./pages/BootstrapSetupUxLab").then((m) => ({ default: m.BootstrapSetupUxLab })));
+const ResponsibleUserDenialUxLab = lazy(() => import("./pages/ResponsibleUserDenialUxLab").then((m) => ({ default: m.ResponsibleUserDenialUxLab })));
+const CrossIssueCollaborationUxLab = lazy(() => import("./pages/CrossIssueCollaborationUxLab").then((m) => ({ default: m.CrossIssueCollaborationUxLab })));
+const CompanySettingsPluginPage = lazy(() => import("./pages/CompanySettingsPluginPage").then((m) => ({ default: m.CompanySettingsPluginPage })));
+const CompanyAccess = lazy(() => import("./pages/CompanyAccess").then((m) => ({ default: m.CompanyAccess })));
+const CompanyAccessLegacyRoute = lazy(() => import("./pages/CompanyAccess").then((m) => ({ default: m.CompanyAccessLegacyRoute })));
+const AdvancedToolsRoute = lazy(() => import("./pages/tools/AdvancedToolsRoute").then((m) => ({ default: m.AdvancedToolsRoute })));
+const ProfileWizardRoute = lazy(() => import("./pages/tools/profiles/ProfileWizardRoute").then((m) => ({ default: m.ProfileWizardRoute })));
+const ProfileDetailRoute = lazy(() => import("./pages/tools/profiles/ProfileDetailRoute").then((m) => ({ default: m.ProfileDetailRoute })));
+const Browse = lazy(() => import("./pages/apps/Browse").then((m) => ({ default: m.Browse })));
+const AppsConnect = lazy(() => import("./pages/apps/AppsConnect").then((m) => ({ default: m.AppsConnect })));
+const ChatEndpointSetup = lazy(() => import("./pages/apps/chat/ChatEndpointSetup").then((m) => ({ default: m.ChatEndpointSetup })));
+const ChatEndpointDetail = lazy(() => import("./pages/apps/chat/ChatEndpointDetail").then((m) => ({ default: m.ChatEndpointDetail })));
+const ChatIdentityConfirm = lazy(() => import("./pages/apps/chat/ChatIdentityConfirm").then((m) => ({ default: m.ChatIdentityConfirm })));
+const AppsReview = lazy(() => import("./pages/apps/AppsReview").then((m) => ({ default: m.AppsReview })));
+const AppDetail = lazy(() => import("./pages/apps/AppDetail").then((m) => ({ default: m.AppDetail })));
+const AppNotConnected = lazy(() => import("./pages/apps/AppNotConnected").then((m) => ({ default: m.AppNotConnected })));
+const PaperclipCloudOAuthHandoffPage = lazy(() => import("./pages/apps/PaperclipCloudOAuthHandoff").then((m) => ({ default: m.PaperclipCloudOAuthHandoffPage })));
+const GatewaysList = lazy(() => import("./pages/apps/gateways/GatewaysList").then((m) => ({ default: m.GatewaysList })));
+const GatewayDetail = lazy(() => import("./pages/apps/gateways/GatewayDetail").then((m) => ({ default: m.GatewayDetail })));
+const CompanySkills = lazy(() => import("./pages/CompanySkills").then((m) => ({ default: m.CompanySkills })));
+const SkillSources = lazy(() => import("./pages/SkillSources").then((m) => ({ default: m.SkillSources })));
+const SkillStudio = lazy(() => import("./pages/SkillStudio").then((m) => ({ default: m.SkillStudio })));
+const Secrets = lazy(() => import("./pages/Secrets").then((m) => ({ default: m.Secrets })));
+const CompanyImport = lazy(() => import("./pages/CompanyImport").then((m) => ({ default: m.CompanyImport })));
+const DesignGuide = lazy(() => import("./pages/DesignGuide").then((m) => ({ default: m.DesignGuide })));
+const InstanceExperimentalSettings = lazy(() => import("./pages/InstanceExperimentalSettings").then((m) => ({ default: m.InstanceExperimentalSettings })));
+const InstanceAccess = lazy(() => import("./pages/InstanceAccess").then((m) => ({ default: m.InstanceAccess })));
+const ProfileSettings = lazy(() => import("./pages/ProfileSettings").then((m) => ({ default: m.ProfileSettings })));
+const PluginManager = lazy(() => import("./pages/PluginManager").then((m) => ({ default: m.PluginManager })));
+const PluginSettings = lazy(() => import("./pages/PluginSettings").then((m) => ({ default: m.PluginSettings })));
+const AdapterManager = lazy(() => import("./pages/AdapterManager").then((m) => ({ default: m.AdapterManager })));
+const PluginPage = lazy(() => import("./pages/PluginPage").then((m) => ({ default: m.PluginPage })));
+const NewAgent = lazy(() => import("./pages/NewAgent").then((m) => ({ default: m.NewAgent })));
+const AuthPage = lazy(() => import("./pages/Auth").then((m) => ({ default: m.AuthPage })));
+const BoardClaimPage = lazy(() => import("./pages/BoardClaim").then((m) => ({ default: m.BoardClaimPage })));
+const CliAuthPage = lazy(() => import("./pages/CliAuth").then((m) => ({ default: m.CliAuthPage })));
+const InviteLandingPage = lazy(() => import("./pages/InviteLanding").then((m) => ({ default: m.InviteLandingPage })));
+const JoinRequestQueue = lazy(() => import("./pages/JoinRequestQueue").then((m) => ({ default: m.JoinRequestQueue })));
+const NotFoundPage = lazy(() => import("./pages/NotFound").then((m) => ({ default: m.NotFoundPage })));
+const Agents = lazy(() => import("./pages/Agents").then((m) => ({ default: m.Agents })));
 
 const CompanyExport = lazy(() =>
   import("./pages/CompanyExport").then((module) => ({ default: module.CompanyExport })),
@@ -796,6 +803,7 @@ export function App() {
 
   return (
     <>
+      <Suspense fallback={<PaperclipLoading />}>
       <Routes>
         <Route path="oauth-handoff" element={<PaperclipCloudOAuthHandoffPage />} />
         <Route path="auth" element={<AuthPage />} />
@@ -888,7 +896,10 @@ export function App() {
           <Route path="*" element={<NotFoundPage scope="global" />} />
         </Route>
       </Routes>
-      <OnboardingWizardVariant />
+      </Suspense>
+      <Suspense fallback={null}>
+        <OnboardingWizardVariant />
+      </Suspense>
     </>
   );
 }
