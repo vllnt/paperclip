@@ -159,8 +159,10 @@ RUN pnpm --filter @paperclipai/ui build
 RUN pnpm exec vitest run packages/plugins/plugin-github/tests/protected-paths.spec.ts packages/plugins/plugin-github/tests/write-identity.spec.ts server/src/__tests__/plugin-github-merge-opt-in-config.test.ts
 RUN pnpm exec vitest run server/src/__tests__/plugin-routes-authz.test.ts -t agentMergeablePaths
 # The Convex plugin's guards (environment classification, per-environment grants, preview and delete guards, the reaper's dry run and its
-# settings page), the bundled-plugin install list that auto-installs it and the CLI that drives it. No database, no network. After the plugin SDK build.
+# page), the bundled-plugin install list that auto-installs it and the CLI that drives it, then the plugin's typecheck (tests included). The OpenAPI route
+# test above covers the Convex action schemas. No database, no network. After the plugin SDK build.
 RUN pnpm exec vitest run packages/plugins/plugin-convex cli/src/__tests__/convex.test.ts server/src/__tests__/bundled-plugins.test.ts
+RUN pnpm --filter @vllnt/paperclip-convex typecheck
 RUN pnpm --filter @vllnt/paperclip-plugin-cliproxyapi build
 RUN pnpm --filter @vllnt/paperclip-github build
 RUN pnpm --filter @vllnt/paperclip-convex build

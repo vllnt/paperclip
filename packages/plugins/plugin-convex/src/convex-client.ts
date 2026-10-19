@@ -41,12 +41,12 @@ export function normalizeDeployment(raw: unknown): ConvexDeployment | null {
   };
 }
 
-/** Only Convex cloud hosts may receive a deploy credential. */
-export function assertConvexCloudUrl(value: string): URL {
+/** Only the deployment's own Convex cloud host (`<name>.convex.cloud`) may receive a credential, not another tenant's host. */
+export function assertConvexCloudUrl(value: string, deploymentName: string): URL {
   let url: URL;
   try { url = new URL(value); } catch { throw new ConvexApiError(0, "Convex returned an invalid deployment URL."); }
-  if (url.protocol !== "https:" || url.username || url.password || url.port || !/^[a-z0-9-]+(\.[a-z0-9-]+)*\.convex\.cloud$/.test(url.hostname)) {
-    throw new ConvexApiError(0, "Refusing to send a credential to a host that is not a Convex cloud deployment.");
+  if (url.protocol !== "https:" || url.username || url.password || url.port || !/^[a-z0-9-]+(\.[a-z0-9-]+)*\.convex\.cloud$/.test(url.hostname) || !url.hostname.startsWith(`${deploymentName.toLowerCase()}.`)) {
+    throw new ConvexApiError(0, "Refusing to send a credential to a host that is not this deployment's Convex cloud host.");
   }
   return url;
 }
@@ -57,6 +57,7 @@ export class ConvexClient {
   constructor(private fetchImpl: FetchLike = (url, init) => fetch(url, init)) {}
 
   private async request<T>(method: string, url: string, scheme: "Bearer" | "Convex", token: string, body?: unknown): Promise<T> {
+    // The host's own fetch limit (30 s) applies behind the plugin SDK, which does not forward the signal; this bounds a direct fetch.
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 20_000);
     try {
@@ -82,9 +83,6 @@ export class ConvexClient {
   }
 
   // --- Management API (https://api.convex.dev/v1) ---
-  listProjects(token: string, teamId: string, cursor?: string) {
-    return this.request<{ items?: unknown[]; pagination?: { hasMore?: boolean; nextCursor?: string | null } }>("GET", `${MANAGEMENT_BASE}/teams/${enc(teamId)}/projects?limit=100${cursor ? `&cursor=${enc(cursor)}` : ""}`, "Bearer", token);
-  }
   async listProjectDeployments(token: string, projectId: string, deploymentType?: string): Promise<ConvexDeployment[]> {
     const query = deploymentType ? `?deploymentType=${enc(deploymentType)}` : "";
     const items = await this.request<unknown[]>("GET", `${MANAGEMENT_BASE}/projects/${enc(projectId)}/list_deployments${query}`, "Bearer", token);
@@ -107,13 +105,12 @@ export class ConvexClient {
   }
   listCustomDomains(token: string, name: string) { return this.request<unknown>("GET", `${MANAGEMENT_BASE}/deployments/${enc(name)}/custom_domains`, "Bearer", token); }
   listDeployKeys(token: string, name: string) { return this.request<unknown>("GET", `${MANAGEMENT_BASE}/deployments/${enc(name)}/list_deploy_keys`, "Bearer", token); }
-  listPreviewDeployKeys(token: string, projectId: string) { return this.request<unknown>("GET", `${MANAGEMENT_BASE}/projects/${enc(projectId)}/list_preview_deploy_keys`, "Bearer", token); }
   listDeploymentClasses(token: string, teamId: string) { return this.request<unknown>("GET", `${MANAGEMENT_BASE}/teams/${enc(teamId)}/list_deployment_classes`, "Bearer", token); }
   listDeploymentRegions(token: string, teamId: string) { return this.request<unknown>("GET", `${MANAGEMENT_BASE}/teams/${enc(teamId)}/list_deployment_regions`, "Bearer", token); }
 
   // --- Deployment API (<deploymentUrl>/api/v1, `Authorization: Convex <key>`) ---
-  deploymentGet<T = unknown>(token: string, deploymentUrl: string, path: "deployment_info" | "get_current_usage" | "list_usage_limits" | "list_audit_log_events", query = ""): Promise<T> {
-    const base = assertConvexCloudUrl(deploymentUrl);
+  async deploymentGet<T = unknown>(token: string, deployment: { name: string; deploymentUrl: string }, path: "deployment_info" | "get_current_usage" | "list_usage_limits" | "list_audit_log_events", query = ""): Promise<T> {
+    const base = assertConvexCloudUrl(deployment.deploymentUrl, deployment.name);
     return this.request<T>("GET", `${base.origin}/api/v1/${path}${query}`, "Convex", token);
   }
 }

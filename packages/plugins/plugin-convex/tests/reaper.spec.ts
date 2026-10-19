@@ -148,7 +148,7 @@ describe("reaper", () => {
     const reap = () => f.h.executeTool<{ data?: any; error?: string }>("convex_reap_previews", { dryRun: false }, run("janitor", COMPANY_A, "run-9"));
     expect((await reap()).data.projects[0].deleted).toHaveLength(3);
     expect((await reap()).data.projects[0].deleted).toHaveLength(0);
-    const single = await f.h.executeTool<{ error?: string }>("convex_delete_preview", { name: "old-7" }, run("janitor", COMPANY_A, "run-9"));
+    const single = await f.h.executeTool<{ error?: string }>("convex_delete_preview", { name: "old-7", dryRun: false }, run("janitor", COMPANY_A, "run-9"));
     expect(single.error).toMatch(/limit of 3 deletions/i);
     expect(f.convex.deletes()).toHaveLength(3);
     // A new run gets a new allowance.

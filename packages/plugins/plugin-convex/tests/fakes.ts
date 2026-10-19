@@ -32,6 +32,12 @@ export class FakeConvex {
   dropDeleteResponseFor = new Set<string>();
   /** GET answers with this name instead of the requested one. */
   answerAs = new Map<string, string>();
+  /** The Convex project ids a token may touch; a valid token without an entry may touch any. Anything else answers 403, as a token of another project does. */
+  scopes = new Map<string, Set<number>>();
+  /** Answers 400 to a delete or an expiry change of this name: a definitive refusal, nothing changed. */
+  refuseChangeFor = new Set<string>();
+  /** Answers 404 to a delete of this name without deleting it, as Convex does for a deployment that is already gone. */
+  goneOnDelete = new Set<string>();
 
   add(...items: FakeDeployment[]) { for (const item of items) this.deployments.set(item.name, item); return this; }
   mutations() { return this.calls.filter(call => call.method !== "GET"); }
@@ -45,10 +51,13 @@ export class FakeConvex {
     this.calls.push({ method, url, authorization, body });
     const token = authorization?.replace(/^(Bearer|Convex) /, "") ?? "";
     const fail = (status: number, code: string) => json(status, { code, message: this.echoCredentialInErrors ? `rejected credential ${authorization}` : code });
-    if (!this.validTokens.has(token)) return fail(401, "Unauthorized");
     const parsed = new URL(url);
     const path = parsed.pathname;
-    if (parsed.hostname.endsWith(".convex.cloud")) {
+    const onCloud = parsed.hostname.endsWith(".convex.cloud");
+    // The management API takes `Bearer`, a deployment's own host takes `Convex`; the wrong scheme is rejected like an unknown token.
+    if (authorization?.split(" ")[0] !== (onCloud ? "Convex" : "Bearer") || !this.validTokens.has(token)) return fail(401, "Unauthorized");
+    const denied = (projectId: number) => { const scope = this.scopes.get(token); return !!scope && !scope.has(projectId); };
+    if (onCloud) {
       if (path.endsWith("/get_current_usage")) return json(200, { metrics: { functionCalls: { unit: "calls", usage: { current_day: 10, current_month: 100 }, internalNote: "LEAK-ME-usage" } }, seedStatus: "complete", billingToken: "LEAK-ME-billing" });
       if (path.endsWith("/list_usage_limits")) return json(200, { usageLimits: [{ id: "u1", metric: "functionCalls", window: "day", limitType: "warning", limit: 1000, enabled: true, webhookSecret: "LEAK-ME-limit" }] });
       if (path.endsWith("/list_audit_log_events")) return json(200, { items: [{ actor: { kind: "member", member_id: 3 }, action: "push_config", createTime: NOW - HOUR, metadata: { note: "pushed" }, clientIp: "203.0.113.9", clientUserAgent: "convex-cli" }], pagination: { hasMore: false, nextCursor: null } });
@@ -60,24 +69,32 @@ export class FakeConvex {
     if (match && method === "GET") {
       const asked = decodeURIComponent(match[1]);
       const found = this.deployments.get(asked);
+      if (found && denied(found.projectId)) return fail(403, "Forbidden");
       if (found && this.answerAs.has(asked)) return json(200, { ...found, name: this.answerAs.get(asked) });
       return found ? json(200, found) : fail(404, "DeploymentNotFound");
     }
     if (match && method === "PATCH") {
       const found = this.deployments.get(decodeURIComponent(match[1]));
       if (!found) return fail(404, "DeploymentNotFound");
+      if (denied(found.projectId)) return fail(403, "Forbidden");
+      if (this.refuseChangeFor.has(found.name)) return fail(400, "InvalidRequest");
       found.expiresAt = (body as { expiresAt: number | null }).expiresAt;
       return bare(200);
     }
     match = /^\/deployments\/([^/]+)\/delete$/.exec(v1);
     if (match && method === "POST") {
       const name = decodeURIComponent(match[1]);
+      const target = this.deployments.get(name);
+      if (target && denied(target.projectId)) return fail(403, "Forbidden");
+      if (this.refuseChangeFor.has(name)) return fail(400, "InvalidRequest");
+      if (this.goneOnDelete.has(name)) { this.deployments.delete(name); return fail(404, "DeploymentNotFound"); }
       if (this.failDeleteFor.has(name)) return fail(500, "InternalError");
       if (this.dropDeleteResponseFor.has(name)) { this.deployments.delete(name); return fail(502, "BadGateway"); }
       return this.deployments.delete(name) ? bare(200) : fail(404, "DeploymentNotFound");
     }
     match = /^\/projects\/([^/]+)\/list_deployments$/.exec(v1);
     if (match) {
+      if (denied(Number(match[1]))) return fail(403, "Forbidden");
       const type = parsed.searchParams.get("deploymentType");
       return json(200, [...this.deployments.values()].filter(item => String(item.projectId) === match![1] && (!type || item.deploymentType === type)));
     }
@@ -92,7 +109,8 @@ export class FakeConvex {
     match = /^\/deployments\/([^/]+)\/custom_domains$/.exec(v1);
     if (match) return json(200, { domains: [{ domain: "api.example.com", requestDestination: "convexCloud", creationTime: NOW - 5 * HOUR, verificationTime: null, deploymentName: match[1], internal: "LEAK-ME-domain" }] });
     match = /^\/deployments\/([^/]+)\/list_deploy_keys$/.exec(v1);
-    if (match) return json(200, { items: [{ id: 9, name: "ci", creationTime: NOW - 9 * HOUR, lastUsedTime: NOW - HOUR, expiresAt: null, creator: 7, allowedActions: ["deployment:deploy"], adminKey: "LEAK-ME-key-material", token: "LEAK-ME-token" }] });
+    // The real endpoint answers with a bare array.
+    if (match) return json(200, [{ id: 9, name: "ci", creationTime: NOW - 9 * HOUR, lastUsedTime: NOW - HOUR, expiresAt: null, creator: 7, allowedActions: ["deployment:deploy"], adminKey: "LEAK-ME-key-material", token: "LEAK-ME-token" }]);
     match = /^\/teams\/([^/]+)\/list_deployment_classes$/.exec(v1);
     if (match) return json(200, { items: [{ type: "s16", available: true }, { type: "d1024", available: false }] });
     match = /^\/teams\/([^/]+)\/list_deployment_regions$/.exec(v1);
@@ -103,7 +121,8 @@ export class FakeConvex {
   };
 }
 
-export interface FakePull { number: number; ref: string; state?: "open" | "closed"; merged?: boolean }
+/** `closedAt` defaults to 30 hours before NOW, which is after the default preview's last deploy (50 hours before NOW). `repo` is the repository of the head branch; a fork has another one. */
+export interface FakePull { number: number; ref: string; state?: "open" | "closed"; merged?: boolean; closedAt?: number; repo?: string }
 
 /** In-memory GitHub REST subset used by the preview guard. Lists are paged by 100, like GitHub. */
 export class FakeGitHub {
@@ -131,7 +150,12 @@ export class FakeGitHub {
       const closed = parsed.searchParams.get("state") === "closed";
       const real = this.pulls.filter(pull => (pull.state ?? "open") === (closed ? "closed" : "open"));
       const filler = closed ? [] : Array.from({ length: this.extraOpenPulls }, (_, i) => ({ number: 100000 + i, ref: `filler-${i}` }));
-      return json(200, slice([...real, ...filler]).map(pull => ({ number: pull.number, state: closed ? "closed" : "open", merged_at: (pull as FakePull).merged ? "2026-10-01T00:00:00Z" : null, head: { ref: pull.ref } })));
+      const mapped = /^\/repos\/([^/]+\/[^/]+)/.exec(parsed.pathname)?.[1];
+      return json(200, slice([...real, ...filler]).map(item => {
+        const pull = item as FakePull;
+        const closedAt = closed ? new Date(pull.closedAt ?? NOW - 30 * HOUR).toISOString() : null;
+        return { number: pull.number, state: closed ? "closed" : "open", merged_at: pull.merged ? closedAt : null, closed_at: closedAt, head: { ref: pull.ref, repo: { full_name: pull.repo ?? mapped } } };
+      }));
     }
     if (repoPath === "/branches") {
       if (this.branchesHidden) return json(404, { message: "Not Found" });

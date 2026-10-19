@@ -1,11 +1,16 @@
+import { isRepositoryName } from "./contracts.js";
 import type { FetchLike } from "./convex-client.js";
 
-export interface PullRequestRef { number: number; headRef: string; state: "open" | "closed" | "merged" }
+/** `headRepo` is the lowercase `owner/name` of the repository the pull request's branch lives in (null when GitHub does not say, e.g. a deleted fork). */
+export interface PullRequestRef { number: number; headRef: string; headRepo: string | null; closedAt: number | null; state: "open" | "closed" | "merged" }
 export interface BranchInfo { name: string; lastCommitAt: number | null }
 
 const MAX_OPEN_PAGES = 10;
 const MAX_BRANCH_PAGES = 10;
 const MAX_CLOSED_PAGES = 5;
+interface RawPull { number?: number; merged_at?: string | null; closed_at?: string | null; head?: { ref?: string; repo?: { full_name?: string } | null } }
+const headRepo = (item: RawPull): string | null => typeof item.head?.repo?.full_name === "string" ? item.head.repo.full_name.toLowerCase() : null;
+const timestamp = (value: unknown): number | null => { const at = typeof value === "string" ? Date.parse(value) : NaN; return Number.isFinite(at) ? at : null; };
 const encSegments = (name: string) => name.split("/").map(encodeURIComponent).join("/");
 
 /**
@@ -19,7 +24,8 @@ export class GitHubReader {
   constructor(private fetchImpl: FetchLike = (url, init) => fetch(url, init)) {}
 
   private async get<T>(repo: string, path: string, token: string): Promise<T | null> {
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error("Invalid GitHub repository.");
+    if (!isRepositoryName(repo)) throw new Error("Invalid GitHub repository.");
+    // The host's own fetch limit (30 s) applies behind the plugin SDK, which does not forward the signal; this bounds a direct fetch.
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 20_000);
     try {
@@ -55,16 +61,17 @@ export class GitHubReader {
 
   /** Every open pull request. More than the page budget fails closed. */
   async openPullRequests(repo: string, token: string): Promise<PullRequestRef[]> {
-    const items = await this.pages<{ number?: number; head?: { ref?: string } }>(repo, token, page => `/pulls?state=open&per_page=100&page=${page}`, MAX_OPEN_PAGES, true);
-    return items.flatMap(item => typeof item.number === "number" && typeof item.head?.ref === "string" ? [{ number: item.number, headRef: item.head.ref, state: "open" as const }] : []);
+    const items = await this.pages<RawPull>(repo, token, page => `/pulls?state=open&per_page=100&page=${page}`, MAX_OPEN_PAGES, true);
+    return items.flatMap(item => typeof item.number === "number" && typeof item.head?.ref === "string"
+      ? [{ number: item.number, headRef: item.head.ref, headRepo: headRepo(item), closedAt: null, state: "open" as const }] : []);
   }
 
   /** Recently updated closed or merged pull requests. Used only as positive evidence, so a partial list is acceptable. */
   async recentClosedPullRequests(repo: string, token: string): Promise<PullRequestRef[]> {
-    const items = await this.pages<{ number?: number; merged_at?: string | null; head?: { ref?: string } }>(
+    const items = await this.pages<RawPull>(
       repo, token, page => `/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=${page}`, MAX_CLOSED_PAGES, false);
     return items.flatMap(item => typeof item.number === "number" && typeof item.head?.ref === "string"
-      ? [{ number: item.number, headRef: item.head.ref, state: item.merged_at ? "merged" as const : "closed" as const }] : []);
+      ? [{ number: item.number, headRef: item.head.ref, headRepo: headRepo(item), closedAt: timestamp(item.closed_at), state: item.merged_at ? "merged" as const : "closed" as const }] : []);
   }
 
   /** Every branch name. More than the page budget fails closed, because "no such branch" must mean the branch is gone. */

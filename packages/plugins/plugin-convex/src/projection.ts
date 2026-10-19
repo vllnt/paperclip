@@ -4,15 +4,17 @@
  */
 const list = (value: unknown): Record<string, unknown>[] =>
   (Array.isArray(value) ? value : []).filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item));
-const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
+/** Strings from Convex can carry attacker-chosen text (branch names, key names, domains): control characters are removed and the length is bounded. */
+export const clean = (value: string, max = 128): string => value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, max);
+const text = (value: unknown): string | null => (typeof value === "string" ? clean(value) : null);
 const num = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
 const id = (value: unknown): string | null => (typeof value === "number" || typeof value === "string" ? String(value) : null);
 const items = (raw: unknown, key = "items"): Record<string, unknown>[] =>
   list(raw && typeof raw === "object" ? (raw as Record<string, unknown>)[key] : undefined);
 
-/** Deploy key metadata only: never the key itself. */
+/** Deploy key metadata only: never the key itself. Convex answers with a bare array; `{ items }` is accepted too. */
 export function projectDeployKeys(raw: unknown) {
-  return items(raw).slice(0, 100).map(key => ({
+  return (Array.isArray(raw) ? list(raw) : items(raw)).slice(0, 100).map(key => ({
     id: id(key.id), name: text(key.name), createdAt: num(key.creationTime), lastUsedAt: num(key.lastUsedTime), expiresAt: num(key.expiresAt), creator: id(key.creator),
     allowedActions: (Array.isArray(key.allowedActions) ? key.allowedActions : []).filter((action): action is string => typeof action === "string").slice(0, 50),
   }));

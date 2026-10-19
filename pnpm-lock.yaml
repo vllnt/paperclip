@@ -738,9 +738,6 @@ importers:
       '@paperclipai/plugin-sdk':
         specifier: workspace:*
         version: link:../sdk
-      '@paperclipai/shared':
-        specifier: workspace:*
-        version: link:../../shared
       '@testing-library/react':
         specifier: ^16.3.3
         version: 16.3.3(@testing-library/dom@10.4.1)(@types/react-dom@19.2.5(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)

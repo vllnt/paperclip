@@ -53,7 +53,9 @@ describe("config", () => {
     [{ grants: [{ agentId: "a", role: "r", preset: "observer", environments: ["preview"] }] }, /exactly one/],
     [{ grants: [{ agentId: "a", preset: "observer", environments: ["staging-x"] }] }, /environment classes/],
     [{ grants: [{ agentId: "a", preset: "janitor", environments: ["preview", "dev"] }] }, /lifecycle can only be granted on preview/],
-    [{ grants: [{ agentId: "a", capabilities: ["env-write"], environments: ["production"] }] }, /per-call/],
+    [{ grants: [{ agentId: "a", capabilities: ["env-write"], environments: ["production"] }] }, /capabilities that this version enforces/],
+    [{ grants: [{ agentId: "a", preset: "triager", environments: ["preview"] }] }, /preset must be one of observer, janitor/],
+    [{ grants: [{ agentId: "a", capabilities: ["meta-read"], environments: ["preview"], approval: "per-call" }] }, /approval is not available/],
     [{ grants: [{ agentId: "a", environments: ["preview"] }] }, /grants nothing/],
     [{ reaper: { ttlHours: 200 } }, /ttlHours/],
     [{ reaper: { ttlHours: 2 } }, /ttlHours/],
@@ -63,10 +65,19 @@ describe("config", () => {
     expect(() => parseConfig(raw as Record<string, unknown>)).toThrow(message);
   });
 
-  it("accepts a production write grant only with a per-call approval", () => {
-    const config = parseConfig({ grants: [{ agentId: "a", capabilities: ["env-write"], environments: ["production"], approval: "per-call" }] });
-    expect(config.grants[0].approval).toBe("per-call");
+  it.each(["env-read-names", "env-read-values", "env-write", "run-query", "run-write", "deploy", "backup", "restore-import", "admin"])(
+    "refuses the %s capability, which no tool in this version enforces", capability => {
+      expect(() => parseConfig({ grants: [{ agentId: "a", capabilities: [capability], environments: ["preview"] }] })).toThrow(/capabilities that this version enforces/);
+    });
+
+  it("accepts the capabilities and presets that tools enforce", () => {
+    const config = parseConfig({ grants: [{ agentId: "a", preset: "janitor", capabilities: ["logs-read"], environments: ["preview"] }] });
+    expect(config.grants[0]).toEqual({ agentId: "a", role: null, environments: ["preview"], capabilities: ["meta-read", "health-read", "lifecycle", "logs-read"] });
     expect(ref("x").secretId).toBe("x");
+  });
+
+  it.each(["../app", "org/..", "org/.", "./app", "org/app/extra", "org"])("rejects the repository %s, which would change a GitHub API path", repository => {
+    expect(() => parseConfig({ projects: [{ convexProjectId: "100", repository }] })).toThrow(/repository must be owner\/name/);
   });
 });
 
@@ -85,22 +96,25 @@ describe("grants", () => {
     expect(isGranted(config, { id: "b", role: "devops" }, "preview", "lifecycle")).toBe(true);
   });
   it("never grants lifecycle outside previews", () => {
-    const forced = { ...config, grants: [{ agentId: "a1", role: null, environments: ["production" as const], capabilities: ["lifecycle" as const], approval: null }] };
+    const forced = { ...config, grants: [{ agentId: "a1", role: null, environments: ["production" as const], capabilities: ["lifecycle" as const] }] };
     expect(isGranted(forced, { id: "a1", role: null }, "production", "lifecycle")).toBe(false);
-  });
-  it("does not use a grant that waits for a per-call approval", () => {
-    const pending = parseConfig({ grants: [{ agentId: "a", capabilities: ["env-write"], environments: ["production"], approval: "per-call" }] });
-    expect(isGranted(pending, { id: "a", role: null }, "production", "env-write")).toBe(false);
   });
 });
 
 describe("Convex client", () => {
   it("accepts only Convex cloud deployment URLs", () => {
-    expect(assertConvexCloudUrl("https://happy-otter-123.convex.cloud").hostname).toBe("happy-otter-123.convex.cloud");
-    expect(assertConvexCloudUrl("https://happy-otter-123.eu-west-1.convex.cloud").hostname).toContain("eu-west-1");
+    expect(assertConvexCloudUrl("https://happy-otter-123.convex.cloud", "happy-otter-123").hostname).toBe("happy-otter-123.convex.cloud");
+    expect(assertConvexCloudUrl("https://happy-otter-123.eu-west-1.convex.cloud", "happy-otter-123").hostname).toContain("eu-west-1");
     for (const bad of ["http://a.convex.cloud", "https://a.convex.cloud.evil.com", "https://evil.com", "https://user:pw@a.convex.cloud", "https://a.convex.cloud:8443", "not a url", "https://convex.cloud"]) {
-      expect(() => assertConvexCloudUrl(bad), bad).toThrow();
+      expect(() => assertConvexCloudUrl(bad, "a"), bad).toThrow();
     }
+  });
+
+  it("sends a credential only to the host of the deployment it was asked about", () => {
+    // Another tenant's valid Convex host is still refused: the host name must start with this deployment's name.
+    expect(() => assertConvexCloudUrl("https://other-tenant-9.convex.cloud", "happy-otter-123")).toThrow(/this deployment's Convex cloud host/);
+    expect(() => assertConvexCloudUrl("https://happy-otter-1234.convex.cloud", "happy-otter-123")).toThrow();
+    expect(() => assertConvexCloudUrl("https://HAPPY-otter-123.convex.cloud", "happy-otter-123")).not.toThrow();
   });
 
   it("redacts the credential from API errors and ignores non-JSON bodies", async () => {
