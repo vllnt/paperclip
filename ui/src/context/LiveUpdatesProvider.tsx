@@ -314,6 +314,10 @@ function isPageForegrounded(): boolean {
   return true;
 }
 
+function isPageVisible(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "visible";
+}
+
 function resolveVisibleIssueRouteContext(
   queryClient: QueryClient,
   pathname: string,
@@ -500,17 +504,20 @@ function invalidateVisibleIssueRunQueries(
   payload: Record<string, unknown>,
   options?: VisibleRouteOptions,
 ): boolean {
-  const context = resolveVisibleIssueRouteContext(
-    queryClient,
-    pathname,
-    options,
-  );
+  // Refreshing the open issue's run queries needs a visible page, not a focused
+  // one: an unfocused window (second monitor, split screen) still shows the run,
+  // and the idle poll is slow enough that it should not be the only refresh.
+  const context = resolveVisibleIssueRouteContext(queryClient, pathname, {
+    isForegrounded: options?.isForegrounded ?? isPageVisible(),
+  });
   if (!context) return false;
 
   const runId = readString(payload.runId);
   const agentId = readString(payload.agentId);
+  const issueId = readString(payload.issueId);
   const matchesVisibleIssue =
     (runId !== null && context.runIds.has(runId)) ||
+    (issueId !== null && context.issueRefs.has(issueId)) ||
     (!!agentId &&
       !!context.assigneeAgentId &&
       agentId === context.assigneeAgentId);
