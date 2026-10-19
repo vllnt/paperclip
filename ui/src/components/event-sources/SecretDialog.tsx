@@ -13,12 +13,10 @@ import {
 } from "@/components/ui/dialog";
 import { AgentSetupPrompt } from "@/components/AgentSetupPrompt";
 import { CopyField } from "@/components/routine-triggers/WebhookFields";
-import type { EventSourceSecretMaterial } from "@/api/eventSources";
+import type { EventSource, EventSourceSecretMaterial, EventSourceWithSecret } from "@/api/eventSources";
 
-export type RevealedSecret = {
-  sourceName: string;
+export type RevealedSecret = EventSourceWithSecret & {
   reason: "created" | "rotated";
-  material: EventSourceSecretMaterial;
 };
 
 const EXAMPLE_EVENT = `{
@@ -33,9 +31,9 @@ const EXAMPLE_EVENT = `{
   "occurredAt": "2026-10-18T12:00:00Z"
 }`;
 
-export function eventSenderInstructions(sourceName: string, material: EventSourceSecretMaterial): string {
+export function eventSenderInstructions(source: EventSource, material: EventSourceSecretMaterial): string {
   const auth =
-    material.signingMode === "bearer"
+    source.signingMode === "bearer"
       ? [
           `Send the header Authorization: Bearer ${material.secret}`,
           "Bearer mode has no replay protection unless each event carries a unique eventId.",
@@ -47,8 +45,8 @@ export function eventSenderInstructions(sourceName: string, material: EventSourc
           "Requests whose timestamp is outside the replay window are rejected.",
         ];
   return [
-    `Send events to the Paperclip event source ${JSON.stringify(sourceName)}.`,
-    `Ingest URL (HTTP POST): ${material.ingestUrl}`,
+    `Send events to the Paperclip event source ${JSON.stringify(source.name)}.`,
+    `Ingest URL (HTTP POST): ${material.ingressUrl}`,
     "Content-Type: application/json, body at most 64 KB, a single JSON object.",
     ...auth,
     "Retry on 429 and 5xx with exponential backoff and honour Retry-After. Do not retry other 4xx responses.",
@@ -73,8 +71,8 @@ export function SecretDialog({
 }) {
   const [confirmed, setConfirmed] = useState(false);
   if (!revealed) return null;
-  const { material, sourceName, reason } = revealed;
-  const bearer = material.signingMode === "bearer";
+  const { secretMaterial: material, source, reason } = revealed;
+  const bearer = source.signingMode === "bearer";
   return (
     <Dialog open onOpenChange={() => {}}>
       <DialogContent
@@ -85,7 +83,7 @@ export function SecretDialog({
       >
         <DialogHeader>
           <DialogTitle>
-            {reason === "created" ? `“${sourceName}” is ready` : `New secret for “${sourceName}”`}
+            {reason === "created" ? `“${source.name}” is ready` : `New secret for “${source.name}”`}
           </DialogTitle>
           <DialogDescription>
             {reason === "created"
@@ -104,7 +102,7 @@ export function SecretDialog({
           </p>
         </div>
         <div className="space-y-4">
-          <CopyField label="Ingest URL" value={material.ingestUrl} />
+          <CopyField label="Ingest URL" value={material.ingressUrl} />
           <CopyField
             label={bearer ? "Authorization header value" : "Signing secret"}
             value={bearer ? `Bearer ${material.secret}` : material.secret}
@@ -115,7 +113,7 @@ export function SecretDialog({
             }
           />
           <AgentSetupPrompt
-            prompt={eventSenderInstructions(sourceName, material)}
+            prompt={eventSenderInstructions(source, material)}
             label="Copy sender instructions"
             title="Event sender setup"
             description="Paste this into your agent or script author. It includes the secret."

@@ -65,8 +65,8 @@ export function CompanyEventSources() {
   const [revealed, setRevealed] = useState<RevealedSecret | null>(null);
 
   const listQuery = useQuery({
-    queryKey: queryKeys.eventSources.list(selectedCompanyId ?? ""),
-    queryFn: () => eventSourcesApi.list(selectedCompanyId!),
+    queryKey: [...queryKeys.eventSources.list(selectedCompanyId ?? ""), { includeArchived: true }],
+    queryFn: () => eventSourcesApi.list(selectedCompanyId!, { includeArchived: true }),
     enabled: Boolean(selectedCompanyId),
   });
   const sources = listQuery.data ?? [];
@@ -91,7 +91,7 @@ export function CompanyEventSources() {
     await queryClient.invalidateQueries({ queryKey: queryKeys.eventSources.list(selectedCompanyId ?? "") });
   };
   const reveal = (response: EventSourceWithSecret, reason: RevealedSecret["reason"]) =>
-    setRevealed({ sourceName: response.eventSource.name, reason, material: response.secretMaterial });
+    setRevealed({ ...response, reason });
 
   const createSource = useMutation({
     mutationFn: (state: EventSourceFormState) =>
@@ -409,7 +409,7 @@ function EventSourceCard({ source, actions }: { source: EventSource; actions: So
           <Link to={`/company/settings/event-sources?source=${source.id}`}>Test &amp; deliveries</Link>
         </Button>
       </div>
-      <CopyField label="Ingest URL" value={source.ingestUrl} />
+      <CopyField label="Ingest URL" value={source.ingressUrl} />
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">{lastEventText(source)}</p>
         <SourceActionButtons source={source} actions={actions} />
@@ -433,7 +433,7 @@ function EventSourceDetail({ source, actions }: { source: EventSource; actions: 
           </div>
           <SourceActionButtons source={source} actions={actions} />
         </div>
-        <CopyField label="Ingest URL" value={source.ingestUrl} />
+        <CopyField label="Ingest URL" value={source.ingressUrl} />
         <dl className="grid gap-x-6 gap-y-1 text-sm sm:grid-cols-2">
           <DetailRow term="Secret" detail="Hidden. Rotate it to get a new one." />
           <DetailRow term="Last event" detail={lastEventText(source).replace(/^Last event /, "")} />

@@ -16,7 +16,7 @@ import {
   type EventTestResult,
 } from "@/api/eventSources";
 import { sampleTestPayload } from "@/lib/event-source-form";
-import { TEST_ACTION_META, ToneBadge } from "./meta";
+import { DeliveryStatusBadge, TEST_ACTION_META, ToneBadge } from "./meta";
 
 const selectClass = "w-full rounded-md border border-input bg-background px-3 py-2 text-sm";
 
@@ -246,13 +246,13 @@ export function TestPanel({ source }: { source: EventSource }) {
 function TestResult({ result }: { result: EventTestResult }) {
   return (
     <div aria-label="Dry run result" role="region" className="space-y-5 rounded-md border border-border p-4">
-      {result.errors.length > 0 && (
+      {result.validationErrors.length > 0 && (
         <div role="alert" className="space-y-1">
           <p className="text-sm font-medium text-destructive">
             This payload would be rejected (422)
           </p>
           <ul className="list-disc space-y-0.5 pl-5 text-sm">
-            {result.errors.map((message) => (
+            {result.validationErrors.map((message) => (
               <li key={message}>{message}</li>
             ))}
           </ul>
@@ -290,7 +290,13 @@ function TestResult({ result }: { result: EventTestResult }) {
         </div>
       )}
 
-      {result.outcome === "unrouted" && (
+      {result.wouldBe && (
+        <p className="flex items-center gap-2 text-sm">
+          Predicted delivery: <DeliveryStatusBadge status={result.wouldBe} />
+        </p>
+      )}
+
+      {result.wouldBe === "unrouted" && (
         <div
           role="status"
           className="flex items-start gap-3 rounded-md bg-muted/40 p-3 text-sm"
@@ -304,14 +310,14 @@ function TestResult({ result }: { result: EventTestResult }) {
         </div>
       )}
 
-      {result.matches.length > 0 && (
-        <MatchList title="Matched triggers" matches={result.matches} />
+      {result.matched.length > 0 && (
+        <MatchList title="Matched triggers" matches={result.matched} />
       )}
-      {result.fallbackMatches.length > 0 && (
+      {result.fallback.length > 0 && (
         <MatchList
           title="Fallback triggers"
           hint="Only used when no routine above takes the event."
-          matches={result.fallbackMatches}
+          matches={result.fallback}
         />
       )}
     </div>
@@ -337,7 +343,7 @@ function MatchList({
         {matches.map((match) => {
           const action = TEST_ACTION_META[match.action];
           return (
-            <li key={match.triggerId} className="space-y-1.5 p-3 text-sm">
+            <li key={match.routineId} className="space-y-1.5 p-3 text-sm">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <Link
                   to={`/routines/${match.routineId}/triggers`}
@@ -348,16 +354,13 @@ function MatchList({
                 <ToneBadge tone={action?.tone ?? "muted"}>{action?.label ?? match.action}</ToneBadge>
               </div>
               <p className="text-xs text-muted-foreground">
-                {match.assigneeAgentName
-                  ? `Agent: ${match.assigneeAgentName}`
-                  : match.assigneeAgentId
-                    ? "Agent assigned"
-                    : "No agent assigned"}
-                {match.issueIdentifier && (
+                {match.assigneeAgentId ? "Agent assigned" : "No agent assigned"}
+                {` · ${match.triggerIds.length} matching ${match.triggerIds.length === 1 ? "trigger" : "triggers"}`}
+                {match.issueId && (
                   <>
                     {" · "}
-                    <Link className="underline underline-offset-2" to={`/issues/${match.issueIdentifier}`}>
-                      {match.issueIdentifier}
+                    <Link className="underline underline-offset-2" to={`/issues/${match.issueId}`}>
+                      Open issue
                     </Link>
                   </>
                 )}

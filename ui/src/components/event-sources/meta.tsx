@@ -66,6 +66,11 @@ export const DELIVERY_STATUS_META: Record<
     tone: "muted",
     description: "A recovery arrived but there was no open issue to comment on.",
   },
+  rejected_aggregate: {
+    label: "Rejected requests",
+    tone: "warn",
+    description: "Rejected and duplicate requests aggregated per source per minute.",
+  },
   failed: {
     label: "Failed",
     tone: "bad",
@@ -84,15 +89,13 @@ export function DeliveryStatusBadge({ status }: { status: EventDeliveryStatus })
 
 export const TEST_ACTION_META: Record<EventTestAction, { label: string; tone: Tone }> = {
   new_issue: { label: "Opens a new issue and wakes the agent", tone: "ok" },
-  comment: { label: "Comments on the open issue and wakes the agent", tone: "ok" },
+  comment: { label: "Comments on the open issue", tone: "ok" },
+  comment_and_wake: { label: "Comments on the open issue and wakes the agent", tone: "ok" },
   silent: { label: "Counted silently, no comment or wake", tone: "muted" },
   recovery_comment: { label: "Adds a recovery comment", tone: "ok" },
   recovery_without_issue: { label: "Recovery with no open issue, nothing happens", tone: "muted" },
   storm_folded: { label: "Folded into the storm issue", tone: "warn" },
-  append_target_unavailable: {
-    label: "Append target unavailable, falls back to a group issue",
-    tone: "warn",
-  },
+  recovery_ignored: { label: "Recovery ignored, no comment or wake", tone: "muted" },
 };
 
 export function signingModeLabel(mode: EventSigningMode): string {

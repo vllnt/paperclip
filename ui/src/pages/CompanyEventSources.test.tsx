@@ -4,17 +4,17 @@ import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { EventSource } from "@/api/eventSources";
+import type { eventSourcesApi, EventSource, EventTestResult } from "@/api/eventSources";
 import { CompanyEventSources } from "./CompanyEventSources";
 
 const api = vi.hoisted(() => ({
-  list: vi.fn(),
-  create: vi.fn(),
-  update: vi.fn(),
-  archive: vi.fn(),
-  rotateSecret: vi.fn(),
-  test: vi.fn(),
-  deliveries: vi.fn(),
+  list: vi.fn<typeof eventSourcesApi.list>(),
+  create: vi.fn<typeof eventSourcesApi.create>(),
+  update: vi.fn<typeof eventSourcesApi.update>(),
+  archive: vi.fn<typeof eventSourcesApi.archive>(),
+  rotateSecret: vi.fn<typeof eventSourcesApi.rotateSecret>(),
+  test: vi.fn<typeof eventSourcesApi.test>(),
+  deliveries: vi.fn<typeof eventSourcesApi.deliveries>(),
 }));
 const copyText = vi.hoisted(() => vi.fn());
 const pushToast = vi.hoisted(() => vi.fn());
@@ -48,7 +48,7 @@ vi.mock("@/context/ToastContext", () => ({ useToastActions: () => ({ pushToast }
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const SECRET = "pcs_live_super_secret_value_123";
-const INGEST_URL = "https://paperclip.example/api/event-sources/public/abc123/events";
+const INGRESS_URL = "https://paperclip.example/api/event-sources/public/abc123/events";
 
 function makeSource(overrides: Partial<EventSource> = {}): EventSource {
   return {
@@ -58,7 +58,8 @@ function makeSource(overrides: Partial<EventSource> = {}): EventSource {
     enabled: true,
     archived: false,
     publicId: "abc123",
-    ingestUrl: INGEST_URL,
+    ingressUrl: INGRESS_URL,
+    secretId: "secret-1",
     signingMode: "hmac_sha256",
     replayWindowSec: 300,
     normalizer: "generic_v1",
@@ -67,6 +68,11 @@ function makeSource(overrides: Partial<EventSource> = {}): EventSource {
     rateLimitPerMinute: 600,
     maxNewIssuesPerHour: 20,
     retentionDays: 30,
+    lastRotatedAt: null,
+    createdByAgentId: null,
+    createdByUserId: "board",
+    updatedByAgentId: null,
+    updatedByUserId: "board",
     lastDeliveryAt: null,
     lastResult: null,
     createdAt: "2026-10-01T00:00:00Z",
@@ -80,7 +86,7 @@ let container: HTMLDivElement;
 let queryClient: QueryClient;
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
   searchParamsState.current = new URLSearchParams();
   api.list.mockResolvedValue([makeSource()]);
   api.deliveries.mockResolvedValue({ items: [], nextCursor: null });
@@ -92,6 +98,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => root.unmount());
+  queryClient.clear();
   container.remove();
   document.body.innerHTML = "";
 });
@@ -145,7 +152,7 @@ describe("event sources list", () => {
   it("lists sources with their ingest URL and state, and never a secret", async () => {
     await renderPage();
     expect(pageText()).toContain("Gatus");
-    expect(pageText()).toContain(INGEST_URL);
+    expect(pageText()).toContain(INGRESS_URL);
     expect(pageText()).toContain("Active");
     expect(pageText()).toContain("HMAC-SHA256");
     expect(pageText()).toContain("No events received yet");
@@ -165,6 +172,7 @@ describe("event sources list", () => {
   it("hides archived sources until asked", async () => {
     api.list.mockResolvedValue([makeSource(), makeSource({ id: "src-2", name: "Old relay", archived: true, enabled: false })]);
     await renderPage();
+    expect(api.list).toHaveBeenCalledWith("company-1", { includeArchived: true });
     expect(pageText()).not.toContain("Old relay");
     await click(document.body.querySelector("#show-archived-sources")!);
     expect(pageText()).toContain("Old relay");
@@ -175,8 +183,8 @@ describe("event sources list", () => {
 describe("creating a source and the one-time secret", () => {
   async function createSource() {
     api.create.mockResolvedValue({
-      eventSource: makeSource({ id: "src-new", name: "Upkeep relay" }),
-      secretMaterial: { ingestUrl: INGEST_URL, secret: SECRET, signingMode: "hmac_sha256" },
+      source: makeSource({ id: "src-new", name: "Upkeep relay" }),
+      secretMaterial: { ingressUrl: INGRESS_URL, secret: SECRET },
     });
     await renderPage();
     await click(findButton("New event source"));
@@ -201,7 +209,7 @@ describe("creating a source and the one-time secret", () => {
     );
     expect(pageText()).toContain("is ready");
     expect(pageText()).toContain(SECRET);
-    expect(pageText()).toContain(INGEST_URL);
+    expect(pageText()).toContain(INGRESS_URL);
     expect(pageText()).toContain("Copy the secret now.");
     expect(pageText()).toContain("shown only once");
 
@@ -232,8 +240,8 @@ describe("creating a source and the one-time secret", () => {
 
   it("shows a bearer token as an Authorization header value", async () => {
     api.create.mockResolvedValue({
-      eventSource: makeSource({ id: "src-b", name: "Gatus", signingMode: "bearer" }),
-      secretMaterial: { ingestUrl: INGEST_URL, secret: SECRET, signingMode: "bearer" },
+      source: makeSource({ id: "src-b", name: "Gatus", signingMode: "bearer" }),
+      secretMaterial: { ingressUrl: INGRESS_URL, secret: SECRET },
     });
     await renderPage();
     await click(findButton("New event source"));
@@ -255,10 +263,10 @@ describe("creating a source and the one-time secret", () => {
 });
 
 describe("rotating, disabling and archiving", () => {
-  it("confirms before rotating, then shows the new secret once", async () => {
+  it.each(["hmac_sha256", "bearer"] as const)("confirms before rotating %s, then shows the new secret once", async (signingMode) => {
     api.rotateSecret.mockResolvedValue({
-      eventSource: makeSource(),
-      secretMaterial: { ingestUrl: INGEST_URL, secret: SECRET, signingMode: "hmac_sha256" },
+      source: makeSource({ signingMode }),
+      secretMaterial: { ingressUrl: INGRESS_URL, secret: SECRET },
     });
     await renderPage();
     await click(findButton("Rotate secret"));
@@ -271,11 +279,27 @@ describe("rotating, disabling and archiving", () => {
     await click(confirm);
     expect(api.rotateSecret).toHaveBeenCalledWith("src-1");
     expect(pageText()).toContain("New secret for");
-    expect(pageText()).toContain(SECRET);
+    expect(pageText()).toContain(INGRESS_URL);
+    expect(pageText()).toContain(signingMode === "bearer" ? `Bearer ${SECRET}` : SECRET);
+    expect(pageText()).toContain(signingMode === "bearer" ? "Authorization header value" : "Signing secret");
 
     await click(document.body.querySelector("#event-source-secret-saved")!);
     await click(findButton("Done"));
     expect(pageText()).not.toContain(SECRET);
+  });
+
+
+  it("surfaces rotation failure without showing a secret", async () => {
+    api.rotateSecret.mockRejectedValue(new Error("Rotation unavailable"));
+    await renderPage();
+    await click(findButton("Rotate secret"));
+    const confirm = [...document.body.querySelectorAll('[role="alertdialog"] button')].find(
+      (item) => item.textContent?.trim() === "Rotate secret",
+    )!;
+    await click(confirm);
+    expect(pageText()).toContain("Rotation unavailable");
+    expect(pageText()).not.toContain(SECRET);
+    expect(pageText()).not.toContain("New secret for");
   });
 
   it("does not rotate when the confirmation is cancelled", async () => {
@@ -287,7 +311,7 @@ describe("rotating, disabling and archiving", () => {
   });
 
   it("archives after confirmation", async () => {
-    api.archive.mockResolvedValue(undefined);
+    api.archive.mockResolvedValue(makeSource({ archived: true, enabled: false }));
     await renderPage();
     await click(findButton("Archive"));
     expect(api.archive).not.toHaveBeenCalled();
@@ -309,7 +333,8 @@ describe("rotating, disabling and archiving", () => {
 });
 
 describe("source detail: test send and deliveries", () => {
-  const dryRun = {
+  // PR144 service.dryRun returns one result per routine, with all matching trigger IDs.
+  const dryRun: EventTestResult = {
     event: {
       source: "upkeep",
       type: "disk.usage",
@@ -318,22 +343,25 @@ describe("source detail: test send and deliveries", () => {
       dedupeKey: "example-host/disk.usage:/",
       title: "example-worker: / at 93%",
       labels: { host_id: "example-host" },
+      eventId: null,
+      summary: "",
+      occurredAt: "2026-10-18T10:00:00Z",
+      url: null,
     },
-    errors: [],
-    outcome: "dispatched",
-    matches: [
+    validationErrors: [],
+    wouldBe: "dispatched",
+    matched: [
       {
-        triggerId: "t1",
+        triggerIds: ["t1", "t2"],
         routineId: "r1",
         routineTitle: "Disk watch",
         assigneeAgentId: "a1",
-        assigneeAgentName: "Hawkeye",
-        fallback: false,
+        issueId: null,
         groupKey: "upkeep:example-host/disk.usage:/",
         action: "new_issue",
       },
     ],
-    fallbackMatches: [],
+    fallback: [],
   };
 
   beforeEach(() => {
@@ -353,13 +381,15 @@ describe("source detail: test send and deliveries", () => {
     const result = document.body.querySelector('[aria-label="Dry run result"]')!;
     expect(result.textContent).toContain("Matched triggers");
     expect(result.textContent).toContain("Disk watch");
-    expect(result.textContent).toContain("Agent: Hawkeye");
+    expect(result.textContent).toContain("Agent assigned");
+    expect(result.textContent).toContain("2 matching triggers");
+    expect(result.querySelectorAll("li")).toHaveLength(1);
     expect(result.textContent).toContain("upkeep:example-host/disk.usage:/");
     expect(result.textContent).toContain("Opens a new issue and wakes the agent");
   });
 
   it("explains an unrouted event", async () => {
-    api.test.mockResolvedValue({ ...dryRun, matches: [], outcome: "unrouted" });
+    api.test.mockResolvedValue({ ...dryRun, matched: [], wouldBe: "unrouted" });
     await renderPage();
     await click(findButton("Run dry run"));
     expect(pageText()).toContain("Unrouted.");
@@ -367,11 +397,97 @@ describe("source detail: test send and deliveries", () => {
   });
 
   it("lists validation errors from the dry run", async () => {
-    api.test.mockResolvedValue({ event: null, errors: ["severity must be one of info, warning, critical"], matches: [], fallbackMatches: [], outcome: "invalid" });
+    api.test.mockResolvedValue({ event: null, validationErrors: ["severity must be one of info, warning, critical"], matched: [], fallback: [], wouldBe: "invalid" });
     await renderPage();
     await click(findButton("Run dry run"));
     expect(pageText()).toContain("would be rejected (422)");
     expect(pageText()).toContain("severity must be one of");
+  });
+
+
+  it.each([
+    ["new_issue", "dispatched", "Opens a new issue and wakes the agent", "Dispatched"],
+    ["comment", "dispatched", "Comments on the open issue", "Dispatched"],
+    ["comment_and_wake", "dispatched", "Comments on the open issue and wakes the agent", "Dispatched"],
+    ["silent", "grouped_silent", "Counted silently, no comment or wake", "Grouped"],
+    ["recovery_comment", "dispatched", "Adds a recovery comment", "Dispatched"],
+    ["recovery_without_issue", "recovery_without_issue", "Recovery with no open issue, nothing happens", "Recovery, no issue"],
+    ["recovery_ignored", "recovery_without_issue", "Recovery ignored, no comment or wake", "Recovery, no issue"],
+    ["storm_folded", "storm_folded", "Folded into the storm issue", "Storm folded"],
+  ] as const)("shows the %s action and predicted delivery status", async (action, wouldBe, label, status) => {
+    api.test.mockResolvedValue({
+      ...dryRun,
+      wouldBe,
+      matched: [{ ...dryRun.matched[0], action, issueId: "issue-1" }],
+    });
+    await renderPage();
+    await click(findButton("Run dry run"));
+    const result = document.body.querySelector('[aria-label="Dry run result"]')!;
+    expect(result.textContent).toContain(label);
+    expect(result.textContent).toContain(`Predicted delivery: ${status}`);
+    expect(result.querySelector('a[href="/issues/issue-1"]')).not.toBeNull();
+  });
+
+  it("shows fallback routines when no regular routine matches", async () => {
+    api.test.mockResolvedValue({
+      ...dryRun,
+      matched: [],
+      fallback: [{ ...dryRun.matched[0], routineTitle: "Fallback watch", triggerIds: ["fallback-1"], assigneeAgentId: null }],
+    });
+    await renderPage();
+    await click(findButton("Run dry run"));
+    const result = document.body.querySelector('[aria-label="Dry run result"]')!;
+    expect(result.textContent).toContain("Fallback triggers");
+    expect(result.textContent).toContain("Fallback watch");
+    expect(result.textContent).toContain("1 matching trigger");
+    expect(result.textContent).toContain("No agent assigned");
+    expect(result.textContent).not.toContain("Unrouted.");
+    expect(result.textContent).not.toContain("Matched triggers");
+  });
+
+  it("surfaces a dry-run request failure and can retry", async () => {
+    api.test.mockRejectedValueOnce(new Error("Source unavailable"));
+    api.test.mockResolvedValueOnce(dryRun);
+    await renderPage();
+    await click(findButton("Run dry run"));
+    expect(pageText()).toContain("Source unavailable");
+    expect(document.body.querySelector('[aria-label="Dry run result"]')).toBeNull();
+    await click(findButton("Run dry run"));
+    expect(pageText()).not.toContain("Source unavailable");
+    expect(pageText()).toContain("Disk watch");
+  });
+
+  it("renders and filters aggregate rejected deliveries", async () => {
+    api.deliveries.mockResolvedValue({
+      items: [{
+        id: "rejected-1", companyId: "company-1", sourceId: "src-1", status: "rejected_aggregate",
+        receivedAt: "2026-10-18T10:00:00Z", claimedAt: null, httpStatus: null, latencyMs: null,
+        attempts: 0, event: null, matchedTriggerIds: [], routineRunIds: [], issueIds: [],
+        routineOutcomes: {}, error: null, rejectCounts: { unauthorized: 3, duplicate: 2 },
+        firstIp: null, lastIp: null,
+      }],
+      nextCursor: null,
+    });
+    await renderPage();
+    const select = [...document.body.querySelectorAll("select")].find((item) =>
+      [...item.options].some((option) => option.value === "invalid"),
+    )!;
+    expect([...select.options].map((option) => option.value)).toEqual([
+      "all", "processing", "dispatched", "grouped_silent", "invalid", "unrouted", "storm_folded",
+      "recovery_without_issue", "failed", "rejected_aggregate",
+    ]);
+    await setValue(select, "rejected_aggregate");
+    await flush();
+    expect(api.deliveries).toHaveBeenLastCalledWith("src-1", expect.objectContaining({ status: "rejected_aggregate" }));
+    await click(document.body.querySelector('button[aria-label="Show delivery details"]')!);
+    expect(pageText()).toContain("unauthorized: 3");
+    expect(pageText()).toContain("duplicate: 2");
+  });
+
+  it("surfaces delivery loading errors", async () => {
+    api.deliveries.mockRejectedValue(new Error("Could not fetch delivery history"));
+    await renderPage();
+    expect(pageText()).toContain("Could not fetch delivery history");
   });
 
   it("rejects a malformed raw JSON payload locally", async () => {
@@ -394,7 +510,12 @@ describe("source detail: test send and deliveries", () => {
       items: [
         {
           id: "d1",
+          companyId: "company-1",
           sourceId: "src-1",
+          claimedAt: null,
+          rejectCounts: null,
+          firstIp: null,
+          lastIp: null,
           status: "dispatched",
           receivedAt: "2026-10-18T10:00:00Z",
           httpStatus: 202,

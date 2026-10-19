@@ -30,6 +30,7 @@ let queryClient: QueryClient;
 function group(overrides: Partial<EventGroup> = {}): EventGroup {
   return {
     id: "g1",
+    companyId: "company-1",
     routineId: "routine-1",
     fingerprint: "upkeep:example-host/disk.usage:/",
     issueId: "issue-uuid-1",

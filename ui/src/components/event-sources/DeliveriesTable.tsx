@@ -41,8 +41,8 @@ export function DeliveriesTable({ sourceId }: { sourceId: string }) {
             Deliveries
           </h2>
           <p className="text-sm text-muted-foreground">
-            One row per authenticated event. Rejected and duplicate requests are counted, not
-            listed.
+            One row per authenticated event. Rejected and duplicate requests are grouped into
+            one summary per minute.
           </p>
         </div>
         <div className="space-y-1">
@@ -168,9 +168,9 @@ function DeliveryRow({
         <td className="max-w-xs px-3 py-2 align-top">
           {delivery.event ? (
             <>
-              <p className="truncate font-medium">{delivery.event.title}</p>
+              <p className="truncate font-medium">{typeof delivery.event.title === "string" ? delivery.event.title : "—"}</p>
               <p className="truncate font-mono text-xs text-muted-foreground">
-                {delivery.event.source} · {delivery.event.type} · {delivery.event.state}
+                {typeof delivery.event.source === "string" ? delivery.event.source : "—"} · {typeof delivery.event.type === "string" ? delivery.event.type : "—"} · {typeof delivery.event.state === "string" ? delivery.event.state : "—"}
               </p>
             </>
           ) : (
@@ -190,6 +190,13 @@ function DeliveryRow({
               {DELIVERY_STATUS_META[delivery.status]?.description} Attempts: {delivery.attempts}.
             </p>
             {delivery.error && <p className="text-xs text-destructive">{delivery.error}</p>}
+            {delivery.rejectCounts && (
+              <ul className="space-y-1 text-xs">
+                {Object.entries(delivery.rejectCounts).map(([outcome, count]) => (
+                  <li key={outcome}>{outcome}: {count}</li>
+                ))}
+              </ul>
+            )}
             {outcomes.length > 0 && (
               <ul className="space-y-1 text-xs">
                 {outcomes.map(([routineId, outcome]) => (
@@ -200,6 +207,7 @@ function DeliveryRow({
                     : {outcome.status}
                     {outcome.failureClass ? ` (${outcome.failureClass})` : ""}
                     {outcome.error ? ` — ${outcome.error}` : ""}
+                    {outcome.note ? ` — ${outcome.note}` : ""}
                   </li>
                 ))}
               </ul>
