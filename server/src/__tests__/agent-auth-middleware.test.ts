@@ -109,6 +109,9 @@ function createApp(db: any, deploymentMode: "authenticated" | "local_trusted" = 
   app.post("/api/routine-triggers/public/:publicId/fire", (req, res) => {
     res.json({ reachedWebhook: true, actorType: req.actor.type });
   });
+  app.post("/api/event-sources/public/:publicId/events", (req, res) => {
+    res.json({ reachedEventIngress: true, actorType: req.actor.type });
+  });
   app.post("/mcp/gateways/:gatewayPublicId", (req, res) => {
     res.json({ reachedGatewayProtocol: true, actorType: req.actor.type });
   });
@@ -257,6 +260,30 @@ describe("agent auth middleware", () => {
   ])("does not bypass actor authentication for %s", async (path) => {
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
     const res = await request(createApp(db)).post(path).set("Authorization", "Bearer routine-secret");
+    expect(res.status).toBe(401);
+  });
+
+  it.each(["authenticated", "local_trusted"] as const)(
+    "leaves event-source authentication to the source secret in %s mode",
+    async (deploymentMode) => {
+      const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+      const res = await request(createApp(db, deploymentMode))
+        .post("/api/event-sources/public/evs_aBcD-1234_xyz/events")
+        .set("Authorization", "Bearer source-secret")
+        .send({ type: "uptime.down" });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ reachedEventIngress: true, actorType: "none" });
+    },
+  );
+
+  it.each([
+    "/api/event-sources/public/evs_aBcD-1234_xyz/events/extra",
+    "/api/event-sources/public/evs_aBcD-1234_xyz/rotate-secret",
+    "/api/event-sources/public/bad%20id/events",
+    `/api/event-sources/public/${"a".repeat(65)}/events`,
+  ])("does not bypass actor authentication for %s", async (path) => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    const res = await request(createApp(db)).post(path).set("Authorization", "Bearer source-secret");
     expect(res.status).toBe(401);
   });
 
