@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { planCodexToGrokSwitch } from "@paperclipai/adapter-grok-local";
 import type { ServerAdapterModule } from "../adapters/index.js";
 
 const mockAgentService = vi.hoisted(() => ({
@@ -566,6 +567,32 @@ describe("agent routes adapter validation", () => {
     );
   });
 
+  it.each([
+    { name: "no model", adapterConfig: {} },
+    { name: "the grok-build placeholder", adapterConfig: { model: "grok-build" } },
+    { name: "a non-Grok model", adapterConfig: { model: "claude-3-5-haiku" } },
+  ])("fails the grok_local environment test with a fix hint for $name behind a gateway", async ({ adapterConfig }) => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/adapters/grok_local/test-environment")
+        .send({
+          adapterConfig: {
+            cwd: os.tmpdir(),
+            ...adapterConfig,
+            env: { GROK_XAI_API_BASE_URL: "https://gateway.example/v1" },
+          },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.status).toBe("fail");
+    const check = res.body.checks.find((entry: { code: string }) => entry.code === "grok_gateway_model_required");
+    expect(check).toMatchObject({ level: "error" });
+    expect(check.hint).toContain("grok-4.7");
+    expect(JSON.stringify(res.body)).not.toContain("gateway.example");
+  });
+
   it("rejects redacted-value restoration from an incompatible saved agent", async () => {
     const { registerServerAdapter } = await import("../adapters/index.js");
     registerServerAdapter(externalAdapter);
@@ -759,6 +786,94 @@ describe("agent routes adapter validation", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("applies the codex_local to grok_local switch plan, keeping the model, instructions and skills and dropping the Codex env", async () => {
+    const secret = { type: "secret_ref", secretId: "11111111-1111-4111-8111-111111111111", version: "latest" };
+    const existing = await mockAgentService.getById();
+    const codexAgent = {
+      ...existing,
+      adapterType: "codex_local",
+      adapterConfig: {
+        model: "grok-4.7",
+        modelReasoningEffort: "xhigh",
+        cwd: "/work/app",
+        instructionsFilePath: "/work/app/AGENTS.md",
+        paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/paperclip"] },
+        env: {
+          OPENAI_API_KEY: secret,
+          OPENAI_BASE_URL: { type: "plain", value: "https://proxy.example/v1" },
+          CODEX_HOME: { type: "plain", value: "/var/codex" },
+        },
+        search: true,
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(codexAgent);
+    const plan = planCodexToGrokSwitch(codexAgent);
+    if (!plan.ok) throw new Error(plan.message);
+    const app = await createApp();
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send(plan.patch),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, patch] = mockAgentService.update.mock.calls.at(-1)!;
+    expect(patch.adapterType).toBe("grok_local");
+    expect(patch.adapterConfig).toMatchObject({
+      model: "grok-4.7",
+      reasoningEffort: "xhigh",
+      cwd: "/work/app",
+      instructionsFilePath: "/work/app/AGENTS.md",
+      paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/paperclip"] },
+      env: { XAI_API_KEY: secret, GROK_XAI_API_BASE_URL: { type: "plain", value: "https://proxy.example/v1" } },
+    });
+    expect(Object.keys(patch.adapterConfig.env)).not.toContain("OPENAI_API_KEY");
+    expect(Object.keys(patch.adapterConfig.env)).not.toContain("CODEX_HOME");
+    expect(patch.adapterConfig).not.toHaveProperty("search");
+    expect(patch.adapterConfig).not.toHaveProperty("modelReasoningEffort");
+  });
+
+  it("keeps a plain env value under the same key when the plan was built from the redacted agent the API returns", async () => {
+    const existing = await mockAgentService.getById();
+    const stored = {
+      ...existing,
+      adapterType: "codex_local",
+      adapterConfig: { model: "grok-4.7", env: { TEAM_REGION: { type: "plain", value: "eu-west-1" } } },
+    };
+    mockAgentService.getById.mockResolvedValue(stored);
+    const redactedView = {
+      adapterType: "codex_local",
+      adapterConfig: { model: "grok-4.7", env: { TEAM_REGION: { type: "plain", value: "***REDACTED***" } } },
+    };
+    const plan = planCodexToGrokSwitch(redactedView);
+    if (!plan.ok) throw new Error(plan.message);
+    expect(plan.patch.adapterConfig.env).toEqual({ TEAM_REGION: { type: "plain", value: "***REDACTED***" } });
+    const app = await createApp();
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send(plan.patch),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const [, patch] = mockAgentService.update.mock.calls.at(-1)!;
+    expect(patch.adapterConfig.env).toEqual({ TEAM_REGION: { type: "plain", value: "eu-west-1" } });
+  });
+
+  it("refuses the switch to grok_local when the instance has disabled that adapter", async () => {
+    mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue(["grok_local"]);
+    const existing = await mockAgentService.getById();
+    mockAgentService.getById.mockResolvedValue({ ...existing, adapterType: "codex_local", adapterConfig: { model: "grok-4.7" } });
+    const app = await createApp();
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterType: "grok_local", replaceAdapterConfig: true, adapterConfig: { model: "grok-4.7", env: {} } }),
+    );
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("not available on this instance");
   });
 
   it("uses the Codex default when a codex_local conversion has no model", async () => {
