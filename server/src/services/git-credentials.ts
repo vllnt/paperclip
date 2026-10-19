@@ -53,6 +53,10 @@ export type GitCredential = {
   identitySource?: "personal" | "dedicated";
   connectionId?: string;
   grantId?: string;
+  /** The secret that holds the token, so a cached answer can check that it is still active. */
+  accessSecretId?: string;
+  /** When the token expires (epoch milliseconds), when the grant says so. */
+  expiresAt?: number;
 };
 
 /** A prepared, credential-bearing git invocation: config args plus the env that carries the token. */
@@ -555,6 +559,9 @@ export async function resolveManagedGitHubCredential(
         identitySource: grant.kind === "agent" ? "dedicated" as const : "personal" as const,
         connectionId: grant.connectionId,
         grantId: grant.id,
+        accessSecretId: accessRef.secretId,
+        ...(Number.isFinite(Date.parse(String(grant.providerTenant?.oauth?.accessTokenExpiresAt ?? "")))
+          ? { expiresAt: Date.parse(String(grant.providerTenant?.oauth?.accessTokenExpiresAt)) } : {}),
       },
     };
   };

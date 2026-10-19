@@ -91,6 +91,18 @@ const dateOf = (res: Response) => typeof res.headers?.get === "function" ? res.h
 /** A response that moves the learned clock by more than this was answered to a JWT dated by the old clock. */
 const JWT_RESIGN_MS = 30_000;
 
+/**
+ * The one request this plugin sends without credentials: GitHub's one-time App manifest conversion, whose code is its only
+ * authentication. It is a POST to the conversion path whose body is exactly `{}`. GitHub allows 60 unauthenticated
+ * requests an hour per IP address, and everything behind one egress IP shares them, so any other request without a token is
+ * refused here, whatever the caller meant (a missing, empty or blank token, another method, or another body on that path).
+ * The body is judged as the string that is sent: a Date, a `toJSON` that is not an own key, or a Proxy can look empty to a check
+ * on the object and still serialize to content.
+ */
+const UNAUTHENTICATED_PATH = /^\/app-manifests\/[A-Za-z0-9_-]{10,200}\/conversions$/;
+const isManifestConversion = (verb: string, path: string, payload: string | undefined) =>
+  verb === "POST" && UNAUTHENTICATED_PATH.test(path) && payload === "{}";
+
 export class GitHubClient {
   /** GitHub's clock, learned from every response: App JWTs and token expiry follow it, not this host's clock. */
   readonly clock = new GitHubClock();
@@ -137,15 +149,19 @@ export class GitHubClient {
   }
   async request<T>(path: string, token?: string, body?: unknown, method?: "POST" | "PATCH" | "PUT" | "DELETE"): Promise<{ data: T; next: boolean }> {
     if (!path.startsWith("/") || path.startsWith("//")) throw new Error("Invalid GitHub path.");
+    const verb = method ?? (body === undefined ? "GET" : "POST");
+    // Serialize once: the credential decision and the request use this one string, never the object again.
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    if (!token?.trim() && !isManifestConversion(verb, path, payload)) throw new Error("Paperclip does not call GitHub without credentials.");
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 20_000);
     const startedAt = this.clock.started();
     try {
       const res = await this.fetchImpl(`https://api.github.com${path}`, {
-        method: method ?? (body === undefined ? "GET" : "POST"), redirect: "error", signal: abort.signal,
+        method: verb, redirect: "error", signal: abort.signal,
         headers: { Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "paperclip-github-plugin",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+          ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(payload === undefined ? {} : { "Content-Type": "application/json" }) },
+        ...(payload === undefined ? {} : { body: payload })
       });
       this.clock.observe(dateOf(res), startedAt);
       if (!res.ok) { await res.body?.cancel(); throw new GitHubError(res.status); }

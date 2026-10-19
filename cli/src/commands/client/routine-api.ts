@@ -39,7 +39,7 @@ export function registerRoutineApiCommands(program: Command): void {
   );
   addCompanyPost(routine, "create", "Create a routine", "routines");
   addIdGet(routine, "get", "Get a routine", "routines");
-  addIdPatch(routine, "update", "Update a routine", "routines");
+  addIdPatch(routine, "update", "Update a routine (payload may set runContextPolicy)", "routines");
   addIdGet(routine, "revisions", "List routine revisions", "routines", "revisions");
   addCommonClientOptions(
     routine
