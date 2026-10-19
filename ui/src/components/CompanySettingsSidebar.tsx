@@ -5,6 +5,7 @@ import {
   Cpu,
   Download,
   FlaskConical,
+  Globe,
   Gauge,
   KeyRound,
   MonitorCog,
@@ -136,6 +137,7 @@ export function CompanySettingsSidebar() {
           {showPage("company.secrets") && (
             <SidebarNavItem to="/company/settings/secrets" label="Secrets" icon={KeyRound} end />
           )}
+          <SidebarNavItem to="/company/settings/browser" label="Shared browser" icon={Globe} end />
           <SidebarNavItem
             to="/company/settings/event-sources"
             label="Event sources"
