@@ -55,10 +55,10 @@ server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
-server/src/__tests__/ssh-remote-process-stop-events.test.ts
-server/src/__tests__/ssh-remote-process-stop.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
+server/src/__tests__/ssh-remote-process-stop-events.test.ts
+server/src/__tests__/ssh-remote-process-stop.test.ts
 server/src/__tests__/ssh-run-directory-reaper-settings.test.ts
 server/src/services/heartbeat-remote-run-temp.test.ts
 server/src/shutdown-budget.test.ts
