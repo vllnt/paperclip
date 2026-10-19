@@ -2,6 +2,7 @@ import { runContextPolicySchema } from "../run-context.js";
 import { z } from "zod";
 import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
+import { routineGateSchema } from "../routine-gate.js";
 import {
   ISSUE_PRIORITIES,
   ROUTINE_ACTIVITY_GATE_POLICIES,
@@ -125,6 +126,8 @@ export const createRoutineSchema = z.object({
   env: envConfigSchema.optional().nullable(),
   automationWakeSettings: automationWakeSettingsSchema.optional(),
   routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
+  /** Board only: the route rejects it from any other actor. */
+  gate: routineGateSchema.optional().nullable(),
   runContextPolicy: runContextPolicySchema.optional().nullable(),
 });
 
@@ -157,6 +160,8 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   runContextPolicy: runContextPolicySchema.optional(),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
+  // Present only on gated routines, so snapshots of every other routine keep their exact stored shape.
+  gate: routineGateSchema.nullable().optional(),
 }).strict();
 
 export const routineRevisionSnapshotTriggerV1Schema = z.object({

@@ -50,6 +50,10 @@ export const EVENT_REJECT_OUTCOMES = [
 export type EventRejectOutcome = (typeof EVENT_REJECT_OUTCOMES)[number];
 
 export const EVENT_ROUTINE_OUTCOME_STATUSES = [
+  // The routine's gate script is queued or running; the outcome settles when it commits.
+  "gating",
+  // The gate script decided there was nothing to do (or the trigger was disabled while it ran).
+  "gate_skipped",
   "issue_created",
   "grouped",
   "grouped_silent",
