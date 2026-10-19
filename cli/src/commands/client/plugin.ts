@@ -866,13 +866,13 @@ function addPluginBridgeKeyPost(parent: Command, name: string, description: stri
       .description(description)
       .argument("<pluginId>", "Plugin ID or key")
       .argument("<key>", "Endpoint or data/action key")
-      .requiredOption("-C, --company-id <id>", "Company ID")
+      .option("-C, --company-id <id>", "Company ID (default: the CLI context company)")
       .option("--params-json <json>", "JSON action/data params")
       .option("--params-file <path>", "Read JSON action/data params from a file")
       .option("--payload-json <json>", "Legacy complete request body", "{}")
       .action(async (pluginId: string, key: string, opts: PluginCompanyOptions) => {
         try {
-          const ctx = resolveCommandContext(opts);
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
           const hasParams = opts.paramsJson !== undefined || opts.paramsFile !== undefined;
           const payload = parseJson(opts.payloadJson ?? "{}");
           if (!hasParams && payload && typeof payload === "object" && !Array.isArray(payload)
