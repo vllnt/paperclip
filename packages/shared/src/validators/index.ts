@@ -427,6 +427,7 @@ export {
 
 export {
   createIssueSchema,
+  isValidExistingBranchName,
   setIssueTitleSchema,
   type SetIssueTitle,
   createIssueInputSchema,

@@ -211,6 +211,8 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       ...(parsed.data.companyEnvironmentDefaults ? { companyEnvironmentDefaults: parsed.data.companyEnvironmentDefaults } : {}),
       ...(parsed.data.routineGateRepos ? { routineGateRepos: parsed.data.routineGateRepos } : {}),
       ...(parsed.data.companyRunTiers ? { companyRunTiers: parsed.data.companyRunTiers } : {}),
+      // Absent => off; only carry through an explicit choice.
+      ...(parsed.data.gitStatusAutomation !== undefined ? { gitStatusAutomation: parsed.data.gitStatusAutomation } : {}),
     };
   }
   return {
