@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { ADAPTER_AGNOSTIC_KEYS } from "@paperclipai/shared";
-import { normalizeAgentPermissions } from "./agent-permissions.js";
+import { normalizeAgentPermissions } from "../lib/agent-permissions.js";
 
 /**
  * Agent fields that bound how much an agent may run and spend, where it runs,

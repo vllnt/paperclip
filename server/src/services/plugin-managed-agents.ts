@@ -24,7 +24,7 @@ import { approvalService } from "./approvals.js";
 import { logActivity } from "./activity-log.js";
 import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
 import { authorizationService } from "./authorization.js";
-import { normalizeAgentPermissions } from "./agent-permissions.js";
+import { normalizeAgentPermissions } from "../lib/agent-permissions.js";
 import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import {
   collectAgentPermissionChanges,

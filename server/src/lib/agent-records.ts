@@ -4,7 +4,7 @@ import { agents, costEvents, type Db } from "@paperclipai/db";
 import {
   agentAppearanceSchema, resolveAgentAppearance, agentAvatarUrl,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS, agentFallbacksSchema, agentRuntimeConfigSchema, getAgentWorkEligibility,
-  normalizeAgentUrlKey, type AgentEligibilityAgent, type AgentRunnerChoice,
+  normalizeAgentUrlKey, type AgentEligibilityAgent, type AgentFallbackTarget, type AgentRunnerChoice,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
@@ -348,6 +348,8 @@ export function agentRecordQueries(db: Db) {
     return withUrlKey({
       ...publicRow,
       permissions: normalizeAgentPermissions(row.permissions),
+      // Validated by agentFallbacksSchema on every write; the column is typed as plain records.
+      fallbacks: row.fallbacks as AgentFallbackTarget[],
     });
   }
 

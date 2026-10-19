@@ -147,7 +147,7 @@ import {
 } from "../services/agent-self-config-authz.js";
 import { assertAgentProtectedChangeGranted, type AgentProtectedChangeSurface } from "./agent-protected-change-guard.js";
 import { configPatchFromSnapshot } from "../services/agents.js";
-import { normalizeAgentPermissions } from "../services/agent-permissions.js";
+import { normalizeAgentPermissions } from "../lib/agent-permissions.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 
