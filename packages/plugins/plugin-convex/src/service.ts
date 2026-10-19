@@ -529,6 +529,16 @@ export class ConvexService {
     /** Delete a preview of an open pull request because this newer preview of the same pull request exists. Only the reaper passes it. */
     supersededBy?: { name: string; pr: number };
   }) {
+    if (options.supersededBy) {
+      ({ config, reserved } = await this.requireConnected(actor.companyId));
+      if (!options.dryRun && !config.reaper.enabled) throw new Refusal("The reaper policy is disabled, so the preview was kept.");
+      if (options.scope) {
+        const scope = config.projects.map((project, index) => ({ project, index }))
+          .find(item => item.project.convexProjectId === options.scope!.project.convexProjectId);
+        if (!scope) throw new Refusal("This Convex project was removed from the company's mapping, so the preview was kept.");
+        options = { ...options, scope };
+      }
+    }
     if (!options.dryRun && !config.guards.dryRunOnly) {
       if (options.budget && options.budget.left <= 0) throw new Refusal(`Deletion limit of ${options.budget.max} reached for this run.`);
       await this.requireRunAllowance(actor, config.guards.maxDeletesPerRun);

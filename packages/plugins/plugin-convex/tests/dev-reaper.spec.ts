@@ -249,6 +249,23 @@ describe("superseded previews of open pull requests", () => {
     expect(f.convex.deletes()).toHaveLength(0);
   });
 
+  it.each([
+    ["minimum age increased", { supersededMinAgeMinutes: 1_440 }],
+    ["template removed", { ciPreviewTemplate: null }],
+    ["reaper disabled", { enabled: false }],
+  ])("keeps a superseded preview when the current policy changed: %s", async (_label, change) => {
+    const f = await setup({ configs: { [COMPANY_A]: withPattern({ supersededMinAgeMinutes: 60 }) } });
+    f.convex.add(ci(4320, 100, 1, 1, 5), ci(4320, 101, 1, 1, 2));
+    f.github.pulls.push({ number: 4320, ref: "feature/x" });
+    const { service } = f.runtime;
+    const { config: planned, reserved } = await service.requireConnected(COMPANY_A);
+    f.configs[COMPANY_A] = withPattern(change);
+    await expect(service.deletePreview({ kind: "reaper", companyId: COMPANY_A }, planned, reserved,
+      "pr4320-run100-s1-a1", { dryRun: false, requireReapEvidence: true, supersededBy: { name: "pr4320-run101-s1-a1", pr: 4320 } },
+    )).rejects.toThrow(/recent|newer|disabled|No closed pull request/i);
+    expect(f.convex.deletes()).toHaveLength(0);
+  });
+
   it("does nothing about open pull requests when no pattern is configured", async () => {
     const f = await setup({ configs: { [COMPANY_A]: config() } });
     // Within the idle window, so only the superseded rule could remove the older one, and it needs a pattern.
@@ -404,7 +421,7 @@ describe("review fixes (PR #46)", () => {
     const { config: cfg, reserved } = await service.requireConnected(COMPANY_A);
     const reaper = { kind: "reaper" as const, companyId: COMPANY_A };
     // Redeployed six minutes ago: in use, so not deleted even though the plan once called it superseded.
-    await expect(service.deletePreview(reaper, cfg, reserved, "pr4320-run100-s1-a1", { dryRun: false, supersededBy: { name: "pr4320-run101-s1-a1", pr: 4320 } })).rejects.toThrow(/idle|recent|in use/i);
+    await expect(service.deletePreview(reaper, cfg, reserved, "pr4320-run100-s1-a1", { dryRun: false, requireReapEvidence: true, supersededBy: { name: "pr4320-run101-s1-a1", pr: 4320 } })).rejects.toThrow(/idle|recent|in use/i);
     // The "newer" preview is really older (run 90): not a replacement.
     await expect(service.deletePreview(reaper, cfg, reserved, "pr4320-run101-s1-a1", { dryRun: false, supersededBy: { name: "pr4320-run90-s1-a1", pr: 4320 } })).rejects.toThrow(/newer preview/i);
     expect(f.convex.deletes()).toHaveLength(0);
