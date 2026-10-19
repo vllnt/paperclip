@@ -1022,18 +1022,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
-      const providerQuota =
-        !loginMeta.requiresLogin &&
-        (proc.exitCode ?? 0) !== 0 &&
-        isClaudeProviderQuotaError({
-          parsed: null,
-          stdout: proc.stdout,
-          stderr: proc.stderr,
-          errorMessage: fallbackErrorMessage,
-        });
+      // Without a result event there is no structured provider error, so this
+      // path never reports provider_quota.
       const transientUpstream =
         !loginMeta.requiresLogin &&
-        !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
           parsed: null,
@@ -1041,7 +1033,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
-      const transientRetryNotBefore = providerQuota || transientUpstream
+      const transientRetryNotBefore = transientUpstream
         ? extractClaudeRetryNotBefore({
             parsed: null,
             stdout: proc.stdout,
@@ -1064,12 +1056,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         })
         ? "model_not_found"
-        : providerQuota
-        ? "provider_quota"
         : transientUpstream
         ? "claude_transient_upstream"
         : null;
-      const errorFamily = providerQuota ? "provider_quota" : transientUpstream ? "transient_upstream" : null;
+      const errorFamily = transientUpstream ? "transient_upstream" : null;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -1088,9 +1078,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : {}),
           ...(transientRetryNotBefore
             ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
-            : {}),
-          ...(providerQuota && transientRetryNotBefore
-            ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
         },
@@ -1174,12 +1161,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
-      isClaudeProviderQuotaError({
-        parsed,
-        stdout: proc.stdout,
-        stderr: proc.stderr,
-        errorMessage,
-      });
+      isClaudeProviderQuotaError({ parsed });
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&

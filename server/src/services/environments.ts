@@ -20,6 +20,7 @@ import {
   ENVIRONMENT_LEASE_POLICIES,
   ENVIRONMENT_LEASE_STATUSES,
   ENVIRONMENT_STATUSES,
+  type CompanyEnvironmentLeaseListItem,
   type CreateEnvironment,
   type Environment,
   type EnvironmentDeleteBlastRadius,
@@ -1373,17 +1374,69 @@ export function environmentService(db: Db) {
     listLeases: async (
       environmentId: string,
       filters: {
-        status?: string;
+        status?: string | readonly string[];
+        /**
+         * Only leases that belong to these companies. Omit for the unscoped
+         * internal reads (runtime, reaper); API callers pass the caller's
+         * companies so one company never reads another's lease rows.
+         */
+        companyIds?: readonly string[];
       } = {},
     ): Promise<EnvironmentLease[]> => {
+      if (filters.companyIds && filters.companyIds.length === 0) return [];
       const conditions = [eq(environmentLeases.environmentId, environmentId)];
-      if (filters.status) conditions.push(eq(environmentLeases.status, filters.status));
+      if (filters.companyIds) conditions.push(inArray(environmentLeases.companyId, [...filters.companyIds]));
+      if (typeof filters.status === "string") {
+        if (filters.status) conditions.push(eq(environmentLeases.status, filters.status));
+      } else if (filters.status && filters.status.length > 0) {
+        conditions.push(inArray(environmentLeases.status, [...filters.status]));
+      }
       const rows = await db
         .select()
         .from(environmentLeases)
         .where(and(...conditions))
         .orderBy(desc(environmentLeases.lastUsedAt), desc(environmentLeases.createdAt));
       return rows.map(toEnvironmentLease);
+    },
+
+    /**
+     * Leases of one company across environments, most recently used first. The
+     * environment is left-joined because an orphan `pending_cleanup` lease keeps
+     * its row after the environment is deleted.
+     */
+    listCompanyLeases: async (
+      companyId: string,
+      filters: { statuses: readonly string[] },
+    ): Promise<CompanyEnvironmentLeaseListItem[]> => {
+      const rows = await db
+        .select({
+          lease: environmentLeases,
+          environmentName: environments.name,
+          environmentDriver: environments.driver,
+        })
+        .from(environmentLeases)
+        .leftJoin(environments, eq(environments.id, environmentLeases.environmentId))
+        .where(
+          and(
+            eq(environmentLeases.companyId, companyId),
+            inArray(environmentLeases.status, [...filters.statuses]),
+          ),
+        )
+        .orderBy(desc(environmentLeases.lastUsedAt), desc(environmentLeases.createdAt));
+      return rows.map((row) => {
+        const lease = toEnvironmentLease(row.lease);
+        return {
+          ...lease,
+          environment:
+            lease.environmentId && row.environmentName !== null && row.environmentDriver !== null
+              ? {
+                  id: lease.environmentId,
+                  name: row.environmentName,
+                  driver: readEnum(row.environmentDriver, ENVIRONMENT_DRIVERS, "environment driver") ?? "local",
+                }
+              : null,
+        };
+      });
     },
 
     acquireLease: async (input: {

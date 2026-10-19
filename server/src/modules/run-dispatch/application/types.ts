@@ -42,6 +42,8 @@ export type PromoteScheduledRetryOutcome =
       reason: string;
       errorCode: ScheduledRetryGateErrorCode;
     }
+  /** The caller's admission policy kept the retry scheduled for a later sweep. */
+  | { outcome: "held" }
   | { outcome: "not_promoted" };
 
 export type CancelStaleQueuedRunOutcome =

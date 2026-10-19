@@ -243,7 +243,11 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
     await vi.waitFor(() => expect(sockets).toHaveLength(2));
-    expect(invalidate).toHaveBeenCalledExactlyOnceWith({ type: "active" }, { cancelRefetch: false });
+    // Pins the shared filter by reference, so a looser predicate fails here.
+    expect(invalidate).toHaveBeenCalledExactlyOnceWith(
+      __liveUpdatesTestUtils.RECONCILE_ACTIVE_QUERIES,
+      { cancelRefetch: false },
+    );
   });
 
   it.each(["parent-agent", "child-agent"])("shows an unrelated retryable failure without issueId for %s", async (agentId) => {

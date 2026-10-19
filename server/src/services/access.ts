@@ -889,6 +889,8 @@ export function accessService(db: Db) {
       return existing;
     }
 
+    // A concurrent caller can insert the same membership between the read above
+    // and this write. The conflict path applies the update the read path would have.
     return db
       .insert(companyMemberships)
       .values({
@@ -897,6 +899,10 @@ export function accessService(db: Db) {
         principalId,
         status,
         membershipRole,
+      })
+      .onConflictDoUpdate({
+        target: [companyMemberships.companyId, companyMemberships.principalType, companyMemberships.principalId],
+        set: { status, membershipRole, updatedAt: new Date() },
       })
       .returning()
       .then((rows) => rows[0]);
@@ -1037,16 +1043,28 @@ export function accessService(db: Db) {
       return;
     }
 
-    await db.insert(principalPermissionGrants).values({
-      companyId,
-      principalType,
-      principalId,
-      permissionKey,
-      scope,
-      grantedByUserId,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
+    // Same race as ensureMembership: the conflict path is the update branch above.
+    await db
+      .insert(principalPermissionGrants)
+      .values({
+        companyId,
+        principalType,
+        principalId,
+        permissionKey,
+        scope,
+        grantedByUserId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [
+          principalPermissionGrants.companyId,
+          principalPermissionGrants.principalType,
+          principalPermissionGrants.principalId,
+          principalPermissionGrants.permissionKey,
+        ],
+        set: { scope, grantedByUserId, updatedAt: new Date() },
+      });
   }
 
   async function updateMember(

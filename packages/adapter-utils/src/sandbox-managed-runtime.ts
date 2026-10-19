@@ -5,13 +5,13 @@ import {
   createReadStream,
   promises as fs,
 } from "node:fs";
-import os from "node:os";
 import { workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
   buildRemoteGitDeltaBundleScript,
   isMissingGitPrerequisiteError,
+  retryTransientGitBundleTransfer,
   createImportedGitRef,
   createRemoteGitExportRef,
   deleteLocalGitRef,
@@ -50,6 +50,7 @@ import {
 } from "./sync-operation-schedule.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 import { withWorkspaceRestoreDiagnostics } from "./workspace-restore-diagnostics.js";
+import { createPaperclipTempDir, removePaperclipTempDir, type PaperclipTempPrefix } from "./paperclip-temp.js";
 
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
@@ -751,12 +752,12 @@ export function sandboxExecutionSessionMatches(saved: unknown, current: SandboxR
   );
 }
 
-async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+async function withTempDir<T>(prefix: PaperclipTempPrefix, fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await createPaperclipTempDir(prefix);
   try {
     return await fn(dir);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(dir).catch(() => undefined);
   }
 }
 
@@ -1847,11 +1848,13 @@ export async function prepareSandboxManagedRuntime(input: {
                     });
                   };
 
+                  // A bundle cut short in transit ("early EOF", "index-pack died")
+                  // is exported again from the live sandbox, in both modes.
                   try {
-                    importedHead = await exportAndImport(false);
+                    importedHead = await retryTransientGitBundleTransfer(() => exportAndImport(false));
                   } catch (error) {
                     if (!isMissingGitPrerequisiteError(error)) throw error;
-                    importedHead = await exportAndImport(true);
+                    importedHead = await retryTransientGitBundleTransfer(() => exportAndImport(true));
                   }
                 }
 
@@ -1925,6 +1928,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   baseline: mergeBaseline,
                   sourceDir: extractedDir,
                   targetDir: input.workspaceLocalDir,
+                  onLockWaitProgress: restoreSink,
                   beforeApply: gitHeadToIntegrate
                     ? async () => {
                         await integrateImportedGitHead({
