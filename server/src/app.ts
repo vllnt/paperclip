@@ -72,6 +72,7 @@ import { issueDuplicateRoutes } from "./routes/issue-duplicates.js";
 import { createDuplicateDetection } from "./services/duplicate-detection-factory.js";
 import { setIssueCreatedListener } from "./services/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
+import { issueGitLinkRoutes } from "./routes/issue-git-links.js";
 import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
 import { routineRoutes } from "./routes/routines.js";
@@ -779,6 +780,7 @@ export async function createApp(
   api.use(projectRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(caseRoutes(db, opts.storageService));
   api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
+  api.use(issueGitLinkRoutes(db));
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(eventSourceRoutes(db, eventSources));
