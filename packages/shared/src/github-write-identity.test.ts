@@ -1142,10 +1142,10 @@ describe("operations agents never perform", () => {
     expect(gh("api", "-X", "POST", "repos/o/r/actions/runs/77/pending_deployments", "-F", "environment_ids[]=1", "-f", "state=approved")).toEqual(write("other", "deploymentApproval"));
     // Feature branches: deleted, renamed or force-updated through the API; the default branch updated without force.
     expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/feature/x")).toEqual({ ...write("push"), branchRewrites: ["feature/x"] });
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", `sha=${sha}`, "-F", "force=true")).toEqual({ ...{ ...write("push"), branchRewrites: ["feature"] }, privileged: ["editWorkflows"], route: "git/refs/heads/feature" });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/feature", "-f", `sha=${sha}`, "-F", "force=true")).toEqual({ ...write("push"), branchRewrites: ["feature"], privileged: ["editWorkflows"], route: "git/refs/heads/feature" });
     expect(gh("api", "-X", "POST", "repos/o/r/branches/feature/rename", "-f", "new_name=feature-2")).toEqual({ ...write("other"), branchRewrites: ["feature"] });
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`)).toEqual({ ...write("push", "pushToMain"), privileged: ["pushToMain", "editWorkflows"], route: "git/refs/heads/main" });
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force=false")).toEqual({ ...write("push", "pushToMain"), privileged: ["pushToMain", "editWorkflows"], route: "git/refs/heads/main" });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`)).toEqual({ ...write("push", "pushToMain"), privileged: ["editWorkflows", "pushToMain"], route: "git/refs/heads/main" });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/main", "-f", `sha=${sha}`, "-F", "force=false")).toEqual({ ...write("push", "pushToMain"), privileged: ["editWorkflows", "pushToMain"], route: "git/refs/heads/main" });
     // git push: feature branches pushed, force-pushed (lease or not) and deleted; the default branch pushed without force.
     const git = (args: string[], context: Record<string, unknown> = {}) => classifyGitHubCommand("git", args, { ...clean, ...context });
     expect(git(["push", "-u", "origin", "feature/x"])).toEqual(write("push"));
@@ -1213,8 +1213,8 @@ describe("security review of the agents-never deny (round 2)", () => {
     expect(git(["push", "origin", "--delete", "protected"])).toEqual({ ...write("push"), branchRewrites: ["protected"] });
     expect(git(["push", "origin", "+HEAD:develop", ":release/1", "feature"], { currentBranch: "feature" })).toEqual({ ...write("push"), branchRewrites: ["develop", "release/1"] });
     expect(git(["push", "--force-with-lease=develop:" + sha, "origin", "develop"])).toEqual({ ...write("push"), branchRewrites: ["develop"] });
-    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-f", "force=true")).toEqual({ ...{ ...write("push"), branchRewrites: ["develop"] }, privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
-    expect(gh("api", "repos/o/r/git/refs/heads/develop", "-X", "PATCH", "--input", "ref.json")).toEqual({ ...{ ...write("push"), branchRewrites: ["develop"] }, privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
+    expect(gh("api", "-X", "PATCH", "repos/o/r/git/refs/heads/develop", "-f", `sha=${sha}`, "-f", "force=true")).toEqual({ ...write("push"), branchRewrites: ["develop"], privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
+    expect(gh("api", "repos/o/r/git/refs/heads/develop", "-X", "PATCH", "--input", "ref.json")).toEqual({ ...write("push"), branchRewrites: ["develop"], privileged: ["editWorkflows"], route: "git/refs/heads/develop" });
     expect(gh("api", "-X", "DELETE", "repos/o/r/git/refs/heads/release%2F1")).toEqual({ ...write("push"), branchRewrites: ["release/1"] });
     expect(gh("api", "-X", "POST", "repos/o/r/branches/develop/rename", "-f", "new_name=dev")).toEqual({ ...write("other"), branchRewrites: ["develop"] });
     expect(gh("repo", "sync", "--force", "--branch", "develop")).toEqual({ ...write("push", "pushToMain"), branchRewrites: ["develop"] });

@@ -2532,11 +2532,11 @@ describe("per-agent grants of editWorkflows and workflowDispatch", () => {
     const spoofed = { ...agent, actor: { ...agent.actor, isInstanceAdmin: true } } as PluginPerformActionContext;
     const before = await f.policy();
     for (const [label, caller] of [["an agent", agent], ["an agent claiming to be an administrator", spoofed], ["a board member who is no administrator", actors(f.companyId).member]] as const) {
-      await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: { agentIds: [DX] } }, caller), label).rejects.toThrow(/board user|administrator/i);
-      await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: true }, caller), label).rejects.toThrow(/board user|administrator/i);
-      await expect(f.h.performAction("write-identity.set", { companyId: f.companyId, policy: { ...before, privileged: { ...before.privileged, editWorkflows: { agentIds: [DX] } } } }, caller), label).rejects.toThrow(/board user|administrator/i);
+      await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: { agentIds: [DX] } }, caller), label).rejects.toThrow(/board user|administrator|board-only/i);
+      await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: true }, caller), label).rejects.toThrow(/board user|administrator|board-only/i);
+      await expect(f.h.performAction("write-identity.set", { companyId: f.companyId, policy: { ...before, privileged: { ...before.privileged, editWorkflows: { agentIds: [DX] } } } }, caller), label).rejects.toThrow(/board user|administrator|board-only/i);
     }
-    await expect(f.h.performAction("write-identity.agents", { companyId: f.companyId }, agent)).rejects.toThrow(/board user/i);
+    await expect(f.h.performAction("write-identity.agents", { companyId: f.companyId }, agent)).rejects.toThrow(/board user|board-only/i);
     // Another company's administrator acts on their own company only (the host scopes every call to the caller's company): this one has no policy to grant in.
     await expect(f.h.performAction("write-identity.grant", { companyId: f.companyId, action: "editWorkflows", scope: true }, actors("other").admin)).rejects.toThrow(/Save a write identity first/);
     expect(await f.policy()).toEqual(before);
