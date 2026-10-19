@@ -3,13 +3,17 @@ import type { Db } from "@paperclipai/db";
 import { agentHarnessCooldowns, heartbeatRuns } from "@paperclipai/db";
 import {
   ADAPTER_AGNOSTIC_KEYS,
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  RUN_TARGET_SOURCES,
   agentFallbacksSchema,
   checkHarnessModelCompatibility,
   fallbackEffortConfigKey,
   harnessTargetKey,
   type AgentFallbackTarget,
   type AgentHarnessFallbackState,
+  type HarnessFallbackAdapterType,
   type HarnessModelCompatibilityResult,
+  type RunTargetSource,
 } from "@paperclipai/shared";
 import { isProviderQuotaMessage, parseProviderQuotaResetAt } from "@paperclipai/adapter-utils/provider-quota";
 import { fallbackEnvBindingPrefix } from "./agent-secret-bindings.js";
@@ -181,13 +185,31 @@ export function resolveCooldownUntil(input: {
   return new Date(Math.min(now + backoffMs, limit));
 }
 
+export type HarnessTargetKind = "primary" | "fallback" | "profile";
+
+/** A run profile resolved against the company's tiers, ready to join the target chain. */
+export interface ProfileTargetInput {
+  adapterType?: string;
+  model?: string;
+  effort?: string;
+  tier?: string;
+  /** Whether the issue or the routine set it. */
+  source: "issue_profile" | "routine_profile";
+}
+
 export interface HarnessTarget {
-  kind: "primary" | "fallback";
+  kind: HarnessTargetKind;
   index: number | null;
   adapterType: string;
   model: string | null;
+  effort: string | null;
   key: string;
   entry: AgentFallbackTarget | null;
+  /** Index of the agent fallback entry whose env and bindings this target uses. */
+  envSourceIndex: number | null;
+  /** True when a profile target runs on another harness than the agent's own. */
+  crossHarness: boolean;
+  profile: ProfileTargetInput | null;
 }
 
 export interface HarnessTargetSelection extends HarnessTarget {
@@ -226,50 +248,103 @@ export function readAgentFallbacks(value: unknown): AgentFallbackTarget[] {
 }
 
 /**
- * The agent's harness targets: the primary, then each fallback in order.
+ * Why a profile cannot run for this agent: a different harness needs the
+ * agent's own fallback entry for it, because that entry holds the harness's
+ * credentials and their secret bindings.
  *
  * @param agent - Stored agent configuration.
+ * @param profile - The resolved profile.
+ * @returns `no_env_source`, or null when the profile can run.
+ */
+export function profileUnavailableReason(agent: HarnessAgentLike, profile: ProfileTargetInput): "no_env_source" | null {
+  if (!profile.adapterType || profile.adapterType === agent.adapterType) return null;
+  const hasEntry = readAgentFallbacks(agent.fallbacks).some((entry) => entry.adapterType === profile.adapterType);
+  return hasEntry ? null : "no_env_source";
+}
+
+function buildProfileTarget(agent: HarnessAgentLike, profile: ProfileTargetInput): HarnessTarget | null {
+  if (profileUnavailableReason(agent, profile)) return null;
+  const adapterType = profile.adapterType ?? agent.adapterType;
+  const crossHarness = adapterType !== agent.adapterType;
+  const model = profile.model ?? (crossHarness ? null : readPrimaryModel(agent));
+  const fallbacks = readAgentFallbacks(agent.fallbacks);
+  const envSourceIndex = crossHarness ? fallbacks.findIndex((entry) => entry.adapterType === adapterType) : -1;
+  const source = envSourceIndex >= 0 ? fallbacks[envSourceIndex] : null;
+  return {
+    kind: "profile",
+    index: null,
+    adapterType,
+    model,
+    effort: profile.effort ?? null,
+    key: harnessTargetKey({ adapterType, model }),
+    entry: crossHarness && source && model
+      ? { adapterType: source.adapterType, model, ...(profile.effort ? { effort: profile.effort } : {}), ...(source.adapterConfig ? { adapterConfig: source.adapterConfig } : {}), ...(source.env ? { env: source.env } : {}) }
+      : null,
+    envSourceIndex: envSourceIndex >= 0 ? envSourceIndex : null,
+    crossHarness,
+    profile,
+  };
+}
+
+/**
+ * The agent's harness targets in the order a run tries them: the run profile's
+ * target (when it has one the agent can run), the primary, then each fallback.
+ * A target repeated by key keeps its first position.
+ *
+ * @param agent - Stored agent configuration.
+ * @param profile - The issue's or routine's resolved run profile.
  * @returns The ordered target list.
  */
-export function listHarnessTargets(agent: HarnessAgentLike): HarnessTarget[] {
+export function listHarnessTargets(agent: HarnessAgentLike, profile?: ProfileTargetInput | null): HarnessTarget[] {
   const primaryModel = readPrimaryModel(agent);
   const primary: HarnessTarget = {
     kind: "primary",
     index: null,
     adapterType: agent.adapterType,
     model: primaryModel,
+    effort: null,
     key: harnessTargetKey({ adapterType: agent.adapterType, model: primaryModel }),
     entry: null,
+    envSourceIndex: null,
+    crossHarness: false,
+    profile: null,
   };
-  return [
-    primary,
-    ...readAgentFallbacks(agent.fallbacks).map((entry, index): HarnessTarget => ({
-      kind: "fallback",
-      index,
-      adapterType: entry.adapterType,
-      model: entry.model,
-      key: harnessTargetKey(entry),
-      entry,
-    })),
-  ];
+  const profileTarget = profile ? buildProfileTarget(agent, profile) : null;
+  const fallbackTargets = readAgentFallbacks(agent.fallbacks).map((entry, index): HarnessTarget => ({
+    kind: "fallback",
+    index,
+    adapterType: entry.adapterType,
+    model: entry.model,
+    effort: entry.effort ?? null,
+    key: harnessTargetKey(entry),
+    entry,
+    envSourceIndex: index,
+    crossHarness: false,
+    profile: null,
+  }));
+  const ordered = profileTarget ? [profileTarget, primary, ...fallbackTargets] : [primary, ...fallbackTargets];
+  const seen = new Set<string>();
+  return ordered.filter((target) => (seen.has(target.key) ? false : Boolean(seen.add(target.key))));
 }
 
 /**
  * Picks the target a new run should execute on: the first target in order
  * that is not cooling down. When every target is cooling down it returns the
- * primary with the earliest recovery time, and the run must wait.
+ * first target with the earliest recovery time, and the run must wait.
  *
  * @param agent - Stored agent configuration.
  * @param cooldowns - Cooldown end per target key.
  * @param now - Selection time.
+ * @param profile - The run's resolved profile, if any.
  * @returns The selected target.
  */
 export function selectHarnessTarget(
   agent: HarnessAgentLike,
   cooldowns: ReadonlyMap<string, Date>,
   now: Date,
+  profile?: ProfileTargetInput | null,
 ): HarnessTargetSelection {
-  const targets = listHarnessTargets(agent);
+  const targets = listHarnessTargets(agent, profile);
   const healthy = targets.find((target) => {
     const until = cooldowns.get(target.key);
     return !until || until.getTime() <= now.getTime();
@@ -281,18 +356,20 @@ export function selectHarnessTarget(
 
 const CARRIED_ENGINE_ADAPTERS = new Set(["claude_local", "codex_local"]);
 
-/** Keys that select a run's model, command line or environment. */
-const RUN_TARGET_OVERRIDE_KEYS = new Set([
+/** Keys that select a run's model or effort. */
+const MODEL_OVERRIDE_KEYS = new Set([
   "model", "effort", "modelReasoningEffort", "reasoningEffort", "thinking", "variant",
-  "env", "extraArgs", "args", "command", "provider",
 ]);
+/** Keys that select a run's command line or environment. */
+const COMMAND_OVERRIDE_KEYS = new Set(["env", "extraArgs", "args", "command", "provider"]);
 
 /**
  * An issue's per-assignee adapter overrides, without the keys that choose the
- * model or environment, when the run executes on a fallback target. Those
- * overrides were written for the primary harness: a per-issue Anthropic model
- * would be refused on Codex, and an env override would replace the fallback's
- * own credentials.
+ * model or environment when the run executes on another target. Those
+ * overrides were written for the agent's own harness: a per-issue Anthropic
+ * model would be refused on Codex, and an env override would replace the
+ * target's own credentials. A profile target on the agent's own harness
+ * already carries its model and effort, so only those keys are dropped.
  *
  * @param overrides - The issue's adapterConfig overrides, if any.
  * @param dispatch - The dispatch the run was claimed with.
@@ -300,11 +377,14 @@ const RUN_TARGET_OVERRIDE_KEYS = new Set([
  */
 export function overridesForHarnessTarget(
   overrides: Record<string, unknown> | null | undefined,
-  dispatch: { target: "primary" | "fallback" } | null,
+  dispatch: { target: HarnessTargetKind; crossHarness?: boolean } | null,
 ): Record<string, unknown> {
   if (!overrides) return {};
-  if (dispatch?.target !== "fallback") return overrides;
-  return Object.fromEntries(Object.entries(overrides).filter(([key]) => !RUN_TARGET_OVERRIDE_KEYS.has(key)));
+  if (!dispatch || dispatch.target === "primary") return overrides;
+  const dropped = dispatch.target === "fallback" || dispatch.crossHarness
+    ? (key: string) => MODEL_OVERRIDE_KEYS.has(key) || COMMAND_OVERRIDE_KEYS.has(key)
+    : (key: string) => MODEL_OVERRIDE_KEYS.has(key);
+  return Object.fromEntries(Object.entries(overrides).filter(([key]) => !dropped(key)));
 }
 
 /**
@@ -318,9 +398,20 @@ export function overridesForHarnessTarget(
  * @returns The stored agent for the primary; otherwise a run-only view.
  */
 export function buildHarnessTargetAgentView<T extends HarnessAgentLike>(agent: T, target: HarnessTarget): T {
-  if (target.kind === "primary" || !target.entry) return agent;
-  const entry = target.entry;
+  if (target.kind === "primary") return agent;
   const primaryConfig = asRecord(agent.adapterConfig) ?? {};
+  if (target.kind === "profile" && !target.crossHarness) {
+    return {
+      ...agent,
+      adapterConfig: {
+        ...primaryConfig,
+        ...(target.model ? { model: target.model } : {}),
+        ...(target.effort ? { [fallbackEffortConfigKey(agentFallbackAdapterType(agent.adapterType))]: target.effort } : {}),
+      },
+    };
+  }
+  if (!target.entry) return agent;
+  const entry = target.entry;
   const carried: Record<string, unknown> = {};
   for (const key of ADAPTER_AGNOSTIC_KEYS) {
     if (key !== "env" && primaryConfig[key] !== undefined) carried[key] = primaryConfig[key];
@@ -343,9 +434,30 @@ export function buildHarnessTargetAgentView<T extends HarnessAgentLike>(agent: T
   };
 }
 
+function agentFallbackAdapterType(adapterType: string): HarnessFallbackAdapterType {
+  return (HARNESS_FALLBACK_ADAPTER_TYPES as readonly string[]).includes(adapterType)
+    ? (adapterType as HarnessFallbackAdapterType)
+    : "claude_local";
+}
+
+export interface HarnessDispatch {
+  adapterType: string;
+  model: string | null;
+  target: HarnessTargetKind;
+  targetKey: string;
+  fallbackIndex: number | null;
+  fallbackReason: string | null;
+  /** Where the run's harness and model came from. */
+  source: RunTargetSource;
+  /** The run profile in effect when the run was claimed, even if it ran elsewhere. */
+  profile?: ProfileTargetInput | null;
+  crossHarness?: boolean;
+}
+
 /**
  * The binding path prefix for the agent's own env on a claimed dispatch: empty
- * for the primary, `fallbacks[<index>].` for a fallback target.
+ * for the primary and for a profile on the agent's own harness, and
+ * `fallbacks[<index>].` for a target whose env comes from a fallback entry.
  *
  * @param agent - The stored agent.
  * @param dispatch - The dispatch the run was claimed with.
@@ -353,20 +465,13 @@ export function buildHarnessTargetAgentView<T extends HarnessAgentLike>(agent: T
  */
 export function agentEnvBindingPrefix(
   agent: HarnessAgentLike,
-  dispatch: { target: "primary" | "fallback"; targetKey: string } | null,
+  dispatch: { target: HarnessTargetKind; targetKey: string; profile?: ProfileTargetInput | null } | null,
 ): string | undefined {
-  if (!dispatch || dispatch.target !== "fallback") return undefined;
-  const target = listHarnessTargets(agent).find((candidate) => candidate.kind === "fallback" && candidate.key === dispatch.targetKey);
-  return target?.index != null ? fallbackEnvBindingPrefix(target.index) : undefined;
-}
-
-export interface HarnessDispatch {
-  adapterType: string;
-  model: string | null;
-  target: "primary" | "fallback";
-  targetKey: string;
-  fallbackIndex: number | null;
-  fallbackReason: string | null;
+  if (!dispatch || dispatch.target === "primary") return undefined;
+  const target = listHarnessTargets(agent, dispatch.profile).find(
+    (candidate) => candidate.kind === dispatch.target && candidate.key === dispatch.targetKey,
+  );
+  return target?.envSourceIndex != null ? fallbackEnvBindingPrefix(target.envSourceIndex) : undefined;
 }
 
 /**
@@ -384,6 +489,52 @@ export function primaryHarnessDispatch(agent: HarnessAgentLike): HarnessDispatch
     targetKey: harnessTargetKey({ adapterType: agent.adapterType, model }),
     fallbackIndex: null,
     fallbackReason: null,
+    source: "agent_default",
+    profile: null,
+  };
+}
+
+/**
+ * The dispatch record for a selected target.
+ *
+ * @param selected - The target `selectHarnessTarget` returned.
+ * @param profile - The run's profile, if it had one.
+ * @param skippedReason - Why earlier targets in the chain were skipped, if they were.
+ * @returns The dispatch to record on the run.
+ */
+export function dispatchForSelection(
+  selected: HarnessTarget,
+  profile: ProfileTargetInput | null | undefined,
+  skippedReason: string | null,
+): HarnessDispatch {
+  const source: RunTargetSource =
+    selected.kind === "profile" ? (selected.profile?.source ?? "issue_profile")
+    : selected.kind === "fallback" || profile ? "fallback"
+    : "agent_default";
+  const movedOff = selected.kind === "fallback" || (selected.kind === "primary" && Boolean(profile));
+  return {
+    adapterType: selected.adapterType,
+    model: selected.model,
+    target: selected.kind,
+    targetKey: selected.key,
+    fallbackIndex: selected.kind === "fallback" ? selected.index : null,
+    fallbackReason: movedOff ? skippedReason ?? "primary_cooling_down" : null,
+    source,
+    profile: profile ?? null,
+    ...(selected.crossHarness ? { crossHarness: true } : {}),
+  };
+}
+
+function readProfileInput(value: unknown): ProfileTargetInput | null {
+  const profile = asRecord(value);
+  if (!profile) return null;
+  const source = profile.source === "routine_profile" ? "routine_profile" : "issue_profile";
+  return {
+    ...(typeof profile.adapterType === "string" ? { adapterType: profile.adapterType } : {}),
+    ...(typeof profile.model === "string" ? { model: profile.model } : {}),
+    ...(typeof profile.effort === "string" ? { effort: profile.effort } : {}),
+    ...(typeof profile.tier === "string" ? { tier: profile.tier } : {}),
+    source,
   };
 }
 
@@ -396,7 +547,10 @@ export function primaryHarnessDispatch(agent: HarnessAgentLike): HarnessDispatch
 export function readClaimedHarnessDispatch(runnerProfileJson: unknown): HarnessDispatch | null {
   const dispatch = asRecord(asRecord(runnerProfileJson)?.adapterDispatch);
   if (!dispatch || typeof dispatch.adapterType !== "string") return null;
-  const target = dispatch.target === "fallback" ? "fallback" : "primary";
+  const target: HarnessTargetKind = dispatch.target === "fallback" || dispatch.target === "profile" ? dispatch.target : "primary";
+  const source = (RUN_TARGET_SOURCES as readonly unknown[]).includes(dispatch.source)
+    ? (dispatch.source as RunTargetSource)
+    : target === "fallback" ? "fallback" : "agent_default";
   return {
     adapterType: dispatch.adapterType,
     model: typeof dispatch.model === "string" ? dispatch.model : null,
@@ -407,6 +561,9 @@ export function readClaimedHarnessDispatch(runnerProfileJson: unknown): HarnessD
     }),
     fallbackIndex: typeof dispatch.fallbackIndex === "number" ? dispatch.fallbackIndex : null,
     fallbackReason: typeof dispatch.fallbackReason === "string" ? dispatch.fallbackReason : null,
+    source,
+    profile: readProfileInput(dispatch.profile),
+    ...(dispatch.crossHarness === true ? { crossHarness: true } : {}),
   };
 }
 
@@ -415,12 +572,12 @@ export function readClaimedHarnessDispatch(runnerProfileJson: unknown): HarnessD
  *
  * @param agent - The stored agent at execution time.
  * @param dispatch - The dispatch recorded at claim.
- * @returns The agent view to execute, or null when the claimed fallback no longer exists.
+ * @returns The agent view to execute, or null when the claimed target no longer exists.
  */
 export function applyClaimedHarnessDispatch<T extends HarnessAgentLike>(agent: T, dispatch: HarnessDispatch | null): T | null {
   if (!dispatch || dispatch.target === "primary") return agent;
-  const target = listHarnessTargets(agent).find(
-    (candidate) => candidate.kind === "fallback" && candidate.key === dispatch.targetKey,
+  const target = listHarnessTargets(agent, dispatch.profile).find(
+    (candidate) => candidate.kind === dispatch.target && candidate.key === dispatch.targetKey,
   );
   return target ? buildHarnessTargetAgentView(agent, target) : null;
 }
@@ -513,7 +670,10 @@ export function harnessFallbackService(db: Db) {
   async function resolveDispatch(
     agent: HarnessFallbackAgent,
     now: Date = new Date(),
+    requestedProfile: ProfileTargetInput | null = null,
   ): Promise<{ dispatch: HarnessDispatch; heldUntil: Date | null }> {
+    // A profile the agent has no credentials for is not skipped, it never applied.
+    const profile = requestedProfile && !profileUnavailableReason(agent, requestedProfile) ? requestedProfile : null;
     // Fail closed. An unreadable cooldown table during a quota outage must not
     // send runs back at the exhausted target, so every target waits for a
     // bounded, growing window. The table is not read again inside the window,
@@ -537,26 +697,27 @@ export function harnessFallbackService(db: Db) {
       return { dispatch: primaryHarnessDispatch(agent), heldUntil: new Date(until) };
     }
     readFailures.delete(agent.id);
-    if (rows.length === 0) return { dispatch: primaryHarnessDispatch(agent), heldUntil: null };
-    const targets = listHarnessTargets(agent);
-    const selected = selectHarnessTarget(agent, cooldownMap(rows), now);
-    const primaryCooldown = rows.find((row) => row.targetKey === targets[0].key);
+    if (rows.length === 0 && !profile) return { dispatch: primaryHarnessDispatch(agent), heldUntil: null };
+    const targets = listHarnessTargets(agent, profile);
+    const selected = selectHarnessTarget(agent, cooldownMap(rows), now, profile);
+    const selectedAt = targets.findIndex((target) => target.key === selected.key);
+    const skipped = targets
+      .slice(0, Math.max(selectedAt, 0))
+      .map((target) => rows.find((row) => row.targetKey === target.key))
+      .find(Boolean);
     return {
-      dispatch: {
-        adapterType: selected.adapterType,
-        model: selected.model,
-        target: selected.kind,
-        targetKey: selected.key,
-        fallbackIndex: selected.index,
-        fallbackReason: selected.kind === "fallback" ? primaryCooldown?.reason ?? "primary_cooling_down" : null,
-      },
+      dispatch: dispatchForSelection(selected, profile, skipped?.reason ?? null),
       heldUntil: selected.heldUntil,
     };
   }
 
   /** The earliest time any of the agent's targets can run, or null when one can run now. */
-  async function heldUntil(agent: HarnessFallbackAgent, now: Date = new Date()): Promise<Date | null> {
-    return (await resolveDispatch(agent, now)).heldUntil;
+  async function heldUntil(
+    agent: HarnessFallbackAgent,
+    now: Date = new Date(),
+    profile: ProfileTargetInput | null = null,
+  ): Promise<Date | null> {
+    return (await resolveDispatch(agent, now, profile)).heldUntil;
   }
 
   /**
@@ -570,9 +731,11 @@ export function harnessFallbackService(db: Db) {
     resetAt: Date | null;
     sourceRunId: string;
     now?: Date;
+    /** The run's profile: the failed target may be the profile's own. */
+    profile?: ProfileTargetInput | null;
   }): Promise<{ until: Date | null; nextTarget: HarnessTargetSelection | null }> {
     const now = input.now ?? new Date();
-    const targets = listHarnessTargets(input.agent);
+    const targets = listHarnessTargets(input.agent, input.profile);
     const target = targets.find((candidate) => candidate.key === input.targetKey);
     if (!target) return { until: null, nextTarget: null };
     const { wasActive, until } = await db.transaction(async (tx) => {
@@ -619,9 +782,9 @@ export function harnessFallbackService(db: Db) {
       return { wasActive: active, until: nextCooldownUntil };
     });
     const rows = await listCooldowns(input.agent.companyId, input.agent.id);
-    const next = selectHarnessTarget(input.agent, cooldownMap(rows), now);
-    const nextTarget = next.kind === "fallback" ? next : null;
-    if (target.kind === "primary" && !wasActive && nextTarget) {
+    const next = selectHarnessTarget(input.agent, cooldownMap(rows), now, input.profile);
+    const nextTarget = next.heldUntil === null && next.key !== target.key ? next : null;
+    if (target.kind !== "fallback" && !wasActive && nextTarget) {
       await logActivity(db, {
         companyId: input.agent.companyId,
         actorType: "system",

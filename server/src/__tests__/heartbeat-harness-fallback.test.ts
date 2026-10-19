@@ -509,6 +509,8 @@ describeEmbeddedPostgres("agent harness fallback", () => {
   it("does not apply an issue's primary model override to a fallback run", async () => {
     const { companyId, agentId, issueId } = await seed();
     await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: { model: "claude-sonnet-5" } } }).where(eq(issues.id, issueId));
+    // The override is an issue-level profile: the agent's own model is the next target, so it is cooling down here.
+    await coolDownTargets(companyId, agentId, ["claude_local:claude-opus-5-5"]);
     scripts.claude_local = [{ kind: "usage_limit" }];
 
     await assign(agentId, issueId);
